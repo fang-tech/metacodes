@@ -924,6 +924,16 @@ pub const KgClient = struct {
                             return;
                         };
                     }
+                    // A local service that refuses this configuration's key may
+                    // be another state root's, holding the port this install
+                    // pinned. The host can move this install to a free port and
+                    // start its own service there; read what it wrote and probe
+                    // once more (tryAutostart allows one start per window, so
+                    // this does not recurse further).
+                    if (first == transport_mod.Error.AuthenticationFailed and daemon.loopbackPort() != null and self.tryAutostart()) {
+                        self.reloadDaemonConfig();
+                        return self.ensureReady();
+                    }
                     self.setDegraded(classifyDaemonError(first), "TinyKG daemon preflight 失败: {s}；未打开本地 Store", .{@errorName(first)});
                     return;
                 };
@@ -1247,7 +1257,7 @@ pub const KgClient = struct {
             .config_unsafe => "chmod 600 and make it a regular non-symlink file under 64 KB",
             .config_invalid => "fix url/api_key/expected_build_id JSON",
             .daemon_unreachable => "a CLI session starts it when it begins (METACODES_KG_AUTOSTART=0 turns that off); `metacodes kgd` starts it now",
-            .auth_failed => "api_key must match the daemon's TINYKG_WEB_API_KEY",
+            .auth_failed => "the service on this port refused this configuration's key: another state root's service (or one started with an older key) holds it; with the default daemon.json the next session moves this install to a free port, otherwise stop that service or fix the configured key or port",
             .pin_mismatch => "set expected_build_id/schema digest to the running daemon's /api/catalog values",
             .store_contract_mismatch => "migrate the store to storage 3 / schema 3",
             .server_degraded => "the daemon is up but reports a degraded store, check its logs",
