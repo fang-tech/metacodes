@@ -10,6 +10,17 @@ status, compatibility boundaries, and entry points are defined by
 
 ## Unreleased
 
+### Changed
+
+- Release and reopen PRs no longer re-run the full CI. A `Release fast path`
+  job (`scripts/release_fast_path.py`) checks that the PR's merge commit adds
+  only what `scripts/release_cut.py` generates from its base, regenerated in a
+  scratch worktree and compared byte for byte, and that the base's push run of
+  CI on `main` succeeded (waiting up to 45 minutes for one still in progress).
+  Then the four required checks report success without the suites; the
+  version state gate still runs. Any other change, a red or missing base run,
+  or an error in the check itself takes the full path.
+
 ## 0.5.0 — 2026-10-11
 
 ### Added
