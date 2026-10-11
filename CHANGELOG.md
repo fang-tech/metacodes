@@ -10,6 +10,8 @@ status, compatibility boundaries, and entry points are defined by
 
 ## Unreleased
 
+## 0.5.0 — 2026-10-11
+
 ### Added
 
 - AgentCore ABI v1 revision 19 (#236): `session_control->update_permission_mode`
