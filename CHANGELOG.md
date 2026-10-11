@@ -21,6 +21,25 @@ status, compatibility boundaries, and entry points are defined by
   version state gate still runs. Any other change, a red or missing base run,
   or an error in the check itself takes the full path.
 
+### Fixed
+
+- A TinyKG service of another state root no longer locks an install out of
+  its own. Every state root used to provision port 8799, so while one
+  install's service was down a test run in a temporary home could provision
+  and bind the very port that install's `daemon.json` pins, and its sessions
+  then met a service that refused their key: `auth_failed` until that service
+  was killed (seen for two days on a developer machine). A new configuration
+  now prefers a port derived from its own path (20000-32767) and takes a free
+  one when that is held. Autostart asks the configured port for readiness
+  with the install's key and never takes a service that refuses it for the
+  install's own: the default configuration moves to a free port with a new
+  key (the old one was presented to that service; any local user can bind a
+  loopback port) and the same store, and starts its service there, while a
+  `METACODES_KG_CONFIG`
+  file is left as written and the conflict is logged. A session whose
+  readiness probe meets such a service now asks the host to do that, and the
+  `auth_failed` hint in `doctor` names the cause.
+
 ## 0.5.0 — 2026-10-11
 
 ### Added

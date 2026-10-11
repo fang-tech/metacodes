@@ -22,6 +22,7 @@ pub const doctor = @import("app/doctor.zig"); // pub: component tests build the 
 pub const kgd_server = @import("kg/kgd/server.zig"); // pub: component tests drive a real supervisor
 pub const kgd_install = @import("kg/kgd/install.zig");
 pub const kgd_runtime_exports = @import("kg/kgd/runtime.zig"); // pub: the component test exercises the install-to-service handoff
+pub const kg_autostart = @import("app/kg_autostart.zig"); // pub: the component test drives the host start against a squatted port
 const kgd_runtime = @import("kg/kgd/runtime.zig");
 const build_options = @import("build_info");
 
