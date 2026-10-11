@@ -263,13 +263,20 @@ const Occupant = enum {
 /// An authenticated readiness request, read only to its status line. The
 /// service checks the key before it reads any body, so a foreign service does
 /// no work for it, and this install's own answers 200, or 503 when degraded.
+///
+/// A signal may interrupt any of these calls (the process runs `std.Io`
+/// threads); an interrupted call is retried within the probe's time, never
+/// read as an answer. Taking an interrupted read for silence once declared a
+/// squatter "unknown", so the install stayed behind it.
 fn occupant(port: u16, api_key: []const u8) Occupant {
-    if (!accepting(port)) return .none;
     for (api_key) |byte| if (byte < 0x21 or byte == 0x7f) return .unknown; // never a header injection
-    const sock = net.connectLoopback(port) catch return .none;
+    // Windows answers from the listener table: no ~2 s refused connect.
+    if (builtin.os.tag == .windows and !accepting(port)) return .none;
+    const sock = connectProbe(port) orelse return .none;
     defer net.closeSocket(sock);
     net.setSendTimeoutMs(sock, PROBE_TIMEOUT_MS);
     net.setRecvTimeoutMs(sock, PROBE_TIMEOUT_MS);
+    const deadline = time.nowMs() +| PROBE_TIMEOUT_MS;
     var request_buf: [384]u8 = undefined;
     const request = std.fmt.bufPrint(
         &request_buf,
@@ -279,17 +286,40 @@ fn occupant(port: u16, api_key: []const u8) Occupant {
     var sent: usize = 0;
     while (sent < request.len) {
         const n = net.send(sock, request[sent..]);
-        if (n <= 0) return .unknown;
-        sent += @intCast(n);
+        if (n > 0) {
+            sent += @intCast(n);
+        } else if (n < 0 and interrupted() and time.nowMs() < deadline) {
+            continue;
+        } else return .unknown;
     }
     var reply: [16]u8 = undefined;
     var got: usize = 0;
     while (got < reply.len) {
         const n = net.recv(sock, reply[got..]);
-        if (n <= 0) break;
-        got += @intCast(n);
+        if (n > 0) {
+            got += @intCast(n);
+        } else if (n < 0 and interrupted() and time.nowMs() < deadline) {
+            continue;
+        } else break;
     }
     return classifyReply(reply[0..got]);
+}
+
+/// A connection to the port, or null when nothing listens (refused). A
+/// connect a signal interrupted is retried on a fresh socket.
+fn connectProbe(port: u16) ?net.Socket {
+    var attempt: u8 = 0;
+    while (attempt < 3) : (attempt += 1) {
+        if (net.connectLoopback(port)) |sock| return sock else |_| {}
+        if (!interrupted()) return null;
+    }
+    return null;
+}
+
+/// Whether the last failed POSIX call was interrupted by a signal.
+fn interrupted() bool {
+    if (builtin.os.tag == .windows) return false;
+    return std.c._errno().* == @intFromEnum(std.c.E.INTR);
 }
 
 fn classifyReply(reply: []const u8) Occupant {
@@ -466,6 +496,8 @@ test "kg autostart: a reply is judged by its status line, and only 401 or non-HT
 const FakeService = struct {
     listener: net.Listener,
     reply: []const u8,
+    /// Wait this long before replying.
+    delay_ms: u32 = 0,
     seen_key: [80]u8 = undefined,
     seen_key_len: usize = 0,
 
@@ -491,6 +523,7 @@ const FakeService = struct {
                 @memcpy(self.seen_key[0..self.seen_key_len], key[0..self.seen_key_len]);
             }
             if (self.reply.len > 0) {
+                time.sleepMs(self.delay_ms);
                 _ = net.send(conn, self.reply);
             } else {
                 time.sleepMs(PROBE_TIMEOUT_MS + 500); // never answers within the probe
@@ -531,4 +564,36 @@ test "kg autostart: the ownership probe asks with this configuration's key" {
     const listener = try net.listenLoopback(0, 1);
     defer net.closeSocket(listener.sock);
     try testing.expectEqual(Occupant.unknown, occupant(listener.port, "k\r\nx-evil: 1"));
+}
+
+fn ignoreSignal(_: std.posix.SIG) callconv(.c) void {}
+
+fn interruptAfter(target: std.c.pthread_t, delay_ms: u32) void {
+    time.sleepMs(delay_ms);
+    _ = std.c.pthread_kill(target, std.posix.SIG.USR1);
+}
+
+test "kg autostart: a signal during the probe is retried, not taken for silence" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    // A handler without SA_RESTART makes a blocked recv return EINTR, as the
+    // std.Io threads' signals do in a session. The probe once read that as
+    // "no answer" and left the install behind a squatter.
+    var action: std.posix.Sigaction = .{
+        .handler = .{ .handler = ignoreSignal },
+        .mask = std.posix.sigemptyset(),
+        .flags = 0,
+    };
+    var previous: std.posix.Sigaction = undefined;
+    std.posix.sigaction(std.posix.SIG.USR1, &action, &previous);
+    defer std.posix.sigaction(std.posix.SIG.USR1, &previous, null);
+
+    const listener = try net.listenLoopback(0, 4);
+    defer net.closeSocket(listener.sock);
+    var fake = FakeService{ .listener = listener, .reply = "HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n", .delay_ms = 400 };
+    const server = try std.Thread.spawn(.{}, FakeService.serve, .{&fake});
+    const interrupter = try std.Thread.spawn(.{}, interruptAfter, .{ std.c.pthread_self(), 150 });
+    const verdict = occupant(listener.port, "k" ** 64);
+    interrupter.join();
+    server.join();
+    try testing.expectEqual(Occupant.foreign, verdict);
 }
