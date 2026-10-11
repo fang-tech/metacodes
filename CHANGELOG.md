@@ -20,6 +20,22 @@ status, compatibility boundaries, and entry points are defined by
   Then the four required checks report success without the suites; the
   version state gate still runs. Any other change, a red or missing base run,
   or an error in the check itself takes the full path.
+- The Jev `recall_evidence` surface is retired: `KgRecall` no longer consults
+  the System-One judge. It appended each hit's relevance percent, an
+  evidence-sufficiency score and usage guidance, which in the paid
+  attribution pilot cancelled the recall gate's gain in gold evidence the
+  model opened (34/60 against 42/60 for the gate alone). A redesign that
+  only reordered rows inside the gate's BM25 band put gold first more often
+  offline (LongMemEval-S turn-level holdout 272 of 288 against 258,
+  p = 0.0005) but showed no gain in a paid paired pilot on 139 cases (gold
+  memory opened 56 against 53 of 125 pairs, p = 0.72, after a post hoc
+  re-validation; the pre-registered analysis was voided because reordering
+  breaks the merge order the evaluator checks), so it was removed too.
+  Configuration that still names `recall_evidence` keeps working: the name is
+  skipped with a warning and the other surfaces stay advised; a list naming
+  only it is refused like an empty list. Records:
+  `evals/memory/pilots/longmem-recall-order-glm52-v1` and
+  doc/JEV_SYSTEM_ONE.md §6.4-§6.5.
 
 ### Fixed
 

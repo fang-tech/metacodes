@@ -21,7 +21,7 @@ Run `zig build gate:pr` to execute the single AGENTS.md pre-submit checklist.
   keep returning nothing new.
 - [Memory system](MEMORY_SYSTEM_DESIGN.md)
 - [Jev System-One memory advisor](JEV_SYSTEM_ONE.md) — optional judge for
-  recall injection, recall evidence, memory relations and enumeration intent.
+  recall injection, memory relations and enumeration intent.
 - [Jev × Harness 接入方案](JEV_HARNESS_INTEGRATION_DESIGN.md) — historical
   Codex proposal (JevTree-style next-action advisor) that JEV_SYSTEM_ONE.md §5
   adopts, defers or rejects point by point; not the current behaviour.
