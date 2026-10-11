@@ -60,6 +60,15 @@ status, compatibility boundaries, and entry points are defined by
   and the macOS system proxy, so behind a proxy that could not reach the judge
   an unreachable judge was recorded as the proxy's 503 instead of 502, and a
   proxy that could reach it measured a path the CLI never takes.
+- The port-ownership probe from the previous entry retries a call a signal
+  interrupted. A session's process runs `std.Io` threads whose signals make a
+  blocked `recv` return `EINTR`; the probe read that as "no answer", judged a
+  squatting service "unknown" and left the install behind it (about one in
+  forty runs of its component test under load, and once on macOS CI). It now
+  retries interrupted connects, sends and reads within its 2 s, and on POSIX
+  no longer opens and closes a connection before the request. A TinyKG
+  service that fails to start after `tinykgd` has answered no longer leaks
+  the bridge's read buffer: the supervisor stopped the copy it moved from.
 
 ## 0.5.0 — 2026-10-11
 

@@ -116,9 +116,11 @@ pub const Supervisor = struct {
             log.err("kgd", "cannot start tinykgd: {s}", .{@errorName(err)});
             return Error.DaemonUnavailable;
         };
-        errdefer bridge.stop();
 
-        const self = allocator.create(Supervisor) catch return Error.OutOfMemory;
+        const self = allocator.create(Supervisor) catch {
+            bridge.stop();
+            return Error.OutOfMemory;
+        };
         errdefer allocator.destroy(self);
         self.* = .{
             .allocator = allocator,
@@ -129,6 +131,9 @@ pub const Supervisor = struct {
             .schema_digest = undefined,
             .listener = undefined,
         };
+        // The bridge now lives in `self`: its read buffer grows there, so a
+        // failure from here on must stop that copy, not the one moved from.
+        errdefer self.bridge.stop();
         self.schema_digest = try self.readStoreContract();
         // A store that was never indexed (an upgraded or imported one) gets its
         // index before the first client can ask for it.

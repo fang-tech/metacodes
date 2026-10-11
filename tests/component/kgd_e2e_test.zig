@@ -352,6 +352,8 @@ const InProcessService = struct {
     supervisor: ?*Supervisor = null,
     thread: ?std.Thread = null,
     launches: u32 = 0,
+    /// Why the last launch failed, for the test's own failure message.
+    last_error: ?anyerror = null,
 
     fn launcher(self: *InProcessService) cc.kg_autostart.Autostart.Launcher {
         return .{ .ctx = self, .launch = launch };
@@ -360,6 +362,13 @@ const InProcessService = struct {
     fn launch(ctx: *anyopaque, state_root: []const u8, config_path: ?[]const u8) anyerror!void {
         const self: *InProcessService = @ptrCast(@alignCast(ctx));
         self.launches += 1;
+        self.start(state_root, config_path) catch |err| {
+            self.last_error = err;
+            return err;
+        };
+    }
+
+    fn start(self: *InProcessService, state_root: []const u8, config_path: ?[]const u8) anyerror!void {
         var config = try cc.kgd_runtime_exports.loadConfig(self.allocator, state_root, .{ .config_path = config_path });
         errdefer config.deinit(self.allocator);
         const staging = try cc.kgd_runtime_exports.stagingDir(self.allocator, state_root);
@@ -466,7 +475,13 @@ test "Kgd: a service of another state root on this install's port is never taken
     });
     defer kg.deinit();
     kg.ensureReady();
-    try std.testing.expect(kg.ready);
+    if (!kg.ready) {
+        // Name the cause in the CI log: which step gave up, and why.
+        std.debug.print("squat test: not ready; launches={d} launch_error={?} degraded={?} detail={s}\n", .{
+            service.launches, service.last_error, kg.degradedKind(), kg.detail(),
+        });
+        return error.TestExpectedReady;
+    }
     try std.testing.expectEqual(@as(u32, 1), service.launches);
 
     var after = try cc.kg_client.KgClient.loadDaemonConfig(a, installed.config_path);
@@ -497,6 +512,40 @@ test "Kgd: a service of another state root on this install's port is never taken
     });
     defer stale.deinit();
     try std.testing.expectError(error.AuthenticationFailed, stale.run("store-info", &.{}, false));
+}
+
+test "Kgd: a service that cannot read its store fails to start without leaking" {
+    // The failure path autostart's launcher meets when tinykgd cannot serve the
+    // store: the supervisor must stop the bridge it moved into itself, read
+    // buffer included (std.testing.allocator reports the leak otherwise).
+    const a = std.testing.allocator;
+    const cli = tinykg_binary.find(a) orelse return error.SkipZigTest;
+    defer a.free(cli);
+    const daemon = daemonPath(a) orelse return error.SkipZigTest;
+    defer a.free(daemon);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buffer[0..try tmp.dir.realPath(std.testing.io, &root_buffer)];
+    // A directory that is not a store: tinykgd starts and answers store-info
+    // with a failure, so the bridge has read a response before start gives up.
+    const store = try std.fmt.allocPrint(a, "{s}/not-a-store.kg.v2", .{root});
+    defer a.free(store);
+    try tmp.dir.createDirPath(std.testing.io, "not-a-store.kg.v2");
+    const staging = try std.fmt.allocPrint(a, "{s}/kg/import", .{root});
+    defer a.free(staging);
+    const started = Supervisor.start(a, .{
+        .store_path = store,
+        .cli_path = cli,
+        .daemon_path = daemon,
+        .api_key = TEST_KEY,
+        .port = 0,
+        .staging_dir = staging,
+    });
+    if (started) |supervisor| {
+        supervisor.deinit();
+        return error.TestExpectedStartFailure;
+    } else |_| {}
 }
 
 test "Kgd: a client that connects and closes without a request does not stall the next" {
