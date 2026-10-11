@@ -7,6 +7,8 @@
 //!   pool by the judge, keeps the most probable candidate when none clears the
 //!   judge floor, and never consults the judge below the BM25 floor; a judge
 //!   that is down falls back to the BM25 floor byte for byte;
+//! - KgRecall: never consults the judge (its surface, recall_evidence, is
+//!   retired); with every surface advised its results are the plain ones;
 //! - KgRemember: advisory surfaces a contradiction the prefix test cannot see,
 //!   shadow journals the same judgment with an unchanged result, and the
 //!   memory is written either way;
@@ -262,7 +264,7 @@ test "L2 jev memory plane: scoped recall shadow keeps baseline bytes, advisory f
         defer srv.stop();
         const runtime = try startRuntime(a, io_runtime.io(), srv, .advisory);
         defer runtime.destroy(a);
-        runtime.advisor.surfaces = .initOne(.recall_evidence);
+        runtime.advisor.surfaces = .initOne(.memory_relation);
         var narrowed = try cc.kg_scoped_recall.buildWithReceipt(a, &kg, &conv, &ab, .{ .advisor = &runtime.advisor });
         defer narrowed.deinit(a);
         try expectSameInjection(baseline, narrowed);
@@ -491,13 +493,11 @@ fn runEnumerationTurn(
     const url = try provider_srv.urlOwned(a);
     defer a.free(url);
 
-    // The seed KgRecall is judged first (evidence over its two hits), then the
-    // tool-result boundary asks the enumeration question.
-    const evidence_body = try answersBody(a, &.{ .{ "c0", 0.90 }, .{ "c1", 0.88 }, .{ "sufficient", 0.30 } });
-    defer a.free(evidence_body);
+    // The seed KgRecall never consults the judge; the tool-result boundary
+    // asks the enumeration question.
     const judge_body = try answersBody(a, &.{.{ "needs_enumeration", 0.93 }});
     defer a.free(judge_body);
-    var judge_srv = try harness.MockServer.startCassette(&.{ evidence_body, judge_body }, 0);
+    var judge_srv = try harness.MockServer.startCassette(&.{judge_body}, 0);
     defer judge_srv.stop();
 
     var io_runtime = std.Io.Threaded.init(a, .{});
@@ -528,7 +528,7 @@ fn runEnumerationTurn(
         .project_dir = dir,
         .cwd_abs = dir,
     }, &backend, a);
-    try std.testing.expectEqual(@as(usize, 2), judge_srv.requestCount());
+    try std.testing.expectEqual(@as(usize, 1), judge_srv.requestCount());
     const after_seed = provider_srv.requestAt(1) orelse return error.NoRequestCaptured;
     return .{ .after_seed = try a.dupe(u8, after_seed.body()), .stop_reason = run_result.stop_reason, .turns = run_result.turns };
 }
@@ -553,7 +553,7 @@ test "L2 jev memory plane: enumeration judge arms only the soft reminder" {
         try std.testing.expect(std.mem.indexOf(u8, result.after_seed, "lexical-coverage-obligation") != null);
         try std.testing.expectEqual(cc.agent_loop.StopReason.end_turn, result.stop_reason);
         try std.testing.expectEqual(@as(u32, 2), result.turns);
-        try std.testing.expectEqual(@as(usize, 2), sink.count);
+        try std.testing.expectEqual(@as(usize, 1), sink.count);
         try std.testing.expectEqual(cc.tools.tool_observation.SystemOneDecision.enumeration_intent, sink.decision);
         try std.testing.expect(sink.actuated);
         try std.testing.expectEqual(@as(u32, 1), sink.positive);
@@ -565,41 +565,33 @@ test "L2 jev memory plane: enumeration judge arms only the soft reminder" {
         defer a.free(result.after_seed);
         try std.testing.expect(std.mem.indexOf(u8, result.after_seed, "lexical-coverage-obligation") == null);
         try std.testing.expectEqual(cc.agent_loop.StopReason.end_turn, result.stop_reason);
-        try std.testing.expectEqual(@as(usize, 2), sink.count);
+        try std.testing.expectEqual(@as(usize, 1), sink.count);
         try std.testing.expectEqual(cc.tools.tool_observation.SystemOneDecision.enumeration_intent, sink.decision);
         try std.testing.expect(!sink.actuated);
         try std.testing.expectEqual(@as(u32, 1), sink.positive);
     }
 }
 
-fn recallWithJudge(
+fn recallWith(
     a: std.mem.Allocator,
-    bin: []const u8,
-    dir: []const u8,
-    name: []const u8,
-    advisor: *cc.jev_advisor.Advisor,
+    kg: *KgClient,
+    advisor: ?*cc.jev_advisor.Advisor,
     sink: *DecisionSink,
-) !struct { output: []u8, ids: [2]u64 } {
-    const store = try std.fmt.allocPrint(a, "{s}/{s}.kg", .{ dir, name });
-    defer a.free(store);
-    var kg = try makeKg(a, bin, store, name);
-    defer kg.deinit();
-    kg.ensureReady();
-    if (!kg.ready) return error.SkipZigTest;
-    const first = try kg.remember(.observation, "quokka deploy uses a blue green switch behind the load balancer", "decision", false);
-    const second = try kg.remember(.observation, "quokka dashboard colors follow the brand palette", "observation", false);
+    args: []const u8,
+    ledger: ?*cc.kg_lexical_query_plan.Ledger,
+) ![]u8 {
     const ctx = cc.tool_context.ToolContext{
         .allocator = a,
-        .kg = &kg,
+        .kg = kg,
         .jev = advisor,
         .jev_request = "How does the quokka deploy switch traffic?",
         .tool_observer = sink.sink(),
+        .kg_lexical_ledger = ledger,
     };
-    const output = try cc.kg_tools.executeRecall(&ctx, "{\"query\":\"quokka deploy\"}");
-    return .{ .output = output, .ids = .{ first, second } };
+    return cc.kg_tools.executeRecall(&ctx, args);
 }
 
-test "L2 jev memory plane: KgRecall evidence annotation is advisory-only and journaled" {
+test "L2 jev memory plane: KgRecall never consults the judge" {
     const a = std.testing.allocator;
     const bin = tinykg_binary.find(a) orelse return error.SkipZigTest;
     defer a.free(bin);
@@ -608,71 +600,48 @@ test "L2 jev memory plane: KgRecall evidence annotation is advisory-only and jou
     var pbuf: [std.fs.max_path_bytes]u8 = undefined;
     const dir_len = try tmp.dir.realPath(std.testing.io, &pbuf);
     _ = harness.normalizeSlashes(pbuf[0..dir_len]);
-    const dir = pbuf[0..dir_len];
+    const store = try std.fmt.allocPrint(a, "{s}/jev-recall-retired.kg", .{pbuf[0..dir_len]});
+    defer a.free(store);
+    var kg = try makeKg(a, bin, store, "jev-recall-retired");
+    defer kg.deinit();
+    kg.ensureReady();
+    if (!kg.ready) return error.SkipZigTest;
+    _ = try kg.remember(.observation, "quokka deploy uses a blue green switch behind the load balancer", "decision", false);
+    _ = try kg.remember(.observation, "quokka deploy dashboard colors follow the brand palette", "observation", false);
 
     var io_runtime = std.Io.Threaded.init(a, .{});
     defer io_runtime.deinit();
-    const body = try answersBody(a, &.{ .{ "c0", 0.91 }, .{ "c1", 0.07 }, .{ "sufficient", 0.84 } });
+    const body = try answersBody(a, &.{ .{ "c0", 0.05 }, .{ "c1", 0.95 } });
     defer a.free(body);
+    var srv = try harness.MockServer.start(body, 0);
+    defer srv.stop();
+    const runtime = try startRuntime(a, io_runtime.io(), srv, .advisory);
+    defer runtime.destroy(a);
+    try std.testing.expect(runtime.advisor.surfaces.eql(.initFull()));
 
-    // Advisory: the envelope carries per-node relevance and sufficiency.
-    {
-        var srv = try harness.MockServer.start(body, 0);
-        defer srv.stop();
-        const runtime = try startRuntime(a, io_runtime.io(), srv, .advisory);
-        defer runtime.destroy(a);
+    // A bare query, a governed v3 seed (one variant) and a v3 semantic batch:
+    // with every surface advised, each result is the one without an advisor.
+    const calls = [_][]const u8{
+        "{\"query\":\"quokka deploy\"}",
+        \\{"query":"quokka deploy","lexical_plan":{"schema_version":"lexical-query-plan-v3","intent":"fact_lookup","stage":"seed","variants":[{"kind":"exact","text":"quokka deploy"}]}}
+        ,
+        \\{"query":"zebra","lexical_plan":{"schema_version":"lexical-query-plan-v3","intent":"fact_lookup","stage":"semantic_expansion","variants":[{"kind":"synonym","text":"quokka deploy"},{"kind":"mechanism","text":"quokka brand palette"}]}}
+        ,
+    };
+    for (calls) |args| {
+        var plain_ledger = cc.kg_lexical_query_plan.Ledger{};
+        var plain_sink: DecisionSink = .{};
+        const plain = try recallWith(a, &kg, null, &plain_sink, args, &plain_ledger);
+        defer a.free(plain);
+        try std.testing.expect(std.mem.indexOf(u8, plain, "{\"node_id\":") != null);
+        var ledger = cc.kg_lexical_query_plan.Ledger{};
         var sink: DecisionSink = .{};
-        const result = try recallWithJudge(a, bin, dir, "jev-recall-advisory", &runtime.advisor, &sink);
-        defer a.free(result.output);
-        var parsed = try std.json.parseFromSlice(std.json.Value, a, result.output, .{});
-        defer parsed.deinit();
-        const block = parsed.value.object.get("system_one") orelse return error.MissingEvidenceBlock;
-        try std.testing.expectEqualStrings("metacodes.jev.recall-evidence.v2", block.object.get("question_set").?.string);
-        try std.testing.expectEqual(@as(i64, 84), block.object.get("sufficient").?.integer);
-        const relevance = block.object.get("relevance").?.array.items;
-        try std.testing.expectEqual(@as(usize, 2), relevance.len);
-        // Relevance is keyed by the node ids the hits array exposed, in rank order.
-        const hits = parsed.value.object.get("hits").?.array.items;
-        try std.testing.expectEqual(hits[0].object.get("node_id").?.integer, relevance[0].object.get("node_id").?.integer);
-        try std.testing.expectEqual(@as(i64, 91), relevance[0].object.get("percent").?.integer);
-        try std.testing.expectEqual(@as(i64, 7), relevance[1].object.get("percent").?.integer);
-        try std.testing.expect(sink.actuated);
-        try std.testing.expectEqual(@as(u32, 2), sink.judged);
-        try std.testing.expectEqual(@as(u32, 1), sink.positive);
-        // The judge saw the tool query first and the run's user request after it.
-        const sent = (srv.lastRequest() orelse return error.NoRequestCaptured).body();
-        try std.testing.expect(std.mem.indexOf(u8, sent, "request: recall query: quokka deploy\\nuser request: How does the quokka deploy") != null);
-        try std.testing.expect(std.mem.indexOf(u8, sent, "\"sufficient\":{\"type\":\"boolean\"") != null);
-    }
-    // Shadow: same judgment journaled, envelope untouched.
-    {
-        var srv = try harness.MockServer.start(body, 0);
-        defer srv.stop();
-        const runtime = try startRuntime(a, io_runtime.io(), srv, .shadow);
-        defer runtime.destroy(a);
-        var sink: DecisionSink = .{};
-        const result = try recallWithJudge(a, bin, dir, "jev-recall-shadow", &runtime.advisor, &sink);
-        defer a.free(result.output);
-        try std.testing.expect(std.mem.indexOf(u8, result.output, "\"system_one\"") == null);
-        try std.testing.expectEqual(@as(usize, 1), sink.count);
-        try std.testing.expect(!sink.actuated);
-        try std.testing.expectEqual(@as(u32, 2), sink.judged);
-    }
-    // METACODES_JEV_DECISIONS without recall_evidence: KgRecall behaves as if
-    // no advisor were installed — no request, no journal entry, no block.
-    {
-        var srv = try harness.MockServer.start(body, 0);
-        defer srv.stop();
-        const runtime = try startRuntime(a, io_runtime.io(), srv, .advisory);
-        defer runtime.destroy(a);
-        runtime.advisor.surfaces = .initOne(.scoped_recall);
-        var sink: DecisionSink = .{};
-        const result = try recallWithJudge(a, bin, dir, "jev-recall-narrowed", &runtime.advisor, &sink);
-        defer a.free(result.output);
-        try std.testing.expect(std.mem.indexOf(u8, result.output, "\"system_one\"") == null);
+        const advised = try recallWith(a, &kg, &runtime.advisor, &sink, args, &ledger);
+        defer a.free(advised);
+        try std.testing.expectEqualStrings(plain, advised);
         try std.testing.expectEqual(@as(usize, 0), sink.count);
-        try std.testing.expectEqual(@as(usize, 0), srv.requestCount());
     }
+    try std.testing.expectEqual(@as(usize, 0), srv.requestCount());
 }
 
 test "L2 jev memory plane: the relation judge asks two questions per existing memory, up to three" {
