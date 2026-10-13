@@ -1354,13 +1354,15 @@ fn hostRoot() []const u8 {
 
 const install_usage =
     \\usage: metacodes install --prefix <dir> [--state-dir <dir>] [--sdk <agentcore-bundle-dir>]
-    \\                         [--link <bin-dir> [--link-name <name>]] [--upgrade] [--force]
+    \\                         [--link <bin-dir> [--link-name <name>]] [--upgrade]
+    \\                         [--allow-downgrade] [--force]
     \\
     \\Installs the release unit this executable belongs to at <dir> as one isolated
     \\install: its own state root (default <dir>/state), kernels, TinyKG and, with
     \\--sdk, the AgentCore SDK under <dir>/sdk/agentcore. --link writes a launcher
     \\into a directory on PATH. Ends with the installed `doctor --strict`.
-    \\--upgrade replaces another version of this product's install (state kept);
+    \\--upgrade replaces another version of this product's install (state kept),
+    \\but never a newer one with an older one unless --allow-downgrade;
     \\--force also replaces foreign files and an existing launcher.
     \\
 ;
@@ -1390,6 +1392,8 @@ fn runInstall(args: *std.process.Args.Iterator, allocator: std.mem.Allocator, io
             options.link_name = allocator.dupe(u8, value_of.get(args, arg) orelse return 2) catch return 1;
         } else if (std.mem.eql(u8, arg, "--upgrade")) {
             options.upgrade = true;
+        } else if (std.mem.eql(u8, arg, "--allow-downgrade")) {
+            options.allow_downgrade = true;
         } else if (std.mem.eql(u8, arg, "--force")) {
             options.force = true;
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
@@ -1422,9 +1426,11 @@ fn runInstall(args: *std.process.Args.Iterator, allocator: std.mem.Allocator, io
             error.UnsupportedManifest => "the unit's manifest.json is not a metacodes-cli schema 2 release manifest",
             error.PrefixOccupied => "the prefix holds files that are not a metacodes install; choose another or pass --force",
             error.DifferentVersionInstalled => "another metacodes version is installed there; pass --upgrade to replace it (its state is kept), or choose another prefix",
+            error.NewerVersionInstalled => "a newer metacodes version is installed there (above); pass --allow-downgrade to replace it with this older one (install.sh --allow-downgrade, install.ps1 -AllowDowngrade), or choose another prefix",
             error.DigestMismatch => "a file does not match the release manifest; the unit is damaged",
             error.InvalidSdkBundle => "--sdk must name an unpacked AgentCore bundle (its manifest.json says \"agentcore\")",
             error.LinkOccupied => "the launcher name is taken by something else; pass --link-name or --force",
+            error.LinkOwnedByAnotherInstall => "that launcher belongs to another metacodes install (above). Update that install instead (a development install: scripts/install.sh --dev from its checkout; a release: --prefix <its prefix>), install this one beside it with --link-name <another name>, or pass --force to point the launcher here",
             error.SelfCheckFailed => "the installed executable's `doctor --strict` failed (output above)",
             else => "",
         };

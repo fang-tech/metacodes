@@ -39,6 +39,22 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- The installer no longer downgrades an install silently. `scripts/install.sh`
+  passes `--upgrade` on every run and fetches whatever GitHub labels the latest
+  release, and `metacodes install --upgrade` replaced any other version, so a
+  rerun moved an install backwards whenever that label pointed at an older
+  version. An older unit now replaces a newer install only with
+  `--allow-downgrade` (`install.sh --allow-downgrade`, `install.ps1
+  -AllowDowngrade`) or `--force`, and an allowed downgrade says so. The unit
+  being installed makes the check, so it protects against units from the next
+  release on: releases up to 0.5.0 still replace a newer install without
+  asking, and do not know `--allow-downgrade`.
+- A launcher name held by another metacodes install is reported as such:
+  `install failed (LinkOwnedByAnotherInstall)` names that launcher's install
+  prefix and version, and says how to update it, install side by side or take
+  the name over. Before, a release install over a development install's
+  `metacodes` launcher failed with a bare "the launcher name is taken". This
+  install's own launcher in an older form is now replaced instead of refused.
 - `zig build test` no longer leaves TinyKG services running. A session that
   needs TinyKG starts its install's service, which outlives the session on
   purpose, and three test entry points ran the real binary in a throwaway

@@ -81,11 +81,20 @@ process-global resolution.
 ## 4. Installer
 
 `bin/metacodes install --prefix <dir> [--state-dir <dir>] [--sdk <bundle>]
-[--link <dir> [--link-name <name>]] [--upgrade] [--force]` (src/app/install.zig),
+[--link <dir> [--link-name <name>]] [--upgrade] [--allow-downgrade] [--force]`
+(src/app/install.zig),
 run from an extracted release unit or one staged from source (`release:verify`):
 
 1. refuses a prefix that holds anything but this product's install unless
    `--force`, and another version of it unless `--upgrade` (or `--force`);
+   `--upgrade` never replaces a newer version with an older one (semantic
+   version order, pre-releases before their release, build metadata ignored)
+   unless `--allow-downgrade` (or `--force`), so the installer's "latest
+   release" path cannot move an install backwards when GitHub's Latest label
+   points at an older version. The unit being installed makes this check, so
+   it holds for units that carry it: releases up to 0.5.0 predate it, replace
+   a newer install as before and reject `--allow-downgrade` as an unknown
+   option;
    refuses a bad `--sdk` bundle and a taken launcher name (step 5) before it
    writes anything; writes only under `<prefix>`, the state root and the
    `--link` directory;
@@ -102,8 +111,10 @@ run from an extracted release unit or one staged from source (`release:verify`):
    each file verified against that bundle's manifest;
 5. with `--link`, writes a launcher script (POSIX `sh`, Windows `.cmd`) that
    `exec`s the installed executable. The name must be free or hold this
-   install's own launcher; a symlink is never written through, and anything
-   else needs `--force`;
+   install's own launcher (in any form `metacodes install` wrote); a symlink
+   is never written through, and anything else needs `--force`. A name held
+   by another metacodes install is refused with that install's prefix and
+   version, so the user can update it, pick another `--link-name`, or force;
 6. runs the installed `bin/metacodes doctor --strict` in an empty environment
    (POSIX) and requires every runtime asset adjacent and the state root to come
    from the install record.

@@ -67,8 +67,10 @@ AgentCore SDK under `<prefix>/sdk/agentcore/` (`include/metask/agentcore.h`,
 `lib/`, Zig and Rust bindings). The scripts only unpack; the install is
 `bin/metacodes install` (`--help` lists its options), which ends with the
 installed `doctor --strict`; `--upgrade` replaces another version of the same
-product (the scripts always pass it), `--force` also foreign files and another
-launcher. A process picks its state root from `--state-dir`,
+product (the scripts always pass it) but not a newer one with an older one
+unless `--allow-downgrade`, `--force` also foreign files and another launcher.
+A launcher name held by another install is refused with that install's prefix
+and version. A process picks its state root from `--state-dir`,
 then `METACODES_HOME`, then the install record, then `~/.metacodes`
 ([doc/INSTALL_DESIGN.md](doc/INSTALL_DESIGN.md)).
 

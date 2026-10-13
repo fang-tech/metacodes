@@ -15,7 +15,11 @@
 //! directory. A prefix that holds anything but this product's own install is
 //! refused unless `--force`; reinstalling the same version over itself is
 //! allowed, and `--upgrade` replaces another version of this product's install
-//! (and nothing else). Replacing a version removes the files the previous
+//! (and nothing else) — never with an older one unless `--allow-downgrade`, so
+//! an installer that fetches "the latest release" cannot move an install
+//! backwards when that label points at an older version. A launcher name held
+//! by another metacodes install is reported with that install's prefix and
+//! version. Replacing a version removes the files the previous
 //! unit's manifest listed and the new one does not; the state root is never
 //! touched. Install logic lives here, once, for every platform:
 //! scripts/install.sh and scripts/install.ps1 only unpack an archive and call
@@ -38,6 +42,9 @@ pub const Options = struct {
     /// never overrides foreign files or someone else's launcher, so an
     /// unattended installer (`curl … | sh`) can pass it on every run.
     upgrade: bool = false,
+    /// Let `upgrade` replace a newer version with an older one. Off by default:
+    /// the unattended "latest release" path must never downgrade an install.
+    allow_downgrade: bool = false,
     /// An unpacked AgentCore SDK bundle (its `manifest.json` names `agentcore`).
     sdk: ?[]const u8 = null,
     /// Directory on PATH that receives a launcher for this install.
@@ -55,9 +62,11 @@ pub const Error = error{
     StateDirNotAbsolute,
     PrefixOccupied,
     DifferentVersionInstalled,
+    NewerVersionInstalled,
     DigestMismatch,
     InvalidSdkBundle,
     LinkOccupied,
+    LinkOwnedByAnotherInstall,
     SelfCheckFailed,
     PathTooLong,
 };
@@ -113,7 +122,11 @@ pub fn run(arena: std.mem.Allocator, io: std.Io, source_root: []const u8, option
 
     const cwd = std.Io.Dir.cwd();
     const in_place = samePath(io, source_root, options.prefix);
-    if (!in_place) try checkPrefix(arena, io, options.prefix, version, options.force or options.upgrade, options.force);
+    if (!in_place) try checkPrefix(arena, io, options.prefix, version, .{
+        .replace_version = options.force or options.upgrade,
+        .allow_downgrade = options.allow_downgrade,
+        .force = options.force,
+    }, log);
     // What the install being replaced shipped, to remove what this one drops.
     const previous: ?UnitManifest = if (in_place) null else readUnitManifest(arena, io, options.prefix) catch null;
     // Refuse a bad SDK before anything is written.
@@ -141,7 +154,7 @@ pub fn run(arena: std.mem.Allocator, io: std.Io, source_root: []const u8, option
     // A launcher name that is taken is refused before any file is written,
     // like a bad SDK: a refusal must not leave a half-replaced install.
     const launcher: ?Launcher = if (options.link_dir) |dir|
-        planLauncher(arena, io, dir, options.link_name, executable, options.force) catch |err| {
+        planLauncher(arena, io, dir, options.link_name, executable, options.force, log) catch |err| {
             if (created_prefix) cwd.deleteDir(io, prefix) catch {};
             return err;
         }
@@ -215,10 +228,14 @@ fn readUnitManifest(arena: std.mem.Allocator, io: std.Io, root: []const u8) !Uni
     return manifest;
 }
 
+const Replace = struct { replace_version: bool, allow_downgrade: bool, force: bool };
+
 /// A destination is empty, absent, or this product's install of the same
-/// version; another version needs `--upgrade` (or `--force`), anything else
+/// version; another version needs `--upgrade` (or `--force`), an older one
+/// than installed also `--allow-downgrade` (or `--force`), anything else
 /// `--force`.
-fn checkPrefix(arena: std.mem.Allocator, io: std.Io, prefix: []const u8, version: []const u8, replace_version: bool, force: bool) !void {
+fn checkPrefix(arena: std.mem.Allocator, io: std.Io, prefix: []const u8, version: []const u8, replace: Replace, log: *std.Io.Writer) !void {
+    const force = replace.force;
     const cwd = std.Io.Dir.cwd();
     var dir = cwd.openDir(io, prefix, .{ .iterate = true }) catch |err| switch (err) {
         error.FileNotFound => return,
@@ -236,7 +253,32 @@ fn checkPrefix(arena: std.mem.Allocator, io: std.Io, prefix: []const u8, version
     const record = std.json.parseFromSliceLeaky(InstallRecord, arena, bytes, .{ .ignore_unknown_fields = true }) catch
         return if (force) {} else error.PrefixOccupied;
     if (!std.mem.eql(u8, record.schema_version, state_root.manifest_schema)) return if (force) {} else error.PrefixOccupied;
-    if (!std.mem.eql(u8, record.version, version) and !replace_version) return error.DifferentVersionInstalled;
+    if (std.mem.eql(u8, record.version, version)) return;
+    if (!replace.replace_version) return error.DifferentVersionInstalled;
+    if (!isOlder(version, record.version)) return;
+    if (!force and !replace.allow_downgrade) {
+        try log.print("{s} holds metacodes {s}, newer than {s}\n", .{ prefix, record.version, version });
+        return error.NewerVersionInstalled;
+    }
+    try log.print("replacing metacodes {s} with the older {s}\n", .{ record.version, version });
+}
+
+/// `candidate` precedes `installed` in semantic-version order (pre-releases
+/// before their release, build metadata ignored). Versions that do not parse
+/// have no order, and nothing is called a downgrade.
+fn isOlder(candidate: []const u8, installed: []const u8) bool {
+    const a = std.SemanticVersion.parse(candidate) catch return false;
+    const b = std.SemanticVersion.parse(installed) catch return false;
+    return a.order(b) == .lt;
+}
+
+/// The version an install's record names, or null without a readable record.
+fn recordedVersion(arena: std.mem.Allocator, io: std.Io, prefix: []const u8) ?[]const u8 {
+    const record_path = std.fs.path.join(arena, &.{ prefix, install_manifest_rel }) catch return null;
+    const bytes = std.Io.Dir.cwd().readFileAlloc(io, record_path, arena, .limited(64 << 10)) catch return null;
+    const record = std.json.parseFromSliceLeaky(InstallRecord, arena, bytes, .{ .ignore_unknown_fields = true }) catch return null;
+    if (!std.mem.eql(u8, record.schema_version, state_root.manifest_schema) or record.version.len == 0) return null;
+    return record.version;
 }
 
 /// The state root this prefix's install record names, when it holds a valid
@@ -312,8 +354,10 @@ const Launcher = struct {
 /// A launcher, not a symlink: the executable finds its kernels, TinyKG and
 /// install.json beside its own physical path either way, but a script keeps
 /// working when the directory it sits in is copied or synced. Decides without
-/// writing whether the name is free: absent, or this install's own launcher.
-fn planLauncher(arena: std.mem.Allocator, io: std.Io, dir: []const u8, name: []const u8, executable: []const u8, force: bool) !Launcher {
+/// writing whether the name is free: absent, or this install's own launcher
+/// (byte for byte, or one `metacodes install` wrote for this executable in
+/// another form). Another metacodes install's launcher is named in `log`.
+fn planLauncher(arena: std.mem.Allocator, io: std.Io, dir: []const u8, name: []const u8, executable: []const u8, force: bool, log: *std.Io.Writer) !Launcher {
     if (name.len == 0 or std.mem.indexOfAny(u8, name, "/\\") != null) return error.LinkOccupied;
     const file_name = if (is_windows) try std.fmt.allocPrint(arena, "{s}.cmd", .{name}) else name;
     const path = try std.fs.path.join(arena, &.{ dir, file_name });
@@ -327,7 +371,21 @@ fn planLauncher(arena: std.mem.Allocator, io: std.Io, dir: []const u8, name: []c
         return .{ .dir = dir, .path = path, .body = body, .replace_symlink = true };
     }
     if (std.Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(64 << 10))) |existing| {
-        if (!std.mem.eql(u8, existing, body) and !force) return error.LinkOccupied;
+        if (!std.mem.eql(u8, existing, body) and !force) {
+            const target = (try launcherTarget(arena, existing)) orelse return error.LinkOccupied;
+            const target_bin = std.fs.path.dirname(target) orelse return error.LinkOccupied;
+            const own_bin = std.fs.path.dirname(executable) orelse return error.LinkOccupied;
+            // This install's own launcher, written in another form: replace it.
+            if (!samePath(io, target_bin, own_bin)) {
+                const other_prefix = std.fs.path.dirname(target_bin) orelse target_bin;
+                if (recordedVersion(arena, io, other_prefix)) |other_version| {
+                    try log.print("{s} runs the metacodes {s} install at {s}\n", .{ path, other_version, other_prefix });
+                } else {
+                    try log.print("{s} runs {s}, which has no metacodes install record (removed?)\n", .{ path, target });
+                }
+                return error.LinkOwnedByAnotherInstall;
+            }
+        }
     } else |err| switch (err) {
         error.FileNotFound => {},
         // Something large sits there (a binary, not a launcher).
@@ -347,6 +405,38 @@ fn writeLauncher(arena: std.mem.Allocator, io: std.Io, plan: Launcher, log: *std
     if (!is_windows) _ = pfs.chmod(path_z.ptr, 0o755);
     try log.print("launcher: {s}\n", .{plan.path});
     return plan.path;
+}
+
+/// The executable a launcher written by `launcherBody` runs, or null when
+/// `body` is anything else (another script, a binary).
+fn launcherTarget(arena: std.mem.Allocator, body: []const u8) !?[]const u8 {
+    var target: std.ArrayList(u8) = .empty;
+    if (is_windows) {
+        if (!std.mem.startsWith(u8, body, "@\"")) return null;
+        const end = std.mem.lastIndexOf(u8, body, "\" %*") orelse return null;
+        if (end < 2) return null;
+        var i: usize = 2;
+        while (i < end) : (i += 1) {
+            try target.append(arena, body[i]);
+            if (body[i] == '%' and i + 1 < end and body[i + 1] == '%') i += 1;
+        }
+        return target.items;
+    }
+    if (std.mem.indexOf(u8, body, "\n# metacodes launcher written by `metacodes install`\n") == null) return null;
+    const start = (std.mem.indexOf(u8, body, "\nexec '") orelse return null) + "\nexec '".len;
+    var i = start;
+    while (true) {
+        const close = std.mem.indexOfScalarPos(u8, body, i, '\'') orelse return null;
+        try target.appendSlice(arena, body[i..close]);
+        // `'\''` is a closed quote, an escaped quote, and a reopened one.
+        if (std.mem.startsWith(u8, body[close..], "'\\''")) {
+            try target.append(arena, '\'');
+            i = close + 4;
+            continue;
+        }
+        break;
+    }
+    return target.items;
 }
 
 /// The launcher script for `executable`, quoted so that no character of the
@@ -789,4 +879,115 @@ test "the doctor state_root line parses paths with spaces" {
     try testing.expectEqualStrings("/a b/state", line.path);
     try testing.expectEqualStrings("install", line.source);
     try testing.expect(parseStateRootLine("ripgrep /x\n") == null);
+}
+
+test "upgrade never moves an install to an older version unless asked" {
+    if (is_windows) return error.SkipZigTest;
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var fixture: Fixture = .{ .tmp = undefined };
+    try fixture.init();
+    defer fixture.tmp.cleanup();
+    var log: std.Io.Writer.Allocating = .init(arena);
+    const prefix = try fixture.path(arena, "opt/mc");
+    _ = try run(arena, testing.io, try fixture.unit(arena, "0.4.0", &unit_files), .{ .prefix = prefix, .self_check = false }, &log.writer);
+    try fixture.tmp.dir.deleteTree(testing.io, "unit");
+    const older = try fixture.unit(arena, "0.3.9", &.{.{ "bin/metacodes", "exe 0.3.9" }});
+
+    // What an unattended "latest release" rerun does: refused, nothing replaced.
+    log.clearRetainingCapacity();
+    try testing.expectError(error.NewerVersionInstalled, run(arena, testing.io, older, .{ .prefix = prefix, .upgrade = true, .self_check = false }, &log.writer));
+    try testing.expect(std.mem.indexOf(u8, log.written(), "holds metacodes 0.4.0, newer than 0.3.9") != null);
+    try testing.expectEqualStrings("exe", try read(arena, try std.fs.path.join(arena, &.{ prefix, "bin", "metacodes" })));
+    try testing.expect(std.mem.indexOf(u8, try read(arena, try fixture.path(arena, "opt/mc/etc/metacodes/install.json")), "0.4.0") != null);
+
+    // Asked for: replaced, and said so.
+    log.clearRetainingCapacity();
+    const outcome = try run(arena, testing.io, older, .{ .prefix = prefix, .upgrade = true, .allow_downgrade = true, .self_check = false }, &log.writer);
+    try testing.expectEqualStrings("0.3.9", outcome.version);
+    try testing.expect(std.mem.indexOf(u8, log.written(), "replacing metacodes 0.4.0 with the older 0.3.9") != null);
+    try testing.expectEqualStrings("exe 0.3.9", try read(arena, try std.fs.path.join(arena, &.{ prefix, "bin", "metacodes" })));
+
+    // A newer version upgrades without asking; --force replaces either way.
+    try fixture.tmp.dir.deleteTree(testing.io, "unit");
+    const newer = try fixture.unit(arena, "0.4.1", &unit_files);
+    _ = try run(arena, testing.io, newer, .{ .prefix = prefix, .upgrade = true, .self_check = false }, &log.writer);
+    try fixture.tmp.dir.deleteTree(testing.io, "unit");
+    _ = try run(arena, testing.io, try fixture.unit(arena, "0.3.9", &unit_files), .{ .prefix = prefix, .force = true, .self_check = false }, &log.writer);
+}
+
+test "version order: pre-releases, build metadata and unparseable versions" {
+    // The release is newer than the development builds before it, older than those after.
+    try testing.expect(isOlder("0.3.1", "0.3.2-dev+5d9bef266f95"));
+    try testing.expect(isOlder("0.3.2-dev+5d9bef266f95", "0.3.2"));
+    try testing.expect(isOlder("0.2.2-dev+210d57de39ab.dirty", "0.3.1"));
+    try testing.expect(!isOlder("0.3.2-dev+aaaa", "0.2.2-dev+210d57de39ab.dirty"));
+    // Builds of the same version differ only in metadata: no order, no downgrade.
+    try testing.expect(!isOlder("0.3.2-dev+aaaa", "0.3.2-dev+bbbb.dirty"));
+    try testing.expect(!isOlder("0.3.1", "0.3.1"));
+    // A version that does not parse is never called older (old behavior).
+    try testing.expect(!isOlder("nightly", "0.3.1"));
+    try testing.expect(!isOlder("0.3.1", "nightly"));
+}
+
+test "launcherTarget reads back what launcherBody writes, and nothing else" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const paths: []const []const u8 = if (is_windows)
+        &.{ "C:\\Users\\a b\\opt\\mc\\bin\\metacodes.exe", "C:\\100%\\done%%\\bin\\metacodes.exe" }
+    else
+        &.{ "/opt/mc/bin/metacodes", "/home/u/it's $HOME `x`/bin/metacodes", "/a''b/bin/metacodes" };
+    for (paths) |path| {
+        const body = try launcherBody(arena, path);
+        try testing.expectEqualStrings(path, (try launcherTarget(arena, body)).?);
+    }
+    try testing.expect(try launcherTarget(arena, "#!/bin/sh\nexec /elsewhere/bin/metacodes \"$@\"\n") == null);
+    try testing.expect(try launcherTarget(arena, "\x7fELF\x02\x01\x01") == null);
+    try testing.expect(try launcherTarget(arena, "") == null);
+}
+
+test "a launcher held by another metacodes install is named; this install's own in another form is replaced" {
+    if (is_windows) return error.SkipZigTest;
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var fixture: Fixture = .{ .tmp = undefined };
+    try fixture.init();
+    defer fixture.tmp.cleanup();
+    var log: std.Io.Writer.Allocating = .init(arena);
+    const bin_dir = try fixture.path(arena, "local/bin");
+    const dev_prefix = try fixture.path(arena, "opt/metacodes-dev");
+    const release_prefix = try fixture.path(arena, "opt/metacodes");
+
+    // A development install owns the `metacodes` launcher (the layout a
+    // `--dev --link-name metacodes` install leaves).
+    const dev = try run(arena, testing.io, try fixture.unit(arena, "0.2.2-dev+210d57de39ab", &unit_files), .{ .prefix = dev_prefix, .link_dir = bin_dir, .self_check = false }, &log.writer);
+    try fixture.tmp.dir.deleteTree(testing.io, "unit");
+    const release = try fixture.unit(arena, "0.3.1", &unit_files);
+
+    log.clearRetainingCapacity();
+    try testing.expectError(error.LinkOwnedByAnotherInstall, run(arena, testing.io, release, .{ .prefix = release_prefix, .link_dir = bin_dir, .upgrade = true, .self_check = false }, &log.writer));
+    const expected = try std.fmt.allocPrint(arena, "{s} runs the metacodes 0.2.2-dev+210d57de39ab install at {s}\n", .{ dev.launcher.?, dev.prefix });
+    try testing.expect(std.mem.indexOf(u8, log.written(), expected) != null);
+    try testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(testing.io, release_prefix, .{}));
+    // Side by side under another name works.
+    _ = try run(arena, testing.io, release, .{ .prefix = release_prefix, .link_dir = bin_dir, .link_name = "metacodes-release", .self_check = false }, &log.writer);
+
+    // The dev install's own launcher, written in an older form, is not "taken".
+    const older_form = try std.fmt.allocPrint(arena, "#!/bin/sh\n# metacodes launcher written by `metacodes install`\n# (an older form)\nexec '{s}' \"$@\"\n", .{dev.executable});
+    try fixture.tmp.dir.writeFile(testing.io, .{ .sub_path = "local/bin/metacodes", .data = older_form });
+    try fixture.tmp.dir.deleteTree(testing.io, "unit");
+    const dev_again = try run(arena, testing.io, try fixture.unit(arena, "0.3.2-dev+aaaa", &unit_files), .{ .prefix = dev_prefix, .link_dir = bin_dir, .upgrade = true, .self_check = false }, &log.writer);
+    try testing.expectEqualStrings(try launcherBody(arena, dev_again.executable), try read(arena, dev_again.launcher.?));
+
+    // A launcher whose install is gone is still not overwritten silently.
+    try std.Io.Dir.cwd().deleteTree(testing.io, dev_prefix);
+    try fixture.tmp.dir.deleteTree(testing.io, "unit");
+    const release_again = try fixture.unit(arena, "0.3.1", &unit_files);
+    log.clearRetainingCapacity();
+    try testing.expectError(error.LinkOwnedByAnotherInstall, run(arena, testing.io, release_again, .{ .prefix = release_prefix, .link_dir = bin_dir, .self_check = false }, &log.writer));
+    try testing.expect(std.mem.indexOf(u8, log.written(), "has no metacodes install record") != null);
+    _ = try run(arena, testing.io, release_again, .{ .prefix = release_prefix, .link_dir = bin_dir, .force = true, .self_check = false }, &log.writer);
 }
