@@ -247,12 +247,14 @@ fn mkdirP(path: []const u8) !void {
 }
 
 fn worktreeExists(allocator: std.mem.Allocator, path: []const u8) bool {
-    // 简单 stat:目录存在即认为是 worktree(更严格的方法是 git worktree list 然后匹配)
+    // 目录存在即认为是 worktree(更严格的方法是 git worktree list 然后匹配)。按目录打开:
+    // 以文件方式 open 一个目录在 Windows 上总是失败(EnterWorktree path= 在那里从来进不去),
+    // 而一个普通文件也不是 worktree。
     const path_z = allocator.dupeZ(u8, path) catch return false;
     defer allocator.free(path_z);
-    const fd = pfs.open(path_z, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
-    if (fd < 0) return false;
-    _ = pfs.close(fd);
+    const pdir = @import("platform").dir;
+    var iterator = pdir.open(path_z.ptr) orelse return false;
+    pdir.close(&iterator);
     return true;
 }
 
@@ -324,4 +326,16 @@ test "EnterWorktree: a host without the hooks is refused before the process move
     const after = try getCwd(testing.allocator);
     defer testing.allocator.free(after);
     try testing.expectEqualStrings(before, after);
+}
+
+test "EnterWorktree: an existing directory is found on every platform, a file is not a worktree" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const len = try tmp.dir.realPath(testing.io, &buf);
+    try testing.expect(worktreeExists(testing.allocator, buf[0..len]));
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "plain.txt", .data = "x" });
+    const file = try std.fs.path.join(testing.allocator, &.{ buf[0..len], "plain.txt" });
+    defer testing.allocator.free(file);
+    try testing.expect(!worktreeExists(testing.allocator, file));
 }
