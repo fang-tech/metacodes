@@ -21,6 +21,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 from scripts.eval.workbuddy.mock_provider import READY_DEADLINE_S  # noqa: E402
+from scripts.eval.kgd_processes import stop_kgd_under  # noqa: E402
 
 ARMS = ("codex_style", "claude_style", "tinykg")
 KG_TOOL_MARKERS = ("\n----- KgRemember -----\n", "\n----- KgRecall -----\n")
@@ -72,6 +73,10 @@ def _headless_protocol_smoke(binary: Path) -> None:
                 "HOME": str(home),
                 "USERPROFILE": str(home),
                 "METACODES_NO_PROBE": "1",
+                # The session would start a TinyKG service in this throwaway
+                # HOME, and the service outlives the run on purpose; this smoke
+                # does not use KG (scripts/eval/kgd_processes.py).
+                "METACODES_KG_AUTOSTART": "0",
             }
         )
         try:
@@ -108,6 +113,8 @@ def _headless_protocol_smoke(binary: Path) -> None:
             except subprocess.TimeoutExpired:
                 provider.kill()
                 provider.wait(timeout=2)
+            leaked = stop_kgd_under(root)
+        _require(not leaked, f"headless protocol left TinyKG services running under its temporary HOME: {leaked}")
 
         requests = request_log.read_text(encoding="utf-8").splitlines()
         _require(

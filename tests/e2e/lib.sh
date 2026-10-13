@@ -110,6 +110,51 @@ setup_fake_home() {
 }
 
 # ============================================================================
+# Stop the TinyKG services (`metacodes --state-dir <dir> kgd [--config <path>]`)
+# whose state root lies under <home>: SIGTERM, then SIGKILL after five
+# seconds. Reports on stdout what it stopped (callers redirect it). Needs `ps`;
+# without it, or on a platform whose `ps` lacks these options, it does nothing.
+# ============================================================================
+stop_scenario_kgd() {
+  local home="$1" physical pids i
+  [[ -n "$home" && -d "$home" ]] || return 0
+  physical="$(cd "$home" 2>/dev/null && pwd -P)" || physical=""
+  # Never an empty spelling: " --state-dir /" would match every service.
+  [[ -n "$physical" ]] || physical="$home"
+  # The paths travel through the environment, so awk's own command line
+  # never contains them and no escape in a path is interpreted. They are
+  # exported inside the substitution: a `VAR=x ps | awk` prefix reaches only
+  # `ps`, and an empty needle would match every service on the machine.
+  pids="$(
+    export KGD_HOME=" --state-dir $home/" KGD_PHYSICAL=" --state-dir $physical/"
+    # `-ww`: unlimited width on both procps and BSD ps, so a long path is
+    # never cut. `kgd` follows the state root but need not be the last word:
+    # autostart appends `--config <path>` for a METACODES_KG_CONFIG file.
+    ps -A -ww -o pid= -o command= 2>/dev/null |
+      awk 'function follows(needle,  at) {
+             at = index(line, needle)
+             return at && index(substr(line, at + length(needle) - 1), " kgd ")
+           }
+           ENVIRON["KGD_HOME"] != "" {
+             line = $0 " "
+             if (follows(ENVIRON["KGD_HOME"]) || follows(ENVIRON["KGD_PHYSICAL"])) print $1
+           }' |
+      tr '\n' ' '
+  )" || return 0
+  [[ -n "${pids// /}" ]] || return 0
+  # shellcheck disable=SC2086 # one pid per word
+  kill -TERM $pids 2>/dev/null || true
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    # shellcheck disable=SC2086
+    kill -0 $pids 2>/dev/null || break
+    sleep 0.5
+  done
+  # shellcheck disable=SC2086
+  kill -KILL $pids 2>/dev/null || true
+  echo "stopped the TinyKG service the scenario started (pids: ${pids% })"
+}
+
+# ============================================================================
 # 跑一个场景:把脚本各段喂进非 tty REPL,全量 stdout 落 logfile。
 # 用法: run_session <scenario_file> <workdir> <logfile> <debug_logfile> <conf_file>
 # 返回(echo): session 退出码
@@ -352,6 +397,11 @@ PY
     exit "$child_rc"
   ) > "$logfile" 2>&1
   local rc=$?
+
+  # A session that needed TinyKG started this install's service in the fake
+  # HOME's state root, and the service outlives the session on purpose
+  # (src/app/kg_autostart.zig). Nothing reaches it once the scenario is over.
+  stop_scenario_kgd "$fake_home" >> "$logfile" 2>&1
 
   # --- worktree 兜底清理(Stage 5)---
   if [[ "$CONF_GIT_INIT" == "1" ]]; then

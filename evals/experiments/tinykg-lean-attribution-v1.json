@@ -289,7 +289,7 @@
   "source_contract": {
     "evals/experiments/tinykg-lean-factorial-block-v1-cases.json": "9a563ae27db1c5840339b2bda47c3f535dda06cc05a95be21a32779bc2ed2542",
     "evals/memory/MEMORY_MATURATION_V1.md": "3621d69f26c6e791033a6ba87887942bb620e92ad6103d5b6f2b6c23d7fff582",
-    "scripts/eval/memory_agent_runtime_smoke.py": "230dc401501bdcccd2ef6d80a16e3af2cb4b019391edc6d503c6936b83de0673",
+    "scripts/eval/memory_agent_runtime_smoke.py": "a70937ec9fbc980adeec6813e35bf876d79ba7d6e9eeb360fd4f5ebee1a9d004",
     "scripts/eval/memory_agent_runtime_pilot.py": "4c52eeb01dce1d0e8adccbbc844cb6c6b120441db0c2d0b7aeb72eeff6caa97b",
     "scripts/eval/project_harness_experiment.py": "1e03325559eba1b3e1f0151c4a25c15105cdb5256a22619a1fd853790042d4e2",
     "scripts/eval/project_harness_rule_impact_prospective.py": "d5397e2bb23d4a730ef12ebfba4cd315da69d86d17decad534cf81299872e06b",

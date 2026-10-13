@@ -10,6 +10,7 @@ from scripts.eval.e2e_adapter import (
     import_run,
     prepare_runtime_metadata,
 )
+from scripts.eval.kgd_processes import temporary_directory_without_kgd
 from scripts.eval.model import load_json
 from tests.tty.slow_mock_server import SlowMockServer, simple_text, slow_text_then_tooluse
 
@@ -23,7 +24,7 @@ class NativeRuntimeTest(unittest.TestCase):
     def test_real_repl_evaluation_tool_policy_filters_provider_schema(self):
         binary = Path(BIN).resolve()
         suite = load_json(REPO_ROOT / "evals/suites/core-e2e.json")
-        with tempfile.TemporaryDirectory() as directory:
+        with temporary_directory_without_kgd() as directory:
             workspace = Path(directory) / "workspace"
             home = workspace / ".home"
             home.mkdir(parents=True)
@@ -93,6 +94,7 @@ class NativeRuntimeTest(unittest.TestCase):
                     env={
                         **os.environ,
                         "HOME": str(home),
+                        "METACODES_KG_AUTOSTART": "0",
                         "METACODES_EVAL_METADATA_FD": str(metadata_fd),
                         "METACODES_EVAL_FD": str(events_file.fileno()),
                     },
@@ -128,7 +130,7 @@ class NativeRuntimeTest(unittest.TestCase):
     def test_real_repl_budget_spans_user_submissions_and_stops_second_request(self):
         binary = Path(BIN).resolve()
         suite = load_json(REPO_ROOT / "evals/suites/core-e2e.json")
-        with tempfile.TemporaryDirectory() as directory:
+        with temporary_directory_without_kgd() as directory:
             workspace = Path(directory) / "workspace"
             home = workspace / ".home"
             home.mkdir(parents=True)
@@ -181,6 +183,7 @@ class NativeRuntimeTest(unittest.TestCase):
                     env={
                         **os.environ,
                         "HOME": str(home),
+                        "METACODES_KG_AUTOSTART": "0",
                         "METACODES_EVAL_METADATA_FD": str(metadata_fd),
                         "METACODES_EVAL_FD": str(events_file.fileno()),
                     },
@@ -214,7 +217,7 @@ class NativeRuntimeTest(unittest.TestCase):
     def test_real_repl_rejects_budget_that_cannot_cover_one_request(self):
         binary = Path(BIN).resolve()
         suite = load_json(REPO_ROOT / "evals/suites/core-e2e.json")
-        with tempfile.TemporaryDirectory() as directory:
+        with temporary_directory_without_kgd() as directory:
             workspace = Path(directory) / "workspace"
             home = workspace / ".home"
             home.mkdir(parents=True)
@@ -261,6 +264,7 @@ class NativeRuntimeTest(unittest.TestCase):
                 env={
                     **os.environ,
                     "HOME": str(home),
+                    "METACODES_KG_AUTOSTART": "0",
                     "METACODES_EVAL_METADATA_FD": str(metadata_fd),
                     "METACODES_EVAL_FD": str(events_file.fileno()),
                 },
@@ -291,7 +295,7 @@ class NativeRuntimeTest(unittest.TestCase):
         self.assertTrue(binary.is_file(), binary)
         suite = load_json(REPO_ROOT / "evals/suites/core-e2e.json")
         task = next(item for item in suite["tasks"] if item["id"] == "00_smoke")
-        with tempfile.TemporaryDirectory() as directory:
+        with temporary_directory_without_kgd() as directory:
             run = Path(directory) / "native-run"
             workspace = run / "00_smoke"
             home = workspace / ".home"
@@ -336,6 +340,7 @@ class NativeRuntimeTest(unittest.TestCase):
                 env = {
                     **os.environ,
                     "HOME": str(home),
+                    "METACODES_KG_AUTOSTART": "0",
                     "METACODES_EVAL_METADATA_FD": str(metadata_fd),
                     "METACODES_EVAL_FD": str(events_file.fileno()),
                     "METACODES_LOG": "agent:debug,permission:debug,*:info",

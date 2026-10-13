@@ -21,6 +21,7 @@ if __package__ in {None, ""}:
     import sys
 
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    from scripts.eval.kgd_processes import stop_kgd_under  # type: ignore
     from scripts.eval.memory_agent_runtime import (  # type: ignore
         PRODUCTION_CHILD_PATH,
         SCRIPTED_PROVIDER_ID,
@@ -40,6 +41,7 @@ if __package__ in {None, ""}:
     from scripts.eval.memory_tinykg_local import _store_info  # type: ignore
     from scripts.eval.model import stable_json  # type: ignore
 else:
+    from .kgd_processes import stop_kgd_under
     from .memory_agent_runtime import (
         PRODUCTION_CHILD_PATH,
         SCRIPTED_PROVIDER_ID,
@@ -289,6 +291,10 @@ def _run_fd_auth_https_environment_regression(root: Path, metacodes: Path) -> No
             "METACODES_API_KEY_FD": str(credential_read_fd),
             "METACODES_NO_PROBE": "1",
             "METACODES_PROVIDER": "anthropic",
+            # HOME is the smoke's temporary root: the session would start a
+            # TinyKG service there that outlives the run, and this check does
+            # not use KG (scripts/eval/kgd_processes.py).
+            "METACODES_KG_AUTOSTART": "0",
         }
         completed = subprocess.run(
             [
@@ -584,6 +590,11 @@ def main(argv: list[str] | None = None) -> int:
                     os.environ.pop(key, None)
                 else:
                     os.environ[key] = value
+            # Whatever a session started under the temporary root outlives
+            # it; stop it before the directory goes, then fail a clean run.
+            leaked = stop_kgd_under(root)
+        if leaked:
+            raise RuntimeError(f"the smoke left TinyKG services running under {root}: pids {leaked}")
         if hashlib.sha256(remote_config.read_bytes()).hexdigest() != before_config:
             raise RuntimeError("remote TinyKG config sentinel changed")
         if hashlib.sha256(remote_store.read_bytes()).hexdigest() != before_store:
