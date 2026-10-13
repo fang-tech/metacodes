@@ -39,6 +39,19 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- `zig build test` no longer leaves TinyKG services running. A session that
+  needs TinyKG starts its install's service, which outlives the session on
+  purpose, and three test entry points ran the real binary in a throwaway
+  HOME: the native REPL tests, the headless protocol smoke and the memory
+  runtime smoke's HTTPS environment regression (macOS only). Each run left
+  `metacodes --state-dir <deleted temp dir> kgd` processes and their
+  `tinykgd` children behind, six pairs per run on macOS (a developer machine
+  had 148). Those tests now set `METACODES_KG_AUTOSTART=0` and fail if a
+  service is still running under their temporary directory
+  (`scripts/eval/kgd_processes.py`), and every e2e scenario run through
+  `tests/e2e/lib.sh` stops the service its fake HOME started once the session
+  ends, leaving other state roots' services alone. Both recognise a service
+  started with `--config <path>` (a `METACODES_KG_CONFIG` file) as well.
 - A TinyKG service of another state root no longer locks an install out of
   its own. Every state root used to provision port 8799, so while one
   install's service was down a test run in a temporary home could provision

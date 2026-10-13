@@ -137,7 +137,7 @@
     "scripts/eval/plugin_pair_runner.py": "2c1c6267154278405fd502c2c08a804708ac4b17a597ed21f9b4dbacb735f209",
     "scripts/eval/plugin_pair_analysis.py": "1cf181442e0c59f5452adfc8aea2c755941f875545b9200ed07589f96606d0f4",
     "tests/e2e/run_e2e.sh": "38b21bdc939682e870846cc57731c90b2a114aec285b8df6d8019ba7a59314f3",
-    "tests/e2e/lib.sh": "625b48249cb41b777bd2183c6d01190d67518d866d172e380bca20abb0cd4133",
+    "tests/e2e/lib.sh": "65471750095f1659a819b482df74e3b2f8023af9e18a0b95bb581c8804767ef7",
     "evals/gates/default.json": "0e8da44acfefe11c5ff7ede5b11cc5d40a8edfd6660e18891dd2b79151e13559",
     "control-plane/lean/MetaCodesControl/HostInjectionMeter.lean": "9ac5611a40f49bbf029162b863a216198bc70e34cf4ac1efbaf13b6271e7447a",
     "control-plane/lean/MetaCodesControl/ObligationGate.lean": "c07307865b182cdebc73c72ed007bb6ae0514833b1247b86fcccb770503e426c"
