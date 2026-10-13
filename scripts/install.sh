@@ -52,12 +52,18 @@ Where it goes:
   --no-link           do not write a launcher
   --sdk ARCHIVE|DIR   use this AgentCore SDK instead of the matching one
   --no-sdk            do not install the AgentCore SDK
+  --allow-downgrade   let a rerun replace a newer install with an older version
+                      (without it, such a unit refuses; releases up to 0.5.0
+                      predate the check: they downgrade without asking and
+                      reject this option)
   --force             also replace foreign files at --prefix or another launcher
   --release-base URL  mirror of https://github.com/metask-ai/metacodes/releases
   -h, --help          this text
 
 Rerunning over an install of this product replaces its version and keeps its
-state root; foreign files and other launchers are never replaced without --force.
+state root, but never with an older version unless --allow-downgrade (the unit
+being installed makes that check); foreign files and other launchers are never
+replaced without --force.
 EOF
 }
 
@@ -230,6 +236,7 @@ main() {
   sdk=""
   want_sdk=1
   force=""
+  allow_downgrade=""
   unit=""
   version=""
   dev=0
@@ -247,6 +254,7 @@ main() {
       --link-name) [ $# -ge 2 ] || die "--link-name needs a name"; link_name=$2; shift 2 ;;
       --no-link) link=""; shift ;;
       --force) force="--force"; shift ;;
+      --allow-downgrade) allow_downgrade="--allow-downgrade"; shift ;;
       --version) [ $# -ge 2 ] || die "--version needs X.Y.Z"; version=$2; shift 2 ;;
       --dev) dev=1; shift ;;
       --uninstall) uninstall=1; shift ;;
@@ -346,6 +354,9 @@ main() {
     set -- "$@" --link "$link" --link-name "$link_name"
   fi
   [ -n "$force" ] && set -- "$@" --force
+  # Passed only when asked: units older than the downgrade guard do not know
+  # the option (and never refuse a downgrade, so they never need it).
+  [ -n "$allow_downgrade" ] && set -- "$@" --allow-downgrade
 
   "$root/bin/metacodes" "$@" </dev/null
 

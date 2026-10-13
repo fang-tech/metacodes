@@ -32,6 +32,8 @@ param(
     [string]$LinkName = 'metacodes',
     # Do not add <Prefix>\bin to the user PATH.
     [switch]$NoPath,
+    # Let a rerun replace a newer install with this older version.
+    [switch]$AllowDowngrade,
     # Replace a different version or foreign files at -Prefix.
     [switch]$Force
 )
@@ -71,12 +73,15 @@ try {
     $exe = Join-Path $root 'bin\metacodes.exe'
     if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) { throw "install.ps1: $exe is missing; is this a metacodes release unit?" }
 
-    # --upgrade: rerunning replaces this product's other version, never foreign files.
+    # --upgrade: rerunning replaces this product's other version (never with an
+    # older one unless -AllowDowngrade), never foreign files.
     $installArgs = @('install', '--prefix', $Prefix, '--upgrade')
     if ($StateDir) { $installArgs += @('--state-dir', $StateDir) }
     if ($Sdk) { $installArgs += @('--sdk', (Expand-Unit $Sdk 'sdk' $work)) }
     if ($LinkDir) { $installArgs += @('--link', $LinkDir, '--link-name', $LinkName) }
     if ($Force) { $installArgs += '--force' }
+    # Only when asked: units older than the downgrade guard do not know it.
+    if ($AllowDowngrade) { $installArgs += '--allow-downgrade' }
 
     & $exe @installArgs
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
