@@ -121,6 +121,28 @@ const OPENAI_FINAL_SSE =
     "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n" ++
     "data: [DONE]\n\n";
 
+// issue #258: the documented Chat Completions shape under
+// `stream_options.include_usage` — every ordinary chunk carries `"usage":null`
+// and a final chunk with empty `choices` carries the request usage. The control
+// removes only the `"usage":null` members.
+const OPENAI_USAGE_NULL_FINAL_USAGE =
+    "data: {\"id\":\"chatcmpl-258\",\"object\":\"chat.completion.chunk\",\"choices\":[]," ++
+    "\"usage\":{\"prompt_tokens\":2006,\"completion_tokens\":10,\"total_tokens\":2016,\"prompt_tokens_details\":{\"cached_tokens\":1920}}}\n\n";
+
+const OPENAI_USAGE_NULL_SSE =
+    "data: {\"id\":\"chatcmpl-258\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\"}}],\"usage\":null}\n\n" ++
+    "data: {\"id\":\"chatcmpl-258\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello\"}}],\"usage\":null}\n\n" ++
+    "data: {\"id\":\"chatcmpl-258\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":null}\n\n" ++
+    OPENAI_USAGE_NULL_FINAL_USAGE ++
+    "data: [DONE]\n\n";
+
+const OPENAI_USAGE_NULL_CONTROL_SSE =
+    "data: {\"id\":\"chatcmpl-258\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\"}}]}\n\n" ++
+    "data: {\"id\":\"chatcmpl-258\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello\"}}]}\n\n" ++
+    "data: {\"id\":\"chatcmpl-258\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n" ++
+    OPENAI_USAGE_NULL_FINAL_USAGE ++
+    "data: [DONE]\n\n";
+
 const OPENAI_RESPONSES_FINAL_SSE =
     "event: response.created\n" ++
     "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_agentcore\"}}\n\n" ++
@@ -4693,6 +4715,89 @@ test "L2 public events reconstruct continuation output and observable run usage"
     try std.testing.expectEqual(@as(usize, 0), probe.discarded_count);
     try std.testing.expectEqual(@as(u64, 11), probe.usage.input_tokens);
     try std.testing.expectEqual(@as(u64, 5), probe.usage.output_tokens);
+}
+
+test "L2 public AgentCore OpenAI chat delivers text from usage:null chunks to the Host (issue #258)" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{ OPENAI_USAGE_NULL_SSE, OPENAI_USAGE_NULL_CONTROL_SSE }) |sse| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const root = try rootPath(&tmp, &root_buf);
+        var server = try harness.MockServer.startCassette(&.{sse}, 0);
+        defer server.stop();
+        const url = try server.urlOwned(a);
+        defer a.free(url);
+
+        const raw_api = abi.metask_agentcore_get_api(wire.ABI_VERSION_V1) orelse return error.MissingApi;
+        const api = try sdk.Api.validate(@ptrCast(@alignCast(raw_api)));
+        var diagnostic = std.mem.zeroes(wire.OwnedBytesV1);
+        defer api.bufferRelease()(&diagnostic);
+
+        var runtime_config = std.mem.zeroes(wire.RuntimeConfigV1);
+        runtime_config.struct_size = @sizeOf(wire.RuntimeConfigV1);
+        var runtime: ?*wire.RuntimeHandle = null;
+        try std.testing.expectEqual(wire.STATUS_OK, api.runtime().create()(&runtime_config, null, &runtime, &diagnostic));
+        defer if (runtime) |handle| {
+            _ = api.runtime().destroy()(handle, &diagnostic);
+        };
+
+        var host_config = std.mem.zeroes(wire.SessionHostConfigV1);
+        host_config.struct_size = @sizeOf(wire.SessionHostConfigV1);
+        host_config.provider_kind_code = wire.PROVIDER_OPENAI;
+        host_config.protocol_kind_code = wire.PROTOCOL_DEFAULT; // Chat Completions
+        host_config.permission_mode_code = wire.PERMISSION_FULL_ACCESS;
+        host_config.shell_policy_code = wire.SHELL_DISABLED;
+        host_config.api_key = sdk.bytesView("test-key");
+        host_config.base_url = sdk.bytesView(url);
+        host_config.workspace_root = sdk.bytesView(root);
+        host_config.workspace_home = sdk.bytesView(root);
+        var session_config = sessionCreateConfig(&host_config, "gpt-4o");
+
+        // The Host-side oracle decodes every event through the official SDK.
+        var probe = ReconstructionProbe{};
+        var callbacks = std.mem.zeroes(wire.SessionCallbacksV1);
+        callbacks.struct_size = @sizeOf(wire.SessionCallbacksV1);
+        callbacks.ctx = &probe;
+        callbacks.on_event = ReconstructionProbe.event;
+        var session: ?*wire.SessionHandle = null;
+        try std.testing.expectEqual(
+            wire.STATUS_OK,
+            api.session().create()(runtime, &session_config, &callbacks, &session, &diagnostic),
+        );
+        defer if (session) |handle| {
+            _ = api.session().destroy()(handle, &diagnostic);
+        };
+
+        var options = std.mem.zeroes(wire.RunOptionsV1);
+        options.struct_size = @sizeOf(wire.RunOptionsV1);
+        options.max_turns = 2;
+        var result = std.mem.zeroes(wire.RunResultV1);
+        try std.testing.expectEqual(
+            wire.STATUS_OK,
+            api.session().runText(session, 1, sdk.bytesView("say hello"), &options, &result, &diagnostic),
+        );
+        try std.testing.expectEqual(wire.STOP_END_TURN, result.stop_reason_code);
+        try std.testing.expectEqual(@as(usize, 1), server.requestCount());
+        try std.testing.expect(std.mem.indexOf(
+            u8,
+            (server.lastRequest() orelse return error.NoRequestCaptured).body(),
+            "\"include_usage\":true",
+        ) != null);
+
+        // The text reached the Host as one final output segment.
+        try std.testing.expectEqualStrings("Hello", probe.answer[0..probe.answer_len]);
+        try std.testing.expectEqual(@as(usize, 1), probe.segment_begin_count);
+        try std.testing.expectEqual(@as(usize, 1), probe.final_count);
+        try std.testing.expectEqual(@as(usize, 0), probe.discarded_count);
+        try std.testing.expectEqual(@as(usize, 1), probe.stream_done_count);
+        // Usage comes only from the final usage object; prompt_tokens includes
+        // the cached tokens, so input = 2006 - 1920.
+        try std.testing.expectEqual(@as(u64, 86), probe.usage.input_tokens);
+        try std.testing.expectEqual(@as(u64, 10), probe.usage.output_tokens);
+        try std.testing.expectEqual(@as(u64, 1920), probe.usage.cache_read_input_tokens);
+        try std.testing.expectEqual(@as(u64, 0), probe.usage.cache_creation_input_tokens);
+    }
 }
 
 test "L2 session_set_model preserves Conversation and changes the next Run request" {
