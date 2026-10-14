@@ -1,6 +1,7 @@
 //! 把 MCP server 的 tools 注入到 DynRegistry。
 //!
-//! 命名空间：`<server_name>__<tool_name>`（双下划线分隔），避免与内建冲突。
+//! 命名：`mcp__<server>__<tool>`(Claude Code 的形式,见 naming.zig;非法字符换 `_`,
+//! 超长/冲突加稳定哈希后缀)。调用 server 时仍用原始工具名。
 //!
 //! 每个 MCP tool 注册时：
 //! - ctx_ptr 指向 McpToolBinding（含 *McpClient + original name）
@@ -11,6 +12,8 @@
 
 const std = @import("std");
 const McpClient = @import("client.zig").McpClient;
+const naming = @import("naming.zig");
+const param_headers = @import("param_headers.zig");
 const DynRegistry = @import("../tools/dynamic.zig").DynRegistry;
 const ToolContext = @import("../tools/context.zig").ToolContext;
 const ToolResultBody = @import("../tools/context.zig").ToolResultBody;
@@ -50,15 +53,25 @@ pub const McpSession = struct {
     }
 
     /// 从 MCP server listTools → 注入到 DynRegistry。
-    /// server_prefix 是命名空间前缀（如 "github"），最终 name 为 "github__search_issues"。
+    /// server_prefix 是 server 名（如 "github"），最终 name 为 "mcp__github__search_issues"。
     pub fn registerTools(
         self: *McpSession,
         registry: *DynRegistry,
         server_prefix: []const u8,
     ) !void {
+        return self.registerToolsFiltered(registry, server_prefix, .{});
+    }
+
+    /// `registerTools` with a server's `enabled_tools` / `disabled_tools`.
+    pub fn registerToolsFiltered(
+        self: *McpSession,
+        registry: *DynRegistry,
+        server_prefix: []const u8,
+        filter: ToolFilter,
+    ) !void {
         const tools_json = try self.client.listTools();
         defer self.allocator.free(tools_json);
-        try self.registerToolsFromJson(registry, server_prefix, tools_json);
+        try self.registerToolsFromJsonFiltered(registry, server_prefix, tools_json, filter);
     }
 
     /// `tools/list` 结果 → DynRegistry。用 std.json 整体解析(不再手写扫描):
@@ -73,6 +86,16 @@ pub const McpSession = struct {
         registry: *DynRegistry,
         server_prefix: []const u8,
         tools_json: []const u8,
+    ) !void {
+        return self.registerToolsFromJsonFiltered(registry, server_prefix, tools_json, .{});
+    }
+
+    pub fn registerToolsFromJsonFiltered(
+        self: *McpSession,
+        registry: *DynRegistry,
+        server_prefix: []const u8,
+        tools_json: []const u8,
+        filter: ToolFilter,
     ) !void {
         const log = @import("../util/log.zig");
         const registry_checkpoint = registry.entries.items.len;
@@ -99,7 +122,20 @@ pub const McpSession = struct {
                 log.warn("mcp", "server '{s}': tools[{d}] has no string name, skipped", .{ server_prefix, index });
                 continue;
             };
+            if (!filter.allows(name)) continue;
             const desc = jsonString(tool_v.object.get("description")) orelse "";
+            // Streamable HTTP: `x-mcp-header` parameters become `Mcp-Param-*`
+            // headers; a tool with an invalid annotation MUST be dropped.
+            const headers: []const param_headers.ParamHeader = if (filter.http_param_headers)
+                param_headers.collect(a, tool_v.object.get("inputSchema")) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    error.InvalidParamHeader => {
+                        log.warn("mcp", "server '{s}': tool '{s}' has an invalid x-mcp-header annotation, skipped", .{ server_prefix, name });
+                        continue;
+                    },
+                }
+            else
+                &.{};
             const input_schema = try projectInputSchema(a, tool_v.object.get("inputSchema"));
 
             const binding = try self.allocator.create(McpToolBinding);
@@ -107,10 +143,11 @@ pub const McpSession = struct {
             binding.* = .{
                 .client = self.client,
                 .mcp_tool_name = try self.allocator.dupe(u8, name),
+                .param_headers = headers,
             };
             errdefer self.allocator.free(binding.mcp_tool_name);
 
-            const full_name = try std.fmt.allocPrint(self.allocator, "{s}__{s}", .{ server_prefix, name });
+            const full_name = try naming.modelToolName(self.allocator, server_prefix, name, RegistryNames{ .registry = registry });
             defer self.allocator.free(full_name);
 
             // Reserve the owner slot before publishing ctx_ptr into registry.
@@ -128,7 +165,8 @@ pub const McpSession = struct {
         }
     }
 
-    /// 注册本 server 的 resource 访问工具：`<prefix>__list_resources` + `<prefix>__read_resource`。
+    /// 注册本 server 的 resource 访问工具：`mcp__<server>__list_resources` + `mcp__<server>__read_resource`。
+    /// CLI 不再调用(统一走 ListMcpResourcesTool / ReadMcpResourceTool),保留给库宿主。
     /// 复用 McpToolBinding（mcp_tool_name 字段此处不用，置空 dup）。
     pub fn registerResourceTools(
         self: *McpSession,
@@ -148,7 +186,7 @@ pub const McpSession = struct {
             errdefer self.allocator.destroy(binding);
             binding.* = .{ .client = self.client, .mcp_tool_name = try self.allocator.dupe(u8, "") };
             errdefer self.allocator.free(binding.mcp_tool_name);
-            const name = try std.fmt.allocPrint(self.allocator, "{s}__list_resources", .{server_prefix});
+            const name = try std.fmt.allocPrint(self.allocator, "mcp__{s}__list_resources", .{server_prefix});
             defer self.allocator.free(name);
             try registry.registerMcpBody(name, "List resources exposed by this MCP server.", &.{}, executeListResourcesBody, binding, server_prefix);
             self.bindings.appendAssumeCapacity(binding);
@@ -159,7 +197,7 @@ pub const McpSession = struct {
             errdefer self.allocator.destroy(binding);
             binding.* = .{ .client = self.client, .mcp_tool_name = try self.allocator.dupe(u8, "") };
             errdefer self.allocator.free(binding.mcp_tool_name);
-            const name = try std.fmt.allocPrint(self.allocator, "{s}__read_resource", .{server_prefix});
+            const name = try std.fmt.allocPrint(self.allocator, "mcp__{s}__read_resource", .{server_prefix});
             defer self.allocator.free(name);
             const required = [_][]const u8{"uri"};
             try registry.registerMcpBody(name, "Read a resource from this MCP server by uri.", &required, executeReadResourceBody, binding, server_prefix);
@@ -168,9 +206,36 @@ pub const McpSession = struct {
     }
 };
 
+/// Claude Code-style per-server tool selection (Codex `enabled_tools` /
+/// `disabled_tools`): raw MCP tool names; deny applies after allow.
+pub const ToolFilter = struct {
+    enabled: ?[]const []const u8 = null,
+    disabled: []const []const u8 = &.{},
+    /// The server speaks Streamable HTTP: honour `x-mcp-header`.
+    http_param_headers: bool = false,
+
+    pub fn allows(self: ToolFilter, name: []const u8) bool {
+        for (self.disabled) |item| if (std.mem.eql(u8, item, name)) return false;
+        const enabled = self.enabled orelse return true;
+        for (enabled) |item| if (std.mem.eql(u8, item, name)) return true;
+        return false;
+    }
+};
+
+/// Names already in the registry, for collision-free model names.
+const RegistryNames = struct {
+    registry: *const DynRegistry,
+
+    pub fn contains(self: RegistryNames, name: []const u8) bool {
+        return self.registry.find(name) != null;
+    }
+};
+
 pub const McpToolBinding = struct {
     client: *McpClient,
     mcp_tool_name: []const u8, // owned
+    /// `x-mcp-header` parameters (borrowed from the session's schema arena).
+    param_headers: []const param_headers.ParamHeader = &.{},
 };
 
 fn executeMcpTool(ctx: *const ToolContext, args: []const u8, ctx_ptr: ?*anyopaque) anyerror![]u8 {
@@ -180,12 +245,16 @@ fn executeMcpTool(ctx: *const ToolContext, args: []const u8, ctx_ptr: ?*anyopaqu
 
 fn executeMcpToolBody(ctx: *const ToolContext, args: []const u8, ctx_ptr: ?*anyopaque) anyerror!ToolResultBody {
     const binding: *McpToolBinding = @ptrCast(@alignCast(ctx_ptr orelse return error.MissingMcpBinding));
-    return binding.client.callToolBodyAbortable(
+    var scratch = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer scratch.deinit();
+    const headers = try param_headers.headersForCall(scratch.allocator(), binding.param_headers, args);
+    return binding.client.callToolBodyWithHeaders(
         binding.mcp_tool_name,
         args,
         ctx.artifact_root,
         ctx.result_budget,
         ctx.abort,
+        headers,
     );
 }
 
@@ -331,7 +400,7 @@ test "registerToolsFromJson: Python 风格带空格的 tools/list 全部注册,i
     try testing.expectEqual(@as(usize, 3), reg.entries.items.len);
     try testing.expectEqual(@as(usize, 3), session.bindings.items.len);
 
-    const search = reg.find("knowforge__search") orelse return error.TestExpectedTool;
+    const search = reg.find("mcp__knowforge__search") orelse return error.TestExpectedTool;
     try testing.expect(search.deferred);
     try testing.expectEqualStrings("knowforge", search.mcp_server.?);
     try testing.expectEqualStrings("智能搜索(向量+关键字+图扩展)。", search.description);
@@ -344,12 +413,12 @@ test "registerToolsFromJson: Python 风格带空格的 tools/list 全部注册,i
     // binding 指回 server 侧的裸工具名。
     try testing.expectEqualStrings("search", session.bindings.items[1].mcp_tool_name);
 
-    const listing = reg.find("knowforge__list_knowledge_bases") orelse return error.TestExpectedTool;
+    const listing = reg.find("mcp__knowforge__list_knowledge_bases") orelse return error.TestExpectedTool;
     try testing.expectEqual(@as(usize, 0), listing.required_fields.len);
     try testing.expect(listing.borrowed_input_schema.?.properties != null);
 
     // 缺描述 → 空描述;required 里的非字符串被丢弃,不拖垮整条。
-    const download = reg.find("knowforge__download") orelse return error.TestExpectedTool;
+    const download = reg.find("mcp__knowforge__download") orelse return error.TestExpectedTool;
     try testing.expectEqualStrings("", download.description);
     try testing.expectEqual(@as(usize, 1), download.required_fields.len);
     try testing.expectEqualStrings("fragment_id", download.required_fields[0]);
@@ -360,7 +429,7 @@ test "registerToolsFromJson: Python 风格带空格的 tools/list 全部注册,i
     try reg.appendDefinitions(&defs, testing.allocator);
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(testing.allocator);
-    for (defs.items) |d| if (std.mem.eql(u8, d.name, "knowforge__search")) {
+    for (defs.items) |d| if (std.mem.eql(u8, d.name, "mcp__knowforge__search")) {
         try @import("../api/request.zig").serializeOneTool(d, &buf, testing.allocator);
     };
     try testing.expect(std.mem.indexOf(u8, buf.items, "\"query\":{\"type\":\"string\"") != null);
@@ -378,15 +447,37 @@ test "registerToolsFromJson: 根形状不对整体报错,不留半注册" {
     try testing.expectError(error.MalformedMcpResponse, session.registerToolsFromJson(&reg, "s", "[]"));
     try testing.expectEqual(@as(usize, 0), reg.entries.items.len);
     try testing.expectEqual(@as(usize, 0), session.bindings.items.len);
-    // 名字冲突时回滚到本批之前(前面已注册的同批条目一起撤)。
-    try reg.registerMcp("s__b", "preexisting", &.{}, executeReadResource, null, "s");
-    try testing.expectError(
-        error.ToolAlreadyRegistered,
-        session.registerToolsFromJson(&reg, "s", "{\"tools\":[{\"name\":\"a\"},{\"name\":\"b\"}]}"),
+}
+
+test "registerToolsFromJson: names collide-free, filters apply to raw names" {
+    var fake_client: McpClient = undefined;
+    var session = McpSession.init(testing.allocator, &fake_client);
+    defer session.deinit();
+    var reg = DynRegistry.init(testing.allocator);
+    defer reg.deinit();
+    // An existing name gets a hashed sibling instead of failing the batch.
+    try reg.registerMcp("mcp__s__b", "preexisting", &.{}, executeReadResource, null, "s");
+    try session.registerToolsFromJsonFiltered(
+        &reg,
+        "s",
+        "{\"tools\":[{\"name\":\"a\"},{\"name\":\"b\"},{\"name\":\"dotted.name\"},{\"name\":\"hidden\"}]}",
+        .{ .disabled = &.{"hidden"} },
     );
-    try testing.expect(reg.find("s__a") == null);
-    try testing.expectEqual(@as(usize, 1), reg.entries.items.len);
-    try testing.expectEqual(@as(usize, 0), session.bindings.items.len);
+    try testing.expect(reg.find("mcp__s__a") != null);
+    try testing.expect(reg.find("mcp__s__dotted_name") != null);
+    try testing.expect(reg.find("mcp__s__hidden") == null);
+    try testing.expectEqual(@as(usize, 4), reg.entries.items.len);
+    for (reg.entries.items) |entry| try testing.expect(naming.isProviderSafe(entry.name));
+    // The binding keeps the raw MCP name for tools/call.
+    try testing.expectEqualStrings("dotted.name", session.bindings.items[2].mcp_tool_name);
+
+    var only = McpSession.init(testing.allocator, &fake_client);
+    defer only.deinit();
+    var only_reg = DynRegistry.init(testing.allocator);
+    defer only_reg.deinit();
+    try only.registerToolsFromJsonFiltered(&only_reg, "s", "{\"tools\":[{\"name\":\"a\"},{\"name\":\"b\"}]}", .{ .enabled = &.{"b"} });
+    try testing.expectEqual(@as(usize, 1), only_reg.entries.items.len);
+    try testing.expect(only_reg.find("mcp__s__b") != null);
 }
 
 test "registerResourceTools registers list + read tools" {
@@ -399,8 +490,8 @@ test "registerResourceTools registers list + read tools" {
     defer reg.deinit();
     try session.registerResourceTools(&reg, "myserver");
 
-    try testing.expect(reg.find("myserver__list_resources") != null);
-    try testing.expect(reg.find("myserver__read_resource") != null);
+    try testing.expect(reg.find("mcp__myserver__list_resources") != null);
+    try testing.expect(reg.find("mcp__myserver__read_resource") != null);
 }
 
 test "registerResourceTools rolls back registry and bindings on partial failure" {
@@ -414,7 +505,7 @@ test "registerResourceTools rolls back registry and bindings on partial failure"
     // already been published. The batch must leave neither its first tool nor
     // any binding behind.
     try reg.registerMcp(
-        "myserver__read_resource",
+        "mcp__myserver__read_resource",
         "preexisting",
         &.{},
         executeReadResource,
@@ -425,8 +516,8 @@ test "registerResourceTools rolls back registry and bindings on partial failure"
         error.ToolAlreadyRegistered,
         session.registerResourceTools(&reg, "myserver"),
     );
-    try testing.expect(reg.find("myserver__list_resources") == null);
-    try testing.expect(reg.find("myserver__read_resource") != null);
+    try testing.expect(reg.find("mcp__myserver__list_resources") == null);
+    try testing.expect(reg.find("mcp__myserver__read_resource") != null);
     try testing.expectEqual(@as(usize, 1), reg.entries.items.len);
     try testing.expectEqual(@as(usize, 0), session.bindings.items.len);
 }

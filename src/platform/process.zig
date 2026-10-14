@@ -437,20 +437,56 @@ pub const PipeChild = struct {
 
 /// spawn 长连接子进程，返回持久 stdin(父写)/stdout(父读) 端点。stderr 丢弃（→null/NUL）。
 pub fn spawnPipes(argv: []const ?[*:0]const u8, inherit_env: bool, cwd: ?[]const u8) CaptureError!PipeChild {
-    last_spawn_failure = null;
-    if (is_windows) return spawnPipesWindows(argv, cwd);
-    return spawnPipesPosix(argv, inherit_env, cwd);
+    return spawnPipesWith(argv, .{ .inherit_env = inherit_env, .cwd = cwd });
 }
 
-fn spawnPipesPosix(argv: []const ?[*:0]const u8, inherit_env: bool, cwd: ?[]const u8) CaptureError!PipeChild {
+pub const PipeSpawnOptions = struct {
+    /// Exact child environment as `KEY=VALUE` entries, borrowed for the call.
+    /// null keeps the `inherit_env` behaviour.
+    env: ?[]const [:0]const u8 = null,
+    /// Used only when `env` is null: POSIX inherits the parent environment
+    /// when true and passes an empty one when false; Windows always inherits.
+    inherit_env: bool = false,
+    cwd: ?[]const u8 = null,
+    /// Open descriptor (a CRT fd on Windows) that receives the child's
+    /// stderr, borrowed for the call; null discards stderr.
+    stderr_fd: ?c_int = null,
+};
+
+/// `spawnPipes` with an explicit environment and a stderr destination
+/// (MCP stdio servers: the environment is the configured one, and server
+/// diagnostics go to a log the user can read).
+pub fn spawnPipesWith(argv: []const ?[*:0]const u8, options: PipeSpawnOptions) CaptureError!PipeChild {
+    last_spawn_failure = null;
+    if (is_windows) return spawnPipesWindows(argv, options);
+    return spawnPipesPosix(argv, options);
+}
+
+fn spawnPipesPosix(argv: []const ?[*:0]const u8, options: PipeSpawnOptions) CaptureError!PipeChild {
+    const cwd = options.cwd;
+    // The child may not allocate between fork and execve: build envp here.
+    var envp_storage: ?[]?[*:0]const u8 = null;
+    defer if (envp_storage) |storage| std.heap.page_allocator.free(storage);
+    if (options.env) |entries| {
+        const storage = std.heap.page_allocator.alloc(?[*:0]const u8, entries.len + 1) catch return error.SpawnFailed;
+        for (entries, 0..) |entry, index| storage[index] = entry.ptr;
+        storage[entries.len] = null;
+        envp_storage = storage;
+    }
+    const envp: [*:null]const ?[*:0]const u8 = if (envp_storage) |storage|
+        @ptrCast(storage.ptr)
+    else if (options.inherit_env)
+        @ptrCast(std.c.environ)
+    else
+        &.{null};
     var in_pipe: [2]std.c.fd_t = undefined; // 父写 → 子读
     var out_pipe: [2]std.c.fd_t = undefined; // 子写 → 父读
     // 从建第一条 pipe 到父端关完子进程侧的端,持 fork 串行锁(见 g_fork_serial)。
     g_fork_serial.lock();
     var fork_locked = true;
     defer if (fork_locked) g_fork_serial.unlock();
-    if (std.c.pipe(&in_pipe) != 0) return error.PipeFailed;
-    if (std.c.pipe(&out_pipe) != 0) {
+    if (!openPipeCloexec(&in_pipe)) return error.PipeFailed;
+    if (!openPipeCloexec(&out_pipe)) {
         closePair(in_pipe);
         return error.PipeFailed;
     }
@@ -470,9 +506,9 @@ fn spawnPipesPosix(argv: []const ?[*:0]const u8, inherit_env: bool, cwd: ?[]cons
         _ = std.c.setpgid(0, 0);
         _ = std.c.close(in_pipe[1]);
         _ = std.c.close(out_pipe[0]);
-        const devnull = std.c.open("/dev/null", .{ .ACCMODE = .WRONLY }, @as(std.c.mode_t, 0));
-        wireStdioOrExit(.{ in_pipe[0], out_pipe[1], devnull }, report.wr);
-        execChild(argv, inherit_env, cwd, report.wr);
+        const stderr_target = options.stderr_fd orelse std.c.open("/dev/null", .{ .ACCMODE = .WRONLY }, @as(std.c.mode_t, 0));
+        wireStdioOrExit(.{ in_pipe[0], out_pipe[1], stderr_target }, report.wr);
+        execChildEnvp(argv, envp, cwd, report.wr);
     }
     _ = std.c.close(in_pipe[0]); // 父不读 stdin pipe
     _ = std.c.close(out_pipe[1]); // 父不写 stdout pipe
@@ -488,13 +524,25 @@ fn spawnPipesPosix(argv: []const ?[*:0]const u8, inherit_env: bool, cwd: ?[]cons
     return .{ .proc = pid, .stdin_h = in_pipe[1], .stdout_h = out_pipe[0] };
 }
 
-fn spawnPipesWindows(argv: []const ?[*:0]const u8, cwd: ?[]const u8) CaptureError!PipeChild {
+fn spawnPipesWindows(argv: []const ?[*:0]const u8, options: PipeSpawnOptions) CaptureError!PipeChild {
+    const cwd = options.cwd;
     // cmdline 在建任何可继承句柄**之前**构造(review-2 F1):它可失败(argv 含非法
     // UTF-8 即可,非只 OOM),若在句柄之后 early-return 会把可继承写端永久泄漏——
     // 之后任何 bInheritHandles spawn 都会把它塞给不相干子进程,capture 永不 EOF。
     const a = std.heap.page_allocator;
     const cmdline = buildWindowsCmdline(a, argv) catch return error.SpawnFailed;
     defer a.free(cmdline);
+    // Likewise built before any inheritable handle exists.
+    const env_block: ?[]u16 = if (options.env) |entries|
+        (buildWindowsEnvBlock(a, entries) catch return error.SpawnFailed)
+    else
+        null;
+    defer if (env_block) |block| a.free(block);
+    const stderr_handle: ?win.HANDLE = if (options.stderr_fd) |fd| blk: {
+        const raw = _get_osfhandle(fd);
+        if (raw == std.math.maxInt(usize)) return error.SpawnFailed;
+        break :blk @ptrFromInt(raw);
+    } else null;
     // 缺陷 B 修复:cwd 转 UTF-16(Windows CreateProcessW 第 8 参数 lpCurrentDirectory)。
     const cwd_w: ?[:0]u16 = if (cwd) |c| (std.unicode.utf8ToUtf16LeAllocZ(a, c) catch return error.SpawnFailed) else null;
     defer if (cwd_w) |w| a.free(w);
@@ -622,16 +670,38 @@ fn spawnPipesWindows(argv: []const ?[*:0]const u8, cwd: ?[]const u8) CaptureErro
         win.CloseHandle(in_wr);
         return error.PipeFailed;
     }
+    if (stderr_handle) |handle| {
+        if (SetHandleInformation(handle, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) == 0) {
+            win.CloseHandle(out_rd);
+            win.CloseHandle(out_wr);
+            win.CloseHandle(in_rd);
+            win.CloseHandle(in_wr);
+            return error.PipeFailed;
+        }
+    }
+    // The borrowed stderr handle is inheritable only for this CreateProcess.
+    defer if (stderr_handle) |handle| {
+        _ = SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0);
+    };
     var si = std.mem.zeroes(win.STARTUPINFOW);
     si.cb = @sizeOf(win.STARTUPINFOW);
     si.dwFlags = win.STARTF_USESTDHANDLES;
     si.hStdInput = in_rd;
     si.hStdOutput = out_wr;
-    si.hStdError = null;
+    si.hStdError = stderr_handle;
     var pi = std.mem.zeroes(win.PROCESS.INFORMATION);
     const cwd_ptr: ?[*:0]u16 = if (cwd_w) |w| w.ptr else null;
-    const inherit_handles = [_]win.HANDLE{ in_rd, out_wr };
-    const process_result = createProcessWithHandleList(cmdline.ptr, .{}, cwd_ptr, &si, &pi, &inherit_handles) catch {
+    const handle_storage = [_]win.HANDLE{ in_rd, out_wr, stderr_handle orelse in_rd };
+    const inherit_handles = handle_storage[0..if (stderr_handle != null) 3 else 2];
+    const process_result = createProcessWithHandleListEnv(
+        cmdline.ptr,
+        .{ .create_unicode_environment = env_block != null },
+        cwd_ptr,
+        if (env_block) |block| @ptrCast(block.ptr) else null,
+        &si,
+        &pi,
+        inherit_handles,
+    ) catch {
         win.CloseHandle(in_rd);
         win.CloseHandle(in_wr);
         win.CloseHandle(out_rd);
@@ -896,14 +966,17 @@ fn chdirChild(cwd: ?[]const u8) bool {
 // 子进程失败报告通道(POSIX)
 // ============================================================================
 
-/// POSIX fork serial lock. A pipe end created for a child is inheritable until
-/// the parent closes its own copy; a fork on another thread inside that window
-/// hands the descriptor to an unrelated child, whose exec'd program then holds
-/// a write end open and the parent's EOF never comes. Holding this from the
-/// first pipe until the parent has closed every child-side end removes that
-/// window for every spawn in this module — the rule `g_spawn_serial` already
-/// applies to inheritable handles on Windows. Forks outside this module take
-/// it through `forkSerialLock`/`forkSerialUnlock`.
+/// POSIX fork serial lock. Every pipe here is created close-on-exec on both
+/// ends (`openPipeCloexec`): the child gets its ends through `dup2`, which
+/// clears the flag on the copy, and the parent's ends never cross a later
+/// exec. Without the flag, a fork on another thread would hand an end to an
+/// unrelated child, whose exec'd program then holds a write end open and the
+/// reader's EOF never comes. macOS has no `pipe2`, so `pipe` and the `fcntl`
+/// that marks it are two steps; holding this lock from the first pipe until
+/// the parent has closed every child-side end keeps any fork in this process
+/// out of that gap — the rule `g_spawn_serial` already applies to inheritable
+/// handles on Windows. Forks outside this module take it through
+/// `forkSerialLock`/`forkSerialUnlock`.
 var g_fork_serial: psync.Mutex = .{};
 
 pub fn forkSerialLock() void {
@@ -917,6 +990,21 @@ pub fn forkSerialUnlock() void {
 fn closePair(p: [2]std.c.fd_t) void {
     _ = std.c.close(p[0]);
     _ = std.c.close(p[1]);
+}
+
+/// The only way this module makes a pipe: both ends close-on-exec. The end a
+/// child needs reaches it through `dup2` onto 0/1/2, which clears the flag on
+/// the copy; the end the parent keeps (a stdio server's stdin and stdout for
+/// the server's whole life, capture's stdin while it is fed) stays out of
+/// every later exec — a sibling spawn, the TinyKG service, a Bash job. Caller
+/// holds `g_fork_serial`.
+fn openPipeCloexec(fds: *[2]std.c.fd_t) bool {
+    if (std.c.pipe(fds) != 0) return false;
+    if (!setCloseOnExec(fds[0]) or !setCloseOnExec(fds[1])) {
+        closePair(fds.*);
+        return false;
+    }
+    return true;
 }
 
 /// 阻塞收尸,EINTR 重试。被信号(SIGWINCH/SIGINT 等)打断的 waitpid 返 -1/EINTR;不重试就
@@ -996,14 +1084,10 @@ const ReportPipe = struct {
 
     fn open() ?ReportPipe {
         var fds: [2]std.c.fd_t = undefined;
-        if (std.c.pipe(&fds) != 0) return null;
         // Close-on-exec on the write end *is* the mechanism: a successful
         // execve closes it and the parent reads EOF. The read end gets the
         // flag too so a sibling spawn's child cannot inherit it either.
-        if (!setCloseOnExec(fds[0]) or !setCloseOnExec(fds[1])) {
-            closePair(fds);
-            return null;
-        }
+        if (!openPipeCloexec(&fds)) return null;
         // A parent running with any of 0/1/2 closed would get one of them back
         // from pipe(); the child's dup2 onto 0/1/2 would then clobber the write
         // end and a failure record could land in the program's stdout instead
@@ -1064,6 +1148,16 @@ fn reportChildFailure(fd: std.c.fd_t, step: SpawnStep, code: i32) void {
 /// The child's tail shared by every POSIX spawn: enter the working directory,
 /// exec, and account for whichever step refused. Never returns.
 fn execChild(argv: []const ?[*:0]const u8, inherit_env: bool, cwd: ?[]const u8, report_fd: std.c.fd_t) noreturn {
+    const envp: [*:null]const ?[*:0]const u8 = if (inherit_env) @ptrCast(std.c.environ) else &.{null};
+    execChildEnvp(argv, envp, cwd, report_fd);
+}
+
+fn execChildEnvp(
+    argv: []const ?[*:0]const u8,
+    envp: [*:null]const ?[*:0]const u8,
+    cwd: ?[]const u8,
+    report_fd: std.c.fd_t,
+) noreturn {
     if (!chdirChild(cwd)) {
         reportChildFailure(report_fd, .chdir, currentErrno());
         std.c._exit(127);
@@ -1072,7 +1166,6 @@ fn execChild(argv: []const ?[*:0]const u8, inherit_env: bool, cwd: ?[]const u8, 
         reportChildFailure(report_fd, .exec, @intFromEnum(std.c.E.INVAL));
         std.c._exit(127);
     };
-    const envp: [*:null]const ?[*:0]const u8 = if (inherit_env) @ptrCast(std.c.environ) else &.{null};
     _ = std.c.execve(argv0, @as([*:null]const ?[*:0]const u8, @ptrCast(argv.ptr)), envp);
     reportChildFailure(report_fd, .exec, currentErrno());
     std.c._exit(127);
@@ -1124,17 +1217,17 @@ fn capturePosix(argv: []const ?[*:0]const u8, allocator: std.mem.Allocator, opts
     defer if (fork_locked) g_fork_serial.unlock();
 
     var out_pipe: [2]std.c.fd_t = undefined;
-    if (std.c.pipe(&out_pipe) != 0) return error.PipeFailed;
+    if (!openPipeCloexec(&out_pipe)) return error.PipeFailed;
     var err_pipe: [2]std.c.fd_t = .{ -1, -1 };
     if (opts.want_stderr) {
-        if (std.c.pipe(&err_pipe) != 0) {
+        if (!openPipeCloexec(&err_pipe)) {
             closePair(out_pipe);
             return error.PipeFailed;
         }
     }
     var in_pipe: [2]std.c.fd_t = .{ -1, -1 };
     if (opts.stdin_data != null) {
-        if (std.c.pipe(&in_pipe) != 0) {
+        if (!openPipeCloexec(&in_pipe)) {
             closePair(out_pipe);
             if (opts.want_stderr) closePair(err_pipe);
             return error.PipeFailed;
@@ -1373,10 +1466,50 @@ const CreateProcessResult = struct {
 /// the list while the kernel is consuming it.  The handles themselves must be
 /// inheritable; CreateProcess still enforces that requirement for entries in
 /// PROC_THREAD_ATTRIBUTE_HANDLE_LIST.
+/// CreateProcessW environment block: `KEY=VALUE` UTF-16 strings, each
+/// NUL-terminated, sorted by name case-insensitively (as Windows expects),
+/// closed by an extra NUL.
+fn buildWindowsEnvBlock(allocator: std.mem.Allocator, entries: []const [:0]const u8) ![]u16 {
+    const sorted = try allocator.dupe([:0]const u8, entries);
+    defer allocator.free(sorted);
+    std.mem.sort([:0]const u8, sorted, {}, struct {
+        fn lessThan(_: void, lhs: [:0]const u8, rhs: [:0]const u8) bool {
+            const lhs_name = lhs[0 .. std.mem.indexOfScalar(u8, lhs, '=') orelse lhs.len];
+            const rhs_name = rhs[0 .. std.mem.indexOfScalar(u8, rhs, '=') orelse rhs.len];
+            return std.ascii.lessThanIgnoreCase(lhs_name, rhs_name);
+        }
+    }.lessThan);
+    var block: std.ArrayList(u16) = .empty;
+    errdefer block.deinit(allocator);
+    for (sorted) |entry| {
+        const wide = try std.unicode.utf8ToUtf16LeAlloc(allocator, entry);
+        defer allocator.free(wide);
+        try block.appendSlice(allocator, wide);
+        try block.append(allocator, 0);
+    }
+    if (sorted.len == 0) try block.append(allocator, 0);
+    try block.append(allocator, 0);
+    return block.toOwnedSlice(allocator);
+}
+
 fn createProcessWithHandleList(
     cmdline: win.LPWSTR,
     flags: win.CreateProcessFlags,
     cwd: ?win.LPCWSTR,
+    startup_info: *const win.STARTUPINFOW,
+    process_info: *win.PROCESS.INFORMATION,
+    handles: []const win.HANDLE,
+) CaptureError!CreateProcessResult {
+    return createProcessWithHandleListEnv(cmdline, flags, cwd, null, startup_info, process_info, handles);
+}
+
+/// `environment` is a double-NUL-terminated UTF-16 block
+/// (`flags.create_unicode_environment`) or null to inherit the parent's.
+fn createProcessWithHandleListEnv(
+    cmdline: win.LPWSTR,
+    flags: win.CreateProcessFlags,
+    cwd: ?win.LPCWSTR,
+    environment: ?[*:0]const u16,
     startup_info: *const win.STARTUPINFOW,
     process_info: *win.PROCESS.INFORMATION,
     handles: []const win.HANDLE,
@@ -1425,7 +1558,7 @@ fn createProcessWithHandleList(
         null,
         @enumFromInt(1),
         process_flags,
-        null,
+        environment,
         cwd,
         @ptrCast(&startup_ex),
         process_info,
@@ -2206,6 +2339,95 @@ test "spawnPipes 双向 echo（写 stdin 读回 stdout）" {
     child.closeStdout();
     child.terminate();
     try std.testing.expect(std.mem.indexOf(u8, buf[0..total], "ping-pong-99") != null);
+}
+
+test "openPipeCloexec marks both ends close-on-exec" {
+    if (is_windows) return error.SkipZigTest;
+    g_fork_serial.lock();
+    defer g_fork_serial.unlock();
+    var fds: [2]std.c.fd_t = undefined;
+    try std.testing.expect(openPipeCloexec(&fds));
+    defer closePair(fds);
+    for (fds) |fd| try std.testing.expect(std.c.fcntl(fd, std.c.F.GETFD) & std.c.FD_CLOEXEC != 0);
+}
+
+test "spawnPipes: a later spawn does not inherit the parent's ends" {
+    // The parent's ends used to be inheritable for the child's whole life:
+    // every later fork+exec (another MCP server, the TinyKG service, a Bash
+    // job) held the server's stdin write end, so closing it never reached the
+    // server, and a killed metacodes left the server running for as long as
+    // that sibling lived.
+    if (is_windows or !procSpawnTestsEnabled()) return error.SkipZigTest;
+    const server = try spawnPipes(&.{ "/bin/cat", null }, true, null);
+    defer server.terminate();
+    const sibling = try spawnPipes(&.{ "/bin/sleep", "10", null }, true, null);
+    defer {
+        sibling.closeStdin();
+        sibling.closeStdout();
+        sibling.terminate();
+    }
+    server.closeStdin();
+    // cat exits on EOF, and its stdout then reads as EOF too.
+    try std.testing.expect(server.pollReadable(3000));
+    var buf: [16]u8 = undefined;
+    try std.testing.expectEqual(@as(isize, 0), server.read(&buf));
+    server.closeStdout();
+}
+
+const CaptureThread = struct {
+    argv: []const ?[*:0]const u8,
+    stdin_data: []const u8,
+    result: CaptureError!Captured = error.SpawnFailed,
+
+    fn run(self: *CaptureThread) void {
+        self.result = capture(self.argv, std.testing.allocator, .{ .timeout_ms = 4000, .stdin_data = self.stdin_data });
+    }
+};
+
+test "capture: a spawn while stdin is being fed does not inherit its write end" {
+    // capture holds the stdin write end until it has written `stdin_data`. A
+    // spawn on another thread in that window used to inherit it, and the
+    // capture child then waited for an EOF that came only when the sibling
+    // exited: a hook, formal kernel or plugin call hung behind an unrelated
+    // background job.
+    if (is_windows or !procSpawnTestsEnabled()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var marker_buf: [256]u8 = undefined;
+    const marker = try testScratchPath(a, &marker_buf, "capture-stdin-started");
+    _ = std.c.unlink(marker.ptr);
+    defer _ = std.c.unlink(marker.ptr);
+    // More than a pipe buffer, so capture is still writing while the child
+    // sleeps; the child marks that it is running before it reads anything.
+    const input = try a.alloc(u8, 256 * 1024);
+    defer a.free(input);
+    @memset(input, 'x');
+    var job = CaptureThread{
+        .argv = &.{ "/bin/sh", "-c", "touch \"$0\"; sleep 1; cat >/dev/null; echo done", marker.ptr, null },
+        .stdin_data = input,
+    };
+    const thread = try std.Thread.spawn(.{}, CaptureThread.run, .{&job});
+    var waited: u32 = 0;
+    while (std.c.access(marker.ptr, 0) != 0) : (waited += 1) {
+        if (waited >= 500) break;
+        const req = std.c.timespec{ .sec = 0, .nsec = 10 * std.time.ns_per_ms };
+        var rem: std.c.timespec = undefined;
+        _ = std.c.nanosleep(&req, &rem);
+    }
+    const marked = std.c.access(marker.ptr, 0) == 0;
+    // The capture child is running, so capture now holds its stdin write end.
+    const sibling = spawnPipes(&.{ "/bin/sleep", "8", null }, true, null);
+    thread.join();
+    if (sibling) |child| {
+        child.closeStdin();
+        child.closeStdout();
+        child.terminate();
+    } else |_| {}
+    try std.testing.expect(marked);
+    _ = try sibling;
+    const captured = try job.result;
+    defer a.free(captured.stdout);
+    defer a.free(captured.stderr);
+    try std.testing.expect(std.mem.indexOf(u8, captured.stdout, "done") != null);
 }
 
 test "runInherit 返回 exit code" {

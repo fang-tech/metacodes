@@ -9,6 +9,8 @@ test {
     _ = @import("integration/http_stream_e2e_test.zig");
     _ = @import("integration/tool_abort_test.zig");
     _ = @import("integration/mcp_e2e_test.zig");
+    _ = @import("integration/mcp_protocol_test.zig");
+    _ = @import("integration/mcp_http_test.zig");
     _ = @import("integration/skills_e2e_test.zig");
     _ = @import("integration/agents_e2e_test.zig");
     _ = @import("component/provider_offer_test.zig");

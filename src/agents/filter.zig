@@ -11,6 +11,7 @@
 const std = @import("std");
 const json = @import("../json.zig");
 const AgentDef = @import("def.zig").AgentDef;
+const mcp_naming = @import("../mcp/naming.zig");
 
 /// 永远不可用于 subagent 的工具名(对齐 Claude Code 官方表)。
 pub const PERMANENTLY_DISABLED = [_][]const u8{
@@ -47,6 +48,7 @@ pub fn filterToolDefs(
         // memory 开启时 Read/Write/Edit 是该能力的必要通道，和 cc 一样补入白名单；
         // disallowed_tools 仍在上一步优先，可显式禁用。
         if (def.tools.len > 0 and !matchesAny(def.tools, d.name) and
+            !(d.mcp_server != null and matchesLegacyMcp(def.tools, d.name)) and
             !(def.memory_scope != .none and isMemoryTool(d.name))) continue;
         try out.append(allocator, d);
     }
@@ -71,6 +73,12 @@ pub fn filterMcpSessions(
         }
     }
     return try out.toOwnedSlice(allocator);
+}
+
+/// `tools:` 里 metacodes 旧命名 `<server>__<tool>` 仍选中现在的 `mcp__<server>__<tool>`。
+fn matchesLegacyMcp(patterns: []const []const u8, name: []const u8) bool {
+    for (patterns) |p| if (mcp_naming.isLegacyAlias(p, name)) return true;
+    return false;
 }
 
 fn isMemoryTool(name: []const u8) bool {
@@ -243,4 +251,28 @@ test "filterToolDefs: MCP allowlist uses provenance, not double-underscore names
     try testing.expectEqual(@as(usize, 2), filtered.len);
     try testing.expectEqualStrings("allowed__probe", filtered[0].name);
     try testing.expectEqualStrings("local__helper", filtered[1].name);
+}
+
+test "filterToolDefs: tools lists name MCP tools as mcp__server__tool or the legacy server__tool" {
+    const a = testing.allocator;
+    var def = try parseAgentMd(
+        a,
+        "---\nname: t\ntools: mcp__github__create_issue, slack__send, plain__tool\n---\nbody",
+        "/x",
+        .personal,
+    );
+    defer def.deinit(a);
+    const parent = [_]json.ToolDefinition{
+        .{ .name = "mcp__github__create_issue", .description = "", .input_schema = .{}, .mcp_server = "github" },
+        .{ .name = "mcp__github__delete_repo", .description = "", .input_schema = .{}, .mcp_server = "github" },
+        .{ .name = "mcp__slack__send", .description = "", .input_schema = .{}, .mcp_server = "slack" },
+        // Not MCP provenance: the legacy alias never applies to it.
+        .{ .name = "mcp__plain__tool", .description = "", .input_schema = .{} },
+    };
+
+    const filtered = try filterToolDefs(a, &parent, &def);
+    defer a.free(filtered);
+    try testing.expectEqual(@as(usize, 2), filtered.len);
+    try testing.expectEqualStrings("mcp__github__create_issue", filtered[0].name);
+    try testing.expectEqualStrings("mcp__slack__send", filtered[1].name);
 }

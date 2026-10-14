@@ -473,3 +473,67 @@ test "Skills E2E: slash syntax preserves path-first ordinary messages" {
         .not_a_command => return error.TestExpectedCommand,
     }
 }
+
+test "Skills E2E: Claude Code / Codex compatible sources reference the live directory" {
+    const allocator = std.testing.allocator;
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest; // POSIX symlink fixture
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try tmpRoot(&tmp, &root_buffer);
+    const agents_root = try std.fmt.allocPrint(allocator, "{s}/agents", .{root});
+    defer allocator.free(agents_root);
+    const claude_root = try std.fmt.allocPrint(allocator, "{s}/claude", .{root});
+    defer allocator.free(claude_root);
+    // The `npx skills add` layout: the real Skill under .agents, a link under .claude.
+    try makeSkill(agents_root, "builder", "---\nname: builder\ndescription: >\n  Builds things\n  from scripts.\nwhen_to_use: when asked to build\n---\nRun ${CLAUDE_SKILL_DIR}/scripts/build.sh then read references/notes.md.\n");
+    try makeSkill(claude_root, "manual", "---\nname: manual\ndescription: typed by the user only\ndisable-model-invocation: true\n---\nmanual body\n");
+    const link = try std.fmt.allocPrintSentinel(allocator, "{s}/builder", .{claude_root}, 0);
+    defer allocator.free(link);
+    const target = try std.fmt.allocPrintSentinel(allocator, "{s}/builder", .{agents_root}, 0);
+    defer allocator.free(target);
+    if (std.c.symlink(target.ptr, link.ptr) != 0) return error.SkipZigTest;
+
+    var fixture: Fixture = undefined;
+    fixture = .{
+        .runtime = Runtime.init(allocator, std.testing.io),
+        .projection = cc.skills.SkillSet.init(allocator),
+        .registry = cc.tools_dynamic.DynRegistry.init(allocator),
+        .abort = cc.util_abort.AbortSignal.init(),
+        .permission = .{ .mode = .init(.bypass_permissions), .allocator = allocator },
+        .tool_defs = try cc.tools.toToolDefinitions(allocator),
+    };
+    defer fixture.deinit(allocator);
+    const sources = [_]Source{
+        .{ .root = claude_root, .scope = .personal, .priority = 2002, .profile = .compat },
+        .{ .root = agents_root, .scope = .personal, .priority = 2003, .profile = .compat },
+    };
+    try fixture.runtime.loadSources(root, "", "", &sources, &fixture.projection);
+    try cc.skills_tool.registerSkillTool(&fixture.registry, &fixture.runtime);
+    allocator.free(fixture.tool_defs);
+    fixture.tool_defs = try cc.tools.toToolDefinitionsWithDyn(allocator, &fixture.registry);
+    try std.testing.expect(fixture.runtime.applyModelToolSchema(fixture.tool_defs));
+
+    // Linked twice, loaded once; the manual-only Skill is in the catalog.
+    try std.testing.expectEqual(@as(usize, 2), fixture.projection.len());
+    const prompt = try cc.system_prompt.buildWithSkills(allocator, "claude-opus-4-7", &fixture.projection, "/tmp");
+    defer allocator.free(prompt);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "**builder** — Builds things from scripts. when asked to build") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "**manual**") == null);
+
+    var real_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const real_length = try std.Io.Dir.realPathFileAbsolute(std.testing.io, target, &real_buffer);
+    const live_dir = real_buffer[0..real_length];
+    var ctx = fixture.context(allocator, root);
+    const output = try dispatchOk(&ctx, "Skill", "{\"name\":\"builder\"}");
+    defer allocator.free(output);
+    const base_line = try std.fmt.allocPrint(allocator, "Base directory for this skill: {s}\n", .{live_dir});
+    defer allocator.free(base_line);
+    try std.testing.expect(std.mem.indexOf(u8, output, base_line) != null);
+    const script = try std.fmt.allocPrint(allocator, "Run {s}/scripts/build.sh", .{live_dir});
+    defer allocator.free(script);
+    try std.testing.expect(std.mem.indexOf(u8, output, script) != null);
+
+    // `disable-model-invocation`: the model may not activate it.
+    try std.testing.expectError(error.PolicyViolation, cc.tools.dispatch(&ctx, "Skill", "{\"name\":\"manual\"}"));
+}

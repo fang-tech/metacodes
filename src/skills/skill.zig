@@ -63,6 +63,10 @@ fn cloneProjection(allocator: std.mem.Allocator, record: catalog.SkillRecord) !S
     errdefer allocator.free(name);
     const description = try allocator.dupe(u8, source.description);
     errdefer allocator.free(description);
+    const when_to_use = try allocator.dupe(u8, source.when_to_use);
+    errdefer allocator.free(when_to_use);
+    const argument_hint = try allocator.dupe(u8, source.argument_hint);
+    errdefer allocator.free(argument_hint);
     const body = try allocator.dupe(u8, source.body);
     errdefer allocator.free(body);
     const allowed_tools = try cloneStrings(allocator, source.allowed_tools);
@@ -85,11 +89,14 @@ fn cloneProjection(allocator: std.mem.Allocator, record: catalog.SkillRecord) !S
     return .{
         .name = name,
         .description = description,
+        .when_to_use = when_to_use,
+        .argument_hint = argument_hint,
         .body = body,
         .allowed_tools = allowed_tools,
         .disallowed_tools = disallowed_tools,
         .arguments = arguments,
         .disable_model_invocation = source.disable_model_invocation,
+        .user_invocable = source.user_invocable,
         .model_activation = source.model_activation,
         .context = source.context,
         .agent = agent,

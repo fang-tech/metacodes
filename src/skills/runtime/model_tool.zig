@@ -155,12 +155,44 @@ pub fn buildDescriptionWithAvailability(
         if (!available.isEnabledAt(snapshot, index) or
             skill.definition.disable_model_invocation)
             continue;
+        var scratch = std.heap.ArenaAllocator.init(allocator);
+        defer scratch.deinit();
         try output.writer.print(
             "- {s}: {s}\n",
-            .{ skill.invocation_name, skill.definition.description },
+            .{
+                skill.invocation_name,
+                try listingDescription(scratch.allocator(), skill.definition.description, skill.definition.when_to_use),
+            },
         );
     }
     return output.toOwnedSlice();
+}
+
+/// Per-Skill cap on `description` + `when_to_use` in a listing (Claude Code
+/// `skillListingMaxDescChars` default, counted here in bytes).
+pub const LISTING_MAX_DESCRIPTION_BYTES: usize = 1536;
+
+/// `description` and `when_to_use` joined on one line with whitespace runs
+/// collapsed (a folded YAML description keeps paragraph breaks), capped at
+/// `LISTING_MAX_DESCRIPTION_BYTES` on a UTF-8 boundary.
+pub fn listingDescription(arena: std.mem.Allocator, description: []const u8, when_to_use: []const u8) ![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    for ([_][]const u8{ description, when_to_use }) |part| {
+        var words = std.mem.tokenizeAny(u8, part, " \t\r\n");
+        while (words.next()) |word| {
+            if (out.items.len != 0) try out.append(arena, ' ');
+            try out.appendSlice(arena, word);
+        }
+    }
+    return truncateUtf8(arena, out.items, LISTING_MAX_DESCRIPTION_BYTES);
+}
+
+pub fn truncateUtf8(arena: std.mem.Allocator, text: []const u8, max_bytes: usize) ![]const u8 {
+    if (text.len <= max_bytes) return text;
+    const ellipsis = "…";
+    var end = max_bytes - ellipsis.len;
+    while (end > 0 and (text[end] & 0xc0) == 0x80) end -= 1;
+    return std.mem.concat(arena, u8, &.{ std.mem.trimEnd(u8, text[0..end], " "), ellipsis });
 }
 
 pub fn formatResult(
@@ -234,6 +266,9 @@ test "model Skill surface omits disabled records while catalog stays intact" {
                 .disallowed_tools = &.{},
                 .arguments = &.{},
                 .disable_model_invocation = false,
+                .when_to_use = "",
+                .argument_hint = "",
+                .user_invocable = true,
                 .model_activation = .required_first,
                 .context = .inline_ctx,
                 .agent = "",
@@ -255,6 +290,9 @@ test "model Skill surface omits disabled records while catalog stays intact" {
                 .disallowed_tools = &.{},
                 .arguments = &.{},
                 .disable_model_invocation = false,
+                .when_to_use = "",
+                .argument_hint = "",
+                .user_invocable = true,
                 .model_activation = .required_first,
                 .context = .inline_ctx,
                 .agent = "",

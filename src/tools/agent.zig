@@ -586,7 +586,7 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     return try out.toOwnedSlice(ctx.allocator);
 }
 
-fn mapPermissionMode(mode: @import("../agents/def.zig").PermissionMode) @import("../types.zig").PermissionMode {
+pub fn mapPermissionMode(mode: @import("../agents/def.zig").PermissionMode) @import("../types.zig").PermissionMode {
     return switch (mode) {
         .default => .default,
         .acceptEdits => .accept_edits,

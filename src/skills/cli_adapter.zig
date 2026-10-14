@@ -72,7 +72,7 @@ pub const Runtime = struct {
         state_root: []const u8,
         projection: *skill_projection.SkillSet,
     ) !void {
-        return self.loadDefaultWithExtraSources(cwd, home, state_root, "", &.{}, projection);
+        return self.loadDefaultWithExtraSources(cwd, home, state_root, &.{}, "", &.{}, projection);
     }
 
     /// Product defaults plus Host-admitted plugin sources are resolved by one
@@ -83,6 +83,7 @@ pub const Runtime = struct {
         cwd: []const u8,
         home: []const u8,
         state_root: []const u8,
+        additional_dirs: []const []const u8,
         workspace_epoch: []const u8,
         extra_sources: []const runtime.catalog.Source,
         projection: *skill_projection.SkillSet,
@@ -93,12 +94,14 @@ pub const Runtime = struct {
 
         var scratch = std.heap.ArenaAllocator.init(self.allocator);
         defer scratch.deinit();
-        const defaults = try runtime.catalog.defaultSources(
-            scratch.allocator(),
-            workspace_root,
-            home,
-            state_root,
-        );
+        const defaults = try runtime.catalog.defaultSources(scratch.allocator(), .{
+            .cwd = cwd,
+            .workspace_root = workspace_root,
+            .home = home,
+            .state_root = state_root,
+            .codex_home = paths.codexHomeEnv() orelse "",
+            .additional_dirs = additional_dirs,
+        });
         var combined: std.ArrayList(runtime.catalog.Source) = .empty;
         try combined.appendSlice(scratch.allocator(), defaults);
         try combined.appendSlice(scratch.allocator(), extra_sources);
@@ -164,10 +167,16 @@ pub const Runtime = struct {
         return null;
     }
 
+    /// A Skill is invocable when the model may call it and its files are
+    /// reachable: a compat Skill references its live directory, a snapshot
+    /// Skill needs the materialization manager.
     pub fn hasModelInvocable(self: *const Runtime) bool {
-        if (self.materializations == null) return false;
         const snapshot = self.snapshot orelse return false;
-        return runtime.model_tool.hasModelInvocable(snapshot);
+        for (snapshot.skills) |record| {
+            if (record.definition.disable_model_invocation) continue;
+            if (record.live_dir != null or self.materializations != null) return true;
+        }
+        return false;
     }
 
     /// Patch the CLI-owned dynamic definition with the canonical schema plus
@@ -198,12 +207,13 @@ pub const Runtime = struct {
         defer self.contexts_mutex.unlock();
 
         const snapshot = self.snapshot orelse return error.SkillUnavailable;
-        const materializations = if (self.materializations) |*manager|
+        const materializations: ?*runtime.materialization.Manager = if (self.materializations) |*manager|
             manager
         else
-            return error.SkillUnavailable;
+            null;
         const record = snapshot.findByInvocation(invocation_name) orelse
             return error.SkillNotFound;
+        if (record.live_dir == null and materializations == null) return error.SkillUnavailable;
         const abort = ctx.abort orelse return error.SkillUnavailable;
         const state = try self.ensureContextLocked(ctx);
         const parent = currentFrameLocked(state);
@@ -218,6 +228,7 @@ pub const Runtime = struct {
                 .context = activation_context,
                 .shell_policy = shell_policy,
                 .model_override_capability = .allowed,
+                .agent_profiles = .supported,
             },
         );
         defer plan.deinit();
@@ -523,7 +534,9 @@ pub fn parseSlashSyntax(rest: []const u8) SlashSyntax {
     var head_end: usize = 0;
     while (head_end < rest.len and rest[head_end] != ' ' and rest[head_end] != '\t') : (head_end += 1) {}
     const head = rest[0..head_end];
-    if (head.len == 0 or !runtime.catalog.validInvocationName(head))
+    // The CLI catalog uses the compat grammar (a superset of the canonical one),
+    // so `/地址库` reaches its Skill.
+    if (head.len == 0 or !runtime.catalog.validCompatInvocationName(head))
         return .not_a_command;
     return .{ .command = head };
 }
@@ -652,9 +665,10 @@ pub fn handleSlash(
     activation_live = false;
     errdefer app.clearActiveSkill();
 
-    const skill_result = try runtime.model_tool.formatResult(
+    const skill_result = try formatSkillResult(
         allocator,
         record.definition.name,
+        activation,
         activation.rendered_body,
         false,
     );
@@ -754,9 +768,10 @@ fn executeModelTool(
         defer ctx.allocator.free(final_text);
         try self.finishActivation(ctx.agent_ident, activation);
         activation_live = false;
-        return runtime.model_tool.formatResult(
+        return formatSkillResult(
             ctx.allocator,
             record.definition.name,
+            activation,
             final_text,
             true,
         );
@@ -764,14 +779,36 @@ fn executeModelTool(
     const permission = ctx.permission_ctx orelse
         return error.SkillPolicyUnavailable;
     try self.projectCurrent(ctx.agent_ident, permission);
-    const output = try runtime.model_tool.formatResult(
+    const output = try formatSkillResult(
         ctx.allocator,
         record.definition.name,
+        activation,
         activation.rendered_body,
         false,
     );
     activation_live = false;
     return output;
+}
+
+/// Skill tool / slash result: the rendered instructions preceded by the
+/// directory their relative paths resolve against. Claude Code and Codex both
+/// give the model this location (Codex skills reference `scripts/` and
+/// `references/` relative to SKILL.md); the body alone cannot be followed.
+fn formatSkillResult(
+    allocator: std.mem.Allocator,
+    display_name: []const u8,
+    activation: *const runtime.activation.Activation,
+    body: []const u8,
+    forked: bool,
+) ![]u8 {
+    if (forked) return runtime.model_tool.formatResult(allocator, display_name, body, true);
+    const with_base = try std.fmt.allocPrint(
+        allocator,
+        "Base directory for this skill: {s}\n\n{s}",
+        .{ activation.tree.path(), body },
+    );
+    defer allocator.free(with_base);
+    return runtime.model_tool.formatResult(allocator, display_name, with_base, false);
 }
 
 fn executeFork(
@@ -787,8 +824,17 @@ fn executeFork(
     var system_prompt: []const u8 = "You are a subagent. Complete the task and return a concise summary.\n";
     var owned_prompt: ?[]u8 = null;
     defer if (owned_prompt) |prompt| ctx.allocator.free(prompt);
+    // `agent:` names the subagent profile a forked Skill runs under (Claude
+    // Code): its prompt, tool set, permission mode and model apply, as they do
+    // for a Task with that subagent type. Without it the general-purpose
+    // prompt is used and the parent's tools pass through the Skill frame.
+    const agent_name = if (activation.agent.len != 0) activation.agent else "general-purpose";
+    const named_agent: ?*const @import("../agents/def.zig").AgentDef = if (activation.agent.len != 0) blk: {
+        const agents = ctx.agents orelse return error.SkillAgentNotFound;
+        break :blk agents.find(agent_name) orelse return error.SkillAgentNotFound;
+    } else null;
     if (ctx.agents) |agents| {
-        if (agents.find("general-purpose")) |definition| {
+        if (agents.find(agent_name)) |definition| {
             owned_prompt = try preload.buildSubagentContext(ctx.allocator, definition, .{
                 .project_dir = ctx.project_dir,
                 .parent_model = ctx.parent_model,
@@ -809,10 +855,27 @@ fn executeFork(
     // skill.model 与 Task 同语义:档位名查当前 provider 档位表(未配置 → inherit),
     // 显式模型名透传。档位 effort 此路径暂不消费(fork 子跑道无 effort override 通道)。
     const model_override = switch (activation.model_selection) {
-        .inherit_parent => null,
+        .inherit_parent => if (named_agent) |agent| agent_tool.resolveModelSelection(ctx.model_tiers, null, agent.model).model else null,
         .override => |model| agent_tool.resolveModelSelection(ctx.model_tiers, model, null).model,
     };
-    var child_permission = permission.scopedDerive(null);
+    var agent_tool_defs: ?[]@import("../json.zig").ToolDefinition = null;
+    defer if (agent_tool_defs) |defs| ctx.allocator.free(defs);
+    if (named_agent) |agent| agent_tool_defs = try @import("../agents/filter.zig").filterToolDefs(ctx.allocator, tool_defs, agent);
+    // The agent's tool set caps dispatch, not just the advertised schema; the
+    // Skill frame still narrows it further.
+    var agent_tool_cap = @import("../tools/context.zig").ToolSetExecutionPolicy{
+        .definitions = agent_tool_defs orelse tool_defs,
+        .parent = activation.frame.executionPolicy(),
+    };
+    const child_execution_policy = if (named_agent != null)
+        agent_tool_cap.executionPolicy()
+    else
+        activation.frame.executionPolicy();
+    const mode_override: ?@import("../types.zig").PermissionMode = if (named_agent) |agent|
+        (if (agent.permission_mode) |mode| agent_tool.mapPermissionMode(mode) else null)
+    else
+        null;
+    var child_permission = permission.scopedDerive(mode_override);
     child_permission.active_skill = null;
     const child_ident = session_id.gen();
     try self.registerChildContext(
@@ -820,14 +883,20 @@ fn executeFork(
         activation.frame,
         &child_permission,
     );
+    const task = try std.fmt.allocPrint(
+        ctx.allocator,
+        "Base directory for this skill: {s}\n\n{s}",
+        .{ activation.tree.path(), activation.rendered_body },
+    );
+    defer ctx.allocator.free(task);
     const result = subagent.spawnAgent(
         ctx.allocator,
         ctx.provider orelse api_client.provider(),
         api_client,
-        tool_defs,
+        agent_tool_defs orelse tool_defs,
         &child_permission,
         ctx.abort,
-        activation.rendered_body,
+        task,
         .{
             .system_prompt = system_prompt,
             .agent_depth = ctx.agent_depth + 1,
@@ -837,7 +906,7 @@ fn executeFork(
             .host_services = null,
             .session = ctx.session,
             .project_dir = ctx.project_dir,
-            .execution_policy = activation.frame.executionPolicy(),
+            .execution_policy = child_execution_policy,
             .agent_ident = child_ident,
         },
     ) catch |run_error| {

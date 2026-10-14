@@ -7,13 +7,19 @@
 //!
 //! 只支持我们需要的形态:127.0.0.1 loopback 的 listen/accept + connect,阻塞 IO +
 //! 可选收/发超时。不做通用 sockets 库(YAGNI)。
+//!
+//! Every socket handed out here is close-on-exec (POSIX) or non-inheritable
+//! (Windows) from creation; see "No socket crosses into a child process".
 
 const std = @import("std");
 const builtin = @import("builtin");
 const pfs = @import("fs.zig"); // 可移植 stat（isSocket 等）——避免 std.c.Stat（linux 下 void）
-const pproc = @import("process.zig"); // currentPid（跨平台;测试唯一 path 用，std.time.nanoTimestamp 在此 Zig 0.16 缺失）
+const pproc = @import("process.zig"); // fork 串行锁(Darwin 建 socket);currentPid(测试唯一 path)
 const psync = @import("sync.zig");
 const is_windows = builtin.os.tag == .windows;
+/// Darwin has neither `SOCK_CLOEXEC` nor `accept4`. Its `std.c.SOCK.CLOEXEC`
+/// is a shim for std's own wrappers, not a flag `socket(2)` accepts.
+const is_darwin = builtin.os.tag.isDarwin();
 const win = std.os.windows;
 const ws2 = win.ws2_32; // 只用它的常量/struct(AF/SOCK/SOL/SO/IPPROTO/sockaddr);zig 0.16 未导出函数
 
@@ -30,7 +36,7 @@ const WSAPOLLFD = extern struct { fd: SOCKET, events: i16, revents: i16 };
 // 中立 wrapper(pub fn recv/send),故放进 `sys` 隔离,符号名不受 zig 侧标识符影响。
 const sys = struct {
     extern "ws2_32" fn WSAStartup(wVersionRequested: u16, lpWSAData: *WSADATA) callconv(.winapi) i32;
-    extern "ws2_32" fn socket(af: i32, socktype: i32, protocol: i32) callconv(.winapi) SOCKET;
+    extern "ws2_32" fn WSASocketW(af: i32, socktype: i32, protocol: i32, lpProtocolInfo: ?*anyopaque, g: u32, dwFlags: u32) callconv(.winapi) SOCKET;
     extern "ws2_32" fn bind(s: SOCKET, addr: *const anyopaque, namelen: i32) callconv(.winapi) i32;
     extern "ws2_32" fn listen(s: SOCKET, backlog: i32) callconv(.winapi) i32;
     extern "ws2_32" fn accept(s: SOCKET, addr: ?*anyopaque, addrlen: ?*i32) callconv(.winapi) SOCKET;
@@ -44,10 +50,16 @@ const sys = struct {
     extern "ws2_32" fn WSAPoll(fdArray: [*]WSAPOLLFD, fds: u32, timeout: i32) callconv(.winapi) i32;
     extern "ws2_32" fn ioctlsocket(s: SOCKET, cmd: c_long, argp: *c_ulong) callconv(.winapi) i32;
     extern "ws2_32" fn WSAGetLastError() callconv(.winapi) i32;
+    extern "kernel32" fn SetHandleInformation(handle: *anyopaque, mask: u32, flags: u32) callconv(.winapi) c_int;
+    extern "kernel32" fn GetHandleInformation(handle: *anyopaque, flags: *u32) callconv(.winapi) c_int;
 };
 
 const FIONBIO: c_long = @bitCast(@as(c_ulong, 0x8004667e));
 const WSAEWOULDBLOCK: i32 = 10035;
+/// `socket()`'s default: keep it, so only inheritance changes.
+const WSA_FLAG_OVERLAPPED: u32 = 0x01;
+const WSA_FLAG_NO_HANDLE_INHERIT: u32 = 0x80;
+const HANDLE_FLAG_INHERIT: u32 = 0x1;
 
 /// 中立 socket 句柄。POSIX=fd(c_int),Windows=SOCKET(UINT_PTR)。
 pub const Socket = if (is_windows) SOCKET else c_int;
@@ -96,14 +108,50 @@ fn loopbackAddr(port: u16) if (is_windows) ws2.sockaddr.in else std.c.sockaddr.i
     };
 }
 
+// ============================================================================
+// No socket crosses into a child process
+// ============================================================================
+//
+// Every socket this module returns is close-on-exec (POSIX) or non-inheritable
+// (Windows) from creation. Before that, each later fork+exec — a Bash job, a
+// hook, an MCP server — took the listener and every open connection with it.
+// A job that outlived metacodes kept the `--web` port bound, so the next
+// `--web` on it failed to bind, and kept the browser's SSE connection open
+// after metacodes closed it, so the page never saw its stream end.
+
+/// POSIX `socket` whose descriptor is close-on-exec from the moment it exists.
+/// Linux sets the flag in the same call. Darwin needs a second one, so both
+/// run under the fork serial lock: no fork that takes it (every spawn in
+/// `process.zig`, the teammate fork) lands between them.
+fn socketCloexec(domain: c_uint, sock_type: c_uint) ?Socket {
+    if (!is_darwin) {
+        const s = std.c.socket(domain, sock_type | std.c.SOCK.CLOEXEC, 0);
+        return if (s >= 0) s else null;
+    }
+    pproc.forkSerialLock();
+    defer pproc.forkSerialUnlock();
+    const s = std.c.socket(domain, sock_type, 0);
+    if (s < 0) return null;
+    if (!setCloseOnExec(s)) {
+        _ = std.c.close(s);
+        return null;
+    }
+    return s;
+}
+
+fn setCloseOnExec(fd: c_int) bool {
+    const current = std.c.fcntl(fd, std.c.F.GETFD);
+    return current >= 0 and std.c.fcntl(fd, std.c.F.SETFD, current | std.c.FD_CLOEXEC) >= 0;
+}
+
 fn newTcp() Error!Socket {
     try ensureStartup();
-    const s = if (is_windows)
-        sys.socket(ws2.AF.INET, ws2.SOCK.STREAM, ws2.IPPROTO.TCP)
-    else
-        std.c.socket(std.c.AF.INET, std.c.SOCK.STREAM, 0);
-    if (!isValid(s)) return error.SocketFailed;
-    return s;
+    if (is_windows) {
+        const s = sys.WSASocketW(ws2.AF.INET, ws2.SOCK.STREAM, ws2.IPPROTO.TCP, null, 0, WSA_FLAG_OVERLAPPED | WSA_FLAG_NO_HANDLE_INHERIT);
+        if (!isValid(s)) return error.SocketFailed;
+        return s;
+    }
+    return socketCloexec(std.c.AF.INET, std.c.SOCK.STREAM) orelse error.SocketFailed;
 }
 
 // Windows 的 SO_REUSEADDR 语义 ≠ POSIX:它允许**别的进程**重绑同一 loopback 端口(本机劫持
@@ -147,16 +195,39 @@ pub fn listenLoopback(port: u16, backlog: u31) Error!Listener {
 }
 
 /// 阻塞 accept 一个连接。出错返 null(调用方据自身 closing 标志决定退出 vs 重试)。
+///
+/// The connection is close-on-exec like every socket here; Linux gets that
+/// from `accept4` in one call. Darwin marks it right after `accept` returns,
+/// outside the fork serial lock: `accept` blocks until a client connects, and
+/// holding the lock that long would stall every spawn. Nor can it become a
+/// `poll` plus a non-blocking `accept` under the lock, because closing the
+/// listener wakes a blocked `accept` but not a `poll` on it (measured on
+/// macOS), so the web and UDS servers would never stop. A fork that lands
+/// between the two calls can still take that one connection along, the trade
+/// Zig's std and Go make on Darwin too.
 pub fn acceptConn(listener: Socket) ?Socket {
     if (is_windows) {
         const c = sys.accept(listener, null, null);
         if (c == INVALID_SOCKET) return null;
+        // Not left to whatever `accept` copies from the listener. Best effort:
+        // a layered service provider that refuses leaves a handle only a
+        // CreateProcess inheriting every handle could pass on, and metacodes
+        // makes none.
+        _ = sys.SetHandleInformation(@ptrFromInt(c), HANDLE_FLAG_INHERIT, 0);
         return c;
     } else {
         var caddr: std.c.sockaddr = undefined;
         var alen: std.c.socklen_t = @sizeOf(@TypeOf(caddr));
+        if (!is_darwin) {
+            const c = std.c.accept4(listener, &caddr, &alen, std.c.SOCK.CLOEXEC);
+            return if (c >= 0) c else null;
+        }
         const c = std.c.accept(listener, &caddr, &alen);
         if (c < 0) return null;
+        if (!setCloseOnExec(c)) {
+            _ = std.c.close(c);
+            return null;
+        }
         return c;
     }
 }
@@ -423,8 +494,7 @@ pub fn listenUnix(path: []const u8, backlog: u31) Error!Socket {
     // **仅当 path 已是 socket 才 unlink**(footgun 防护,Linus-C):`--uds /some/regular/file` 绝不该删
     // 用户的普通文件。非 socket 存在 → 不删,后续 bind 报 BindFailed(EADDRINUSE),不静默毁数据。
     if (pfs.isSocket(pz)) _ = std.c.unlink(pz); // 可移植 stat（非 socket / 不存在 → 不删）
-    const s = std.c.socket(std.c.AF.UNIX, std.c.SOCK.STREAM, 0);
-    if (!isValid(s)) return error.SocketFailed;
+    const s = socketCloexec(std.c.AF.UNIX, std.c.SOCK.STREAM) orelse return error.SocketFailed;
     errdefer closeSocket(s);
     var addr = unixAddr(path);
     if (std.c.bind(s, @ptrCast(&addr), @sizeOf(@TypeOf(addr))) < 0) return error.BindFailed;
@@ -445,8 +515,7 @@ pub fn recvRetriable() bool {
 pub fn connectUnix(path: []const u8) Error!Socket {
     if (is_windows) return error.ConnectFailed;
     if (path.len == 0 or path.len >= SUN_PATH_MAX) return error.ConnectFailed;
-    const s = std.c.socket(std.c.AF.UNIX, std.c.SOCK.STREAM, 0);
-    if (!isValid(s)) return error.SocketFailed;
+    const s = socketCloexec(std.c.AF.UNIX, std.c.SOCK.STREAM) orelse return error.SocketFailed;
     errdefer closeSocket(s);
     var addr = unixAddr(path);
     if (std.c.connect(s, @ptrCast(&addr), @sizeOf(@TypeOf(addr))) < 0) return error.ConnectFailed;
@@ -562,6 +631,69 @@ test "loopback listen/connect/send/recv roundtrip" {
     try testing.expectEqualSlices(u8, msg, buf[0..@intCast(n)]);
 }
 
+/// Whether a child process could inherit `s`. An unreadable flag counts as
+/// inheritable, so a failed lookup cannot pass a test.
+fn inheritable(s: Socket) bool {
+    if (is_windows) {
+        var flags: u32 = 0;
+        if (sys.GetHandleInformation(@ptrFromInt(s), &flags) == 0) return true;
+        return flags & HANDLE_FLAG_INHERIT != 0;
+    }
+    const flags = std.c.fcntl(s, std.c.F.GETFD);
+    return flags < 0 or flags & std.c.FD_CLOEXEC == 0;
+}
+
+test "loopback listener, client and accepted socket are not inheritable" {
+    const listener = try listenLoopback(0, 4);
+    defer closeSocket(listener.sock);
+    const client = try connectLoopback(listener.port);
+    defer closeSocket(client);
+    const conn = acceptConn(listener.sock) orelse return error.AcceptFailed;
+    defer closeSocket(conn);
+    try testing.expect(!inheritable(listener.sock));
+    try testing.expect(!inheritable(client));
+    try testing.expect(!inheritable(conn));
+}
+
+test "a child spawned after listen and accept holds neither the port nor the connection" {
+    // A Bash job started while `--web` served a page used to inherit the
+    // listener and the page's SSE connection. Once metacodes had closed both
+    // (or was gone), the job still held them: the next `--web` on the port
+    // failed to bind, and the browser waited on a stream nobody would end.
+    // On Windows every CreateProcess passes no handles or an explicit list.
+    if (is_windows) return error.SkipZigTest;
+    // Forks a real child; see `procSpawnTestsEnabled` in process.zig.
+    if (std.c.getenv("METACODES_PROC_TEST") == null) return error.SkipZigTest;
+    const listener = try listenLoopback(0, 4);
+    var listening = true;
+    defer if (listening) closeSocket(listener.sock);
+    const client = try connectLoopback(listener.port);
+    defer closeSocket(client);
+    const conn = acceptConn(listener.sock) orelse return error.AcceptFailed;
+    var connected = true;
+    defer if (connected) closeSocket(conn);
+
+    const null_fd = std.c.open("/dev/null", .{ .ACCMODE = .WRONLY, .CLOEXEC = true }, @as(std.c.mode_t, 0));
+    if (null_fd < 0) return error.SkipZigTest;
+    defer _ = std.c.close(null_fd);
+    const child = try pproc.spawnToFiles(&.{ "/bin/sleep", "30", null }, null_fd, null_fd, null);
+    defer {
+        pproc.killJob(child);
+        pproc.reapBlocking(child);
+    }
+
+    closeSocket(conn);
+    connected = false;
+    try testing.expect(pollReadable(client, 2000));
+    var buf: [8]u8 = undefined;
+    try testing.expectEqual(@as(isize, 0), recv(client, &buf));
+
+    closeSocket(listener.sock);
+    listening = false;
+    const again = try listenLoopback(listener.port, 4);
+    closeSocket(again.sock);
+}
+
 test "pollReadable tracks pending loopback connection" {
     const listener = try listenLoopback(0, 4);
     defer closeSocket(listener.sock);
@@ -643,6 +775,9 @@ test "UDS listen/connect/send/recv roundtrip(POSIX)" {
     defer closeSocket(client);
     const conn = acceptConn(listener) orelse return error.AcceptFailed;
     defer closeSocket(conn);
+    try testing.expect(!inheritable(listener));
+    try testing.expect(!inheritable(client));
+    try testing.expect(!inheritable(conn));
 
     const msg = "ndjson\n";
     try testing.expectEqual(@as(isize, msg.len), send(client, msg));

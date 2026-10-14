@@ -644,14 +644,26 @@ test "modern tools list preserves full schemas and derives bound identity" {
     try std.testing.expect(!std.mem.allEqual(u8, &catalog.tools[0].identity.permissionBinding(), 0));
 }
 
-test "modern call rejects missing result type and returns typed input required" {
-    const missing = try parseCallToolResponse(
+test "modern call treats a missing result type as complete and returns typed input required" {
+    // 2026-07-28 `Result.resultType`: an absent field MUST be read as "complete".
+    var missing = try parseCallToolResponse(
         std.testing.allocator,
         "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"content\":[]}}",
         1,
         .{},
     );
-    try std.testing.expectEqual(canonical.DiagnosticCode.missing_result_type, missing.diagnostic.code);
+    switch (missing) {
+        .value => |*result| result.deinit(),
+        .diagnostic => return error.TestUnexpectedResult,
+    }
+    // A spec-shaped InputRequest carries only `method` and `params`.
+    const spec_shaped = try parseCallToolResponse(
+        std.testing.allocator,
+        "{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"resultType\":\"input_required\",\"inputRequests\":{\"login\":{\"method\":\"elicitation/create\",\"params\":{\"message\":\"who\"}}},\"requestState\":\"s\"}}",
+        3,
+        .{},
+    );
+    try std.testing.expectEqual(canonical.DiagnosticCode.input_required_unsupported, spec_shaped.diagnostic.code);
     const input_required = try parseCallToolResponse(
         std.testing.allocator,
         "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"resultType\":\"input_required\",\"requestState\":\"opaque\"}}",

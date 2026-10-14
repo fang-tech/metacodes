@@ -433,7 +433,9 @@ runner 试图 `abort_pre_request`:日志仍是 `reserved` 则中止落账、续�
 contribution_count 全部保留。同一 commit、同一运行时在另一路径的 checkout 上得到同一份清单。
 inventory 预检在临时 HOME 下、`METACODES_NO_PROBE=1` 执行:`--dump-plugins` 应答前运行时
 会构造完整 App,在真实 HOME 下会留下 session 目录、读 `~/.metacodes/config.json` 并拉起
-其中的 MCP server、探测模型目录。
+其中的 MCP server、探测模型目录。`CODEX_HOME` 是绝对路径、不随临时 HOME 移走,预检与门禁
+的子进程环境都把它剥掉,否则运行时会读调用者 Codex 的 Skills 并拉起其 `config.toml` 里的
+MCP server。
 
 **子进程环境去注入向量。** 预检与 rollout(`paired_runner._runner_env`)共用 `hermetic_env`:
 剥掉 `BASH_ENV`/`ENV`/`SHELLOPTS`/`BASHOPTS`/`CDPATH`/`GLOBIGNORE`、导出的 shell 函数
