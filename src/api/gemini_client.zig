@@ -1134,7 +1134,7 @@ test "M7 Gemini: reasoning_effort=null 不发 generation_config(自适应)" {
 
 test "Gemini 有状态缓存句柄表:命中/过期/剔除" {
     const a = std.testing.allocator;
-    var io_rt = std.Io.Threaded.init(a, .{});
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
     defer io_rt.deinit();
     var client = GeminiClient.init(a, io_rt.io(), "k", "gemini-2.5-flash", "http://localhost");
     defer client.deinit();

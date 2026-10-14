@@ -114,7 +114,7 @@ fn runScenario(
     defer server.stop();
     const url = try server.urlOwned(allocator);
     defer allocator.free(url);
-    var io_runtime = std.Io.Threaded.init(allocator, .{});
+    var io_runtime = @import("platform").signal.threadedIo(allocator, .{});
     defer io_runtime.deinit();
     var client = cc.client_mod.Client.initWithBaseUrl(allocator, io_runtime.io(), "key", "model", url);
     defer client.deinit();

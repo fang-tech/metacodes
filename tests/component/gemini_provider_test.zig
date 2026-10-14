@@ -25,7 +25,7 @@ test "C3: 同一 agent_loop 喂 Gemini provider(异协议)跑通到 end_turn" {
     const url = try srv.urlOwned(a);
     defer a.free(url);
 
-    var io_rt = std.Io.Threaded.init(a, .{});
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
     defer io_rt.deinit();
     var client = gemini.GeminiClient.init(a, io_rt.io(), "test-key", "gemini-2.5-flash", url);
     defer client.deinit();
@@ -73,7 +73,7 @@ test "P0.5: parent=Gemini → spawnAgentSink 继承 Gemini provider(子请求是
     const url = try srv.urlOwned(a);
     defer a.free(url);
 
-    var io_rt = std.Io.Threaded.init(a, .{});
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
     defer io_rt.deinit();
     var client = gemini.GeminiClient.init(a, io_rt.io(), "test-key", "gemini-2.5-flash", url);
     defer client.deinit();
@@ -127,7 +127,7 @@ test "C3: Gemini functionCall → 中立工具循环 → 第二轮 end_turn(工�
     const url = try srv.urlOwned(a);
     defer a.free(url);
 
-    var io_rt = std.Io.Threaded.init(a, .{});
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
     defer io_rt.deinit();
     var client = gemini.GeminiClient.init(a, io_rt.io(), "test-key", "gemini-2.5-flash", url);
     defer client.deinit();
@@ -183,7 +183,7 @@ test "C3/P0.1: 并行 functionCall 两个都执行 + name 干净 + 第二轮双 
     const url = try srv.urlOwned(a);
     defer a.free(url);
 
-    var io_rt = std.Io.Threaded.init(a, .{});
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
     defer io_rt.deinit();
     var client = gemini.GeminiClient.init(a, io_rt.io(), "test-key", "gemini-2.5-flash", url);
     defer client.deinit();
@@ -239,7 +239,7 @@ test "C3/缓存: 有状态句柄命中 → 请求体带 cachedContent 引用(sta
     const url = try srv.urlOwned(a);
     defer a.free(url);
 
-    var io_rt = std.Io.Threaded.init(a, .{});
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
     defer io_rt.deinit();
     var client = gemini.GeminiClient.init(a, io_rt.io(), "test-key", "gemini-2.5-flash", url);
     defer client.deinit();
@@ -280,7 +280,7 @@ test "C3/缓存: usage 与 content 同 chunk 时 usage 不丢(E 修复)" {
     const url = try srv.urlOwned(a);
     defer a.free(url);
 
-    var io_rt = std.Io.Threaded.init(a, .{});
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
     defer io_rt.deinit();
     var client = gemini.GeminiClient.init(a, io_rt.io(), "test-key", "gemini-2.5-flash", url);
     defer client.deinit();
@@ -336,7 +336,7 @@ test "Gemini functionCall id 跨请求唯一(掺 RequestId,防跨轮碰撞)" {
     const url = try srv.urlOwned(a);
     defer a.free(url);
 
-    var io_rt = std.Io.Threaded.init(a, .{});
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
     defer io_rt.deinit();
     var client = gemini.GeminiClient.init(a, io_rt.io(), "test-key", "gemini-2.5-flash", url);
     defer client.deinit();

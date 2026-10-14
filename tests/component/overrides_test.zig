@@ -99,7 +99,7 @@ test "L2 overrides: OpenAIClient.overrides.temperature → HTTP body 含 tempera
     const url = try srv.urlOwned(a);
     defer a.free(url);
 
-    var io_rt = std.Io.Threaded.init(a, .{});
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
     defer io_rt.deinit();
     var client = openai.OpenAIClient.init(a, io_rt.io(), "test-key", "gpt-4o", url);
     defer client.deinit();
@@ -134,7 +134,7 @@ test "L2 overrides: provider.setRequestOverrides → 后续请求 body 含字段
     const url = try srv.urlOwned(a);
     defer a.free(url);
 
-    var io_rt = std.Io.Threaded.init(a, .{});
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
     defer io_rt.deinit();
     var client = openai.OpenAIClient.init(a, io_rt.io(), "test-key", "gpt-4o", url);
     defer client.deinit();
@@ -179,7 +179,7 @@ test "L2 overrides: SpawnOptions.overrides_override reaches subagent request" {
     const url = try srv.urlOwned(a);
     defer a.free(url);
 
-    var io_rt = std.Io.Threaded.init(a, .{});
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
     defer io_rt.deinit();
     var client = openai.OpenAIClient.init(a, io_rt.io(), "k", "gpt-4o", url);
     defer client.deinit();

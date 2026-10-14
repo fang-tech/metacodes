@@ -286,7 +286,7 @@ test "L2 CLI process package preserves typed artifact through DynRegistry and Ag
     var probe_guard = try EnvGuard.set(std.testing.allocator, "METACODES_NO_PROBE", "1");
     defer probe_guard.restore();
 
-    var io_runtime = std.Io.Threaded.init(allocator, .{});
+    var io_runtime = @import("platform").signal.threadedIo(allocator, .{});
     defer io_runtime.deinit();
     const app = try cc.app_module.App.init(allocator, io_runtime.io(), config, "test-key");
     defer app.deinit();

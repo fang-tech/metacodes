@@ -73,7 +73,7 @@ test "L3: 挂起 → 跨进程 loadTranscript 恢复 → 续跑到 end_turn(L2 c
         const url = try srv.urlOwned(a);
         defer a.free(url);
 
-        var io_rt = std.Io.Threaded.init(a, .{});
+        var io_rt = @import("platform").signal.threadedIo(a, .{});
         defer io_rt.deinit();
         var client = cc.client_mod.Client.initWithBaseUrl(a, io_rt.io(), "test-key", "claude-sonnet-4-20250514", url);
         defer client.deinit();
@@ -127,7 +127,7 @@ test "L3: 挂起 → 跨进程 loadTranscript 恢复 → 续跑到 end_turn(L2 c
         const url = try srv.urlOwned(a);
         defer a.free(url);
 
-        var io_rt = std.Io.Threaded.init(a, .{});
+        var io_rt = @import("platform").signal.threadedIo(a, .{});
         defer io_rt.deinit();
         var client = cc.client_mod.Client.initWithBaseUrl(a, io_rt.io(), "test-key", "claude-sonnet-4-20250514", url);
         defer client.deinit();
@@ -216,7 +216,7 @@ test "L3: 多工具同轮(A pending + B done)→ 挂起不拆 turn,resume 同条
     const url = try srv.urlOwned(a);
     defer a.free(url);
 
-    var io_rt = std.Io.Threaded.init(a, .{});
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
     defer io_rt.deinit();
     var client = cc.client_mod.Client.initWithBaseUrl(a, io_rt.io(), "test-key", "claude-sonnet-4-20250514", url);
     defer client.deinit();
@@ -268,7 +268,7 @@ test "L3: 多工具同轮(A pending + B done)→ 挂起不拆 turn,resume 同条
     defer srv2.stop();
     const url2 = try srv2.urlOwned(a);
     defer a.free(url2);
-    var io_rt2 = std.Io.Threaded.init(a, .{});
+    var io_rt2 = @import("platform").signal.threadedIo(a, .{});
     defer io_rt2.deinit();
     var client2 = cc.client_mod.Client.initWithBaseUrl(a, io_rt2.io(), "test-key", "claude-sonnet-4-20250514", url2);
     defer client2.deinit();

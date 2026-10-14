@@ -31,7 +31,7 @@ test "P3: 同一 agent_loop 喂 OpenAI provider(异协议)跑通到 end_turn" {
     const url = try srv.urlOwned(a);
     defer a.free(url);
 
-    var io_rt = std.Io.Threaded.init(a, .{});
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
     defer io_rt.deinit();
     // OpenAIClient(不是 Anthropic Client)——讲 chat/completions 协议。
     var client = openai.OpenAIClient.init(a, io_rt.io(), "test-key", "gpt-4o", url);
@@ -99,7 +99,7 @@ test "P3: OpenAI tool_calls → 中立工具循环 → 第二轮 end_turn(工具
     const url = try srv.urlOwned(a);
     defer a.free(url);
 
-    var io_rt = std.Io.Threaded.init(a, .{});
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
     defer io_rt.deinit();
     var client = openai.OpenAIClient.init(a, io_rt.io(), "test-key", "gpt-4o", url);
     defer client.deinit();
@@ -151,7 +151,7 @@ test "P0.5: parent=OpenAI → spawnAgentSink 继承 OpenAI provider(子请求是
     const url = try srv.urlOwned(a);
     defer a.free(url);
 
-    var io_rt = std.Io.Threaded.init(a, .{});
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
     defer io_rt.deinit();
     // 父 provider 是 OpenAIClient(gpt-4o)——讲 chat/completions 协议。
     var client = openai.OpenAIClient.init(a, io_rt.io(), "test-key", "gpt-4o", url);
@@ -200,7 +200,7 @@ test "P3: OpenAI provider 下 WebSearch 被 capability 门控剔除(跨 provider
     const url = try srv.urlOwned(a);
     defer a.free(url);
 
-    var io_rt = std.Io.Threaded.init(a, .{});
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
     defer io_rt.deinit();
     var client = openai.OpenAIClient.init(a, io_rt.io(), "test-key", "gpt-4o", url);
     defer client.deinit();
@@ -252,7 +252,7 @@ test "P3/P0.1: 并行 tool_calls 两个都执行 + 各自 name 干净 + 第二�
     const url = try srv.urlOwned(a);
     defer a.free(url);
 
-    var io_rt = std.Io.Threaded.init(a, .{});
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
     defer io_rt.deinit();
     var client = openai.OpenAIClient.init(a, io_rt.io(), "test-key", "gpt-4o", url);
     defer client.deinit();
@@ -317,7 +317,7 @@ test "P0.2: PreToolUse ModifyInput 改写执行输入 + PostToolUse 注入上下
     defer srv.stop();
     const url = try srv.urlOwned(a);
     defer a.free(url);
-    var io_rt = std.Io.Threaded.init(a, .{});
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
     defer io_rt.deinit();
     var client = openai.OpenAIClient.init(a, io_rt.io(), "test-key", "gpt-4o", url);
     defer client.deinit();
@@ -384,7 +384,7 @@ test "P3/缓存: OpenAI cached_tokens → 中立 UsageDelta.cache_read(onUsage �
     const url = try srv.urlOwned(a);
     defer a.free(url);
 
-    var io_rt = std.Io.Threaded.init(a, .{});
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
     defer io_rt.deinit();
     var client = openai.OpenAIClient.init(a, io_rt.io(), "test-key", "gpt-4o", url);
     defer client.deinit();
@@ -448,7 +448,7 @@ test "OpenAI tool_call 无 id → 合成非空唯一 id(不流空 dispatch_id)" 
     const url = try srv.urlOwned(a);
     defer a.free(url);
 
-    var io_rt = std.Io.Threaded.init(a, .{});
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
     defer io_rt.deinit();
     var client = openai.OpenAIClient.init(a, io_rt.io(), "test-key", "gpt-4o", url);
     defer client.deinit();
@@ -504,7 +504,7 @@ test "issue#4: OpenAI 流式 content 解除 JSON 转义(真实 \\n/\\t/引号/�
     const url = try srv.urlOwned(a);
     defer a.free(url);
 
-    var io_rt = std.Io.Threaded.init(a, .{});
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
     defer io_rt.deinit();
     var client = openai.OpenAIClient.init(a, io_rt.io(), "test-key", "gpt-4o", url);
     defer client.deinit();
@@ -552,7 +552,7 @@ test "issue#4: deepseek reasoning_content 增量解除转义(.thinking 字节含
     const url = try srv.urlOwned(a);
     defer a.free(url);
 
-    var io_rt = std.Io.Threaded.init(a, .{});
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
     defer io_rt.deinit();
     var client = openai.OpenAIClient.init(a, io_rt.io(), "test-key", "deepseek-chat", url);
     defer client.deinit();

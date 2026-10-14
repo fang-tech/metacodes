@@ -101,7 +101,7 @@ test "L2 auth: stored OAuth resolves into Anthropic Authorization header" {
     const url = try srv.urlOwned(a);
     defer a.free(url);
 
-    var io_runtime = std.Io.Threaded.init(a, .{});
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
     defer io_runtime.deinit();
     var client = cc.client_mod.Client.initWithBaseUrl(a, io_runtime.io(), resolved.bearer_token, "claude-3-5-haiku-20241022", url);
     defer client.deinit();
@@ -173,7 +173,7 @@ test "L2 auth: ordinary environment credential remains compatible with process t
     defer srv.stop();
     const url = try srv.urlOwned(a);
     defer a.free(url);
-    var io_runtime = std.Io.Threaded.init(a, .{});
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
     defer io_runtime.deinit();
     var client = cc.client_mod.Client.initWithBaseUrl(
         a,
@@ -237,7 +237,7 @@ test "L2 auth: inherited credential FD authenticates without secret in initial e
     defer srv.stop();
     const url = try srv.urlOwned(a);
     defer a.free(url);
-    var io_runtime = std.Io.Threaded.init(a, .{});
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
     defer io_runtime.deinit();
     var client = cc.client_mod.Client.initWithBaseUrl(
         a,
@@ -426,7 +426,7 @@ test "L2 auth: expiring OAuth refreshes before request and persists replacement"
     const url = try srv.urlOwned(a);
     defer a.free(url);
 
-    var io_runtime = std.Io.Threaded.init(a, .{});
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
     defer io_runtime.deinit();
     var client = cc.client_mod.Client.initWithBaseUrl(a, io_runtime.io(), resolved.bearer_token, "claude-3-5-haiku-20241022", url);
     defer client.deinit();

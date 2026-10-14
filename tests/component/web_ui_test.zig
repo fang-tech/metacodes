@@ -98,7 +98,7 @@ test "L2 web ①: agent_loop 文本流经 WebBackend 落 journal,SSE 读回带 i
     const url = try srv.urlOwned(a);
     defer a.free(url);
 
-    var io_runtime = std.Io.Threaded.init(a, .{});
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
     defer io_runtime.deinit();
     var client = cc.client_mod.Client.initWithBaseUrl(a, io_runtime.io(), "test-key", "m", url);
     defer client.deinit();
@@ -135,7 +135,7 @@ test "L2 web ②: AskUserQuestion 经 HTTP /respond 回填 → 工具拿到答�
     const url = try srv.urlOwned(a);
     defer a.free(url);
 
-    var io_runtime = std.Io.Threaded.init(a, .{});
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
     defer io_runtime.deinit();
     var client = cc.client_mod.Client.initWithBaseUrl(a, io_runtime.io(), "test-key", "m", url);
     defer client.deinit();

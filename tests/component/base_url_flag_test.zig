@@ -85,7 +85,7 @@ test "L2: transport model and actor-visible model identity remain separate" {
     defer srv.stop();
     const url = try srv.urlOwned(a);
     defer a.free(url);
-    var io_runtime = std.Io.Threaded.init(a, .{});
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
     defer io_runtime.deinit();
     var client = cc.client_mod.Client.initWithBaseUrl(a, io_runtime.io(), "test-key", config.model, url);
     defer client.deinit();
@@ -115,7 +115,7 @@ test "L2 Stage7: Config.base_url → Client 请求打到 mock 端点" {
     const url = try srv.urlOwned(a);
     defer a.free(url);
 
-    var io_runtime = std.Io.Threaded.init(a, .{});
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
     defer io_runtime.deinit();
     const io = io_runtime.io();
 

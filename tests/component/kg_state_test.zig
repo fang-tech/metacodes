@@ -250,7 +250,7 @@ test "KgState: transport ready() reports a degraded daemon and a refused connect
     const a = std.testing.allocator;
     // std.testing.io runs Select tasks without real concurrency, so the 2 s deadline
     // task would always win the race; the app uses a threaded Io, tests too.
-    var io_runtime = std.Io.Threaded.init(a, .{});
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
     defer io_runtime.deinit();
     const io = io_runtime.io();
     var responder = ReadyResponder{ .listener = try net.listenLoopback(0, 1), .body = "{\"ok\":false,\"ready\":false,\"degraded\":true}" };
@@ -286,7 +286,7 @@ test "KgState: transport ready() reports a degraded daemon and a refused connect
 test "KgState: an actor without /api/ready is reported as supported=false, not degraded" {
     if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
     const a = std.testing.allocator;
-    var io_runtime = std.Io.Threaded.init(a, .{});
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
     defer io_runtime.deinit();
     const io = io_runtime.io();
     var responder = ReadyResponder{ .listener = try net.listenLoopback(0, 1), .body = "", .status_line = "HTTP/1.1 501 Not Implemented" };
