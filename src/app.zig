@@ -1618,33 +1618,35 @@ pub const App = struct {
         const io = app.api_client.http_client.io;
         // A cancel from another thread (`cancelInFlightRequest`) must see a
         // complete client whenever it sees the kind that selects it.
-        app.route_mutex.lock();
-        switch (binding.transport) {
-            .anthropic => {},
-            .openai => if (app.openai_client == null) {
-                app.openai_client = openai_mod.OpenAIClient.init(
-                    app.allocator,
-                    io,
-                    secret,
-                    binding.request_model_id,
-                    endpoint,
-                );
-                app.openai_client.?.dialect_resolver = app.api_client.dialect_resolver;
-                app.openai_client.?.overrides = buildOverridesFromConfig(app.config);
-            },
-            .gemini => if (app.gemini_client == null) {
-                app.gemini_client = gemini_mod.GeminiClient.init(
-                    app.allocator,
-                    io,
-                    secret,
-                    binding.request_model_id,
-                    endpoint,
-                );
-                app.gemini_client.?.dialect_resolver = app.api_client.dialect_resolver;
-                app.gemini_client.?.overrides = buildOverridesFromConfig(app.config);
-            },
+        {
+            app.route_mutex.lock();
+            defer app.route_mutex.unlock();
+            switch (binding.transport) {
+                .anthropic => {},
+                .openai => if (app.openai_client == null) {
+                    app.openai_client = openai_mod.OpenAIClient.init(
+                        app.allocator,
+                        io,
+                        secret,
+                        binding.request_model_id,
+                        endpoint,
+                    );
+                    app.openai_client.?.dialect_resolver = app.api_client.dialect_resolver;
+                    app.openai_client.?.overrides = buildOverridesFromConfig(app.config);
+                },
+                .gemini => if (app.gemini_client == null) {
+                    app.gemini_client = gemini_mod.GeminiClient.init(
+                        app.allocator,
+                        io,
+                        secret,
+                        binding.request_model_id,
+                        endpoint,
+                    );
+                    app.gemini_client.?.dialect_resolver = app.api_client.dialect_resolver;
+                    app.gemini_client.?.overrides = buildOverridesFromConfig(app.config);
+                },
+            }
         }
-        app.route_mutex.unlock();
 
         try app.switchModel(binding.request_model_id);
 
