@@ -131,10 +131,14 @@ fn run(init: std.process.Init) !void {
     }};
     const run_binding = try completedFailureRun(session_dir);
 
+    // The runner writes daemon.json to <workspace>/home/.metacodes/kg, the
+    // state root a host with this home and no other configuration resolves.
+    const state_root = try cc.util_state_root.legacyDefault(allocator, home);
+    defer allocator.free(state_root);
     var io_runtime = @import("platform").signal.threadedIo(allocator, .{});
     defer io_runtime.deinit();
     var kg = try cc.kg_client.KgClient.init(allocator, .{
-        .home = home,
+        .state_root = state_root,
         .domain = project_key,
         .io = io_runtime.io(),
     });

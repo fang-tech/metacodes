@@ -84,7 +84,7 @@
         "checks": [
           {"type": "file_absent", "path": "isolation-child.txt", "description": "子 agent 修改没有泄漏到父 workspace"},
           {"type": "contains", "path": "isolation-proof.txt", "text": "worktree_path", "description": "Task 返回可审计 worktree 路径"},
-          {"type": "contains", "path": "isolation-proof.txt", "text": "worktree_kept=true", "description": "有修改的 worktree 被保留"}
+          {"type": "validator", "validator": "evals/validators/42_agentdef_isolation.py", "timeout_seconds": 30, "description": "有修改的 worktree 被保留(Task 报告 kept,盘上 worktree 含子 agent 写入)"}
         ]
       },
       "trajectory_constraints": {
@@ -101,7 +101,7 @@
         "max_model_tool_errors": "允许少量文件参数自纠但不接受 worktree 循环。",
         "max_harness_tool_errors": "worktree 创建、finalize 与结果序列化不允许 harness 故障。"
       },
-      "grader": {"kind": "deterministic_workspace", "version": "agentdef-release-v1"}
+      "grader": {"kind": "deterministic_workspace", "version": "agentdef-release-v2"}
     },
     {
       "id": "43_agentdef_effort",

@@ -9,6 +9,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import tempfile
 import threading
@@ -24,6 +25,24 @@ TASK_CAPABILITY = "task-hierarchy-canonical-read-v1"
 ONTOLOGY_CAPABILITY = "tinykg-ontology-rule-snapshot-v1"
 SUMMARY = "A governed ontology is context, not promotion authority."
 FALSIFIER = "A held-out replay observes ontology context self-authorizing promotion."
+KG_CLIENT_SOURCE = Path(__file__).resolve().parents[2] / "src/kg/client.zig"
+
+
+def _expected_store_contract() -> tuple[str, str]:
+    """The Store versions the KgClient accepts, read from its source.
+
+    The simulated daemon has to report whatever the client under test expects:
+    a copied literal went stale once (storage 2 after the client moved to 3)
+    and failed the pilot as TinyKgDaemonNotReady.
+    """
+    source = KG_CLIENT_SOURCE.read_text(encoding="utf-8")
+    versions = []
+    for name in ("EXPECTED_STORAGE_FORMAT_VERSION", "EXPECTED_SCHEMA_VERSION"):
+        match = re.search(rf'^pub const {name} = "([^"]+)";$', source, re.MULTILINE)
+        if match is None:
+            raise RuntimeError(f"{name} not found in {KG_CLIENT_SOURCE}")
+        versions.append(match.group(1))
+    return versions[0], versions[1]
 
 
 def _canonical(value: Any) -> bytes:
@@ -61,6 +80,8 @@ class PilotState:
         self.lock = threading.Lock()
         self.commands: list[dict[str, Any]] = []
         self.provider_bodies: list[dict[str, Any]] = []
+        # node id -> properties written with set-node-property, as TinyKG keeps them.
+        self.node_properties: dict[int, dict[str, str]] = {}
 
 
 STATE = PilotState()
@@ -74,6 +95,12 @@ def _ontology_snapshot(args: list[str]) -> bytes:
     project_id = int(args[0])
     project_sha256 = args[2]
     project_key = args[4]
+    # TinyKG serves the snapshot only for a project node that carries the
+    # requested identity; the client binds it with set-node-property first.
+    with STATE.lock:
+        bound = dict(STATE.node_properties.get(project_id, {}))
+    if bound.get("project_sha256") != project_sha256 or bound.get("project_key") != project_key:
+        raise ValueError("project node identity does not match the snapshot request")
     provenance = [{
         "kind": "user_correction",
         "node_id": 17,
@@ -142,15 +169,23 @@ class TinyKgHandler(BaseHTTPRequestHandler):
             STATE.commands.append(body)
         stdout = ""
         if command == "store-info":
-            stdout = "nodes=2\nstorage_format_version=2\nschema_version=3\n"
+            storage, schema = _expected_store_contract()
+            stdout = f"nodes=2\nstorage_format_version={storage}\nschema_version={schema}\n"
         elif command == "find":
             if len(args) != 2 or args[0] != "project":
                 self.send_error(400, "invalid find")
                 return
             stdout = f"7\tproject\t{args[1]}\n"
+        elif command == "set-node-property":
+            if len(args) != 3 or args[1] not in ("project_sha256", "project_key"):
+                self.send_error(400, "unexpected node property")
+                return
+            with STATE.lock:
+                STATE.node_properties.setdefault(int(args[0]), {})[args[1]] = args[2]
         elif command == "ontology-rule-snapshot":
             try:
-                stdout = _ontology_snapshot(args).decode("utf-8")
+                # The CLI frames the canonical artifact with exactly one LF.
+                stdout = _ontology_snapshot(args).decode("utf-8") + "\n"
             except (ValueError, KeyError) as exc:
                 self.send_error(400, str(exc))
                 return
@@ -280,7 +315,8 @@ def run(probe: Path, output: Path) -> dict[str, Any]:
         counts: dict[str, int] = {}
         for row in commands:
             counts[row["command"]] = counts.get(row["command"], 0) + 1
-        if counts != {"store-info": 1, "find": 3, "ontology-rule-snapshot": 6}:
+        # Each snapshot is preceded by binding project_sha256 and project_key.
+        if counts != {"store-info": 1, "find": 3, "set-node-property": 12, "ontology-rule-snapshot": 6}:
             raise RuntimeError(f"unexpected TinyKG command trace: {counts}")
         if len(provider_bodies) != 1:
             raise RuntimeError(f"expected one provider request, got {len(provider_bodies)}")

@@ -274,6 +274,32 @@ status, compatibility boundaries, and entry points are defined by
   `error.PermissionModeDisabled` / `INVALID_ARGUMENT`; an AgentCore Session's
   settings are the Host-imported rules, which cannot disable a mode, so
   today the Host owns which modes it offers.
+- `zig build eval:rule-author-build` and `eval:project-rule-mac-pilot` build
+  again. Both had stopped compiling on 2026-10-01, when the state root became
+  an explicit parameter. The rule-author probe passes no state root, so a
+  missing `METACODES_API_KEY_FD` fails it instead of a stored login paying.
+  The pilot's simulated TinyKG daemon was also stale against the client: it
+  reported store format 2 instead of 3, and lacked the `set-node-property`
+  project binding that snapshots need since 2026-08-18. It now reads the
+  expected versions from `src/kg/client.zig` and checks the binding before
+  serving a snapshot. `zig build test` compiles both drivers on POSIX hosts
+  and runs the zero-paid pilot on macOS.
+- **The production release gate's calibration can no longer go stale silently.**
+  - **What went wrong:** `cli.py gate --thresholds evals/gates/default.json` had refused every release since the evaluation contract moved to v4 (2026-08-23). Its calibration still named contract v3 and a release-contract fingerprint that suite repins had since changed. CI stayed green because every gate test repaired the calibration before using it.
+  - **What changed:**
+    - A calibration is now either `production` and current, or `stale` with a `stale_reason` that the gate prints when it refuses.
+    - `test_checked_in_calibration_is_current_or_marked_stale` checks the committed calibration, using `release_calibration_drift`.
+    - The release contract now names glm-5.3-flash.
+  - **Recalibrated for contract v4:** 0.5.0 against the candidate, both suites × 6 trials, 132 rollouts (US$27.51). All nine checks pass with unchanged thresholds. The candidate is 100% trustworthy against 0.5.0's 89%, US$0.009 cheaper and 3.6 s faster per rollout. The calibration records the four rollout files' SHA-256; the rollouts themselves stay out of Git.
+- The AgentDef release suite no longer fails `42_agentdef_isolation` on how
+  the model spells a fact. Its "modified worktree is kept" check looked for
+  the literal `worktree_kept=true` in the model's proof file, so a model that
+  copied the same Task result as `worktree_kept: true` failed: 7 of 12
+  rollouts in a 2026-10-14 paired run, while in all 12 the worktree was kept,
+  held the subagent's file and nothing leaked. The check is now the validator
+  `evals/validators/42_agentdef_isolation.py`, which grades the Task tool's own
+  structured result and the kept worktree on disk (grader
+  `agentdef-release-v2`); the suite fingerprint is repinned.
 - Sockets no longer leak into child processes. The `--web`, OAuth callback
   and UDS daemon listeners, and every connection they accepted, were
   inheritable, so each later Bash command, hook, MCP server or browser launch
