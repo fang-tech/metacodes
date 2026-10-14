@@ -1,12 +1,19 @@
-//! 可移植 TCP loopback socket。auth OAuth 回调 + --web HTTP server 共用。
+//! 可移植 TCP socket。auth OAuth 回调 + --web/serve HTTP server + kgd 共用。
 //!
 //! 为什么单独一层:Windows 的 socket 是 `SOCKET`(内核对象句柄,非 int fd),不能用
 //! `_close/_read/_write`(那是文件 fd 的 CRT 层),必须走 `closesocket/recv/send`;
 //! 且任何 socket 调用前必须 `WSAStartup`。POSIX 下 socket 就是普通 fd,read/write/close
 //! 通用。两者接口差异被这层吸收,上层(auth/web)只见中立 `Socket` + 语义函数。
 //!
-//! 只支持我们需要的形态:127.0.0.1 loopback 的 listen/accept + connect,阻塞 IO +
-//! 可选收/发超时。不做通用 sockets 库(YAGNI)。
+//! 只支持我们需要的形态:IPv4/IPv6 字面地址的 listen/accept + connect(`listenAddress`/
+//! `connectAddress`;`listenLoopback`/`connectLoopback` 是 127.0.0.1 的包装),阻塞 IO +
+//! 可选收/发超时,外加 POSIX UDS。不解析主机名,不做通用 sockets 库(YAGNI)。
+//!
+//! Only `--web-bind` (#253) asks for an address other than 127.0.0.1. An IPv6
+//! socket sets `IPV6_V6ONLY` explicitly, because the platform defaults differ
+//! (Linux and macOS 0, Windows 1): the unspecified address `::` is dual-stack
+//! (it also accepts IPv4 clients, as "every interface" suggests), every other
+//! IPv6 address is IPv6-only.
 //!
 //! Every socket handed out here is close-on-exec (POSIX) or non-inheritable
 //! (Windows) from creation; see "No socket crosses into a child process".
@@ -64,6 +71,11 @@ const HANDLE_FLAG_INHERIT: u32 = 0x1;
 /// 中立 socket 句柄。POSIX=fd(c_int),Windows=SOCKET(UINT_PTR)。
 pub const Socket = if (is_windows) SOCKET else c_int;
 
+/// An IPv4 or IPv6 address with a port (std's value type; parsing and
+/// formatting are pure, no `Io` needed). `format` prints `1.2.3.4:80` and
+/// `[::1]:80`, the host:port part of a URL.
+pub const IpAddress = std.Io.net.IpAddress;
+
 pub const Error = error{
     SocketFailed,
     BindFailed,
@@ -98,13 +110,95 @@ fn isValid(s: Socket) bool {
     return s >= 0;
 }
 
-/// 构造 127.0.0.1:port 的 sockaddr_in(网络字节序)。POSIX/Windows sockaddr.in 同布局。
-fn loopbackAddr(port: u16) if (is_windows) ws2.sockaddr.in else std.c.sockaddr.in {
-    return .{
-        .family = if (is_windows) ws2.AF.INET else std.c.AF.INET,
-        .port = std.mem.nativeToBig(u16, port),
-        .addr = 0x0100007f, // 127.0.0.1,已是网络字节序
-        .zero = [_]u8{0} ** 8,
+// ============================================================================
+// IP literals
+// ============================================================================
+
+pub const AddressError = error{
+    /// Not an IPv4 or IPv6 literal. Host names are never resolved here.
+    InvalidAddress,
+    /// An IPv6 literal with a zone (`fe80::1%en0`): naming the interface
+    /// needs a lookup this layer does not do.
+    ScopedAddress,
+    /// `::ffff:a.b.c.d`: spell the IPv4 literal instead, so one address has
+    /// one spelling and one socket family.
+    Ipv4Mapped,
+};
+
+/// The longest textual IPv6 address (INET6_ADDRSTRLEN - 1). Also keeps std's
+/// IPv6 parser, which indexes the text with a `u8`, inside its range.
+const MAX_IP_TEXT: usize = 45;
+const IPV4_MAPPED_PREFIX = [12]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff };
+
+/// Parse an IPv4 literal (`127.0.0.1`, `0.0.0.0`) or an IPv6 literal (`::1`,
+/// `::`, also bracketed as `[::1]`) into an address with `port`. Nothing is
+/// resolved: a host name is `error.InvalidAddress`. A bracketed literal must
+/// be IPv6, as in a URL.
+pub fn parseIpLiteral(text: []const u8, port: u16) AddressError!IpAddress {
+    var literal = text;
+    const bracketed = literal.len >= 2 and literal[0] == '[' and literal[literal.len - 1] == ']';
+    if (bracketed) literal = literal[1 .. literal.len - 1];
+    if (literal.len == 0 or literal.len > MAX_IP_TEXT) return error.InvalidAddress;
+    if (std.mem.indexOfScalar(u8, literal, '%') != null) return error.ScopedAddress;
+    if (!bracketed) {
+        if (std.Io.net.Ip4Address.parse(literal, port)) |ip4| return .{ .ip4 = ip4 } else |_| {}
+    }
+    const ip6 = std.Io.net.Ip6Address.parse(literal, port) catch return error.InvalidAddress;
+    if (std.mem.eql(u8, ip6.bytes[0..12], &IPV4_MAPPED_PREFIX)) return error.Ipv4Mapped;
+    return .{ .ip6 = ip6 };
+}
+
+/// 127.0.0.0/8 or ::1. The unspecified addresses (0.0.0.0, ::) are not
+/// loopback: they bind every interface.
+pub fn isLoopbackAddress(address: IpAddress) bool {
+    return switch (address) {
+        .ip4 => |ip4| ip4.bytes[0] == 127,
+        .ip6 => |ip6| std.mem.eql(u8, &ip6.bytes, &std.Io.net.Ip6Address.loopback(0).bytes),
+    };
+}
+
+/// 0.0.0.0 or ::, the "every interface" addresses.
+pub fn isUnspecifiedAddress(address: IpAddress) bool {
+    return switch (address) {
+        .ip4 => |ip4| std.mem.allEqual(u8, &ip4.bytes, 0),
+        .ip6 => |ip6| std.mem.allEqual(u8, &ip6.bytes, 0),
+    };
+}
+
+/// 127.0.0.1:port.
+pub fn loopback(port: u16) IpAddress {
+    return .{ .ip4 = .loopback(port) };
+}
+
+// The two sockaddr shapes, laid out by the platform (Darwin's carry a length
+// byte, which the defaults fill in). A union of both is large enough for
+// whatever getsockname returns for a socket of either family.
+const SockaddrIn = if (is_windows) ws2.sockaddr.in else std.c.sockaddr.in;
+const SockaddrIn6 = if (is_windows) ws2.sockaddr.in6 else std.c.sockaddr.in6;
+const SockaddrAny = extern union { in: SockaddrIn, in6: SockaddrIn6 };
+const SockLen = if (is_windows) i32 else std.c.socklen_t;
+
+/// `address` as the sockaddr the socket calls take, with its length.
+fn sockaddrOf(address: IpAddress) struct { raw: SockaddrAny, len: SockLen } {
+    return switch (address) {
+        .ip4 => |ip4| .{
+            .raw = .{
+                .in = .{
+                    .family = if (is_windows) ws2.AF.INET else std.c.AF.INET,
+                    .port = std.mem.nativeToBig(u16, ip4.port),
+                    .addr = @bitCast(ip4.bytes), // already network order
+                    .zero = [_]u8{0} ** 8,
+                },
+            },
+            .len = @sizeOf(SockaddrIn),
+        },
+        .ip6 => |ip6| .{ .raw = .{ .in6 = .{
+            .family = if (is_windows) ws2.AF.INET6 else std.c.AF.INET6,
+            .port = std.mem.nativeToBig(u16, ip6.port),
+            .flowinfo = 0,
+            .addr = ip6.bytes,
+            .scope_id = 0,
+        } }, .len = @sizeOf(SockaddrIn6) },
     };
 }
 
@@ -144,14 +238,36 @@ fn setCloseOnExec(fd: c_int) bool {
     return current >= 0 and std.c.fcntl(fd, std.c.F.SETFD, current | std.c.FD_CLOEXEC) >= 0;
 }
 
-fn newTcp() Error!Socket {
+fn newTcp(family: IpAddress.Family) Error!Socket {
     try ensureStartup();
     if (is_windows) {
-        const s = sys.WSASocketW(ws2.AF.INET, ws2.SOCK.STREAM, ws2.IPPROTO.TCP, null, 0, WSA_FLAG_OVERLAPPED | WSA_FLAG_NO_HANDLE_INHERIT);
+        const af: i32 = switch (family) {
+            .ip4 => ws2.AF.INET,
+            .ip6 => ws2.AF.INET6,
+        };
+        const s = sys.WSASocketW(af, ws2.SOCK.STREAM, ws2.IPPROTO.TCP, null, 0, WSA_FLAG_OVERLAPPED | WSA_FLAG_NO_HANDLE_INHERIT);
         if (!isValid(s)) return error.SocketFailed;
         return s;
     }
-    return socketCloexec(std.c.AF.INET, std.c.SOCK.STREAM) orelse error.SocketFailed;
+    const domain: c_uint = switch (family) {
+        .ip4 => std.c.AF.INET,
+        .ip6 => std.c.AF.INET6,
+    };
+    return socketCloexec(domain, std.c.SOCK.STREAM) orelse error.SocketFailed;
+}
+
+// IPPROTO_IPV6 is 41 everywhere; IPV6_V6ONLY is 26 on Linux and 27 on Darwin,
+// the BSDs and Windows (ws2ipdef.h). std exports neither for Darwin or ws2.
+const IPPROTO_IPV6: i32 = 41;
+const IPV6_V6ONLY: u32 = if (builtin.os.tag == .linux) 26 else 27;
+
+/// Set IPV6_V6ONLY to `only` (must precede bind). False when the stack refuses.
+fn setV6Only(s: Socket, only: bool) bool {
+    const value: c_int = @intFromBool(only);
+    if (is_windows) {
+        return sys.setsockopt(s, IPPROTO_IPV6, @intCast(IPV6_V6ONLY), @ptrCast(&value), @sizeOf(c_int)) == 0;
+    }
+    return std.c.setsockopt(s, IPPROTO_IPV6, IPV6_V6ONLY, &value, @sizeOf(c_int)) == 0;
 }
 
 // Windows 的 SO_REUSEADDR 语义 ≠ POSIX:它允许**别的进程**重绑同一 loopback 端口(本机劫持
@@ -170,28 +286,41 @@ fn setReuseAddr(s: Socket) void {
 
 /// 绑 127.0.0.1:port(0=内核分配)+ REUSEADDR + listen(backlog),读回真实端口。
 pub fn listenLoopback(port: u16, backlog: u31) Error!Listener {
-    const s = try newTcp();
+    return listenAddress(loopback(port), backlog);
+}
+
+/// Bind `address` (an IPv4 or IPv6 literal; port 0 = kernel-assigned) with
+/// REUSEADDR (SO_EXCLUSIVEADDRUSE on Windows) and listen. The returned port is
+/// read back with getsockname. An IPv6 socket gets an explicit IPV6_V6ONLY:
+/// off for `::` (dual-stack), on for every other IPv6 address (see the header).
+pub fn listenAddress(address: IpAddress, backlog: u31) Error!Listener {
+    const family: IpAddress.Family = address;
+    const s = try newTcp(family);
     errdefer closeSocket(s);
     setReuseAddr(s);
+    if (family == .ip6 and !setV6Only(s, !isUnspecifiedAddress(address))) return error.SocketFailed;
 
-    var addr = loopbackAddr(port);
+    const addr = sockaddrOf(address);
     if (is_windows) {
-        if (sys.bind(s, @ptrCast(&addr), @sizeOf(@TypeOf(addr))) != 0) return error.BindFailed;
+        if (sys.bind(s, @ptrCast(&addr.raw), addr.len) != 0) return error.BindFailed;
         if (sys.listen(s, backlog) != 0) return error.ListenFailed;
     } else {
-        if (std.c.bind(s, @ptrCast(&addr), @sizeOf(@TypeOf(addr))) < 0) return error.BindFailed;
+        if (std.c.bind(s, @ptrCast(&addr.raw), addr.len) < 0) return error.BindFailed;
         if (std.c.listen(s, backlog) < 0) return error.ListenFailed;
     }
 
-    var bound = loopbackAddr(0);
+    var bound: SockaddrAny = undefined;
+    var bound_len: SockLen = @sizeOf(SockaddrAny);
     if (is_windows) {
-        var blen: i32 = @sizeOf(@TypeOf(bound));
-        if (sys.getsockname(s, @ptrCast(&bound), &blen) != 0) return error.GetSocknameFailed;
+        if (sys.getsockname(s, @ptrCast(&bound), &bound_len) != 0) return error.GetSocknameFailed;
     } else {
-        var blen: std.c.socklen_t = @sizeOf(@TypeOf(bound));
-        if (std.c.getsockname(s, @ptrCast(&bound), &blen) < 0) return error.GetSocknameFailed;
+        if (std.c.getsockname(s, @ptrCast(&bound), &bound_len) < 0) return error.GetSocknameFailed;
     }
-    return .{ .sock = s, .port = std.mem.bigToNative(u16, bound.port) };
+    const wire_port = switch (family) {
+        .ip4 => bound.in.port,
+        .ip6 => bound.in6.port,
+    };
+    return .{ .sock = s, .port = std.mem.bigToNative(u16, wire_port) };
 }
 
 /// 阻塞 accept 一个连接。出错返 null(调用方据自身 closing 标志决定退出 vs 重试)。
@@ -312,13 +441,18 @@ pub fn sendSome(s: Socket, buf: []const u8) SendResult {
 
 /// 连 127.0.0.1:port。
 pub fn connectLoopback(port: u16) Error!Socket {
-    const s = try newTcp();
+    return connectAddress(loopback(port));
+}
+
+/// Connect to `address` (an IPv4 or IPv6 literal with its port).
+pub fn connectAddress(address: IpAddress) Error!Socket {
+    const s = try newTcp(address);
     errdefer closeSocket(s);
-    var addr = loopbackAddr(port);
+    const addr = sockaddrOf(address);
     if (is_windows) {
-        if (sys.connect(s, @ptrCast(&addr), @sizeOf(@TypeOf(addr))) != 0) return error.ConnectFailed;
+        if (sys.connect(s, @ptrCast(&addr.raw), addr.len) != 0) return error.ConnectFailed;
     } else {
-        if (std.c.connect(s, @ptrCast(&addr), @sizeOf(@TypeOf(addr))) < 0) return error.ConnectFailed;
+        if (std.c.connect(s, @ptrCast(&addr.raw), addr.len) < 0) return error.ConnectFailed;
     }
     return s;
 }
@@ -629,6 +763,87 @@ test "loopback listen/connect/send/recv roundtrip" {
     const n = recv(conn, &buf);
     try testing.expectEqual(@as(isize, 4), n);
     try testing.expectEqualSlices(u8, msg, buf[0..@intCast(n)]);
+}
+
+test "parseIpLiteral accepts IPv4 and IPv6 literals and refuses everything else" {
+    const v4 = try parseIpLiteral("10.1.2.3", 8080);
+    try testing.expectEqual(IpAddress.Family.ip4, @as(IpAddress.Family, v4));
+    try testing.expectEqualSlices(u8, &.{ 10, 1, 2, 3 }, &v4.ip4.bytes);
+    try testing.expectEqual(@as(u16, 8080), v4.getPort());
+    try testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0 }, &(try parseIpLiteral("0.0.0.0", 0)).ip4.bytes);
+
+    const v6 = try parseIpLiteral("::1", 7);
+    try testing.expectEqualSlices(u8, &std.Io.net.Ip6Address.loopback(0).bytes, &v6.ip6.bytes);
+    try testing.expectEqual(@as(u16, 7), v6.getPort());
+    // A URL spells IPv6 in brackets; the bracketed form is the same address.
+    try testing.expectEqualSlices(u8, &v6.ip6.bytes, &(try parseIpLiteral("[::1]", 7)).ip6.bytes);
+    try testing.expect(isUnspecifiedAddress(try parseIpLiteral("::", 0)));
+
+    for ([_][]const u8{ "", "localhost", "example.com", "127.0.0.1:80", "1.2.3", "256.0.0.1", "01.2.3.4", "[127.0.0.1]", "[::1", ":::", "1::2::3", "::1 " }) |bad| {
+        try testing.expectError(error.InvalidAddress, parseIpLiteral(bad, 0));
+    }
+    try testing.expectError(error.ScopedAddress, parseIpLiteral("fe80::1%en0", 0));
+    try testing.expectError(error.Ipv4Mapped, parseIpLiteral("::ffff:127.0.0.1", 0));
+    // Longer than any IPv6 literal: refused before std's parser (u8 indices) sees it.
+    try testing.expectError(error.InvalidAddress, parseIpLiteral("1%" ++ "a" ** 300, 0));
+    try testing.expectError(error.InvalidAddress, parseIpLiteral("1" ** 46, 0));
+}
+
+test "isLoopbackAddress: 127/8 and ::1 only; the unspecified addresses are not loopback" {
+    for ([_][]const u8{ "127.0.0.1", "127.1.2.3", "::1" }) |text| {
+        try testing.expect(isLoopbackAddress(try parseIpLiteral(text, 0)));
+    }
+    for ([_][]const u8{ "0.0.0.0", "::", "10.0.0.1", "192.168.1.5", "::2", "fe80::1", "2001:db8::1" }) |text| {
+        try testing.expect(!isLoopbackAddress(try parseIpLiteral(text, 0)));
+    }
+    try testing.expect(isUnspecifiedAddress(try parseIpLiteral("0.0.0.0", 0)));
+    try testing.expect(!isUnspecifiedAddress(try parseIpLiteral("127.0.0.1", 0)));
+    try testing.expect(!isUnspecifiedAddress(try parseIpLiteral("::1", 0)));
+}
+
+test "listenAddress on an explicit IPv4 address reports the kernel-assigned port" {
+    const listener = try listenAddress(try parseIpLiteral("127.0.0.1", 0), 4);
+    defer closeSocket(listener.sock);
+    try testing.expect(listener.port != 0);
+    // The reported port is the bound one: a client reaches it there.
+    const client = try connectAddress(try parseIpLiteral("127.0.0.1", listener.port));
+    defer closeSocket(client);
+    const conn = acceptConn(listener.sock) orelse return error.AcceptFailed;
+    defer closeSocket(conn);
+    try testing.expectEqual(@as(isize, 2), send(client, "v4"));
+    var buf: [4]u8 = undefined;
+    try testing.expectEqual(@as(isize, 2), recv(conn, &buf));
+}
+
+/// Whether this host can listen on [::1], asked of std's own socket layer so
+/// a defect in `listenAddress` cannot turn into a skip.
+fn ipv6LoopbackAvailable() bool {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const address: IpAddress = .{ .ip6 = .loopback(0) };
+    var server = address.listen(io, .{}) catch return false;
+    server.deinit(io);
+    return true;
+}
+
+test "IPv6 [::1] listen/connect/send/recv roundtrip with the real port read back" {
+    if (!ipv6LoopbackAvailable()) return error.SkipZigTest; // no IPv6 on this host (e.g. a v4-only container)
+    const listener = try listenAddress(try parseIpLiteral("::1", 0), 4);
+    defer closeSocket(listener.sock);
+    try testing.expect(listener.port != 0);
+    try testing.expect(!inheritable(listener.sock));
+
+    const client = try connectAddress(try parseIpLiteral("::1", listener.port));
+    defer closeSocket(client);
+    const conn = acceptConn(listener.sock) orelse return error.AcceptFailed;
+    defer closeSocket(conn);
+
+    try testing.expectEqual(@as(isize, 4), send(client, "ping"));
+    var buf: [16]u8 = undefined;
+    const n = recv(conn, &buf);
+    try testing.expectEqual(@as(isize, 4), n);
+    try testing.expectEqualSlices(u8, "ping", buf[0..@intCast(n)]);
 }
 
 /// Whether a child process could inherit `s`. An unreadable flag counts as

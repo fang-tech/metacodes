@@ -103,6 +103,18 @@ pub const Config = struct {
     /// **U10-B:`serve --uds <path>`**:daemon 附加一条 UDS+NDJSON 本地绑定(gui/语音 UI 首选,与 web
     /// 并存)。非 null 即启用(强制走 serveMulti,即便 N=1)。POSIX only(Windows 走 web)。null=不启用。
     uds_path: ?[]const u8 = null,
+    /// `--web-bind <addr>`, else `METACODES_WEB_BIND` (#253): the IP literal the
+    /// HTTP surface of `--web`/`serve` binds (port from `--web`/`serve`).
+    /// null = 127.0.0.1. Parsed when read, so a bad value fails before startup;
+    /// a non-loopback address needs `web_token` or `web_allow_unauth`.
+    web_bind: ?std.Io.net.IpAddress = null,
+    /// `--web-token <t>`, else `METACODES_WEB_TOKEN` (#252): the bearer token
+    /// every HTTP route but `GET /health` requires. null = no authentication.
+    /// Never printed or logged. The flag is visible in `ps`; prefer the env var.
+    web_token: ?[]const u8 = null,
+    /// `--web-allow-unauth` (#253): accept a non-loopback `web_bind` without a
+    /// token, handing the session to anyone who reaches the port.
+    web_allow_unauth: bool = false,
     /// **task#20:`--session <id>`**:显式指定 session id(24-char)。App.init 用它替代 gen()。
     /// 用途:subprocess resume——B 进程用挂起 session 的 id 复用其 transcript 目录 + suspend.json。
     /// null = gen 新 id。非 24-char 回退 gen。

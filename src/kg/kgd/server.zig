@@ -242,7 +242,7 @@ pub const Supervisor = struct {
             return;
         };
         const presented = http.headerValue(head, "x-api-key") orelse "";
-        if (!constantTimeEql(presented, self.options.api_key)) {
+        if (!http.constantTimeEql(presented, self.options.api_key)) {
             self.sendError(conn, 401, "invalid or missing x-api-key");
             return;
         }
@@ -737,15 +737,6 @@ fn sendAll(conn: net.Socket, bytes: []const u8, deadline_ms: i64) void {
     }
 }
 
-/// Compares in time independent of how many leading bytes match, so a peer
-/// cannot discover the key one byte at a time.
-pub fn constantTimeEql(presented: []const u8, expected: []const u8) bool {
-    if (presented.len != expected.len or expected.len == 0) return false;
-    var diff: u8 = 0;
-    for (presented, expected) |a, b| diff |= a ^ b;
-    return diff == 0;
-}
-
 pub fn identifierValid(value: []const u8) bool {
     if (value.len == 0 or value.len > MAX_REQUEST_ID_BYTES) return false;
     for (value) |byte| switch (byte) {
@@ -894,15 +885,6 @@ fn statusText(status: u16) []const u8 {
 }
 
 const testing = std.testing;
-
-test "KgdServer: the api key comparison is length-safe and constant-time shaped" {
-    try testing.expect(constantTimeEql("abc", "abc"));
-    try testing.expect(!constantTimeEql("abc", "abd"));
-    try testing.expect(!constantTimeEql("ab", "abc"));
-    // An empty configured key must never authenticate anyone, including a peer
-    // that sends no header at all (which arrives here as "").
-    try testing.expect(!constantTimeEql("", ""));
-}
 
 test "KgdServer: identifiers and source keys reject what the daemon would" {
     try testing.expect(identifierValid("metacodes-kgd-1.2:3_4"));

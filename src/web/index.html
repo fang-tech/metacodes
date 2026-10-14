@@ -3,6 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
 <title>metacodes web</title>
 <style>
   :root {
@@ -116,6 +117,28 @@
 </div>
 <script>
 "use strict";
+// Bearer token (server started with --web-token / METACODES_WEB_TOKEN). The page is opened
+// as /?token=<t>: the server only serves this page to a request that carries the token, and
+// a URL fragment never reaches it. Read the token once, then drop the query from the address
+// bar so it does not stay in history or get copied along. URLSearchParams would turn a
+// literal "+" into a space, so decode the raw value instead.
+const TOKEN = (() => {
+  const m = /(?:^|[?&])token=([^&#]*)/.exec(location.search);
+  if (!m) return "";
+  history.replaceState(null, "", location.pathname);
+  try { return decodeURIComponent(m[1]); } catch { return ""; }
+})();
+// Every API call carries the token as a Bearer header (a POST is never authenticated by query).
+function api(path, init) {
+  init = init || {};
+  if (TOKEN) init.headers = Object.assign({}, init.headers, { Authorization: "Bearer " + TOKEN });
+  return fetch(path, init).then(r => { if (r.status === 401) authFailed(); return r; });
+}
+let authWarned = false;
+function authFailed() {
+  if (authWarned) return; authWarned = true;
+  sysline("unauthorized: this server requires a token; open " + location.origin + "/?token=<token>", true);
+}
 const scroll = document.getElementById("scroll");
 const input = document.getElementById("input");
 const overlay = document.getElementById("dialog-overlay");
@@ -143,7 +166,8 @@ function jparse(s) { try { return JSON.parse(s); } catch { return null; } }
 
 // ── SSE ─────────────────────────────────────────────────────────────────────
 function connect() {
-  const es = new EventSource("/events?since=" + (lastSeq + 1) + (lastEpoch ? "&epoch=" + lastEpoch : ""));
+  // EventSource cannot send headers: the token rides in the query (GET only, server side).
+  const es = new EventSource("/events?since=" + (lastSeq + 1) + (lastEpoch ? "&epoch=" + lastEpoch : "") + (TOKEN ? "&token=" + encodeURIComponent(TOKEN) : ""));
   document.getElementById("st-conn").textContent = "";
   es.onmessage = (m) => {
     const dash = m.lastEventId.lastIndexOf("-");
@@ -504,7 +528,7 @@ function renderAsk(id, questions) {
   const next = () => { idx++; if (idx < questions.length) step(); else respond({ id, answers }); };
   step();
 }
-function respond(payload) { fetch("/respond", { method: "POST", body: JSON.stringify(payload) }).then(r => { if (!r.ok && r.status !== 409) sysline("respond failed: " + r.status, true); }); hideDialog(); }
+function respond(payload) { api("/respond", { method: "POST", body: JSON.stringify(payload) }).then(r => { if (!r.ok && r.status !== 409) sysline("respond failed: " + r.status, true); }); hideDialog(); }
 function hideDialog() { overlay.style.display = "none"; pendingReqId = 0; }
 
 // ── 输入 / 命令 / 历史 / 中断 ─────────────────────────────────────────────────
@@ -550,7 +574,7 @@ function updatePalette() {
 
 function backendCommand(text) {
   // 入队,真实结果经 journal command_result 事件异步回(见 dispatch)。
-  fetch("/command", { method: "POST", body: JSON.stringify({ cmd: text }) })
+  api("/command", { method: "POST", body: JSON.stringify({ cmd: text }) })
     .then(r => { if (!r.ok) sysline("command failed: " + r.status, true); })
     .catch(() => sysline("command failed", true));
 }
@@ -561,7 +585,7 @@ function runCommand(text) {
   if (spec && spec.kind === "client") {
     if (name === "/clear") { resetView(); return; }
     if (name === "/help") { const d = el("md"); d.innerHTML = renderMarkdown("**Commands**\n" + COMMANDS.map(c => "- `" + c.name + "` — " + c.desc).join("\n") + "\n- `!<cmd>` — run a shell command (output joins the conversation context)"); scroll.appendChild(d); return; }
-    if (name === "/cost") { fetch("/state").then(r => r.json()).then(s => sysline("tokens: " + (s.input_tokens || 0) + " in / " + (s.output_tokens || 0) + " out · $" + Number(s.cost_usd || 0).toFixed(4))); return; }
+    if (name === "/cost") { api("/state").then(r => r.json()).then(s => sysline("tokens: " + (s.input_tokens || 0) + " in / " + (s.output_tokens || 0) + " out · $" + Number(s.cost_usd || 0).toFixed(4))); return; }
   }
   // 表内 backend 与表外 "/x" 一律透传:动词裁决归服务端(U11 单一注册表)。
   backendCommand(text);
@@ -573,13 +597,13 @@ function send() {
   history.push(text); histIdx = history.length;
   if (text.startsWith("/")) { runCommand(text); return; } // 斜杠命令不进对话
   if (text.startsWith("!")) { backendCommand(text); return; } // U11:shell 车道(不是模型 prompt)
-  fetch("/message", { method: "POST", body: JSON.stringify({ text }) }).then(r => { if (!r.ok) sysline("send failed: " + r.status, true); });
+  api("/message", { method: "POST", body: JSON.stringify({ text }) }).then(r => { if (!r.ok) sysline("send failed: " + r.status, true); });
 }
 function autoResize() { input.style.height = "auto"; input.style.height = Math.min(input.scrollHeight, window.innerHeight * 0.4) + "px"; }
 
 document.getElementById("send").onclick = send;
-document.getElementById("stop").onclick = () => fetch("/interrupt", { method: "POST" });
-document.getElementById("st-mode").onclick = () => fetch("/command", { method: "POST", body: JSON.stringify({ cmd: "/mode" }) }); // 结果经 journal command_result 回
+document.getElementById("stop").onclick = () => api("/interrupt", { method: "POST" });
+document.getElementById("st-mode").onclick = () => api("/command", { method: "POST", body: JSON.stringify({ cmd: "/mode" }) }); // 结果经 journal command_result 回
 
 input.addEventListener("input", () => { autoResize(); updatePalette(); });
 input.addEventListener("keydown", (e) => {
@@ -606,7 +630,7 @@ function setPhaseLabel(t) { const e = document.getElementById("st-phase"); e.inn
 let stateTimer = 0;
 function refreshStateSoon() { clearTimeout(stateTimer); stateTimer = setTimeout(refreshState, 300); }
 function refreshState() {
-  fetch("/state").then(r => r.json()).then(s => {
+  api("/state").then(r => r.json()).then(s => {
     document.getElementById("st-model").textContent = "model: " + (s.model || "—");
     document.getElementById("st-mode").textContent = "mode: " + (s.permission_mode || "—");
     document.getElementById("st-tokens").textContent = "tokens: " + (s.input_tokens || 0) + " in / " + (s.output_tokens || 0) + " out" + (s.cost_usd != null ? " · $" + Number(s.cost_usd).toFixed(4) : "");

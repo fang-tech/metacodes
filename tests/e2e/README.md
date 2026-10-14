@@ -17,6 +17,17 @@ zig build tinykg:stage && tests/e2e/process_dag_resume_smoke.sh
 "Active task recovery packet"。会话关掉 autostart、清掉所有 `METACODES_KG_*` 覆盖,只走
 这个服务;退出时停掉服务,并在有 TinyKG 进程残留时失败。
 
+daemon 的 HTTP 面另有两个不调用模型的真进程 e2e(`zig build test` 在 POSIX 上自动跑):
+
+```bash
+zig build && bash tests/e2e/daemon_serve_e2e.sh && bash tests/e2e/daemon_serve_multi_e2e.sh
+```
+
+`serve` / `serve --sessions 2 --uds` 对 loopback mock provider(`daemon_mock_provider.py`)跑:
+`GET /health`、bearer token、`--web-bind ::1`、非回环无鉴权拒绝启动、按 session 路由、UDS、
+SIGINT 关停。端口全由内核分配,HOME 与 state root 临时,TinyKG autostart 关,共用
+`daemon_e2e_lib.sh`。
+
 ## 它怎么工作
 
 cc-zig 的 REPL 在**非 tty(stdin 是管道)** 下走 `readLineBuffered` 干净逐行读取,
