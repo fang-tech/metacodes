@@ -14,7 +14,7 @@ const harness = @import("harness");
 const cc = @import("cc");
 
 const agent_loop = cc.agent_loop;
-const EventJournal = cc.web_journal.EventJournal;
+const EventJournal = cc.event_journal.EventJournal;
 const WebBackend = cc.web_backend.WebBackend;
 const WebServer = cc.web_server.WebServer;
 const MsgQueue = cc.repl_msg_queue.MsgQueue;
@@ -119,8 +119,10 @@ test "L2 web ①: agent_loop 文本流经 WebBackend 落 journal,SSE 读回带 i
     // 经真 HTTP 从 /events 读回(重放语义:事件先发生,连接后至)
     const resp = try httpGetUntil(a, fx.srv.port, "/events", "stream_done");
     defer a.free(resp);
-    try std.testing.expect(std.mem.indexOf(u8, resp, "id: 0\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, resp, "\"text_chunk\":\"hello web\"") != null);
+    var first_id_buf: [32]u8 = undefined;
+    const first_id = try std.fmt.bufPrint(&first_id_buf, "id: {s}-0\n", .{&fx.journal.epochHex()});
+    try std.testing.expect(std.mem.indexOf(u8, resp, first_id) != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "\"type\":\"text_chunk\",\"data\":\"hello web\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, resp, "stream_begin") != null);
     try std.testing.expect(std.mem.indexOf(u8, resp, "stream_done") != null);
 }
@@ -149,10 +151,10 @@ test "L2 web ②: AskUserQuestion 经 HTTP /respond 回填 → 工具拿到答�
     // 模拟浏览器:HTTP 轮询 /events 等 ui_request 出现 → POST /respond 选 Red。
     const Browser = struct {
         fn run(port: u16, alloc: std.mem.Allocator) void {
-            const events = httpGetUntil(alloc, port, "/events", "\"ui_request\"") catch return;
+            const events = httpGetUntil(alloc, port, "/events", "\"type\":\"ui_request\"") catch return;
             defer alloc.free(events);
             // 从事件流抠 id(测试内恒 1;稳妥起见仍解析)
-            const key = "{\"ui_request\":{\"id\":";
+            const key = "\"type\":\"ui_request\",\"id\":";
             const at = std.mem.indexOf(u8, events, key) orelse return;
             const rest = events[at + key.len ..];
             const end = std.mem.indexOfScalar(u8, rest, ',') orelse return;
@@ -193,7 +195,7 @@ test "L2 web ②: AskUserQuestion 经 HTTP /respond 回填 → 工具拿到答�
     }
     try std.testing.expect(saw_red_result);
 
-    // journal 里有完整生命周期:ui_request → ui_request_done
+    // journal 里有完整生命周期:wire 的 ui_request → ui_request_closed(answered),问题字段是 v1 拼写
     const all = (try fx.journal.waitSince(a, 0, 100)).?;
     defer {
         for (all) |l| a.free(l);
@@ -202,8 +204,10 @@ test "L2 web ②: AskUserQuestion 经 HTTP /respond 回填 → 工具拿到答�
     var saw_req = false;
     var saw_done = false;
     for (all) |l| {
-        if (std.mem.indexOf(u8, l, "\"ui_request\"") != null) saw_req = true;
-        if (std.mem.indexOf(u8, l, "\"ui_request_done\"") != null) saw_done = true;
+        if (std.mem.indexOf(u8, l, "\"type\":\"ui_request\"") != null and
+            std.mem.indexOf(u8, l, "\"multi_select\":false") != null) saw_req = true;
+        if (std.mem.indexOf(u8, l, "\"type\":\"ui_request_closed\"") != null and
+            std.mem.indexOf(u8, l, "\"outcome\":\"answered\"") != null) saw_done = true;
     }
     try std.testing.expect(saw_req);
     try std.testing.expect(saw_done);
@@ -452,6 +456,86 @@ test "L2 web:MAX_CONNS 连接上限——第 N+1 条被立即拒绝(close),存�
 }
 
 // ── 极简 HTTP 客户端(raw socket;哑读到含 needle / EOF)───────────────────────
+
+/// SSE request with a raw header block (e.g. Last-Event-ID).
+fn sseWithHeaders(a: std.mem.Allocator, port: u16, path: []const u8, headers: []const u8, needle: []const u8) ![]u8 {
+    var req_buf: [512]u8 = undefined;
+    const req = try std.fmt.bufPrint(&req_buf, "GET {s} HTTP/1.1\r\nHost: l\r\n{s}\r\n", .{ path, headers });
+    return roundtrip(a, port, req, needle);
+}
+
+// 事故形态(云端宿主同款):宿主重启后 journal 换了一份、seq 从 0 重来,浏览器带着旧游标
+// (seq 41)重连。没有 epoch 时服务端只会等 seq 追到 42,其间事件全部漏掉。现在游标带
+// epoch:不是本 journal 的游标 → resync(epoch_changed)+ 从最老保留行整体重放。
+test "L2 web: 另一份 journal 的游标 → resync epoch_changed + 从头重放,帧 id 带本 journal epoch" {
+    const a = std.testing.allocator;
+    var fx = Fixture.init(a);
+    defer fx.deinit();
+    try fx.start(a);
+    const be = fx.wb.backend();
+    be.emitEvent(cc.session_id.SessionId.single, .{ .text_chunk = "first after restart" });
+    be.emitEvent(cc.session_id.SessionId.single, .{ .text_chunk = "second after restart" });
+
+    // The old cursor (seq 0 of the previous journal) is behind this journal's
+    // end, so only the epoch tells it apart: without it the server would
+    // continue from seq 1 and the first event would never arrive.
+    const resp = try sseWithHeaders(a, fx.srv.port, "/events", "Last-Event-ID: 0123456789abcdef-0\r\n", "second after restart");
+    defer a.free(resp);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "event: resync\ndata: {\"reason\":\"epoch_changed\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "first after restart") != null);
+    var frame_buf: [64]u8 = undefined;
+    const frame = try std.fmt.bufPrint(&frame_buf, "id: {s}-0\n", .{&fx.journal.epochHex()});
+    try std.testing.expect(std.mem.indexOf(u8, resp, frame) != null);
+}
+
+// 旧式游标(只有 seq,没有 epoch)无法判断属于哪份 journal:宿主重启后的 since=1 会让新
+// journal 的第 0 条事件静默丢失。一律按 epoch_unknown 从最老保留行重放。
+test "L2 web: 无 epoch 的旧式游标 → resync epoch_unknown + 从头重放,不丢第 0 条" {
+    const a = std.testing.allocator;
+    var fx = Fixture.init(a);
+    defer fx.deinit();
+    try fx.start(a);
+    const be = fx.wb.backend();
+    be.emitEvent(cc.session_id.SessionId.single, .{ .text_chunk = "event zero" });
+    be.emitEvent(cc.session_id.SessionId.single, .{ .text_chunk = "event one" });
+
+    const resp = try httpGetUntil(a, fx.srv.port, "/events?since=1", "event one");
+    defer a.free(resp);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "\"reason\":\"epoch_unknown\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "event zero") != null);
+}
+
+test "L2 web: 本 journal 的游标超出末尾 → resync cursor_ahead + 从头重放" {
+    const a = std.testing.allocator;
+    var fx = Fixture.init(a);
+    defer fx.deinit();
+    try fx.start(a);
+    const be = fx.wb.backend();
+    be.emitEvent(cc.session_id.SessionId.single, .{ .text_chunk = "fresh journal" });
+
+    var path_buf: [96]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "/events?since=99&epoch={s}", .{&fx.journal.epochHex()});
+    const resp = try httpGetUntil(a, fx.srv.port, path, "fresh journal");
+    defer a.free(resp);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "\"reason\":\"cursor_ahead\"") != null);
+}
+
+test "L2 web: 本 journal 的游标照常续接,不 resync、不重放已见事件" {
+    const a = std.testing.allocator;
+    var fx = Fixture.init(a);
+    defer fx.deinit();
+    try fx.start(a);
+    const be = fx.wb.backend();
+    be.emitEvent(cc.session_id.SessionId.single, .{ .text_chunk = "seen before" });
+    be.emitEvent(cc.session_id.SessionId.single, .{ .text_chunk = "not seen yet" });
+
+    var header_buf: [64]u8 = undefined;
+    const header = try std.fmt.bufPrint(&header_buf, "Last-Event-ID: {s}-0\r\n", .{&fx.journal.epochHex()});
+    const resp = try sseWithHeaders(a, fx.srv.port, "/events", header, "not seen yet");
+    defer a.free(resp);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "resync") == null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "seen before") == null);
+}
 
 fn httpGetUntil(a: std.mem.Allocator, port: u16, path: []const u8, needle: []const u8) ![]u8 {
     var req_buf: [256]u8 = undefined;

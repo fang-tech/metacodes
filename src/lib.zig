@@ -72,6 +72,8 @@ pub const agent_job_registry = @import("core/agent_job_registry.zig");
 pub const cron_registry = @import("core/cron_registry.zig");
 pub const cache_break = @import("core/cache_break.zig");
 pub const transcript = @import("core/transcript.zig");
+pub const event_journal = @import("core/event_journal.zig"); // bounded seq+epoch event log for SSE-style replay
+pub const session_host = @import("core/session_host.zig"); // multi-session service over AgentSession for network Hosts
 pub const session_id = @import("core/session_id.zig"); // SessionId 值类型(多 Session 基石)
 pub const system_prompt = @import("core/system_prompt.zig");
 pub const prompt_sections = @import("core/prompt_sections.zig");
@@ -174,6 +176,7 @@ pub const protocol = struct {
     pub const ui_backend = @import("core/protocol/ui_backend.zig"); // UiBackend vtable
     pub const ui_event = @import("core/protocol/ui_event.zig"); // CoreEvent, UiEvent, ConfigChange
     pub const ui_request = @import("core/protocol/ui_request.zig"); // UiRequest, UiResponse, UiRequestFn
+    pub const wire = @import("core/protocol/wire.zig"); // versioned JSON lines for out-of-process Hosts
     pub const PermissionChoice = @import("core/protocol/permission_choice.zig").PermissionChoice;
     pub const CHAT_SENTINEL = @import("core/protocol/chat_sentinel.zig").CHAT_SENTINEL;
 };

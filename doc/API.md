@@ -553,6 +553,98 @@ its context, the provider credentials, and `workspace_root` alive until the Sess
 is destroyed. Use `RuntimeHost.replace` for a staged generation change; do not
 mutate a live Session's tool catalog directly.
 
+### Session configuration classes
+
+Each setting belongs to the Session that was configured with it, and changes
+in one of four ways:
+
+| Class | Settings | How it changes |
+|---|---|---|
+| Idle-mutable | model, permission mode, imported permission rules, prompt profile, reasoning effort, additional directories | `setModel`, `setPermissionMode`, `updatePermissionRules`, `setPromptProfile`, `setReasoningEffort`, `setAdditionalDirectories`. Only while idle (`error.SessionBusy` otherwise). Input is validated before the Session changes; on error the previous value stays in force. The next Run uses the new value. |
+| Runtime generation | built-in tool set, static and process plugins, provider dialects | `RuntimeHost.replace`. Sessions created afterwards use the new generation; existing Sessions stay on theirs. To move a Session, persist it and restore it with `createRestoredSession` on the new generation. |
+| Fixed at create | provider kind, OpenAI protocol, auth scheme, API key, base URL, workspace root/home/state root/shell, artifact store, run journal | Create a new Session, restoring the conversation from a checkpoint or transcript. |
+| Identity | Session ID | Never; a restore reuses it. |
+
+`SessionConfig.reasoning_effort` is carried by every provider request and kept
+across `setModel`; a provider without an effort control (Gemini) refuses a
+non-null value with `error.AgentEffortUnsupportedProvider`.
+`WorkspaceConfig.additional_dirs` widens exactly what the workspace root grants:
+`accept_edits` auto-approval of Write/Edit/NotebookEdit and sandboxed shell
+writes. It is not named in the system prompt. These two are source-level only;
+AgentCore revision 19 does not carry them.
+
+### Wire lines for out-of-process Hosts
+
+A Host that carries a Session over SSE, a WebSocket or a queue serializes
+events and UI requests with `mc.protocol.wire` rather than `std.json` over the
+kernel structs, so a field renamed inside the kernel shows up as a contract
+change instead of silently reaching every client. Each line is one JSON object
+with the schema version `v` (currently 1) and a `type`:
+
+```text
+{"v":1,"type":"<CoreEvent tag>","data":<payload or null>}
+{"v":1,"type":"ui_request","id":N,"kind":"permission|plan_approval|ask_question|custom","request":{...}}
+{"v":1,"type":"ui_request_closed","id":N,"outcome":"answered|cancelled|malformed"}
+```
+
+`wire.parseResponse` turns the client's answer (`{"choice":...}`,
+`{"answers":[...]}` or `{"result":...}`) back into a `UiResponse`; anything
+malformed or of another version is answered as a cancellation, never as a
+grant, and closes as `malformed`. An answer that races an interrupt or close
+loses: it is refused or discarded and the request closes as `cancelled`. `tests/fixtures/wire/v1` pins one line for every event tag and request
+kind and doubles as conformance vectors for Hosts in other languages. The
+bundled `--web` UI consumes exactly these lines.
+
+The `--web` server streams these lines over SSE with ids `<epoch>-<seq>`. The
+epoch names the event journal; a restarted host or a rebuilt session has a new
+one. A client resumes with `Last-Event-ID` or `?since=<seq>&epoch=<epoch>`
+(`/state` reports both). When the cursor belongs to another epoch, names a
+position without an epoch, or lies past the journal's end, the server sends
+`event: resync` with
+`{"reason":"epoch_changed"|"epoch_unknown"|"cursor_ahead","epoch":...,"from":N}`
+and replays from the oldest event it kept; when old events were evicted under
+the cursor, the reason is `evicted`. Deduplicate on `(session, epoch, seq)`.
+
+### SessionHost: a multi-session service for network Hosts
+
+`mc.session_host.SessionHost` is what a Host puts behind its own transport
+when Sessions are opened and closed by id at runtime (one container serving
+many users, a GUI with many tabs). It composes the pieces above instead of
+leaving every Host to rebuild them:
+
+- `open(.{ .config, .id, .mode = .fresh | .resume })` creates a Session, or
+  restores one from its transcript (`transcript.sessionDir` under the
+  Session's state root). A fresh open under an id that has a transcript
+  replaces that transcript at once. `open` and `acquire` return a counted
+  reference; `release` gives it back.
+- `HostedSession.submit` and `command` (`set_model`, `set_permission_mode`,
+  `set_reasoning_effort`, `set_additional_directories`, `set_prompt_profile`,
+  `update_permission_rules`, `compact`) share one FIFO run by the Session's
+  driver thread, so configuration changes apply between Runs in the order
+  they were queued.
+- Every kernel event, host event (`user_message`, `run_done`,
+  `command_result`, `session_poisoned`) and UI request lands in the
+  Session's `journal` as a wire line; CoreEvents carry `run_id` and the
+  submission's `trace_id`. `respond(id, json)` answers a UI request;
+  anything but the pending id is `error.NoSuchRequest`.
+- `interrupt` aborts the Run (or the one being admitted) and answers a
+  pending UI request as cancelled. A Session the kernel poisoned reports
+  `session_poisoned`, drops its queue and refuses further work; close and
+  reopen it.
+- `close` stops the driver, closes the journal (waking readers), waits only
+  for an in-flight `interrupt` to leave the kernel and destroys the Session,
+  so the id can be opened again as soon as it returns. It never waits for
+  references: a holder keeps a closed `HostedSession` readable (journal,
+  `snapshot`) until its own `release`, which frees it last.
+
+Options: `max_queued`, `max_turns`, `transcripts`, `ui_request_timeout_ms`.
+Authentication, tenancy, idempotency and the transport stay with the Host.
+To stream a Session's journal over SSE, parse the client's position with
+`event_journal.Cursor.fromLastEventId` / `fromSince`, start from
+`EventJournal.planResume(cursor)` (send `resync` when it reports a restart),
+and label lines with `EventJournal.eventId` — the rule the bundled `--web`
+server uses.
+
 Static trusted plugins can contribute typed tools, streaming tools, services,
 advisory policies, and deterministic provider dialects. Process plugins can only
 contribute isolated tools through the versioned wire protocol. Neither receives a

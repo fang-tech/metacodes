@@ -29,6 +29,37 @@ status, compatibility boundaries, and entry points are defined by
 - Typing `/` suggests Skills alongside the built-in commands (with
   `argument-hint`); the menu scrolls with the selection. `/skills` and `/mcp`
   show where each Skill or server came from and why anything did not load.
+- Two more Session settings a source-level Host can change while idle.
+  `SessionConfig.reasoning_effort` and `AgentSession.setReasoningEffort` set
+  the effort every provider request carries; `setModel` keeps it, and a
+  provider without an effort control refuses a non-null value at create.
+  `WorkspaceConfig.additional_dirs` and `AgentSession.setAdditionalDirectories`
+  give a Session further working directories (existing directories only):
+  `accept_edits` approves
+  Write/Edit/NotebookEdit there and a sandboxed shell may write there, exactly
+  as for the workspace root. A replacement is validated before the Session
+  changes. doc/API.md now tabulates which settings are idle-mutable, which
+  need a new Runtime generation, and which are fixed at create.
+- `protocol.wire`: versioned JSON lines for Hosts that carry a Session across
+  a process or network boundary. `writeEvent`, `writeRequest` and
+  `writeRequestClosed` produce `{"v":1,"type":...}` lines; `parseResponse`
+  reads a client's answer back, treating anything malformed as a cancellation
+  (closed as `malformed`) and an answer that races an interrupt as cancelled
+  (also in `--web`). Hosts previously ran `std.json` over kernel structs, so a
+  renamed field changed their clients silently. One pinned line per event
+  tag and request kind lives in `tests/fixtures/wire/v1`.
+- `session_host.SessionHost`: the multi-session service a network Host puts
+  behind its own transport. Sessions open and close by id (fresh, or resumed
+  from their transcript), submissions and configuration commands run in one
+  FIFO per Session on its driver thread, every event lands in a replayable
+  journal as wire lines with `run_id`/`trace_id`, UI requests are answered by
+  id, `interrupt` also releases a pending prompt, a poisoned Session is
+  reported and refuses work, and `close` frees the id at once while holders
+  keep a readable shell until they release it. A cloud
+  Host had rebuilt this by hand with a 5-minute watchdog, an interrupt that
+  could not reach a pending prompt and a fresh session that resumed the old
+  transcript; this is the kernel-side version. `EventJournal` moved from
+  `web/` to `core/event_journal.zig` and is exported.
 
 ### Changed
 
@@ -48,6 +79,24 @@ status, compatibility boundaries, and entry points are defined by
 - AgentCore's MCP parser treats an absent 2026-07-28 `resultType` as
   `complete` and accepts the specification's `{method, params}` input
   requests, as the final 2026-07-28 schema requires.
+- The `--web` event stream sends the `protocol.wire` v1 lines. Kernel events
+  were `{"core_event":{"<tag>":...}}` and UI requests
+  `{"ui_request":{"id":N,"request":{"<kind>":...}}}`; they are now
+  `{"v":1,"type":"<tag>","data":...}` and
+  `{"v":1,"type":"ui_request","id":N,"kind":"<kind>","request":...}`, with
+  `ui_request_closed` replacing `ui_request_done`/`ui_request_cancelled` and
+  `multi_select` replacing `multi` in questions. The bundled page follows;
+  a client reading the stream directly must follow too.
+- Breaking for source-level embedders: `transcript.Writer.init` and
+  `transcript.listSessions` take the state root as a `StateRoot`
+  (`util/state_root.zig`) instead of a `[]const u8`, so a bare path no longer
+  compiles there; take the value from `WorkspacePolicy.stateRoot()`. On 2026-10-01 the third
+  `Writer.init` parameter changed meaning from home to state root while keeping
+  its type, so a Host that still passed `$HOME` compiled and wrote transcripts
+  one level off from where it resumed them. New `transcript.sessionDir` and
+  `transcript.projectDir` are the only definitions of the layout, and
+  `WorkspacePolicy.stateRoot()` returns the root an `AgentSession` resolved;
+  doc/LIB_API.md shows the write and resume paths.
 - Release and reopen PRs no longer re-run the full CI. A `Release fast path`
   job (`scripts/release_fast_path.py`) checks that the PR's merge commit adds
   only what `scripts/release_cut.py` generates from its base, regenerated in a
@@ -103,6 +152,26 @@ status, compatibility boundaries, and entry points are defined by
   server blocked startup forever; a server `ping` got `method_not_found`; tool
   names with `.` broke provider requests; failures were visible only with
   `METACODES_LOG=warn`.
+- A `--web` client that reconnects after the host restarted gets the new
+  session's events instead of silence. Event sequence numbers restart at 0
+  with every journal, and a cursor from the previous one (`since=41`) made the
+  server wait until the new journal reached 41, dropping everything before.
+  Each journal now has an epoch: SSE ids are `<epoch>-<seq>`, `/state`
+  reports `epoch` next to `seq`, and a cursor from another epoch, one naming
+  a position without an epoch, or one past the journal's end is answered with
+  `event: resync`
+  (`{"reason":"epoch_changed"|"epoch_unknown"|"cursor_ahead","epoch","from"}`)
+  and a replay from the oldest kept event. Evictions report
+  `"reason":"evicted"`. The bundled page reconnects with `?since=&epoch=` and
+  starts its view over (DOM and render state) on a resync. Clients that send
+  `?since=N` without the epoch now get a replay instead of a continuation.
+- An embedded `AgentSession` keeps "allow always" in the Session. Answering
+  a Host permission prompt with `allow_always` also appended a whole-tool
+  grant to `<workspace>/.claude/settings.local.json`, a file no AgentSession
+  reads but the next CLI started in that workspace does, so one click in a
+  web or cloud UI became a lasting grant for every later CLI session there.
+  `PermissionContext.always_allow` now defaults to `session`; only the App
+  (CLI, TUI, `--web`) opts into `settings_file`.
 - EnterWorktree moves the session into the worktree, not just the process.
   It used to chdir and record the entry while the session's working root
   stayed put, so Bash (and every tool working from that root) kept running

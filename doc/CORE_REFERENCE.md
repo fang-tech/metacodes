@@ -79,7 +79,7 @@ provenance sidecar 各按自己的 artifact schema 校验（formal v4 manifest +
 | `tool_exec` | 工具批量执行(按并发安全分批;每 job 独立 arena + per-worker 值拷贝 ctx) | `executeSlots`, `Slot` |
 | `tools` | 工具注册表 + dispatch(静态 + 动态 Skill/MCP) | `dispatch`, `registry`, `isConcurrencySafe(Input)` |
 | `tools/context` | `ToolContext`——工具执行时拿到的全部依赖 + 接口回调 | `ToolContext`, `SkillActivator`, `ToolActivator`, `WorktreeHook`, `ToolProgressReporter` |
-| `transcript` | 对话持久化(JSONL per-turn)+ 重建 | `Writer`, `loadTranscript` |
+| `transcript` | 对话持久化(JSONL per-turn)+ 重建 | `Writer`, `loadTranscript`, `sessionDir` |
 | `session_id` | session 身份值类型(多 session 基石) | `SessionId`, `.single`, `gen()` |
 | `permission*` | 权限决策链(模式 + 规则 + 沙箱 + UI 请求) | `PermissionContext`, decision/settings/session_rules |
 | `agents` / `skills` / `mcp` / `sandbox` | subagent 定义 / Skill / MCP 客户端 / Seatbelt 沙箱 | `AgentSet`, `SkillSet`, `mcp_client`, `sandbox_config` |
@@ -316,6 +316,12 @@ pub fn serializeUiRequest(allocator, req) ![]u8; // 给异步前端投递用
 ```
 
 `RequestOutcome` 三态是同步/异步前端的分水岭(见 §5)。
+
+跨进程或网络投递(SSE、WebSocket、队列)用 `protocol.wire`:带版本号的事件行、请求行、
+请求关闭行，以及把前端应答解析回 `UiResponse` 的 `parseResponse`(坏应答一律按取消处理，
+绝不放行)。格式见 [API.md](API.md#wire-lines-for-out-of-process-hosts)，逐行钉在
+`tests/fixtures/wire/v1`。`serializeUiRequest` 只是内部 struct 的直译，供挂起持久化使用，
+不是对外契约。
 
 ---
 
