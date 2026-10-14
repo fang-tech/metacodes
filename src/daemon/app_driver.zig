@@ -89,21 +89,16 @@ pub fn driverFn(host: *SessionHost, ctx: *anyopaque) void {
         if (app.abort.isAborted() and app.abort.reason() == .user_interrupt) app.abort.reset();
 
         if (!pending_run) {
-            const msg = host.inbox.popFront() orelse {
+            var msg = host.inbox.popFront() orelse {
                 reapAgentDone(app, &be, host.id, infra); // 空闲期也 reap:后台 job 可能在无新消息时完成
                 time.sleepMs(50);
                 continue;
             };
-            defer infra.free(msg); // msg 来自 host.inbox(infra alloc)
+            defer msg.deinit(infra); // msg 来自 host.inbox(infra alloc)
 
-            // U11:prompt 提交经 service.submitPrompt(clearActiveSkill + append 与 TUI/web
-            // 同源;此前 daemon 直 appendText 漏 clearActiveSkill)。空文本/失败 → 无 run。
-            var svc = @import("../session_service.zig").SessionService.init(app);
-            const d = svc.submitPrompt(msg);
-            if (d.run == null) {
-                if (!d.outcome.ok) log.warn("daemon", "submitPrompt failed", .{});
-                continue;
-            }
+            // 与 web run() 同一入口:先应用消息自带的 model/permission_mode,再提交 prompt
+            // (service.submitPrompt)并回显 user_message;应用失败 → message_rejected,无 run。
+            if (!web_session.startSubmission(app, &host.journal, infra, &msg)) continue;
         }
 
         const run_control: ?*project_activation.RunControl = if (app.sessionDir()) |dir|

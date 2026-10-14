@@ -1,11 +1,12 @@
 //! Web 会话驱动 —— `metacodes --web [port]` 的主循环。
 //!
 //! 角色对照:repl/loop.zig 的 web 等价物,但**只做编排不做表达**:
-//!   等 inbox 消息(POST /message 入队)→ append conversation → agent_loop.run
+//!   等 inbox 消息(POST /message 入队)→ startSubmission(应用该消息的 model/
+//!   permission_mode → append conversation → journal 回显 user_message)→ agent_loop.run
 //!   (WebBackend 做 emit,WebBackend.requester 做 UiRequest)→ persistTranscript
 //!   → journal 通告 run_done → 回到等待。
 //!
-//! 生成期入队的消息天然排队(inbox 是 MsgQueue,线程安全),本轮结束逐条续跑——
+//! 生成期入队的消息天然排队(inbox 是 SubmissionQueue,线程安全),本轮结束逐条续跑——
 //! 对齐 TUI 的 commandQueue 语义,但不需要 watcher 线程:HTTP 线程就是输入线程。
 //!
 //! 退出:空闲期收到 AbortSignal(终端 Ctrl+C / SIGINT)→ 优雅收尾(close journal →
@@ -23,13 +24,17 @@ const journal_mod = @import("../core/event_journal.zig");
 const backend_mod = @import("backend.zig");
 const server_mod = @import("server.zig");
 const msg_queue_mod = @import("../repl/msg_queue.zig");
+const submission_mod = @import("submission.zig");
 const log = @import("../util/log.zig");
 const util_json = @import("../util/json.zig");
+const wire = @import("../core/protocol/wire.zig");
 
 const EventJournal = journal_mod.EventJournal;
 const WebBackend = backend_mod.WebBackend;
 const WebServer = server_mod.WebServer;
 const MsgQueue = msg_queue_mod.MsgQueue;
+const Submission = submission_mod.Submission;
+const SubmissionQueue = submission_mod.SubmissionQueue;
 const ui_event = @import("../core/protocol/ui_event.zig");
 
 fn stringifyJson(allocator: std.mem.Allocator, value: anytype) ![]u8 {
@@ -38,8 +43,9 @@ fn stringifyJson(allocator: std.mem.Allocator, value: anytype) ![]u8 {
     return util_json.repairJsonUtf8(allocator, raw);
 }
 
-/// **U4 A4:web 配置变更 sink**。config 变更(model/mode/dirs/reasoning 任一 UI/工具触发)→
-/// journal.append 一条 `{"config_changed":{...}}` → 浏览器 SSE 收到更新状态。与 command_result
+/// **U4 A4:web 配置变更 sink**。config 变更(model/mode/dirs/reasoning/route 任一 UI/工具/消息
+/// 触发)→ journal.append 一条 wire v1 行 `{"v":1,"type":"config_changed","data":{...}}`(与内核
+/// 事件同一序列化,tests/fixtures/wire/v1 钉住)→ 浏览器 SSE 收到更新状态。与 command_result
 /// 分开(config_changed 是状态广播,任何来源都发;command_result 只是命令 ack)。
 /// **借用契约**:emit 在 driver 线程同步序列化 ev(含 borrow .model/.dirs)→ journal.append **dup**
 /// 进 journal 串,SSE 线程后读的是 dup,borrow 释放安全(dup 发生在 emit 调用内,早于下一次 mutation)。
@@ -48,7 +54,7 @@ pub const WebConfigSink = struct { // U10-D:daemon app_driver 复用
     alloc: std.mem.Allocator,
     fn emitThunk(ctx: *anyopaque, ev: ui_event.ConfigChange) void {
         const self: *WebConfigSink = @ptrCast(@alignCast(ctx));
-        const line = stringifyJson(self.alloc, .{ .config_changed = ev }) catch return;
+        const line = wire.writeEvent(self.alloc, .{ .config_changed = ev }) catch return;
         defer self.alloc.free(line);
         self.journal.append(line); // journal dup → borrow 同步序列化后即可释放
     }
@@ -209,8 +215,8 @@ pub fn execCommand(app: *app_mod.App, journal: *EventJournal, web_alloc: std.mem
     }
     const d = session_service_mod.execLine(&svc, app.allocator, trimmed);
     // prompt 经 /command 提交时补 user_message 回显——与 POST /message 的回显对齐
-    // (server.zig 回显在入队前),否则 attach/重放的 SSE 客户端只见 assistant 回合,
-    // 可见 transcript 与 conversation 脱节。宏注入(/commit 等)不回显,对齐 TUI。
+    // (driver 在该轮开跑时回显,见 startSubmission),否则 attach/重放的 SSE 客户端只见
+    // assistant 回合,可见 transcript 与 conversation 脱节。宏注入(/commit 等)不回显,对齐 TUI。
     if (d.run != null and d.run.?.kind == .user_prompt) {
         if (stringifyJson(web_alloc, .{ .user_message = trimmed }) catch null) |echo| {
             defer web_alloc.free(echo);
@@ -230,6 +236,81 @@ pub fn execCommand(app: *app_mod.App, journal: *EventJournal, web_alloc: std.mem
     return d.run;
 }
 const session_service_mod = @import("../session_service.zig");
+
+/// Driver-thread start of one queued message (`POST /message`, UDS `message`):
+/// apply its configuration, put its text into the conversation and announce
+/// the turn. true = the caller runs the turn now. The web `run()` loop and the
+/// daemon driver (daemon/app_driver.zig) both take messages through here.
+///
+/// Journal order for one message:
+///   `config_changed{model}` (if `model` was given) → `config_changed{mode}`
+///   (if `permission_mode` was given) → `{"user_message":text}` → the turn's events.
+/// A given field is announced even when its value was already in force, so a
+/// client sees what the turn runs with.
+///
+/// Both fields are checked before anything changes: the mode must not be one
+/// the settings disable (`disableBypassPermissionsMode`, `disableAutoMode`),
+/// and the model must resolve (tier names) and be usable with the current
+/// provider. If either is refused, neither is applied, the text stays out of
+/// the conversation, and `{"message_rejected":{...}}` takes the place of
+/// `user_message`. The model is switched for the session only: the login's
+/// saved selection, which `/model` writes, is left alone
+/// (SessionService.setTurnModel).
+pub fn startSubmission(app: *app_mod.App, journal: *EventJournal, web_alloc: std.mem.Allocator, submission: *const Submission) bool {
+    var svc = session_service_mod.SessionService.init(app);
+    var reason_buf: [256]u8 = undefined;
+    // Check the mode before switching the model: a refusal found after setTurnModel would
+    // leave the model switched for a message that is then refused.
+    if (submission.permission_mode) |mode| {
+        if (svc.checkPermMode(mode)) |refusal| {
+            journalRejected(journal, web_alloc, submission, refusal.render(&reason_buf));
+            return false;
+        }
+    }
+    if (submission.model) |model| {
+        const outcome = svc.setTurnModel(web_alloc, model);
+        if (!outcome.ok) {
+            journalRejected(journal, web_alloc, submission, outcome.render(&reason_buf));
+            return false;
+        }
+    }
+    if (submission.permission_mode) |mode| {
+        // Allowed by the check above; nothing between it and here reloads settings. Should
+        // that ever change, refuse the turn rather than run it in a mode the settings forbid.
+        const applied = svc.setPermMode(mode);
+        if (!applied.ok) {
+            journalRejected(journal, web_alloc, submission, applied.render(&reason_buf));
+            return false;
+        }
+    }
+    const d = svc.submitPrompt(submission.text);
+    if (d.run == null) {
+        // Only an allocation failure gets here (the transport refuses empty text). Whatever
+        // configuration was applied stays applied; its config_changed lines say so.
+        journalRejected(journal, web_alloc, submission, if (d.outcome.ok) "empty message" else d.outcome.render(&reason_buf));
+        return false;
+    }
+    const echo = stringifyJson(web_alloc, .{ .user_message = submission.text }) catch return true;
+    defer web_alloc.free(echo);
+    journal.append(echo);
+    return true;
+}
+
+/// `{"message_rejected":{"message","text","model","permission_mode"}}`: the message
+/// started no turn. `model`/`permission_mode` repeat what the message asked for (null =
+/// not given); `permission_mode` in the canonical spelling `/state` reports.
+fn journalRejected(journal: *EventJournal, web_alloc: std.mem.Allocator, submission: *const Submission, message: []const u8) void {
+    log.warn("web", "message rejected: {s}", .{message});
+    const requested_mode: ?[]const u8 = if (submission.permission_mode) |m| @tagName(m) else null;
+    const line = stringifyJson(web_alloc, .{ .message_rejected = .{
+        .message = message,
+        .text = submission.text,
+        .model = submission.model,
+        .permission_mode = requested_mode,
+    } }) catch return;
+    defer web_alloc.free(line);
+    journal.append(line);
+}
 
 /// `!cmd` 的 journal 渲染:执行(service 业务核)→ stdout/stderr 摘录进 command_result。
 /// 摘录上限 2 KiB/流(完整输出已在对话上下文里,模型可见;这里只为浏览器用户回显)。
@@ -301,7 +382,7 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, surface: server_mod.
     defer wb.deinit();
     wb.abort = &app.abort;
     wb.usage_totals = &app.usage; // /state 的 token/cost 数据源(backend 累计,全仓惯例)
-    var inbox = MsgQueue.init(web_alloc);
+    var inbox = SubmissionQueue.init(web_alloc);
     defer inbox.deinit();
     var cmdbox = MsgQueue.init(web_alloc);
     defer cmdbox.deinit();
@@ -372,7 +453,7 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, surface: server_mod.
             // abort 二义:user_ctrl_c=真 SIGINT(退出进程)vs user_interrupt=浏览器 Stop
             // (只中断 run)。空闲期若 flag 亮:SIGINT → 退出;残留的 interrupt(门 race 漏进
             // 来的)→ 复位丢弃,继续等。
-            const msg = inbox.popFront() orelse {
+            var msg = inbox.popFront() orelse {
                 if (app.abort.isAborted()) {
                     if (app.abort.reason() == .user_ctrl_c) break :outer;
                     app.abort.reset(); // 残留 interrupt,不退出
@@ -380,11 +461,11 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, surface: server_mod.
                 time.sleepMs(50);
                 continue;
             };
-            defer web_alloc.free(msg);
-            // U11:prompt 提交经 service.submitPrompt(clearActiveSkill + append 与 TUI
-            // 同源;此前 web 直 appendText 漏 clearActiveSkill)。空文本 → 无 run,回等待。
-            var svc = session_service_mod.SessionService.init(app);
-            if (svc.submitPrompt(msg).run == null) continue;
+            defer msg.deinit(web_alloc);
+            // 消息自带的 model/permission_mode 在本轮开跑前原子应用,再回显 user_message;
+            // prompt 提交经 service.submitPrompt(clearActiveSkill + append 与 TUI 同源)。
+            // 应用失败 → message_rejected,不跑本轮。
+            if (!startSubmission(app, &journal, web_alloc, &msg)) continue;
         }
         generating_flag.store(true, .release);
         defer generating_flag.store(false, .release);

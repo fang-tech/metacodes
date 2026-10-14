@@ -1581,40 +1581,13 @@ test "L2: a provider metadata extension round-trips through the generic client v
 
 test "L2: a route change is broadcast as an ordered, replayable event carrying identity" {
     const a = std.testing.allocator;
-    const ui_event = cc.ui_event;
 
-    const Collector = struct {
-        lines: std.ArrayList([]u8) = .empty,
-        allocator: std.mem.Allocator,
-
-        fn emit(ctx: *anyopaque, ev: ui_event.ConfigChange) void {
-            const self: *@This() = @ptrCast(@alignCast(ctx));
-            // The same serialization the Web journal performs, so the test sees
-            // exactly what a browser would.
-            const line = std.json.Stringify.valueAlloc(
-                self.allocator,
-                .{ .config_changed = ev },
-                .{},
-            ) catch return;
-            self.lines.append(self.allocator, line) catch self.allocator.free(line);
-        }
-
-        fn deinit(self: *@This()) void {
-            for (self.lines.items) |line| self.allocator.free(line);
-            self.lines.deinit(self.allocator);
-        }
-    };
-
-    var collector = Collector{ .allocator = a };
-    defer collector.deinit();
-    const sink = ui_event.ConfigEventSink{
-        .ctx = @ptrCast(&collector),
-        .emitFn = struct {
-            fn run(ctx: *anyopaque, ev: ui_event.ConfigChange) void {
-                Collector.emit(ctx, ev);
-            }
-        }.run,
-    };
+    // The Web journal's own sink (also the daemon's), so the test sees exactly
+    // what a browser or an attached client reads.
+    var journal = cc.event_journal.EventJournal.init(a);
+    defer journal.deinit();
+    var web_sink = cc.web_session.WebConfigSink{ .journal = &journal, .alloc = a };
+    const sink = web_sink.sink();
 
     // A route event as `bindCommittedSelection` produces one.
     sink.emit(.{ .route = .{
@@ -1627,13 +1600,17 @@ test "L2: a route change is broadcast as an ordered, replayable event carrying i
         .scope = "session",
     } });
 
-    try std.testing.expectEqual(@as(usize, 1), collector.lines.items.len);
-    const line = collector.lines.items[0];
+    const lines = (try journal.waitSince(a, 0, 0)) orelse return error.TestExpectedRouteEvent;
+    defer {
+        for (lines) |l| a.free(l);
+        a.free(lines);
+    }
+    try std.testing.expectEqual(@as(usize, 1), lines.len);
+    const line = lines[0];
     // Identity, not just a display name: a second client can tell this route
     // from another that shows the same model name.
     for ([_][]const u8{
-        "\"config_changed\"",
-        "\"route\"",
+        "{\"v\":1,\"type\":\"config_changed\",\"data\":{\"route\":",
         "zai-coding-plan",
         "cn-openai",
         "openai_chat",
