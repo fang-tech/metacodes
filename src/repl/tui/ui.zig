@@ -98,7 +98,7 @@ pub fn dispatch(state: *UiState, ev: Event) Effect {
             state.editor = .{ .view = e.view, .cursor = e.cursor };
             // slash 菜单选中项随 buffer 变化归位:菜单关 → 重置 0;过滤变窄 → 钳到末项。
             // (打字改前缀会重排匹配列表,选中项不归位会指向错命令。)
-            const n = complete.slashFilterCount(e.view);
+            const n = complete.slashFilterCount(state.slash_catalog, e.view);
             if (n == 0) {
                 state.slash_sel = 0;
             } else if (state.slash_sel >= n) {
@@ -224,8 +224,8 @@ fn dispatchKey(state: *UiState, key: input.Key) Effect {
     {
         const gen0 = state.phase == .generating;
         const view = state.editor.view;
-        if (!gen0 and complete.slashMenuOpen(view)) {
-            const n = complete.slashFilterCount(view);
+        if (!gen0 and complete.slashMenuOpen(state.slash_catalog, view)) {
+            const n = complete.slashFilterCount(state.slash_catalog, view);
             if (state.slash_sel >= n) state.slash_sel = if (n == 0) 0 else n - 1;
             switch (key) {
                 .down => {

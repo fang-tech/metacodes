@@ -7,6 +7,7 @@
 //! 属于 Renderer(render_region.zig),不在这里。
 
 const std = @import("std");
+const complete = @import("../complete.zig");
 const types = @import("../../types.zig");
 
 /// 决策面:输入期 vs 生成期。
@@ -192,6 +193,9 @@ pub const UiState = struct {
     // slash 菜单选中项(对齐 cc:`/` 菜单 ↑↓ 移高亮 + Enter 选中)。menu 开时 ↑↓ 改它而非历史导航。
     // 渲染按它高亮(accent 色);菜单关(非 `/` 态)恒重置为 0。范围由 complete.slashFilterCount 钳制。
     slash_sel: usize = 0,
+    // `/` 菜单的命令源(内建 + 可由用户调用的 skill)。REPL loop 在 skill catalog 就绪后
+    // 设置并持有其内存;默认只有内建命令(测试/无 skill 场景)。
+    slash_catalog: complete.SlashCatalog = .builtin,
 
     // Ctrl+U/K/W 杀行后显 `Ctrl+Y to paste deleted text` 提示(对齐 cc,框上方右对齐)。
     // 杀行键置 true,下次打字(char)清 false。

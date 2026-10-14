@@ -332,7 +332,7 @@ test "L2: shared Runtime fork honors model override" {
     try std.testing.expect(std.mem.indexOf(u8, model, "tier-low-model") != null);
 }
 
-test "L2: unsupported agent binding fails before child execution" {
+test "L2: unknown agent binding fails before any child request" {
     const allocator = std.testing.allocator;
     var root_buf: [512]u8 = undefined;
     const root = fixtureRoot(&root_buf, "cc-zig-skill-agent-unavailable");
@@ -340,17 +340,79 @@ test "L2: unsupported agent binding fails before child execution" {
     try makeSkill(
         root,
         "agentfork",
-        "---\nname: agentfork\ndescription: unavailable binding\ncontext: fork\nagent: custom\n---\nbody\n",
+        "---\nname: agentfork\ndescription: unknown binding\ncontext: fork\nagent: custom\n---\nbody\n",
     );
+    var server = try harness.MockServer.start(MINIMAL_END_TURN_SSE, 0);
+    defer server.stop();
+    const url = try server.urlOwned(allocator);
+    defer allocator.free(url);
+    var io_runtime = std.Io.Threaded.init(allocator, .{});
+    defer io_runtime.deinit();
+    var client = cc.client_mod.Client.initWithBaseUrl(allocator, io_runtime.io(), "test-key", "claude-sonnet-4-20250514", url);
+    defer client.deinit();
+
     var fixture: Fixture = undefined;
-    try fixture.init(allocator, std.testing.io, root);
+    try fixture.init(allocator, io_runtime.io(), root);
     defer fixture.deinit(allocator);
-    var ctx = fixture.context(allocator, root, null);
+    var agents = cc.agents_set.AgentSet.init(allocator);
+    defer agents.deinit();
+    var ctx = fixture.context(allocator, root, &client);
+    ctx.agents = &agents;
     const entry = fixture.registry.find("Skill").?;
     try std.testing.expectError(
-        error.SkillUnavailable,
+        error.SkillAgentNotFound,
         entry.execute(&ctx, "{\"name\":\"agentfork\"}"),
     );
+    try std.testing.expectEqual(@as(usize, 0), server.requestCount());
+    try std.testing.expect(fixture.runtime.currentPolicyFrame() == null);
+}
+
+test "L2: agent binding runs the fork under that subagent's tool set" {
+    const allocator = std.testing.allocator;
+    var root_buf: [512]u8 = undefined;
+    const root = fixtureRoot(&root_buf, "cc-zig-skill-agent-bound");
+    defer cleanup(root, "readerfork");
+    try makeSkill(
+        root,
+        "readerfork",
+        "---\nname: readerfork\ndescription: bound to reader\ncontext: fork\nagent: reader\n---\nREADER_FORK_BODY\n",
+    );
+    var server = try harness.MockServer.start(MINIMAL_END_TURN_SSE, 0);
+    defer server.stop();
+    const url = try server.urlOwned(allocator);
+    defer allocator.free(url);
+    var io_runtime = std.Io.Threaded.init(allocator, .{});
+    defer io_runtime.deinit();
+    var client = cc.client_mod.Client.initWithBaseUrl(allocator, io_runtime.io(), "test-key", "claude-sonnet-4-20250514", url);
+    defer client.deinit();
+
+    var fixture: Fixture = undefined;
+    try fixture.init(allocator, io_runtime.io(), root);
+    defer fixture.deinit(allocator);
+    var agents = cc.agents_set.AgentSet.init(allocator);
+    defer agents.deinit();
+    try agents.agents.append(allocator, try cc.agents_def.parseAgentMd(
+        allocator,
+        "---\nname: reader\ndescription: read only\ntools: Read, Grep\n---\nREADER_AGENT_PROMPT\n",
+        "/fake/reader.md",
+        .project,
+    ));
+    var ctx = fixture.context(allocator, root, &client);
+    ctx.agents = &agents;
+    const entry = fixture.registry.find("Skill").?;
+    var output_body = try entry.execute(&ctx, "{\"name\":\"readerfork\"}");
+    defer output_body.deinit(allocator);
+
+    const capture = server.lastRequest() orelse return error.NoRequestCaptured;
+    const tools = capture.jsonField("tools") orelse return error.ToolsFieldMissing;
+    try std.testing.expect(std.mem.indexOf(u8, tools, "\"Read\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tools, "\"Write\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, tools, "\"Bash\"") == null);
+    const system = capture.jsonField("system") orelse return error.SystemFieldMissing;
+    try std.testing.expect(std.mem.indexOf(u8, system, "READER_AGENT_PROMPT") != null);
+    const messages = capture.jsonField("messages") orelse return error.MessagesFieldMissing;
+    try std.testing.expect(std.mem.indexOf(u8, messages, "Base directory for this skill:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, messages, "READER_FORK_BODY") != null);
 }
 
 test "L2: fork without child runner fails closed and never falls back inline" {

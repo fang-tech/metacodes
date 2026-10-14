@@ -13,6 +13,8 @@ Run `zig build gate:pr` to execute the single AGENTS.md pre-submit checklist.
 - [Plugin architecture](PLUGIN_ARCHITECTURE.md) — immutable plugin generations.
 - [Process plugin protocol](PLUGIN_PROCESS_PROTOCOL.md) — isolated tool packages.
 - [Core hot-swap](CORE_PLUGIN_HOTSWAP.md) — first-party profiles and cache rules.
+- [Skills and MCP servers](SKILLS_AND_MCP.md) — Skill and MCP discovery from
+  metacodes, Claude Code and Codex directories; MCP 2026-07-28 client.
 
 ## Kernel design
 

@@ -26,6 +26,7 @@
 const std = @import("std");
 const tt = @import("../tools/test_tmp.zig"); // 测试 fixture 唯一路径(并发隔离)
 const pfs = @import("platform").fs;
+const mcp_naming = @import("../mcp/naming.zig");
 
 pub const Spec = union(enum) {
     /// 整工具(无 specifier 或 `*`)
@@ -211,7 +212,9 @@ pub fn matchesMode(spec: *const RuleSpec, mctx: *const MatchContext, tool_name: 
     // Agent 规则对 Task 工具和(历史)Agent 工具生效(两者都 spawn subagent)
     if (std.mem.eql(u8, spec.tool, "Agent")) {
         if (!std.mem.eql(u8, tool_name, "Task") and !std.mem.eql(u8, tool_name, "Agent")) return false;
-    } else if (!std.mem.eql(u8, spec.tool, tool_name)) {
+    } else if (!std.mem.eql(u8, spec.tool, tool_name) and
+        !mcp_naming.isLegacyAlias(spec.tool, tool_name))
+    {
         return false;
     }
 
@@ -773,36 +776,33 @@ fn matchesAgent(allowed_name: []const u8, args: []const u8) bool {
     return std.mem.eql(u8, subtype, allowed_name);
 }
 
-/// `mcp__server` / `mcp__server__*` / `mcp__server__tool` 三种形式。
-/// MCP 工具名约定:`<server>__<tool>`(cc-zig 的 registry_bridge 命名)。
+/// `mcp__server` / `mcp__server__*` / `mcp__server__tool` / `mcp__server__prefix*`
+/// (Claude Code 的 MCP 规则形式;允许规则的通配必须跟在字面量 `mcp__<server>__` 之后)。
+/// 模型可见的 MCP 工具名是 `mcp__<server>__<tool>`(mcp/naming.zig);旧的
+/// `<server>__<tool>` 命名按补上 `mcp__` 前缀后同样匹配。
 fn matchesMcp(pattern: []const u8, tool_name: []const u8) bool {
-    // 兼容 cc-zig 命名(无前导 mcp__):剥前缀
     if (!std.mem.startsWith(u8, pattern, "mcp__")) return false;
+    var name_buf: [512]u8 = undefined;
+    const name = if (std.mem.startsWith(u8, tool_name, "mcp__"))
+        tool_name
+    else
+        std.fmt.bufPrint(&name_buf, "mcp__{s}", .{tool_name}) catch return false;
     const after = pattern[5..];
-    // 拆 server / tool
-    const sep = std.mem.indexOf(u8, after, "__");
-    if (sep == null) {
-        // mcp__server — 匹配该 server 任意工具(tool_name 须以 server__ 开头)
-        const prefix = try_concat(after, "__");
-        _ = prefix;
-        var buf: [256]u8 = undefined;
-        const need = std.fmt.bufPrint(&buf, "{s}__", .{after}) catch return false;
-        return std.mem.startsWith(u8, tool_name, need);
-    }
-    const server = after[0..sep.?];
-    const tool_part = after[sep.? + 2 ..];
-    if (std.mem.eql(u8, tool_part, "*")) {
-        var buf: [256]u8 = undefined;
-        const need = std.fmt.bufPrint(&buf, "{s}__", .{server}) catch return false;
-        return std.mem.startsWith(u8, tool_name, need);
-    }
     var buf: [512]u8 = undefined;
-    const need = std.fmt.bufPrint(&buf, "{s}__{s}", .{ server, tool_part }) catch return false;
-    return std.mem.eql(u8, tool_name, need);
-}
-
-fn try_concat(_: []const u8, _: []const u8) []const u8 {
-    return "";
+    const sep = std.mem.indexOf(u8, after, "__") orelse {
+        // mcp__server — 该 server 的任意工具
+        const need = std.fmt.bufPrint(&buf, "mcp__{s}__", .{after}) catch return false;
+        return std.mem.startsWith(u8, name, need);
+    };
+    const server = after[0..sep];
+    const tool_part = after[sep + 2 ..];
+    if (std.mem.endsWith(u8, tool_part, "*")) {
+        // mcp__server__* / mcp__server__get_* — 字面量前缀
+        const need = std.fmt.bufPrint(&buf, "mcp__{s}__{s}", .{ server, tool_part[0 .. tool_part.len - 1] }) catch return false;
+        return std.mem.startsWith(u8, name, need);
+    }
+    const need = std.fmt.bufPrint(&buf, "mcp__{s}__{s}", .{ server, tool_part }) catch return false;
+    return std.mem.eql(u8, name, need);
 }
 
 // ============================================================================
@@ -1013,6 +1013,29 @@ test "matches: mcp__server__tool exact" {
     var mctx = MatchContext{};
     try testing.expect(matches(&r, &mctx, "puppeteer__navigate", "{}"));
     try testing.expect(!matches(&r, &mctx, "puppeteer__screenshot", "{}"));
+}
+
+test "matches: Claude Code mcp__ names, server-wide and prefix wildcards" {
+    var mctx = MatchContext{};
+    const server = try parseRule("mcp__github");
+    try testing.expect(matches(&server, &mctx, "mcp__github__create_issue", "{}"));
+    try testing.expect(!matches(&server, &mctx, "mcp__githubx__create_issue", "{}"));
+    const prefix = try parseRule("mcp__github__get_*");
+    try testing.expect(matches(&prefix, &mctx, "mcp__github__get_issue", "{}"));
+    try testing.expect(!matches(&prefix, &mctx, "mcp__github__create_issue", "{}"));
+    const exact = try parseRule("mcp__github__create_issue");
+    try testing.expect(matches(&exact, &mctx, "mcp__github__create_issue", "{}"));
+    try testing.expect(!matches(&exact, &mctx, "mcp__github__create_issue_comment", "{}"));
+}
+
+test "matches: legacy server__tool rules keep selecting mcp__server__tool" {
+    var mctx = MatchContext{};
+    const legacy = try parseRule("github__create_issue");
+    try testing.expect(matches(&legacy, &mctx, "mcp__github__create_issue", "{}"));
+    try testing.expect(matches(&legacy, &mctx, "github__create_issue", "{}"));
+    try testing.expect(!matches(&legacy, &mctx, "mcp__github__create_issue_comment", "{}"));
+    const builtin = try parseRule("Read");
+    try testing.expect(!matches(&builtin, &mctx, "mcp__Read", "{}"));
 }
 
 test "matchesMode: Bash compound — allow 要每段都匹中,deny/ask 任一段即命中" {

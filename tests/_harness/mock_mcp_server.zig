@@ -5,12 +5,44 @@
 //! - initialize → 返回 capabilities / serverInfo
 //! - tools/list → 返回 1 个工具 "echo"（接受 message 参数）
 //! - tools/call → 如果 name="echo"，返回 content [{type:"text",text:<message>}]
+//!
+//! 模式(argv 旗标,协议双时代 / 连接行为测试用):
+//! - `--modern`:2026-07-28 server。回 `server/discover`,拒 `initialize`(-32601),每个请求必须带
+//!   `_meta` 协议版本(否则 -32602);结果带 `resultType`;工具 "mrtr" 先回 input_required。
+//! - `--version <v>`:Classic initialize 回该版本(默认 2024-11-05)。
+//! - `--paginate`:tools/list 第一页 nextCursor 为空串,带 cursor 的请求回第二页。
+//! - `--ping`:回 tools/list 前先发 server→client `ping`,收到回复才给结果。
+//! - `--die-on-discover`:收到 `server/discover` 立即退出(Rust SDK 一类 server 的行为)。
+//! - `--silent-discover`:对 `server/discover` 不回复。
+//! 工具 "env":回 arguments.name 指定环境变量的值;"cwd":回工作目录;"hang":永不回复,
+//! 直到收到 notifications/cancelled;"cancelled":回最近一次被取消的请求 id。
 
 const std = @import("std");
 const pfs = @import("platform").fs;
 
-pub fn main() !void {
+var modern = false;
+var paginate = false;
+var ping_before_list = false;
+var die_on_discover = false;
+var silent_discover = false;
+var classic_version: []const u8 = "2024-11-05";
+var pending_list_id: ?u64 = null;
+var hang_id: ?u64 = null;
+var last_cancelled: ?u64 = null;
+
+pub fn main(init: std.process.Init) !void {
     const alloc = std.heap.page_allocator;
+    var args = std.process.Args.iterateAllocator(init.minimal.args, alloc) catch std.process.exit(2);
+    defer args.deinit();
+    _ = args.next();
+    while (args.next()) |arg| {
+        if (std.mem.eql(u8, arg, "--modern")) modern = true;
+        if (std.mem.eql(u8, arg, "--paginate")) paginate = true;
+        if (std.mem.eql(u8, arg, "--ping")) ping_before_list = true;
+        if (std.mem.eql(u8, arg, "--die-on-discover")) die_on_discover = true;
+        if (std.mem.eql(u8, arg, "--silent-discover")) silent_discover = true;
+        if (std.mem.eql(u8, arg, "--version")) classic_version = try alloc.dupe(u8, args.next() orelse "2024-11-05");
+    }
     var buf = std.ArrayList(u8).empty;
     defer buf.deinit(alloc);
 
@@ -38,10 +70,24 @@ var pending_elicit_id: ?u64 = null;
 
 fn handleLine(alloc: std.mem.Allocator, line: []const u8) !void {
     // notifications 无 id 也不需回复
-    if (std.mem.indexOf(u8, line, "\"method\":\"notifications/") != null) return;
+    if (std.mem.indexOf(u8, line, "\"method\":\"notifications/") != null) {
+        if (std.mem.indexOf(u8, line, "\"method\":\"notifications/cancelled\"") != null) {
+            last_cancelled = parseUintAfter(line, "\"requestId\":");
+            if (hang_id != null and last_cancelled != null and hang_id.? == last_cancelled.?) hang_id = null;
+        }
+        return;
+    }
 
     const method_opt = extractStringField(line, "method");
     if (method_opt == null) {
+        // The client's answer to our ping: now finish the pending tools/list.
+        if (pending_list_id) |list_id| {
+            if (parseId(line) == 4242) {
+                pending_list_id = null;
+                try writeToolsList(alloc, list_id, null);
+                return;
+            }
+        }
         // 无 method = client→server 响应(elicitation 回复)。据 action 完成挂起的 tools/call。
         if (pending_elicit_id) |eid| {
             const action = extractStringField(line, "action") orelse "decline";
@@ -57,14 +103,42 @@ fn handleLine(alloc: std.mem.Allocator, line: []const u8) !void {
     const method = method_opt.?;
     const id = parseId(line) orelse return;
 
+    if (std.mem.eql(u8, method, "server/discover")) {
+        if (die_on_discover) std.process.exit(0);
+        if (silent_discover) return;
+        if (!modern) {
+            try writeError(alloc, id, -32601, "Method not found");
+            return;
+        }
+        try writeResponse(alloc, id,
+            \\{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{"tools":{},"resources":{}},"ttlMs":0,"cacheScope":"private"}
+        );
+        return;
+    }
+    if (modern) {
+        if (std.mem.eql(u8, method, "initialize")) {
+            try writeError(alloc, id, -32601, "Method not found");
+            return;
+        }
+        if (std.mem.indexOf(u8, line, "\"io.modelcontextprotocol/protocolVersion\":\"2026-07-28\"") == null) {
+            try writeError(alloc, id, -32602, "missing _meta protocolVersion");
+            return;
+        }
+    }
+
     if (std.mem.eql(u8, method, "initialize")) {
-        try writeResponse(alloc, id,
-            \\{"protocolVersion":"2024-11-05","capabilities":{"tools":{}},"serverInfo":{"name":"mock-mcp","version":"0.1.0"}}
-        );
+        const result = try std.fmt.allocPrint(alloc,
+            \\{{"protocolVersion":"{s}","capabilities":{{"tools":{{}}}},"serverInfo":{{"name":"mock-mcp","version":"0.1.0"}}}}
+        , .{classic_version});
+        defer alloc.free(result);
+        try writeResponse(alloc, id, result);
     } else if (std.mem.eql(u8, method, "tools/list")) {
-        try writeResponse(alloc, id,
-            \\{"tools":[{"name":"echo","description":"echo back input","inputSchema":{"type":"object","properties":{"message":{"type":"string"}},"required":["message"]}},{"name":"slow_echo","description":"delayed echo for concurrency tests","inputSchema":{"type":"object","properties":{"message":{"type":"string"}},"required":["message"]}},{"name":"elicit","description":"asks user via elicitation","inputSchema":{"type":"object"}},{"name":"large","description":"stream a 17MiB result","inputSchema":{"type":"object"}}]}
-        );
+        if (ping_before_list and !modern) {
+            pending_list_id = id;
+            _ = pfs.write(1, "{\"jsonrpc\":\"2.0\",\"id\":4242,\"method\":\"ping\"}\n");
+            return;
+        }
+        try writeToolsList(alloc, id, extractStringField(line, "cursor"));
     } else if (std.mem.eql(u8, method, "resources/list")) {
         try writeResponse(alloc, id,
             \\{"resources":[{"uri":"mock://large","name":"large fixture","mimeType":"text/plain"}]}
@@ -113,7 +187,59 @@ fn handleLine(alloc: std.mem.Allocator, line: []const u8) !void {
         try writeStdoutAll("RESOURCE_TAIL\"}]}}\n");
         return;
     } else if (std.mem.eql(u8, method, "tools/call")) {
-        const tool = extractStringField(line, "name") orelse "";
+        const tool = toolName(line);
+        if (std.mem.eql(u8, tool, "hang")) {
+            hang_id = id;
+            return;
+        }
+        if (std.mem.eql(u8, tool, "cancelled")) {
+            const payload = try std.fmt.allocPrint(alloc,
+                \\{{"content":[{{"type":"text","text":"cancelled:{d}"}}]}}
+            , .{last_cancelled orelse 0});
+            defer alloc.free(payload);
+            try writeResponse(alloc, id, payload);
+            return;
+        }
+        if (std.mem.eql(u8, tool, "env")) {
+            const name = extractNestedStringField(line, "name") orelse "";
+            var name_buffer: [256]u8 = undefined;
+            const name_z = std.fmt.bufPrintZ(&name_buffer, "{s}", .{name}) catch "";
+            const value = if (std.c.getenv(name_z.ptr)) |raw| std.mem.span(raw) else "<unset>";
+            const payload = try std.fmt.allocPrint(alloc,
+                \\{{"content":[{{"type":"text","text":"env:{s}={s}"}}]}}
+            , .{ name, value });
+            defer alloc.free(payload);
+            try writeResponse(alloc, id, payload);
+            return;
+        }
+        if (std.mem.eql(u8, tool, "cwd")) {
+            var cwd_buffer: [4096]u8 = undefined;
+            const cwd = if (std.c.getcwd(&cwd_buffer, cwd_buffer.len)) |raw| std.mem.span(@as([*:0]const u8, @ptrCast(raw))) else "?";
+            const payload = try std.fmt.allocPrint(alloc,
+                \\{{"content":[{{"type":"text","text":"cwd:{s}"}}]}}
+            , .{cwd});
+            defer alloc.free(payload);
+            try writeResponse(alloc, id, payload);
+            return;
+        }
+        if (modern and std.mem.eql(u8, tool, "mrtr")) {
+            // Round 1: ask for input. Round 2 (with inputResponses and the
+            // echoed requestState): answer with what the client sent.
+            if (std.mem.indexOf(u8, line, "\"inputResponses\"") == null) {
+                try writeResponse(alloc, id,
+                    \\{"resultType":"input_required","inputRequests":{"login":{"method":"elicitation/create","params":{"message":"who are you","requestedSchema":{"type":"object","properties":{"name":{"type":"string"}}}}}},"requestState":"opaque-state-1"}
+                );
+                return;
+            }
+            const action = extractStringField(line, "action") orelse "none";
+            const state_ok = std.mem.indexOf(u8, line, "\"requestState\":\"opaque-state-1\"") != null;
+            const payload = try std.fmt.allocPrint(alloc,
+                \\{{"resultType":"complete","content":[{{"type":"text","text":"mrtr:{s}:state={}"}}]}}
+            , .{ action, state_ok });
+            defer alloc.free(payload);
+            try writeResponse(alloc, id, payload);
+            return;
+        }
         if (std.mem.eql(u8, tool, "elicit")) {
             // 挂起 tools/call,发 server→client elicitation/create;等 client 回复(下一行处理)。
             pending_elicit_id = id;
@@ -158,6 +284,55 @@ fn handleLine(alloc: std.mem.Allocator, line: []const u8) !void {
     } else {
         try writeError(alloc, id, -32601, "Method not found");
     }
+}
+
+fn writeToolsList(alloc: std.mem.Allocator, id: u64, cursor: ?[]const u8) !void {
+    const result_type = if (modern) "\"resultType\":\"complete\"," else "";
+    if (paginate and cursor == null) {
+        // An empty-string cursor is a real cursor (pagination.mdx): page two follows.
+        const page = try std.fmt.allocPrint(alloc,
+            \\{{{s}"tools":[{{"name":"echo","description":"echo back input","inputSchema":{{"type":"object","properties":{{"message":{{"type":"string"}}}},"required":["message"]}}}}],"nextCursor":""}}
+        , .{result_type});
+        defer alloc.free(page);
+        try writeResponse(alloc, id, page);
+        return;
+    }
+    if (paginate) {
+        const page = try std.fmt.allocPrint(alloc,
+            \\{{{s}"tools":[{{"name":"page.two","description":"second page","inputSchema":{{"type":"object"}}}}]}}
+        , .{result_type});
+        defer alloc.free(page);
+        try writeResponse(alloc, id, page);
+        return;
+    }
+    const full = try std.fmt.allocPrint(alloc,
+        \\{{{s}"tools":[{{"name":"echo","description":"echo back input","inputSchema":{{"type":"object","properties":{{"message":{{"type":"string"}}}},"required":["message"]}}}},{{"name":"slow_echo","description":"delayed echo for concurrency tests","inputSchema":{{"type":"object","properties":{{"message":{{"type":"string"}}}},"required":["message"]}}}},{{"name":"elicit","description":"asks user via elicitation","inputSchema":{{"type":"object"}}}},{{"name":"large","description":"stream a 17MiB result","inputSchema":{{"type":"object"}}}},{{"name":"env","description":"report an environment variable","inputSchema":{{"type":"object","properties":{{"name":{{"type":"string"}}}}}}}},{{"name":"cwd","description":"report the working directory","inputSchema":{{"type":"object"}}}},{{"name":"hang","description":"never answers","inputSchema":{{"type":"object"}}}},{{"name":"cancelled","description":"last cancelled request id","inputSchema":{{"type":"object"}}}},{{"name":"mrtr","description":"needs input (2026-07-28)","inputSchema":{{"type":"object"}}}}]}}
+    , .{result_type});
+    defer alloc.free(full);
+    try writeResponse(alloc, id, full);
+}
+
+/// `params.name` of a tools/call: the last `"name"` before `"arguments"`
+/// (a 2026-07-28 request's `_meta.clientInfo` also has a `name`).
+fn toolName(line: []const u8) []const u8 {
+    const arguments = std.mem.indexOf(u8, line, "\"arguments\"") orelse line.len;
+    var result: []const u8 = "";
+    var cursor: usize = 0;
+    while (extractStringFieldFrom(line[0..arguments], cursor, "name")) |found| {
+        result = found.value;
+        cursor = found.end;
+    }
+    return result;
+}
+
+fn parseUintAfter(data: []const u8, key: []const u8) ?u64 {
+    const index = std.mem.indexOf(u8, data, key) orelse return null;
+    var start = index + key.len;
+    while (start < data.len and data[start] == ' ') : (start += 1) {}
+    var end = start;
+    while (end < data.len and data[end] >= '0' and data[end] <= '9') : (end += 1) {}
+    if (end == start) return null;
+    return std.fmt.parseInt(u64, data[start..end], 10) catch null;
 }
 
 fn writeStdoutAll(bytes: []const u8) !void {

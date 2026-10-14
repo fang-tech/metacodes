@@ -163,6 +163,9 @@ pub const skills_tool = @import("skills/tool.zig");
 pub const skills_render = @import("skills/render.zig");
 pub const mcp_client = @import("mcp/client.zig");
 pub const mcp_protocol = @import("mcp/protocol.zig");
+pub const mcp_config = @import("mcp/config.zig");
+pub const mcp_launch = @import("mcp/launch.zig");
+pub const mcp_naming = @import("mcp/naming.zig");
 pub const mcp_result_stream = @import("agentcore/mcp_result_stream.zig");
 pub const sandbox_config = @import("sandbox/config.zig");
 

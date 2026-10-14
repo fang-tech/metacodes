@@ -39,7 +39,17 @@ pub const StdioTransport = struct {
     /// spawn 子进程。argv 以 null 结尾，argv[0] 是绝对路径或在 PATH 内。
     /// 走可移植 platform/process.spawnPipes（POSIX fork+pipe / Windows CreateProcessW+CreatePipe）。
     pub fn spawn(allocator: std.mem.Allocator, argv: []const ?[*:0]const u8) !StdioTransport {
-        const child = process.spawnPipes(argv, false, null) catch {
+        return spawnWith(allocator, argv, .{});
+    }
+
+    /// `spawn` with an explicit environment, working directory and stderr
+    /// destination (see `platform.process.PipeSpawnOptions`).
+    pub fn spawnWith(
+        allocator: std.mem.Allocator,
+        argv: []const ?[*:0]const u8,
+        options: process.PipeSpawnOptions,
+    ) !StdioTransport {
+        const child = process.spawnPipesWith(argv, options) catch {
             // 子进程报了具体原因(程序不存在/不可执行)就记进日志;错误名保持 SpawnFailed,
             // 调用方语义不动。过去这里 spawn "成功"、server 立刻死、握手再撞 McpServerCrashed,
             // 原因全程无人知道。
@@ -154,9 +164,14 @@ pub const StdioTransport = struct {
 
         var chunk: [32 * 1024]u8 = undefined;
         while (true) {
-            if (self.abort) |ab| {
+            if (self.abort != null or self.deadline_ms != null) {
                 while (true) {
-                    if (ab.isAborted()) return error.Aborted;
+                    if (self.abort) |ab| {
+                        if (ab.isAborted()) return error.Aborted;
+                    }
+                    if (self.deadline_ms) |deadline| {
+                        if (util_time.nowMs() >= deadline) return error.Timeout;
+                    }
                     if (self.child.pollReadable(100)) break;
                 }
             }

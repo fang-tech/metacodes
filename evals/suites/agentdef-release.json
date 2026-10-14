@@ -148,15 +148,15 @@
           "tests/_harness/mock_mcp_server.zig"
         ]
       },
-      "tools": {"profile": "metacodes-agentdef-release-v1", "required": ["Task", "ToolSearch", "allowed__echo", "Write"]},
+      "tools": {"profile": "metacodes-agentdef-release-v1", "required": ["Task", "ToolSearch", "mcp__allowed__echo", "Write"]},
       "constraints": {"timeout_seconds": 600, "permission_mode": "bypassPermissions"},
       "success": {
         "checks": [
           {"type": "contains", "path": "mcp-proof.txt", "text": "MCP_ALLOWLIST_SENTINEL", "description": "允许的 MCP server 完成真实 roundtrip"},
-          {"type": "contains", "path": "mcp-proof.txt", "text": "allowed__echo", "description": "父 agent 固化实际允许工具名"},
-          {"type": "debug_log_contains", "text": "tool.exec done(par) name=allowed__echo", "description": "子 agent 实际完成 allowed MCP roundtrip"},
+          {"type": "contains", "path": "mcp-proof.txt", "text": "mcp__allowed__echo", "description": "父 agent 固化实际允许工具名"},
+          {"type": "debug_log_contains", "text": "tool.exec done(par) name=mcp__allowed__echo", "description": "子 agent 实际完成 allowed MCP roundtrip"},
           {"type": "debug_log_contains", "text": "tool.exec FAILED(par) name=ToolSearch err=NoToolMatch", "description": "ToolSearch 不会从全局 registry 泄露 blocked server 工具"},
-          {"type": "debug_log_not_contains", "text": "tool.exec done(par) name=blocked__echo", "description": "blocked server 工具未完成动态执行"}
+          {"type": "debug_log_not_contains", "text": "tool.exec done(par) name=mcp__blocked__echo", "description": "blocked server 工具未完成动态执行"}
         ]
       },
       "trajectory_constraints": {

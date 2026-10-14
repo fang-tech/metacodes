@@ -501,6 +501,11 @@ pub const App = struct {
     /// 已连接的 MCP server。每个 owns 一个 McpClient + McpSession（一一对应）。
     /// 退出时 deinit 反向关闭：先 session（释放 binding 内存）再 client（关 transport）。
     mcp_sessions: std.ArrayList(McpSessionEntry),
+    /// Every configured MCP server and its startup outcome (for /mcp).
+    mcp_report: McpReport = .{},
+    /// Owns the resolved MCP configuration and `mcp_report` (child of
+    /// `allocator`, released in deinit). Null until MCP servers are loaded.
+    mcp_arena: ?*std.heap.ArenaAllocator = null,
     /// 当前激活的 skill 状态(allowed/disallowed 临时白黑名单)。
     /// 激活 Skill 工具时设;loop.zig 处理下条 user message 前清。
     active_skill: ?ActiveSkillState = null,
@@ -643,10 +648,14 @@ pub const App = struct {
         const plugin_skill_sources = if (app.plugin_snapshot) |snapshot| snapshot.skill_sources else &.{};
         const plugin_agent_sources = if (app.plugin_snapshot) |snapshot| snapshot.agent_sources else &.{};
         if (cwd_for_skills) |cwd| {
+            var add_dir_scratch = std.heap.ArenaAllocator.init(allocator);
+            defer add_dir_scratch.deinit();
+            const skill_add_dirs = cliAddDirs(add_dir_scratch.allocator(), config.add_dirs, cwd) catch &.{};
             app.skill_runtime.loadDefaultWithExtraSources(
                 cwd,
                 @import("platform").paths.homeDir() orelse "",
                 app.stateRoot(),
+                skill_add_dirs,
                 if (app.plugin_snapshot != null) "plugin-generation-1" else "",
                 plugin_skill_sources,
                 &app.skills,
@@ -1097,6 +1106,12 @@ pub const App = struct {
             app.allocator.free(entry.name);
         }
         app.mcp_sessions.deinit(app.allocator);
+        if (app.mcp_arena) |arena_state| {
+            app.mcp_report = .{};
+            arena_state.deinit();
+            app.allocator.destroy(arena_state);
+            app.mcp_arena = null;
+        }
         app.dyn_registry.deinit();
         {
             var it = app.activated_tools.keyIterator();
@@ -3199,112 +3214,178 @@ pub const App = struct {
         @import("util/log.zig").info("permission", "loaded {d} rule(s) from config", .{app.rule_set.?.rules.items.len});
     }
 
-    /// 启动时连接 <state root>/config.json 里 mcp_servers 数组里声明的每个 server。
-    /// Schema：
-    ///   {"mcp_servers": [
-    ///       {"name": "github", "command": ["/usr/local/bin/mcp-github", "--token=..."]},
-    ///       ...
-    ///   ]}
-    /// 每个 server 失败仅 log,不影响其它 server 或 App 启动。
-    /// 成功的 session 注册的工具进 dyn_registry,naming: `<name>__<tool>`。
+    /// 启动时连接所有配置来源里的 MCP server(见 mcp/config.zig:metacodes 自己的
+    /// `<state root>/config.json`,以及 Claude Code / Codex 的配置)。各 server 并行连接,
+    /// 每个受启动超时约束;失败逐个记入 `mcp_report`(/mcp 可见)并 warn,不影响其它
+    /// server 或 App 启动。工具以 `mcp__<server>__<tool>` 注册进 dyn_registry。
     fn connectMcpServers(app: *App) !void {
-        const state_dir = app.stateRoot();
-        if (state_dir.len == 0) return error.NoHome;
-        var pbuf: [std.fs.max_path_bytes + 1]u8 = undefined;
-        const path = try std.fmt.bufPrint(&pbuf, "{s}/config.json\x00", .{state_dir});
-        const fd = pfs.open(@ptrCast(path.ptr), .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
-        if (fd < 0) return error.NotFound;
-        defer _ = pfs.close(fd);
-
-        var all = std.ArrayList(u8).empty;
-        defer all.deinit(app.allocator);
-        var buf: [4096]u8 = undefined;
-        while (true) {
-            const n = pfs.read(fd, buf[0..buf.len]);
-            if (n <= 0) break;
-            try all.appendSlice(app.allocator, buf[0..@intCast(n)]);
-        }
-
-        var parsed = try std.json.parseFromSlice(std.json.Value, app.allocator, all.items, .{});
-        defer parsed.deinit();
-        const root = parsed.value;
-        if (root != .object) return;
-        const servers_v = root.object.get("mcp_servers") orelse return;
-        if (servers_v != .array) return;
-
         const log = @import("util/log.zig");
-        for (servers_v.array.items) |sv| {
-            if (sv != .object) continue;
-            const name_v = sv.object.get("name") orelse continue;
-            const cmd_v = sv.object.get("command") orelse continue;
-            if (name_v != .string or cmd_v != .array) continue;
-
-            // 把 command 数组转成 C argv（null-terminated, 每项 [*:0]u8）
-            var argv_storage = std.ArrayList(?[*:0]const u8).empty;
-            defer {
-                for (argv_storage.items) |item| {
-                    if (item) |p| app.allocator.free(std.mem.span(p));
-                }
-                argv_storage.deinit(app.allocator);
-            }
-            for (cmd_v.array.items) |arg| {
-                if (arg != .string) {
-                    log.warn("mcp", "server '{s}': non-string in command array, skipped", .{name_v.string});
-                    break;
-                }
-                const dup = try app.allocator.dupeZ(u8, arg.string);
-                try argv_storage.append(app.allocator, dup.ptr);
-            }
-            if (argv_storage.items.len == 0) continue;
-            try argv_storage.append(app.allocator, null);
-
-            // spawn + connect
-            const client_heap = try app.allocator.create(McpClient);
-            client_heap.* = McpClient.connect(app.allocator, argv_storage.items) catch |err| {
-                log.warn("mcp", "server '{s}' connect failed: {s}", .{ name_v.string, @errorName(err) });
-                app.allocator.destroy(client_heap);
-                continue;
-            };
-            var client_committed = false;
-            defer if (!client_committed) {
-                client_heap.close();
-                app.allocator.destroy(client_heap);
-            };
-
-            // Reserve every App-owned resource before publishing any tool
-            // definition into dyn_registry. After registration succeeds the
-            // final session append is infallible, so registry ctx_ptr values
-            // cannot outlive an unowned/freed McpSession.
-            const name_owned = try app.allocator.dupe(u8, name_v.string);
-            var name_committed = false;
-            defer if (!name_committed) app.allocator.free(name_owned);
-            try app.mcp_sessions.ensureUnusedCapacity(app.allocator, 1);
-
-            // **诚实登记(elicitation UI 未接线)**:client.elicit 回调机制已实现+测试(见 mcp/client.zig),
-            // 但此处**不设** handler → 生产中 MCP server 发 elicitation/create 一律安全 decline(协议正确闭合,
-            // tool 继续/优雅失败,不 hang)。接真 UI 需一个 elicitation 渲染器(同 custom UiRequest,TUI 暂无);
-            // 有渲染器后在此 per-session 设 client_heap.elicit=路由到 ui_requester 即可,MCP 层零改。
-            var session = McpSession.init(app.allocator, client_heap);
-            // 注册 server tools + resource tools；任一失败回滚本 server
-            session.registerTools(&app.dyn_registry, name_v.string) catch |err| {
-                log.warn("mcp", "server '{s}' registerTools failed: {s}", .{ name_v.string, @errorName(err) });
-                session.deinit();
-                continue;
-            };
-            session.registerResourceTools(&app.dyn_registry, name_v.string) catch |err| {
-                log.warn("mcp", "server '{s}' registerResourceTools failed: {s}", .{ name_v.string, @errorName(err) });
-                // tools 已注册无法回滚；只能略过 resources
-            };
-
-            app.mcp_sessions.appendAssumeCapacity(.{
-                .name = name_owned,
-                .client = client_heap,
-                .session = session,
+        const mcp_config = @import("mcp/config.zig");
+        const mcp_launch = @import("mcp/launch.zig");
+        const arena_state = try app.allocator.create(std.heap.ArenaAllocator);
+        arena_state.* = std.heap.ArenaAllocator.init(app.allocator);
+        app.mcp_arena = arena_state;
+        const a = arena_state.allocator();
+        const cwd = app.cwdAbs();
+        const workspace_root = app.project_dir_or_empty();
+        const environment = try mcp_config.Environment.fromProcess(a);
+        const resolved = try mcp_config.load(a, .{
+            .state_root = app.stateRoot(),
+            .home = app.homeDir(),
+            .cwd = cwd,
+            .workspace_root = if (workspace_root.len != 0) workspace_root else cwd,
+            .codex_home = @import("platform").paths.codexHomeEnv() orelse "",
+            .env = environment,
+        });
+        for (resolved.problems) |problem| {
+            log.warn("mcp", "{s} ({s}){s}{s}: {s}", .{
+                problem.origin_path,
+                problem.origin.label(),
+                if (problem.server.len != 0) " server " else "",
+                problem.server,
+                problem.message,
             });
-            name_committed = true;
-            client_committed = true;
-            log.info("mcp", "connected '{s}'", .{name_v.string});
         }
+        for (resolved.pending) |pending| {
+            if (pending.reason == .needs_approval)
+                log.warn("mcp", "project server '{s}' in {s} awaits approval (add it to enabledMcpjsonServers)", .{ pending.name, pending.origin_path });
+        }
+
+        const jobs = try a.alloc(McpConnectJob, resolved.servers.len);
+        for (resolved.servers, jobs) |server, *job| {
+            job.* = .{ .server = server, .io = app.io };
+            switch (server.transport) {
+                .stdio => |stdio| {
+                    job.launch = mcp_launch.prepare(a, stdio, environment, cwd) catch |err| {
+                        job.result = .{ .failed = if (err == error.CommandNotFound) error.McpCommandNotFound else err };
+                        continue;
+                    };
+                    job.log_path = app.openMcpLog(a, server.name, &job.log_fd);
+                },
+                .http => |http| {
+                    job.http_headers = mcpHttpHeaders(a, http, environment) catch |err| {
+                        job.result = .{ .failed = err };
+                        continue;
+                    };
+                },
+            }
+        }
+        // Parallel startup (Claude Code and Codex both connect servers
+        // concurrently); a thread that cannot be spawned runs inline.
+        const threads = try a.alloc(?std.Thread, jobs.len);
+        for (jobs, threads) |*job, *thread| {
+            thread.* = null;
+            if (job.result != .pending) continue;
+            thread.* = std.Thread.spawn(.{}, McpConnectJob.run, .{job}) catch blk: {
+                job.run();
+                break :blk null;
+            };
+        }
+        for (threads) |maybe| if (maybe) |thread| thread.join();
+
+        var statuses: std.ArrayList(McpServerStatus) = .empty;
+        for (jobs) |*job| {
+            if (job.log_fd) |fd| _ = @import("platform").fs.close(fd);
+            var status = McpServerStatus{
+                .name = job.server.name,
+                .origin = job.server.origin,
+                .origin_path = job.server.origin_path,
+                .log_path = job.log_path,
+                .state = .failed,
+            };
+            switch (job.result) {
+                .pending => unreachable,
+                .failed => |err| {
+                    status.detail = mcpFailureDetail(err, job);
+                    log.warn("mcp", "server '{s}' ({s}) failed: {s}", .{ job.server.name, job.server.origin.label(), status.detail });
+                },
+                .connected => |connected| {
+                    var client = connected.client;
+                    const tools_json = connected.tools_json;
+                    defer std.heap.c_allocator.free(tools_json);
+                    status.protocol = client.protocol_version;
+                    if (app.registerMcpServer(job.server, &client, tools_json)) |count| {
+                        status.state = .connected;
+                        status.tool_count = count;
+                        log.info("mcp", "connected '{s}' ({s}, {d} tools)", .{ job.server.name, client.protocol_version, count });
+                    } else |err| {
+                        client.close();
+                        status.detail = @errorName(err);
+                        log.warn("mcp", "server '{s}' tool registration failed: {s}", .{ job.server.name, @errorName(err) });
+                    }
+                },
+            }
+            try statuses.append(a, status);
+        }
+        app.mcp_report = .{
+            .servers = try statuses.toOwnedSlice(a),
+            .pending = resolved.pending,
+            .disabled = resolved.disabled,
+            .problems = resolved.problems,
+        };
+    }
+
+    /// Move a connected client into App ownership and publish its tools.
+    /// Returns the number of tools registered.
+    fn registerMcpServer(app: *App, server: @import("mcp/config.zig").Server, client: *McpClient, tools_json: []const u8) !usize {
+        // Reserve every App-owned resource before publishing any tool
+        // definition into dyn_registry. After registration succeeds the
+        // final session append is infallible, so registry ctx_ptr values
+        // cannot outlive an unowned/freed McpSession.
+        const name_owned = try app.allocator.dupe(u8, server.name);
+        errdefer app.allocator.free(name_owned);
+        try app.mcp_sessions.ensureUnusedCapacity(app.allocator, 1);
+        const client_heap = try app.allocator.create(McpClient);
+        errdefer app.allocator.destroy(client_heap);
+        client_heap.* = client.*;
+
+        // **诚实登记(elicitation UI 未接线)**:client.elicit 回调机制已实现+测试(见 mcp/client.zig),
+        // 但此处**不设** handler → 生产中 MCP server 发 elicitation 一律安全 decline(协议正确闭合,
+        // tool 继续/优雅失败,不 hang)。接真 UI 需一个 elicitation 渲染器(同 custom UiRequest,TUI 暂无);
+        // 有渲染器后在此 per-session 设 client_heap.elicit=路由到 ui_requester 即可,MCP 层零改。
+        var session = McpSession.init(app.allocator, client_heap);
+        errdefer session.deinit();
+        try session.registerToolsFromJsonFiltered(&app.dyn_registry, name_owned, tools_json, .{
+            .enabled = server.enabled_tools,
+            .disabled = server.disabled_tools,
+            .http_param_headers = server.transport == .http,
+        });
+        const count = session.bindings.items.len;
+        app.mcp_sessions.appendAssumeCapacity(.{
+            .name = name_owned,
+            .client = client_heap,
+            .session = session,
+        });
+        return count;
+    }
+
+    /// `<state root>/logs/mcp/<server>.log`, truncated per session: the
+    /// server's stderr (startup errors, crashes) lands where `/mcp` points.
+    fn openMcpLog(app: *App, arena: std.mem.Allocator, server: []const u8, fd_out: *?c_int) []const u8 {
+        fd_out.* = null;
+        const state = app.stateRoot();
+        if (state.len == 0) return "";
+        const name = @import("mcp/launch.zig").logFileName(arena, server) catch return "";
+        const dir = std.fs.path.join(arena, &.{ state, "logs", "mcp" }) catch return "";
+        @import("util/fs.zig").mkdirParents(dir) catch return "";
+        const path = std.fs.path.join(arena, &.{ dir, name }) catch return "";
+        const path_z = arena.dupeZ(u8, path) catch return "";
+        // Close-on-exec: every log is open while the servers start in
+        // parallel, and each server gets its own as fd 2 through dup2. Without
+        // the flag each server, and anything else spawned meanwhile, would
+        // also hold every other server's log open. The fork lock keeps a
+        // concurrent spawn out of the gap between open and fcntl.
+        const process = @import("platform").process;
+        process.forkSerialLock();
+        defer process.forkSerialUnlock();
+        const fd = pfs.open(path_z.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o600));
+        if (fd < 0) return "";
+        pfs.makeCloseOnExec(fd) catch {
+            _ = pfs.close(fd);
+            return "";
+        };
+        fd_out.* = fd;
+        return path;
     }
 
     /// 把 app.abort 绑到进程级 SIGINT handler。**只在前台(TUI N=1)会话调一次。**
@@ -3320,6 +3401,126 @@ pub const App = struct {
         platform_signal.installInterrupt(onSigint);
     }
 };
+
+/// One configured MCP server and what became of it at startup (for /mcp).
+pub const McpServerStatus = struct {
+    name: []const u8,
+    origin: @import("mcp/config.zig").Origin,
+    origin_path: []const u8,
+    state: enum { connected, failed } = .failed,
+    /// Failure reason ("" when connected).
+    detail: []const u8 = "",
+    /// Negotiated protocol revision ("" when not connected).
+    protocol: []const u8 = "",
+    tool_count: usize = 0,
+    /// The server's stderr log ("" when none).
+    log_path: []const u8 = "",
+};
+
+pub const McpReport = struct {
+    servers: []const McpServerStatus = &.{},
+    pending: []const @import("mcp/config.zig").Pending = &.{},
+    disabled: []const []const u8 = &.{},
+    problems: []const @import("mcp/config.zig").Problem = &.{},
+};
+
+/// Static headers, `Authorization: Bearer $bearer_token_env_var` and
+/// `env_http_headers` for an HTTP server. A missing bearer variable is an
+/// error (Codex); a missing header variable drops that header.
+fn mcpHttpHeaders(
+    arena: std.mem.Allocator,
+    http: @import("mcp/config.zig").Http,
+    environment: @import("mcp/config.zig").Environment,
+) ![]const @import("mcp/transport.zig").Header {
+    var headers: std.ArrayList(@import("mcp/transport.zig").Header) = .empty;
+    for (http.headers) |header| try headers.append(arena, .{ .name = header.name, .value = header.value });
+    for (http.env_headers) |header| {
+        const value = environment.get(header.value) orelse continue;
+        if (value.len == 0) continue;
+        try headers.append(arena, .{ .name = header.name, .value = value });
+    }
+    if (http.bearer_token_env_var) |variable| {
+        const token = environment.get(variable) orelse return error.McpBearerTokenUnset;
+        if (token.len == 0) return error.McpBearerTokenUnset;
+        try headers.append(arena, .{ .name = "Authorization", .value = try std.fmt.allocPrint(arena, "Bearer {s}", .{token}) });
+    }
+    return headers.toOwnedSlice(arena);
+}
+
+/// Startup work for one server, run on its own thread.
+const McpConnectJob = struct {
+    server: @import("mcp/config.zig").Server,
+    io: std.Io,
+    launch: ?@import("mcp/launch.zig").Launch = null,
+    http_headers: []const @import("mcp/transport.zig").Header = &.{},
+    log_fd: ?c_int = null,
+    log_path: []const u8 = "",
+    result: Result = .pending,
+
+    const Result = union(enum) {
+        pending,
+        failed: anyerror,
+        connected: struct { client: McpClient, tools_json: []u8 },
+    };
+
+    fn run(job: *McpConnectJob) void {
+        // c_allocator: the client allocates and frees per request for the
+        // whole session; the App arena could never reclaim that.
+        const options: @import("mcp/client.zig").ConnectOptions = .{
+            .spawn = .{ .argv = &.{} },
+            .startup_timeout_ms = job.server.startup_timeout_ms,
+            .request_timeout_ms = job.server.tool_timeout_ms,
+        };
+        var client = switch (job.server.transport) {
+            .stdio => blk: {
+                const launch = job.launch orelse {
+                    job.result = .{ .failed = error.McpLaunchUnavailable };
+                    return;
+                };
+                var stdio_options = options;
+                stdio_options.spawn = .{
+                    .argv = launch.argv,
+                    .env = launch.env,
+                    .cwd = launch.cwd,
+                    .stderr_fd = job.log_fd,
+                };
+                break :blk McpClient.connectWith(std.heap.c_allocator, stdio_options);
+            },
+            .http => |http| McpClient.connectHttp(std.heap.c_allocator, .{
+                .io = job.io,
+                .url = http.url,
+                .headers = job.http_headers,
+            }, options),
+        } catch |err| {
+            job.result = .{ .failed = err };
+            return;
+        };
+        client.transport.setDeadline(@import("util/time.zig").nowMs() + job.server.startup_timeout_ms);
+        const tools_json = client.listTools() catch |err| {
+            client.close();
+            job.result = .{ .failed = err };
+            return;
+        };
+        client.transport.setDeadline(null);
+        job.result = .{ .connected = .{ .client = client, .tools_json = tools_json } };
+    }
+};
+
+fn mcpFailureDetail(err: anyerror, job: *const McpConnectJob) []const u8 {
+    return switch (err) {
+        error.McpCommandNotFound => "command not found on the server's PATH",
+        error.SpawnFailed => "could not start the command",
+        error.Timeout, error.McpRequestTimeout => "no response before the startup timeout",
+        error.McpServerCrashed, error.Eof => if (job.log_path.len != 0) "server exited; see its log" else "server exited",
+        error.UnsupportedProtocolVersion => "server speaks no supported MCP revision",
+        error.McpAuthRequired => "the server requires authentication (401/403); OAuth login is not supported, configure a bearer token or headers",
+        error.McpBearerTokenUnset => "bearer_token_env_var is not set",
+        error.McpConnectFailed => "could not connect to the server URL",
+        error.McpInvalidUrl => "invalid server URL",
+        error.McpServerError => "the server answered with an HTTP 5xx error",
+        else => @errorName(err),
+    };
+}
 
 /// 从 Config 的方言字段构造 RequestOverrides(给 OpenAI/Gemini client 用)。
 /// reasoning_effort 不进 overrides(它有独立 legacy 字段 + setter,保持原路径)。
@@ -3359,6 +3560,23 @@ pub fn shouldQueueModelSwitchCompact(
     current_context_window: u32,
 ) bool {
     return !std.mem.eql(u8, previous_model, current_model) and previous_context_window > current_context_window;
+}
+
+/// `--add-dir` values (NUL-separated, as `parseArgs` accumulates them) as
+/// absolute paths resolved against `cwd`. Claude Code loads each directory's
+/// `.claude/skills`; the Skill catalog reads the same directories.
+fn cliAddDirs(arena: std.mem.Allocator, raw: ?[]const u8, cwd: []const u8) ![]const []const u8 {
+    const list = raw orelse return &.{};
+    var out: std.ArrayList([]const u8) = .empty;
+    var parts = std.mem.splitScalar(u8, list, 0);
+    while (parts.next()) |part| {
+        if (part.len == 0) continue;
+        try out.append(arena, if (std.fs.path.isAbsolute(part))
+            part
+        else
+            try std.fs.path.resolve(arena, &.{ cwd, part }));
+    }
+    return out.toOwnedSlice(arena);
 }
 
 /// 读整个文件(POSIX open/read,稳定不依赖 Io.Dir)。caller free。

@@ -560,7 +560,7 @@ pub fn buildFull(
     return buildFullWithDefs(allocator, model, skills, agents, enabled_tool_names, memdir_abs, kg_ready, cwd, null);
 }
 
-/// `buildFull` + 运行时工具定义:`tool_defs` 里 deferred 的**动态**工具(MCP `<server>__<tool>`、
+/// `buildFull` + 运行时工具定义:`tool_defs` 里 deferred 的**动态**工具(MCP `mcp__<server>__<tool>`、
 /// 插件工具)也列进 `# Deferred tools`。静态注册表之外的 deferred 工具只有这一条被模型发现的
 /// 路径——它们不在 API tools 数组里,ToolSearch 的关键字匹配又是 AND 语义,模型不知道名字就
 /// 只能瞎猜。null = 只列静态 deferred(纯单测/无动态工具的宿主)。
@@ -1160,14 +1160,61 @@ fn buildAgentsSection(allocator: std.mem.Allocator, set: *const @import("../agen
 }
 
 /// 构造 skills section。空 set 返回空串（caller 不会加 separator）。
+/// Total budget for listed descriptions. Codex budgets 2% of the context window
+/// and Claude Code 1%; without the model's window in this layer, a fixed
+/// budget near Codex's share of a 200K window keeps a large Skill set from
+/// crowding the prompt. Names are always listed.
+pub const SKILL_LISTING_BUDGET_BYTES: usize = 16 * 1024;
+/// Floor a description is shortened to before descriptions are dropped.
+const SKILL_LISTING_MIN_DESCRIPTION_BYTES: usize = 120;
+
+const skill_listing = @import("../skills/runtime/model_tool.zig");
+
 fn buildSkillsSection(allocator: std.mem.Allocator, set: *const @import("../skills/skill.zig").SkillSet) ![]u8 {
-    if (set.len() == 0) return try allocator.dupe(u8, "");
+    var scratch = std.heap.ArenaAllocator.init(allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+
+    // Claude Code: a `disable-model-invocation` Skill's description is not in
+    // context; Codex: `allow_implicit_invocation: false` removes it from the
+    // catalog. The catalog maps both onto `disable_model_invocation`.
+    const Entry = struct { name: []const u8, description: []const u8 };
+    var entries: std.ArrayList(Entry) = .empty;
+    var total: usize = 0;
+    for (set.skills.items) |s| {
+        if (s.disable_model_invocation) continue;
+        const description = try skill_listing.listingDescription(a, s.description, s.when_to_use);
+        total += description.len;
+        try entries.append(a, .{ .name = s.name, .description = description });
+    }
+    if (entries.items.len == 0) return try allocator.dupe(u8, "");
+
+    if (total > SKILL_LISTING_BUDGET_BYTES) {
+        // Shorten every description to an equal share, then drop descriptions
+        // from the end of the (sorted) list until the budget holds.
+        const share = @max(SKILL_LISTING_BUDGET_BYTES / entries.items.len, SKILL_LISTING_MIN_DESCRIPTION_BYTES);
+        total = 0;
+        for (entries.items) |*entry| {
+            entry.description = try skill_listing.truncateUtf8(a, entry.description, share);
+            total += entry.description.len;
+        }
+        var index = entries.items.len;
+        while (total > SKILL_LISTING_BUDGET_BYTES and index > 0) {
+            index -= 1;
+            total -= entries.items[index].description.len;
+            entries.items[index].description = "";
+        }
+    }
 
     var out: std.Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
     try out.writer.writeAll("# Available skills\n\nYou have access to the following skills. Before using other tools, compare the current user request with their descriptions. If exactly one skill clearly applies, activate it immediately by calling the `Skill` tool with the matching `name`, then follow the returned instructions. Do not activate a marginal match, and do not activate multiple skills speculatively.\n\n");
-    for (set.skills.items) |s| {
-        try out.writer.print("- **{s}** — {s}\n", .{ s.name, s.description });
+    for (entries.items) |entry| {
+        if (entry.description.len == 0) {
+            try out.writer.print("- **{s}**\n", .{entry.name});
+        } else {
+            try out.writer.print("- **{s}** — {s}\n", .{ entry.name, entry.description });
+        }
     }
     return try out.toOwnedSlice();
 }

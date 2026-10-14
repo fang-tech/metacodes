@@ -451,7 +451,7 @@ test "MCP P0.3: 无 elicitation handler → 自动 decline,tool 仍完成(不 ha
     try std.testing.expect(std.mem.indexOf(u8, result, "elicited:decline") != null);
 }
 
-test "MCP: dispatch via DynRegistry routes mock__echo to MCP server" {
+test "MCP: dispatch via DynRegistry routes mcp__mock__echo to MCP server" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -469,11 +469,11 @@ test "MCP: dispatch via DynRegistry routes mock__echo to MCP server" {
     defer session.deinit();
     try session.registerTools(&dyn, "mock");
 
-    // 现在 dispatch 应当能找到 mock__echo 并调用,得到包含 "hi via dispatch" 的结果
+    // 现在 dispatch 应当能找到 mcp__mock__echo 并调用,得到包含 "hi via dispatch" 的结果
     var ctx = cc.tools.ToolContext.simple(a);
     ctx.artifact_root = root;
     ctx.dyn_registry = &dyn;
-    const out = try dispatchOk(&ctx, "mock__echo", "{\"message\":\"hi via dispatch\"}");
+    const out = try dispatchOk(&ctx, "mcp__mock__echo", "{\"message\":\"hi via dispatch\"}");
     defer a.free(out);
     try std.testing.expect(std.mem.indexOf(u8, out, "hi via dispatch") != null);
 }
@@ -493,7 +493,7 @@ test "MCP: CLI stdio captures 17MiB from byte zero and dispatch preserves typed 
     var session = cc.mcp_registry_bridge.McpSession.init(a, &client);
     defer session.deinit();
     try session.registerTools(&dyn, "mock");
-    const entry = dyn.find("mock__large") orelse return error.MissingLargeMcpTool;
+    const entry = dyn.find("mcp__mock__large") orelse return error.MissingLargeMcpTool;
     try std.testing.expect(entry.executor == .result_body);
     var ctx = cc.tools.ToolContext.simple(a);
     ctx.artifact_root = root;
@@ -537,8 +537,8 @@ test "MCP: registerResourceTools adds list_resources + read_resource" {
     defer session.deinit();
     try session.registerResourceTools(&dyn, "mock");
 
-    try std.testing.expect(dyn.find("mock__list_resources") != null);
-    try std.testing.expect(dyn.find("mock__read_resource") != null);
+    try std.testing.expect(dyn.find("mcp__mock__list_resources") != null);
+    try std.testing.expect(dyn.find("mcp__mock__read_resource") != null);
 }
 
 test "MCP: static resource tools preserve byte-zero artifact recovery" {

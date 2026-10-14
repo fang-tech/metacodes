@@ -22,6 +22,7 @@ from scripts.eval.plugin_release_gate import (
     _require_exact_tree,
     _materialize_head,
     attest_runtime_artifact,
+    gate_child_environment,
     implementation_fingerprint,
     load_protocol,
     load_protocol_structure,
@@ -107,6 +108,20 @@ class PluginReleaseGateTest(unittest.TestCase):
         self.assertEqual(2, _median_int([4, 1, 2, 3]))
         with self.assertRaises(PluginGateError):
             _median_int([])
+
+    def test_gate_commands_run_without_credentials_or_the_callers_codex_home(self) -> None:
+        # A temporary HOME does not move an absolute CODEX_HOME: the runtime
+        # would load the caller's Codex Skills and start its MCP servers.
+        clean = gate_child_environment(
+            {
+                "PATH": "/operator/bin",
+                "CODEX_HOME": "/host/.codex",
+                "METASK_API_KEY": "must-not-pass",
+                "METACODES_API_KEY_FD": "9",
+                "METACODES_NO_PROBE": "0",
+            }
+        )
+        self.assertEqual({"PATH": "/operator/bin", "METACODES_NO_PROBE": "1"}, clean)
 
     def test_checked_in_protocol_is_valid_and_zero_provider(self) -> None:
         # Structural: every pin except the implementation fingerprint, which

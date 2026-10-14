@@ -370,14 +370,7 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
             continue;
         }
         if (std.mem.eql(u8, trimmed, "/skills")) {
-            if (app.skills.len() == 0) {
-                std.debug.print("No skills installed. Put SKILL.md files under ~/.agents/skills/<name>/ or <project>/.agents/skills/<name>/\n", .{});
-            } else {
-                std.debug.print("Available skills ({d}):\n", .{app.skills.len()});
-                for (app.skills.skills.items) |s| {
-                    std.debug.print("  \x1b[36m{s}\x1b[0m — {s}\n", .{ s.name, s.description });
-                }
-            }
+            printSkills(app);
             continue;
         }
         if (std.mem.eql(u8, trimmed, "/history")) {
@@ -1239,6 +1232,11 @@ fn readLineRaw(fd: c_int, allocator: std.mem.Allocator, history: *history_mod.Hi
     // 输入期固定底部区(复刻 Claude Code:圆角输入框 + ❯ + footer + 钉底)。
     var region = render_region_mod.RenderRegion.init(allocator, 2, app.theme, tui_term_root.detectFromEnv(1));
     defer region.deinit();
+    // `/` 菜单命令源:内建命令 + 本 session 可由用户调用的 skill(对齐 cc:输入 `/` 即联想
+    // 出命令与 skill)。每次读取重建:skill catalog 可能已重载,构建成本只是几十个借用切片。
+    var slash_arena = std.heap.ArenaAllocator.init(allocator);
+    defer slash_arena.deinit();
+    region.ui.slash_catalog = complete.buildSlashCatalog(slash_arena.allocator(), app.skills.skills.items) catch .builtin;
     // 终端 resize 监听:SIGWINCH → 下次 poll 超时时重画自适应。
     g_winch.store(false, .release);
     installSigwinch();
@@ -1421,14 +1419,14 @@ fn readLineRaw(fd: c_int, allocator: std.mem.Allocator, history: *history_mod.Hi
                 },
                 .complete => {
                     region.clear();
-                    try handleCompletion(&editor, allocator);
+                    try handleCompletion(&editor, allocator, region.ui.slash_catalog);
                     redraw(&region, &editor, app);
                     continue;
                 },
                 .slash_complete => {
                     // Tab on slash 菜单:把 buffer 换成选中命令名(不提交,留补参数)。
-                    if (complete.slashNthMatch(editor.view(), region.ui.slash_sel)) |cmd| {
-                        try editor.setLine(cmd.name);
+                    if (complete.slashNthMatch(region.ui.slash_catalog, editor.view(), region.ui.slash_sel)) |cmd| {
+                        try setSlashLine(&editor, cmd);
                     }
                     redraw(&region, &editor, app);
                     continue;
@@ -1436,7 +1434,14 @@ fn readLineRaw(fd: c_int, allocator: std.mem.Allocator, history: *history_mod.Hi
                 .slash_select => {
                     // Enter on slash 菜单:把 buffer 换成选中命令名后提交(对齐 cc:Enter 运行选中项)。
                     // 复刻 .commit 路径(下方 editor.handle(.enter)→.commit 同款):清区 + 回显 + 返回。
-                    if (complete.slashNthMatch(editor.view(), region.ui.slash_sel)) |cmd| {
+                    if (complete.slashNthMatch(region.ui.slash_catalog, editor.view(), region.ui.slash_sel)) |cmd| {
+                        if (cmd.takes_args) {
+                            // 带参数的 skill:Enter 只填 `/name ` 留给用户输入参数(对齐 cc),不提交。
+                            try setSlashLine(&editor, cmd);
+                            region.ui.slash_sel = 0;
+                            redraw(&region, &editor, app);
+                            continue;
+                        }
                         try editor.setLine(cmd.name);
                     }
                     region.ui.slash_sel = 0;
@@ -1717,8 +1722,18 @@ fn readLineRaw(fd: c_int, allocator: std.mem.Allocator, history: *history_mod.Hi
 }
 
 /// TAB 补全：算候选，唯一则补全，多个则列出 + 补到公共前缀。
-fn handleCompletion(editor: *input.LineEditor, allocator: std.mem.Allocator) !void {
-    var r = complete.compute(allocator, editor.view(), editor.cursor) catch return;
+/// 选中一个 slash 项填入输入行:需要参数的项补一个空格(菜单随之收起,光标停在参数位)。
+fn setSlashLine(editor: *input.LineEditor, cmd: complete.SlashCmd) !void {
+    if (!cmd.takes_args) return editor.setLine(cmd.name);
+    var buffer: [512]u8 = undefined;
+    if (cmd.name.len + 1 > buffer.len) return editor.setLine(cmd.name);
+    @memcpy(buffer[0..cmd.name.len], cmd.name);
+    buffer[cmd.name.len] = ' ';
+    try editor.setLine(buffer[0 .. cmd.name.len + 1]);
+}
+
+fn handleCompletion(editor: *input.LineEditor, allocator: std.mem.Allocator, slash_catalog: complete.SlashCatalog) !void {
+    var r = complete.compute(allocator, slash_catalog, editor.view(), editor.cursor) catch return;
     defer r.deinit(allocator);
     if (r.candidates.len == 0) return;
 
@@ -3641,20 +3656,152 @@ fn handleRecap(app: *app_mod.App, allocator: std.mem.Allocator) !void {
     std.debug.print("\x1b[36m↻ {s}\x1b[0m\n", .{std.mem.trim(u8, recap, " \n")});
 }
 
-fn handleMcp(app: *app_mod.App) !void {
-    if (app.mcp_sessions.items.len == 0) {
+/// /skills:列出已加载 skill(来源 scope + 根目录)、加载失败的 skill(issue)与被跳过的根目录。
+/// 失败与跳过必须可见——静默丢 skill 正是兼容问题最难排查的形态。
+fn printSkills(app: *app_mod.App) void {
+    const catalog = @import("../skills/runtime/catalog.zig");
+    const snapshot = app.skill_runtime.snapshot orelse {
+        std.debug.print("Skills unavailable (catalog not loaded; run with METACODES_LOG=warn for the reason)\n", .{});
+        return;
+    };
+    if (snapshot.skills.len == 0 and snapshot.issues.len == 0 and snapshot.skipped_sources.len == 0) {
         std.debug.print(
-            \\MCP servers: (none connected)
+            \\No skills installed. Put <name>/SKILL.md under any of:
+            \\  {s}/skills  ~/.agents/skills  ~/.claude/skills  ~/.codex/skills
+            \\  <project>/.metacodes/skills  .agents/skills  .claude/skills  .codex/skills
             \\
-            \\Declare servers in <state root>/config.json:
-            \\  {{"mcp_servers":[{{"name":"foo","command":["/path/to/server","--flag"]}}]}}
-            \\
-        , .{});
+        , .{app.stateRoot()});
         return;
     }
-    std.debug.print("MCP servers ({d}):\n", .{app.mcp_sessions.items.len});
-    for (app.mcp_sessions.items) |*entry| {
-        std.debug.print("  \x1b[36m{s}\x1b[0m  ({d} tools registered as {s}__*)\n", .{ entry.name, entry.session.bindings.items.len, entry.name });
+    std.debug.print("Skills ({d}):\n", .{snapshot.skills.len});
+    for (snapshot.skills) |record| {
+        const scope = switch (record.source_scope) {
+            .enterprise => "enterprise",
+            .personal => "user",
+            .project => "project",
+            .plugin => "plugin",
+        };
+        const flags = if (record.definition.disable_model_invocation)
+            " [manual only]"
+        else if (!record.definition.user_invocable)
+            " [model only]"
+        else
+            "";
+        var line_buf: [96]u8 = undefined;
+        std.debug.print("  \x1b[36m/{s}\x1b[0m \x1b[2m({s}{s})\x1b[0m {s}\n", .{
+            record.invocation_name,
+            scope,
+            flags,
+            oneLine(&line_buf, record.definition.description),
+        });
+        std.debug.print("    \x1b[2m{s}\x1b[0m\n", .{record.live_dir orelse record.source_root});
+    }
+    if (snapshot.issues.len != 0) {
+        std.debug.print("\x1b[33mNot loaded ({d}):\x1b[0m\n", .{snapshot.issues.len});
+        for (snapshot.issues) |issue| {
+            std.debug.print("  {s}: {s}{s}{s}\n", .{
+                issue.invocation_name orelse "(invalid name)",
+                @tagName(issue.code),
+                if (issue.reason != null) " / " else "",
+                if (issue.reason) |reason| @tagName(reason) else "",
+            });
+        }
+    }
+    for (snapshot.skipped_sources) |skipped| {
+        std.debug.print("\x1b[33mSkipped skills root\x1b[0m {s} ({s})\n", .{
+            skipped.root,
+            switch (skipped.reason) {
+                catalog.SkipReason.unreadable => "unreadable",
+                catalog.SkipReason.scan_limit => "too many entries to scan",
+            },
+        });
+    }
+}
+
+/// Collapse whitespace and cut at a UTF-8 boundary to fit `buf` (display only).
+fn oneLine(buf: []u8, text: []const u8) []const u8 {
+    var len: usize = 0;
+    var words = std.mem.tokenizeAny(u8, text, " \t\r\n");
+    while (words.next()) |word| {
+        const need = word.len + @intFromBool(len != 0);
+        if (len + need > buf.len) {
+            var room = buf.len - len;
+            if (len != 0 and room != 0) {
+                buf[len] = ' ';
+                len += 1;
+                room -= 1;
+            }
+            var take = @min(room, word.len);
+            while (take > 0 and take < word.len and (word[take] & 0xc0) == 0x80) take -= 1;
+            @memcpy(buf[len .. len + take], word[0..take]);
+            len += take;
+            break;
+        }
+        if (len != 0) {
+            buf[len] = ' ';
+            len += 1;
+        }
+        @memcpy(buf[len .. len + word.len], word);
+        len += word.len;
+    }
+    return buf[0..len];
+}
+
+/// /mcp:每个配置来源里的 MCP server 及其启动结果(已连接/失败原因/协议版本/工具数/日志),
+/// 待批准的项目级 server、被禁用的名字与配置问题。失败必须可见——启动期只打 warn 日志
+/// 而默认日志级别看不到,这里是用户唯一的排查入口。
+fn handleMcp(app: *app_mod.App) !void {
+    const report = app.mcp_report;
+    if (report.servers.len == 0 and report.pending.len == 0 and report.problems.len == 0) {
+        std.debug.print(
+            \\MCP servers: (none configured)
+            \\
+            \\metacodes reads, highest precedence first:
+            \\  {s}/config.json  {{"mcpServers": {{"name": {{"command": "npx", "args": ["-y", "pkg"]}}}}}}
+            \\  ~/.claude.json (Claude Code user/local), <project>/.mcp.json (needs approval)
+            \\  ~/.codex/config.toml [mcp_servers.<name>] (Codex)
+            \\
+        , .{app.stateRoot()});
+        return;
+    }
+    std.debug.print("MCP servers ({d}):\n", .{report.servers.len});
+    for (report.servers) |server| {
+        switch (server.state) {
+            .connected => std.debug.print("  \x1b[32m●\x1b[0m \x1b[36m{s}\x1b[0m  {d} tools as mcp__{s}__*  \x1b[2m(MCP {s}; {s})\x1b[0m\n", .{
+                server.name, server.tool_count, server.name, server.protocol, server.origin.label(),
+            }),
+            .failed => std.debug.print("  \x1b[31m✗\x1b[0m \x1b[36m{s}\x1b[0m  {s}  \x1b[2m({s})\x1b[0m\n", .{
+                server.name, server.detail, server.origin.label(),
+            }),
+        }
+        std.debug.print("      \x1b[2m{s}{s}{s}\x1b[0m\n", .{
+            server.origin_path,
+            if (server.log_path.len != 0) "  log: " else "",
+            server.log_path,
+        });
+        // The tool list sent to the model is fixed for the session (it is part
+        // of the cached prompt); a server-announced change applies on restart.
+        for (app.mcp_sessions.items) |entry| {
+            if (std.mem.eql(u8, entry.name, server.name) and entry.client.tools_changed.load(.acquire))
+                std.debug.print("      \x1b[33mthe server changed its tools; restart the session to use the new list\x1b[0m\n", .{});
+        }
+    }
+    for (report.pending) |pending| {
+        switch (pending.reason) {
+            .needs_approval => std.debug.print("  \x1b[33m○\x1b[0m \x1b[36m{s}\x1b[0m  awaiting approval (project {s}); add \"{s}\" to \"enabledMcpjsonServers\" in {s}/config.json\n", .{
+                pending.name, pending.origin_path, pending.name, app.stateRoot(),
+            }),
+            .rejected => std.debug.print("  \x1b[2m○ {s}  rejected (disabledMcpjsonServers)\x1b[0m\n", .{pending.name}),
+        }
+    }
+    for (report.disabled) |name| std.debug.print("  \x1b[2m○ {s}  disabled\x1b[0m\n", .{name});
+    for (report.problems) |problem| {
+        std.debug.print("  \x1b[33m!\x1b[0m {s}{s}{s}: {s}\n", .{
+            problem.origin_path,
+            if (problem.server.len != 0) " / " else "",
+            problem.server,
+            problem.message,
+        });
     }
 }
 

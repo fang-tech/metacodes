@@ -305,15 +305,21 @@ class PluginPairRunnerTest(unittest.TestCase):
                 "'schema':'metacodes.plugin-inventory/v1',"
                 "'contract_version':1,'plugins':[],"
                 "'home':os.environ.get('HOME'),"
+                "'codex_home':os.environ.get('CODEX_HOME'),"
                 "'no_probe':os.environ.get('METACODES_NO_PROBE')}))\n",
                 encoding="utf-8",
             )
             os.chmod(runtime, 0o700)
-            with mock.patch.dict(os.environ, {"METACODES_NO_PROBE": "0"}):
+            with mock.patch.dict(
+                os.environ, {"METACODES_NO_PROBE": "0", "CODEX_HOME": "/host/.codex"}
+            ):
                 inventory = _inventory(
                     ROOT, ROOT / "scripts/eval/fixtures/plugin_baseline.py", runtime
                 )
         self.assertEqual("1", inventory["no_probe"])
+        # An absolute CODEX_HOME would follow the runtime into the private
+        # HOME and load the caller's Codex Skills and MCP servers.
+        self.assertIsNone(inventory["codex_home"])
         self.assertNotEqual(os.environ.get("HOME"), inventory["home"])
         self.assertIn("metacodes-plugin-inventory-home-", inventory["home"])
         self.assertFalse(Path(inventory["home"]).exists())

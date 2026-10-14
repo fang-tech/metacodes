@@ -2982,6 +2982,14 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
         )
         self.assertEqual(clean, {"PATH": "/operator/bin"})
 
+    def test_scripted_environment_does_not_inherit_the_operators_codex_home(self):
+        # The sealed HOME does not move an absolute CODEX_HOME: the operator's
+        # Codex Skills and MCP servers would join every arm.
+        clean = _sanitized_environment(
+            {"PATH": "/operator/bin", "CODEX_HOME": "/host/.codex"}
+        )
+        self.assertEqual(clean, {"PATH": "/operator/bin"})
+
     def test_scripted_environment_never_inherits_a_system_one_advisor(self):
         # An operator's METACODES_JEV_* would install the advisor in every arm,
         # the no-memory baseline included.

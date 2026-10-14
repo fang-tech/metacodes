@@ -362,6 +362,7 @@ PY
 
   # 用 perl 实现可移植的超时(macOS 无 timeout)。
   # 关键:cd 到隔离 workdir;HOME 指 fake HOME;分级日志双写(debug 落单独文件)。
+  # CODEX_HOME 会把 Codex 的 skills/config.toml MCP 指回宿主,不随 HOME 隔离,故清掉。
   (
     cd "$workdir" || exit 97
     local -a eval_env=()
@@ -375,6 +376,7 @@ PY
     fi
     printf '%s\n' "$feed" | \
       env \
+      -u CODEX_HOME \
       "HOME=$fake_home" \
       "METACODES_LOG=$E2E_LOG_SPEC" \
       "METACODES_LOG_FILE=$debug_logfile" \
