@@ -124,6 +124,17 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- Sockets no longer leak into child processes. The `--web`, OAuth callback
+  and UDS daemon listeners, and every connection they accepted, were
+  inheritable, so each later Bash command, hook, MCP server or browser launch
+  took them along. A process that outlived metacodes (a job left running
+  after a crash, or one started with `nohup … &`) kept the `--web` port
+  bound, so the next `--web` on it failed to bind, and kept the browser's
+  event stream open after metacodes closed it, so the page never saw it end.
+  Every socket the platform layer creates, the TinyKG service's included, is
+  now close-on-exec from creation (Linux `SOCK_CLOEXEC` and `accept4`; on
+  macOS `fcntl` under the fork serial lock, and straight after `accept`) and
+  non-inheritable on Windows.
 - A stdio MCP server no longer outlives a metacodes that crashed or was
   killed. The pipe ends metacodes keeps were inheritable, so every process it
   spawned afterwards, above all the TinyKG service that stays up between
