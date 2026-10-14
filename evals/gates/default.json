@@ -2,14 +2,23 @@
   "schema_version": 1,
   "name": "metacodes-default-gate-v1",
   "calibration": {
-    "id": "glm-5.2-native-order-balanced-contract-v3-2026-08-02-r5",
-    "version": 3,
-    "status": "stale",
-    "stale_reason": "Calibrated on evaluation contract v3 with glm-5.2 (2026-08-02 r5). The evaluation contract is v4 since ab4ce247 (2026-08-23), the agentdef suite was repinned by #257 and by the 42_agentdef_isolation grader v2, and the release contract now names glm-5.3-flash; none of these was recalibrated.",
-    "evaluation_contract_version": 3,
+    "id": "glm-5.3-flash-native-order-balanced-contract-v4-2026-10-14",
+    "version": 4,
+    "status": "production",
+    "evaluation_contract_version": 4,
     "thresholds_fingerprint": "ecb3043e241424df",
-    "release_contract_fingerprint": "b238d83d8a1e80c6",
-    "basis": "2026-08-01/02 order-balanced native glm-5.2 contract-v3 calibration: frozen baseline and candidate-v4 across core-r4 36 pairs plus AgentDef-r5 30 pairs; 132 release rollouts; AgentDef memory grader v2; thresholds unchanged"
+    "release_contract_fingerprint": "e246c2969fd5f8b7",
+    "basis": "2026-10-14 order-balanced native glm-5.3-flash contract-v4 calibration: baseline 0.5.0 (c4b0af79) vs candidate c27c2a0e across core-e2e 36 pairs plus AgentDef 30 pairs; 132 release rollouts, US$27.51; 42_agentdef_isolation grader v2; thresholds unchanged",
+    "evidence": {
+      "baseline_revision": "c4b0af79fe20b1bb8e8516ec9b0fe1de8feb8644",
+      "candidate_revision": "c27c2a0e9352dc7f9aedb5473e03b66c5ab05f3d",
+      "rollouts_sha256": {
+        "core/baseline.jsonl": "673184aa72e79a42fab1cce7c38de40c0712f931d0b6e47da4932ef55f8f4bb3",
+        "core/candidate.jsonl": "5de9cdcdc616ea7bf10362bdf873ec7c7c5927817cdfff07c0b3d26945cc61fc",
+        "agentdef/baseline.jsonl": "639819c5be00e4e1dac0529f26352d2e058ba28dc0636e7720af157fcbb28c61",
+        "agentdef/candidate.jsonl": "e41e6ae5468348e448d6103115a3cee0ea00839f80f924911adb4f24549f5b1c"
+      }
+    }
   },
   "release_contract": {
     "suites": [

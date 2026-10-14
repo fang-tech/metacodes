@@ -149,6 +149,7 @@ status, compatibility boundaries, and entry points are defined by
     - A calibration is now either `production` and current, or `stale` with a `stale_reason` that the gate prints when it refuses.
     - `test_checked_in_calibration_is_current_or_marked_stale` checks the committed calibration, using `release_calibration_drift`.
     - The release contract now names glm-5.3-flash.
+  - **Recalibrated for contract v4:** 0.5.0 against the candidate, both suites × 6 trials, 132 rollouts (US$27.51). All nine checks pass with unchanged thresholds. The candidate is 100% trustworthy against 0.5.0's 89%, US$0.009 cheaper and 3.6 s faster per rollout. The calibration records the four rollout files' SHA-256; the rollouts themselves stay out of Git.
 - The AgentDef release suite no longer fails `42_agentdef_isolation` on how
   the model spells a fact. Its "modified worktree is kept" check looked for
   the literal `worktree_kept=true` in the model's proof file, so a model that
