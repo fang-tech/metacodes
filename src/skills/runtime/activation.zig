@@ -56,7 +56,13 @@ pub const PrepareOptions = struct {
     shell_policy: workspace.ShellPolicy,
     model_override_capability: ModelOverrideCapability,
     availability: availability.View = .all,
+    /// Whether the host can run a forked Skill under a named subagent profile
+    /// (`agent:` frontmatter). AgentCore has no AgentDef catalog, so it keeps
+    /// rejecting such Skills; the CLI resolves the name against its AgentSet.
+    agent_profiles: AgentProfiles = .unsupported,
 };
+
+pub const AgentProfiles = enum { unsupported, supported };
 
 pub const ActivationPlan = struct {
     arena: std.heap.ArenaAllocator,
@@ -74,7 +80,9 @@ pub const ActivationPlan = struct {
 };
 
 pub const ExecuteOptions = struct {
-    materializations: *materialization.Manager,
+    /// Required for snapshot (canonical) Skills; a live-directory (compat)
+    /// Skill needs no working tree.
+    materializations: ?*materialization.Manager,
     parent_frame: *policy_frame.PolicyFrame,
     abort: *const AbortSignal,
     project_dir: []const u8,
@@ -89,9 +97,33 @@ pub const ExecuteOptions = struct {
 /// Owned result of the one canonical activation kernel. External typed input
 /// and model-tool invocation both prepare the same immutable plan and enter
 /// here after their respective admission boundary.
+/// Where an activated Skill's files are: a private working tree materialized
+/// from the snapshot, or the live directory of a compat source.
+pub const SkillTree = union(enum) {
+    materialized: materialization.WorkingTree,
+    /// Owned copy of `SkillRecord.live_dir`.
+    live: []u8,
+
+    pub fn path(self: *const SkillTree) []const u8 {
+        return switch (self.*) {
+            .materialized => |*tree| tree.path,
+            .live => |live| live,
+        };
+    }
+
+    fn deinit(self: *SkillTree, allocator: std.mem.Allocator) materialization.Error!void {
+        switch (self.*) {
+            .materialized => |*tree| try tree.deinit(),
+            .live => |live| allocator.free(live),
+        }
+    }
+};
+
 pub const Activation = struct {
     owner_allocator: std.mem.Allocator,
-    tree: materialization.WorkingTree,
+    tree: SkillTree,
+    /// `agent:` frontmatter of a forked Skill ("" = the host's default).
+    agent: []u8,
     frame: *policy_frame.PolicyFrame,
     rendered_body: []u8,
     parent_agent_depth: u8,
@@ -101,8 +133,9 @@ pub const Activation = struct {
         const owner_allocator = self.owner_allocator;
         freeModelSelection(owner_allocator, self.model_selection);
         owner_allocator.free(self.rendered_body);
+        owner_allocator.free(self.agent);
         self.frame.release();
-        self.tree.deinit() catch |err| {
+        self.tree.deinit(owner_allocator) catch |err| {
             self.* = undefined;
             return err;
         };
@@ -190,7 +223,8 @@ fn finishPrepare(
     // AgentCore has no AgentDef catalog or profile-binding contract. Accepting
     // this metadata and silently using the generic fork prompt would claim a
     // capability the formal ABI cannot provide.
-    if (skill.definition.agent.len != 0) return error.SkillUnavailable;
+    if (skill.definition.agent.len != 0 and options.agent_profiles == .unsupported)
+        return error.SkillUnavailable;
     policy_frame.validateRules(
         skill.definition.allowed_tools,
         skill.definition.disallowed_tools,
@@ -239,16 +273,19 @@ pub fn activate(
     );
     errdefer freeModelSelection(owner_allocator, model_selection);
 
-    var tree = try options.materializations.materialize(
-        plan.skill,
-        options.abort,
-    );
+    var tree: SkillTree = if (plan.skill.live_dir) |live_dir|
+        .{ .live = try owner_allocator.dupe(u8, live_dir) }
+    else
+        .{ .materialized = try (options.materializations orelse return error.SkillUnavailable).materialize(
+            plan.skill,
+            options.abort,
+        ) };
     const frame = policy_frame.PolicyFrame.derive(
         options.parent_frame,
         plan.skill.definition.allowed_tools,
         plan.skill.definition.disallowed_tools,
     ) catch |frame_error| {
-        tree.deinit() catch return error.CoreError;
+        tree.deinit(owner_allocator) catch return error.CoreError;
         return frame_error;
     };
 
@@ -258,7 +295,7 @@ pub fn activate(
         .{
             .arguments = plan.arguments,
             .arg_names = plan.skill.definition.arguments,
-            .skill_dir = tree.path,
+            .skill_dir = tree.path(),
             .project_dir = options.project_dir,
             .session_id = options.session_id,
             .shell = plan.skill.definition.shell,
@@ -271,19 +308,26 @@ pub fn activate(
         },
     ) catch |render_error| {
         frame.release();
-        tree.deinit() catch return error.CoreError;
+        tree.deinit(owner_allocator) catch return error.CoreError;
         return render_error;
     };
     options.abort.throwIfAborted() catch |abort_error| {
         owner_allocator.free(rendered);
         frame.release();
-        tree.deinit() catch return error.CoreError;
+        tree.deinit(owner_allocator) catch return error.CoreError;
         return abort_error;
+    };
+    const agent = owner_allocator.dupe(u8, plan.skill.definition.agent) catch |alloc_error| {
+        owner_allocator.free(rendered);
+        frame.release();
+        tree.deinit(owner_allocator) catch return error.CoreError;
+        return alloc_error;
     };
 
     return .{
         .owner_allocator = owner_allocator,
         .tree = tree,
+        .agent = agent,
         .frame = frame,
         .rendered_body = rendered,
         .parent_agent_depth = options.parent_agent_depth,
@@ -390,6 +434,9 @@ const TestFixture = struct {
                 .disallowed_tools = &.{},
                 .arguments = &.{ "target", "depth" },
                 .disable_model_invocation = false,
+                .when_to_use = "",
+                .argument_hint = "",
+                .user_invocable = true,
                 .context = .inline_ctx,
                 .agent = "",
                 .model = "",

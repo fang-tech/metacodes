@@ -34,6 +34,7 @@ fn envNonEmpty(name: [*:0]const u8) ?[]const u8 {
 var home_utf8: if (is_windows) [std.fs.max_path_bytes]u8 else void = undefined;
 var temp_utf8: if (is_windows) [std.fs.max_path_bytes]u8 else void = undefined;
 var state_home_utf8: if (is_windows) [std.fs.max_path_bytes]u8 else void = undefined;
+var codex_home_utf8: if (is_windows) [std.fs.max_path_bytes]u8 else void = undefined;
 
 fn envNonEmptyW(name: [*:0]const u16, out: []u8) ?[]const u8 {
     var wbuf: [std.os.windows.PATH_MAX_WIDE + 1]u16 = undefined;
@@ -61,6 +62,44 @@ pub fn metacodesHomeEnv() ?[]const u8 {
     if (is_windows) return envNonEmptyW(std.unicode.utf8ToUtf16LeStringLiteral("METACODES_HOME"), &state_home_utf8);
     return envNonEmpty("METACODES_HOME");
 }
+
+/// `CODEX_HOME`(Codex CLI 的配置根,缺省 `~/.codex`),UTF-8;空值=未设。只用于读取
+/// Codex 的 skills / config.toml 做兼容,metacodes 自己的状态不放在这里。
+pub fn codexHomeEnv() ?[]const u8 {
+    if (is_windows) return envNonEmptyW(std.unicode.utf8ToUtf16LeStringLiteral("CODEX_HOME"), &codex_home_utf8);
+    return envNonEmpty("CODEX_HOME");
+}
+
+/// 当前进程完整环境,`KEY=VALUE` UTF-8 串(arena 持有)。MCP stdio server 的子进程环境由此
+/// 构造(Claude Code 语义:继承;Codex 语义:按 allowlist 挑选)。Windows 从
+/// `GetEnvironmentStringsW` 读(UTF-16 → UTF-8),不走按 ANSI 代码页转码的窄 `environ`。
+pub fn environment(arena: std.mem.Allocator) error{OutOfMemory}![]const [:0]const u8 {
+    var out: std.ArrayList([:0]const u8) = .empty;
+    if (is_windows) {
+        const block = GetEnvironmentStringsW() orelse return out.toOwnedSlice(arena);
+        defer _ = FreeEnvironmentStringsW(block);
+        var index: usize = 0;
+        while (block[index] != 0) {
+            const start = index;
+            while (block[index] != 0) index += 1;
+            const utf8 = std.unicode.utf16LeToUtf8AllocZ(arena, block[start..index]) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => null,
+            };
+            if (utf8) |entry| try out.append(arena, entry);
+            index += 1;
+        }
+        return out.toOwnedSlice(arena);
+    }
+    var cursor: [*:null]const ?[*:0]const u8 = @ptrCast(std.c.environ);
+    while (cursor[0]) |entry| : (cursor += 1) {
+        try out.append(arena, try arena.dupeZ(u8, std.mem.span(entry)));
+    }
+    return out.toOwnedSlice(arena);
+}
+
+extern "kernel32" fn GetEnvironmentStringsW() callconv(.winapi) ?[*]u16;
+extern "kernel32" fn FreeEnvironmentStringsW(block: [*]u16) callconv(.winapi) c_int;
 
 /// 临时目录。POSIX=$TMPDIR or /tmp;Windows=$TEMP or $TMP or C:\Windows\Temp,UTF-8。
 pub fn tempDir() []const u8 {

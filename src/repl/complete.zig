@@ -1,7 +1,7 @@
 //! TAB 补全：根据当前 buffer + cursor 计算补全候选。
 //!
 //! 两种场景：
-//! 1. 整行以 `/` 开头且无空格 → slash command 补全（从固定命令表）
+//! 1. 整行以 `/` 开头且无空格 → slash command 补全（内建命令表 + 可由用户调用的 skill,见 SlashCatalog）
 //! 2. 否则 → 光标前最后一个"路径 token"做文件路径补全（扫目录）
 //!
 //! 设计：纯函数式——输入 (line, cursor)，输出候选列表 + 公共前缀。
@@ -12,7 +12,26 @@ const tt = @import("../tools/test_tmp.zig"); // 测试 fixture 唯一路径(并�
 const pfs = @import("platform").fs;
 const pdir = @import("platform").dir;
 
-pub const SlashCmd = struct { name: []const u8, desc: []const u8 };
+pub const SlashKind = enum { builtin, skill };
+
+pub const SlashCmd = struct {
+    /// 含前导 `/`。
+    name: []const u8,
+    desc: []const u8,
+    kind: SlashKind = .builtin,
+    /// Claude Code `argument-hint`,菜单里跟在命令名后(dim)。
+    hint: []const u8 = "",
+    /// Enter 选中时只填 `name ` 等用户补参数,而不是立即提交(skill 声明了参数时)。
+    takes_args: bool = false,
+};
+
+/// `/` 菜单与 Tab 补全的命令源:内建命令在前,可由用户调用的 skill 在后。
+/// 由 REPL loop 构建并持有,UiState 借用(见 buildSlashCatalog)。
+pub const SlashCatalog = struct {
+    entries: []const SlashCmd,
+
+    pub const builtin: SlashCatalog = .{ .entries = &SLASH_COMMAND_TABLE };
+};
 
 pub const MODEL_MENU_MAX_ROWS: usize = 8;
 
@@ -48,19 +67,10 @@ pub const SLASH_COMMAND_TABLE = [_]SlashCmd{
     .{ .name = "/exit", .desc = "Exit REPL" },
 };
 
-pub const SLASH_COMMANDS = blk: {
-    var arr: [SLASH_COMMAND_TABLE.len][]const u8 = undefined;
-    for (SLASH_COMMAND_TABLE, 0..) |c, i| arr[i] = c.name;
-    break :blk arr;
-};
-
 /// slash 菜单是否应弹出(整行 trim 后以 `/` 开头且无空格 → 命令补全态)。
 /// 单一真相源:dispatch(导航键语义)与 drawSlashMenu(渲染)共用,防两处判定漂移。
-pub fn slashMenuOpen(line: []const u8) bool {
-    const trimmed = std.mem.trimStart(u8, line, " \t");
-    if (!std.mem.startsWith(u8, trimmed, "/")) return false;
-    if (std.mem.indexOfScalar(u8, trimmed, ' ') != null) return false;
-    return slashFilterCount(line) > 0;
+pub fn slashMenuOpen(catalog: SlashCatalog, line: []const u8) bool {
+    return slashFilterCount(catalog, line) > 0;
 }
 
 /// `/model` 的服务端 catalog 菜单。它和普通 slash 菜单同占下边框与 footer 之间的区域,
@@ -80,29 +90,92 @@ pub fn modelsMenuOpen(line: []const u8) bool {
     return std.mem.eql(u8, trimmed, "/models");
 }
 
-/// 当前 `/` 前缀匹配的命令数(菜单显示的行数,也是导航上限)。
-pub fn slashFilterCount(line: []const u8) usize {
+/// 菜单处于命令态时的查询串(含 `/`);非命令态 null。
+fn slashQuery(line: []const u8) ?[]const u8 {
     const trimmed = std.mem.trimStart(u8, line, " \t");
-    if (!std.mem.startsWith(u8, trimmed, "/")) return 0;
-    if (std.mem.indexOfScalar(u8, trimmed, ' ') != null) return 0;
+    if (!std.mem.startsWith(u8, trimmed, "/")) return null;
+    if (std.mem.indexOfAny(u8, trimmed, " \t") != null) return null;
+    return trimmed;
+}
+
+/// 匹配分档(对齐 cc 的命令联想:先前缀,再名字内子串)。0 = 不匹配。
+fn matchTier(cmd: SlashCmd, query: []const u8) u2 {
+    if (std.mem.startsWith(u8, cmd.name, query)) return 1;
+    const needle = query[1..]; // 去掉 `/`
+    if (needle.len >= 2 and containsIgnoreCase(cmd.name[1..], needle)) return 2;
+    return 0;
+}
+
+fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len > haystack.len) return false;
+    var i: usize = 0;
+    while (i + needle.len <= haystack.len) : (i += 1) {
+        if (std.ascii.eqlIgnoreCase(haystack[i .. i + needle.len], needle)) return true;
+    }
+    return false;
+}
+
+/// 当前查询匹配的命令数(菜单行数,也是导航上限)。
+pub fn slashFilterCount(catalog: SlashCatalog, line: []const u8) usize {
+    const query = slashQuery(line) orelse return 0;
     var n: usize = 0;
-    for (SLASH_COMMAND_TABLE) |cmd| {
-        if (std.mem.startsWith(u8, cmd.name, trimmed)) n += 1;
+    for (catalog.entries) |cmd| {
+        if (matchTier(cmd, query) != 0) n += 1;
     }
     return n;
 }
 
-/// 取第 idx 个匹配命令(0-based,顺序同 drawSlashMenu);越界返回 null。
-pub fn slashNthMatch(line: []const u8, idx: usize) ?SlashCmd {
-    const trimmed = std.mem.trimStart(u8, line, " \t");
-    if (!std.mem.startsWith(u8, trimmed, "/")) return null;
+/// 取第 idx 个匹配命令(0-based,前缀档在前、子串档在后,档内保持表序;
+/// drawSlashMenu 用同一顺序);越界返回 null。
+pub fn slashNthMatch(catalog: SlashCatalog, line: []const u8, idx: usize) ?SlashCmd {
+    const query = slashQuery(line) orelse return null;
     var n: usize = 0;
-    for (SLASH_COMMAND_TABLE) |cmd| {
-        if (!std.mem.startsWith(u8, cmd.name, trimmed)) continue;
-        if (n == idx) return cmd;
-        n += 1;
+    for ([_]u2{ 1, 2 }) |tier| {
+        for (catalog.entries) |cmd| {
+            if (matchTier(cmd, query) != tier) continue;
+            if (n == idx) return cmd;
+            n += 1;
+        }
     }
     return null;
+}
+
+/// 构建 `/` 命令源:内建表 + 可由用户调用的 skill(`user-invocable: false` 的不进菜单)。
+/// 与内建命令同名的 skill 不列出——loop 先分派内建命令,那个 skill 无法经 `/` 运行。
+/// 返回的 entries 与名字由 `arena` 持有。
+pub fn buildSlashCatalog(
+    arena: std.mem.Allocator,
+    skills: []const @import("../skills/runtime/definition.zig").Skill,
+) !SlashCatalog {
+    var list: std.ArrayList(SlashCmd) = .empty;
+    try list.appendSlice(arena, &SLASH_COMMAND_TABLE);
+    for (skills) |skill| {
+        if (!skill.user_invocable) continue;
+        const name = try std.fmt.allocPrint(arena, "/{s}", .{skill.name});
+        var shadowed = false;
+        for (SLASH_COMMAND_TABLE) |builtin_cmd| {
+            if (std.mem.eql(u8, builtin_cmd.name, name)) shadowed = true;
+        }
+        if (shadowed) continue;
+        try list.append(arena, .{
+            .name = name,
+            .desc = try collapseWhitespace(arena, skill.description),
+            .kind = .skill,
+            .hint = skill.argument_hint,
+            .takes_args = skill.argument_hint.len != 0 or skill.arguments.len != 0,
+        });
+    }
+    return .{ .entries = try list.toOwnedSlice(arena) };
+}
+
+fn collapseWhitespace(arena: std.mem.Allocator, text: []const u8) ![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    var words = std.mem.tokenizeAny(u8, text, " \t\r\n");
+    while (words.next()) |word| {
+        if (out.items.len != 0) try out.append(arena, ' ');
+        try out.appendSlice(arena, word);
+    }
+    return out.toOwnedSlice(arena);
 }
 
 /// @-mention 菜单是否激活(对齐 cc DIFF#5):光标前最后一个空白分隔 token 以 `@` 开头。
@@ -117,7 +190,7 @@ pub fn atMenuActive(line: []const u8, cursor: usize) bool {
 
 /// @ 菜单候选(文件路径,owned)。调用方用完 deinit。复用 compute 的 @-mention 路径。
 pub fn atCandidates(allocator: std.mem.Allocator, line: []const u8, cursor: usize) !Result {
-    return compute(allocator, line[0..@min(cursor, line.len)], @min(cursor, line.len));
+    return compute(allocator, .builtin, line[0..@min(cursor, line.len)], @min(cursor, line.len));
 }
 
 pub const Result = struct {
@@ -137,14 +210,14 @@ pub const Result = struct {
 };
 
 /// 计算补全。无候选返回 candidates.len == 0。
-pub fn compute(allocator: std.mem.Allocator, line: []const u8, cursor: usize) !Result {
+pub fn compute(allocator: std.mem.Allocator, catalog: SlashCatalog, line: []const u8, cursor: usize) !Result {
     const upto = line[0..@min(cursor, line.len)];
 
     // slash command：整行 trim 后以 '/' 开头且没有空格
     const trimmed = std.mem.trimStart(u8, upto, " \t");
     if (std.mem.startsWith(u8, trimmed, "/") and std.mem.indexOfScalar(u8, trimmed, ' ') == null) {
         const start = line.len - upto.len + (upto.len - trimmed.len); // trimmed 在 line 中的起点
-        return try slashCandidates(allocator, trimmed, start);
+        return try slashCandidates(allocator, catalog, trimmed, start);
     }
 
     // 路径补全：取光标前最后一个空白分隔的 token
@@ -166,11 +239,11 @@ fn isWs(c: u8) bool {
     return c == ' ' or c == '\t';
 }
 
-fn slashCandidates(allocator: std.mem.Allocator, prefix: []const u8, start: usize) !Result {
+fn slashCandidates(allocator: std.mem.Allocator, catalog: SlashCatalog, prefix: []const u8, start: usize) !Result {
     var list = std.ArrayList([]const u8).empty;
     errdefer list.deinit(allocator);
-    for (SLASH_COMMANDS) |cmd| {
-        if (std.mem.startsWith(u8, cmd, prefix)) try list.append(allocator, cmd);
+    for (catalog.entries) |cmd| {
+        if (std.mem.startsWith(u8, cmd.name, prefix)) try list.append(allocator, cmd.name);
     }
     return .{ .candidates = try list.toOwnedSlice(allocator), .replace_start = start, .owns_candidates = false };
 }
@@ -235,7 +308,7 @@ pub fn commonPrefix(candidates: []const []const u8) []const u8 {
 const testing = std.testing;
 
 test "slash completion: /he -> /help" {
-    var r = try compute(testing.allocator, "/he", 3);
+    var r = try compute(testing.allocator, .builtin, "/he", 3);
     defer r.deinit(testing.allocator);
     try testing.expectEqual(@as(usize, 1), r.candidates.len);
     try testing.expectEqualStrings("/help", r.candidates[0]);
@@ -243,7 +316,7 @@ test "slash completion: /he -> /help" {
 }
 
 test "slash completion: /co -> commit/compact/config/cost" {
-    var r = try compute(testing.allocator, "/co", 3);
+    var r = try compute(testing.allocator, .builtin, "/co", 3);
     defer r.deinit(testing.allocator);
     try testing.expect(r.candidates.len >= 3);
     const pfx = commonPrefix(r.candidates);
@@ -251,7 +324,7 @@ test "slash completion: /co -> commit/compact/config/cost" {
 }
 
 test "slash completion: no match" {
-    var r = try compute(testing.allocator, "/zzz", 4);
+    var r = try compute(testing.allocator, .builtin, "/zzz", 4);
     defer r.deinit(testing.allocator);
     try testing.expectEqual(@as(usize, 0), r.candidates.len);
 }
@@ -273,7 +346,7 @@ test "path completion finds known file" {
 
     var line_buf: [600]u8 = undefined;
     const line = try std.fmt.bufPrint(&line_buf, "cat {s}/complete-uniq-", .{dir});
-    var r = try compute(testing.allocator, line, line.len);
+    var r = try compute(testing.allocator, .builtin, line, line.len);
     defer r.deinit(testing.allocator);
     try testing.expect(r.candidates.len >= 1);
     var found = false;
@@ -295,7 +368,7 @@ test "@-mention completion finds file" {
     // 输入 "review @<dir>/atmention-" → 补全应找到文件,replace_start 在 @ 之后
     var line_buf: [600]u8 = undefined;
     const line = try std.fmt.bufPrint(&line_buf, "review @{s}/atmention-", .{dir});
-    var r = try compute(testing.allocator, line, line.len);
+    var r = try compute(testing.allocator, .builtin, line, line.len);
     defer r.deinit(testing.allocator);
     try testing.expect(r.candidates.len >= 1);
     var found = false;
@@ -305,4 +378,49 @@ test "@-mention completion finds file" {
     try testing.expect(found);
     // replace_start 指向 @ 后的 / (保留 @ 前缀不被覆盖)
     try testing.expect(line[r.replace_start - 1] == '/' or r.replace_start > 7);
+}
+
+test "slash catalog: skills join the built-ins, collisions and model-only skills stay out" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const definition = @import("../skills/runtime/definition.zig");
+    const base = definition.Skill{
+        .name = "deploy",
+        .description = "Deploy\n  the service",
+        .when_to_use = "",
+        .argument_hint = "[env]",
+        .body = "",
+        .allowed_tools = &.{},
+        .disallowed_tools = &.{},
+        .arguments = &.{},
+        .disable_model_invocation = false,
+        .user_invocable = true,
+        .context = .inline_ctx,
+        .agent = "",
+        .model = "",
+        .shell = "bash",
+        .source_path = "",
+    };
+    var hidden = base;
+    hidden.name = "model-only";
+    hidden.user_invocable = false;
+    var shadow = base;
+    shadow.name = "help";
+    var plain = base;
+    plain.name = "地址库";
+    plain.argument_hint = "";
+    const catalog = try buildSlashCatalog(arena.allocator(), &.{ base, hidden, shadow, plain });
+    try testing.expectEqual(SLASH_COMMAND_TABLE.len + 2, catalog.entries.len);
+
+    // Prefix matches rank before substring matches.
+    const first = slashNthMatch(catalog, "/dep", 0).?;
+    try testing.expectEqualStrings("/deploy", first.name);
+    try testing.expectEqual(SlashKind.skill, first.kind);
+    try testing.expect(first.takes_args);
+    try testing.expectEqualStrings("Deploy the service", first.desc);
+    try testing.expectEqual(@as(usize, 1), slashFilterCount(catalog, "/ploy"));
+    try testing.expect(slashMenuOpen(catalog, "/地址"));
+    try testing.expect(!slashNthMatch(catalog, "/地址库", 0).?.takes_args);
+    // A space closes the menu (arguments are being typed).
+    try testing.expect(!slashMenuOpen(catalog, "/deploy prod"));
 }

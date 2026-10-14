@@ -12,6 +12,23 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Added
 
+- Skills and MCP servers configured for Claude Code and Codex now work in
+  metacodes, next to its own `<state root>/skills` and `config.json`
+  ([doc/SKILLS_AND_MCP.md](doc/SKILLS_AND_MCP.md)). Skills come from
+  `~/.agents/skills`, `~/.claude/skills`, `~/.codex/skills`, the managed
+  directories, every project level from the repository root to the working
+  directory, and `--add-dir`; MCP servers from `mcpServers` in metacodes'
+  config, `~/.claude.json`, an approved `.mcp.json`, and Codex's
+  `config.toml` (trusted projects only for project layers).
+- MCP 2026-07-28: `server/discover`, per-request `_meta`, `resultType`, and
+  input-required retries (MRTR), with the `initialize` handshake (2025-11-25
+  down to 2024-11-05) as fallback; Streamable HTTP servers (JSON and SSE
+  responses, session headers, `Mcp-Method` / `Mcp-Name` / `x-mcp-header`,
+  bearer token from an environment variable); `tools/list` pagination; answers
+  to server `ping`s; `notifications/cancelled` on interrupt or tool timeout.
+- Typing `/` suggests Skills alongside the built-in commands (with
+  `argument-hint`); the menu scrolls with the selection. `/skills` and `/mcp`
+  show where each Skill or server came from and why anything did not load.
 - Two more Session settings a source-level Host can change while idle.
   `SessionConfig.reasoning_effort` and `AgentSession.setReasoningEffort` set
   the effort every provider request carries; `setModel` keeps it, and a
@@ -46,6 +63,22 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Changed
 
+- MCP tools are named `mcp__<server>__<tool>` (Claude Code's form, so its
+  permission rules and `allowed-tools` lists match); invalid characters become
+  `_` and over-long or colliding names get a stable hash suffix. A subagent
+  `tools:` list, a Skill's `allowed-tools` or a permission rule that still uses
+  the old `<server>__<tool>` name keeps selecting the tool. The
+  per-server `<server>__list_resources` / `__read_resource` tools are no longer
+  registered; `ListMcpResourcesTool` / `ReadMcpResourceTool` serve resources.
+- A Skill name clash now resolves enterprise > personal > project, as in Claude
+  Code (it was project-first). Compat Skills reference their live directory —
+  only `SKILL.md` and `agents/openai.yaml` are read at startup — and the
+  activation result starts with `Base directory for this skill: <dir>`.
+- A forked Skill's `agent:` runs it under that subagent's prompt, tool set,
+  permission mode and model in the CLI (it used to make the Skill unavailable).
+- AgentCore's MCP parser treats an absent 2026-07-28 `resultType` as
+  `complete` and accepts the specification's `{method, params}` input
+  requests, as the final 2026-07-28 schema requires.
 - The `--web` event stream sends the `protocol.wire` v1 lines. Kernel events
   were `{"core_event":{"<tag>":...}}` and UI requests
   `{"ui_request":{"id":N,"request":{"<kind>":...}}}`; they are now
@@ -64,7 +97,6 @@ status, compatibility boundaries, and entry points are defined by
   `transcript.projectDir` are the only definitions of the layout, and
   `WorkspacePolicy.stateRoot()` returns the root an `AgentSession` resolved;
   doc/LIB_API.md shows the write and resume paths.
-
 - Release and reopen PRs no longer re-run the full CI. A `Release fast path`
   job (`scripts/release_fast_path.py`) checks that the PR's merge commit adds
   only what `scripts/release_cut.py` generates from its base, regenerated in a
@@ -103,6 +135,34 @@ status, compatibility boundaries, and entry points are defined by
   now close-on-exec from creation (Linux `SOCK_CLOEXEC` and `accept4`; on
   macOS `fcntl` under the fork serial lock, and straight after `accept`) and
   non-inheritable on Windows.
+- A stdio MCP server no longer outlives a metacodes that crashed or was
+  killed. The pipe ends metacodes keeps were inheritable, so every process it
+  spawned afterwards, above all the TinyKG service that stays up between
+  sessions, held the server's stdin open and the server never saw end-of-file
+  (on `main` too). Every pipe the process layer creates is now close-on-exec.
+  The same fix stops a permission hook, formal kernel or plugin call that is
+  fed on stdin from waiting behind an unrelated child spawned at that moment,
+  and keeps each MCP server's log from being held open by the other servers.
+- Tests and evaluation harnesses that run metacodes under a throwaway HOME no
+  longer pick up the caller's Codex setup. `CODEX_HOME` is an absolute path
+  that the throwaway HOME does not move, so with it exported every App a test
+  built loaded the caller's Codex Skills and started the MCP servers in its
+  `config.toml`, and the tests still passed (one App-building test run directly
+  started a probe server 14 times). `zig build` now removes it from every step
+  it runs, and `tests/e2e/lib.sh`, the TTY driver, the session-memory and
+  runtime-arm smokes, the memory-agent runtime's scripted arms, and the plugin
+  gate and pair runner drop it from the child environment themselves.
+- Skills that Claude Code and Codex load no longer vanish: a symlinked Skill
+  directory or skills root (one unreadable root used to empty the whole
+  catalog), YAML frontmatter with folded or multi-line descriptions, block
+  lists, quotes or CRLF, non-ASCII names, and Skills carrying a virtualenv or
+  large assets (which exceeded the snapshot limits). `disable-model-invocation`
+  Skills are no longer listed to the model.
+- MCP stdio servers started with an empty environment and without a `PATH`
+  lookup, so `npx`, `uvx` or `python3` commands never ran; an unresponsive
+  server blocked startup forever; a server `ping` got `method_not_found`; tool
+  names with `.` broke provider requests; failures were visible only with
+  `METACODES_LOG=warn`.
 - A `--web` client that reconnects after the host restarted gets the new
   session's events instead of silence. Event sequence numbers restart at 0
   with every journal, and a cursor from the previous one (`since=41`) made the

@@ -23,6 +23,8 @@ const verbs = @import("verbs.zig");
 const StatusBar = @import("widget/status_bar.zig").StatusBar;
 const util_time = @import("../../util/time.zig");
 const complete = @import("../complete.zig");
+/// `/` 菜单最多同时显示的行数(超出时按选中项滚动)。
+const SLASH_MENU_MAX_ROWS: usize = 10;
 const model_command = @import("../model_command.zig");
 const msg_queue = @import("../msg_queue.zig");
 const agent_tree = @import("widget/agent_tree.zig");
@@ -619,33 +621,68 @@ pub const RenderRegion = struct {
         w.writeAll(th.reset) catch {};
     }
 
-    /// 画 slash 命令菜单(`/` 前缀且无空格时)。每行 ` /cmd   描述`,匹配项列出。
+    /// 画 slash 命令菜单(`/` 前缀且无空格时)。每行 `  /cmd [hint]   描述`。
     /// 选中项(self.ui.slash_sel)命令名用 accent 高亮,其余 dim(对齐 cc:↑↓ 移高亮)。
+    /// 匹配项多于 SLASH_MENU_MAX_ROWS 时按选中项滚动窗口,选中项永远可见;每行按终端宽截断,
+    /// 保证"一项一行"(行数是导航与重画的前提)。skill 项在描述前标 `(skill)`。
     /// 返回新增行数(每行末尾 \r\n,光标停下一行行首供 footer 续画)。调用前光标停下边框下一行行首。
     fn drawSlashMenu(self: *RenderRegion, w: *std.Io.Writer, content: []const u8) u16 {
-        const trimmed = std.mem.trimStart(u8, content, " \t");
-        if (!std.mem.startsWith(u8, trimmed, "/")) return 0;
-        if (std.mem.indexOfScalar(u8, trimmed, ' ') != null) return 0; // 已带参数 → 不弹菜单
+        const catalog = self.ui.slash_catalog;
+        const total = complete.slashFilterCount(catalog, content);
+        if (total == 0) return 0;
 
         const th = self.theme;
+        const max_rows: usize = SLASH_MENU_MAX_ROWS;
+        const selected_idx = @min(self.ui.slash_sel, total - 1);
+        const first = if (selected_idx < max_rows) 0 else selected_idx + 1 - max_rows;
+        const last = @min(total, first + max_rows);
+        const cols: usize = if (self.cols > 4) self.cols else 80;
+
+        // 名字列宽:可见窗口内最宽的 `/name [hint]`,封顶 32 列,至少 14 列(对齐旧布局)。
+        var name_col: usize = 14;
+        var index = first;
+        while (index < last) : (index += 1) {
+            const cmd = complete.slashNthMatch(catalog, content, index) orelse break;
+            const width = displayWidth(cmd.name) + (if (cmd.hint.len != 0) 1 + displayWidth(cmd.hint) else 0) + 2;
+            name_col = @max(name_col, @min(width, 32));
+        }
+
         var rows: u16 = 0;
-        const MAX_ROWS: u16 = 10; // 菜单最多列 10 项,防撑爆终端
-        var match_idx: usize = 0; // 第几个匹配项(与 slash_sel 对齐)
-        for (complete.SLASH_COMMAND_TABLE) |cmd| {
-            if (!std.mem.startsWith(u8, cmd.name, trimmed)) continue;
-            if (rows >= MAX_ROWS) break;
-            const selected = match_idx == self.ui.slash_sel;
+        index = first;
+        while (index < last) : (index += 1) {
+            const cmd = complete.slashNthMatch(catalog, content, index) orelse break;
+            const selected = index == selected_idx;
             w.writeAll(ansi.clear.line) catch {};
             // 对齐 cc:固定 2 空格缩进,选中项命令名 accent,非选中 dim gray(仅颜色区分,不移位)。
             const name_color = if (selected) th.accent else th.dim;
-            w.print("  {s}{s}{s}", .{ name_color, cmd.name, th.reset }) catch {};
-            const pad = if (cmd.name.len < 14) 14 - cmd.name.len else 1;
-            var p: usize = 0;
-            while (p < pad) : (p += 1) w.writeAll(" ") catch {};
-            w.print("{s}{s}{s}", .{ th.dim, cmd.desc, th.reset }) catch {};
+            const desc_col = 2 + name_col;
+            var used: usize = 2;
+            w.print("  {s}", .{name_color}) catch {};
+            used += writeClippedWidth(w, cmd.name, 30);
+            w.writeAll(th.reset) catch {};
+            if (cmd.hint.len != 0 and used + 2 < desc_col) {
+                w.print(" {s}", .{th.dim}) catch {};
+                used += 1;
+                used += writeClippedWidth(w, cmd.hint, desc_col - used - 1);
+                w.writeAll(th.reset) catch {};
+            }
+            if (used >= desc_col) {
+                w.writeAll(" ") catch {};
+                used += 1;
+            }
+            while (used < desc_col) : (used += 1) w.writeAll(" ") catch {};
+            if (cols > used + 4) {
+                var room = cols - used - 2;
+                w.writeAll(th.dim) catch {};
+                if (cmd.kind == .skill and room > 8) {
+                    w.writeAll("(skill) ") catch {};
+                    room -= 8;
+                }
+                _ = writeClippedWidth(w, cmd.desc, room);
+                w.writeAll(th.reset) catch {};
+            }
             w.writeAll("\r\n") catch {};
             rows += 1;
-            match_idx += 1;
         }
         return rows;
     }
@@ -2240,6 +2277,29 @@ fn writeTruncatedWidth(w: *std.Io.Writer, s: []const u8, max_w: usize) void {
     }
 }
 
+/// Write at most `max_w` display columns of `s` (an ellipsis included when it
+/// is cut) and return the columns written.
+fn writeClippedWidth(w: *std.Io.Writer, s: []const u8, max_w: usize) usize {
+    if (max_w == 0) return 0;
+    if (displayWidth(s) <= max_w) {
+        w.writeAll(s) catch {};
+        return displayWidth(s);
+    }
+    var vis: usize = 0;
+    var i: usize = 0;
+    while (i < s.len) {
+        const nb = nextCharBytes(s, i);
+        const end = @min(i + nb, s.len);
+        const cw = displayWidth(s[i..end]);
+        if (vis + cw > max_w - 1) break;
+        w.writeAll(s[i..end]) catch {};
+        vis += cw;
+        i = end;
+    }
+    w.writeAll("…") catch {};
+    return vis + 1;
+}
+
 fn capabilityChips(provider: types.ProviderKind, model: []const u8, buf: []u8) []const u8 {
     var len: usize = 0;
     appendCapabilityChip(buf, &len, provider, model, .extended_thinking, "think");
@@ -2502,4 +2562,41 @@ test "tryVerticalMove:软折单行 up 落软折续行(可视行非逻辑行)" {
     // 落点必须落在 a 行的【最后一个软折段】(21..24)内,即软折续行而非逻辑行首(0),
     // 证明竖移按可视行(软折段)而非逻辑行。goal=width("short")=5 > 3 → clamp 到段尾 24。
     try std.testing.expect(up1.cursor >= 21 and up1.cursor <= 24);
+}
+
+test "slash menu: skills appear, the window follows the selection, rows fit the terminal" {
+    var r = RenderRegion.init(std.testing.allocator, 2, theme_mod.select(.monochrome, .none), .none);
+    defer r.deinit();
+    r.cols = 40;
+    var entries: [15]complete.SlashCmd = undefined;
+    var names: [15][8]u8 = undefined;
+    for (&entries, &names, 0..) |*entry, *name, index| {
+        const text = std.fmt.bufPrint(name, "/s{d:0>2}", .{index}) catch unreachable;
+        entry.* = .{
+            .name = text,
+            .desc = "a long description that has to be cut to the terminal width",
+            .kind = .skill,
+            .hint = if (index == 12) "[file]" else "",
+        };
+    }
+    r.ui.slash_catalog = .{ .entries = &entries };
+    r.ui.slash_sel = 12;
+
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    const rows = r.drawSlashMenu(&out.writer, "/s");
+    try std.testing.expectEqual(@as(u16, SLASH_MENU_MAX_ROWS), rows);
+    const text = out.written();
+    // Selection 12 of 15 with 10 rows: entries 3..12 are drawn.
+    try std.testing.expect(std.mem.indexOf(u8, text, "/s12 [file]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "/s03") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "/s02") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "/s13") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "(skill)") != null);
+    var lines = std.mem.splitSequence(u8, text, "\r\n");
+    while (lines.next()) |line| {
+        // Strip the clear-line escape and measure the visible part.
+        const visible = if (std.mem.lastIndexOfScalar(u8, line, 'K')) |k| line[k + 1 ..] else line;
+        try std.testing.expect(displayWidth(visible) <= 40);
+    }
 }

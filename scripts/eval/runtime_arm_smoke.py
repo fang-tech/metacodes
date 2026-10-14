@@ -253,6 +253,9 @@ def _base_env() -> Dict[str, str]:
         and not key.startswith("TINYKG_")
         and not key.startswith("CLAUDE_CODE_")
         and key != "RG_BIN"
+        # Absolute, so a temporary HOME does not move it: the host's Codex
+        # Skills and config.toml MCP servers would join every arm.
+        and key != "CODEX_HOME"
     }
 
 

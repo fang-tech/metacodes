@@ -1902,6 +1902,9 @@ def _sanitized_environment(base: Mapping[str, str]) -> Dict[str, str]:
         "METACODES_NO_AUTO_RECALL",
         "METACODES_RECALL_FLOOR",
         "METASK_API_KEY",
+        # Absolute, so the sealed HOME does not move it: the operator's Codex
+        # Skills and config.toml MCP servers would join every arm.
+        "CODEX_HOME",
     }
     # An operator's METACODES_JEV_* would silently install a System-One
     # advisor in every arm (including the no-memory baseline); the caller sets

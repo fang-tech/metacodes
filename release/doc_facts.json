@@ -124,6 +124,71 @@
           "regex": "\\| ripgrep ([0-9.]+) \\|"
         }
       ]
+    },
+    {
+      "id": "mcp_startup_timeout_seconds",
+      "source": {
+        "file": "src/mcp/config.zig",
+        "regex": "pub const DEFAULT_STARTUP_TIMEOUT_MS: u32 = (\\d+)_000;"
+      },
+      "assert_in": [
+        {
+          "file": "doc/SKILLS_AND_MCP.md",
+          "regex": "The handshake has (\\d+) s by default"
+        }
+      ]
+    },
+    {
+      "id": "mcp_codex_tool_timeout_seconds",
+      "source": {
+        "file": "src/mcp/config.zig",
+        "regex": "pub const CODEX_TOOL_TIMEOUT_MS: u32 = (\\d+)_000;"
+      },
+      "assert_in": [
+        {
+          "file": "doc/SKILLS_AND_MCP.md",
+          "regex": "Codex entries default to (\\d+) s"
+        }
+      ]
+    },
+    {
+      "id": "skill_listing_description_bytes",
+      "source": {
+        "file": "src/skills/runtime/model_tool.zig",
+        "regex": "pub const LISTING_MAX_DESCRIPTION_BYTES: usize = (\\d+);"
+      },
+      "assert_in": [
+        {
+          "file": "doc/SKILLS_AND_MCP.md",
+          "regex": "capped at (\\d+)\\s+bytes per Skill"
+        }
+      ]
+    },
+    {
+      "id": "skill_listing_budget_kib",
+      "source": {
+        "file": "src/core/system_prompt.zig",
+        "regex": "pub const SKILL_LISTING_BUDGET_BYTES: usize = (\\d+) \\* 1024;"
+      },
+      "assert_in": [
+        {
+          "file": "doc/SKILLS_AND_MCP.md",
+          "regex": "past a (\\d+) KiB total"
+        }
+      ]
+    },
+    {
+      "id": "skill_discovery_depth",
+      "source": {
+        "file": "src/skills/runtime/catalog.zig",
+        "regex": "pub const COMPAT_MAX_DISCOVERY_DEPTH: usize = (\\d+);"
+      },
+      "assert_in": [
+        {
+          "file": "doc/SKILLS_AND_MCP.md",
+          "regex": "found up to (\\d+) directory levels"
+        }
+      ]
     }
   ]
 }

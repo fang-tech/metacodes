@@ -32,6 +32,41 @@ pub const SourceScope = enum {
 
 pub const DEFAULT_PROVIDER_ID = "agents.directory";
 
+/// How a source is discovered and what a Skill from it references.
+pub const Profile = enum {
+    /// AgentCore Revision 19 contract (doc/AGENTCORE_BINARY_ABI.md, "Skill
+    /// catalog and typed input"): Skills sit one directory below the root,
+    /// symlinks are `unsupported_entry`, any failure to open a present root
+    /// fails the whole query, and the complete Skill tree is snapshotted and
+    /// later materialized into a private working tree.
+    canonical,
+    /// Claude Code / Codex compatible discovery for the CLI's own sources:
+    /// - a symlinked root or Skill directory is resolved, and a Skill reached
+    ///   through several links is loaded once (by canonical path);
+    /// - SKILL.md is found up to `COMPAT_MAX_DISCOVERY_DEPTH` directories below
+    ///   the root (Codex), skipping hidden directories and Claude Code's
+    ///   reserved `synced` folder;
+    /// - a root that exists but cannot be read, or exceeds its scan budget, is
+    ///   reported in `Snapshot.skipped_sources` instead of failing every other
+    ///   source;
+    /// - only SKILL.md and `agents/openai.yaml` are read. Activation references
+    ///   the live Skill directory, as `${CLAUDE_SKILL_DIR}` does in Claude Code
+    ///   and the SKILL.md path does in Codex, so Skills that carry a venv,
+    ///   node_modules or large assets work as they do there;
+    /// - invocation names may contain non-ASCII letters (e.g. `地址库`);
+    /// - a missing `description` falls back to the first body line (Claude
+    ///   Code), and `agents/openai.yaml` `policy.allow_implicit_invocation:
+    ///   false` hides the Skill from the model (Codex).
+    compat,
+};
+
+/// Codex scans at most six directory levels below a skills root.
+pub const COMPAT_MAX_DISCOVERY_DEPTH: usize = 6;
+/// Per-root scan budget for compat sources (Codex: 2000 directories, 20000
+/// entries per root). Exceeding it skips the rest of that source only.
+pub const COMPAT_MAX_SCAN_DIRECTORIES: usize = 2000;
+pub const COMPAT_MAX_SCAN_ENTRIES: usize = 20000;
+
 /// Higher numeric priority wins. Equal-priority candidates for the same
 /// invocation name are a conflict, independent of source enumeration order.
 pub const Source = struct {
@@ -45,37 +80,129 @@ pub const Source = struct {
     /// Stable opaque identity for this configured source. Empty keeps legacy
     /// in-process callers working and derives an identity from the root.
     source_instance_id: []const u8 = "",
+    profile: Profile = .canonical,
 };
 
-/// Built-in product source order. AgentCore deliberately supplies its own
-/// neutral-only `.agents/skills` policy to the shared engine.
-pub fn defaultSources(
-    arena: std.mem.Allocator,
+/// Inputs of the CLI's built-in source list.
+pub const DefaultSourceInputs = struct {
+    /// Current working directory (absolute).
+    cwd: []const u8,
+    /// Repository root containing `cwd`, or `cwd` itself outside a repository.
     workspace_root: []const u8,
-    workspace_home: []const u8,
+    /// User home. "" skips every personal source.
+    home: []const u8,
     /// Host state root: `<state_root>/skills` is the metacodes personal tier.
     /// "" skips it.
     state_root: []const u8,
+    /// `$CODEX_HOME`; "" means `<home>/.codex`.
+    codex_home: []const u8 = "",
+    /// `--add-dir` directories; each contributes its own skills directories.
+    additional_dirs: []const []const u8 = &.{},
+};
+
+/// Priority bands. Claude Code resolves a name clash enterprise > personal >
+/// project, so a cloned repository cannot shadow a Skill the user installed.
+const ENTERPRISE_PRIORITY: u32 = 3000;
+const PERSONAL_PRIORITY: u32 = 2000;
+const PROJECT_PRIORITY: u32 = 1000;
+const ADDITIONAL_DIR_PRIORITY: u32 = 500;
+/// Directories between the repository root and cwd that contribute project
+/// sources. Each level takes 10 priority slots, so this bound keeps the
+/// project band below the personal band.
+const MAX_PROJECT_CHAIN: usize = 64;
+
+/// Within one directory, metacodes' own folder wins, then the cross-agent
+/// `.agents` convention, then Claude Code, then Codex.
+const ProjectDirKind = struct { parts: []const []const u8, rank: u32 };
+const PROJECT_DIR_KINDS = [_]ProjectDirKind{
+    .{ .parts = &.{ ".metacodes", "skills" }, .rank = 4 },
+    .{ .parts = &.{ ".agents", "skills" }, .rank = 3 },
+    .{ .parts = &.{ ".claude", "skills" }, .rank = 2 },
+    .{ .parts = &.{ ".codex", "skills" }, .rank = 1 },
+};
+
+/// Built-in CLI source order: metacodes' own directories plus the directories
+/// Claude Code and Codex read, all with the `compat` profile. AgentCore
+/// deliberately supplies its own neutral-only `.agents/skills` policy to the
+/// shared engine.
+pub fn defaultSources(
+    arena: std.mem.Allocator,
+    inputs: DefaultSourceInputs,
 ) error{OutOfMemory}![]const Source {
     var sources: std.ArrayList(Source) = .empty;
-    const enterprise = "/etc/metacodes/skills";
-    if (std.fs.path.isAbsolute(enterprise)) {
-        try sources.append(arena, .{
-            .root = enterprise,
-            .scope = .enterprise,
-            .priority = 100,
-        });
+
+    // Enterprise / admin. metacodes defines its managed directory on POSIX only.
+    if (builtin.os.tag == .windows) {
+        try appendSource(arena, &sources, "C:\\Program Files\\ClaudeCode", &.{ ".claude", "skills" }, .enterprise, ENTERPRISE_PRIORITY + 2);
+        try appendSource(arena, &sources, "C:\\ProgramData\\OpenAI\\Codex", &.{"skills"}, .enterprise, ENTERPRISE_PRIORITY + 1);
+    } else {
+        try appendSource(arena, &sources, "/etc/metacodes", &.{"skills"}, .enterprise, ENTERPRISE_PRIORITY + 3);
+        const claude_managed = if (builtin.os.tag == .macos)
+            "/Library/Application Support/ClaudeCode"
+        else
+            "/etc/claude-code";
+        try appendSource(arena, &sources, claude_managed, &.{ ".claude", "skills" }, .enterprise, ENTERPRISE_PRIORITY + 2);
+        try appendSource(arena, &sources, "/etc/codex", &.{"skills"}, .enterprise, ENTERPRISE_PRIORITY + 1);
     }
-    try appendDefaultSource(arena, &sources, workspace_home, &.{ ".claude", "skills" }, .personal, 200);
-    try appendDefaultSource(arena, &sources, state_root, &.{"skills"}, .personal, 201);
-    try appendDefaultSource(arena, &sources, workspace_home, &.{ ".agents", "skills" }, .personal, 202);
-    try appendDefaultSource(arena, &sources, workspace_root, &.{ ".claude", "skills" }, .project, 300);
-    try appendDefaultSource(arena, &sources, workspace_root, &.{ ".metacodes", "skills" }, .project, 301);
-    try appendDefaultSource(arena, &sources, workspace_root, &.{ ".agents", "skills" }, .project, 302);
+
+    // Personal: metacodes' own state root first.
+    try appendSource(arena, &sources, inputs.state_root, &.{"skills"}, .personal, PERSONAL_PRIORITY + 4);
+    try appendSource(arena, &sources, inputs.home, &.{ ".agents", "skills" }, .personal, PERSONAL_PRIORITY + 3);
+    try appendSource(arena, &sources, inputs.home, &.{ ".claude", "skills" }, .personal, PERSONAL_PRIORITY + 2);
+    if (inputs.codex_home.len != 0) {
+        try appendSource(arena, &sources, inputs.codex_home, &.{"skills"}, .personal, PERSONAL_PRIORITY + 1);
+    } else {
+        try appendSource(arena, &sources, inputs.home, &.{ ".codex", "skills" }, .personal, PERSONAL_PRIORITY + 1);
+    }
+
+    // Project: every directory from the repository root down to cwd. A level
+    // closer to cwd wins (Claude Code searches from the start directory up).
+    const chain = try projectChain(arena, inputs.workspace_root, inputs.cwd);
+    for (chain, 0..) |directory, level| {
+        const level_base = PROJECT_PRIORITY + @as(u32, @intCast(level)) * 10;
+        for (PROJECT_DIR_KINDS) |kind| {
+            try appendSource(arena, &sources, directory, kind.parts, .project, level_base + kind.rank);
+        }
+    }
+
+    // `--add-dir` directories (Claude Code loads `.claude/skills` from them).
+    for (inputs.additional_dirs, 0..) |directory, index| {
+        if (index >= MAX_PROJECT_CHAIN) break;
+        const base = ADDITIONAL_DIR_PRIORITY - @as(u32, @intCast(index)) * 5;
+        for (PROJECT_DIR_KINDS[0..3]) |kind| {
+            try appendSource(arena, &sources, directory, kind.parts, .project, base - (4 - kind.rank));
+        }
+    }
     return sources.toOwnedSlice(arena);
 }
 
-fn appendDefaultSource(
+/// Directories from `workspace_root` down to `cwd`, root first. A `cwd` that
+/// is not below `workspace_root` contributes only itself.
+fn projectChain(
+    arena: std.mem.Allocator,
+    workspace_root: []const u8,
+    cwd: []const u8,
+) error{OutOfMemory}![]const []const u8 {
+    var chain: std.ArrayList([]const u8) = .empty;
+    const root = std.mem.trimEnd(u8, workspace_root, "/\\");
+    const start = std.mem.trimEnd(u8, cwd, "/\\");
+    const below_root = root.len != 0 and std.mem.startsWith(u8, start, root) and
+        (start.len == root.len or start[root.len] == '/' or start[root.len] == '\\');
+    if (!below_root) {
+        if (start.len != 0) try chain.append(arena, start);
+        return chain.toOwnedSlice(arena);
+    }
+    try chain.append(arena, root);
+    var cursor = root.len;
+    while (cursor < start.len and chain.items.len < MAX_PROJECT_CHAIN) {
+        const next = std.mem.indexOfAnyPos(u8, start, cursor + 1, "/\\") orelse start.len;
+        try chain.append(arena, start[0..next]);
+        cursor = next;
+    }
+    return chain.toOwnedSlice(arena);
+}
+
+fn appendSource(
     arena: std.mem.Allocator,
     sources: *std.ArrayList(Source),
     base: []const u8,
@@ -83,7 +210,7 @@ fn appendDefaultSource(
     scope: SourceScope,
     priority: u32,
 ) error{OutOfMemory}!void {
-    if (base.len == 0) return;
+    if (base.len == 0 or !std.fs.path.isAbsolute(base)) return;
     const parts = try arena.alloc([]const u8, suffix.len + 1);
     parts[0] = base;
     @memcpy(parts[1..], suffix);
@@ -91,6 +218,7 @@ fn appendDefaultSource(
         .root = try std.fs.path.join(arena, parts),
         .scope = scope,
         .priority = priority,
+        .profile = .compat,
     });
 }
 
@@ -138,6 +266,27 @@ pub const SkillRecord = struct {
     definition: definition_mod.Skill,
     directories: []const []const u8,
     files: []const FileRecord,
+    /// `compat` sources only: the canonical live Skill directory. Activation
+    /// references it instead of materializing `files`, which then hold only the
+    /// parsed metadata files (SKILL.md, `agents/openai.yaml`).
+    live_dir: ?[]const u8 = null,
+    /// The configured root the Skill was discovered under (display only).
+    source_root: []const u8 = "",
+};
+
+pub const SkipReason = enum {
+    /// The root exists but could not be opened or enumerated.
+    unreadable,
+    /// The root holds more directories or entries than the compat scan budget.
+    scan_limit,
+};
+
+/// A `compat` source left out of the catalog. Canonical sources never skip:
+/// they fail the whole query instead (AgentCore contract).
+pub const SkippedSource = struct {
+    root: []const u8,
+    scope: SourceScope,
+    reason: SkipReason,
 };
 
 pub const Issue = struct {
@@ -169,6 +318,7 @@ pub const Snapshot = struct {
     health: Health,
     skills: []const SkillRecord,
     issues: []const Issue,
+    skipped_sources: []const SkippedSource = &.{},
     descriptor_json: []const u8,
     content_bytes: usize,
     resident_bytes: usize,
@@ -204,8 +354,19 @@ pub const Snapshot = struct {
 };
 
 const Candidate = struct {
-    root: []const u8,
+    /// Absolute directory holding the Skill directory; opened without following
+    /// a final symlink.
+    parent: []const u8,
+    /// Skill directory name below `parent`.
     dir_name: []const u8,
+    /// The name the Skill is listed under in its root (a link keeps its own
+    /// name); the invocation fallback and contribution identity.
+    identity_name: []const u8,
+    /// Deduplication key: the canonical Skill directory for compat sources,
+    /// `root/entry` for canonical ones.
+    canonical: []const u8,
+    source_root: []const u8,
+    profile: Profile = .canonical,
     invocation_name: []const u8,
     scope: SourceScope,
     provider_id: []const u8 = DEFAULT_PROVIDER_ID,
@@ -291,12 +452,15 @@ pub fn build(
 
     var candidates: std.ArrayList(Candidate) = .empty;
     var issues: std.ArrayList(Issue) = .empty;
+    var skipped: std.ArrayList(SkippedSource) = .empty;
     var work_budget = WorkBudget{};
     var catalog_usage = CatalogUsage{};
 
-    for (sources) |source| {
-        try enumerateSource(scratch, io, source, limits, &work_budget, &candidates, &issues);
-    }
+    for (sources) |source| switch (source.profile) {
+        .canonical => try enumerateSource(scratch, io, source, limits, &work_budget, &candidates, &issues),
+        .compat => try enumerateCompatSource(scratch, io, source, &candidates, &issues, &skipped),
+    };
+    try dropDuplicateTargets(scratch, &candidates);
     std.mem.sort(Candidate, candidates.items, {}, candidateLessThan);
     std.mem.sort(Issue, issues.items, {}, issueLessThan);
 
@@ -395,8 +559,12 @@ pub fn build(
     try validateUniqueSkillIds(scratch, records.items);
     snapshot.skills = records.toOwnedSlice(arena) catch return error.OutOfMemory;
     snapshot.issues = cloneIssues(arena, issues.items) catch return error.OutOfMemory;
+    snapshot.skipped_sources = cloneSkipped(arena, skipped.items) catch return error.OutOfMemory;
     snapshot.content_bytes = catalog_usage.content_bytes;
-    snapshot.health = if (snapshot.issues.len == 0) .healthy else .degraded;
+    snapshot.health = if (snapshot.issues.len == 0 and snapshot.skipped_sources.len == 0)
+        .healthy
+    else
+        .degraded;
     snapshot.revision = computeRevision(snapshot, workspace_epoch);
     snapshot.descriptor_json = buildDescriptor(arena, snapshot, limits.max_descriptor_bytes) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
@@ -445,7 +613,7 @@ fn enumerateSource(
                 try appendCandidate(
                     arena,
                     source,
-                    entry.name,
+                    try canonicalLocation(arena, source.root, entry.name),
                     .{ .invalid_resource = discoveryFailureReason(err) },
                     candidates,
                     issues,
@@ -461,23 +629,33 @@ fn enumerateSource(
         // directory is ignored; an entry that cannot be proven ordinary is a
         // failed candidate so it remains in priority/no-fallback selection.
         const state = probeCandidateDirectory(io, root, entry.name) orelse continue;
-        try appendCandidate(arena, source, entry.name, state, candidates, issues);
+        try appendCandidate(arena, source, try canonicalLocation(arena, source.root, entry.name), state, candidates, issues);
     }
     const after = root.stat(io) catch return error.CatalogIncomplete;
     if (!sameDirectoryState(before, after)) return error.CatalogIncomplete;
 }
 
+const CandidateLocation = struct {
+    parent: []const u8,
+    dir_name: []const u8,
+    identity_name: []const u8,
+    canonical: []const u8,
+};
+
 fn appendCandidate(
     arena: std.mem.Allocator,
     source: Source,
-    dir_name: []const u8,
+    location: CandidateLocation,
     state: Candidate.State,
     candidates: *std.ArrayList(Candidate),
     issues: *std.ArrayList(Issue),
-) BuildError!void {
-    const invocation = makeInvocationName(arena, source.namespace, dir_name) catch
-        return error.OutOfMemory;
-    if (!validInvocationName(invocation)) {
+) error{OutOfMemory}!void {
+    const invocation = try makeInvocationName(arena, source.namespace, location.identity_name);
+    const valid = switch (source.profile) {
+        .canonical => validInvocationName(invocation),
+        .compat => validCompatInvocationName(invocation),
+    };
+    if (!valid) {
         const raw_name_hash = hashHex(invocation);
         try issues.append(arena, .{
             .code = .invalid_invocation_name,
@@ -491,9 +669,13 @@ fn appendCandidate(
         return;
     }
     try candidates.append(arena, .{
+        .parent = try arena.dupe(u8, location.parent),
+        .dir_name = try arena.dupe(u8, location.dir_name),
+        .identity_name = try arena.dupe(u8, location.identity_name),
+        .canonical = try arena.dupe(u8, location.canonical),
         // Sources are borrowed for the synchronous duration of `build`.
-        .root = source.root,
-        .dir_name = try arena.dupe(u8, dir_name),
+        .source_root = source.root,
+        .profile = source.profile,
         .invocation_name = invocation,
         .scope = source.scope,
         .provider_id = source.provider_id,
@@ -503,12 +685,207 @@ fn appendCandidate(
     });
 }
 
+/// A Skill reached through several roots or links is one Skill: keep the
+/// highest-priority path to it (Claude Code: "loads the skill once even if
+/// several locations point at the same target"; Codex dedupes on the
+/// canonical SKILL.md path). Distinct targets are left for name resolution.
+fn dropDuplicateTargets(
+    scratch: std.mem.Allocator,
+    candidates: *std.ArrayList(Candidate),
+) BuildError!void {
+    var best = std.StringHashMapUnmanaged(usize).empty;
+    defer best.deinit(scratch);
+    var keep = scratch.alloc(bool, candidates.items.len) catch return error.OutOfMemory;
+    @memset(keep, true);
+    for (candidates.items, 0..) |candidate, index| {
+        const entry = best.getOrPut(scratch, candidate.canonical) catch return error.OutOfMemory;
+        if (!entry.found_existing) {
+            entry.value_ptr.* = index;
+            continue;
+        }
+        const previous = &candidates.items[entry.value_ptr.*];
+        if (candidate.priority > previous.priority) {
+            keep[entry.value_ptr.*] = false;
+            entry.value_ptr.* = index;
+        } else {
+            keep[index] = false;
+        }
+    }
+    var write: usize = 0;
+    for (candidates.items, keep) |candidate, kept| {
+        if (!kept) continue;
+        candidates.items[write] = candidate;
+        write += 1;
+    }
+    candidates.shrinkRetainingCapacity(write);
+}
+
 fn sourceInstanceId(arena: std.mem.Allocator, source: Source) error{OutOfMemory}![]const u8 {
     if (source.source_instance_id.len != 0)
         return arena.dupe(u8, source.source_instance_id);
     const derived = hashHex(source.root);
     return arena.dupe(u8, &derived);
 }
+
+fn canonicalLocation(
+    arena: std.mem.Allocator,
+    root: []const u8,
+    entry_name: []const u8,
+) error{OutOfMemory}!CandidateLocation {
+    return .{
+        .parent = root,
+        .dir_name = entry_name,
+        .identity_name = entry_name,
+        .canonical = try std.fs.path.join(arena, &.{ root, entry_name }),
+    };
+}
+
+const CompatScanError = error{ OutOfMemory, ScanLimit, RootUnavailable };
+
+/// Claude Code / Codex compatible discovery; see `Profile.compat`.
+fn enumerateCompatSource(
+    arena: std.mem.Allocator,
+    io: std.Io,
+    source: Source,
+    candidates: *std.ArrayList(Candidate),
+    issues: *std.ArrayList(Issue),
+    skipped: *std.ArrayList(SkippedSource),
+) BuildError!void {
+    if (source.root.len == 0 or !std.fs.path.isAbsolute(source.root)) return error.CatalogInvalid;
+    if (source.namespace.len > 128 or source.provider_id.len == 0 or
+        source.provider_id.len > 128 or source.source_instance_id.len > 128)
+        return error.ResourceLimit;
+
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = Dir.realPathFileAbsolute(io, source.root, &root_buffer) catch |err| switch (err) {
+        error.FileNotFound, error.NotDir => return,
+        else => {
+            try skipped.append(arena, .{ .root = source.root, .scope = source.scope, .reason = .unreadable });
+            return;
+        },
+    };
+    const root = try arena.dupe(u8, root_buffer[0..root_len]);
+
+    const candidate_checkpoint = candidates.items.len;
+    const issue_checkpoint = issues.items.len;
+    var scan = CompatScan{
+        .arena = arena,
+        .io = io,
+        .source = source,
+        .candidates = candidates,
+        .issues = issues,
+    };
+    try scan.visited.put(arena, root, {});
+    scan.walk(root, 1) catch |err| {
+        // A partial walk depends on directory enumeration order; publish the
+        // source whole or not at all.
+        candidates.shrinkRetainingCapacity(candidate_checkpoint);
+        issues.shrinkRetainingCapacity(issue_checkpoint);
+        try skipped.append(arena, .{
+            .root = source.root,
+            .scope = source.scope,
+            .reason = switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.ScanLimit => .scan_limit,
+                error.RootUnavailable => .unreadable,
+            },
+        });
+    };
+}
+
+const CompatScan = struct {
+    arena: std.mem.Allocator,
+    io: std.Io,
+    source: Source,
+    candidates: *std.ArrayList(Candidate),
+    issues: *std.ArrayList(Issue),
+    /// Canonical directories already walked or registered (cycle guard).
+    visited: std.StringHashMapUnmanaged(void) = .empty,
+    directories: usize = 0,
+    entries: usize = 0,
+
+    const Child = struct { name: []const u8, kind: File.Kind };
+
+    fn walk(self: *CompatScan, dir_path: []const u8, depth: usize) CompatScanError!void {
+        self.directories += 1;
+        if (self.directories > COMPAT_MAX_SCAN_DIRECTORIES) return error.ScanLimit;
+        var dir = Dir.openDirAbsolute(self.io, dir_path, .{
+            .iterate = true,
+            .follow_symlinks = false,
+        }) catch {
+            // A nested directory that cannot be opened has no visible SKILL.md.
+            if (depth == 1) return error.RootUnavailable;
+            return;
+        };
+        defer dir.close(self.io);
+
+        var children: std.ArrayList(Child) = .empty;
+        var iterator = dir.iterate();
+        while (iterator.next(self.io) catch {
+            if (depth == 1) return error.RootUnavailable;
+            return;
+        }) |entry| {
+            self.entries += 1;
+            if (self.entries > COMPAT_MAX_SCAN_ENTRIES) return error.ScanLimit;
+            if (entry.name.len == 0 or entry.name[0] == '.') continue;
+            if (depth == 1 and std.ascii.eqlIgnoreCase(entry.name, "synced")) continue;
+            try children.append(self.arena, .{ .name = try self.arena.dupe(u8, entry.name), .kind = entry.kind });
+        }
+        std.mem.sort(Child, children.items, {}, childLessThan);
+
+        for (children.items) |child| {
+            const target = (try self.resolveDirectory(dir, dir_path, child)) orelse continue;
+            const seen = try self.visited.getOrPut(self.arena, target);
+            if (seen.found_existing) continue;
+            if (try self.probe(target)) |state| {
+                try appendCandidate(self.arena, self.source, .{
+                    .parent = std.fs.path.dirname(target) orelse continue,
+                    .dir_name = std.fs.path.basename(target),
+                    .identity_name = child.name,
+                    .canonical = target,
+                }, state, self.candidates, self.issues);
+                continue;
+            }
+            if (depth < COMPAT_MAX_DISCOVERY_DEPTH) try self.walk(target, depth + 1);
+        }
+    }
+
+    /// Canonical path of a child directory, following a symlink. Anything that
+    /// is not (or does not lead to) a directory is not a Skill location.
+    fn resolveDirectory(self: *CompatScan, dir: Dir, dir_path: []const u8, child: Child) CompatScanError!?[]const u8 {
+        switch (child.kind) {
+            .directory => return try std.fs.path.join(self.arena, &.{ dir_path, child.name }),
+            .sym_link, .unknown => {
+                var buffer: [std.fs.max_path_bytes]u8 = undefined;
+                const length = dir.realPathFile(self.io, child.name, &buffer) catch return null;
+                const target = try self.arena.dupe(u8, buffer[0..length]);
+                var probe_dir = Dir.openDirAbsolute(self.io, target, .{ .follow_symlinks = false }) catch
+                    return null;
+                probe_dir.close(self.io);
+                return target;
+            },
+            else => return null,
+        }
+    }
+
+    /// `null` when the directory has no SKILL.md (keep descending); a failed
+    /// state when SKILL.md exists but is not a stable regular file.
+    fn probe(self: *CompatScan, target: []const u8) CompatScanError!?Candidate.State {
+        var skill_dir = Dir.openDirAbsolute(self.io, target, .{ .follow_symlinks = false }) catch
+            return null;
+        defer skill_dir.close(self.io);
+        const stat = skill_dir.statFile(self.io, "SKILL.md", .{ .follow_symlinks = false }) catch |err| switch (err) {
+            error.FileNotFound => return null,
+            else => return .{ .invalid_resource = .resource_unavailable },
+        };
+        if (stat.kind != .file) return .{ .invalid_resource = .unsupported_entry };
+        return .ready;
+    }
+
+    fn childLessThan(_: void, lhs: Child, rhs: Child) bool {
+        return std.mem.lessThan(u8, lhs.name, rhs.name);
+    }
+};
 
 fn probeCandidateDirectory(
     io: std.Io,
@@ -651,7 +1028,7 @@ fn snapshotCandidateTemporary(
     work_budget: *WorkBudget,
     candidate_usage: *CandidateUsage,
 ) LocalError!SkillRecord {
-    var root = Dir.openDirAbsolute(io, candidate.root, .{
+    var root = Dir.openDirAbsolute(io, candidate.parent, .{
         .iterate = true,
         .follow_symlinks = false,
     }) catch return error.ResourceUnavailable;
@@ -664,6 +1041,8 @@ fn snapshotCandidateTemporary(
 
     var files: std.ArrayList(FileRecord) = .empty;
     var directories: std.ArrayList([]const u8) = .empty;
+    if (candidate.profile == .compat)
+        return snapshotCompatMetadata(arena, io, candidate, skill_dir, limits, candidate_usage);
     try snapshotTree(
         arena,
         io,
@@ -689,29 +1068,94 @@ fn snapshotCandidateTemporary(
         }
     }
     const md = definition_bytes orelse return error.ResourceChanged;
+    const definition = try parseDefinition(arena, md, candidate, .{});
+    return finishRecord(candidate, definition, owned_directories, owned_files, null);
+}
+
+/// Compat sources read only the metadata the catalog parses; the Skill's other
+/// files stay in its live directory (see `Profile.compat`).
+fn snapshotCompatMetadata(
+    arena: std.mem.Allocator,
+    io: std.Io,
+    candidate: Candidate,
+    skill_dir: Dir,
+    limits: Limits,
+    candidate_usage: *CandidateUsage,
+) LocalError!SkillRecord {
+    var files: std.ArrayList(FileRecord) = .empty;
+    var directories: std.ArrayList([]const u8) = .empty;
+    try snapshotFile(arena, io, skill_dir, "SKILL.md", "SKILL.md", limits, candidate_usage, &files);
+    const md = files.items[0].bytes;
+
+    var sidecar: ?definition_mod.CodexSidecar = null;
+    if (skill_dir.openDir(io, "agents", .{ .follow_symlinks = false })) |opened| {
+        var agents_dir = opened;
+        defer agents_dir.close(io);
+        const present = if (agents_dir.statFile(io, "openai.yaml", .{ .follow_symlinks = false })) |stat|
+            stat.kind == .file
+        else |_|
+            false;
+        if (present) {
+            try snapshotFile(arena, io, agents_dir, "openai.yaml", "agents/openai.yaml", limits, candidate_usage, &files);
+            try directories.append(arena, "agents");
+            sidecar = try definition_mod.parseCodexSidecar(arena, files.items[1].bytes);
+        }
+    } else |_| {}
+
+    var definition = try parseDefinition(arena, md, candidate, .{ .description_fallback = true });
+    if (sidecar) |policy| {
+        if (!policy.allow_implicit_invocation) definition.disable_model_invocation = true;
+    }
+    const live_dir = try std.fs.path.join(arena, &.{ candidate.parent, candidate.dir_name });
+    return finishRecord(
+        candidate,
+        definition,
+        try directories.toOwnedSlice(arena),
+        try files.toOwnedSlice(arena),
+        live_dir,
+    );
+}
+
+fn parseDefinition(
+    arena: std.mem.Allocator,
+    md: []const u8,
+    candidate: Candidate,
+    options: definition_mod.ParseOptions,
+) LocalError!definition_mod.Skill {
     if (!std.unicode.utf8ValidateSlice(md)) return error.InvalidDefinition;
-    validateSkillMetadata(md) catch return error.InvalidDefinition;
-    const definition = definition_mod.parseSkillMdWithFallback(
+    const definition = definition_mod.parseSkillMdWithOptions(
         arena,
         md,
         "",
-        candidate.dir_name,
+        candidate.identity_name,
+        options,
     ) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
         return error.InvalidDefinition;
     };
     if (!validArgumentNames(definition.arguments)) return error.InvalidDefinition;
+    return definition;
+}
 
+fn finishRecord(
+    candidate: Candidate,
+    definition: definition_mod.Skill,
+    directories: []const []const u8,
+    files: []const FileRecord,
+    live_dir: ?[]const u8,
+) SkillRecord {
     var record = SkillRecord{
         .skill_id = hashHex(candidate.invocation_name),
         .invocation_name = candidate.invocation_name,
         .provider_id = candidate.provider_id,
         .source_scope = candidate.scope,
         .source_instance_id = candidate.source_instance_id,
-        .contribution_id = hashHex(candidate.dir_name),
+        .contribution_id = hashHex(candidate.identity_name),
         .definition = definition,
-        .directories = owned_directories,
-        .files = owned_files,
+        .directories = directories,
+        .files = files,
+        .live_dir = live_dir,
+        .source_root = candidate.source_root,
     };
     record.content_revision = computeContentRevision(&record);
     record.execution_id = computeExecutionId(&record);
@@ -740,11 +1184,14 @@ fn cloneSkillRecord(arena: std.mem.Allocator, source: SkillRecord) error{OutOfMe
         .definition = .{
             .name = try arena.dupe(u8, source.definition.name),
             .description = try arena.dupe(u8, source.definition.description),
+            .when_to_use = try arena.dupe(u8, source.definition.when_to_use),
+            .argument_hint = try arena.dupe(u8, source.definition.argument_hint),
             .body = try arena.dupe(u8, source.definition.body),
             .allowed_tools = try cloneStringList(arena, source.definition.allowed_tools),
             .disallowed_tools = try cloneStringList(arena, source.definition.disallowed_tools),
             .arguments = try cloneStringList(arena, source.definition.arguments),
             .disable_model_invocation = source.definition.disable_model_invocation,
+            .user_invocable = source.definition.user_invocable,
             .model_activation = source.definition.model_activation,
             .context = source.definition.context,
             .agent = try arena.dupe(u8, source.definition.agent),
@@ -754,7 +1201,24 @@ fn cloneSkillRecord(arena: std.mem.Allocator, source: SkillRecord) error{OutOfMe
         },
         .directories = directories,
         .files = files,
+        .live_dir = if (source.live_dir) |path| try arena.dupe(u8, path) else null,
+        .source_root = try arena.dupe(u8, source.source_root),
     };
+}
+
+fn cloneSkipped(
+    arena: std.mem.Allocator,
+    source: []const SkippedSource,
+) error{OutOfMemory}![]const SkippedSource {
+    const result = try arena.alloc(SkippedSource, source.len);
+    for (source, result) |skipped, *copy| {
+        copy.* = .{
+            .root = try arena.dupe(u8, skipped.root),
+            .scope = skipped.scope,
+            .reason = skipped.reason,
+        };
+    }
+    return result;
 }
 
 fn cloneStringList(
@@ -1148,6 +1612,15 @@ fn computeRevision(snapshot: *const Snapshot, workspace_epoch: []const u8) [64]u
             hashU64(&hash, @intFromBool(file.executable));
             hashField(&hash, file.bytes);
         }
+        if (record.live_dir) |live_dir| {
+            hashField(&hash, "live_dir");
+            hashField(&hash, live_dir);
+        }
+    }
+    for (snapshot.skipped_sources) |skipped| {
+        hashField(&hash, "skipped_source");
+        hashField(&hash, skipped.root);
+        hashField(&hash, @tagName(skipped.reason));
     }
     for (snapshot.issues) |issue| {
         hashField(&hash, "issue");
@@ -1187,53 +1660,6 @@ fn makeInvocationName(arena: std.mem.Allocator, namespace: []const u8, name: []c
         std.fmt.allocPrint(arena, "{s}:{s}", .{ namespace, name });
 }
 
-/// The shared parser remains the canonical materializer. The formal ABI adds
-/// strict validation only where that parser intentionally has tolerant
-/// fallbacks, so malformed policy metadata becomes a typed tombstone instead
-/// of silently changing meaning.
-fn validateSkillMetadata(md: []const u8) error{InvalidDefinition}!void {
-    if (!std.mem.startsWith(u8, md, "---\n")) return;
-    const fm_start: usize = 4;
-    const fm_end = std.mem.indexOfPos(u8, md, fm_start, "\n---\n") orelse
-        return error.InvalidDefinition;
-    var lines = std.mem.splitScalar(u8, md[fm_start..fm_end], '\n');
-    while (lines.next()) |line| {
-        const trimmed = std.mem.trim(u8, line, " \t\r");
-        if (trimmed.len == 0 or trimmed[0] == '#') continue;
-        const colon = std.mem.indexOfScalar(u8, trimmed, ':') orelse
-            return error.InvalidDefinition;
-        const key = std.mem.trim(u8, trimmed[0..colon], " \t");
-        const value = std.mem.trim(u8, trimmed[colon + 1 ..], " \t");
-        if (std.mem.eql(u8, key, "context")) {
-            if (!std.mem.eql(u8, value, "inline") and !std.mem.eql(u8, value, "fork"))
-                return error.InvalidDefinition;
-        } else if (std.mem.eql(u8, key, "shell")) {
-            if (!std.mem.eql(u8, value, "bash") and !std.mem.eql(u8, value, "powershell"))
-                return error.InvalidDefinition;
-        } else if (std.mem.eql(u8, key, "disable-model-invocation") or
-            std.mem.eql(u8, key, "disable_model_invocation"))
-        {
-            if (!validBoolean(value)) return error.InvalidDefinition;
-        } else if (std.mem.eql(u8, key, "model-activation") or
-            std.mem.eql(u8, key, "model_activation"))
-        {
-            if (!std.mem.eql(u8, value, "advisory") and
-                !std.mem.eql(u8, value, "required-first") and
-                !std.mem.eql(u8, value, "required_first"))
-                return error.InvalidDefinition;
-        }
-    }
-}
-
-fn validBoolean(value: []const u8) bool {
-    return std.mem.eql(u8, value, "true") or
-        std.mem.eql(u8, value, "yes") or
-        std.mem.eql(u8, value, "1") or
-        std.mem.eql(u8, value, "false") or
-        std.mem.eql(u8, value, "no") or
-        std.mem.eql(u8, value, "0");
-}
-
 fn validArgumentNames(names: []const []const u8) bool {
     if (names.len > 64) return false;
     for (names, 0..) |name, index| {
@@ -1267,6 +1693,36 @@ pub fn validInvocationName(name: []const u8) bool {
     return true;
 }
 
+/// Compat invocation grammar: the canonical grammar plus any non-ASCII letter,
+/// so a Skill directory such as `地址库` (which Claude Code loads) is
+/// invocable. Unicode whitespace, controls and format characters stay out, so
+/// a name is always one visible `/token`.
+pub fn validCompatInvocationName(name: []const u8) bool {
+    if (name.len == 0 or name.len > 128) return false;
+    if (!std.unicode.utf8ValidateSlice(name)) return false;
+    var view = std.unicode.Utf8View.initUnchecked(name);
+    var iterator = view.iterator();
+    var first = true;
+    while (iterator.nextCodepoint()) |codepoint| {
+        defer first = false;
+        if (codepoint < 0x80) {
+            const byte: u8 = @intCast(codepoint);
+            if (std.ascii.isAlphanumeric(byte) or byte == '_') continue;
+            if (!first and (byte == ':' or byte == '-')) continue;
+            return false;
+        }
+        if (codepoint <= 0x9f or isUnicodeSpaceOrFormat(codepoint)) return false;
+    }
+    return true;
+}
+
+fn isUnicodeSpaceOrFormat(codepoint: u21) bool {
+    return switch (codepoint) {
+        0xa0, 0xad, 0x1680, 0x180e, 0x2000...0x200f, 0x2028...0x202f, 0x205f...0x206f, 0x3000, 0xfeff => true,
+        else => false,
+    };
+}
+
 pub fn isLowerHex64(value: []const u8) bool {
     if (value.len != 64) return false;
     for (value) |byte| {
@@ -1281,7 +1737,7 @@ fn candidateLessThan(_: void, lhs: Candidate, rhs: Candidate) bool {
     if (lhs.priority != rhs.priority) return lhs.priority > rhs.priority;
     const by_scope = std.mem.order(u8, @tagName(lhs.scope), @tagName(rhs.scope));
     if (by_scope != .eq) return by_scope == .lt;
-    const by_root = std.mem.order(u8, lhs.root, rhs.root);
+    const by_root = std.mem.order(u8, lhs.parent, rhs.parent);
     if (by_root != .eq) return by_root == .lt;
     return std.mem.lessThan(u8, lhs.dir_name, rhs.dir_name);
 }
@@ -1353,43 +1809,88 @@ test "typed argument schema accepts only unique renderable names" {
     try std.testing.expect(!validArgumentNames(&.{"9bad"}));
 }
 
-test "product default sources preserve product-owned directory policy" {
-    const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
-    var arena = std.heap.ArenaAllocator.init(allocator);
+test "product default sources follow Claude Code tiers and read every compatible directory" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const workspace_root = try std.fs.path.join(a, &.{ root_buffer[0..root_len], "workspace" });
-    const workspace_home = try std.fs.path.join(a, &.{ root_buffer[0..root_len], "home" });
-    const state_root = try std.fs.path.join(a, &.{ root_buffer[0..root_len], "state" });
+    const sep = std.fs.path.sep_str;
+    const base = if (builtin.os.tag == .windows) "C:\\w" else "/w";
+    const repo = base ++ sep ++ "repo";
+    const cwd = repo ++ sep ++ "pkg" ++ sep ++ "app";
+    const home = base ++ sep ++ "home";
+    const state = base ++ sep ++ "state";
+    const extra = base ++ sep ++ "extra";
 
-    const sources = try defaultSources(a, workspace_root, workspace_home, state_root);
-    const has_enterprise: usize = @intFromBool(std.fs.path.isAbsolute("/etc/metacodes/skills"));
-    try std.testing.expectEqual(6 + has_enterprise, sources.len);
-    if (has_enterprise == 1) {
-        try std.testing.expectEqualStrings("/etc/metacodes/skills", sources[0].root);
-        try std.testing.expectEqual(SourceScope.enterprise, sources[0].scope);
-        try std.testing.expectEqual(@as(u32, 100), sources[0].priority);
-    }
+    const sources = try defaultSources(a, .{
+        .cwd = cwd,
+        .workspace_root = repo,
+        .home = home,
+        .state_root = state,
+        .additional_dirs = &.{extra},
+    });
+    for (sources) |source| try std.testing.expectEqual(Profile.compat, source.profile);
 
-    const expected = [_]Source{
-        .{ .root = try std.fs.path.join(a, &.{ workspace_home, ".claude", "skills" }), .scope = .personal, .priority = 200 },
-        .{ .root = try std.fs.path.join(a, &.{ state_root, "skills" }), .scope = .personal, .priority = 201 },
-        .{ .root = try std.fs.path.join(a, &.{ workspace_home, ".agents", "skills" }), .scope = .personal, .priority = 202 },
-        .{ .root = try std.fs.path.join(a, &.{ workspace_root, ".claude", "skills" }), .scope = .project, .priority = 300 },
-        .{ .root = try std.fs.path.join(a, &.{ workspace_root, ".metacodes", "skills" }), .scope = .project, .priority = 301 },
-        .{ .root = try std.fs.path.join(a, &.{ workspace_root, ".agents", "skills" }), .scope = .project, .priority = 302 },
+    const Expect = struct { root: []const u8, scope: SourceScope };
+    const join = struct {
+        fn f(alloc: std.mem.Allocator, parts: []const []const u8) []const u8 {
+            return std.fs.path.join(alloc, parts) catch unreachable;
+        }
+    }.f;
+    const personal_and_project = [_]Expect{
+        .{ .root = join(a, &.{ state, "skills" }), .scope = .personal },
+        .{ .root = join(a, &.{ home, ".agents", "skills" }), .scope = .personal },
+        .{ .root = join(a, &.{ home, ".claude", "skills" }), .scope = .personal },
+        .{ .root = join(a, &.{ home, ".codex", "skills" }), .scope = .personal },
+        .{ .root = join(a, &.{ cwd, ".metacodes", "skills" }), .scope = .project },
+        .{ .root = join(a, &.{ cwd, ".agents", "skills" }), .scope = .project },
+        .{ .root = join(a, &.{ cwd, ".claude", "skills" }), .scope = .project },
+        .{ .root = join(a, &.{ cwd, ".codex", "skills" }), .scope = .project },
+        .{ .root = join(a, &.{ repo, "pkg", ".agents", "skills" }), .scope = .project },
+        .{ .root = join(a, &.{ repo, ".metacodes", "skills" }), .scope = .project },
+        .{ .root = join(a, &.{ repo, ".codex", "skills" }), .scope = .project },
+        .{ .root = join(a, &.{ extra, ".metacodes", "skills" }), .scope = .project },
+        .{ .root = join(a, &.{ extra, ".claude", "skills" }), .scope = .project },
     };
-    for (expected, 0..) |want, index| {
-        const got = sources[has_enterprise + index];
-        try std.testing.expectEqualStrings(want.root, got.root);
-        try std.testing.expectEqual(want.scope, got.scope);
-        try std.testing.expectEqual(want.priority, got.priority);
-        try std.testing.expectEqualStrings("", got.namespace);
+    // Sorting by priority (highest first) must reproduce the documented order:
+    // enterprise > personal (metacodes, .agents, Claude Code, Codex) > project
+    // (closest to cwd first; metacodes, .agents, Claude Code, Codex within a
+    // directory) > --add-dir.
+    const sorted = try a.dupe(Source, sources);
+    std.mem.sort(Source, sorted, {}, struct {
+        fn lessThan(_: void, lhs: Source, rhs: Source) bool {
+            return lhs.priority > rhs.priority;
+        }
+    }.lessThan);
+    for (sorted[0 .. sorted.len - 1], sorted[1..]) |higher, lower| {
+        try std.testing.expect(higher.priority != lower.priority);
     }
+    var enterprise_count: usize = 0;
+    for (sorted) |source| {
+        if (source.scope == .enterprise) enterprise_count += 1;
+    }
+    for (sorted[0..enterprise_count]) |source| try std.testing.expectEqual(SourceScope.enterprise, source.scope);
+    const rest = sorted[enterprise_count..];
+    var cursor: usize = 0;
+    for (personal_and_project) |want| {
+        while (cursor < rest.len and !std.mem.eql(u8, rest[cursor].root, want.root)) cursor += 1;
+        if (cursor == rest.len) {
+            std.debug.print("missing or out of order: {s}\n", .{want.root});
+            return error.TestUnexpectedResult;
+        }
+        try std.testing.expectEqual(want.scope, rest[cursor].scope);
+    }
+}
+
+test "project chain covers repository root down to cwd, or cwd alone outside it" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const chain = try projectChain(arena.allocator(), "/r", "/r/a/b/");
+    try std.testing.expectEqual(@as(usize, 3), chain.len);
+    try std.testing.expectEqualStrings("/r", chain[0]);
+    try std.testing.expectEqualStrings("/r/a/b", chain[2]);
+    const outside = try projectChain(arena.allocator(), "/r", "/rx/y");
+    try std.testing.expectEqual(@as(usize, 1), outside.len);
+    try std.testing.expectEqualStrings("/rx/y", outside[0]);
 }
 
 test "catalog priority, tombstone, snapshot, parser parity, and revision are deterministic" {
@@ -1535,6 +2036,9 @@ test "catalog identity validation rejects duplicates and preserves allocation fa
         .disallowed_tools = &.{},
         .arguments = &.{},
         .disable_model_invocation = false,
+        .when_to_use = "",
+        .argument_hint = "",
+        .user_invocable = true,
         .context = .inline_ctx,
         .agent = "",
         .model = "",
@@ -1798,8 +2302,11 @@ test "definition loss after discovery is resource_changed" {
             arena.allocator(),
             io,
             .{
-                .root = root,
+                .parent = root,
                 .dir_name = "review",
+                .identity_name = "review",
+                .canonical = "review",
+                .source_root = root,
                 .invocation_name = "review",
                 .scope = .project,
                 .priority = 1,
@@ -1966,4 +2473,230 @@ test "selected skill tree never follows symbolic links" {
     try std.testing.expectEqual(@as(usize, 0), catalog.skills.len);
     try std.testing.expectEqual(IssueCode.invalid_resource, catalog.issues[0].code);
     try std.testing.expectEqual(ResourceReason.unsupported_entry, catalog.issues[0].reason.?);
+}
+
+// ============================================================================
+// Compat profile (Claude Code / Codex directories)
+// ============================================================================
+
+const CompatFixture = struct {
+    tmp: std.testing.TmpDir,
+    root_buffer: [std.fs.max_path_bytes]u8 = undefined,
+    root_len: usize = 0,
+
+    fn init() !CompatFixture {
+        var fixture = CompatFixture{ .tmp = std.testing.tmpDir(.{}) };
+        fixture.root_len = try fixture.tmp.dir.realPath(std.testing.io, &fixture.root_buffer);
+        return fixture;
+    }
+
+    fn deinit(self: *CompatFixture) void {
+        self.tmp.cleanup();
+    }
+
+    fn root(self: *const CompatFixture) []const u8 {
+        return self.root_buffer[0..self.root_len];
+    }
+
+    fn path(self: *const CompatFixture, arena: std.mem.Allocator, relative: []const u8) []const u8 {
+        return std.fs.path.join(arena, &.{ self.root(), relative }) catch unreachable;
+    }
+
+    fn write(self: *const CompatFixture, arena: std.mem.Allocator, relative: []const u8, data: []const u8) !void {
+        const full = self.path(arena, relative);
+        if (std.fs.path.dirname(full)) |parent| try Dir.cwd().createDirPath(std.testing.io, parent);
+        try Dir.cwd().writeFile(std.testing.io, .{ .sub_path = full, .data = data });
+    }
+
+    fn link(self: *const CompatFixture, arena: std.mem.Allocator, target: []const u8, relative_link: []const u8) !bool {
+        const link_path = self.path(arena, relative_link);
+        if (std.fs.path.dirname(link_path)) |parent| try Dir.cwd().createDirPath(std.testing.io, parent);
+        Dir.symLinkAbsolute(std.testing.io, self.path(arena, target), link_path, .{ .is_directory = true }) catch |err| switch (err) {
+            error.AccessDenied, error.PermissionDenied => return false,
+            else => return err,
+        };
+        return true;
+    }
+
+    fn source(self: *const CompatFixture, arena: std.mem.Allocator, relative: []const u8, scope: SourceScope, priority: u32) Source {
+        return .{ .root = self.path(arena, relative), .scope = scope, .priority = priority, .profile = .compat };
+    }
+};
+
+const compat_scope_id = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+fn expectSkill(snapshot: *const Snapshot, name: []const u8) !*const SkillRecord {
+    return snapshot.findByInvocation(name) orelse {
+        std.debug.print("missing skill {s}\n", .{name});
+        return error.TestUnexpectedResult;
+    };
+}
+
+test "compat: a Skill linked from several roots loads once, through its highest-priority path" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var fixture = try CompatFixture.init();
+    defer fixture.deinit();
+
+    // `npx skills add` layout: the real copy in ~/.agents/skills, a link in ~/.claude/skills.
+    try fixture.write(a, "agents/browser/SKILL.md", "---\ndescription: drive a browser\n---\nbody");
+    if (!try fixture.link(a, "agents/browser", "claude/browser")) return error.SkipZigTest;
+    // A link that points outside every root, under its own name.
+    try fixture.write(a, "elsewhere/real-name/SKILL.md", "---\ndescription: linked in\n---\nbody");
+    if (!try fixture.link(a, "elsewhere/real-name", "claude/link-name")) return error.SkipZigTest;
+    // A dangling link and a plain file are not Skills.
+    _ = try fixture.link(a, "missing", "claude/dangling");
+    try fixture.write(a, "claude/README.md", "not a skill");
+
+    const sources = [_]Source{
+        fixture.source(a, "claude", .personal, 2002),
+        fixture.source(a, "agents", .personal, 2003),
+    };
+    const snapshot = try build(std.testing.allocator, std.testing.io, compat_scope_id, "", &sources, .{});
+    defer snapshot.deinit();
+    try std.testing.expectEqual(Health.healthy, snapshot.health);
+    try std.testing.expectEqual(@as(usize, 2), snapshot.skills.len);
+    const browser = try expectSkill(snapshot, "browser");
+    try std.testing.expect(std.mem.endsWith(u8, browser.source_root, "agents"));
+    const linked = try expectSkill(snapshot, "link-name");
+    try std.testing.expect(std.mem.endsWith(u8, linked.live_dir.?, "real-name"));
+}
+
+test "compat: a symlinked root, nested Skills, hidden and reserved folders" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var fixture = try CompatFixture.init();
+    defer fixture.deinit();
+
+    try fixture.write(a, "dotfiles/skills/top/SKILL.md", "---\ndescription: top\n---\nb");
+    try fixture.write(a, "dotfiles/skills/group/inner/SKILL.md", "---\ndescription: nested one level\n---\nb");
+    try fixture.write(a, "dotfiles/skills/a/b/c/d/e/six/SKILL.md", "---\ndescription: depth six\n---\nb");
+    try fixture.write(a, "dotfiles/skills/a/b/c/d/e/f/seven/SKILL.md", "---\ndescription: too deep\n---\nb");
+    try fixture.write(a, "dotfiles/skills/.system/hidden/SKILL.md", "---\ndescription: hidden\n---\nb");
+    try fixture.write(a, "dotfiles/skills/Synced/claude-ai/SKILL.md", "---\ndescription: reserved\n---\nb");
+    // A Skill's own subtree is not searched for more Skills.
+    try fixture.write(a, "dotfiles/skills/top/examples/sub/SKILL.md", "---\ndescription: inside top\n---\nb");
+    if (!try fixture.link(a, "dotfiles/skills", "home/skills")) return error.SkipZigTest;
+
+    const sources = [_]Source{fixture.source(a, "home/skills", .personal, 2000)};
+    const snapshot = try build(std.testing.allocator, std.testing.io, compat_scope_id, "", &sources, .{});
+    defer snapshot.deinit();
+    try std.testing.expectEqual(@as(usize, 3), snapshot.skills.len);
+    _ = try expectSkill(snapshot, "top");
+    _ = try expectSkill(snapshot, "inner");
+    _ = try expectSkill(snapshot, "six");
+}
+
+test "compat: only metadata is read, the live directory is referenced" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var fixture = try CompatFixture.init();
+    defer fixture.deinit();
+
+    try fixture.write(a, "skills/heavy/SKILL.md", "---\ndescription: carries a venv\n---\nRun `.venv/bin/python scripts/x.py`.");
+    try fixture.write(a, "skills/heavy/agents/openai.yaml", "interface:\n  display_name: Heavy\npolicy:\n  allow_implicit_invocation: false\n");
+    // More files than a snapshot Skill may hold, and a link leaving the tree:
+    // a canonical source rejects this Skill, a compat source never reads them.
+    var index: usize = 0;
+    while (index < 1100) : (index += 1) {
+        try fixture.write(a, try std.fmt.allocPrint(a, "skills/heavy/.venv/lib/f{d}.py", .{index}), "x");
+    }
+    _ = try fixture.link(a, "skills", "skills/heavy/.venv/escape");
+
+    const sources = [_]Source{fixture.source(a, "skills", .project, 1000)};
+    const snapshot = try build(std.testing.allocator, std.testing.io, compat_scope_id, "", &sources, .{});
+    defer snapshot.deinit();
+    try std.testing.expectEqual(Health.healthy, snapshot.health);
+    const heavy = try expectSkill(snapshot, "heavy");
+    try std.testing.expectEqual(@as(usize, 2), heavy.files.len);
+    try std.testing.expectEqualStrings("SKILL.md", heavy.files[0].relative_path);
+    try std.testing.expectEqualStrings("agents/openai.yaml", heavy.files[1].relative_path);
+    try std.testing.expect(std.mem.endsWith(u8, heavy.live_dir.?, "heavy"));
+    // Codex `allow_implicit_invocation: false` hides it from the model.
+    try std.testing.expect(heavy.definition.disable_model_invocation);
+
+    const canonical_sources = [_]Source{.{ .root = fixture.path(a, "skills"), .scope = .project, .priority = 1 }};
+    const strict = try build(std.testing.allocator, std.testing.io, compat_scope_id, "", &canonical_sources, .{});
+    defer strict.deinit();
+    try std.testing.expectEqual(@as(usize, 0), strict.skills.len);
+    try std.testing.expect(strict.skills.len == 0 and strict.issues.len == 1);
+}
+
+test "compat: Claude Code precedence, Unicode names and description fallback" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var fixture = try CompatFixture.init();
+    defer fixture.deinit();
+
+    try fixture.write(a, "personal/deploy/SKILL.md", "---\ndescription: personal deploy\n---\nb");
+    try fixture.write(a, "project/deploy/SKILL.md", "---\ndescription: project deploy\n---\nb");
+    try fixture.write(a, "project/地址库/SKILL.md", "---\ndescription: 查询地址\n---\nb");
+    try fixture.write(a, "project/untitled/SKILL.md", "---\nname: untitled\n---\n\nFirst body line describes it.\n");
+    try fixture.write(a, "project/bad name/SKILL.md", "---\ndescription: spaces are not invocable\n---\nb");
+
+    const sources = [_]Source{
+        fixture.source(a, "personal", .personal, 2000),
+        fixture.source(a, "project", .project, 1000),
+    };
+    const snapshot = try build(std.testing.allocator, std.testing.io, compat_scope_id, "", &sources, .{});
+    defer snapshot.deinit();
+    const deploy = try expectSkill(snapshot, "deploy");
+    try std.testing.expectEqualStrings("personal deploy", deploy.definition.description);
+    _ = try expectSkill(snapshot, "地址库");
+    const untitled = try expectSkill(snapshot, "untitled");
+    try std.testing.expectEqualStrings("First body line describes it.", untitled.definition.description);
+    // The invalid name is a typed issue, not a silent drop.
+    try std.testing.expectEqual(@as(usize, 1), snapshot.issues.len);
+    try std.testing.expectEqual(IssueCode.invalid_invocation_name, snapshot.issues[0].code);
+}
+
+test "compat: an unreadable root is skipped and reported; siblings still load" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var fixture = try CompatFixture.init();
+    defer fixture.deinit();
+
+    try fixture.write(a, "good/ok/SKILL.md", "---\ndescription: ok\n---\nb");
+    try fixture.write(a, "locked/hidden/SKILL.md", "---\ndescription: unreachable\n---\nb");
+    const locked = fixture.path(a, "locked");
+    const locked_z = try a.dupeZ(u8, locked);
+    if (std.c.chmod(locked_z.ptr, 0) != 0) return error.SkipZigTest;
+    defer _ = std.c.chmod(locked_z.ptr, 0o755);
+    // Root can still list a 000 directory: skip the test there.
+    if (Dir.openDirAbsolute(std.testing.io, locked, .{ .iterate = true })) |opened| {
+        var dir = opened;
+        var iterator = dir.iterate();
+        const readable = if (iterator.next(std.testing.io)) |_| true else |_| false;
+        dir.close(std.testing.io);
+        if (readable) return error.SkipZigTest;
+    } else |_| {}
+
+    const sources = [_]Source{
+        fixture.source(a, "locked", .personal, 2000),
+        fixture.source(a, "good", .project, 1000),
+    };
+    const snapshot = try build(std.testing.allocator, std.testing.io, compat_scope_id, "", &sources, .{});
+    defer snapshot.deinit();
+    try std.testing.expectEqual(Health.degraded, snapshot.health);
+    _ = try expectSkill(snapshot, "ok");
+    try std.testing.expectEqual(@as(usize, 1), snapshot.skipped_sources.len);
+    try std.testing.expectEqual(SkipReason.unreadable, snapshot.skipped_sources[0].reason);
+}
+
+test "compat invocation grammar admits non-ASCII letters but no blanks or controls" {
+    try std.testing.expect(validCompatInvocationName("地址库"));
+    try std.testing.expect(validCompatInvocationName("plugin:review-2"));
+    try std.testing.expect(validCompatInvocationName("Résumé"));
+    try std.testing.expect(!validCompatInvocationName("two words"));
+    try std.testing.expect(!validCompatInvocationName("全角\u{3000}空格"));
+    try std.testing.expect(!validCompatInvocationName("zero\u{200b}width"));
+    try std.testing.expect(!validCompatInvocationName("-leading"));
+    try std.testing.expect(!validCompatInvocationName("bad.name"));
+    try std.testing.expect(!validCompatInvocationName("\xff"));
 }

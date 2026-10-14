@@ -594,6 +594,27 @@ class _GateSnapshot:
         validate_protocol_payload(root, final_raw)
 
 
+def gate_child_environment(source: Mapping[str, str]) -> dict[str, str]:
+    """The environment of every command the gate runs: the caller's, minus
+    credentials and `CODEX_HOME`. `CODEX_HOME` is absolute, so the temporary
+    inventory HOME does not move it, and the runtime would load the caller's
+    Codex Skills and start the MCP servers in its config.toml."""
+    clean_env = {
+        key: value
+        for key, value in source.items()
+        if key
+        not in {
+            "METASK_API_KEY",
+            "METACODES_API_KEY",
+            "METACODES_API_KEY_FD",
+            "METACODES_RUNTIME_CREDENTIAL_FD",
+            "CODEX_HOME",
+        }
+    }
+    clean_env["METACODES_NO_PROBE"] = "1"
+    return clean_env
+
+
 def run_gate(
     root: Path,
     protocol_path: Path,
@@ -636,18 +657,7 @@ def _run_gate_materialized(
             f"DeepSeek Harness revision drifted: expected {expected_dsh}, observed {observed_dsh}"
         )
 
-    clean_env = {
-        key: value
-        for key, value in os.environ.items()
-        if key
-        not in {
-            "METASK_API_KEY",
-            "METACODES_API_KEY",
-            "METACODES_API_KEY_FD",
-            "METACODES_RUNTIME_CREDENTIAL_FD",
-        }
-    }
-    clean_env["METACODES_NO_PROBE"] = "1"
+    clean_env = gate_child_environment(os.environ)
     checks: list[dict[str, Any]] = []
     for name, argv in (
         ("plugin_component_l2", ["zig", "build", "test:new", "-Dtfilter=plugin"]),

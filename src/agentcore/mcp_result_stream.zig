@@ -395,8 +395,10 @@ const ParseState = struct {
                 .rpc_code = self.remote_code,
             } };
         }
+        // 2026-07-28 `Result.resultType`: "the client MUST treat the absent
+        // field as `complete`" (schema/2026-07-28/schema.ts).
         if (self.era == .modern_2026_07_28) switch (self.result_type) {
-            .missing => return .{ .diagnostic = Diagnostic.init(.missing_result_type) },
+            .missing => {},
             .input_required => return .{ .diagnostic = Diagnostic.init(.input_required_unsupported) },
             .unsupported => return .{ .diagnostic = Diagnostic.init(.unsupported_result_type) },
             .complete => {},

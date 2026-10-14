@@ -241,7 +241,7 @@ test "dispatch: slash 菜单开 → Down 移选中(slash_sel++, 不上抛 histor
 test "dispatch: slash 菜单开 → Up 在 0 处回绕到末项" {
     var s = UiState{};
     _ = ui.dispatch(&s, .{ .editor_view = .{ .view = "/", .cursor = 1 } });
-    const n = complete.slashFilterCount("/");
+    const n = complete.slashFilterCount(.builtin, "/");
     const e = ui.dispatch(&s, keyTag(.up));
     try testing.expectEqual(n - 1, s.slash_sel); // 0 → 末项
     try testing.expectEqual(event.LoopAction.none, e.action);
@@ -279,16 +279,16 @@ test "dispatch: slash 菜单 → 打字过滤变窄,slash_sel 钳到末项" {
     const big = s.slash_sel;
     // 过滤到只剩 /clear(唯一匹配)→ slash_sel 应钳到 0
     _ = ui.dispatch(&s, .{ .editor_view = .{ .view = "/clea", .cursor = 5 } });
-    const n2 = complete.slashFilterCount("/clea");
+    const n2 = complete.slashFilterCount(.builtin, "/clea");
     try testing.expect(s.slash_sel < n2 or s.slash_sel == 0);
     try testing.expect(big >= s.slash_sel);
 }
 
 test "slashNthMatch: 顺序与表一致" {
-    const c0 = complete.slashNthMatch("/", 0).?;
+    const c0 = complete.slashNthMatch(.builtin, "/", 0).?;
     try testing.expectEqualStrings("/help", c0.name);
     // /c 前缀:/clear /compact /cost /config /commit(按表顺序)
-    const cc0 = complete.slashNthMatch("/c", 0).?;
+    const cc0 = complete.slashNthMatch(.builtin, "/c", 0).?;
     try testing.expectEqualStrings("/clear", cc0.name);
 }
 

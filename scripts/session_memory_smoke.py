@@ -134,7 +134,13 @@ class Provider:
 def _run(binary: Path, provider: Provider, work: Path, args: List[str], stdin: Optional[str], extra_env: Dict[str, str]) -> subprocess.CompletedProcess:
     home = work / ".home"
     home.mkdir(parents=True, exist_ok=True)
-    env = {key: value for key, value in os.environ.items() if not key.startswith(("METACODES_", "TINYKG_", "CLAUDE_CODE_", "METASK_"))}
+    # CODEX_HOME is absolute, so the temporary HOME does not move it: it would
+    # load the host's Codex Skills and start its config.toml MCP servers.
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith(("METACODES_", "TINYKG_", "CLAUDE_CODE_", "METASK_")) and key != "CODEX_HOME"
+    }
     env.update(
         {
             "HOME": str(home),

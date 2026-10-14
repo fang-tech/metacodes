@@ -240,6 +240,9 @@ def _build_env(base_url, env):
     if not (env and env.get("HOME")):
         ephemeral_home = tempfile.mkdtemp(prefix="cc-tty-home-")
         full_env["HOME"] = ephemeral_home
+    # CODEX_HOME 是绝对路径,不随 HOME 隔离:留着就会读宿主 Codex 的 skills,并拉起它
+    # config.toml 里的 MCP server。要测它的用例经下方 env 参数显式给。
+    full_env.pop("CODEX_HOME", None)
     # 每个用例的 HOME 都是临时目录(ephemeral 或用例自建/播种),会话会在里面自建并拉起
     # TinyKG 服务(kgd + tinykgd);它按设计常驻、不随会话退出,每个用例都会留一对孤儿进程
     # 占着 HOME(Windows 上因此删不掉)。默认关掉;真要测 KG 的用例经 env 参数传
