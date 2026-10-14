@@ -431,13 +431,10 @@ def test_T34_gen_shift_tab_cycles_mode(bin_path):
                          "sleep:0.6", "key:shift_tab", "sleep:1.5"],
               per_key_drain=0.05, permission="default")
     a = TTYAssert(raw)
-    # 某帧 footer 出现非 default 模式(accept edits / plan mode)——Shift+Tab 在生成期切换生效。
-    ok = any(
-        sc.find_last_row("accept edits") is not None or sc.find_last_row("plan mode") is not None
-        for sc in a.frame_screens
-    )
+    # 某帧 footer 出现 accept edits——Shift+Tab 在生成期切换生效。
+    ok = any(sc.find_last_row("accept edits") is not None for sc in a.frame_screens)
     if not ok:
-        a._fail("生成期 Shift+Tab 未切换权限模式(footer 无 accept edits/plan mode)")
+        a._fail("生成期 Shift+Tab 未切换权限模式(footer 无 accept edits)")
 
 
 def test_generation_frames_are_synchronized(bin_path):

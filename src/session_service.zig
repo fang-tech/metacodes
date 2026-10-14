@@ -159,7 +159,7 @@ pub const SessionService = struct {
             for (name, 0..) |ch, i| buf[i] = if (ch == '-') '_' else ch;
             break :blk permission_mode.parseStrict(buf[0..name.len]);
         } orelse {
-            return .{ .kind = .err, .ok = false, .data = .{ .text = "unknown mode (try: default, accept-edits, plan, auto, dont-ask, bypass)" } };
+            return .{ .kind = .err, .ok = false, .data = .{ .text = "unknown mode (try: default, accept-edits, auto, dont-ask, bypass)" } };
         };
         return self.setPermMode(mode);
     }
@@ -170,9 +170,7 @@ pub const SessionService = struct {
     }
 
     pub fn setPermMode(self: *SessionService, mode: types.PermissionMode) CommandOutcome {
-        // 经 App.setPermModeTracked:进/出 plan 的 plan_prev_mode 簿记与 Shift+Tab 同源
-        // (直写 setMode 会漏簿记 → ExitPlanMode approve 恢复到 stale 的更宽模式)。
-        self.app.setPermModeTracked(mode);
+        self.app.setPermMode(mode);
         return .{ .kind = .mode_changed, .ok = true, .data = .{ .mode = self.app.permMode() } };
     }
 
@@ -442,7 +440,6 @@ pub fn buildRunOptions(app: *app_mod.App, synthetic_user_input: ?[]const u8) age
         .job_notifications = if (app.jobs) |*j| j else null,
         .agent_jobs = if (app.agent_jobs) |*aj| aj else null,
         .swarm = &app.swarm,
-        .plan_prev_mode = &app.plan_prev_mode,
         .tasks = &app.tasks,
         .kg = if (app.kg) |*k| k else null,
         .jev = app.jevAdvisor(),
@@ -476,7 +473,6 @@ pub fn buildRunOptions(app: *app_mod.App, synthetic_user_input: ?[]const u8) age
             null,
         .tool_result_metrics = &app.tool_result_metrics,
         .file_change_journal = &app.file_change_journal,
-        .plan_file_path = app.plan_file_path,
         .emit_tool_cards = true,
     };
 }
@@ -532,19 +528,19 @@ test "U11: /mode 命名设置(含连字符归一)与非法名" {
     var app: app_mod.App = undefined;
     app.config = types.Config{};
     app.permission_ctx = @import("permission.zig").createContext(.default, testing.allocator);
-    app.plan_prev_mode = null;
     var svc = SessionService.init(&app);
 
-    const o1 = svc.exec(testing.allocator, "mode", "plan");
+    const o1 = svc.exec(testing.allocator, "mode", "dont-ask");
     try testing.expectEqual(CommandOutcome.Kind.mode_changed, o1.kind);
-    try testing.expectEqual(types.PermissionMode.plan, o1.data.mode);
-    // 进 plan 记录前态(ExitPlanMode approve 据此恢复;命名路径与 Shift+Tab 同簿记)。
-    try testing.expectEqual(types.PermissionMode.default, app.plan_prev_mode.?);
+    try testing.expectEqual(types.PermissionMode.dont_ask, o1.data.mode);
 
     const o2 = svc.exec(testing.allocator, "mode", "accept-edits");
     try testing.expectEqual(types.PermissionMode.accept_edits, o2.data.mode);
-    // 离开 plan 清簿记:stale prev 绝不能残留(否则下次 approve 恢复到历史宽模式)。
-    try testing.expect(app.plan_prev_mode == null);
+
+    // plan 已不是权限模式:按非法名拒绝,不静默落到别的模式。
+    const o_plan = svc.exec(testing.allocator, "mode", "plan");
+    try testing.expectEqual(CommandOutcome.Kind.err, o_plan.kind);
+    try testing.expectEqual(types.PermissionMode.accept_edits, app.permission_ctx.modeValue());
 
     const o3 = svc.exec(testing.allocator, "mode", "nonsense");
     try testing.expectEqual(CommandOutcome.Kind.err, o3.kind);

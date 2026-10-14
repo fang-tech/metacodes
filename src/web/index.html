@@ -469,7 +469,7 @@ function renderGeneric(body, name, content) {
   const d = el("tout"); d.textContent = txt; body.appendChild(d);
 }
 
-// ── UI 请求对话框(permission / ask_question / plan_approval / custom)──────────
+// ── UI 请求对话框(permission / ask_question / custom)──────────────────────────
 let pendingReqId = 0;
 function showDialog(id, tag, p) {
   pendingReqId = id; dialog.innerHTML = "";
@@ -479,13 +479,6 @@ function showDialog(id, tag, p) {
     choiceButtons([
       ["Yes (once)", "allow_once"], ["Yes, always allow " + p.tool, "allow_always"],
       ["No (once)", "deny_once"], ["No, don't ask again this session", "deny_tool_session"],
-    ], (c) => respond({ id, choice: c }));
-  } else if (tag === "plan_approval") {
-    dialog.appendChild(Object.assign(document.createElement("h3"), { textContent: "Plan approval" + (p.kg_step_count ? " (" + p.kg_step_count + " steps → task graph)" : "") }));
-    const md = el("md"); md.innerHTML = renderMarkdown(p.plan_md || ""); md.style.cssText = "background:var(--bg);padding:8px;border-radius:4px;max-height:40vh;overflow:auto"; dialog.appendChild(md);
-    choiceButtons([
-      ["Yes, proceed", "approve_default"], ["Yes, and auto-accept edits", "approve_accept_edits"],
-      ["No, keep planning", "reject"],
     ], (c) => respond({ id, choice: c }));
   } else if (tag === "ask_question") { renderAsk(id, p.questions); }
   else { dialog.appendChild(Object.assign(document.createElement("h3"), { textContent: "Unsupported UI request: " + tag }));

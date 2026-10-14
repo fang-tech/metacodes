@@ -109,7 +109,7 @@ Model-facing routing (TaskOutput, TaskStop, notifications) keeps the
 one-session scope `SessionScope.only`.
 
 Process-mode teammate startup binds `--parent-session-id` before `App.init`, so
-KG identity, provider-visible context, plan paths, permissions, and transcript
+KG identity, provider-visible context, permissions, and transcript
 all use the same parent session from the first request. Team names are
 canonicalized before path construction. Each spawn receives a fresh lease and
 the child refuses a changed or missing worktree; it never falls back to the

@@ -292,19 +292,19 @@ REPL 在 Run 结束后派发。REPL 里 Run 内的边界由 `run()` 消费,Run �
 
 ### 3.4 UiRequest — core 向前端**请求一个回答**(交互式)
 
-工具(AskUserQuestion / 权限门 / ExitPlanMode 审批)需要用户当场回答时,经
+工具(AskUserQuestion / 权限门 / custom 动态 UI)需要用户当场回答时,经
 `ToolContext.requestUi` / `PermissionContext.ui_requester` 发出:
 
 ```zig
 pub const UiRequest = union(enum) {
     ask_question: []const AskQuestion,                    // 多选问答(可多选 + preview)
     permission: struct { tool, args },                    // 权限确认
-    plan_approval: struct { plan_md },                    // 计划审批(三选项)
+    custom: struct { kind, payload_json },                // 宿主自定义 UI(core 只转发)
 };
 pub const UiResponse = union(enum) {
     answers: []const []const u8,                          // 选中的 label(s)
     permission: PermissionChoice,                         // allow_once/allow_always/deny_once/deny_tool_session
-    plan_approval: PlanApproval,                          // approve_default/approve_accept_edits/reject
+    custom: []const u8,                                   // custom 请求的结果 JSON
 };
 pub const RequestOutcome = enum { answered, pending, unavailable };
 pub const UiRequester = struct {
@@ -708,7 +708,7 @@ connector、process plugin 与公开 Host stream ABI 都复用同一 CAS/receipt
   `agents` `skills_set` `cron_registry` `sandbox`
   `mcp_sessions` `output_ledger`(§3.2.1) `file_change_journal`(§3.2.2) …
 - **SESSION/身份**:`session: SessionId` `session_id` `project_dir` `cwd_abs` `home_dir`
-  `parent_model` `plan_file_path` `artifact_root` …
+  `parent_model` `artifact_root` …
 - **接口回调/观察(类型安全,见 §4.3)**:`ui_requester` `host_services` `tool_observer`
   `spawn_tick_fn`；usage/progress 由 `CoreEvent`/`EventSink` 投影，不再注入私有 sink。
 

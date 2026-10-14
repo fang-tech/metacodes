@@ -541,7 +541,7 @@ pub fn main(init: std.process.Init) !void {
 
     // Process-mode teammates must bind the complete App initialization to
     // their parent's session. Adopting only after App.init would seed KG,
-    // prompts, plan paths, and provider-visible session state from a random
+    // prompts, and provider-visible session state from a random
     // child id, then leave those snapshots stale after the writer switch.
     if (config.teammate_name.len > 0 and (config.teammate_parent_session.len == 0 or config.teammate_lease_id.len == 0)) {
         std.debug.print("error: --teammate requires --parent-session-id and --teammate-lease-id\n", .{});
@@ -2932,7 +2932,7 @@ fn printHelp() void {
         \\  --parallel-tool-calls <bool>  Mistral explicit parallel tools (dialect-gated)
         \\  --response-format <json_object|json_schema>  Structured output (dialect-gated)
         \\  --api-key <key>       API key (overrides stored credentials by default)
-        \\  --permission <mode>   default | acceptEdits | plan | auto | dontAsk | bypassPermissions
+        \\  --permission <mode>   default | acceptEdits | auto | dontAsk | bypassPermissions
         \\  --settings <path>     Extra settings JSON (CLI layer)
         \\  --allowedTools <list> Comma-separated allow rules, e.g. "Bash(git *),Read"
         \\  --disallowedTools <l> Comma-separated deny rules
@@ -3035,8 +3035,6 @@ test {
     _ = &@import("core/host_check.zig");
     _ = &@import("core/check_gate.zig");
     _ = &@import("core/test_integrity.zig");
-    _ = &@import("core/proposed_plan.zig");
-    _ = &@import("core/plan_file.zig");
     _ = &@import("swarm/team.zig");
     _ = &@import("swarm/mailbox.zig");
     _ = &@import("swarm/teammate.zig");

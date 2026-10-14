@@ -122,6 +122,25 @@ status, compatibility boundaries, and entry points are defined by
   `evals/memory/pilots/longmem-recall-order-glm52-v1` and
   doc/JEV_SYSTEM_ONE.md §6.4-§6.5.
 
+### Removed
+
+- Plan mode. `PermissionMode.plan`, the `EnterPlanMode`/`ExitPlanMode` tools,
+  the `<proposed_plan>` protocol and the per-session plan file under
+  `<state root>/plans/` are gone, and so is the `plan_approval` UI request:
+  `UiRequest`/`UiResponse`, `protocol.wire` (not yet released) and the `--web`
+  page no longer carry it. `--permission plan`, `/mode plan` and an agent file
+  with `permissionMode: plan` are now rejected as unknown values instead of
+  selecting a read-only mode; Shift+Tab cycles default ↔ acceptEdits. The
+  built-in Explore and Plan subagents are read-only by their tool allowlists
+  (Read/Grep/Glob, plus KgRecall/KgContext for Plan), which also cap dispatch,
+  instead of by a permission mode; Explore loses Bash, which plan mode denied
+  unless a settings allow rule matched. The AgentCore ABI never exposed plan mode; its
+  checkpoint byte 2 stays reserved and decodes as corrupt. Breaking for
+  source-level embedders that name `.plan` or `.plan_approval`. A plan
+  approved through ExitPlanMode was the only producer of a TinyKG plan graph
+  (`kg/plan_commit.zig`), which has no production caller now; existing
+  `kg_root` pointers are still read.
+
 ### Fixed
 
 - Sockets no longer leak into child processes. The `--web`, OAuth callback

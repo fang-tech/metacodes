@@ -7813,7 +7813,6 @@ test "L2 AskUserQuestion mapping is complete and canonical Permission bypasses p
     }};
     const ask = core.protocol.ui_request.UiRequest{ .ask_question = &questions };
     const permission = core.protocol.ui_request.UiRequest{ .permission = .{ .tool = "Bash", .args = "{}" } };
-    const plan = core.protocol.ui_request.UiRequest{ .plan_approval = .{ .plan_md = "Do it", .kg_step_count = 2 } };
     const custom = core.protocol.ui_request.UiRequest{ .custom = .{ .kind = "video_timeline", .payload_json = "{\"clips\":[]}" } };
     const public_options = [_]sdk.protocol.AskOption{
         .{ .label = "Yes", .description = "Proceed", .preview = "preview" },
@@ -7829,10 +7828,6 @@ test "L2 AskUserQuestion mapping is complete and canonical Permission bypasses p
     try std.testing.expectError(
         error.UnsupportedUiRequest,
         abi.protocol_v1.encodeUiRequest(std.testing.allocator, &permission),
-    );
-    try std.testing.expectError(
-        error.UnsupportedUiRequest,
-        abi.protocol_v1.encodeUiRequest(std.testing.allocator, &plan),
     );
     try std.testing.expectError(
         error.UnsupportedUiRequest,

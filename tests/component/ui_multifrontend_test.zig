@@ -242,12 +242,12 @@ test "M6: 自定义 session 经 agent_loop emit 端到端透传(非默认路由)
 }
 
 // M6(还 M5 欠条):ToolContext.requestUi 把 ctx.session 透传给 UiRequestFn 回调。
-// 用一个捕获 session 的 mock runner,验自定义 session 不被弄丢(现 plan/ask mock 都忽略 session)。
+// 用一个捕获 session 的 mock runner,验自定义 session 不被弄丢(现 ask mock 都忽略 session)。
 const SessionCapture = struct {
     threadlocal var got: SessionId = SessionId.single;
     fn runner(_: *anyopaque, session: SessionId, _: std.mem.Allocator, _: *const cc.ui_request.UiRequest, out: *cc.ui_request.UiResponse) anyerror!cc.ui_request.RequestOutcome {
         got = session;
-        out.* = .{ .plan_approval = .reject };
+        out.* = .{ .permission = .deny_once };
         return .answered;
     }
 };
@@ -261,7 +261,7 @@ test "M6: requestUi 把 ctx.session 透传给 UiRequestFn(非默认)" {
         .ui_requester = .{ .ctx = @ptrCast(&dummy), .requestFn = &SessionCapture.runner },
         .session = custom,
     };
-    const req = cc.ui_request.UiRequest{ .plan_approval = .{ .plan_md = "x" } };
+    const req = cc.ui_request.UiRequest{ .permission = .{ .tool = "Bash", .args = "{}" } };
     var resp: cc.ui_request.UiResponse = undefined;
     _ = try ctx.requestUi(a, &req, &resp);
     // 回调收到的 session == ctx.session(透传未丢)。

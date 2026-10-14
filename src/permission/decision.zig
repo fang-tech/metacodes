@@ -128,9 +128,6 @@ pub const Context = struct {
     hooks: ?*const hooks_mod.HookSet = null,
     /// hook spawn 需要 allocator(构造 stdin JSON);未提供 → 跳过 hook。
     hook_allocator: ?std.mem.Allocator = null,
-    /// 当前 session 的 plan 文件全路径(plan 模式下特许写此文件;空串 = 无)。
-    /// 对齐 cc isSessionPlanFile:plan 模式下模型把计划写到此文件,是唯一可写文件。
-    plan_file_path: []const u8 = "",
     /// memdir 绝对路径(通道 B 自动记忆目录;空串 = 禁用)。模型用 Write/Edit 自管记忆,
     /// 写此子树内的文件**任何模式都豁免**(对齐 cc isAutoMemPath)。
     /// 安全:豁免严格限于 memdir 子树(realpath + 分隔符边界,见 memdir.isAutoMemPath);
@@ -309,13 +306,13 @@ pub fn checkClassified(
         }
     }
 
-    // 4. Bash 专属免询问(plan/dont_ask 除外,它们语义就是限制):
+    // 4. Bash 专属免询问(dont_ask 除外,它的语义就是限制):
     //    a. 只读命令(bash_readonly:完整词法,每段只读,无写重定向/替换/写选项)→ ALLOW
     //    b. autoAllowBashIfSandboxed 且本次调用**确实**进沙箱(sandbox_exec.plan)→ ALLOW
     //    其余落到下方模式兜底(default/acceptEdits/auto 下即 ask)。
     if (std.mem.eql(u8, tool_name, "Bash")) {
         const m4 = @import("mode.zig").canonical(ctx.mode);
-        if (m4 != .plan and m4 != .dont_ask and bashAutoAllowed(ctx, args)) return .allow;
+        if (m4 != .dont_ask and bashAutoAllowed(ctx, args)) return .allow;
     }
 
     // 名字兜底只服务 legacy 路径(null dispatcher / dyn_registry):dispatcher 在场时
@@ -331,24 +328,6 @@ pub fn checkClassified(
     const m = mode_mod.canonical(ctx.mode);
     const decision: Decision = blk: {
         if (m == .bypass_permissions) break :blk .allow;
-        if (m == .plan) {
-            if (cat == .read) break :blk .allow;
-            // plan 文件特许:plan 模式下 Write/Edit 目标==当前 session plan 文件 → allow
-            // (对齐 cc isSessionPlanFile:plan 文件是 plan 模式下唯一可写文件)。
-            if (ctx.plan_file_path.len > 0 and
-                (std.mem.eql(u8, tool_name, "Write") or std.mem.eql(u8, tool_name, "Edit")))
-            {
-                const util_json = @import("../util/json.zig");
-                const plan_file = @import("../core/plan_file.zig");
-                if (util_json.extractStringField(args, "file_path")) |target| {
-                    if (plan_file.isPlanFile(ctx.plan_file_path, target)) {
-                        log.debug("permission", "plan mode: allow write to plan file {s}", .{target});
-                        break :blk .allow;
-                    }
-                }
-            }
-            break :blk .deny;
-        }
         if (m == .auto) break :blk if (risk == .low) .allow else .ask;
         if (m == .dont_ask) break :blk .deny;
         if (m == .accept_edits) {
@@ -414,10 +393,10 @@ fn bashAutoAllowed(ctx: *const Context, args: []const u8) bool {
 }
 
 test "classified Host effect replaces legacy unknown-name read fallback" {
-    const plan = Context{ .mode = .plan };
-    try std.testing.expectEqual(Decision.allow, check(&plan, "PluginTool", "{}"));
-    try std.testing.expectEqual(Decision.deny, checkClassified(&plan, "PluginTool", "{}", .execute));
-    try std.testing.expectEqual(Decision.allow, checkClassified(&plan, "PluginTool", "{}", .read));
+    const default = Context{ .mode = .default };
+    try std.testing.expectEqual(Decision.allow, check(&default, "PluginTool", "{}"));
+    try std.testing.expectEqual(Decision.ask, checkClassified(&default, "PluginTool", "{}", .execute));
+    try std.testing.expectEqual(Decision.allow, checkClassified(&default, "PluginTool", "{}", .read));
 
     const auto = Context{ .mode = .auto };
     try std.testing.expectEqual(Decision.ask, checkClassified(&auto, "PluginTool", "{}", .execute));
@@ -452,28 +431,6 @@ test "legacy bypass alias still works" {
     try std.testing.expect(check(&ctx, "Write", "") == .allow);
 }
 
-test "plan mode: read allowed, write/exec denied" {
-    const ctx = Context{ .mode = .plan };
-    try std.testing.expect(check(&ctx, "Read", "") == .allow);
-    try std.testing.expect(check(&ctx, "Grep", "") == .allow);
-    try std.testing.expect(check(&ctx, "Write", "") == .deny);
-    try std.testing.expect(check(&ctx, "Edit", "") == .deny);
-    try std.testing.expect(check(&ctx, "Bash", "") == .deny);
-}
-
-test "plan mode: 特许写 plan 文件,其它 Write 仍 deny(对齐 cc isSessionPlanFile)" {
-    const plan_path = "/home/u/.metacodes/plans/cozy-canyon.md";
-    const ctx = Context{ .mode = .plan, .plan_file_path = plan_path };
-    // 写 plan 文件 → allow。
-    try std.testing.expect(check(&ctx, "Write", "{\"file_path\":\"/home/u/.metacodes/plans/cozy-canyon.md\",\"content\":\"x\"}") == .allow);
-    try std.testing.expect(check(&ctx, "Edit", "{\"file_path\":\"/home/u/.metacodes/plans/cozy-canyon.md\"}") == .allow);
-    // 写别的文件 → 仍 deny(plan 文件是唯一例外)。
-    try std.testing.expect(check(&ctx, "Write", "{\"file_path\":\"/home/u/src/main.zig\",\"content\":\"x\"}") == .deny);
-    // 无 plan_file_path 配置时,连 plan 路径也 deny(机制未启用)。
-    const ctx_noplan = Context{ .mode = .plan };
-    try std.testing.expect(check(&ctx_noplan, "Write", "{\"file_path\":\"/home/u/.metacodes/plans/cozy-canyon.md\"}") == .deny);
-}
-
 test "memdir 写豁免:子树内任何模式 allow,外部按常规;deny 仍优先(通道 B)" {
     const a = std.testing.allocator;
     // 真建一个 memdir 子树(isAutoMemPath 走 realpath,需真实路径)。
@@ -486,18 +443,18 @@ test "memdir 写豁免:子树内任何模式 allow,外部按常规;deny 仍优�
     var mdbuf: [std.fs.max_path_bytes]u8 = undefined;
     const md = memdir.memdirPath(home, "/fake/repo", &mdbuf);
 
-    // plan 模式(最严):写 memdir 内文件仍 allow(记忆与 plan 正交)。
-    const ctx = Context{ .mode = .plan, .memdir_abs = md, .memdir_allocator = a };
+    // dont_ask(最严):写 memdir 内文件仍 allow(记忆与模式正交)。
+    const ctx = Context{ .mode = .dont_ask, .memdir_abs = md, .memdir_allocator = a };
     var ibuf: [std.fs.max_path_bytes + 64]u8 = undefined;
     const inside_args = try std.fmt.bufPrint(&ibuf, "{{\"file_path\":\"{s}/topic.md\",\"content\":\"x\"}}", .{md});
     try std.testing.expect(check(&ctx, "Write", inside_args) == .allow);
     try std.testing.expect(check(&ctx, "Edit", inside_args) == .allow);
 
-    // memdir 外的文件:plan 模式照常 deny(豁免严格限子树)。
+    // memdir 外的文件:dont_ask 照常 deny(豁免严格限子树)。
     try std.testing.expect(check(&ctx, "Write", "{\"file_path\":\"/etc/passwd\",\"content\":\"x\"}") == .deny);
 
-    // 未配置 memdir_abs → 连 memdir 路径也不豁免(走常规 plan deny)。
-    const ctx_off = Context{ .mode = .plan };
+    // 未配置 memdir_abs → 连 memdir 路径也不豁免(走常规 dont_ask deny)。
+    const ctx_off = Context{ .mode = .dont_ask };
     try std.testing.expect(check(&ctx_off, "Write", inside_args) == .deny);
 }
 
@@ -859,10 +816,7 @@ test "bash auto-allow judges the unescaped command (heap scratch as in productio
     try std.testing.expectEqual(Decision.ask, check(&ctx, "Bash", "{\"command\":\"ls \\u0026\\u0026 rm x\"}"));
 }
 
-test "bash readonly NOT auto-allowed in plan/dont_ask" {
-    // plan:即便 readonly,Bash 仍 deny(plan 不执行任何命令)
-    const ctx_plan = Context{ .mode = .plan };
-    try std.testing.expect(check(&ctx_plan, "Bash", "{\"command\":\"ls\"}") == .deny);
+test "bash readonly NOT auto-allowed in dont_ask" {
     // dont_ask:readonly 也不放行(只放 explicit allow)
     const ctx_da = Context{ .mode = .dont_ask };
     try std.testing.expect(check(&ctx_da, "Bash", "{\"command\":\"ls\"}") == .deny);

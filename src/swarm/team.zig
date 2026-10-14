@@ -57,7 +57,6 @@ pub const Member = struct {
     agent_type: ?[]const u8 = null,
     model: ?[]const u8 = null,
     color: ?[]const u8 = null,
-    plan_mode_required: bool = false,
     joined_at_ms: i64 = 0,
     cwd: []const u8 = "",
     worktree_path: ?[]const u8 = null,
@@ -150,7 +149,6 @@ fn dupeMember(a: std.mem.Allocator, src: Member, out: *Member) !void {
         .agent_type = agent_type,
         .model = model,
         .color = color,
-        .plan_mode_required = src.plan_mode_required,
         .joined_at_ms = src.joined_at_ms,
         .cwd = cwd,
         .worktree_path = worktree_path,
@@ -296,7 +294,6 @@ pub fn parse(allocator: std.mem.Allocator, raw: []const u8) ?TeamFile {
                     .agent_type = strField(mo, "agentType"),
                     .model = strField(mo, "model"),
                     .color = strField(mo, "color"),
-                    .plan_mode_required = boolField(mo, "planModeRequired") orelse false,
                     .joined_at_ms = intField(mo, "joinedAt") orelse 0,
                     .cwd = strField(mo, "cwd") orelse "",
                     .worktree_path = strField(mo, "worktreePath"),
@@ -355,7 +352,7 @@ pub fn serialize(allocator: std.mem.Allocator, tf: *const TeamFile) ![]u8 {
             try out.appendSlice(allocator, ",\"color\":");
             try util_json.serializeString(v, &out, allocator);
         }
-        try appendFmt(&out, allocator, ",\"planModeRequired\":{},\"joinedAt\":{d}", .{ m.plan_mode_required, m.joined_at_ms });
+        try appendFmt(&out, allocator, ",\"joinedAt\":{d}", .{m.joined_at_ms});
         try out.appendSlice(allocator, ",\"cwd\":");
         try util_json.serializeString(m.cwd, &out, allocator);
         if (m.worktree_path) |v| {
@@ -605,7 +602,6 @@ test "TeamFile serialize→parse 往返(全字段)" {
         .agent_type = "researcher",
         .model = "claude-x",
         .color = "blue",
-        .plan_mode_required = true,
         .joined_at_ms = 99,
         .cwd = "/tmp/x",
         .worktree_path = "/tmp/wt",
@@ -631,7 +627,6 @@ test "TeamFile serialize→parse 往返(全字段)" {
     try testing.expectEqualStrings("s1", m.session_id.?);
     try testing.expectEqualStrings("lease1", m.lease_id.?);
     try testing.expectEqualStrings("researcher", m.agent_type.?);
-    try testing.expect(m.plan_mode_required);
     try testing.expect(!m.is_active);
     try testing.expectEqualStrings("acceptEdits", m.mode.?);
 }

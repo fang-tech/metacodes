@@ -381,8 +381,6 @@ pub const Options = struct {
     /// Swarm 会话状态（TeamCreate/TeamDelete/SendMessage + Task name+team_name spawn）。
     /// null = 非 lead 上下文（subagent/headless）。透传进 base_ctx.swarm。
     swarm: ?*@import("../swarm/context.zig").SwarmContext = null,
-    /// Plan mode 前的原始 mode 存储；EnterPlanMode/ExitPlanMode 用
-    plan_prev_mode: ?*?types.PermissionMode = null,
     /// 模型 Task 清单（TaskCreate/Get/List/Update/Stop 共享）
     tasks: ?*@import("task_store.zig").TaskStore = null,
     kg: ?*@import("../kg/client.zig").KgClient = null,
@@ -460,8 +458,6 @@ pub const Options = struct {
     file_change_journal: ?*@import("file_change.zig").Journal = null,
     /// 额外工作目录(--add-dir / additionalDirectories,绝对路径;sandbox 可写白名单)。
     additional_dirs: []const []const u8 = &.{},
-    /// 当前 session plan 文件路径(ExitPlanMode 读盘兜底用;仅顶层接)。
-    plan_file_path: []const u8 = "",
     /// 子 agent 定义集合(Task 工具据此找 subagent_type)。
     agents: ?*const @import("../agents/set.zig").AgentSet = null,
     /// 当前会话用的 model 名(供 subagent inherit 解析)。
@@ -579,7 +575,7 @@ pub const Options = struct {
     /// duplicate it; headless evaluation enables 2, where one transient
     /// otherwise destroys an entire paired arm's evidence.
     max_stream_turn_retries: u8 = 0,
-    /// 统一 UI 请求回调(替代旧 ask_question/exit_plan 三套;ctx 指 *TuiBackend)。
+    /// 统一 UI 请求回调(替代旧 ask_question 等多套;ctx 指 *TuiBackend)。
     /// 仅顶层 TUI 接(agent_depth==0)——子 agent 无 tty。见 UiRequester。
     ui_requester: ?@import("protocol/ui_request.zig").UiRequester = null,
     /// MCP session 列表(ListMcpResourcesTool/ReadMcpResourceTool 用)。
@@ -1452,21 +1448,17 @@ pub fn run(
         else
             tool_defs;
 
-        // Plan 模式每轮把 plan 指令追加到 system prompt(对齐 mecode 每轮 developer_instructions):
-        // 根治"指令只在 EnterPlanMode 返回出现一次,后续轮模型忘了 <proposed_plan> 格式"。
-        // turn 作用域 alloc,用后 free;非 plan 模式直接用 opts.system_prompt(零开销)。
+        // swarm 纪律:有 team 时每轮把 addendum 追加到 system prompt(裸文本对 teammate 不可见,
+        // 必须用 SendMessage;对齐 cc teammate addendum,Linus/PM SW2 F3)。lead 与 teammate 都注入。
+        // turn 作用域 alloc,用后 free;无 team 直接用 opts.system_prompt(零开销)。
         var sys_prompt_owned: ?[]u8 = null;
         defer if (sys_prompt_owned) |p| allocator.free(p);
         const augmented_system_prompt: ?[]const u8 = blk: {
-            const in_plan = permission_ctx.modeValue() == .plan;
-            // swarm 纪律:有 team 时追加 addendum(裸文本对 teammate 不可见,必须用 SendMessage;
-            // 对齐 cc teammate addendum,Linus/PM SW2 F3)。lead 与 teammate 都注入。
             const in_swarm = if (opts.swarm) |s| s.hasTeam() else false;
-            if (!in_plan and !in_swarm) break :blk opts.system_prompt;
+            if (!in_swarm) break :blk opts.system_prompt;
             const base = opts.system_prompt orelse "";
-            const plan_seg = if (in_plan) "\n\n# Plan Mode (active)\n" ++ @import("../tools/plan_mode.zig").PLAN_MODE_INSTRUCTIONS else "";
-            const swarm_seg = if (in_swarm) "\n\n" ++ @import("../swarm/tools.zig").SWARM_ADDENDUM else "";
-            sys_prompt_owned = std.fmt.allocPrint(allocator, "{s}{s}{s}", .{ base, plan_seg, swarm_seg }) catch null;
+            const swarm_seg = "\n\n" ++ @import("../swarm/tools.zig").SWARM_ADDENDUM;
+            sys_prompt_owned = std.fmt.allocPrint(allocator, "{s}{s}", .{ base, swarm_seg }) catch null;
             break :blk if (sys_prompt_owned) |p| p else opts.system_prompt;
         };
         var projected_guidance_owned: ?[]u8 = null;
@@ -1757,9 +1749,8 @@ pub fn run(
         pc_prefetch.hooks = null;
         // 预取用 ToolContext:**忠实镜像下方 base_ctx 的 opts.* 字段**(广播到 concurrency-safe 全集后
         // 只读 Bash/BashOutput/WebFetch 也流式,它们要 jobs/spawn_tick_fn/api_client 等——缺则行为分叉)。
-        // 刻意排除三类 mid-stream 不安全/流末派生的:progress_reporter+ui_requester(流中不驱动 TUI/不
-        // 弹询问,且 tool_start 卡尚未 emit)、last_proposed_plan(流末才提取,ExitPlanMode 非并发安全)、
-        // hooks(经 pc_prefetch 剥离,PreToolUse 可 ModifyInput)、session/agent_ident(UiRequest 路由/kg
+        // 刻意排除两类 mid-stream 不安全的:progress_reporter+ui_requester(流中不驱动 TUI/不
+        // 弹询问,且 tool_start 卡尚未 emit)、hooks(经 pc_prefetch 剥离,PreToolUse 可 ModifyInput)、session/agent_ident(UiRequest 路由/kg
         // claim 身份,并发安全工具不用)。**维护约束**:base_ctx 新增字段若被并发安全工具读,须同步这里。
         var prefetch_ctx = tools_mod.ToolContext{
             .allocator = allocator,
@@ -1770,7 +1761,6 @@ pub fn run(
             .jobs = opts.jobs,
             .agent_jobs = opts.agent_jobs,
             .permission_ctx = &pc_prefetch, // hooks 已剥离
-            .plan_prev_mode = opts.plan_prev_mode,
             .tasks = opts.tasks,
             .kg = opts.kg,
             .kg_lexical_ledger = &kg_lexical_ledger,
@@ -1810,7 +1800,6 @@ pub fn run(
             .tool_result_metrics = opts.tool_result_metrics,
             .file_change_journal = opts.file_change_journal,
             .additional_dirs = opts.additional_dirs,
-            .plan_file_path = opts.plan_file_path,
             .agents = opts.agents,
             .parent_model = opts.parent_model,
             // 本 run 真会命名的模型及其收图能力——Read 的图片门控按 model_override 判,
@@ -1862,7 +1851,7 @@ pub fn run(
                     return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .budget, .turns = turns, .tool_calls = total_tool_calls });
             }
 
-            // 击穿检测必须跟真实 provider 前缀走：plan/swarm 会改变 effective
+            // 击穿检测必须跟真实 provider 前缀走：swarm addendum 会改变 effective
             // system prompt，同名工具也可能改变 description/input_schema。只看基础
             // system 或工具名会把真实前缀漂移误报成 TTL/server-side miss。
             {
@@ -3042,8 +3031,8 @@ pub fn run(
             };
             // With a Session dispatcher present, the directory is the only
             // classification authority. A name it cannot resolve is not a
-            // known-read tool — default it to `.execute` (deny in plan, ask
-            // in default) instead of the legacy name-based read fallback.
+            // known-read tool — default it to `.execute` (deny in dont_ask,
+            // ask in default) instead of the legacy name-based read fallback.
             // Dispatch of such a name still fails as UnknownTool; note the
             // deny happens before dispatch, so the UnknownTool "did you
             // mean X" guidance does not fire on the denied path. The legacy
@@ -3064,12 +3053,12 @@ pub fn run(
                 .deny => {
                     log.warnId("permission", rid, "DENY tool={s} input={s}", .{ tu.name, tu.input });
                     slot.decision = .denied;
-                    slot.content = try tool_error.errorToJson("PermissionDenied", "tool '{s}' denied by permission rule or plan mode", .{tu.name}, allocator);
+                    slot.content = try tool_error.errorToJson("PermissionDenied", "tool '{s}' denied by permission rule or permission mode", .{tu.name}, allocator);
                     slot.is_error = true;
                 },
                 .ask => {
-                    // ctx constCast:promptUser 写 session 记忆(有副作用)。同 plan_mode 分支
-                    // 的 @constCast 先例——agent_loop 持 *const 但权限交互本就改 per-session 状态。
+                    // ctx constCast:promptUser 写 session 记忆(有副作用)——agent_loop 持 *const
+                    // 但权限交互本就改 per-session 状态(base_ctx.permission_ctx 同理)。
                     // R2-3:传 canonical_name——ask 记忆(rememberAllow/Deny)与决策链读取
                     // (decisionFor)必须同键,否则 "always deny" 存 "bash" 键、后续按 "Bash"
                     // 查不到,session deny 被 settings allow 越过。
@@ -3128,14 +3117,6 @@ pub fn run(
         }
 
         // 6b. 构造一次 ToolContext(所有 tool 共用;并发 job 各自换独立 arena allocator)。
-        // plan 模式:从刚提交的助手文本提取 <proposed_plan>,存进 ctx 供 ExitPlanMode 读
-        //（XML 协议主路径,对齐 mecode:计划走文本流而非工具参数)。turn 作用域,用后 free。
-        var proposed_plan_buf: ?[]u8 = null;
-        defer if (proposed_plan_buf) |p| allocator.free(p);
-        if (permission_ctx.modeValue() == .plan and assistant_text.items.len > 0) {
-            const pp = @import("proposed_plan.zig");
-            proposed_plan_buf = pp.extractProposedPlan(allocator, assistant_text.items) catch null;
-        }
         // 工具进度 trampoline 的 per-run 存储(backend + session),供 progress_state 指向。
         // 声明在 base_ctx 同作用域,生命周期覆盖整个工具执行。
         var progress_tramp: ProgressTramp = undefined;
@@ -3150,7 +3131,6 @@ pub fn run(
             .agent_jobs = opts.agent_jobs,
             .swarm = opts.swarm,
             .permission_ctx = @constCast(permission_ctx),
-            .plan_prev_mode = opts.plan_prev_mode,
             .tasks = opts.tasks,
             .kg = opts.kg,
             .kg_lexical_ledger = &kg_lexical_ledger,
@@ -3199,8 +3179,6 @@ pub fn run(
             .tool_result_metrics = opts.tool_result_metrics,
             .file_change_journal = opts.file_change_journal,
             .additional_dirs = opts.additional_dirs,
-            .plan_file_path = opts.plan_file_path,
-            .last_proposed_plan = if (proposed_plan_buf) |p| p else "",
             .agents = opts.agents,
             .parent_model = opts.parent_model,
             // 本 run 真会命名的模型及其收图能力——Read 的图片门控按 model_override 判,
@@ -4680,7 +4658,7 @@ fn runAutoCompactIfNeeded(
                     if (summary_reserve_tokens) |reserve| reserve.* = 0;
                 }
                 // PostCompact hook(压缩后):喂 {trigger, summary},其 additionalContext 拼进投影摘要
-                // → 模型下轮读得到(条目 I 的挂载点:重注入 active skill/plan/MCP)。非阻塞。
+                // → 模型下轮读得到(条目 I 的挂载点:重注入 active skill/MCP)。非阻塞。
                 if (hookset) |hs| if (hs.hasPostCompact()) {
                     const pj = buildPostCompactStdin(allocator, trigger_cause, conversation.compact_summary orelse "") catch null;
                     if (pj) |json| {

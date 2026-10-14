@@ -110,10 +110,10 @@ test "U11 parity: execLine 在真 App 上的 config mutation 语义(mode/vim/com
     const alloc = fx.arena.allocator();
 
     // /mode <name>(web/daemon 的字面路径;TUI /mode 同一调用)。
-    const d_mode = session_service.execLine(&svc, alloc, "/mode plan");
+    const d_mode = session_service.execLine(&svc, alloc, "/mode auto");
     try std.testing.expect(d_mode.run == null);
     try std.testing.expectEqual(session_service.CommandOutcome.Kind.mode_changed, d_mode.outcome.kind);
-    try std.testing.expectEqual(cc.types_mod.PermissionMode.plan, app.permMode());
+    try std.testing.expectEqual(cc.types_mod.PermissionMode.auto, app.permMode());
     // 连字符归一(web 客户端习惯)与非法名 fail-closed。
     try std.testing.expectEqual(session_service.CommandOutcome.Kind.mode_changed, session_service.execLine(&svc, alloc, "/mode accept-edits").outcome.kind);
     try std.testing.expectEqual(cc.types_mod.PermissionMode.accept_edits, app.permMode());

@@ -60,8 +60,6 @@ pub const MsgKind = enum {
     shutdown_request,
     shutdown_approved,
     shutdown_rejected,
-    plan_approval_request,
-    plan_approval_response,
     task_assignment,
     team_permission_update,
     mode_set_request,
@@ -581,7 +579,7 @@ test "classify: 协议识别 + plain 兜底" {
     const a = testing.allocator;
     try testing.expectEqual(MsgKind.idle_notification, classify(a, "{\"type\":\"idle_notification\",\"from\":\"x\"}"));
     try testing.expectEqual(MsgKind.shutdown_request, classify(a, "  {\"type\":\"shutdown_request\"}"));
-    try testing.expectEqual(MsgKind.plan_approval_response, classify(a, "{\"type\":\"plan_approval_response\",\"approve\":true}"));
+    try testing.expectEqual(MsgKind.permission_response, classify(a, "{\"type\":\"permission_response\",\"approve\":true}"));
     try testing.expectEqual(MsgKind.plain, classify(a, "hello world"));
     try testing.expectEqual(MsgKind.plain, classify(a, "{\"type\":\"unknown_thing\"}"));
     try testing.expectEqual(MsgKind.plain, classify(a, "{\"notype\":1}"));

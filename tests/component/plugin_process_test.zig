@@ -294,11 +294,12 @@ test "L2 CLI process package preserves typed artifact through DynRegistry and Ag
     try std.testing.expectEqual(cc.permission.ToolCategory.execute, dynamic.category.?);
     try std.testing.expect(dynamic.executor == .result_body);
     try std.testing.expect(dynamic.borrowed_input_schema.?.properties.?.get("text") != null);
-    var plan_permission = cc.permission.createContext(.plan, allocator);
+    // execute 分类在 default 下落 ask;若被当 read,default 会免询问 allow。
+    var default_permission = cc.permission.createContext(.default, allocator);
     try std.testing.expectEqual(
-        cc.permission.PermissionResult.deny,
+        cc.permission.PermissionResult.ask,
         cc.permission.checkPermissionClassified(
-            &plan_permission,
+            &default_permission,
             TOOL_NAME,
             "{\"text\":\"hello\"}",
             app.dyn_registry.category(TOOL_NAME),
@@ -430,7 +431,7 @@ test "L2 process plugin writes from byte zero into the kernel artifact spool" {
     try std.testing.expect(std.mem.indexOf(u8, recovered.bytes, "PLUGIN_TAIL") != null);
 }
 
-test "L2 native plan mode denies process plugin before child execution" {
+test "L2 native dont_ask mode denies process plugin before child execution" {
     if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -452,7 +453,7 @@ test "L2 native plan mode denies process plugin before child execution" {
         .api_key = "test-key",
         .model = "test-model",
         .base_url = url,
-        .permission_mode = .plan,
+        .permission_mode = .dont_ask,
         .workspace = .{ .root = root },
         .allowed_tools = &.{TOOL_NAME},
     });
@@ -463,7 +464,7 @@ test "L2 native plan mode denies process plugin before child execution" {
     defer allocator.free(marker);
     try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, marker, .{}));
     const body = (server.lastRequest() orelse return error.NoRequestCaptured).body();
-    try std.testing.expect(std.mem.indexOf(u8, body, "denied by permission rule or plan mode") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "denied by permission rule or permission mode") != null);
 }
 
 fn dispatchOnce(runtime: *cc.agent_session.AgentRuntime, abort: ?*const cc.util_abort.AbortSignal) !cc.tool_context.ToolDispatchOutcome {

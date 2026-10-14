@@ -593,7 +593,6 @@ pub fn mapPermissionMode(mode: @import("../agents/def.zig").PermissionMode) @imp
         .auto => .auto,
         .dontAsk => .dont_ask,
         .bypassPermissions => .bypass_permissions,
-        .plan => .plan,
     };
 }
 

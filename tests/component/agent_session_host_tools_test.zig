@@ -1021,7 +1021,7 @@ test "L2 RuntimeHost atomically replaces plugin generations and drains pinned Se
     try std.testing.expectEqual(@as(usize, 1), new_probe.cleanups);
 }
 
-test "L2 static plugin cannot bypass the native plan-mode guard" {
+test "L2 static plugin cannot bypass the native dont_ask guard" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1055,7 +1055,7 @@ test "L2 static plugin cannot bypass the native plan-mode guard" {
         .api_key = "test-key",
         .model = "test-model",
         .base_url = url,
-        .permission_mode = .plan,
+        .permission_mode = .dont_ask,
         .workspace = .{ .root = root },
         .allowed_tools = &.{"acme_dreview__HostEcho"},
         .host_identity_ctx = &probe,
@@ -1069,7 +1069,7 @@ test "L2 static plugin cannot bypass the native plan-mode guard" {
     try std.testing.expect(advisory_probe.tool_checks > 0);
     try std.testing.expectEqual(@as(usize, 0), advisory_probe.invocation_checks);
     const body = (server.lastRequest() orelse return error.NoRequestCaptured).body();
-    try std.testing.expect(std.mem.indexOf(u8, body, "denied by permission rule or plan mode") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "denied by permission rule or permission mode") != null);
 }
 
 test "L2 Host identity is admission-fixed across two Runs and distinct across two Sessions" {

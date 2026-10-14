@@ -321,8 +321,8 @@ test "L2 文件修改可观测:被权限拒绝的 Write 报 rejected 且盘上�
     const write_sse = try toolSse(a, "w1", "Write", write_input);
     defer a.free(write_sse);
 
-    // plan mode denies mutations without any interactive approval path.
-    var scenario = try runCassette(a, &.{ write_sse, END_TURN }, root, .plan);
+    // dont_ask denies mutations without any interactive approval path.
+    var scenario = try runCassette(a, &.{ write_sse, END_TURN }, root, .dont_ask);
     defer scenario.deinit();
 
     // A refusal is still an answer about that file: silence would read as
@@ -574,8 +574,8 @@ test "L2 文件修改可观测:ApplyPatch 被权限拒绝时逐文件报 rejecte
     const apply_sse = try toolSse(a, "p1", "ApplyPatch", apply_input);
     defer a.free(apply_sse);
 
-    // plan 模式:ApplyPatch 的 phase-1 权限门把每个计划路径当 Write 喂回权限引擎 → 整批拒。
-    var scenario = try runCassette(a, &.{ apply_sse, END_TURN }, root, .plan);
+    // dont_ask 模式:ApplyPatch 的 phase-1 权限门把每个计划路径当 Write 喂回权限引擎 → 整批拒。
+    var scenario = try runCassette(a, &.{ apply_sse, END_TURN }, root, .dont_ask);
     defer scenario.deinit();
 
     // 整批零落盘,但契约上必须说出"这个文件被拒了"——静默会被读成"没涉及文件"。

@@ -21,8 +21,6 @@ pub const PermissionMode = enum {
     dontAsk,
     /// bypassPermissions:跳过所有权限检查
     bypassPermissions,
-    /// plan:read 允许,write/exec 拒绝
-    plan,
 };
 
 pub const Color = enum { default, red, blue, green, yellow, purple, orange, pink, cyan };
@@ -287,7 +285,7 @@ fn parsePermissionMode(s: []const u8) !?PermissionMode {
     if (std.mem.eql(u8, s, "auto")) return .auto;
     if (std.mem.eql(u8, s, "dontAsk")) return .dontAsk;
     if (std.mem.eql(u8, s, "bypassPermissions")) return .bypassPermissions;
-    if (std.mem.eql(u8, s, "plan")) return .plan;
+    // `plan` 曾是合法值(plan 模式已移除):按非法值拒绝,绝不静默退回更宽的模式。
     return error.InvalidAgentPermissionMode;
 }
 
@@ -424,7 +422,7 @@ test "parseAgentMd: model + permissionMode + maxTurns + background + color" {
         "name: x\n" ++
         "description: d\n" ++
         "model: haiku\n" ++
-        "permissionMode: plan\n" ++
+        "permissionMode: acceptEdits\n" ++
         "maxTurns: 5\n" ++
         "background: true\n" ++
         "color: cyan\n" ++
@@ -435,7 +433,7 @@ test "parseAgentMd: model + permissionMode + maxTurns + background + color" {
     var d = try parseAgentMd(testing.allocator, md, "/x", .project);
     defer d.deinit(testing.allocator);
     try testing.expectEqualStrings("haiku", d.model);
-    try testing.expect(d.permission_mode.? == .plan);
+    try testing.expect(d.permission_mode.? == .acceptEdits);
     try testing.expectEqual(@as(u32, 5), d.max_turns);
     try testing.expect(d.background == true);
     try testing.expect(d.color == .cyan);
@@ -459,6 +457,10 @@ test "parseAgentMd: invalid effort and isolation are rejected" {
     try testing.expectError(
         error.InvalidAgentPermissionMode,
         parseAgentMd(testing.allocator, "---\nname: x\npermissionMode: permissive\n---\nbody", "/x", .personal),
+    );
+    try testing.expectError(
+        error.InvalidAgentPermissionMode,
+        parseAgentMd(testing.allocator, "---\nname: x\npermissionMode: plan\n---\nbody", "/x", .personal),
     );
     try testing.expectError(
         error.InvalidAgentMaxTurns,

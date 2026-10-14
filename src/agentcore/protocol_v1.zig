@@ -301,7 +301,7 @@ pub fn encodeUiRequest(allocator: std.mem.Allocator, request: *const InternalUiR
         // Revision 6 Permission is encoded by session_permission.zig because
         // it requires Session/Run/request/generation identities unavailable
         // in this presentation-only Core request.
-        .permission, .plan_approval, .custom => return error.UnsupportedUiRequest,
+        .permission, .custom => return error.UnsupportedUiRequest,
     };
     var output: std.Io.Writer.Allocating = .init(allocator);
     defer output.deinit();
@@ -350,7 +350,7 @@ pub fn decodeUiResponse(
             },
             else => return error.InvalidUiResponse,
         },
-        .permission, .plan_approval, .custom => return error.UnsupportedUiRequest,
+        .permission, .custom => return error.UnsupportedUiRequest,
     }
 }
 
@@ -389,16 +389,10 @@ test "internal-only events are explicitly excluded from ABI v1" {
     try std.testing.expect((try event(std.testing.allocator, .{ .ui_request_pending = .{ .tool_use_id = "t", .request_json = "{}" } })) == null);
 }
 
-test "plan and custom UI requests are not part of ABI v1" {
-    const plan = InternalUiRequest{ .plan_approval = .{ .plan_md = "example" } };
+test "custom UI requests are not part of ABI v1" {
     const custom = InternalUiRequest{ .custom = .{ .kind = "example", .payload_json = "{}" } };
-    try std.testing.expectError(error.UnsupportedUiRequest, encodeUiRequest(std.testing.allocator, &plan));
     try std.testing.expectError(error.UnsupportedUiRequest, encodeUiRequest(std.testing.allocator, &custom));
     var out: InternalUiResponse = undefined;
-    try std.testing.expectError(
-        error.UnsupportedUiRequest,
-        decodeUiResponse(std.testing.allocator, &plan, "{\"answers\":[]}", &out),
-    );
     try std.testing.expectError(
         error.UnsupportedUiRequest,
         decodeUiResponse(std.testing.allocator, &custom, "{\"answers\":[]}", &out),

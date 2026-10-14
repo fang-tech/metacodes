@@ -25,7 +25,6 @@
 //! them may change freely:
 //!
 //!   permission     {"tool":"...","args":"<tool input JSON text>"}
-//!   plan_approval  {"plan_md":"...","kg_step_count":N}
 //!   ask_question   {"questions":[{"question","header","multi_select",
 //!                                 "options":[{"label","description","preview"}]}]}
 //!   custom         {"kind":"...","payload_json":"<renderer-defined JSON text>"}
@@ -34,7 +33,6 @@
 //! (a `v` field, when present, must be 1):
 //!
 //!   permission     {"choice":"allow_once"|"allow_always"|"deny_once"|"deny_tool_session"}
-//!   plan_approval  {"choice":"approve_default"|"approve_accept_edits"|"reject"}
 //!   ask_question   {"answers":["...", ...]}  one per question; several labels joined by ", "
 //!   custom         {"result":<any JSON>}
 //!
@@ -56,7 +54,6 @@ const CoreEvent = ui_event.CoreEvent;
 const UiRequest = ui_request.UiRequest;
 const UiResponse = ui_request.UiResponse;
 const RequestOutcome = ui_request.RequestOutcome;
-const PlanApproval = ui_request.PlanApproval;
 
 pub const SCHEMA_VERSION: u32 = 1;
 
@@ -241,12 +238,6 @@ fn writeRequestTo(json: *std.json.Stringify, id: u64, request: *const UiRequest)
             try json.objectField("args");
             try json.write(permission.args);
         },
-        .plan_approval => |plan| {
-            try json.objectField("plan_md");
-            try json.write(plan.plan_md);
-            try json.objectField("kg_step_count");
-            try json.write(plan.kg_step_count);
-        },
         .ask_question => |questions| {
             try json.objectField("questions");
             try json.beginArray();
@@ -298,17 +289,13 @@ fn finish(allocator: std.mem.Allocator, out: *std.Io.Writer.Allocating) error{Ou
 }
 
 /// The answer to a request that was cancelled or answered unreadably: a
-/// permission prompt is denied once and a plan is rejected, never granted;
+/// permission prompt is denied once, never granted;
 /// a question or a custom UI reports `error.InputAborted`, as Esc does in the
 /// terminal.
 pub fn cancelResponse(request: *const UiRequest, out: *UiResponse) error{InputAborted}!RequestOutcome {
     switch (request.*) {
         .permission => {
             out.* = .{ .permission = .deny_once };
-            return .answered;
-        },
-        .plan_approval => {
-            out.* = .{ .plan_approval = .reject };
             return .answered;
         },
         .ask_question, .custom => return error.InputAborted,
@@ -339,11 +326,6 @@ pub fn parseResponse(
         .permission => {
             const choice = choiceField(object, PermissionChoice) orelse return malformed(request, out);
             out.* = .{ .permission = choice };
-            return .answer;
-        },
-        .plan_approval => {
-            const choice = choiceField(object, PlanApproval) orelse return malformed(request, out);
-            out.* = .{ .plan_approval = choice };
             return .answer;
         },
         .ask_question => |questions| {

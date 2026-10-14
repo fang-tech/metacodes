@@ -271,9 +271,52 @@ test "L2 AgentDef.model=haiku 未配置档位表: 不映射硬编码 ID,子请�
     try std.testing.expectEqualStrings("\"claude-sonnet-4-20250514\"", model);
 }
 
-test "L2 AgentDef.permission_mode=plan: Task 注入真实子请求 Plan Mode" {
-    const a = std.testing.allocator;
-    var srv = try harness.MockServer.start(END_TURN_SSE, 0);
+/// 子 agent 的一次 Write tool_use(绝对路径,经 JSON 字符串转义进 partial_json)。
+fn writeToolSse(a: std.mem.Allocator, path: []const u8) ![]u8 {
+    const input = try std.fmt.allocPrint(a, "{{\"file_path\":\"{s}\",\"content\":\"x\\n\"}}", .{path});
+    defer a.free(input);
+    var escaped: std.Io.Writer.Allocating = .init(a);
+    defer escaped.deinit();
+    try std.json.Stringify.encodeJsonString(input, .{}, &escaped.writer);
+    const delta = try std.fmt.allocPrint(
+        a,
+        "data: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"input_json_delta\",\"partial_json\":{s}}}}}\n\n",
+        .{escaped.written()},
+    );
+    defer a.free(delta);
+    return std.mem.concat(a, u8, &.{
+        TOOL_USE_PREFIX,
+        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"t1\",\"name\":\"Write\",\"input\":{}}}\n\n",
+        delta,
+        TOOL_USE_SUFFIX,
+    });
+}
+
+const ChildWrite = struct {
+    out: []u8,
+    /// 子 agent 第二次请求的 body(含 Write 的 tool_result)。
+    followup: []u8,
+    created: bool,
+
+    fn deinit(self: *ChildWrite, a: std.mem.Allocator) void {
+        a.free(self.out);
+        a.free(self.followup);
+    }
+};
+
+/// 父会话 bypassPermissions 下,让 `subagent_type` 的子 agent 尝试 Write 一个临时文件。
+fn runChildWrite(a: std.mem.Allocator, agent_md: ?[]const u8, subagent_type: []const u8) !ChildWrite {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = harness.normalizeSlashes(root_buf[0..try tmp.dir.realPath(std.testing.io, &root_buf)]);
+    const target = try std.fmt.allocPrint(a, "{s}/child-write.txt", .{root});
+    defer a.free(target);
+    const write_sse = try writeToolSse(a, target);
+    defer a.free(write_sse);
+
+    const bodies = [_][]const u8{ write_sse, END_TURN_SSE };
+    var srv = try harness.MockServer.startCassette(&bodies, 0);
     defer srv.stop();
     const url = try srv.urlOwned(a);
     defer a.free(url);
@@ -283,15 +326,44 @@ test "L2 AgentDef.permission_mode=plan: Task 注入真实子请求 Plan Mode" {
     defer client.deinit();
     var agents = cc.agents_set.AgentSet.init(a);
     defer agents.deinit();
-    try addAgent(a, &agents, "---\nname: planning-agent\npermissionMode: plan\n---\nPlan without changing files.");
+    if (agent_md) |md| try addAgent(a, &agents, md) else try agents.loadFromStandardPaths("");
+    const defs = try cc.tools.toToolDefinitions(a);
+    defer a.free(defs);
     const perm = cc.permission.createContext(.bypass_permissions, a);
-    const ctx = baseContext(a, &client, &agents, &perm, &.{});
+    const ctx = baseContext(a, &client, &agents, &perm, defs);
 
-    const out = try cc.agent_tool.execute(&ctx, "{\"subagent_type\":\"planning-agent\",\"prompt\":\"go\"}");
-    defer a.free(out);
-    const system = (srv.lastRequest() orelse return error.NoRequestCaptured).jsonField("system") orelse return error.SystemFieldMissing;
-    try std.testing.expect(std.mem.indexOf(u8, system, "# Plan Mode (active)") != null);
-    try std.testing.expect(std.mem.indexOf(u8, system, "<proposed_plan>") != null);
+    const args = try std.fmt.allocPrint(a, "{{\"subagent_type\":\"{s}\",\"prompt\":\"write\"}}", .{subagent_type});
+    defer a.free(args);
+    const out = try cc.agent_tool.execute(&ctx, args);
+    errdefer a.free(out);
+    try std.testing.expectEqual(@as(usize, 2), srv.requestCount());
+    const followup = try a.dupe(u8, (srv.lastRequest() orelse return error.NoRequestCaptured).body());
+    const created = if (std.Io.Dir.cwd().access(std.testing.io, target, .{})) |_| true else |_| false;
+    return .{ .out = out, .followup = followup, .created = created };
+}
+
+test "L2 AgentDef.permission_mode=dontAsk: 子 run 按自己的模式拒写,不继承父 bypass" {
+    const a = std.testing.allocator;
+    // 对照组:不声明 permissionMode → 继承父 bypassPermissions → Write 真落盘。
+    var inherited = try runChildWrite(a, "---\nname: writer-agent\ntools: Write\n---\nWrite the file.", "writer-agent");
+    defer inherited.deinit(a);
+    try std.testing.expect(inherited.created);
+
+    // 声明 dontAsk:同一个父会话下,子请求里的 Write 被权限链拒绝,盘上无文件。
+    var guarded = try runChildWrite(a, "---\nname: writer-agent\ntools: Write\npermissionMode: dontAsk\n---\nWrite the file.", "writer-agent");
+    defer guarded.deinit(a);
+    try std.testing.expect(!guarded.created);
+    try std.testing.expect(std.mem.indexOf(u8, guarded.followup, "permission_denied") != null);
+}
+
+test "L2 Explore 只读由工具白名单保证:bypass 父会话下猜 Write 也到不了磁盘" {
+    // plan 模式移除后 Explore 不再带 permission_mode;只读靠 AgentDef 工具白名单——它既裁剪
+    // provider 看到的工具,也是执行边界(ToolSetExecutionPolicy),猜出来的名字同样被拒。
+    const a = std.testing.allocator;
+    var run = try runChildWrite(a, null, "Explore");
+    defer run.deinit(a);
+    try std.testing.expect(!run.created);
+    try std.testing.expect(std.mem.indexOf(u8, run.followup, "outside the current execution policy") != null);
 }
 
 test "L2 AgentDef.max_turns=1: Task 在一次真实 tool_use 后停止" {

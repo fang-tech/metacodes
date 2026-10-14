@@ -20,7 +20,6 @@ pub fn render(app: *const app_mod.App) void {
     const mode_str = switch (app.permMode()) {
         .default => "default",
         .accept_edits => "acceptEdits",
-        .plan => "plan",
         .auto => "auto",
         .dont_ask => "dontAsk",
         .bypass_permissions => "bypassPermissions",

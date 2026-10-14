@@ -1,7 +1,7 @@
-//! 权限模式(Mode):对齐 Claude Code 6 模式 + cc-zig 历史别名。
+//! 权限模式(Mode):Claude Code 的 5 个执行模式 + cc-zig 历史别名。
 //!
-//! 对齐 Claude Code 的 6 个官方权限模式;语义以本模块枚举与其测试为准。
-//! 解析支持驼峰(acceptEdits)和下划线(accept_edits)两种写法。
+//! 不含 plan:plan 模式已移除,`plan` 是词表外的值(严格解析返回 null,由边界报错)。
+//! 语义以本模块枚举与其测试为准。解析支持驼峰(acceptEdits)和下划线(accept_edits)两种写法。
 
 const std = @import("std");
 const types = @import("../types.zig");
@@ -11,14 +11,13 @@ pub const Mode = types.PermissionMode;
 /// 严格解析:词表外返回 null,由调用方决定 fail-closed 还是回退。
 /// CLI 边界必须用这个——`--permission BOGUS` 静默落 .default 会让评估
 /// treatment 参数拼错时无声降级(2026-08-17 harness 复审 #3)。
-/// 接受:default/acceptEdits/plan/auto/dontAsk/bypassPermissions(官方驼峰)
+/// 接受:default/acceptEdits/auto/dontAsk/bypassPermissions(官方驼峰)
 ///   + accept_edits/dont_ask/bypass_permissions(下划线变体)
 ///   + prompt/bypass(历史 cc-zig 名)
 pub fn parseStrict(s: []const u8) ?Mode {
     // 官方驼峰
     if (std.mem.eql(u8, s, "default")) return .default;
     if (std.mem.eql(u8, s, "acceptEdits")) return .accept_edits;
-    if (std.mem.eql(u8, s, "plan")) return .plan;
     if (std.mem.eql(u8, s, "auto")) return .auto;
     if (std.mem.eql(u8, s, "dontAsk")) return .dont_ask;
     if (std.mem.eql(u8, s, "bypassPermissions")) return .bypass_permissions;
@@ -49,7 +48,6 @@ pub fn canonical(m: Mode) Mode {
 test "parse all official modes" {
     try std.testing.expect(parse("default") == .default);
     try std.testing.expect(parse("acceptEdits") == .accept_edits);
-    try std.testing.expect(parse("plan") == .plan);
     try std.testing.expect(parse("auto") == .auto);
     try std.testing.expect(parse("dontAsk") == .dont_ask);
     try std.testing.expect(parse("bypassPermissions") == .bypass_permissions);
@@ -70,9 +68,13 @@ test "parse unknown → default" {
     try std.testing.expect(parse("garbage") == .default);
 }
 
+test "plan is no longer a permission mode" {
+    try std.testing.expect(parseStrict("plan") == null);
+}
+
 test "canonical maps aliases" {
     try std.testing.expect(canonical(.prompt) == .default);
     try std.testing.expect(canonical(.bypass) == .bypass_permissions);
     try std.testing.expect(canonical(.default) == .default);
-    try std.testing.expect(canonical(.plan) == .plan);
+    try std.testing.expect(canonical(.dont_ask) == .dont_ask);
 }

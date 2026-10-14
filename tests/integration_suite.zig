@@ -38,7 +38,6 @@ test {
     _ = @import("component/unknown_flag_test.zig");
     _ = @import("component/task_error_test.zig");
     _ = @import("component/tool_loop_breaker_test.zig");
-    _ = @import("component/plan_mode_inject_test.zig");
     _ = @import("component/user_context_inject_test.zig");
     _ = @import("component/verification_checkpoint_test.zig");
     _ = @import("component/verification_final_gate_test.zig");
