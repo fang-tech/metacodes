@@ -2000,6 +2000,39 @@ pub const App = struct {
         };
     }
 
+    /// Rebuild the conversation persisted under this App's own session
+    /// directory, for an App built with `config.session_id` naming a session
+    /// that ran before and that has not run since (#254: the daemon's
+    /// `POST /sessions/create {"resume":true}`). The same steps as `/resume`:
+    /// `transcript.loadTranscript`, a writer reopened past the restored
+    /// messages (App.init opened one at zero, which would append them a second
+    /// time), the session's goal and its own model route. Returns the number of
+    /// messages restored; leaves the App unchanged on error.
+    pub fn resumePersistedConversation(app: *App) !usize {
+        std.debug.assert(app.conversation.len() == 0);
+        const writer = if (app.transcript_writer) |*w| w else return error.NoSessionDir;
+        var path_buffer: [std.fs.max_path_bytes + 1]u8 = undefined;
+        const path = std.fmt.bufPrintZ(&path_buffer, "{s}/transcript.jsonl", .{writer.dir}) catch return error.TranscriptNotFound;
+        if (!pfs.exists(path.ptr)) return error.TranscriptNotFound;
+
+        var staged = Conversation.init(app.allocator);
+        errdefer staged.deinit();
+        try transcript.loadTranscript(&staged, writer.dir, app.allocator);
+        const dir_owned = try app.allocator.dupe(u8, writer.dir);
+        // Nothing below fails: switch to the restored conversation and its writer.
+        app.conversation.deinit();
+        app.conversation = staged;
+        writer.deinit();
+        writer.* = transcript.Writer.openExisting(app.allocator, dir_owned, app.activeModel(), app.conversation.len());
+        app.loadGoalFromSessionDir(dir_owned);
+        if (app.restoreSessionSelection()) |restored| {
+            if (restored) writer.model = app.activeModel();
+        } else |err| {
+            @import("util/log.zig").warn("session", "stored model route of session {s} is unavailable ({s}); the current route is kept", .{ app.session_id.asSlice(), @errorName(err) });
+        }
+        return app.conversation.len();
+    }
+
     /// 当前 session 目录(transcript.jsonl / suspend.json 所在)。无 writer → null。
     pub fn sessionDir(app: *App) ?[]const u8 {
         if (app.transcript_writer) |*w| return w.dir;
@@ -3350,9 +3383,19 @@ pub const App = struct {
     /// 故 g_abort_signal 单指针不是多 session 缺陷——它是 TUI 单终端的正确机制,GUI 旁路它。
     /// (不预包 requestStop wrapper:GUI 真来时直接调 abort.abort + 那时定确切语义,避孤儿 API。)
     pub fn installSigintHandler(app: *App) !void {
-        g_abort_signal = &app.abort;
+        @atomicStore(?*AbortSignal, &g_abort_signal, &app.abort, .seq_cst);
         // 可移植:POSIX=SIGINT sigaction;Windows=SetConsoleCtrlHandler(见 platform/signal.zig)。
         platform_signal.installInterrupt(onSigint);
+    }
+
+    /// Stop SIGINT from aborting this App's run; SIGINT still requests process
+    /// shutdown. For the multi-session daemon (#254), which frees the App it
+    /// was started with while the process lives on (`--sessions 0`, or a
+    /// destroy of the session that adopted it): a later SIGINT must not write
+    /// into it. The daemon's shutdown path aborts every session itself. A
+    /// no-op when another App is the target.
+    pub fn detachSigintAbort(app: *App) void {
+        _ = @cmpxchgStrong(?*AbortSignal, &g_abort_signal, &app.abort, null, .seq_cst, .seq_cst);
     }
 };
 
@@ -3502,7 +3545,7 @@ fn buildOverridesFromConfig(config: types.Config) request_overrides.RequestOverr
 /// (唤醒 N=1 宿主的 run,兼容既有行为;daemon 未绑单 session 时此指针为 null,靠 accept EINTR 醒)。
 fn onSigint() void {
     @import("core/shutdown.zig").request();
-    if (g_abort_signal) |s| {
+    if (@atomicLoad(?*AbortSignal, &g_abort_signal, .seq_cst)) |s| {
         s.abort(.user_ctrl_c);
     }
 }

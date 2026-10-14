@@ -83,8 +83,34 @@ status, compatibility boundaries, and entry points are defined by
   non-loopback address without a token exits 2 unless `--web-allow-unauth` is
   given. Normative rules: [doc/API.md](doc/API.md#web-and-daemon-http-surface);
   trust model: [SECURITY.md](SECURITY.md#web-and-daemon-trust-model).
+- Dynamic sessions in the multi-session daemon (#254): `GET /sessions` lists
+  the live sessions (`generating`, `model`, `permission_mode`,
+  `pending_request_id`); `POST /sessions/create` (`{"session_id"?,
+  "resume"?}`) starts one, under the caller's id or a generated one, and with
+  `"resume":true` rebuilds its conversation from the transcript persisted under
+  the state root, so a session survives a container rebuild;
+  `POST /sessions/<id>/resume` answers 200 when the session is live and 404
+  otherwise; `POST /sessions/<id>/destroy` aborts its run, joins its driver,
+  ends every SSE stream and UDS attach with `session_lifecycle.closed`, and
+  returns. `serve --sessions 0` starts with no session, and
+  `--max-sessions M` (default 32) caps live sessions, answering 429 beyond it.
+  Requests now hold a counted lease on the session they address for as long
+  as they run (an SSE stream or UDS attach for its whole life); a destroy
+  never waits for one and frees the session after the last is returned.
+  Normative rules: [doc/API.md](doc/API.md#web-and-daemon-http-surface).
 
 ### Changed
+
+- `serve --sessions 1` now runs the multi-session daemon (one startup session
+  under `/s/<id>/`, plus the `/sessions` routes), as doc/API.md already
+  described; it used to fall back to the single-session `serve`. Plain `serve`
+  is unchanged. `--sessions` takes a count of 0 or more and rejects anything
+  else (it used to read a bad value as 1), and `--sessions`, `--max-sessions`
+  and `--uds` without `serve` are argument errors (exit 2) instead of being
+  ignored.
+- Destroying or shutting down a daemon session now also cancels its in-flight
+  provider request, so a session whose provider stopped sending stops at once
+  instead of after the stream idle limit (up to 120 s by default).
 
 - MCP tools are named `mcp__<server>__<tool>` (Claude Code's form, so its
   permission rules and `allowed-tools` lists match); invalid characters become

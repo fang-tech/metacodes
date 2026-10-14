@@ -32,11 +32,16 @@ pub const DriverCtx = struct {
     wb: *WebBackend, // serve 建、绑 host.journal,driver 取 backend() 喂 agent_loop
 };
 
-/// SessionHost.abort_fn:中断该 session 的 in-flight run(戳 app.abort)。requestStop 调它 → agent_loop
-/// 的网络 IO 阻塞立即返回,join 不挂(见 registry.SessionHost.destroy)。
+/// SessionHost.abort_fn:中断该 session 的 in-flight run(戳 app.abort)。requestStop/stopDriver 调它 →
+/// agent_loop 的网络 IO 阻塞立即返回,join 不挂(见 registry.SessionHost.destroy)。
+/// A socket read blocked on a silent provider never polls the flag, so the
+/// in-flight request is shut down as well (the TUI's SIGINT bridge does the
+/// same); a request that registers after this sees the flag and shuts itself
+/// down. Without it a destroy over HTTP waits out the stream idle limit.
 pub fn abortFn(ctx: *anyopaque, reason: abort.Reason) void {
     const dctx: *DriverCtx = @ptrCast(@alignCast(ctx));
     dctx.app.abort.abort(reason);
+    dctx.app.provider().cancel(&dctx.app.abort);
 }
 
 /// SessionHost.driver_fn:真 App 驱动循环(mirror web/session.zig run() 的 outer 循环,用 host 资源)。

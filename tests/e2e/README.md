@@ -25,8 +25,9 @@ zig build && bash tests/e2e/daemon_serve_e2e.sh && bash tests/e2e/daemon_serve_m
 
 `serve` / `serve --sessions 2 --uds` 对 loopback mock provider(`daemon_mock_provider.py`)跑:
 `GET /health`、bearer token、`--web-bind ::1`、非回环无鉴权拒绝启动、按 session 路由、UDS、
-SIGINT 关停。端口全由内核分配,HOME 与 state root 临时,TinyKG autostart 关,共用
-`daemon_e2e_lib.sh`。
+动态 session 生命周期(`/sessions` create/list/resume/destroy、`"resume":true` 从 transcript
+恢复、`--sessions 0`、`--max-sessions` 的 429,#254)、SIGINT 关停。端口全由内核分配,HOME 与
+state root 临时,TinyKG autostart 关,共用 `daemon_e2e_lib.sh`。
 
 ## 它怎么工作
 

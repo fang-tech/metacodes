@@ -12,7 +12,13 @@
 #     /state and /command (/mode dont-ask) isolation.
 #   - UDS + NDJSON: list / message / attach (since, streaming) / interrupt,
 #     mid-run interrupt ends the run as aborted, consecutive messages.
-#   - SIGINT shuts both drivers down cleanly.
+#   - #254 dynamic lifecycle: GET /sessions, POST /sessions/create (201, 409
+#     live duplicate, 400 malformed id), /sessions/<id>/resume (200 live, 404
+#     not), /sessions/<id>/destroy (200, then 404 everywhere, /health drops,
+#     the main loop reaps it), create {"resume":true} restores the transcript;
+#     a second daemon with --sessions 0 starts empty and answers 429 at
+#     --max-sessions.
+#   - SIGINT shuts every driver down cleanly.
 #
 # Run by `zig build test` on POSIX hosts (build.zig sets
 # METACODES_DAEMON_E2E_BIN); by hand: `zig build && bash tests/e2e/daemon_serve_multi_e2e.sh`.
@@ -27,7 +33,8 @@ token="e2e-$(python3 -c 'import secrets; print(secrets.token_hex(16))')"
 auth=(-H "Authorization: Bearer $token")
 usock="$TMP/daemon.sock"
 
-start_daemon "$TMP/multi.out" METACODES_WEB_TOKEN="$token" \
+# daemon:info puts "session <id> reaped" in the log: the main loop's reaper at work.
+start_daemon "$TMP/multi.out" METACODES_WEB_TOKEN="$token" METACODES_LOG=daemon:info \
   "$BIN" serve 0 --sessions 2 --uds "$usock" --api-key test --base-url "$BASE_URL"
 wait_listening "$TMP/multi.out"
 url="$DAEMON_URL"
@@ -161,6 +168,75 @@ PY
 uds_out="$(python3 "$TMP/uds_check.py" "$usock" "$A" "$B" 2>&1)" || fail "UDS checks failed: $uds_out"
 grep -q "UDS_OK" <<<"$uds_out" || fail "UDS checks did not finish: $uds_out"
 
+# ── #254: dynamic session lifecycle over HTTP ───────────────────────────────
+# lifecycle <method> <path> [body]: prints "<status> <body>" (authenticated).
+lifecycle() {
+  local method="$1" path="$2" body="${3:-}"
+  "${CURL[@]}" --max-time 30 "${auth[@]}" -X "$method" "$url$path" -H "Origin: $url" \
+    ${body:+-d "$body"} -w ' %{http_code}' || true
+}
+# The token guards the lifecycle routes like every other.
+[[ "$(http_code "$url/sessions")" == 401 ]] || fail "GET /sessions served without the token"
+[[ "$(http_code -X POST "$url/sessions/create" -H "Origin: $url" -d '{}')" == 401 ]] || fail "create without the token"
+[[ "$(http_code -X POST "$url/sessions/$A/destroy" -H "Origin: $url")" == 401 ]] || fail "destroy without the token"
+check_health "$url" "$version" 2
+
+# GET /sessions lists the two startup sessions with their state.
+listed="$("${CURL[@]}" "${auth[@]}" "$url/sessions")"
+python3 - "$listed" "$A" "$B" <<'PY' || fail "unexpected GET /sessions: $listed"
+import json, sys
+doc = json.loads(sys.argv[1])
+ids = [s["session_id"] for s in doc["sessions"]]
+assert sorted(ids) == sorted(sys.argv[2:4]), ids
+for s in doc["sessions"]:
+    assert set(s) == {"session_id", "generating", "model", "permission_mode", "pending_request_id"}, s
+    assert isinstance(s["generating"], bool) and s["pending_request_id"] == 0, s
+PY
+
+# create → 201; it is an ordinary session: /s/<id>/*, its own driver.
+created="$(lifecycle POST /sessions/create '{}')"
+[[ "$created" == *" 201" ]] || fail "create did not answer 201: $created"
+C="$(python3 -c 'import json, sys; print(json.loads(sys.argv[1].rsplit(" ", 1)[0])["session_id"])' "$created")"
+echo "session C=$C (created over HTTP)"
+check_health "$url" "$version" 3
+[[ "$(lifecycle POST "/sessions/$C/resume")" == *'"live":true}'*" 200" ]] || fail "resume of a live session is not 200"
+grep -q '"ok":true' <<<"$("${CURL[@]}" "${auth[@]}" -X POST "$url/s/$C/message" -H "Origin: $url" -d '{"text":"hi-C"}')" ||
+  fail "/s/C/message not accepted"
+events_until '"run_done".*end_turn' "${auth[@]}" "$url/s/$C/events" >/dev/null || fail "C produced no run"
+[[ "$(lifecycle POST /sessions/create "{\"session_id\":\"$C\"}")" == *" 409" ]] || fail "a live duplicate is not 409"
+[[ "$(lifecycle POST /sessions/create '{"session_id":"NOT-AN-ID"}')" == *" 400" ]] || fail "a malformed id is not 400"
+
+# destroy → 200 once the driver is joined; the session is gone, the reaper frees it.
+[[ "$(lifecycle POST "/sessions/$C/destroy")" == *'"ok":true'*" 200" ]] || fail "destroy did not answer 200"
+[[ "$(http_code "${auth[@]}" "$url/s/$C/state")" == 404 ]] || fail "/s/C/state after destroy is not 404"
+[[ "$(lifecycle POST "/sessions/$C/resume")" == *" 404" ]] || fail "resume of a destroyed session is not 404"
+[[ "$(lifecycle POST "/sessions/$C/destroy")" == *" 404" ]] || fail "a second destroy is not 404"
+check_health "$url" "$version" 2
+if "${CURL[@]}" "${auth[@]}" "$url/sessions" | grep -q "$C"; then fail "GET /sessions still lists C"; fi
+wait_for_line "$TMP/multi.out" "$DAEMON_PID" "session $C reaped" || fail "the main loop never reaped C"
+
+# The conversation survives the destroy: restore it from the transcript.
+restored="$(lifecycle POST /sessions/create "{\"session_id\":\"$C\",\"resume\":true}")"
+[[ "$restored" == "{\"session_id\":\"$C\",\"messages\":2} 201" ]] || fail "restore did not bring back 2 messages: $restored"
+check_health "$url" "$version" 3
+[[ "$(lifecycle POST "/sessions/$C/destroy")" == *" 200" ]] || fail "destroy of the restored session"
+
 stop_daemon "$TMP/multi.out"
 
-echo "PASS: serve-multi e2e — /health, bearer token (HTTP) vs 0600 UDS, routing isolation, UDS list/message/attach/interrupt, per-session /state·/command, SIGINT shutdown"
+# ── #254: --sessions 0 starts empty; the cap answers 429 ────────────────────
+start_daemon "$TMP/zero.out" METACODES_WEB_TOKEN="$token" \
+  "$BIN" serve 0 --sessions 0 --max-sessions 1 --api-key test --base-url "$BASE_URL"
+wait_listening "$TMP/zero.out"
+url="$DAEMON_URL"
+check_health "$url" "$version" 0
+[[ "$("${CURL[@]}" "${auth[@]}" "$url/sessions")" == '{"sessions":[]}' ]] || fail "--sessions 0 did not start empty"
+first="$(lifecycle POST /sessions/create)"
+[[ "$first" == *" 201" ]] || fail "create on an empty daemon: $first"
+D="$(python3 -c 'import json, sys; print(json.loads(sys.argv[1].rsplit(" ", 1)[0])["session_id"])' "$first")"
+[[ "$(lifecycle POST /sessions/create)" == '{"error":"session limit reached","max_sessions":1} 429' ]] || fail "the cap did not answer 429"
+grep -q '"ok":true' <<<"$("${CURL[@]}" "${auth[@]}" -X POST "$url/s/$D/message" -H "Origin: $url" -d '{"text":"hi-D"}')" ||
+  fail "/s/D/message not accepted"
+events_until '"run_done".*end_turn' "${auth[@]}" "$url/s/$D/events" >/dev/null || fail "D produced no run"
+stop_daemon "$TMP/zero.out"
+
+echo "PASS: serve-multi e2e — /health, bearer token (HTTP) vs 0600 UDS, routing isolation, UDS list/message/attach/interrupt, per-session /state·/command, dynamic create/list/resume/destroy/restore (#254), --sessions 0 and the 429 cap, SIGINT shutdown"
