@@ -101,6 +101,9 @@ persist transcript → ③ destroy registry → 退出。**逐 session 优雅**,
   直到 resolver 的生命周期安全解决(refcount handle / lock-hold closure——即 §4 下一条的 access-API
   决策;届时 resolver **签名会从 by-value 改为 handle**)。整个 daemon 关停仍安全(serve `srv.stop()`
   drain 所有连接 → `live_conns→0` 后才 `reg.shutdownAll()`)。task#22 登记。
+  **Resolved by #254**: `resolve` now returns a counted `server.Lease` that every HTTP and UDS
+  consumer releases exactly once; per-session destroy over HTTP never waits for a lease and the
+  daemon's reaper frees a destroyed session after the last release (`src/daemon/serve_multi.zig`).
 - [ ] **按 id 借用 host 的访问 API + refcount(option B 已删,待 U10-C/D 消费者按真实需求加)**:
   a570c36 的 lean registry 只做生命周期(create/put/remove/shutdownAll)+ abort_fn,**无 borrow
   API(acquire/get)⇒ 无跨线程借用 ⇒ 无 UAF ⇒ 现在不需要 refcount**。当 U10-C/D 引入绑定层(UDS/web

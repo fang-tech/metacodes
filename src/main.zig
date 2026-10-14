@@ -276,6 +276,7 @@ pub const session_service = @import("session_service.zig"); // U11:canonical 会
 pub const daemon_registry = @import("daemon/registry.zig"); // U10:SessionRegistry + SessionHost
 pub const daemon_app_driver = @import("daemon/app_driver.zig"); // U10-D:真 App driver
 pub const daemon_serve = @import("daemon/serve.zig"); // U10-D:serve(单 session daemon MVP)
+pub const daemon_serve_multi = @import("daemon/serve_multi.zig"); // U10-C/#254:multi-session daemon (component tests drive it)
 pub const daemon_uds = @import("daemon/uds.zig"); // U10-B:UDS+NDJSON 绑定(组件测试驱动 message op)
 pub const core_shutdown = @import("core/shutdown.zig"); // U9:进程级停机信号
 pub const tui_status_bar = @import("repl/tui/widget/status_bar.zig");
@@ -911,12 +912,13 @@ pub fn main(init: std.process.Init) !void {
     const running_version = version_info.fullVersion(&version_buffer, VERSION, version_info.BuildInfo.fromOptions(build_options));
 
     // U10-D:`serve [port]` daemon 模式 → 经 registry/host/app_driver 跑 session,SIGINT 优雅关停。
-    // --sessions N>1 → serveMulti(N 个独立 session,WebServer resolver 按 /s/<id>/* 路由,U10-C)。
+    // --sessions N(N ≥ 0)或 --uds → serveMulti(sessions under /s/<id>/*, created and
+    // destroyed over HTTP, U10-C/#254)。
     if (config.serve_port) |port| {
         const surface = webSurface(&config, port, running_version);
-        // serve-multi 路径:N>1(多 session)或设了 --uds(附加 UDS 绑定,即便 N=1)。
-        if (config.serve_sessions > 1 or config.uds_path != null) {
-            const code = @import("daemon/serve_multi.zig").serveMulti(app, gpa, config, api_key, surface, config.serve_sessions, config.uds_path) catch |err| blk: {
+        if (config.serve_sessions != null or config.uds_path != null) {
+            // serveMulti owns `app` from here: a session adopts it, or (N = 0) it is released at once.
+            const code = daemon_serve_multi.serveMulti(app, config, api_key, surface, config.serve_sessions orelse 1, multiSessionCap(config), config.uds_path) catch |err| blk: {
                 log.err("daemon", "serve-multi failed: {s}", .{@errorName(err)});
                 break :blk @as(u8, 1);
             };
@@ -2810,14 +2812,34 @@ fn parseArgsInto(config: *types.Config, args: *std.process.Args.Iterator, alloca
                 }
             }
         } else if (std.mem.eql(u8, arg, "--sessions")) {
-            // U10-C:daemon 静态 session 数(>1 → serveMulti)。
-            if (args.next()) |v| {
-                config.serve_sessions = std.fmt.parseInt(usize, v, 10) catch 1;
-                if (config.serve_sessions < 1) config.serve_sessions = 1;
+            // U10-C/#254:the multi-session daemon, with N sessions built at startup (N ≥ 0).
+            const v = args.next() orelse {
+                setParseError(config, allocator, "missing value for --sessions", .{});
+                return;
+            };
+            config.serve_sessions = std.fmt.parseInt(usize, v, 10) catch {
+                setParseError(config, allocator, "invalid --sessions '{s}' (a session count, 0 or more)", .{v});
+                return;
+            };
+        } else if (std.mem.eql(u8, arg, "--max-sessions")) {
+            // #254:the multi-session daemon's cap on live sessions.
+            const v = args.next() orelse {
+                setParseError(config, allocator, "missing value for --max-sessions", .{});
+                return;
+            };
+            const max = std.fmt.parseInt(usize, v, 10) catch 0;
+            if (max == 0) {
+                setParseError(config, allocator, "invalid --max-sessions '{s}' (a session count, 1 or more)", .{v});
+                return;
             }
+            config.serve_max_sessions = max;
         } else if (std.mem.eql(u8, arg, "--uds")) {
             // U10-B:daemon 附加 UDS+NDJSON 绑定(路径)。设置即启用(强制走 serveMulti)。
-            if (args.next()) |v| config.uds_path = allocator.dupe(u8, v) catch null;
+            const v = args.next() orelse {
+                setParseError(config, allocator, "missing value for --uds", .{});
+                return;
+            };
+            config.uds_path = allocator.dupe(u8, v) catch v;
         } else if (std.mem.eql(u8, arg, "--web-bind")) {
             // #253: validated here, so a typo fails before anything starts.
             const v = args.next() orelse {
@@ -2909,6 +2931,24 @@ fn parseArgsInto(config: *types.Config, args: *std.process.Args.Iterator, alloca
     {
         setParseError(config, allocator, "--web-bind / --web-token / --web-allow-unauth require --web or serve", .{});
     }
+    // The daemon flags shape `serve`; anywhere else they would configure nothing.
+    if ((config.serve_sessions != null or config.serve_max_sessions != null or config.uds_path != null) and
+        config.serve_port == null and config.parse_error == null)
+    {
+        setParseError(config, allocator, "--sessions / --max-sessions / --uds require serve", .{});
+    }
+    // The cap belongs to the multi-session daemon, which --sessions or --uds selects.
+    if (config.serve_max_sessions != null and config.serve_sessions == null and config.uds_path == null and config.parse_error == null) {
+        setParseError(config, allocator, "--max-sessions requires --sessions or --uds (the multi-session daemon)", .{});
+    }
+    if (config.serve_sessions) |initial| if (initial > multiSessionCap(config.*) and config.parse_error == null) {
+        setParseError(config, allocator, "--sessions {d} exceeds --max-sessions {d}", .{ initial, multiSessionCap(config.*) });
+    };
+}
+
+/// The multi-session daemon's live-session cap: `--max-sessions`, else the default.
+fn multiSessionCap(config: types.Config) usize {
+    return config.serve_max_sessions orelse daemon_serve_multi.DEFAULT_MAX_SESSIONS;
 }
 
 fn webBindHint(err: platform_net.AddressError) []const u8 {
@@ -3094,8 +3134,12 @@ fn printHelp() void {
         \\  --dump-plugins        Print the immutable plugin inventory JSON and exit
         \\  serve [port]          Daemon mode (HTTP; default port 7777; GET /health is an unauthenticated
         \\                        liveness probe; --web-bind/--web-token apply here too)
-        \\  --sessions <n>        Daemon: static session count (>1 enables multi-session)
-        \\  --uds <path>          Daemon: additional UDS+NDJSON binding
+        \\  --sessions <n>        Daemon: multi-session mode (sessions under /s/<id>/, created and destroyed
+        \\                        over POST /sessions/create and /sessions/<id>/destroy); n sessions (0 or
+        \\                        more) are built at startup
+        \\  --max-sessions <m>    Daemon: cap on live sessions in multi-session mode (default 32); a create
+        \\                        beyond it is refused with 429
+        \\  --uds <path>          Daemon: additional UDS+NDJSON binding (implies multi-session mode)
         \\  --add-dir <path>      Extra read/write directory (repeatable)
         \\  --plugin-dir <path>   Enable a manifest-based data plugin package (repeatable)
         \\  --process-plugin-dir <path>  Enable a pinned executable plugin package (repeatable)
