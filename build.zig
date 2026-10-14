@@ -2346,6 +2346,18 @@ pub fn build(b: *std.Build) void {
     const doc_facts_test_step = b.step("test:doc-facts", "Test documentation fact checks");
     doc_facts_test_step.dependOn(&doc_facts_test_cmd.step);
     test_step.dependOn(&doc_facts_test_cmd.step);
+    // Every std.Io.Threaded goes through platform.signal.threadedIo (SIGPIPE
+    // must stay ignored; see src/platform/signal.zig).
+    const io_threaded_test_cmd = b.addSystemCommand(&.{
+        if (@import("builtin").os.tag == .windows) "python" else "python3",
+        "-m",
+        "unittest",
+        "scripts.tests.test_io_threaded_discipline",
+        "-v",
+    });
+    const io_threaded_test_step = b.step("test:io-threaded", "Test that std.Io.Threaded is created only through platform.signal.threadedIo");
+    io_threaded_test_step.dependOn(&io_threaded_test_cmd.step);
+    test_step.dependOn(&io_threaded_test_cmd.step);
     const gate_manifest_test_cmd = b.addSystemCommand(&.{
         if (@import("builtin").os.tag == .windows) "python" else "python3",
         "-m",
@@ -2553,6 +2565,21 @@ pub fn build(b: *std.Build) void {
             eval_test_cmd.step.dependOn(b.getInstallStep());
             eval_test_cmd.setEnvironmentVariable("METACODES_NATIVE_E2E_BIN", b.getInstallPath(.bin, exe.out_filename));
         }
+        // The daemon HTTP surface end to end: the installed product's `serve`
+        // and `serve --sessions 2 --uds` against a loopback mock provider
+        // (paid=0, external network=0, kernel-picked ports, TinyKG autostart
+        // off): /health, bearer token, bind address, the non-loopback
+        // refusal, routing, UDS, SIGINT shutdown. Unwired, both scripts rotted
+        // (fixed ports, a `/mode plan` that no longer exists). POSIX only:
+        // they are bash, use curl and Unix-domain sockets, and send SIGINT.
+        if (@import("builtin").os.tag != .windows) {
+            for ([_][]const u8{ "tests/e2e/daemon_serve_e2e.sh", "tests/e2e/daemon_serve_multi_e2e.sh" }) |script| {
+                const daemon_e2e = b.addSystemCommand(&.{ "bash", script });
+                daemon_e2e.step.dependOn(b.getInstallStep());
+                daemon_e2e.setEnvironmentVariable("METACODES_DAEMON_E2E_BIN", b.getInstallPath(.bin, exe.out_filename));
+                test_step.dependOn(&daemon_e2e.step);
+            }
+        }
         // The native project-Harness suites (E3 runtime and templates, the
         // E2 evolution lifecycle, the calibration matrix) run the installed
         // product, both zero-provider drivers, the project kernel and the
@@ -2712,6 +2739,7 @@ pub fn build(b: *std.Build) void {
     dispatcher_metadata_mod.addImport("harness", test_harness_mod);
     dispatcher_metadata_mod.addImport("metacodes-core", core_mod);
     dispatcher_metadata_mod.addImport("agentcore-abi", agentcore_abi_test_mod);
+    addPlatform(b, dispatcher_metadata_mod);
     const dispatcher_metadata_test = b.addTest(.{
         .name = "tool-dispatcher-metadata",
         .root_module = dispatcher_metadata_mod,

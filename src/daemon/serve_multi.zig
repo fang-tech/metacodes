@@ -64,6 +64,9 @@ const SessionSlot = struct {
 const MultiDaemon = struct {
     slots: []SessionSlot,
     dummy: u8 = 0, // trivialState 的 state_ctx 占位(MVP 无 rich attach)
+    /// Wired slots: what `GET /health` reports as `sessions`, read without
+    /// going through the resolver (#251).
+    wired: std.atomic.Value(usize) = .init(0),
 };
 
 /// trivial /state:仅作 Deps 必填占位(resolver 存在时单 session 分支永不被读)。
@@ -91,6 +94,7 @@ fn rootPage(ctx: *anyopaque, allocator: std.mem.Allocator) ?[]u8 {
         buf.appendSlice(allocator, "</code></li>") catch return null;
     }
     buf.appendSlice(allocator, "</ul><h2>API</h2><pre>" ++
+        "GET  /health             (liveness; no session, no token)\n" ++
         "POST /s/&lt;id&gt;/message   {\"text\":\"...\"}\n" ++
         "GET  /s/&lt;id&gt;/events    (SSE)\n" ++
         "POST /s/&lt;id&gt;/interrupt\n" ++
@@ -200,8 +204,9 @@ fn udsList(ctx: *anyopaque, allocator: std.mem.Allocator) ?[]u8 {
 
 /// 跑 daemon(静态 N session)直到 SIGINT。返回进程退出码。app0=main 预建 app(作 slot[0])。
 /// config 用 anytype(避免 daemon 层依赖 types.Config 具体形状;App.init 按值接收)。
+/// `surface`:HTTP 面的 bind/token/版本(#251-#253;UDS 不受影响,仍是 0600 文件权限)。
 /// uds_path 非 null → 附加一条 UDS+NDJSON 绑定(U10-B,与 web 并存,同 registry)。
-pub fn serveMulti(app0: *app_mod.App, allocator: std.mem.Allocator, config: anytype, api_key: []const u8, port: u16, n: usize, uds_path: ?[]const u8) !u8 {
+pub fn serveMulti(app0: *app_mod.App, allocator: std.mem.Allocator, config: anytype, api_key: []const u8, surface: server_mod.Surface, n: usize, uds_path: ?[]const u8) !u8 {
     _ = allocator; // slot[0] 的 App 已用它;新 App 与 daemon 基建用 c_allocator(跨线程)
     std.debug.assert(n >= 1);
     const web_alloc = std.heap.c_allocator;
@@ -236,7 +241,7 @@ pub fn serveMulti(app0: *app_mod.App, allocator: std.mem.Allocator, config: anyt
             // 全新 App:c_allocator(线程安全,逐次释放)+ 独立 io_runtime。
             const io_rt = try web_alloc.create(std.Io.Threaded);
             errdefer web_alloc.destroy(io_rt);
-            io_rt.* = std.Io.Threaded.init(web_alloc, .{});
+            io_rt.* = @import("platform").signal.threadedIo(web_alloc, .{});
             errdefer io_rt.deinit();
             const app = try app_mod.App.init(web_alloc, io_rt.io(), config, api_key);
             // App.init 成功 → app 归本 slot;上面 errdefer 只覆盖 App.init 之前的失败(io_rt)。
@@ -248,6 +253,7 @@ pub fn serveMulti(app0: *app_mod.App, allocator: std.mem.Allocator, config: anyt
             return err;
         };
         built += 1;
+        _ = md.wired.fetchAdd(1, .release);
         std.debug.print("session {s} ready\n", .{slot.app.session_id.asSlice()});
         log.info("daemon", "session {s} ready", .{slot.app.session_id.asSlice()});
     }
@@ -256,21 +262,20 @@ pub fn serveMulti(app0: *app_mod.App, allocator: std.mem.Allocator, config: anyt
     // Deps 的单 session 字段(journal/wb/inbox/abort/state_*)在 resolver 非 null 时**永不被读**
     // (route 走 resolver 分支,singleView 不调)→ 填 slot[0] 占位满足 struct 必填。
     const s0 = &md.slots[0];
-    const srv = try WebServer.start(web_alloc, port, .{
+    const srv = try WebServer.start(web_alloc, surface, .{
         .journal = &s0.host.journal,
         .web_backend = &s0.wb,
         .inbox = &s0.host.inbox,
         .abort = &s0.app.abort,
         .state_ctx = @ptrCast(&md.dummy),
         .state_fn = &trivialState,
-        .resolver = &resolveSession,
-        .resolver_ctx = @ptrCast(&md),
+        .resolver = .{ .resolve = &resolveSession, .ctx = @ptrCast(&md), .sessions = &md.wired },
         .root_fn = &rootPage, // GET / → 诚实落地页(列 session id + API),非死 SPA(PM M1)
         .root_ctx = @ptrCast(&md),
     });
 
-    std.debug.print("metacodes daemon ({d} sessions): http://127.0.0.1:{d}  (Ctrl+C to quit)\n", .{ n, srv.port });
-    log.info("daemon", "serve-multi listening on 127.0.0.1:{d} ({d} sessions)", .{ srv.port, n });
+    var label_buffer: [64]u8 = undefined;
+    srv.announce(std.fmt.bufPrint(&label_buffer, "metacodes daemon ({d} sessions)", .{n}) catch "metacodes daemon");
 
     // ── 可选 UDS+NDJSON 绑定(U10-B,与 web 共享 registry/resolver)────────────────
     const uds: ?*UdsServer = if (uds_path) |p| blk: {

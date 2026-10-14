@@ -60,6 +60,29 @@ status, compatibility boundaries, and entry points are defined by
   could not reach a pending prompt and a fresh session that resumed the old
   transcript; this is the kernel-side version. `EventJournal` moved from
   `web/` to `core/event_journal.zig` and is exported.
+- `GET /health` on `--web`, `serve` and `serve --sessions` (#251): `200
+  {"status":"ok","version":"<v>","sessions":N}`, unauthenticated and
+  independent of any session, for container liveness and readiness probes.
+  `version` is exactly what `metacodes --version` prints first, so an
+  orchestrator can check the running release against the one it pinned.
+- Bearer-token authentication for that HTTP surface (#252):
+  `METACODES_WEB_TOKEN` (or `--web-token`, visible in `ps`) makes every route
+  but `/health` require `Authorization: Bearer <token>`; a GET may pass
+  `?token=` (EventSource, opening the browser UI), a POST may not. A wrong or
+  missing token is `401` with `WWW-Authenticate: Bearer`, decided before any
+  request body is read and compared in constant time. The bundled UI is
+  opened as `/?token=<token>`; it drops the token from the address bar and
+  sends it on every request. Without a token, requests whose `Host` is not a
+  loopback name are now refused (DNS rebinding), and a POST's `Origin` is
+  compared with its own `Host` (`[::1]` and TLS-terminating proxies work).
+  Unset, local use is unchanged. The `--uds` transport keeps its 0600
+  socket-file access control.
+- `--web-bind <addr>` / `METACODES_WEB_BIND` (#253): bind the HTTP surface to
+  any IPv4 or IPv6 literal (`0.0.0.0`, `::` dual-stack, `::1`, ...) instead of
+  only `127.0.0.1`; the startup line shows the address actually bound. A
+  non-loopback address without a token exits 2 unless `--web-allow-unauth` is
+  given. Normative rules: [doc/API.md](doc/API.md#web-and-daemon-http-surface);
+  trust model: [SECURITY.md](SECURITY.md#web-and-daemon-trust-model).
 - A `--web`/`serve` message can carry its turn's configuration (#255):
   `POST /message` (`/s/<id>/message` under `serve --sessions N`) and the UDS
   `message` op take optional `model` and `permission_mode` beside `text`. The
@@ -169,6 +192,35 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- OpenAI Chat Completions streams no longer drop text (issue #258). metacodes
+  always asks for `stream_options.include_usage`, under which every ordinary
+  chunk carries `"usage": null`; the parser took any chunk containing the key
+  `usage` for the usage report and returned before reading the rest, so the
+  chunk's text, reasoning, tool-call deltas and `finish_reason` were lost. A
+  Host or AgentCore SDK consumer could receive no text at all, tool calls never
+  formed, and the stop reason came back unknown. Usage now counts only when its
+  value is an object (at the top level, or inside a choice where some
+  compatible endpoints put it), its numbers are read from that object alone,
+  and a chunk that carries both content and a usage object yields both,
+  content first. The Responses API and Gemini paths had the same presence test:
+  a `null` `response.usage` or `usageMetadata` was reported as a measured zero,
+  and Responses read token counts from the whole terminal event, where an
+  echoed tool schema with an `input_tokens` property could supply them. Both
+  now read only the usage object and report nothing when there is none.
+- The daemon end-to-end tests (`tests/e2e/daemon_serve_e2e.sh`,
+  `daemon_serve_multi_e2e.sh`) run again and now run in `zig build test` on
+  POSIX hosts. They still sent `/mode plan`, which no longer exists, and
+  used fixed ports; they now use `/mode dont-ask`, kernel-picked ports, an
+  isolated state root with TinyKG autostart off, and also cover `/health`, the
+  token, an IPv6 bind and the non-loopback refusal.
+- **SIGPIPE no longer interrupts blocking calls with EINTR.**
+  - **Cause:** `metacodes` ignores SIGPIPE at startup, but every `std.Io.Threaded.init` swapped that for a do-nothing handler installed without SA_RESTART. Its `deinit` put back whatever it had found, so overlapping lifetimes could leave another instance's handler in place.
+  - **Effect:** a handler, unlike SIG_IGN, gets the signal delivered. On macOS a write to a closed socket signals the whole process, so any thread's blocked `recv`/`poll`/`accept`/`waitpid` could return EINTR:
+    - the web server reads `recv <= 0` as the end of a request and dropped it;
+    - the TinyKG autostart probe once took it for "no answer".
+  - **Fix:** every `std.Io.Threaded` is now created through `platform.signal.threadedIo`, which keeps SIGPIPE ignored when the process asked for it, and in tests. A library embedded by a host keeps std's behavior; the host owns its signal policy.
+  - **Children:** they get the default SIGPIPE back before `execve`. An ignored disposition survives exec, and without the reset a child pipeline such as `yes | head` would see EPIPE errors instead of ending normally.
+  - **Enforcement:** `zig build test` fails on a direct `std.Io.Threaded.init` call (`test:io-threaded`).
 - `/mode` could switch a session into a permission mode its settings disable
   (`disableBypassPermissionsMode`, `disableAutoMode`): they were enforced only
   when the settings were loaded. `/mode` now refuses such a mode on every

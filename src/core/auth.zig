@@ -628,7 +628,7 @@ fn postTokenForm(allocator: std.mem.Allocator, form: []const u8) ![]u8 {
     const url = try oauthTokenUrl(allocator);
     defer allocator.free(url);
     const uri = std.Uri.parse(url) catch return error.InvalidOAuthTokenUrl;
-    var io_runtime = std.Io.Threaded.init(allocator, .{});
+    var io_runtime = @import("platform").signal.threadedIo(allocator, .{});
     defer io_runtime.deinit();
     var http_client = std.http.Client{ .allocator = allocator, .io = io_runtime.io() };
     defer http_client.deinit();
@@ -817,7 +817,7 @@ fn refreshOAuthCredential(allocator: std.mem.Allocator, old: *const OAuthCredent
     defer allocator.free(url);
     const uri = std.Uri.parse(url) catch return error.InvalidOAuthTokenUrl;
 
-    var io_runtime = std.Io.Threaded.init(allocator, .{});
+    var io_runtime = @import("platform").signal.threadedIo(allocator, .{});
     defer io_runtime.deinit();
     var http_client = std.http.Client{ .allocator = allocator, .io = io_runtime.io() };
     defer http_client.deinit();

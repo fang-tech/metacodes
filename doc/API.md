@@ -15,9 +15,12 @@ artifact store, and TinyKG admission are not replaceable extensions.
 | Process plugins | strict manifest + stdio protocol | versioned v1 | reject unknown fields and digest drift |
 | Plugin inventory | `--dump-plugins`, Zig, Web state | versioned v1 | additive observation fields only where specified |
 | TinyKG executable distribution | `vendor/tinykg/manifest.json` | bundle v1 | exact target, format, source commit, and SHA-256 pinning |
+| Web/daemon HTTP surface | `metacodes --web`, `metacodes serve` | pre-1.0 | endpoints, authentication and bind rules as in [Web and daemon HTTP surface](#web-and-daemon-http-surface); changes with changelog notice |
 
-There is no general HTTP service API promise yet. The Web and daemon hosts are
-product surfaces built over the same core protocols.
+Beyond the endpoints and access rules of
+[Web and daemon HTTP surface](#web-and-daemon-http-surface), there is no
+general HTTP service API promise yet. The Web and daemon hosts are product
+surfaces built over the same core protocols.
 
 ## Provider selection surface
 
@@ -507,6 +510,72 @@ rather than sent to a model that would reject them. Reasoning items round-trip
 through the JSONL transcript and the AgentCore checkpoint (block tag 6), so a
 resumed session keeps the continuity. A conversation with no reasoning items
 serializes byte-identically to before.
+
+## Web and daemon HTTP surface
+
+`metacodes --web [port]` (one session with the bundled browser UI),
+`metacodes serve [port]` (one session) and `metacodes serve --sessions N
+[--uds <path>] [port]` (N static sessions) serve one HTTP/1.1 surface
+(`src/web/server.zig`). Port 0 lets the kernel pick; the startup line prints
+the address actually bound, `<label>: http://<address>:<port>  (Ctrl+C to quit)`.
+
+**Endpoints.** With one session the routes below sit at the root; with
+`--sessions N` (or `--uds`) every session route is under `/s/<id>/` and an
+unknown id is 404. Bodies are JSON unless noted.
+
+| Method and path | Purpose |
+|---|---|
+| `GET /health` | Liveness probe: `200 {"status":"ok","version":"<v>","sessions":N}`. `<v>` is the version `metacodes --version` prints on its first line (the semver, plus `+<commit12>` on a development build); `N` is 1, or the number of sessions the daemon hosts. Never under `/s/<id>/`, never authenticated, and it reads no session, journal or lock. |
+| `GET /` | The bundled single-session browser UI; in the `/s/<id>/` daemon, a page listing the session ids and these endpoints. |
+| `GET /events` | SSE stream of the session's wire lines ([Wire lines](#wire-lines-for-out-of-process-hosts): ids `<epoch>-<seq>`, `Last-Event-ID` or `?since=<seq>&epoch=<epoch>`, `event: resync`). |
+| `POST /message` | `{"text":"..."}`: queue a prompt; echoed as `user_message`. |
+| `POST /respond` | `{"id":N,...}`: answer the pending `ui_request` N; 409 when N is not pending. |
+| `POST /command` | `{"cmd":"/verb ..."}`: queue a [service verb](#session-command-surface-ui-neutral); the result arrives as `command_result`. |
+| `POST /interrupt` | Interrupt the running generation; 409 when idle. |
+| `GET /state` | Session snapshot (model, mode, usage, journal epoch and seq, ...). |
+
+**Admission.** Each request is judged on its head, before any body byte is
+read, in this order:
+
+1. `GET /health` is answered at once.
+2. Token: when one is configured (`--web-token <t>`, else
+   `METACODES_WEB_TOKEN`; the flag wins), every other request must carry
+   `Authorization: Bearer <t>` (scheme case-insensitive). A `GET` may carry
+   `?token=<t>` instead, percent-encoded (EventSource cannot set headers, and
+   a browser opens the UI as `/?token=<t>`); a `POST` is never authenticated by
+   query. Missing or wrong: `401 {"error":"unauthorized"}` with
+   `WWW-Authenticate: Bearer`. The comparison takes the same time however many
+   leading bytes match. A token is 1 to 4096 visible ASCII bytes. The token is
+   never printed or logged; a `--web-token` value is visible to other local
+   users in `ps`, so the environment variable is preferred.
+3. Host (DNS rebinding): without a token, a `Host` header must name the server
+   by `localhost`, `127.0.0.1` (any 127/8 literal) or `[::1]`, with the
+   listening port or none; on a non-loopback bind allowed by
+   `--web-allow-unauth` an IP literal is accepted as well, since no DNS answer
+   can rebind one. Anything else is `403 {"error":"host not allowed"}`. With a
+   token, `Host` is not restricted. A request without `Host` is not from a
+   browser and passes.
+4. Origin (CSRF): a `POST` whose `Origin` is present must be `http://<Host>`,
+   or `https://<Host>` behind a TLS-terminating proxy, where `<Host>` is the
+   request's own `Host` value (without `Host`: the loopback origins of the
+   listening port). Otherwise `403 {"error":"cross-origin POST rejected"}`. A
+   valid token does not lift this rule.
+
+**Bind.** `--web-bind <addr>`, else `METACODES_WEB_BIND` (the flag wins),
+names the IPv4 or IPv6 literal to bind (`127.0.0.1` by default; `0.0.0.0`,
+`::`, `::1`, `[::1]` and specific addresses are accepted; host names, zone
+ids and `::ffff:` IPv4-mapped forms are not). An IPv6 socket sets
+`IPV6_V6ONLY` explicitly: `::` is dual-stack (IPv4 clients reach it too), any
+other IPv6 address is IPv6-only. A bind address that is not loopback (127/8 or
+`::1`) needs a token or `--web-allow-unauth`; otherwise the process exits with
+code 2 before anything starts and names `METACODES_WEB_TOKEN`. Invalid values
+(a malformed address, an empty or non-ASCII token) also exit 2, and
+`--web-bind`, `--web-token` and `--web-allow-unauth` without `--web` or
+`serve` are argument errors. The environment variables are ignored when no
+web surface is requested.
+
+The `--uds` transport of `serve` is not HTTP and takes no token: its access
+control is the socket file's mode 0600 (owner only).
 
 ## Zig source embedding
 

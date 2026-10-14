@@ -19,6 +19,7 @@ const builtin = @import("builtin");
 const is_windows = builtin.os.tag == .windows;
 const psync = @import("sync.zig");
 const pfs = @import("fs.zig");
+const psignal = @import("signal.zig");
 
 // Windows spawn 串行锁。bInheritHandles=TRUE 的 CreateProcessW 会把**并发线程**同窗口期
 // 创建的全部可继承句柄(别人的管道写端/落盘句柄)一并塞给本次子进程。长命子进程(MCP
@@ -1166,6 +1167,8 @@ fn execChildEnvp(
         reportChildFailure(report_fd, .exec, @intFromEnum(std.c.E.INVAL));
         std.c._exit(127);
     };
+    // 父进程恒忽略 SIGPIPE;忽略态会穿过 exec 继承,子程序应拿回默认行为。
+    psignal.defaultBrokenPipeInChild();
     _ = std.c.execve(argv0, @as([*:null]const ?[*:0]const u8, @ptrCast(argv.ptr)), envp);
     reportChildFailure(report_fd, .exec, currentErrno());
     std.c._exit(127);
@@ -1979,6 +1982,22 @@ test "capture stdout+stderr 分别捕获" {
     try std.testing.expect(std.mem.indexOf(u8, r.stdout, "out-line") != null);
     try std.testing.expect(std.mem.indexOf(u8, r.stderr, "err-line") != null);
     try std.testing.expectEqual(@as(i32, 0), r.exit_code);
+}
+
+test "spawned children get the default SIGPIPE back while the parent ignores it" {
+    if (!procSpawnTestsEnabled() or is_windows) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var saved: std.posix.Sigaction = undefined;
+    std.posix.sigaction(std.posix.SIG.PIPE, null, &saved);
+    defer std.posix.sigaction(std.posix.SIG.PIPE, &saved, null);
+    psignal.ignoreBrokenPipe();
+    // 带着"忽略"启动的 shell 无法再取消忽略(POSIX),`kill -PIPE $$` 会被吞掉、打出 survived;
+    // 拿回默认处置的 shell 被自己的 SIGPIPE 结束,什么也打不出来。
+    const argv: []const ?[*:0]const u8 = &.{ "/bin/sh", "-c", "kill -PIPE $$; echo survived", null };
+    const r = try captureStdout(argv, a, 10_000, 1 << 20);
+    defer a.free(r.stdout);
+    defer a.free(r.stderr);
+    try std.testing.expect(std.mem.indexOf(u8, r.stdout, "survived") == null);
 }
 
 test "captureStdout 便捷+非零 exit" {

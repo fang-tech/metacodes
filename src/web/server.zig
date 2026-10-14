@@ -1,17 +1,44 @@
-//! WebServer —— 最小 HTTP/1.1 + SSE 服务器(std.c socket,127.0.0.1 only)。
+//! WebServer —— 最小 HTTP/1.1 + SSE 服务器(`--web`、`serve`、`serve --sessions/--uds` 的 HTTP 面)。
 //!
 //! 职责:把 web 前端的 HTTP 动词翻成协议层动作,自身不懂任何业务语义:
+//!   GET  /health      → {"status":"ok","version":"<v>","sessions":N}(进程存活探针,#251)
 //!   GET  /            → 内嵌 index.html(单页,自包含)
 //!   GET  /events      → SSE:重放 journal(?since=N / Last-Event-ID)+ condvar 推新事件
 //!   POST /message     → 入 inbox 队列(session driver 消费;user_message 由 driver 在该轮开跑时回显)
 //!   POST /respond     → 回填 WebBackend 挂起的 UiRequest({"id":N,...})
+//!   POST /command     → 斜杠命令入队(driver 线程执行)
 //!   POST /interrupt   → 打 AbortSignal(与 TUI esc 同通道)
 //!   GET  /state       → session 状态快照(经回调,server 不依赖 App)
+//! 多 session(`Deps.resolver`)下,`/` 与 `/health` 之外的路径都在 `/s/<id>/` 之下。
+//!
+//! Admission is decided from the request head, before a byte of body is read:
+//!   1. `GET /health` answers at once: no token, no Host check, no session,
+//!      no journal, no heap. `version` is what `metacodes --version` prints;
+//!      `sessions` is 1, or the resolver's session count.
+//!   2. With a token (`Surface.token`, #252) every other request needs
+//!      `Authorization: Bearer <token>`. A GET may carry `?token=` instead:
+//!      EventSource cannot set headers, and a browser opens the SPA that way.
+//!      A POST never authenticates by query. Missing or wrong → 401 with
+//!      `WWW-Authenticate: Bearer`. Compared in constant time.
+//!   3. Host, against DNS rebinding: without a token, a Host header must name
+//!      the server by a loopback name (`localhost`, `127.0.0.1`, `[::1]`, with
+//!      the listening port or none) — or, on a non-loopback bind allowed by
+//!      `--web-allow-unauth`, by an IP literal, which no DNS answer can rebind.
+//!      With a token, Host is free: the token is the guard. No Host at all is
+//!      not a browser and passes.
+//!   4. CSRF: a POST's Origin, when present, must be the origin of the Host it
+//!      was sent to (`http://` or, behind a TLS-terminating proxy, `https://`).
 //!
 //! 线程模型:accept 循环一个线程;每连接一个 detached 线程(SSE 长连接阻塞在
 //! journal.waitSince,普通请求即答即关)。allocator 必须线程安全(c_allocator)。
 //!
-//! 安全边界:只绑 127.0.0.1;无鉴权(本机单用户 MVP,与 TUI 同信任级)。
+//! Trust model: by default the server binds 127.0.0.1 without a token, the
+//! same trust level as the TUI on this machine (single user). Any other bind
+//! address (#253) needs a token or the operator's explicit
+//! `--web-allow-unauth` (`checkExposure`): main refuses to start otherwise,
+//! and `WebServer.start` refuses again before it opens a socket.
+//! The daemon's UDS transport (daemon/uds.zig) keeps file-mode 0600 as its
+//! only access control and takes no token.
 
 const std = @import("std");
 const time = @import("../util/time.zig");
@@ -45,6 +72,75 @@ pub const StateFn = *const fn (ctx: *anyopaque, allocator: std.mem.Allocator) an
 /// **线程**:在 HTTP 连接线程调——session 实现自行判 generating 拒绝会撞 driver 的操作。
 pub const CommandFn = *const fn (ctx: *anyopaque, allocator: std.mem.Allocator, cmd: []const u8) anyerror![]u8;
 
+/// Longest bearer token accepted (#252). A token travels in a header and, on
+/// a GET, in the query; 4 KiB leaves room for a JWT.
+pub const MAX_TOKEN_LEN: usize = 4096;
+
+pub const TokenError = error{ EmptyToken, TokenTooLong, TokenCharset };
+
+/// A token is 1..MAX_TOKEN_LEN visible ASCII bytes (0x21-0x7e): it has to
+/// cross an HTTP header unchanged, and a space or control byte would not.
+pub fn validateToken(token: []const u8) TokenError!void {
+    if (token.len == 0) return error.EmptyToken;
+    if (token.len > MAX_TOKEN_LEN) return error.TokenTooLong;
+    for (token) |byte| if (byte < 0x21 or byte > 0x7e) return error.TokenCharset;
+}
+
+/// How the process exposes this surface, resolved by main from flags and
+/// environment (#251-#253) and handed to every host unchanged. Borrowed for
+/// the server's lifetime.
+pub const Surface = struct {
+    /// IP literal to bind; its port is the requested one (0 = kernel-assigned).
+    address: net.IpAddress = net.loopback(0),
+    /// Bearer token every route but `GET /health` requires; null = none, which
+    /// `start` accepts only on a loopback address unless `allow_unauth`.
+    token: ?[]const u8 = null,
+    /// `--web-allow-unauth`: the operator accepts a non-loopback address
+    /// without a token.
+    allow_unauth: bool = false,
+    /// What `metacodes --version` prints (semver, plus `+commit` on dev
+    /// builds), reported by `GET /health` so an orchestrator can check the
+    /// running release.
+    version: []const u8,
+};
+
+pub const ExposureError = error{UnauthenticatedNonLoopback};
+
+/// #253: a non-loopback bind hands the session (shell, files, permission
+/// answers) to whoever reaches the port, so it needs a token, or the
+/// operator's explicit `--web-allow-unauth`.
+pub fn checkExposure(address: net.IpAddress, token: ?[]const u8, allow_unauth: bool) ExposureError!void {
+    if (net.isLoopbackAddress(address) or token != null or allow_unauth) return;
+    return error.UnauthenticatedNonLoopback;
+}
+
+/// Which Host headers a request may carry (DNS-rebinding guard, see the header).
+pub const HostPolicy = enum {
+    /// A token is set: it is the guard, Host is not restricted.
+    any,
+    /// No token, loopback bind: only loopback names.
+    loopback,
+    /// No token, non-loopback bind (`--web-allow-unauth`): loopback names or
+    /// IP literals; a client on the network reaches the server by its address.
+    loopback_or_ip_literal,
+
+    pub fn of(address: net.IpAddress, token: ?[]const u8) HostPolicy {
+        if (token != null) return .any;
+        return if (net.isLoopbackAddress(address)) .loopback else .loopback_or_ip_literal;
+    }
+};
+
+/// What admission checks a request against; fixed when the server starts.
+pub const Access = struct {
+    token: ?[]const u8,
+    host: HostPolicy,
+    /// The listening port: the port a Host header may name.
+    port: u16,
+};
+
+/// The verdict on a request head, reached before any body byte is read.
+pub const Admission = enum { health, unauthorized, host_rejected, cross_origin, admitted };
+
 /// server 的借用依赖(session driver 拥有,生命周期须覆盖 server)。
 /// **U10-C:一个 session 的 per-request 视图**(handler 用它,而非直接 self.deps)。单 session 模式
 /// 从 Deps 直取(singleView);多 session 模式经 resolver 按 /s/<id>/ 的 id 解析。
@@ -57,6 +153,23 @@ pub const SessionView = struct {
     state_ctx: *anyopaque,
     state_fn: StateFn,
     command_fn: ?CommandFn = null,
+};
+
+/// Multi-session routing (`Deps.resolver`).
+///
+/// **⚠️ 生命周期契约(PM/Linus review,必守)**:`resolve` 返回的 SessionView 是 **borrow 快照**(裸指针
+/// 指向该 session 的 journal/inbox/wb/abort)。handler 在**整个请求期**持这些指针——**尤其 serveSse 阻塞
+/// waitSinceFrom 最多 15s**。故 resolver **必须保证:被解析的 session 活过所有在飞请求**,即 host
+/// 绝不可在某连接持其指针时被 destroy。**MVP 满足此约束靠 session 静态**(fixed-N at startup,无
+/// per-session destroy);引入 dynamic destroy / idle-reap 前**必须**先把签名改成 refcount handle /
+/// lock-hold(见 doc/history/U9_U10_DAEMON_TIER_DESIGN.md §4)。否则 = 重现 U10-A 删掉的 borrow-UAF。
+pub const Resolver = struct {
+    /// id → SessionView; null = unknown session (404).
+    resolve: *const fn (ctx: *anyopaque, id: []const u8) ?SessionView,
+    ctx: *anyopaque,
+    /// How many sessions `resolve` answers for. `GET /health` reads this and
+    /// never calls `resolve` (#251): a probe must not touch session state.
+    sessions: *const std.atomic.Value(usize),
 };
 
 pub const Deps = struct {
@@ -72,17 +185,9 @@ pub const Deps = struct {
     state_fn: StateFn,
     /// 斜杠命令处理(可空:单测不接)。ctx 复用 state_ctx。
     command_fn: ?CommandFn = null,
-    /// **U10-C:多 session 解析器**。非 null 时,路径 `/s/<id>/rest` 按 id 解析 SessionView(null=未知
-    /// session→404);无 /s/ 前缀的非 `/` 路径→404。null=单 session 模式(--web,直用上面字段,向后兼容)。
-    ///
-    /// **⚠️ 生命周期契约(PM/Linus review,必守)**:返回的 SessionView 是 **borrow 快照**(裸指针指向
-    /// 该 session 的 journal/inbox/wb/abort)。handler 在**整个请求期**持这些指针——**尤其 serveSse 阻塞
-    /// waitSinceFrom 最多 15s**。故 resolver **必须保证:被解析的 session 活过所有在飞请求**,即 host
-    /// 绝不可在某连接持其指针时被 destroy。**MVP 满足此约束靠 session 静态**(fixed-N at startup,无
-    /// per-session destroy);引入 dynamic destroy / idle-reap 前**必须**先把签名改成 refcount handle /
-    /// lock-hold(见 doc/history/U9_U10_DAEMON_TIER_DESIGN.md §4)。否则 = 重现 U10-A 删掉的 borrow-UAF。
-    resolver: ?*const fn (ctx: *anyopaque, id: []const u8) ?SessionView = null,
-    resolver_ctx: *anyopaque = undefined,
+    /// **U10-C:多 session 解析器**。非 null 时,路径 `/s/<id>/rest` 按 id 解析 SessionView(未知
+    /// session→404);无 /s/ 前缀的非 `/`、非 `/health` 路径→404。null=单 session 模式(--web,直用上面字段)。
+    resolver: ?Resolver = null,
     /// **U10-C:`GET /` 落地页覆盖**。非 null → `GET /` 调它取 HTML(caller-allocated,route 用完 free);
     /// null → 返内嵌单 session SPA(INDEX_HTML)。多 session(resolver≠null)下 SPA 的 fetch 全走无前缀
     /// 路径会 404(PM M1),故 serve-multi 用它回一张**诚实落地页**(列 session id + API 端点,不假装 SPA 可用)。
@@ -98,6 +203,11 @@ pub const WebServer = struct {
     allocator: std.mem.Allocator,
     listen_fd: net.Socket,
     port: u16,
+    /// The bound address, with the port the kernel picked when 0 was asked for.
+    address: net.IpAddress,
+    access: Access,
+    /// `Surface.version` (borrowed).
+    version: []const u8,
     accept_thread: std.Thread = undefined,
     /// 活跃连接线程数(detached)。stop() 等它归零再释放 self——否则连接线程
     /// 还在摸 self.deps 时资源已被 deinit(UAF)。
@@ -108,11 +218,19 @@ pub const WebServer = struct {
     closing: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     deps: Deps,
 
-    /// 绑 127.0.0.1:port(0 = 内核分配,读回真实端口)并起 accept 线程。
-    pub fn start(allocator: std.mem.Allocator, port: u16, deps: Deps) !*WebServer {
-        // 可移植 loopback listen(POSIX socket/Windows WSAStartup+ws2_32),内部含 REUSEADDR+getsockname。
-        const l = try net.listenLoopback(port, 16);
+    /// 绑 surface.address(端口 0 = 内核分配,读回真实端口)并起 accept 线程。
+    /// Main refuses an unauthenticated non-loopback surface before anything
+    /// starts; `start` refuses it again, before any socket exists, so no other
+    /// host of this server can expose a session by mistake. A malformed token
+    /// is refused here too.
+    pub fn start(allocator: std.mem.Allocator, surface: Surface, deps: Deps) !*WebServer {
+        if (surface.token) |token| try validateToken(token);
+        try checkExposure(surface.address, surface.token, surface.allow_unauth);
+        // 可移植 listen(POSIX socket/Windows WSAStartup+ws2_32),内部含 REUSEADDR+getsockname。
+        const l = try net.listenAddress(surface.address, 16);
         errdefer net.closeSocket(l.sock);
+        var address = surface.address;
+        address.setPort(l.port);
 
         const self = try allocator.create(WebServer);
         errdefer allocator.destroy(self);
@@ -120,10 +238,38 @@ pub const WebServer = struct {
             .allocator = allocator,
             .listen_fd = l.sock,
             .port = l.port,
+            .address = address,
+            .access = .{ .token = surface.token, .host = .of(surface.address, surface.token), .port = l.port },
+            .version = surface.version,
             .deps = deps,
         };
         self.accept_thread = try std.Thread.spawn(.{}, acceptLoop, .{self});
         return self;
+    }
+
+    /// `http://<bound address>`, e.g. `http://127.0.0.1:7777` or
+    /// `http://[::1]:7777`. Never carries the token.
+    pub fn url(self: *const WebServer, buffer: []u8) []const u8 {
+        return std.fmt.bufPrint(buffer, "http://{f}", .{self.address}) catch "http://?";
+    }
+
+    /// The startup line every host prints, `<label>: <url>  (Ctrl+C to quit)`,
+    /// and, with a token, how to present it. The token itself is never printed
+    /// or logged.
+    pub fn announce(self: *const WebServer, label: []const u8) void {
+        var buffer: [80]u8 = undefined;
+        const where = self.url(&buffer);
+        std.debug.print("{s}: {s}  (Ctrl+C to quit)\n", .{ label, where });
+        if (self.access.token != null) {
+            std.debug.print("bearer-token auth is on (token not shown): send 'Authorization: Bearer <token>', or open {s}/?token=<token> in a browser\n", .{where});
+        }
+        log.info("web", "{s} listening on {s} (token auth {s})", .{ label, where, if (self.access.token != null) "on" else "off" });
+    }
+
+    /// Sessions `GET /health` reports: the resolver's count, else the one
+    /// session this server was started for.
+    pub fn sessionCount(self: *const WebServer) usize {
+        return if (self.deps.resolver) |r| r.sessions.load(.acquire) else 1;
     }
 
     /// shutdown+关 listen fd(accept 返负退出)+ join + 等连接线程归零。SSE 连接线程靠
@@ -207,6 +353,32 @@ pub const WebServer = struct {
             }
         }
         const he = headers_end orelse return;
+        const head = buf[0..(he - 4)];
+        const line = parseRequestLine(head) orelse {
+            writeSimple(fd, "400 Bad Request", "application/json", "{\"error\":\"bad request line\"}");
+            return;
+        };
+
+        // Admission on the head alone: a peer that has not proved it may talk
+        // to us never gets the server to wait for, or buffer, its body.
+        const body_received = total - he;
+        switch (admit(line, head, self.access)) {
+            .health => return self.serveHealth(fd),
+            .unauthorized => {
+                writeResponse(fd, "401 Unauthorized", "application/json", "WWW-Authenticate: Bearer\r\n", "{\"error\":\"unauthorized\"}");
+                return discardDeclaredBody(fd, body_received, content_length);
+            },
+            .host_rejected => {
+                writeSimple(fd, "403 Forbidden", "application/json", "{\"error\":\"host not allowed\"}");
+                return discardDeclaredBody(fd, body_received, content_length);
+            },
+            .cross_origin => {
+                writeSimple(fd, "403 Forbidden", "application/json", "{\"error\":\"cross-origin POST rejected\"}");
+                return discardDeclaredBody(fd, body_received, content_length);
+            },
+            .admitted => {},
+        }
+
         // 减法侧比较:`he + content_length` 在恶意 Content-Length(接近 usize max)下会
         // 溢出(safe 模式 panic=DoS,fast 模式绕过检查=堆溢出)。cap-he 恒 ≥0,永不溢出。
         if (content_length > cap - he) {
@@ -218,27 +390,30 @@ pub const WebServer = struct {
             if (n <= 0) return;
             total += @intCast(n);
         }
-
-        const head = buf[0..(he - 4)];
         const body = buf[he..total];
-        const line = parseRequestLine(head) orelse {
-            writeSimple(fd, "400 Bad Request", "application/json", "{\"error\":\"bad request line\"}");
-            return;
-        };
 
         self.route(fd, line, head, body);
     }
 
-    fn route(self: *WebServer, fd: net.Socket, line: RequestLine, head: []const u8, body: []const u8) void {
-        // CSRF 防线:状态变更(POST)必须同源。浏览器跨域 POST 强制带 Origin 头——
-        // 恶意网页 fetch('http://127.0.0.1:<port>/message',{method:'POST'}) 是简单请求、
-        // 能发出(读不到响应但副作用已生效:让模型跑命令、抢答权限对话框)。检查 Origin
-        // 挡掉它;无 Origin(curl/非浏览器 CLI)放行——浏览器一定带,缺失即非浏览器。
-        // 读端点(GET /events /state)靠浏览器 CORS 挡:不发 CORS 头 → 跨域读不到响应。
-        if (std.mem.eql(u8, line.method, "POST") and !originAllowed(head, self.port)) {
-            writeSimple(fd, "403 Forbidden", "application/json", "{\"error\":\"cross-origin POST rejected\"}");
+    /// `GET /health` (#251): fixed-size, on the stack; touches neither the
+    /// resolver nor any session, journal or lock.
+    fn serveHealth(self: *WebServer, fd: net.Socket) void {
+        var buffer: [256]u8 = undefined;
+        var writer = std.Io.Writer.fixed(&buffer);
+        std.json.Stringify.value(.{
+            .status = "ok",
+            .version = self.version,
+            .sessions = self.sessionCount(),
+        }, .{}, &writer) catch {
+            writeSimple(fd, "500 Internal Server Error", "application/json", "{\"status\":\"error\"}");
             return;
-        }
+        };
+        writeResponse(fd, "200 OK", "application/json", "Cache-Control: no-store\r\n", writer.buffered());
+    }
+
+    fn route(self: *WebServer, fd: net.Socket, line: RequestLine, head: []const u8, body: []const u8) void {
+        // Token, Host and the CSRF Origin check were settled by `admit` before
+        // the body was read; see the module header.
         if (std.mem.eql(u8, line.method, "GET") and std.mem.eql(u8, line.path, "/")) {
             // 落地页:root_fn 覆盖(多 session 诚实落地页)优先,否则内嵌单 session SPA。
             if (self.deps.root_fn) |rf| {
@@ -260,7 +435,7 @@ pub const WebServer = struct {
                 writeSimple(fd, "404 Not Found", "application/json", "{\"error\":\"session path required (/s/<id>/...)\"}");
                 return;
             };
-            sv = r(self.deps.resolver_ctx, sp.id) orelse {
+            sv = r.resolve(r.ctx, sp.id) orelse {
                 writeSimple(fd, "404 Not Found", "application/json", "{\"error\":\"unknown session\"}");
                 return;
             };
@@ -426,9 +601,110 @@ pub const WebServer = struct {
     }
 };
 
-/// CSRF 门:POST 的 Origin 必须是本机同源(http://127.0.0.1:<port> 或 localhost),
-/// 或无 Origin(非浏览器客户端)。返回 true=放行。
-/// 只做前缀+端口精确匹配,不解析 URL——Origin 无路径,形如 "scheme://host:port"。
+/// The admission order of the module header: `/health`, token, Host, then
+/// the CSRF Origin check for POST. Pure over the head, so the server can call
+/// it before reading a body and tests can call it without a socket.
+pub fn admit(line: RequestLine, head: []const u8, access: Access) Admission {
+    if (std.mem.eql(u8, line.method, "GET") and std.mem.eql(u8, line.path, "/health")) return .health;
+    if (access.token) |token| {
+        if (!authorized(line, head, token)) return .unauthorized;
+    }
+    if (!hostAllowed(head, access.host, access.port)) return .host_rejected;
+    if (std.mem.eql(u8, line.method, "POST") and !originAllowed(head, access.port)) return .cross_origin;
+    return .admitted;
+}
+
+/// Whether the request presents `token`: `Authorization: Bearer <token>` on
+/// any method, or `?token=<token>` (percent-encoded) on a GET. A POST cannot
+/// authenticate by query, so a token never needs to sit in a form or a link
+/// that changes state.
+pub fn authorized(line: RequestLine, head: []const u8, token: []const u8) bool {
+    if (headerValue(head, "authorization")) |value| {
+        if (bearerCredential(value)) |credential| {
+            if (http.constantTimeEql(credential, token)) return true;
+        }
+    }
+    if (!std.mem.eql(u8, line.method, "GET")) return false;
+    const encoded = queryParam(line.query, "token") orelse return false;
+    var buffer: [MAX_TOKEN_LEN]u8 = undefined;
+    const presented = http.percentDecode(encoded, &buffer) orelse return false;
+    return http.constantTimeEql(presented, token);
+}
+
+/// The credential of an `Authorization: Bearer <credential>` value (scheme
+/// case-insensitive, RFC 6750); null for any other scheme or an empty one.
+fn bearerCredential(value: []const u8) ?[]const u8 {
+    const scheme = "bearer";
+    if (value.len <= scheme.len or !std.ascii.eqlIgnoreCase(value[0..scheme.len], scheme)) return null;
+    if (value[scheme.len] != ' ' and value[scheme.len] != '\t') return null;
+    const credential = std.mem.trim(u8, value[scheme.len..], " \t");
+    return if (credential.len == 0) null else credential;
+}
+
+/// DNS-rebinding gate (module header, step 3). `port` is the listening port.
+pub fn hostAllowed(head: []const u8, policy: HostPolicy, port: u16) bool {
+    if (policy == .any) return true;
+    // Every browser sends Host; a request without one is not a browser, and
+    // so not a page that a rebound DNS name pointed here.
+    const host = headerValue(head, "host") orelse return true;
+    const authority = splitAuthority(host) orelse return false;
+    if (authority.port) |named| {
+        if (named != port) return false;
+    }
+    if (std.ascii.eqlIgnoreCase(authority.name, "localhost")) return true;
+    const literal = net.parseIpLiteral(authority.name, 0) catch return false;
+    if (net.isLoopbackAddress(literal)) return true;
+    return policy == .loopback_or_ip_literal;
+}
+
+/// `name[:port]` or `[v6]:port` → name (brackets kept) and port. Null when
+/// malformed: an empty name, a non-numeric port, an unbracketed IPv6 literal.
+fn splitAuthority(host: []const u8) ?struct { name: []const u8, port: ?u16 } {
+    var name = host;
+    var port_text: ?[]const u8 = null;
+    if (std.mem.startsWith(u8, host, "[")) {
+        const close = std.mem.indexOfScalar(u8, host, ']') orelse return null;
+        name = host[0 .. close + 1];
+        const rest = host[close + 1 ..];
+        if (rest.len > 0) {
+            if (rest[0] != ':') return null;
+            port_text = rest[1..];
+        }
+    } else if (std.mem.indexOfScalar(u8, host, ':')) |colon| {
+        name = host[0..colon];
+        port_text = host[colon + 1 ..];
+    }
+    if (name.len == 0) return null;
+    const port: ?u16 = if (port_text) |text| (std.fmt.parseInt(u16, text, 10) catch return null) else null;
+    return .{ .name = name, .port = port };
+}
+
+/// CSRF 门(POST)。浏览器跨域 POST 强制带 Origin 头——恶意网页
+/// fetch('http://127.0.0.1:<port>/message',{method:'POST'}) 是简单请求、能发出(读不到响应但
+/// 副作用已生效:让模型跑命令、抢答权限对话框)。同源 = Origin 正是请求所发往的 Host 的源
+/// (`http://<Host>`,或 TLS 终结代理后的 `https://<Host>`);Host 已由 `hostAllowed` 把关。
+/// 无 Origin(curl/非浏览器 CLI)放行——浏览器一定带,缺失即非浏览器。无 Host 却带 Origin
+/// (HTTP/1.0 客户端)只认监听端口的回环源。读端点(GET /events /state)靠浏览器 CORS 挡:
+/// 不发 CORS 头 → 跨域读不到响应。返回 true=放行。
+pub fn originAllowed(head: []const u8, port: u16) bool {
+    const origin = headerValue(head, "origin") orelse return true;
+    if (headerValue(head, "host")) |host| {
+        if (host.len == 0) return false;
+        inline for (.{ "http://", "https://" }) |scheme| {
+            if (origin.len == scheme.len + host.len and
+                std.ascii.startsWithIgnoreCase(origin, scheme) and
+                std.ascii.eqlIgnoreCase(origin[scheme.len..], host)) return true;
+        }
+        return false;
+    }
+    inline for (.{ "127.0.0.1", "localhost", "[::1]" }) |name| {
+        var buffer: [64]u8 = undefined;
+        const loopback_origin = std.fmt.bufPrint(&buffer, "http://" ++ name ++ ":{d}", .{port}) catch return false;
+        if (std.mem.eql(u8, origin, loopback_origin)) return true;
+    }
+    return false;
+}
+
 /// U10-C:从 `/s/<id>/rest` 解析 {id, rest}(rest 含前导 /)。非此前缀 / id 空 / 无 rest → null。
 pub fn parseSessionPrefix(path: []const u8) ?struct { id: []const u8, rest: []const u8 } {
     const pfx = "/s/";
@@ -437,16 +713,6 @@ pub fn parseSessionPrefix(path: []const u8) ?struct { id: []const u8, rest: []co
     const slash = std.mem.indexOfScalar(u8, after, '/') orelse return null; // 必须有 id 后的 /rest
     if (slash == 0) return null; // 空 id
     return .{ .id = after[0..slash], .rest = after[slash..] };
-}
-
-pub fn originAllowed(head: []const u8, port: u16) bool {
-    const origin = headerValue(head, "origin") orelse return true; // 无 Origin=非浏览器,放行
-    var buf: [64]u8 = undefined;
-    const o1 = std.fmt.bufPrint(&buf, "http://127.0.0.1:{d}", .{port}) catch return false;
-    if (std.mem.eql(u8, origin, o1)) return true;
-    var buf2: [64]u8 = undefined;
-    const o2 = std.fmt.bufPrint(&buf2, "http://localhost:{d}", .{port}) catch return false;
-    return std.mem.eql(u8, origin, o2);
 }
 
 /// SSE 游标来源优先级:?since=N(&epoch=E) > Last-Event-ID 头 > 0。解析与续接判定在
@@ -499,10 +765,36 @@ pub fn extractRespondId(body: []const u8) ?u64 {
     };
 }
 
+/// After a refusal sent from the head alone, take in and drop what is left of
+/// a small declared body before the connection closes: closing with unread
+/// input makes the kernel reset the connection, and the peer could lose the
+/// refusal it was about to read. Bounded (64 KiB, 1 s) and never kept, so a
+/// peer that has not been admitted still cannot make the server buffer or
+/// wait for a body of its choosing.
+fn discardDeclaredBody(fd: net.Socket, received: usize, declared: usize) void {
+    const max_bytes: usize = 64 * 1024;
+    if (declared <= received or declared > max_bytes) return;
+    const deadline = time.nowMs() +| 1000;
+    net.setRecvTimeoutMs(fd, 1000);
+    var scratch: [4096]u8 = undefined;
+    var left = declared - received;
+    while (left > 0 and time.nowMs() < deadline) {
+        const n = net.recv(fd, scratch[0..@min(left, scratch.len)]);
+        if (n <= 0) return;
+        left -|= @intCast(n);
+    }
+}
+
 fn writeSimple(fd: net.Socket, comptime status: []const u8, comptime content_type: []const u8, body: []const u8) void {
+    writeResponse(fd, status, content_type, "", body);
+}
+
+/// `extra_headers`: complete `Name: value\r\n` lines, or "".
+fn writeResponse(fd: net.Socket, comptime status: []const u8, comptime content_type: []const u8, comptime extra_headers: []const u8, body: []const u8) void {
     var head_buf: [256]u8 = undefined;
     const head = std.fmt.bufPrint(&head_buf, "HTTP/1.1 " ++ status ++ "\r\n" ++
         "Content-Type: " ++ content_type ++ "\r\n" ++
+        extra_headers ++
         "Content-Length: {d}\r\n" ++
         "Connection: close\r\n\r\n", .{body.len}) catch return;
     if (!writeAll(fd, head)) return;
@@ -524,6 +816,7 @@ fn writeAll(fd: net.Socket, bytes: []const u8) bool {
 // ============================================================================
 
 const testing = std.testing;
+const TEST_VERSION = "0.0.0-test";
 
 test "parseRequestLine: 方法/路径/query 拆分" {
     const l = parseRequestLine("GET /events?since=42 HTTP/1.1\r\nHost: x").?;
@@ -554,16 +847,136 @@ test "U10-C: parseSessionPrefix 拆 /s/<id>/rest(边界)" {
 test "originAllowed: 同源放行 / 无 Origin 放行(CLI)/ 跨域拒绝(CSRF)" {
     // 无 Origin(curl):放行
     try testing.expect(originAllowed("POST /message HTTP/1.1\r\nHost: x", 7777));
-    // 同源 127.0.0.1:放行
+    // 无 Host 时只认监听端口的回环源:127.0.0.1 / localhost / [::1]
     try testing.expect(originAllowed("POST /m HTTP/1.1\r\nOrigin: http://127.0.0.1:7777", 7777));
-    // 同源 localhost:放行
     try testing.expect(originAllowed("POST /m HTTP/1.1\r\nOrigin: http://localhost:7777", 7777));
+    try testing.expect(originAllowed("POST /m HTTP/1.1\r\nOrigin: http://[::1]:7777", 7777));
     // 跨域恶意页:拒绝(CSRF 防线)
     try testing.expect(!originAllowed("POST /m HTTP/1.1\r\nOrigin: http://evil.com", 7777));
     // 同 host 错端口:拒绝(端口精确匹配)
     try testing.expect(!originAllowed("POST /m HTTP/1.1\r\nOrigin: http://127.0.0.1:1234", 7777));
-    // https 混淆:拒绝(scheme 精确)
+    // 无 Host 时 https 混淆:拒绝(scheme 精确)
     try testing.expect(!originAllowed("POST /m HTTP/1.1\r\nOrigin: https://127.0.0.1:7777", 7777));
+}
+
+test "originAllowed with a Host: same origin is Origin == scheme://Host, anything else is cross-origin" {
+    // The bound host forms, including IPv6 and a non-loopback bind reached by address.
+    try testing.expect(originAllowed("POST /m HTTP/1.1\r\nHost: [::1]:7777\r\nOrigin: http://[::1]:7777", 7777));
+    try testing.expect(originAllowed("POST /m HTTP/1.1\r\nHost: 10.0.0.5:7777\r\nOrigin: http://10.0.0.5:7777", 7777));
+    try testing.expect(originAllowed("POST /m HTTP/1.1\r\nHost: LOCALHOST:7777\r\nOrigin: http://localhost:7777", 7777));
+    // A TLS-terminating proxy: the page is https, the hop to us is not.
+    try testing.expect(originAllowed("POST /m HTTP/1.1\r\nHost: gw.example.com\r\nOrigin: https://gw.example.com", 7777));
+    // A page elsewhere posting here: Origin names its own host, not ours.
+    try testing.expect(!originAllowed("POST /m HTTP/1.1\r\nHost: 127.0.0.1:7777\r\nOrigin: http://evil.com", 7777));
+    try testing.expect(!originAllowed("POST /m HTTP/1.1\r\nHost: 127.0.0.1:7777\r\nOrigin: http://127.0.0.1:7778", 7777));
+    try testing.expect(!originAllowed("POST /m HTTP/1.1\r\nHost: 127.0.0.1:7777\r\nOrigin: null", 7777));
+    try testing.expect(!originAllowed("POST /m HTTP/1.1\r\nHost: 127.0.0.1:7777\r\nOrigin: ftp://127.0.0.1:7777", 7777));
+    try testing.expect(!originAllowed("POST /m HTTP/1.1\r\nHost: 127.0.0.1:7777\r\nOrigin: http://127.0.0.1:7777/x", 7777));
+    try testing.expect(!originAllowed("POST /m HTTP/1.1\r\nHost: \r\nOrigin: http://", 7777));
+}
+
+test "hostAllowed: loopback names only without a token; IP literals on a non-loopback bind; anything with one" {
+    const loopback_ok = [_][]const u8{ "127.0.0.1:7777", "127.0.0.1", "localhost:7777", "LocalHost", "[::1]:7777", "[::1]" };
+    for (loopback_ok) |host| {
+        var buffer: [96]u8 = undefined;
+        const head = try std.fmt.bufPrint(&buffer, "GET /state HTTP/1.1\r\nHost: {s}", .{host});
+        try testing.expect(hostAllowed(head, .loopback, 7777));
+        try testing.expect(hostAllowed(head, .loopback_or_ip_literal, 7777));
+    }
+    // A rebound DNS name, a wrong port, a non-loopback address, malformed authorities.
+    const rejected = [_][]const u8{ "evil.com:7777", "evil.com", "localhost.evil.com:7777", "127.0.0.1:1234", "localhost:", "[::1", "::1:7777", ":7777", "10.0.0.5:7777", "0.0.0.0:7777", "" };
+    for (rejected) |host| {
+        var buffer: [96]u8 = undefined;
+        const head = try std.fmt.bufPrint(&buffer, "GET /state HTTP/1.1\r\nHost: {s}", .{host});
+        try testing.expect(!hostAllowed(head, .loopback, 7777));
+        try testing.expect(hostAllowed(head, .any, 7777));
+    }
+    // Reached over the network by address: an IP literal cannot be rebound; a name can.
+    try testing.expect(hostAllowed("GET / HTTP/1.1\r\nHost: 10.0.0.5:7777", .loopback_or_ip_literal, 7777));
+    try testing.expect(hostAllowed("GET / HTTP/1.1\r\nHost: [2001:db8::1]:7777", .loopback_or_ip_literal, 7777));
+    try testing.expect(!hostAllowed("GET / HTTP/1.1\r\nHost: evil.com:7777", .loopback_or_ip_literal, 7777));
+    try testing.expect(!hostAllowed("GET / HTTP/1.1\r\nHost: 10.0.0.5:1234", .loopback_or_ip_literal, 7777));
+    // No Host header: not a browser.
+    try testing.expect(hostAllowed("GET / HTTP/1.1", .loopback, 7777));
+}
+
+test "HostPolicy.of: a token frees Host; otherwise the bind decides" {
+    try testing.expectEqual(HostPolicy.any, HostPolicy.of(net.loopback(0), "t"));
+    try testing.expectEqual(HostPolicy.any, HostPolicy.of(try net.parseIpLiteral("0.0.0.0", 0), "t"));
+    try testing.expectEqual(HostPolicy.loopback, HostPolicy.of(net.loopback(0), null));
+    try testing.expectEqual(HostPolicy.loopback, HostPolicy.of(try net.parseIpLiteral("::1", 0), null));
+    try testing.expectEqual(HostPolicy.loopback_or_ip_literal, HostPolicy.of(try net.parseIpLiteral("::", 0), null));
+}
+
+test "checkExposure: a non-loopback bind needs a token or --web-allow-unauth" {
+    const lan = try net.parseIpLiteral("192.168.1.5", 0);
+    for ([_][]const u8{ "0.0.0.0", "::", "192.168.1.5", "2001:db8::1" }) |text| {
+        const address = try net.parseIpLiteral(text, 7777);
+        try testing.expectError(error.UnauthenticatedNonLoopback, checkExposure(address, null, false));
+        try checkExposure(address, "token", false);
+        try checkExposure(address, null, true);
+    }
+    for ([_][]const u8{ "127.0.0.1", "127.0.0.2", "::1" }) |text| {
+        try checkExposure(try net.parseIpLiteral(text, 7777), null, false);
+    }
+    try checkExposure(lan, "token", true);
+}
+
+test "validateToken: 1..MAX visible ASCII bytes" {
+    try validateToken("a");
+    try validateToken("Zm9vYmFy-_.~!$&'()*+,;=:@/?#[]%");
+    try validateToken("x" ** MAX_TOKEN_LEN);
+    try testing.expectError(error.EmptyToken, validateToken(""));
+    try testing.expectError(error.TokenTooLong, validateToken("x" ** (MAX_TOKEN_LEN + 1)));
+    try testing.expectError(error.TokenCharset, validateToken("has space"));
+    try testing.expectError(error.TokenCharset, validateToken("tab\there"));
+    try testing.expectError(error.TokenCharset, validateToken("line\r\nX-Injected: 1"));
+    try testing.expectError(error.TokenCharset, validateToken("caf\xc3\xa9"));
+}
+
+test "admit: /health first, then token, Host and the POST Origin check" {
+    const open: Access = .{ .token = null, .host = .loopback, .port = 7777 };
+    const locked: Access = .{ .token = "s3cret", .host = .any, .port = 7777 };
+    const Case = struct { request: []const u8, access: Access, verdict: Admission };
+    const cases = [_]Case{
+        // /health never asks for anything, not even a sane Host.
+        .{ .request = "GET /health HTTP/1.1\r\nHost: evil.com", .access = open, .verdict = .health },
+        .{ .request = "GET /health HTTP/1.1", .access = locked, .verdict = .health },
+        .{ .request = "GET /health?probe=1 HTTP/1.1", .access = locked, .verdict = .health },
+        // Only GET /health is the probe.
+        .{ .request = "POST /health HTTP/1.1", .access = locked, .verdict = .unauthorized },
+        .{ .request = "GET /s/abc/health HTTP/1.1", .access = locked, .verdict = .unauthorized },
+        // Token: header on any method; query on GET only.
+        .{ .request = "GET /state HTTP/1.1", .access = locked, .verdict = .unauthorized },
+        .{ .request = "GET /state HTTP/1.1\r\nAuthorization: Bearer wrong!", .access = locked, .verdict = .unauthorized },
+        .{ .request = "GET /state HTTP/1.1\r\nAuthorization: Bearer s3cret", .access = locked, .verdict = .admitted },
+        .{ .request = "GET /state HTTP/1.1\r\nAuthorization: bearer   s3cret ", .access = locked, .verdict = .admitted },
+        .{ .request = "GET /state HTTP/1.1\r\nAuthorization: Basic s3cret", .access = locked, .verdict = .unauthorized },
+        .{ .request = "GET /state HTTP/1.1\r\nAuthorization: Bearers3cret", .access = locked, .verdict = .unauthorized },
+        .{ .request = "GET /state HTTP/1.1\r\nAuthorization: s3cret", .access = locked, .verdict = .unauthorized },
+        .{ .request = "GET /events?since=0&token=s3cret HTTP/1.1", .access = locked, .verdict = .admitted },
+        .{ .request = "GET /events?token=s3cre%74 HTTP/1.1", .access = locked, .verdict = .admitted },
+        .{ .request = "GET /events?token=s3cre HTTP/1.1", .access = locked, .verdict = .unauthorized },
+        .{ .request = "GET /events?token=%zz HTTP/1.1", .access = locked, .verdict = .unauthorized },
+        .{ .request = "POST /message?token=s3cret HTTP/1.1", .access = locked, .verdict = .unauthorized },
+        .{ .request = "POST /message HTTP/1.1\r\nAuthorization: Bearer s3cret", .access = locked, .verdict = .admitted },
+        // A valid token does not excuse a cross-origin POST.
+        .{ .request = "POST /message HTTP/1.1\r\nHost: 127.0.0.1:7777\r\nAuthorization: Bearer s3cret\r\nOrigin: http://evil.com", .access = locked, .verdict = .cross_origin },
+        // With a token Host is free; without one it must be a loopback name.
+        .{ .request = "GET /state HTTP/1.1\r\nHost: metacodes.internal:8080\r\nAuthorization: Bearer s3cret", .access = locked, .verdict = .admitted },
+        .{ .request = "GET /state HTTP/1.1\r\nHost: evil.com:7777", .access = open, .verdict = .host_rejected },
+        .{ .request = "GET /state HTTP/1.1\r\nHost: localhost:7777", .access = open, .verdict = .admitted },
+        // No token configured: today's behaviour, a query token is just ignored.
+        .{ .request = "GET /state HTTP/1.1", .access = open, .verdict = .admitted },
+        .{ .request = "POST /message HTTP/1.1\r\nOrigin: http://evil.com", .access = open, .verdict = .cross_origin },
+    };
+    for (cases) |case| {
+        const line = parseRequestLine(case.request).?;
+        testing.expectEqual(case.verdict, admit(line, case.request, case.access)) catch |err| {
+            std.debug.print("request: {s}\n", .{case.request});
+            return err;
+        };
+    }
 }
 
 test "resolveCursor: ?since 优先于 Last-Event-ID;都无 = 从头" {
@@ -601,7 +1014,7 @@ test "loopback: /message 入队(不回显), /state 快照, 404" {
         }
     };
     var dummy: u8 = 0;
-    const srv = try WebServer.start(testing.allocator, 0, .{
+    const srv = try WebServer.start(testing.allocator, .{ .version = TEST_VERSION }, .{
         .journal = &j,
         .web_backend = &wb,
         .inbox = &inbox,
@@ -668,7 +1081,7 @@ test "loopback: /interrupt 打 abort;/respond 无挂起 409" {
         }
     };
     var dummy: u8 = 0;
-    const srv = try WebServer.start(testing.allocator, 0, .{
+    const srv = try WebServer.start(testing.allocator, .{ .version = TEST_VERSION }, .{
         .journal = &j,
         .web_backend = &wb,
         .inbox = &inbox,
@@ -707,7 +1120,7 @@ test "loopback: SSE 重放已有事件(带 id 帧)" {
         }
     };
     var dummy: u8 = 0;
-    const srv = try WebServer.start(testing.allocator, 0, .{
+    const srv = try WebServer.start(testing.allocator, .{ .version = TEST_VERSION }, .{
         .journal = &j,
         .web_backend = &wb,
         .inbox = &inbox,

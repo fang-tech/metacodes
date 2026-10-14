@@ -173,7 +173,7 @@ test "L2: end-of-run evolution proposes and the next run arms the provisional ru
     defer server.stop();
     const url = try server.urlOwned(a);
     defer a.free(url);
-    var io_runtime = std.Io.Threaded.init(a, .{});
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
     defer io_runtime.deinit();
     var client = cc.client_mod.Client.initWithBaseUrl(a, io_runtime.io(), "author-key", "test-model", url);
     defer client.deinit();
@@ -497,7 +497,7 @@ test "L2: author obligation proposal lands as an envelope the same task collects
     defer server.stop();
     const url = try server.urlOwned(a);
     defer a.free(url);
-    var io_runtime = std.Io.Threaded.init(a, .{});
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
     defer io_runtime.deinit();
     var client = cc.client_mod.Client.initWithBaseUrl(a, io_runtime.io(), "author-key", "test-model", url);
     defer client.deinit();

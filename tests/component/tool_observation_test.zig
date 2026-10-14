@@ -151,7 +151,7 @@ test "L2 actual tool observation is independent of UI projection and depth" {
     defer server.stop();
     const url = try server.urlOwned(allocator);
     defer allocator.free(url);
-    var io_runtime = std.Io.Threaded.init(allocator, .{});
+    var io_runtime = @import("platform").signal.threadedIo(allocator, .{});
     defer io_runtime.deinit();
     var client = cc.client_mod.Client.initWithBaseUrl(
         allocator,
@@ -285,7 +285,7 @@ test "L2 builtin replay declaration reaches durable dispatch intent" {
     defer server.stop();
     const url = try server.urlOwned(allocator);
     defer allocator.free(url);
-    var io_runtime = std.Io.Threaded.init(allocator, .{});
+    var io_runtime = @import("platform").signal.threadedIo(allocator, .{});
     defer io_runtime.deinit();
     var client = cc.client_mod.Client.initWithBaseUrl(
         allocator,

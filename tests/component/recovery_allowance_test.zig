@@ -204,7 +204,7 @@ const Run = struct {
 /// harness model maps to the 200K window (`Budget.fromModel(200_000)`:
 /// per_result 25,000, per_turn 204,800, allowance 102,400).
 fn runTurns(allocator: std.mem.Allocator, fixture: *const Fixture, url: []const u8, run: *Run, max_turns: u32) !void {
-    run.io_runtime = std.Io.Threaded.init(allocator, .{});
+    run.io_runtime = @import("platform").signal.threadedIo(allocator, .{});
     run.client = cc.client_mod.Client.initWithBaseUrl(allocator, run.io_runtime.io(), "test-key", "claude-sonnet-4-20250514", url);
     run.conversation = cc.conversation.Conversation.init(allocator);
     try run.conversation.appendText(.user, "recover the artifact in parallel");

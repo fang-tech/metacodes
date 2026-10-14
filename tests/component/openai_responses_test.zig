@@ -236,7 +236,7 @@ test "Responses(a): agent_loop e2e 文本流 → end_turn;请求是 input/instru
     const url = try srv.urlOwned(a);
     defer a.free(url);
 
-    var io_rt = std.Io.Threaded.init(a, .{});
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
     defer io_rt.deinit();
     var client = initResponsesClient(a, io_rt.io(), "gpt-5.2", url);
     defer client.deinit();
@@ -289,7 +289,7 @@ test "Responses(b): function_call 闭环 → 第二请求含 function_call_outpu
     const url = try srv.urlOwned(a);
     defer a.free(url);
 
-    var io_rt = std.Io.Threaded.init(a, .{});
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
     defer io_rt.deinit();
     var client = initResponsesClient(a, io_rt.io(), "gpt-5.2", url);
     defer client.deinit();
@@ -351,7 +351,7 @@ test "Responses(c): usage 归一(input 减 cached)+ 补发 .done + stopReason=en
     const url = try srv.urlOwned(a);
     defer a.free(url);
 
-    var io_rt = std.Io.Threaded.init(a, .{});
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
     defer io_rt.deinit();
     var client = initResponsesClient(a, io_rt.io(), "gpt-5.2", url);
     defer client.deinit();
@@ -379,6 +379,91 @@ test "Responses(c): usage 归一(input 减 cached)+ 补发 .done + stopReason=en
     try std.testing.expectEqual(cc.api_stream.StopReason.end_turn, handle.stopReason());
 }
 
+// ── (c2) issue #258:usage 只在 response.usage 是 object 时计,只从该对象读 ─────────
+
+// 终止事件 `response.usage` 为 null:旧实现照样发一个全零 usage,把"未计量"报成
+// "已计量为 0"。修复后 Host 收不到 usage 事件,文本与 stop 不受影响。
+const RESPONSES_NULL_USAGE_SSE =
+    "event: response.created\n" ++
+    "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_n\",\"status\":\"in_progress\",\"usage\":null}}\n\n" ++
+    "event: response.output_text.delta\n" ++
+    "data: {\"type\":\"response.output_text.delta\",\"item_id\":\"msg_1\",\"output_index\":0,\"delta\":\"hi\"}\n\n" ++
+    "event: response.completed\n" ++
+    "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_n\",\"status\":\"completed\",\"usage\":null}}\n\n";
+
+// 终止事件的 response 回显 tools,其参数 schema 恰有 input_tokens/output_tokens/cached_tokens
+// 属性,且排在 usage 之前。旧实现扫整个事件取首个同名键,读出 0。
+const RESPONSES_TOOLS_ECHO_USAGE_SSE =
+    "event: response.output_text.delta\n" ++
+    "data: {\"type\":\"response.output_text.delta\",\"item_id\":\"msg_1\",\"output_index\":0,\"delta\":\"hi\"}\n\n" ++
+    "event: response.completed\n" ++
+    "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_t\",\"status\":\"completed\"," ++
+    "\"tools\":[{\"type\":\"function\",\"name\":\"count\",\"parameters\":{\"type\":\"object\",\"properties\":" ++
+    "{\"input_tokens\":{\"type\":\"integer\"},\"output_tokens\":{\"type\":\"integer\"},\"cached_tokens\":{\"type\":\"integer\"}}}}]," ++
+    "\"usage\":{\"input_tokens\":2006,\"input_tokens_details\":{\"cached_tokens\":1920},\"output_tokens\":10}}}\n\n";
+
+const UsageCapture = struct {
+    allocator: std.mem.Allocator,
+    text: std.ArrayList(u8) = .empty,
+    usages: std.ArrayList(cc.api_stream.UsageDelta) = .empty,
+
+    fn emit(ctx: *anyopaque, _: cc.session_id.SessionId, ev: cc.ui_backend.CoreEvent) void {
+        const self: *UsageCapture = @ptrCast(@alignCast(ctx));
+        switch (ev) {
+            .text_chunk => |t| self.text.appendSlice(self.allocator, t) catch @panic("capture OOM"),
+            .usage => |u| self.usages.append(self.allocator, u) catch @panic("capture OOM"),
+            else => {},
+        }
+    }
+    fn poll(_: *anyopaque, _: cc.session_id.SessionId) ?cc.ui_event.UiEvent {
+        return null;
+    }
+};
+
+test "issue #258 Responses L2: response.usage null → Host 无 usage 事件;有对象 → 数值只从对象读" {
+    const a = std.testing.allocator;
+    const Case = struct { sse: []const u8, usages: []const cc.api_stream.UsageDelta, anchor: ?usize };
+    const cases = [_]Case{
+        .{ .sse = RESPONSES_NULL_USAGE_SSE, .usages = &.{}, .anchor = null },
+        .{
+            .sse = RESPONSES_TOOLS_ECHO_USAGE_SSE,
+            .usages = &.{.{ .input_tokens = 86, .output_tokens = 10, .cache_read_input_tokens = 1920 }},
+            .anchor = 2006,
+        },
+    };
+    for (cases) |case| {
+        var srv = try harness.MockServer.startCassette(&[_][]const u8{case.sse}, 0);
+        defer srv.stop();
+        const url = try srv.urlOwned(a);
+        defer a.free(url);
+
+        var io_rt = @import("platform").signal.threadedIo(a, .{});
+        defer io_rt.deinit();
+        var client = initResponsesClient(a, io_rt.io(), "gpt-5.2", url);
+        defer client.deinit();
+
+        var conv = cc.conversation.Conversation.init(a);
+        defer conv.deinit();
+        try conv.appendText(.user, "hi");
+        const perm = cc.permission.createContext(.bypass_permissions, a);
+        const empty_defs: []const cc.json_mod.ToolDefinition = &.{};
+        var cap = UsageCapture{ .allocator = a };
+        defer cap.text.deinit(a);
+        defer cap.usages.deinit(a);
+        const be = cc.ui_backend.UiBackend{ .ctx = @ptrCast(&cap), .emit = UsageCapture.emit, .poll = UsageCapture.poll };
+
+        const result = try agent_loop.run(&conv, client.provider(), empty_defs, &perm, .{ .max_turns = 2 }, &be, a);
+        try std.testing.expectEqual(agent_loop.StopReason.end_turn, result.stop_reason);
+        try std.testing.expectEqualStrings("hi", cap.text.items);
+        try std.testing.expectEqualSlices(cc.api_stream.UsageDelta, case.usages, cap.usages.items);
+        if (case.anchor) |tokens| {
+            try std.testing.expectEqual(tokens, conv.usageAnchor().?.context_tokens);
+        } else {
+            try std.testing.expect(conv.usageAnchor() == null);
+        }
+    }
+}
+
 // ── (d) incomplete → max_tokens ──────────────────────────────────────────────
 
 test "Responses(d): response.incomplete reason=max_output_tokens → stopReason=max_tokens" {
@@ -388,7 +473,7 @@ test "Responses(d): response.incomplete reason=max_output_tokens → stopReason=
     const url = try srv.urlOwned(a);
     defer a.free(url);
 
-    var io_rt = std.Io.Threaded.init(a, .{});
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
     defer io_rt.deinit();
     var client = initResponsesClient(a, io_rt.io(), "gpt-5.2", url);
     defer client.deinit();
@@ -423,7 +508,7 @@ test "Responses(e): response.failed 与流级 error 事件都上抛 RequestFaile
         const url = try srv.urlOwned(a);
         defer a.free(url);
 
-        var io_rt = std.Io.Threaded.init(a, .{});
+        var io_rt = @import("platform").signal.threadedIo(a, .{});
         defer io_rt.deinit();
         var client = initResponsesClient(a, io_rt.io(), "gpt-5.2", url);
         defer client.deinit();
@@ -453,7 +538,7 @@ test "Responses(f): output_text.delta 解除 JSON 转义(真实换行进 .text)"
     const url = try srv.urlOwned(a);
     defer a.free(url);
 
-    var io_rt = std.Io.Threaded.init(a, .{});
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
     defer io_rt.deinit();
     var client = initResponsesClient(a, io_rt.io(), "gpt-5.2", url);
     defer client.deinit();
@@ -598,7 +683,7 @@ test "Responses(h): >8KB SSE 行走 line_overflow 慢路径,完整吐文本且�
     const url = try srv.urlOwned(a);
     defer a.free(url);
 
-    var io_rt = std.Io.Threaded.init(a, .{});
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
     defer io_rt.deinit();
     var client = initResponsesClient(a, io_rt.io(), "gpt-5.2", url);
     defer client.deinit();
@@ -634,7 +719,7 @@ test "Responses(i): \\ud83c/\\udf89 拆进两个 arguments delta → 终值是�
     const url = try srv.urlOwned(a);
     defer a.free(url);
 
-    var io_rt = std.Io.Threaded.init(a, .{});
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
     defer io_rt.deinit();
     var client = initResponsesClient(a, io_rt.io(), "gpt-5.2", url);
     defer client.deinit();
@@ -672,7 +757,7 @@ test "Responses(j): item 序列化在 type 前的 output_item.added 仍注册 fu
     const url = try srv.urlOwned(a);
     defer a.free(url);
 
-    var io_rt = std.Io.Threaded.init(a, .{});
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
     defer io_rt.deinit();
     var client = initResponsesClient(a, io_rt.io(), "gpt-5.2", url);
     defer client.deinit();
@@ -708,7 +793,7 @@ test "Responses(k): 文本与两个 function_call 交错流,分槽 call_id/argum
     const url = try srv.urlOwned(a);
     defer a.free(url);
 
-    var io_rt = std.Io.Threaded.init(a, .{});
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
     defer io_rt.deinit();
     var client = initResponsesClient(a, io_rt.io(), "gpt-5.2", url);
     defer client.deinit();
@@ -790,7 +875,7 @@ test "Responses(i): 工具续跑的第二请求回放 reasoning item(id/summary/
     const url = try srv.urlOwned(a);
     defer a.free(url);
 
-    var io_rt = std.Io.Threaded.init(a, .{});
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
     defer io_rt.deinit();
     var client = initResponsesClient(a, io_rt.io(), "gpt-5.2", url);
     defer client.deinit();
@@ -858,7 +943,7 @@ test "Responses(i2): reasoning item 只出现在终止事件的 output 里时同
     const url = try srv.urlOwned(a);
     defer a.free(url);
 
-    var io_rt = std.Io.Threaded.init(a, .{});
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
     defer io_rt.deinit();
     var client = initResponsesClient(a, io_rt.io(), "gpt-5.2", url);
     defer client.deinit();
@@ -897,7 +982,7 @@ test "Responses(i3): 无 reasoning 的对照回合 → 第二请求里没有任�
     const url = try srv.urlOwned(a);
     defer a.free(url);
 
-    var io_rt = std.Io.Threaded.init(a, .{});
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
     defer io_rt.deinit();
     var client = initResponsesClient(a, io_rt.io(), "gpt-5.2", url);
     defer client.deinit();
@@ -932,7 +1017,7 @@ test "Responses(i4): 只有 reasoning 的一轮不落进会话(估算与 wire �
     const url = try srv.urlOwned(a);
     defer a.free(url);
 
-    var io_rt = std.Io.Threaded.init(a, .{});
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
     defer io_rt.deinit();
     var client = initResponsesClient(a, io_rt.io(), "gpt-5.2", url);
     defer client.deinit();

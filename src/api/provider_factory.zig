@@ -144,7 +144,7 @@ pub fn makeProviderWithOptions(
     const io_rt = try a.create(std.Io.Threaded);
     errdefer a.destroy(io_rt);
     @import("../util/log.zig").info("mp", "io_rt created, calling Threaded.init", .{});
-    io_rt.* = std.Io.Threaded.init(a, .{});
+    io_rt.* = @import("platform").signal.threadedIo(a, .{});
     errdefer io_rt.deinit();
     @import("../util/log.zig").info("mp", "Threaded.init done, creating client", .{});
 
