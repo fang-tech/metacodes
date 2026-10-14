@@ -82,7 +82,7 @@ pub const Manager = struct {
         const io_runtime = allocator.create(std.Io.Threaded) catch
             return error.OutOfMemory;
         errdefer allocator.destroy(io_runtime);
-        io_runtime.* = std.Io.Threaded.init(allocator, .{});
+        io_runtime.* = @import("platform").signal.threadedIo(allocator, .{});
         errdefer io_runtime.deinit();
         var manager = try initWithPreferredRoot(
             allocator,

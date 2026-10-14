@@ -2346,6 +2346,18 @@ pub fn build(b: *std.Build) void {
     const doc_facts_test_step = b.step("test:doc-facts", "Test documentation fact checks");
     doc_facts_test_step.dependOn(&doc_facts_test_cmd.step);
     test_step.dependOn(&doc_facts_test_cmd.step);
+    // Every std.Io.Threaded goes through platform.signal.threadedIo (SIGPIPE
+    // must stay ignored; see src/platform/signal.zig).
+    const io_threaded_test_cmd = b.addSystemCommand(&.{
+        if (@import("builtin").os.tag == .windows) "python" else "python3",
+        "-m",
+        "unittest",
+        "scripts.tests.test_io_threaded_discipline",
+        "-v",
+    });
+    const io_threaded_test_step = b.step("test:io-threaded", "Test that std.Io.Threaded is created only through platform.signal.threadedIo");
+    io_threaded_test_step.dependOn(&io_threaded_test_cmd.step);
+    test_step.dependOn(&io_threaded_test_cmd.step);
     const gate_manifest_test_cmd = b.addSystemCommand(&.{
         if (@import("builtin").os.tag == .windows) "python" else "python3",
         "-m",
@@ -2727,6 +2739,7 @@ pub fn build(b: *std.Build) void {
     dispatcher_metadata_mod.addImport("harness", test_harness_mod);
     dispatcher_metadata_mod.addImport("metacodes-core", core_mod);
     dispatcher_metadata_mod.addImport("agentcore-abi", agentcore_abi_test_mod);
+    addPlatform(b, dispatcher_metadata_mod);
     const dispatcher_metadata_test = b.addTest(.{
         .name = "tool-dispatcher-metadata",
         .root_module = dispatcher_metadata_mod,

@@ -18,6 +18,7 @@ const EventJournal = cc.event_journal.EventJournal;
 const WebBackend = cc.web_backend.WebBackend;
 const WebServer = cc.web_server.WebServer;
 const MsgQueue = cc.repl_msg_queue.MsgQueue;
+const SubmissionQueue = cc.web_submission.SubmissionQueue;
 
 /// 单 turn 纯文本回复。
 const TEXT_SSE =
@@ -50,7 +51,7 @@ const DONE_SSE =
 const Fixture = struct {
     journal: EventJournal,
     wb: WebBackend,
-    inbox: MsgQueue,
+    inbox: SubmissionQueue,
     sig: cc.util_abort.AbortSignal,
     srv: *WebServer = undefined,
 
@@ -58,7 +59,7 @@ const Fixture = struct {
         return .{
             .journal = EventJournal.init(a),
             .wb = undefined, // 指向 journal,须在定址后接线(见 start)
-            .inbox = MsgQueue.init(a),
+            .inbox = SubmissionQueue.init(a),
             .sig = cc.util_abort.AbortSignal.init(),
         };
     }
@@ -98,7 +99,7 @@ test "L2 web ①: agent_loop 文本流经 WebBackend 落 journal,SSE 读回带 i
     const url = try srv.urlOwned(a);
     defer a.free(url);
 
-    var io_runtime = std.Io.Threaded.init(a, .{});
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
     defer io_runtime.deinit();
     var client = cc.client_mod.Client.initWithBaseUrl(a, io_runtime.io(), "test-key", "m", url);
     defer client.deinit();
@@ -135,7 +136,7 @@ test "L2 web ②: AskUserQuestion 经 HTTP /respond 回填 → 工具拿到答�
     const url = try srv.urlOwned(a);
     defer a.free(url);
 
-    var io_runtime = std.Io.Threaded.init(a, .{});
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
     defer io_runtime.deinit();
     var client = cc.client_mod.Client.initWithBaseUrl(a, io_runtime.io(), "test-key", "m", url);
     defer client.deinit();
@@ -226,7 +227,7 @@ test "L2 web: 跨域 POST 被 403 拒绝(CSRF 防线),同源/无 Origin 放行" 
         defer a.free(resp);
         try std.testing.expect(std.mem.indexOf(u8, resp, "403") != null);
     }
-    try std.testing.expectEqual(@as(?[]u8, null), fx.inbox.popFront()); // 副作用未发生
+    try std.testing.expectEqual(@as(usize, 0), fx.inbox.len()); // 副作用未发生
 
     // 无 Origin(CLI):放行,消息入队
     {
@@ -234,9 +235,9 @@ test "L2 web: 跨域 POST 被 403 拒绝(CSRF 防线),同源/无 Origin 放行" 
         defer a.free(resp);
         try std.testing.expect(std.mem.indexOf(u8, resp, "200 OK") != null);
     }
-    const m = fx.inbox.popFront().?;
-    defer a.free(m);
-    try std.testing.expectEqualStrings("cli", m);
+    var m = fx.inbox.popFront().?;
+    defer m.deinit(a);
+    try std.testing.expectEqualStrings("cli", m.text);
 }
 
 // 命令通道:POST /command → commandFn(只入队,不碰 App)+ extractStringKey。
@@ -255,7 +256,7 @@ test "L2 web: /command 端点经 commandFn 入队 + extractStringKey" {
     defer j.deinit();
     var wb = WebBackend.init(a, &j);
     defer wb.deinit();
-    var inbox = MsgQueue.init(a);
+    var inbox = SubmissionQueue.init(a);
     defer inbox.deinit();
     var cmdbox = MsgQueue.init(a);
     defer cmdbox.deinit();
@@ -388,7 +389,7 @@ test "L2 web: /interrupt 空闲期 409 不打 abort;生成期 200 打 abort" {
     defer j.deinit();
     var wb = WebBackend.init(a, &j);
     defer wb.deinit();
-    var inbox = MsgQueue.init(a);
+    var inbox = SubmissionQueue.init(a);
     defer inbox.deinit();
     var sig = cc.util_abort.AbortSignal.init();
     var generating = std.atomic.Value(bool).init(false);

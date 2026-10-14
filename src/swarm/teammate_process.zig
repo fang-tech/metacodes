@@ -731,6 +731,7 @@ pub fn forkExecTeammate(a: std.mem.Allocator, p: SpawnProcessParams) !i64 {
             _ = std.c.dup2(devnull, 2);
             if (devnull > 2) _ = std.c.close(devnull);
         }
+        @import("platform").signal.defaultBrokenPipeInChild();
         _ = std.c.execve(exe_path_z, @ptrCast(argv.ptr), @ptrCast(std.c.environ));
         std.c._exit(127); // execve 失败
     }

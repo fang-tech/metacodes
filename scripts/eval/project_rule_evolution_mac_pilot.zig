@@ -131,7 +131,7 @@ fn run(init: std.process.Init) !void {
     }};
     const run_binding = try completedFailureRun(session_dir);
 
-    var io_runtime = std.Io.Threaded.init(allocator, .{});
+    var io_runtime = @import("platform").signal.threadedIo(allocator, .{});
     defer io_runtime.deinit();
     var kg = try cc.kg_client.KgClient.init(allocator, .{
         .home = home,

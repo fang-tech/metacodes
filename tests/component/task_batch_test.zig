@@ -26,7 +26,7 @@ test "P1.2 e2e: TaskBatch 对每个 item 展开模板 + spawn 真子 agent,聚�
     const url = try srv.urlOwned(a);
     defer a.free(url);
 
-    var io_rt = std.Io.Threaded.init(a, .{});
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
     defer io_rt.deinit();
     var client = cc.client_mod.Client.initWithBaseUrl(a, io_rt.io(), "k", "claude-3-5-haiku-20241022", url);
     defer client.deinit();
@@ -88,7 +88,7 @@ test "P1.2 e2e: TaskBatch 并发路径(有 registry)真起 N 线程各 spawn 子
     const perm = cc.permission.createContext(.bypass_permissions, a);
     const empty_defs: []const cc.json_mod.ToolDefinition = &.{};
 
-    var io_rt = std.Io.Threaded.init(a, .{});
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
     defer io_rt.deinit();
     var client = cc.client_mod.Client.initWithBaseUrl(a, io_rt.io(), "k", "claude-3-5-haiku-20241022", url);
     defer client.deinit();
@@ -130,7 +130,7 @@ test "P1.2 e2e: 部分失败——一个 item 报错记 error,其它 completed(�
     const url = try srv.urlOwned(a);
     defer a.free(url);
 
-    var io_rt = std.Io.Threaded.init(a, .{});
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
     defer io_rt.deinit();
     var client = cc.client_mod.Client.initWithBaseUrl(a, io_rt.io(), "k", "claude-3-5-haiku-20241022", url);
     defer client.deinit();

@@ -19,7 +19,7 @@ const pnet = @import("platform").net;
 const EventJournal = cc.event_journal.EventJournal;
 const WebBackend = cc.web_backend.WebBackend;
 const WebServer = cc.web_server.WebServer;
-const MsgQueue = cc.repl_msg_queue.MsgQueue;
+const SubmissionQueue = cc.web_submission.SubmissionQueue;
 const Surface = cc.web_server.Surface;
 
 const TOKEN = "t0k3n-for+tests/~";
@@ -59,7 +59,7 @@ const Probe = struct {
 const Fixture = struct {
     journal: EventJournal,
     wb: WebBackend = undefined,
-    inbox: MsgQueue,
+    inbox: SubmissionQueue,
     sig: cc.util_abort.AbortSignal,
     probe: Probe = .{},
     srv: *WebServer = undefined,
@@ -67,7 +67,7 @@ const Fixture = struct {
     fn init(a: std.mem.Allocator) Fixture {
         return .{
             .journal = EventJournal.init(a),
-            .inbox = MsgQueue.init(a),
+            .inbox = SubmissionQueue.init(a),
             .sig = cc.util_abort.AbortSignal.init(),
         };
     }
@@ -108,8 +108,9 @@ const Fixture = struct {
     }
 
     fn inboxEmpty(self: *Fixture) bool {
-        if (self.inbox.popFront()) |m| {
-            self.inbox.allocator.free(m);
+        if (self.inbox.popFront()) |popped| {
+            var m = popped;
+            m.deinit(self.inbox.allocator);
             return false;
         }
         return true;
@@ -240,9 +241,9 @@ test "#252 token: missing or wrong → 401 and no side effect; the right header 
     const accepted = try request(a, port, "POST /message HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer " ++ TOKEN ++ "\r\nContent-Length: 13\r\n\r\n{\"text\":\"ok\"}");
     defer a.free(accepted);
     try std.testing.expect(statusIs(accepted, "200"));
-    const queued = fx.inbox.popFront().?;
-    defer a.free(queued);
-    try std.testing.expectEqualStrings("ok", queued);
+    var queued = fx.inbox.popFront().?;
+    defer queued.deinit(a);
+    try std.testing.expectEqualStrings("ok", queued.text);
 
     // GETs: the header, or the query (the SPA's page load and EventSource).
     for ([_][]const u8{
@@ -354,9 +355,9 @@ test "#252 no token configured: today's behaviour (no header needed, a query tok
     const response = try request(a, fx.srv.port, "POST /message HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 15\r\n\r\n{\"text\":\"open\"}");
     defer a.free(response);
     try std.testing.expect(statusIs(response, "200"));
-    const queued = fx.inbox.popFront().?;
-    defer a.free(queued);
-    try std.testing.expectEqualStrings("open", queued);
+    var queued = fx.inbox.popFront().?;
+    defer queued.deinit(a);
+    try std.testing.expectEqualStrings("open", queued.text);
 
     const state = try request(a, fx.srv.port, "GET /state?token=whatever HTTP/1.1\r\nAuthorization: Bearer whatever\r\n\r\n");
     defer a.free(state);
@@ -417,7 +418,7 @@ test "DNS rebinding: without a token a non-loopback Host is refused, loopback na
 /// Whether this host can listen on [::1], asked of std's own sockets so a
 /// defect in the code under test cannot turn into a skip.
 fn ipv6LoopbackAvailable() bool {
-    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    var threaded = @import("platform").signal.threadedIo(std.testing.allocator, .{});
     defer threaded.deinit();
     const io = threaded.io();
     const address: std.Io.net.IpAddress = .{ .ip6 = .loopback(0) };
@@ -472,9 +473,9 @@ test "#253 bind: an IPv6 literal binds, reports its real port and serves its own
     const posted = try roundtripAt(a, at, post);
     defer a.free(posted);
     try std.testing.expect(statusIs(posted, "200"));
-    const queued = fx.inbox.popFront().?;
-    defer a.free(queued);
-    try std.testing.expectEqualStrings("v6", queued);
+    var queued = fx.inbox.popFront().?;
+    defer queued.deinit(a);
+    try std.testing.expectEqualStrings("v6", queued.text);
 }
 
 test "#253 bind: an explicit IPv4 address binds there and the URL names it" {

@@ -104,6 +104,7 @@ test {
     _ = @import("component/diff_highlight_test.zig");
     _ = @import("component/prompt_override_test.zig");
     _ = @import("component/web_ui_test.zig");
+    _ = @import("component/web_message_config_test.zig");
     _ = @import("component/web_auth_test.zig");
     _ = @import("component/serve_sessions_test.zig");
     _ = @import("component/weak_model_test.zig");

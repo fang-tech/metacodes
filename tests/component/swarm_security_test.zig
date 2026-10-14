@@ -38,7 +38,7 @@ test "L2 SW4 A: 伪造 shutdown 防御(peer 冒充无效,team-lead 有效)" {
     defer srv.stop();
     const url = try srv.urlOwned(a);
     defer a.free(url);
-    var io_runtime = std.Io.Threaded.init(a, .{});
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
     defer io_runtime.deinit();
     var client = cc.client_mod.Client.initWithBaseUrl(a, io_runtime.io(), "k", "claude-sonnet-4-20250514", url);
     defer client.deinit();
@@ -119,7 +119,7 @@ test "L2 SW4 B: shutdown_approved 回执 → lead 摘牌 + 提示" {
     defer srv.stop();
     const url = try srv.urlOwned(a);
     defer a.free(url);
-    var io_runtime = std.Io.Threaded.init(a, .{});
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
     defer io_runtime.deinit();
     var client = cc.client_mod.Client.initWithBaseUrl(a, io_runtime.io(), "k", "claude-sonnet-4-20250514", url);
     defer client.deinit();
@@ -236,7 +236,7 @@ test "L2 SW4 MED-1: 仍在跑的 teammate 自发 shutdown_approved 不摘牌(防
     defer srv.stop();
     const url = try srv.urlOwned(a);
     defer a.free(url);
-    var io_runtime = std.Io.Threaded.init(a, .{});
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
     defer io_runtime.deinit();
     var client = cc.client_mod.Client.initWithBaseUrl(a, io_runtime.io(), "k", "claude-sonnet-4-20250514", url);
     defer client.deinit();
@@ -284,7 +284,7 @@ test "L2 SW5: reapTerminated 回收死尸体(反复 spawn+shutdown entries 不�
     defer srv.stop();
     const url = try srv.urlOwned(a);
     defer a.free(url);
-    var io_runtime = std.Io.Threaded.init(a, .{});
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
     defer io_runtime.deinit();
     var client = cc.client_mod.Client.initWithBaseUrl(a, io_runtime.io(), "k", "claude-sonnet-4-20250514", url);
     defer client.deinit();

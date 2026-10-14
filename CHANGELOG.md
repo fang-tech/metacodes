@@ -83,6 +83,19 @@ status, compatibility boundaries, and entry points are defined by
   non-loopback address without a token exits 2 unless `--web-allow-unauth` is
   given. Normative rules: [doc/API.md](doc/API.md#web-and-daemon-http-surface);
   trust model: [SECURITY.md](SECURITY.md#web-and-daemon-trust-model).
+- A `--web`/`serve` message can carry its turn's configuration (#255):
+  `POST /message` (`/s/<id>/message` under `serve --sessions N`) and the UDS
+  `message` op take optional `model` and `permission_mode` beside `text`. The
+  session applies them right before that message's turn — the model for this
+  session only, without writing the login's saved selection as `/model` does —
+  and journals one `config_changed` line per given field ahead of the turn's
+  `user_message`. A bad `permission_mode` is refused with 400 before anything
+  is queued; a model the provider cannot serve, or a mode the settings
+  disable, applies neither field, runs no turn and journals
+  `message_rejected`. A control plane no longer has to send
+  `/command`, poll `/state` and race a busy session before each message.
+  `/state`'s `seq`, `permission_mode` and `pending_request_id` are documented
+  for reconnecting clients (doc/API.md).
 - Dynamic sessions in the multi-session daemon (#254): `GET /sessions` lists
   the live sessions (`generating`, `model`, `permission_mode`,
   `pending_request_id`); `POST /sessions/create` (`{"session_id"?,
@@ -105,6 +118,18 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Changed
 
+- `--web`/`serve`: `user_message` is journaled by the session when the
+  message's turn starts, no longer by the transport when the message is
+  queued, so it always means "this turn started with this text". A message
+  sent while a turn runs now appears after that turn's `run_done`; the bundled
+  page shows it as queued until then. Over UDS, the `message` text is trimmed
+  and must not be empty, as over HTTP: an empty text is refused instead of
+  queued and dropped, and a missing one is reported as `empty message` (was
+  `missing text`).
+- `config_changed` on the `--web`/`serve` stream is a `protocol.wire` v1 line,
+  `{"v":1,"type":"config_changed","data":{...}}`, instead of
+  `{"config_changed":{...}}`. The bundled page now updates its model and mode
+  display from it; a client reading the stream directly must follow.
 - `serve --sessions 1` now runs the multi-session daemon (one startup session
   under `/s/<id>/`, plus the `/sessions` routes), as doc/API.md already
   described; it used to fall back to the single-session `serve`. Plain `serve`
@@ -118,7 +143,6 @@ status, compatibility boundaries, and entry points are defined by
   background agent job or a swarm teammate (session close, App teardown) now
   cancels its in-flight provider request too, instead of waiting out that
   limit.
-
 - MCP tools are named `mcp__<server>__<tool>` (Claude Code's form, so its
   permission rules and `allowed-tools` lists match); invalid characters become
   `_` and over-long or colliding names get a stable hash suffix. A subagent
@@ -199,12 +223,41 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- OpenAI Chat Completions streams no longer drop text (issue #258). metacodes
+  always asks for `stream_options.include_usage`, under which every ordinary
+  chunk carries `"usage": null`; the parser took any chunk containing the key
+  `usage` for the usage report and returned before reading the rest, so the
+  chunk's text, reasoning, tool-call deltas and `finish_reason` were lost. A
+  Host or AgentCore SDK consumer could receive no text at all, tool calls never
+  formed, and the stop reason came back unknown. Usage now counts only when its
+  value is an object (at the top level, or inside a choice where some
+  compatible endpoints put it), its numbers are read from that object alone,
+  and a chunk that carries both content and a usage object yields both,
+  content first. The Responses API and Gemini paths had the same presence test:
+  a `null` `response.usage` or `usageMetadata` was reported as a measured zero,
+  and Responses read token counts from the whole terminal event, where an
+  echoed tool schema with an `input_tokens` property could supply them. Both
+  now read only the usage object and report nothing when there is none.
 - The daemon end-to-end tests (`tests/e2e/daemon_serve_e2e.sh`,
   `daemon_serve_multi_e2e.sh`) run again and now run in `zig build test` on
   POSIX hosts. They still sent `/mode plan`, which no longer exists, and
   used fixed ports; they now use `/mode dont-ask`, kernel-picked ports, an
   isolated state root with TinyKG autostart off, and also cover `/health`, the
   token, an IPv6 bind and the non-loopback refusal.
+- **SIGPIPE no longer interrupts blocking calls with EINTR.**
+  - **Cause:** `metacodes` ignores SIGPIPE at startup, but every `std.Io.Threaded.init` swapped that for a do-nothing handler installed without SA_RESTART. Its `deinit` put back whatever it had found, so overlapping lifetimes could leave another instance's handler in place.
+  - **Effect:** a handler, unlike SIG_IGN, gets the signal delivered. On macOS a write to a closed socket signals the whole process, so any thread's blocked `recv`/`poll`/`accept`/`waitpid` could return EINTR:
+    - the web server reads `recv <= 0` as the end of a request and dropped it;
+    - the TinyKG autostart probe once took it for "no answer".
+  - **Fix:** every `std.Io.Threaded` is now created through `platform.signal.threadedIo`, which keeps SIGPIPE ignored when the process asked for it, and in tests. A library embedded by a host keeps std's behavior; the host owns its signal policy.
+  - **Children:** they get the default SIGPIPE back before `execve`. An ignored disposition survives exec, and without the reset a child pipeline such as `yes | head` would see EPIPE errors instead of ending normally.
+  - **Enforcement:** `zig build test` fails on a direct `std.Io.Threaded.init` call (`test:io-threaded`).
+- `/mode` could switch a session into a permission mode its settings disable
+  (`disableBypassPermissionsMode`, `disableAutoMode`): they were enforced only
+  when the settings were loaded. `/mode` now refuses such a mode on every
+  surface (terminal, `--web`/`serve` `POST /command`), leaving the mode
+  unchanged, and a `--web`/`serve` message asking for it is refused with
+  `message_rejected` before anything else in it is applied.
 - Sockets no longer leak into child processes. The `--web`, OAuth callback
   and UDS daemon listeners, and every connection they accepted, were
   inheritable, so each later Bash command, hook, MCP server or browser launch

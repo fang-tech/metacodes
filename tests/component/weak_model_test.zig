@@ -38,7 +38,7 @@ test "P0.6 e2e: 确定性归一化工具名(echo-tool→echo_tool)自动改派�
     const url = try srv.urlOwned(a);
     defer a.free(url);
 
-    var io_rt = std.Io.Threaded.init(a, .{});
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
     defer io_rt.deinit();
     var client = openai.OpenAIClient.init(a, io_rt.io(), "k", "gpt-4o", url);
     defer client.deinit();
@@ -90,7 +90,7 @@ test "P0.6 e2e: 模糊近似名不自动执行,返 UnknownTool + 建议(诚实�
     const url = try srv.urlOwned(a);
     defer a.free(url);
 
-    var io_rt = std.Io.Threaded.init(a, .{});
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
     defer io_rt.deinit();
     var client = openai.OpenAIClient.init(a, io_rt.io(), "k", "gpt-4o", url);
     defer client.deinit();
@@ -165,7 +165,7 @@ test "P0.6 e2e: 畸形 JSON 参数(trailing comma)经修复,工具收到合法�
     const url = try srv.urlOwned(a);
     defer a.free(url);
 
-    var io_rt = std.Io.Threaded.init(a, .{});
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
     defer io_rt.deinit();
     var client = cc.client_mod.Client.initWithBaseUrl(a, io_rt.io(), "k", "claude-3-5-haiku-20241022", url);
     defer client.deinit();
@@ -214,7 +214,7 @@ test "P0.6 e2e: GLM extra nested closer preserves complete tool input" {
     const url = try srv.urlOwned(a);
     defer a.free(url);
 
-    var io_rt = std.Io.Threaded.init(a, .{});
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
     defer io_rt.deinit();
     var client = cc.client_mod.Client.initWithBaseUrl(a, io_rt.io(), "k", "glm-5.2", url);
     defer client.deinit();
@@ -275,7 +275,7 @@ test "P0.6 e2e: 孤儿 tool_result 在发出的请求体里被剥离(normalize �
     const url = try srv.urlOwned(a);
     defer a.free(url);
 
-    var io_rt = std.Io.Threaded.init(a, .{});
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
     defer io_rt.deinit();
     var client = cc.client_mod.Client.initWithBaseUrl(a, io_rt.io(), "k", "claude-3-5-haiku-20241022", url);
     defer client.deinit();
@@ -312,7 +312,7 @@ test "P0.6 e2e: 连续 user(inject_context + user)在请求体里合并且不丢
     const url = try srv.urlOwned(a);
     defer a.free(url);
 
-    var io_rt = std.Io.Threaded.init(a, .{});
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
     defer io_rt.deinit();
     var client = cc.client_mod.Client.initWithBaseUrl(a, io_rt.io(), "k", "claude-3-5-haiku-20241022", url);
     defer client.deinit();

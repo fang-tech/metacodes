@@ -12,7 +12,7 @@ test "MockServer + std.http.Client + EventIterator: text_delta event" {
     var srv = try MockServer.start(sse_body, 0);
     defer srv.stop();
 
-    var io_runtime = std.Io.Threaded.init(a, .{});
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
     defer io_runtime.deinit();
     const io = io_runtime.io();
 
@@ -61,7 +61,7 @@ test "MockServer + EventIterator: abort cuts stream" {
     var srv = try MockServer.start(body_buf.items, 100);
     defer srv.stop();
 
-    var io_runtime = std.Io.Threaded.init(a, .{});
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
     defer io_runtime.deinit();
 
     var client = std.http.Client{ .allocator = a, .io = io_runtime.io() };

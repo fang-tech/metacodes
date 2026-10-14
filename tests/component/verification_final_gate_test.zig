@@ -119,7 +119,7 @@ fn runGate(
     defer server.stop();
     const url = try server.urlOwned(allocator);
     defer allocator.free(url);
-    var io_runtime = std.Io.Threaded.init(allocator, .{});
+    var io_runtime = @import("platform").signal.threadedIo(allocator, .{});
     defer io_runtime.deinit();
     var client = cc.client_mod.Client.initWithBaseUrl(allocator, io_runtime.io(), "key", "model", url);
     defer client.deinit();
@@ -282,7 +282,7 @@ test "L2 observe-only records the outcome and never touches the conversation" {
     defer server.stop();
     const url = try server.urlOwned(a);
     defer a.free(url);
-    var io_runtime = std.Io.Threaded.init(a, .{});
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
     defer io_runtime.deinit();
     var client = cc.client_mod.Client.initWithBaseUrl(a, io_runtime.io(), "key", "model", url);
     defer client.deinit();
@@ -350,7 +350,7 @@ test "L2 a mid-stream provider failure retries the same turn instead of dying" {
     defer server.stop();
     const url = try server.urlOwned(a);
     defer a.free(url);
-    var io_runtime = std.Io.Threaded.init(a, .{});
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
     defer io_runtime.deinit();
     var client = cc.client_mod.Client.initWithBaseUrl(a, io_runtime.io(), "key", "model", url);
     defer client.deinit();
@@ -399,7 +399,7 @@ test "L2 zero-retry default preserves the api_error surface" {
     defer server.stop();
     const url = try server.urlOwned(a);
     defer a.free(url);
-    var io_runtime = std.Io.Threaded.init(a, .{});
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
     defer io_runtime.deinit();
     var client = cc.client_mod.Client.initWithBaseUrl(a, io_runtime.io(), "key", "model", url);
     defer client.deinit();
@@ -609,7 +609,7 @@ test "L2 a test-file edit after a failed verification emits a hot weakening cand
     defer server.stop();
     const url = try server.urlOwned(a);
     defer a.free(url);
-    var io_runtime = std.Io.Threaded.init(a, .{});
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
     defer io_runtime.deinit();
     var client = cc.client_mod.Client.initWithBaseUrl(a, io_runtime.io(), "key", "model", url);
     defer client.deinit();

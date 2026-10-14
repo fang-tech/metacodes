@@ -947,7 +947,7 @@ test "#254 without the multi-session daemon the /sessions routes are 404 (--web,
     defer journal.deinit();
     var wb = cc.web_backend.WebBackend.init(a, &journal);
     defer wb.deinit();
-    var inbox = cc.repl_msg_queue.MsgQueue.init(a);
+    var inbox = cc.web_submission.SubmissionQueue.init(a);
     defer inbox.deinit();
     var abort = cc.util_abort.AbortSignal.init();
     const State = struct {

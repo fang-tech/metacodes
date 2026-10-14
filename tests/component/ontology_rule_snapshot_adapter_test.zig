@@ -1174,7 +1174,7 @@ test "L2 project rule evolution persists one source-bound candidate without acto
     defer server.stop();
     const url = try server.urlOwned(a);
     defer a.free(url);
-    var io_runtime = std.Io.Threaded.init(a, .{});
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
     defer io_runtime.deinit();
     var client = cc.client_mod.Client.initWithBaseUrl(a, io_runtime.io(), "evolution-success-key", input.model, url);
     defer client.deinit();
@@ -1273,7 +1273,7 @@ test "L2 project rule evolution source drift before provider spends zero request
     defer server.stop();
     const url = try server.urlOwned(a);
     defer a.free(url);
-    var io_runtime = std.Io.Threaded.init(a, .{});
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
     defer io_runtime.deinit();
     var client = cc.client_mod.Client.initWithBaseUrl(a, io_runtime.io(), "evolution-pre-drift-key", input.model, url);
     defer client.deinit();
@@ -1331,7 +1331,7 @@ test "L2 project rule evolution active pointer drift before provider spends zero
     defer server.stop();
     const url = try server.urlOwned(a);
     defer a.free(url);
-    var io_runtime = std.Io.Threaded.init(a, .{});
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
     defer io_runtime.deinit();
     var client = cc.client_mod.Client.initWithBaseUrl(a, io_runtime.io(), "evolution-active-drift-key", input.model, url);
     defer client.deinit();
@@ -1390,7 +1390,7 @@ test "L2 project rule evolution rejects TinyKG source drift after provider befor
     defer server.stop();
     const url = try server.urlOwned(a);
     defer a.free(url);
-    var io_runtime = std.Io.Threaded.init(a, .{});
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
     defer io_runtime.deinit();
     var client = cc.client_mod.Client.initWithBaseUrl(a, io_runtime.io(), "evolution-l2-key", input.model, url);
     defer client.deinit();

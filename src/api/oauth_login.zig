@@ -433,7 +433,7 @@ fn postFormRaw(
 test "a flow whose endpoint the profile never declared fails before any I/O" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var io_runtime = std.Io.Threaded.init(std.testing.allocator, .{});
+    var io_runtime = @import("platform").signal.threadedIo(std.testing.allocator, .{});
     defer io_runtime.deinit();
 
     // No authorize URL: the browser flow has nowhere to send the user.

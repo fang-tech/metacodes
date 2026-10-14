@@ -59,7 +59,7 @@ test "L2 Stage6: HTTP 401 → error.Unauthorized 且 body 进日志" {
     const url = try srv.urlOwned(a);
     defer a.free(url);
 
-    var io_runtime = std.Io.Threaded.init(a, .{});
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
     defer io_runtime.deinit();
     const io = io_runtime.io();
 
@@ -92,7 +92,7 @@ test "L2 Provider unnamed HTTP 529 returns HttpError without killing the process
     const url = try srv.urlOwned(a);
     defer a.free(url);
 
-    var io_runtime = std.Io.Threaded.init(a, .{});
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
     defer io_runtime.deinit();
     const io = io_runtime.io();
 
@@ -129,7 +129,7 @@ test "L2 Stage6: SSE error 帧 → error.ApiError(非 RequestFailed)" {
     const url = try srv.urlOwned(a);
     defer a.free(url);
 
-    var io_runtime = std.Io.Threaded.init(a, .{});
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
     defer io_runtime.deinit();
     const io = io_runtime.io();
 
@@ -159,7 +159,7 @@ test "L2 AutoCompact: HTTP context-window-exceeded body → error.ContextWindowE
     const url = try srv.urlOwned(a);
     defer a.free(url);
 
-    var io_runtime = std.Io.Threaded.init(a, .{});
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
     defer io_runtime.deinit();
     const io = io_runtime.io();
 
@@ -181,7 +181,7 @@ test "L2 AutoCompact: SSE context-window-exceeded error 帧 → error.ContextWin
     const url = try srv.urlOwned(a);
     defer a.free(url);
 
-    var io_runtime = std.Io.Threaded.init(a, .{});
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
     defer io_runtime.deinit();
     const io = io_runtime.io();
 
@@ -209,7 +209,7 @@ test "L2 AutoCompact: request_too_large without context wording stays HttpError"
     const url = try srv.urlOwned(a);
     defer a.free(url);
 
-    var io_runtime = std.Io.Threaded.init(a, .{});
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
     defer io_runtime.deinit();
     const io = io_runtime.io();
 

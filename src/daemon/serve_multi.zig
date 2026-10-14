@@ -62,7 +62,7 @@ const shutdown = @import("../core/shutdown.zig");
 const transcript = @import("../core/transcript.zig");
 const session_id_mod = @import("../core/session_id.zig");
 const EventJournal = @import("../core/event_journal.zig").EventJournal;
-const MsgQueue = @import("../repl/msg_queue.zig").MsgQueue;
+const SubmissionQueue = @import("../web/submission.zig").SubmissionQueue;
 const web_session = @import("../web/session.zig");
 const server_mod = @import("../web/server.zig");
 const WebBackend = @import("../web/backend.zig").WebBackend;
@@ -153,7 +153,7 @@ const SessionSlot = struct {
 const Placeholder = struct {
     journal: EventJournal,
     wb: WebBackend,
-    inbox: MsgQueue,
+    inbox: SubmissionQueue,
     abort: abort_mod.AbortSignal,
 };
 
@@ -234,7 +234,7 @@ pub const MultiDaemon = struct {
         md.placeholder = .{
             .journal = EventJournal.init(gpa),
             .wb = undefined,
-            .inbox = MsgQueue.init(gpa),
+            .inbox = SubmissionQueue.init(gpa),
             .abort = abort_mod.AbortSignal.init(),
         };
         md.placeholder.wb = WebBackend.init(gpa, &md.placeholder.journal);
@@ -619,7 +619,7 @@ pub const MultiDaemon = struct {
         errdefer md.gpa.destroy(slot);
         const io_rt = try md.gpa.create(std.Io.Threaded);
         errdefer md.gpa.destroy(io_rt);
-        io_rt.* = std.Io.Threaded.init(md.gpa, .{});
+        io_rt.* = @import("platform").signal.threadedIo(md.gpa, .{});
         errdefer io_rt.deinit();
         slot.* = .{ .id = id, .id_text = id.bytes, .io_rt = io_rt, .app = undefined };
         var config = md.config;
