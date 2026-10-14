@@ -285,8 +285,9 @@ pub fn buildWebOptions(app: *app_mod.App, wb: *WebBackend, scoped_recall: ?[]con
     return options;
 }
 
-/// 跑 web 会话直到退出(空闲期 SIGINT)。返回进程退出码。
-pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, port: u16) !u8 {
+/// 跑 web 会话直到退出(空闲期 SIGINT)。返回进程退出码。`surface` = bind 地址/端口、
+/// token、/health 版本(main 解析 flag+env,#251-#253)。
+pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, surface: server_mod.Surface) !u8 {
     // web 侧资源统一 c_allocator:emit/journal/HTTP 连接线程并发分配,必须线程安全,
     // 不依赖调用方传入的 allocator 是否线程安全。生命周期 = 本函数,deinit 成对。
     const web_alloc = std.heap.c_allocator;
@@ -317,7 +318,7 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, port: u16) !u8 {
     app.setConfigEventSink(config_sink.sink());
     defer app.setConfigEventSink(null);
 
-    const srv = try WebServer.start(web_alloc, port, .{
+    const srv = try WebServer.start(web_alloc, surface, .{
         .journal = &journal,
         .web_backend = &wb,
         .inbox = &inbox,
@@ -336,8 +337,7 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, port: u16) !u8 {
     // SSE 客户端在 session_closed 传输帧前先收到 journal 里的 lifecycle.closed 事件。
     defer journalSessionLifecycle(&journal, web_alloc, .{ .closed = app.session_id.asSlice() });
 
-    std.debug.print("metacodes web UI: http://127.0.0.1:{d}  (Ctrl+C to quit)\n", .{srv.port});
-    log.info("web", "listening on 127.0.0.1:{d}", .{srv.port});
+    srv.announce("metacodes web UI");
 
     // 权限询问也走 web 对话框(prompt.ask 读 permission_ctx.ui_requester)。
     app.permission_ctx.ui_requester = wb.requester();

@@ -429,6 +429,171 @@ test "P3/缓存: OpenAI cached_tokens → 中立 UsageDelta.cache_read(onUsage �
     try std.testing.expect(std.mem.indexOf(u8, cap.body(), "\"include_usage\":true") != null);
 }
 
+// issue #258:include_usage 下每个普通 chunk 带 `"usage":null`,末尾另有
+// `{"choices":[],"usage":{...}}`。旧解析器按 substring `"usage"` 判 usage 并提前 return,
+// 文本 chunk 被整体吞掉、finish_reason 丢失。经真 agent_loop 驱动:文本必须进对话与
+// backend,stop 必须是 end_turn,usage 只来自末尾那个 usage 对象(一次,数值正确)。
+// 对照组只删掉 `"usage":null`,结果必须完全一致(双侧)。
+const ISSUE_258_FINAL_USAGE =
+    "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":2006,\"completion_tokens\":10,\"total_tokens\":2016,\"prompt_tokens_details\":{\"cached_tokens\":1920}}}\n\n";
+
+const ISSUE_258_TEXT_SSE =
+    "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\"}}],\"usage\":null}\n\n" ++
+    "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello\"}}],\"usage\":null}\n\n" ++
+    "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":null}\n\n" ++
+    ISSUE_258_FINAL_USAGE ++
+    "data: [DONE]\n\n";
+
+const ISSUE_258_TEXT_CONTROL_SSE =
+    "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\"}}]}\n\n" ++
+    "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello\"}}]}\n\n" ++
+    "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n" ++
+    ISSUE_258_FINAL_USAGE ++
+    "data: [DONE]\n\n";
+
+/// 记录 agent_loop 经 CoreEvent 总线发给 Host 的文本与 usage(Host 实际能看到的东西)。
+const HostCapture = struct {
+    allocator: std.mem.Allocator,
+    text: std.ArrayList(u8) = .empty,
+    usages: std.ArrayList(cc.api_stream.UsageDelta) = .empty,
+
+    fn deinit(self: *HostCapture) void {
+        self.text.deinit(self.allocator);
+        self.usages.deinit(self.allocator);
+    }
+    fn emit(ctx: *anyopaque, _: cc.session_id.SessionId, ev: cc.ui_backend.CoreEvent) void {
+        const self: *HostCapture = @ptrCast(@alignCast(ctx));
+        switch (ev) {
+            .text_chunk => |t| self.text.appendSlice(self.allocator, t) catch @panic("capture OOM"),
+            .usage => |u| self.usages.append(self.allocator, u) catch @panic("capture OOM"),
+            else => {},
+        }
+    }
+    fn poll(_: *anyopaque, _: cc.session_id.SessionId) ?cc.ui_event.UiEvent {
+        return null;
+    }
+    fn backend(self: *HostCapture) cc.ui_backend.UiBackend {
+        return .{ .ctx = @ptrCast(self), .emit = emit, .poll = poll };
+    }
+};
+
+fn assistantText(a: std.mem.Allocator, conv: *const cc.conversation.Conversation) ![]u8 {
+    var got: std.ArrayList(u8) = .empty;
+    errdefer got.deinit(a);
+    for (conv.messages.items) |m| {
+        if (m.role != .assistant) continue;
+        for (m.blocks) |b| switch (b) {
+            .text => |t| try got.appendSlice(a, t),
+            else => {},
+        };
+    }
+    return got.toOwnedSlice(a);
+}
+
+test "issue #258 L2: chat chunk 带 usage:null → 文本到达对话与 Host、end_turn、usage 仅来自末尾 usage 对象" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{ ISSUE_258_TEXT_SSE, ISSUE_258_TEXT_CONTROL_SSE }) |sse| {
+        var srv = try harness.MockServer.startCassette(&[_][]const u8{sse}, 0);
+        defer srv.stop();
+        const url = try srv.urlOwned(a);
+        defer a.free(url);
+
+        var io_rt = @import("platform").signal.threadedIo(a, .{});
+        defer io_rt.deinit();
+        var client = openai.OpenAIClient.init(a, io_rt.io(), "test-key", "gpt-4o", url);
+        defer client.deinit();
+
+        var conv = cc.conversation.Conversation.init(a);
+        defer conv.deinit();
+        try conv.appendText(.user, "hi");
+        const perm = cc.permission.createContext(.bypass_permissions, a);
+        const empty_defs: []const cc.json_mod.ToolDefinition = &.{};
+        var cap = HostCapture{ .allocator = a };
+        defer cap.deinit();
+        const be = cap.backend();
+
+        const result = try agent_loop.run(&conv, client.provider(), empty_defs, &perm, .{ .max_turns = 3 }, &be, a);
+        try std.testing.expectEqual(agent_loop.StopReason.end_turn, result.stop_reason);
+        try std.testing.expectEqual(@as(usize, 1), srv.requestCount());
+
+        const text = try assistantText(a, &conv);
+        defer a.free(text);
+        try std.testing.expectEqualStrings("Hello", text);
+        try std.testing.expectEqualStrings("Hello", cap.text.items);
+
+        // usage:恰好一次,数值来自末尾 usage 对象(prompt 含 cached → input=2006-1920)。
+        try std.testing.expectEqualSlices(cc.api_stream.UsageDelta, &.{.{
+            .input_tokens = 86,
+            .output_tokens = 10,
+            .cache_read_input_tokens = 1920,
+            .cache_creation_input_tokens = 0,
+        }}, cap.usages.items);
+        // 下游计量:usage 锚点 = 服务端实计 prompt(input + cache_read)。
+        try std.testing.expectEqual(@as(usize, 2006), conv.usageAnchor().?.context_tokens);
+    }
+}
+
+// tool_calls 每个增量 chunk 都带 usage:null:旧实现在第一个 chunk 就返回 usage,工具调用
+// 根本不成型,循环停在第一轮。修复后工具执行、第二轮文本照常。
+const ISSUE_258_TOOLCALL_SSE =
+    "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"get_time\",\"arguments\":\"\"}}]}}],\"usage\":null}\n\n" ++
+    "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{}\"}}]}}],\"usage\":null}\n\n" ++
+    "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}],\"usage\":null}\n\n" ++
+    "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":30,\"completion_tokens\":5}}\n\n" ++
+    "data: [DONE]\n\n";
+
+const ISSUE_258_TOOL_FINAL_SSE =
+    "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"the time is now\"}}],\"usage\":null}\n\n" ++
+    "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":null}\n\n" ++
+    "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":40,\"completion_tokens\":4}}\n\n" ++
+    "data: [DONE]\n\n";
+
+test "issue #258 L2: tool_call 增量带 usage:null → 工具执行 + 第二轮 end_turn" {
+    const a = std.testing.allocator;
+    var srv = try harness.MockServer.startCassette(&[_][]const u8{ ISSUE_258_TOOLCALL_SSE, ISSUE_258_TOOL_FINAL_SSE }, 0);
+    defer srv.stop();
+    const url = try srv.urlOwned(a);
+    defer a.free(url);
+
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
+    defer io_rt.deinit();
+    var client = openai.OpenAIClient.init(a, io_rt.io(), "test-key", "gpt-4o", url);
+    defer client.deinit();
+
+    var dyn = cc.tools_dynamic.DynRegistry.init(a);
+    defer dyn.deinit();
+    try dyn.register("get_time", "Get current time", &.{}, getTimeExec, null, false);
+
+    var conv = cc.conversation.Conversation.init(a);
+    defer conv.deinit();
+    try conv.appendText(.user, "what time is it");
+    const perm = cc.permission.createContext(.bypass_permissions, a);
+    const tool_defs = try cc.tools.toToolDefinitionsFull(a, &dyn, null);
+    defer a.free(tool_defs);
+    var cap = HostCapture{ .allocator = a };
+    defer cap.deinit();
+    const be = cap.backend();
+
+    const result = try agent_loop.run(&conv, client.provider(), tool_defs, &perm, .{ .max_turns = 4, .dyn_registry = &dyn }, &be, a);
+    try std.testing.expectEqual(agent_loop.StopReason.end_turn, result.stop_reason);
+    try std.testing.expectEqual(@as(u32, 1), result.tool_calls);
+    try std.testing.expectEqual(@as(usize, 2), srv.requestCount());
+
+    var tool_result: ?[]const u8 = null;
+    for (conv.messages.items) |m| for (m.blocks) |b| switch (b) {
+        .tool_result => |tr| if (std.mem.eql(u8, tr.tool_use_id, "call_1")) {
+            tool_result = tr.content;
+        },
+        else => {},
+    };
+    try std.testing.expect(std.mem.indexOf(u8, tool_result.?, "\"t\":42") != null);
+    try std.testing.expectEqualStrings("the time is now", cap.text.items);
+    try std.testing.expectEqualSlices(cc.api_stream.UsageDelta, &.{
+        .{ .input_tokens = 30, .output_tokens = 5 },
+        .{ .input_tokens = 40, .output_tokens = 4 },
+    }, cap.usages.items);
+}
+
 // 后端漏发 tool_call id 的变体(2026-08-17 复审发射侧 #1 的 OpenAI 面):
 // 旧实现让空 id 直通,流进观察日志成空 dispatch_id(trace fail-closed,同轮
 // 多工具还必撞重复)。修法 = buildFlush 兜底合成进程级唯一 id。

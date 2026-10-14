@@ -1,7 +1,8 @@
 //! Request-head parsing shared by the local HTTP servers Metacodes runs (the
-//! `--web` UI and the `kgd` TinyKG supervisor). Pure functions over bytes: no
-//! sockets, no allocation, no policy. Two servers parsing headers two slightly
-//! different ways is how one of them ends up with a header-smuggling bug.
+//! `--web`/`serve` UI and the `kgd` TinyKG supervisor), and the credential
+//! comparison both use. Pure functions over bytes: no sockets, no allocation,
+//! no policy. Two servers parsing headers two slightly different ways is how
+//! one of them ends up with a header-smuggling bug.
 
 const std = @import("std");
 
@@ -26,7 +27,8 @@ pub fn parseRequestLine(head: []const u8) ?RequestLine {
     return .{ .method = method, .path = target, .query = "" };
 }
 
-/// Read `name` out of `a=1&b=2`. No URL decoding: callers use numeric values.
+/// Read `name` out of `a=1&b=2`, still percent-encoded: a caller that needs
+/// the decoded value (a credential) runs it through `percentDecode`.
 pub fn queryParam(query: []const u8, name: []const u8) ?[]const u8 {
     var it = std.mem.splitScalar(u8, query, '&');
     while (it.next()) |pair| {
@@ -55,7 +57,64 @@ pub fn parseContentLength(head: []const u8) ?usize {
     return std.fmt.parseInt(usize, v, 10) catch null;
 }
 
+/// Decode the `%XX` escapes of a query value into `out`. `+` stays `+`: the
+/// values decoded here (credentials) never contain a space, and a browser's
+/// `encodeURIComponent` sends a literal `+` as `%2B`. Null when an escape is
+/// malformed or the result does not fit `out`.
+pub fn percentDecode(encoded: []const u8, out: []u8) ?[]const u8 {
+    var in: usize = 0;
+    var len: usize = 0;
+    while (in < encoded.len) : (len += 1) {
+        if (len == out.len) return null;
+        if (encoded[in] != '%') {
+            out[len] = encoded[in];
+            in += 1;
+            continue;
+        }
+        if (encoded.len - in < 3) return null;
+        const high = std.fmt.charToDigit(encoded[in + 1], 16) catch return null;
+        const low = std.fmt.charToDigit(encoded[in + 2], 16) catch return null;
+        out[len] = high * 16 + low;
+        in += 3;
+    }
+    return out[0..len];
+}
+
+/// Compares in time independent of how many leading bytes match, so a peer
+/// cannot discover a key one byte at a time (only its length). An empty
+/// `expected` never matches: a server whose key is empty must not admit a
+/// peer that sent no credential at all.
+pub fn constantTimeEql(presented: []const u8, expected: []const u8) bool {
+    if (presented.len != expected.len or expected.len == 0) return false;
+    var diff: u8 = 0;
+    for (presented, expected) |a, b| diff |= a ^ b;
+    return diff == 0;
+}
+
 const testing = std.testing;
+
+test "Http: credential comparison is length-safe and never matches an empty key" {
+    try testing.expect(constantTimeEql("abc", "abc"));
+    try testing.expect(!constantTimeEql("abc", "abd"));
+    try testing.expect(!constantTimeEql("ab", "abc"));
+    // An empty configured key must never authenticate anyone, including a peer
+    // that sends no credential at all (which arrives here as "").
+    try testing.expect(!constantTimeEql("", ""));
+}
+
+test "Http: percentDecode decodes escapes, keeps +, refuses malformed or oversized input" {
+    var buf: [16]u8 = undefined;
+    try testing.expectEqualStrings("a+b/c=", percentDecode("a+b%2Fc%3d", &buf).?);
+    try testing.expectEqualStrings("plain", percentDecode("plain", &buf).?);
+    try testing.expectEqualStrings("", percentDecode("", &buf).?);
+    try testing.expect(percentDecode("%4", &buf) == null);
+    try testing.expect(percentDecode("%zz", &buf) == null);
+    try testing.expect(percentDecode("abc%", &buf) == null);
+    var small: [3]u8 = undefined;
+    try testing.expectEqualStrings("abc", percentDecode("abc", &small).?);
+    try testing.expect(percentDecode("abcd", &small) == null);
+    try testing.expect(percentDecode("ab%41%42", &small) == null);
+}
 
 test "Http: the request line splits method, path and query" {
     const line = parseRequestLine("POST /api/run?since=3 HTTP/1.1\r\nhost: x\r\n\r\n").?;
