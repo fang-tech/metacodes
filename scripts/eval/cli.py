@@ -760,6 +760,66 @@ def cmd_promote_multi(args: argparse.Namespace) -> int:
     return 0
 
 
+def _short_digest(value: Any) -> str:
+    return hashlib.sha256(stable_json(value).encode("utf-8")).hexdigest()[:16]
+
+
+def release_suite_fingerprint(suite: Dict[str, Any], task_ids: Sequence[str]) -> str:
+    """The grounding a release contract pins for one suite: each contracted
+    task's task and grader fingerprints, in contract order."""
+    grounding = {
+        task["id"]: grounding_fingerprints(task, REPO_ROOT) for task in suite["tasks"]
+    }
+    return _short_digest(
+        {
+            "suite_id": suite["suite_id"],
+            "tasks": [
+                {
+                    "id": task_id,
+                    "task_fingerprint": grounding[task_id]["task_fingerprint"],
+                    "grader_fingerprint": grounding[task_id]["grader_fingerprint"],
+                }
+                for task_id in task_ids
+            ],
+        }
+    )
+
+
+def release_calibration_drift(
+    config: Dict[str, Any], suites_by_id: Dict[str, Dict[str, Any]]
+) -> list:
+    """Everything a production calibration no longer matches, as messages.
+
+    A calibration attests to rollouts run under one evaluation contract,
+    release contract and set of thresholds; any of them moving afterwards
+    leaves it describing something else."""
+    calibration = config.get("calibration") or {}
+    release_contract = config.get("release_contract") or {}
+    drift = []
+    if calibration.get("evaluation_contract_version") != EVALUATION_CONTRACT_VERSION:
+        drift.append(
+            f"evaluation contract v{calibration.get('evaluation_contract_version')} "
+            f"!= current v{EVALUATION_CONTRACT_VERSION}"
+        )
+    if calibration.get("thresholds_fingerprint") != _short_digest(config.get("thresholds")):
+        drift.append("thresholds changed since calibration")
+    if calibration.get("release_contract_fingerprint") != _short_digest(release_contract):
+        drift.append("release contract changed since calibration")
+    for declared in release_contract.get("suites") or []:
+        suite_id = declared.get("suite_id")
+        suite = suites_by_id.get(suite_id)
+        if suite is None:
+            drift.append(f"release contract names unknown suite {suite_id!r}")
+            continue
+        actual = release_suite_fingerprint(suite, declared.get("task_ids") or [])
+        if declared.get("suite_fingerprint") != actual:
+            drift.append(
+                f"suite {suite_id} grounding is {actual}, contract pins "
+                f"{declared.get('suite_fingerprint')}"
+            )
+    return drift
+
+
 def cmd_gate(args: argparse.Namespace) -> int:
     candidate = load_rollouts(Path(args.candidate))
     baseline = load_rollouts(Path(args.baseline)) if args.baseline else None
@@ -800,6 +860,16 @@ def cmd_gate(args: argparse.Namespace) -> int:
             raise ValidationError(
                 "versioned gate config requires release_contract.suites"
             )
+        if isinstance(calibration, dict) and calibration.get("status") == "stale":
+            reason = calibration.get("stale_reason")
+            if not isinstance(reason, str) or not reason.strip():
+                raise ValidationError(
+                    "a stale production calibration must state its stale_reason"
+                )
+            raise ValidationError(
+                f"production calibration is stale: {reason.strip()} "
+                "Re-run the release-contract calibration before gating a release."
+            )
         if (
             not isinstance(calibration, dict)
             or calibration.get("status") != "production"
@@ -819,17 +889,11 @@ def cmd_gate(args: argparse.Namespace) -> int:
                 "versioned release gate requires machine-readable production calibration "
                 "with id, version, status, basis, and the current evaluation contract"
             )
-        actual_thresholds_fingerprint = hashlib.sha256(
-            stable_json(config["thresholds"]).encode("utf-8")
-        ).hexdigest()[:16]
-        actual_contract_fingerprint = hashlib.sha256(
-            stable_json(release_contract).encode("utf-8")
-        ).hexdigest()[:16]
-        if calibration["thresholds_fingerprint"] != actual_thresholds_fingerprint:
+        if calibration["thresholds_fingerprint"] != _short_digest(config["thresholds"]):
             raise ValidationError(
                 "calibration does not match the configured release thresholds"
             )
-        if calibration["release_contract_fingerprint"] != actual_contract_fingerprint:
+        if calibration["release_contract_fingerprint"] != _short_digest(release_contract):
             raise ValidationError(
                 "calibration does not match the configured release contract"
             )
@@ -974,21 +1038,7 @@ def cmd_gate(args: argparse.Namespace) -> int:
                 task["id"]: grounding_fingerprints(task, REPO_ROOT)
                 for task in suite["tasks"]
             }
-            actual_suite_fingerprint = hashlib.sha256(
-                stable_json(
-                    {
-                        "suite_id": suite_id,
-                        "tasks": [
-                            {
-                                "id": task_id,
-                                "task_fingerprint": grounding[task_id]["task_fingerprint"],
-                                "grader_fingerprint": grounding[task_id]["grader_fingerprint"],
-                            }
-                            for task_id in task_ids
-                        ],
-                    }
-                ).encode("utf-8")
-            ).hexdigest()[:16]
+            actual_suite_fingerprint = release_suite_fingerprint(suite, task_ids)
             if declared_suite_fingerprint != actual_suite_fingerprint:
                 raise ValidationError(
                     "calibrated release contract does not match the current suite grounding: "
