@@ -90,14 +90,18 @@ status, compatibility boundaries, and entry points are defined by
   `"resume":true` rebuilds its conversation from the transcript persisted under
   the state root, so a session survives a container rebuild;
   `POST /sessions/<id>/resume` answers 200 when the session is live and 404
-  otherwise; `POST /sessions/<id>/destroy` aborts its run, joins its driver,
+  otherwise; `POST /sessions/<id>/destroy` aborts its run and stops its
+  background agent jobs, teammates and background shells, joins them all,
   ends every SSE stream and UDS attach with `session_lifecycle.closed`, and
   returns. `serve --sessions 0` starts with no session, and
   `--max-sessions M` (default 32) caps live sessions, answering 429 beyond it.
   Requests now hold a counted lease on the session they address for as long
   as they run (an SSE stream or UDS attach for its whole life); a destroy
-  never waits for one and frees the session after the last is returned.
-  Normative rules: [doc/API.md](doc/API.md#web-and-daemon-http-surface).
+  never waits for one and frees the session after the last is returned; until
+  then its id is refused to a create (409 `session is still closing`). A
+  create holds its connection while the session starts; after a timed-out
+  create, check `GET /sessions`. Normative rules:
+  [doc/API.md](doc/API.md#web-and-daemon-http-surface).
 
 ### Changed
 
@@ -110,7 +114,10 @@ status, compatibility boundaries, and entry points are defined by
   ignored.
 - Destroying or shutting down a daemon session now also cancels its in-flight
   provider request, so a session whose provider stopped sending stops at once
-  instead of after the stream idle limit (up to 120 s by default).
+  instead of after the stream idle limit (up to 120 s by default). Stopping a
+  background agent job or a swarm teammate (session close, App teardown) now
+  cancels its in-flight provider request too, instead of waiting out that
+  limit.
 
 - MCP tools are named `mcp__<server>__<tool>` (Claude Code's form, so its
   permission rules and `allowed-tools` lists match); invalid characters become

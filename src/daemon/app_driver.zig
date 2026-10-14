@@ -37,11 +37,14 @@ pub const DriverCtx = struct {
 /// A socket read blocked on a silent provider never polls the flag, so the
 /// in-flight request is shut down as well (the TUI's SIGINT bridge does the
 /// same); a request that registers after this sees the flag and shuts itself
-/// down. Without it a destroy over HTTP waits out the stream idle limit.
+/// down. Without it a destroy over HTTP waits out the stream idle limit. This
+/// runs off the driver thread while the driver may be switching routes, hence
+/// `cancelInFlightRequest` (serialized with the switch) rather than
+/// `provider().cancel`.
 pub fn abortFn(ctx: *anyopaque, reason: abort.Reason) void {
     const dctx: *DriverCtx = @ptrCast(@alignCast(ctx));
     dctx.app.abort.abort(reason);
-    dctx.app.provider().cancel(&dctx.app.abort);
+    dctx.app.cancelInFlightRequest(&dctx.app.abort);
 }
 
 /// SessionHost.driver_fn:真 App 驱动循环(mirror web/session.zig run() 的 outer 循环,用 host 资源)。

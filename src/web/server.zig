@@ -168,7 +168,7 @@ pub const SessionView = struct {
 /// the App behind `state_ctx`, the abort signal) stays valid until `release`.
 /// The holder calls `release` exactly once, by `defer` right after a
 /// successful `resolve`. Destroying a session never waits for leases: the
-/// host stops the session's driver, appends `session_lifecycle.closed` and
+/// host stops the session's driver and background work, appends `session_lifecycle.closed` and
 /// closes the journal (which ends every SSE stream and attachment, so their
 /// leases come back), and frees the session's memory only once the last lease
 /// is released. A session that is being destroyed is never resolved again.
@@ -213,6 +213,10 @@ pub const Created = struct {
 pub const CreateError = error{
     /// The id names a live session (409).
     SessionLive,
+    /// The id names a destroyed session that is not reaped yet: its App still
+    /// owns the session directory (409, normally for milliseconds after the
+    /// last request using it ends).
+    SessionClosing,
     /// A fresh create names an id whose transcript is persisted; it would
     /// overwrite that conversation (409; `"resume":true` restores it).
     TranscriptExists,
@@ -242,7 +246,8 @@ pub const Lifecycle = struct {
     create: *const fn (ctx: *anyopaque, request: CreateRequest) CreateError!Created,
     /// Whether `id` names a live session; loads nothing.
     is_live: *const fn (ctx: *anyopaque, id: SessionId) bool,
-    /// Returns once the session's driver has stopped and been joined.
+    /// Returns once the session's driver and background work have stopped
+    /// and been joined.
     destroy: *const fn (ctx: *anyopaque, id: SessionId) DestroyError!void,
     /// `{"sessions":[...]}` (owned by `allocator`).
     list: *const fn (ctx: *anyopaque, allocator: std.mem.Allocator) anyerror![]u8,
@@ -925,6 +930,7 @@ fn serveLifecycle(fd: net.Socket, allocator: std.mem.Allocator, method: []const 
 fn writeCreateError(fd: net.Socket, err: CreateError, max_sessions: usize) void {
     switch (err) {
         error.SessionLive => writeError(fd, "409 Conflict", "session already live"),
+        error.SessionClosing => writeError(fd, "409 Conflict", "session is still closing"),
         error.TranscriptExists => writeError(fd, "409 Conflict", "a transcript is persisted under this session_id; create with resume true to restore it"),
         error.TranscriptNotFound => writeError(fd, "404 Not Found", "no persisted transcript for this session_id"),
         error.SessionLimit => {

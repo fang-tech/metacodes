@@ -42,6 +42,17 @@ fn textSse(comptime text: []const u8) []const u8 {
         "data: {\"type\":\"message_stop\"}\n\n";
 }
 
+/// One turn that calls `name` with `input_json`, given escaped as it sits
+/// inside a JSON string (`{\"k\":\"v\"}`).
+fn toolUseSse(comptime id: []const u8, comptime name: []const u8, comptime input_json: []const u8) []const u8 {
+    return "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":7,\"output_tokens\":0}}}\n\n" ++
+        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"" ++ id ++ "\",\"name\":\"" ++ name ++ "\",\"input\":{}}}\n\n" ++
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"" ++ input_json ++ "\"}}\n\n" ++
+        "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n" ++
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":3}}\n\n" ++
+        "data: {\"type\":\"message_stop\"}\n\n";
+}
+
 const EnvGuard = struct {
     name: [*:0]const u8,
     previous: ?[:0]u8,
@@ -77,6 +88,8 @@ const Fixture = struct {
         responses: []const []const u8 = &.{textSse("hello from the provider")},
         /// The first provider request gets no response at all (never a head).
         silent_first: bool = false,
+        /// Every provider request from this one on gets no response at all.
+        silent_from: ?usize = null,
         initial: usize = 0,
         max_sessions: usize = 8,
         token: ?[]const u8 = null,
@@ -107,6 +120,8 @@ const Fixture = struct {
 
         self.provider = if (options.silent_first)
             try harness.MockServer.startCassetteSilent(options.responses, 0, 0)
+        else if (options.silent_from) |first|
+            try harness.MockServer.startCassetteSilentFrom(options.responses, first)
         else
             try harness.MockServer.startCassette(options.responses, 0);
         errdefer self.provider.stop();
@@ -194,6 +209,18 @@ const Fixture = struct {
 
     fn lifecyclePath(buffer: []u8, id: SessionId, comptime verb: []const u8) []const u8 {
         return std.fmt.bufPrint(buffer, "/sessions/{s}/" ++ verb, .{id.asSlice()}) catch unreachable;
+    }
+
+    /// Wait (≤ 5 s) for every lease on a destroyed session to come back, then
+    /// reap it, as the daemon's main loop would.
+    fn settle(self: *Fixture, id: SessionId) !void {
+        const deadline = cc.util_time.nowMs() + 5000;
+        while ((self.md.leasesOf(id) orelse 0) != 0) {
+            if (cc.util_time.nowMs() >= deadline) return error.LeaseNeverReturned;
+            cc.util_time.sleepMs(10);
+        }
+        self.md.reap();
+        if (self.md.leasesOf(id) != null) return error.NotReaped;
     }
 
     /// Send a prompt to a session; must be accepted.
@@ -562,6 +589,153 @@ test "#254 destroy never waits for leases: SSE and UDS attach end and give their
     try std.testing.expectEqual(@as(?usize, null), fx.md.leasesOf(id));
 }
 
+const START_BACKGROUND_AGENT = toolUseSse("tu_bg", "Task", "{\\\"description\\\":\\\"slow work\\\",\\\"prompt\\\":\\\"run the slow command\\\",\\\"subagent_type\\\":\\\"general-purpose\\\",\\\"run_in_background\\\":true}");
+
+test "#254 destroy stops the session's background work before it returns: an agent job busy in a shell" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest; // the job runs `sleep`
+    // The session's next turn and the job's first turn (in either order) each
+    // get `sleep 30`: both are in a shell when the destroy lands.
+    const sleep_long = toolUseSse("tu_sleep", "Bash", "{\\\"command\\\":\\\"sleep 30\\\"}");
+    var fx: Fixture = undefined;
+    try fx.setup(.{ .responses = &.{ START_BACKGROUND_AGENT, sleep_long, sleep_long } });
+    defer fx.deinit();
+    try expectDestroyStopsBackgroundAgent(&fx);
+}
+
+test "#254 destroy stops the session's background work before it returns: an agent job stalled in a provider request" {
+    // After turn 1 nothing answers: the session and the job both wait on a
+    // silent provider, which only a cancel ends (the idle limit is 20 s).
+    var fx: Fixture = undefined;
+    try fx.setup(.{ .responses = &.{START_BACKGROUND_AGENT}, .silent_from = 1 });
+    defer fx.deinit();
+    try expectDestroyStopsBackgroundAgent(&fx);
+}
+
+/// Turn 1 of the session starts a background agent job; once the job runs
+/// (and the session generates), a destroy must return within 5 s with the
+/// job already stopped, as a lease that outlives the destroy reads it.
+fn expectDestroyStopsBackgroundAgent(fx: *Fixture) !void {
+    const a = std.testing.allocator;
+    const id = try fx.create("");
+    try fx.message(id, "start the background work");
+
+    // Running: the job is on the session's roster and three requests are out
+    // (turn 1, the session's turn 2, the job's turn 1).
+    var path_buffer: [96]u8 = undefined;
+    {
+        const deadline = cc.util_time.nowMs() + 15_000;
+        while (true) {
+            if (fx.provider.requestCount() >= 3) {
+                const response = try fx.call("GET", Fixture.sessionPath(&path_buffer, id, "/state"), "");
+                defer a.free(response);
+                if (std.mem.indexOf(u8, response, "\"state\":\"running\"") != null and
+                    std.mem.indexOf(u8, response, "\"generating\":true") != null) break;
+            }
+            if (cc.util_time.nowMs() >= deadline) return error.BackgroundJobNeverRan;
+            cc.util_time.sleepMs(20);
+        }
+    }
+    cc.util_time.sleepMs(300); // both shells are spawned
+
+    // A lease keeps the closed session readable after the destroy.
+    const held = fx.md.resolve(id.asSlice()) orelse return error.NotResolvable;
+    defer held.release();
+    const started = cc.util_time.nowMs();
+    {
+        const response = try fx.call("POST", Fixture.lifecyclePath(&path_buffer, id, "destroy"), "");
+        defer a.free(response);
+        const took = elapsedSince(started);
+        if (took >= 5000) {
+            std.debug.print("destroy took {d} ms\n", .{took});
+            return error.DestroyNotBounded;
+        }
+        try expectStatus(response, "200");
+    }
+
+    // By the time destroy answered, the job had been stopped and joined.
+    const snapshot = try held.view.state_fn(held.view.state_ctx, a);
+    defer a.free(snapshot);
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, snapshot, .{});
+    defer parsed.deinit();
+    const agents = parsed.value.object.get("agents").?.array.items;
+    try std.testing.expect(agents.len >= 1);
+    for (agents) |agent| {
+        const state = agent.object.get("state").?.string;
+        if (std.mem.eql(u8, state, "running")) {
+            std.debug.print("after destroy: {s}\n", .{snapshot});
+            return error.BackgroundJobStillRunning;
+        }
+    }
+}
+
+test "#254 a destroyed session keeps its id until it is reaped: 409 while closing, 201 after" {
+    const a = std.testing.allocator;
+    var fx: Fixture = undefined;
+    try fx.setup(.{});
+    defer fx.deinit();
+
+    const wanted = "0123456789abcdef0123abcd";
+    const id = try fx.create("{\"session_id\":\"" ++ wanted ++ "\"}");
+    // A request still using the session keeps it from being reaped.
+    const held = fx.md.resolve(wanted) orelse return error.NotResolvable;
+    var held_out = true;
+    defer if (held_out) held.release();
+    var path_buffer: [96]u8 = undefined;
+    try std.testing.expectEqual(@as(u16, 200), try fx.status("POST", Fixture.lifecyclePath(&path_buffer, id, "destroy"), ""));
+    try std.testing.expectEqual(@as(u16, 404), try fx.status("POST", Fixture.lifecyclePath(&path_buffer, id, "resume"), ""));
+
+    // Its App still owns the session directory: neither a fresh create nor a
+    // restore may build a second App on it yet.
+    for ([_][]const u8{ "{\"session_id\":\"" ++ wanted ++ "\"}", "{\"session_id\":\"" ++ wanted ++ "\",\"resume\":true}" }) |body| {
+        const response = try fx.call("POST", "/sessions/create", body);
+        defer a.free(response);
+        try expectStatus(response, "409");
+        try std.testing.expectEqualStrings("{\"error\":\"session is still closing\"}", bodyOf(response));
+    }
+    fx.md.reap();
+    try std.testing.expectEqual(@as(u16, 409), try fx.status("POST", "/sessions/create", "{\"session_id\":\"" ++ wanted ++ "\"}"));
+    // A different id is not affected.
+    _ = try fx.create("");
+
+    held.release();
+    held_out = false;
+    fx.md.reap();
+    try std.testing.expectEqual(@as(usize, 1), fx.md.stats().reaped);
+    const again = try fx.create("{\"session_id\":\"" ++ wanted ++ "\"}");
+    try std.testing.expectEqualStrings(wanted, again.asSlice());
+}
+
+test "#254 the destroy's provider cancel is serialized with a route switch (App.route_mutex)" {
+    var fx: Fixture = undefined;
+    try fx.setup(.{});
+    defer fx.deinit();
+    const id = try fx.create("");
+    const held = fx.md.resolve(id.asSlice()) orelse return error.NotResolvable;
+    defer held.release();
+    const state: *cc.web_session.StateSource = @ptrCast(@alignCast(held.view.state_ctx));
+    const app = state.app;
+
+    const Canceller = struct {
+        returned: std.atomic.Value(bool) = .init(false),
+        fn run(self: *@This(), target: *cc.app_module.App) void {
+            // What app_driver.abortFn does from a destroy thread (nothing is in
+            // flight here, so it shuts nothing down).
+            target.cancelInFlightRequest(&target.abort);
+            self.returned.store(true, .release);
+        }
+    };
+    var canceller: Canceller = .{};
+    // A route switch holds the lock while it builds a client and moves the kind.
+    app.route_mutex.lock();
+    const thread = try std.Thread.spawn(.{}, Canceller.run, .{ &canceller, app });
+    cc.util_time.sleepMs(200);
+    const returned_during_switch = canceller.returned.load(.acquire);
+    app.route_mutex.unlock();
+    thread.join();
+    try std.testing.expect(!returned_during_switch);
+    try std.testing.expect(canceller.returned.load(.acquire));
+}
+
 // ── create ──────────────────────────────────────────────────────────────────
 
 test "#254 create: caller id, 409 live duplicate, 400 malformed, 429 at the cap (live sessions only), 404 unknown routes" {
@@ -683,9 +857,16 @@ test "#254 create {resume:true} restores the persisted conversation; /sessions/<
     }
     try std.testing.expectEqual(@as(u16, 200), try fx.status("POST", Fixture.lifecyclePath(&path_buffer, id, "destroy"), ""));
     try std.testing.expectEqual(@as(u16, 404), try fx.status("POST", Fixture.lifecyclePath(&path_buffer, id, "resume"), ""));
+    // The id comes back once the closed session is reaped (the daemon's main loop does this).
+    try fx.settle(id);
 
     // A fresh create would overwrite the persisted conversation: refused.
-    try std.testing.expectEqual(@as(u16, 409), try fx.status("POST", "/sessions/create", "{\"session_id\":\"" ++ wanted ++ "\"}"));
+    {
+        const response = try fx.call("POST", "/sessions/create", "{\"session_id\":\"" ++ wanted ++ "\"}");
+        defer a.free(response);
+        try expectStatus(response, "409");
+        try std.testing.expect(std.mem.indexOf(u8, response, "a transcript is persisted") != null);
+    }
 
     // Restore: the two persisted messages come back.
     {

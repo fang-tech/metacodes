@@ -367,6 +367,12 @@ pub const App = struct {
     openai_client: ?openai_mod.OpenAIClient = null,
     /// Gemini 后端(config.provider_kind==.gemini 时非 null)。持有状态缓存句柄表(C3)。
     gemini_client: ?gemini_mod.GeminiClient = null,
+    /// Held while a route switch builds a transport client and while it moves
+    /// `config.provider_kind`, and by `cancelInFlightRequest`: another thread
+    /// calling `provider()` would otherwise read the new kind before the new
+    /// client is visible to it (or the client half-written). Clients are never
+    /// freed before `deinit`, so this is the only window.
+    route_mutex: sync.Mutex = .{},
     /// Built once in `init` and kept for the whole session, so the slices,
     /// the dynamic descriptions (`describe_fn`, env overrides) and
     /// `enabled_tool_names` live in `tool_defs_arena`, released in `deinit`.
@@ -1038,6 +1044,9 @@ pub const App = struct {
         const allocator = app.allocator;
         const state_root_default = app.state_root_default;
         defer if (state_root_default) |owned| allocator.free(owned);
+        // Every background worker stops (and is joined) before anything it
+        // shares is freed; a host may already have done this (idempotent).
+        app.stopBackgroundWork();
         // 最先 drain 后台 subagent：abort 全部 running → join 全部线程 → free。
         // 必须早于任何共享资源（agents/dyn_registry/skills/allocator）释放，
         // 否则在跑的后台线程会触碰已释放内存（UAF）。job 用专属 Client，不依赖 api_client。
@@ -1607,6 +1616,9 @@ pub const App = struct {
         // The target transport must exist before the model seam runs, or the
         // new client would never receive the model.
         const io = app.api_client.http_client.io;
+        // A cancel from another thread (`cancelInFlightRequest`) must see a
+        // complete client whenever it sees the kind that selects it.
+        app.route_mutex.lock();
         switch (binding.transport) {
             .anthropic => {},
             .openai => if (app.openai_client == null) {
@@ -1632,6 +1644,7 @@ pub const App = struct {
                 app.gemini_client.?.overrides = buildOverridesFromConfig(app.config);
             },
         }
+        app.route_mutex.unlock();
 
         try app.switchModel(binding.request_model_id);
 
@@ -1644,7 +1657,12 @@ pub const App = struct {
         // generation makes the worst case a wrong-but-in-bounds string.
         app.route_strings.install(endpoint, secret);
 
-        app.config.provider_kind = binding.transport;
+        {
+            // Published under the lock that built the client it selects.
+            app.route_mutex.lock();
+            defer app.route_mutex.unlock();
+            app.config.provider_kind = binding.transport;
+        }
         app.config.openai_protocol = binding.openai_protocol;
         app.config.auth_scheme = binding.auth_scheme;
         // `config` is the snapshot subagent and swarm workers are constructed
@@ -2031,6 +2049,31 @@ pub const App = struct {
             @import("util/log.zig").warn("session", "stored model route of session {s} is unavailable ({s}); the current route is kept", .{ app.session_id.asSlice(), @errorName(err) });
         }
         return app.conversation.len();
+    }
+
+    /// Stop the work this session runs beside its driver and wait for each
+    /// piece to end: background agent jobs (nested ones included), swarm
+    /// teammates (in-process and process ones; the team is detached as
+    /// `deinit` would), and background shell jobs. Records stay readable
+    /// (`/state` rosters, TaskOutput) until `deinit`, and no new background
+    /// work can start afterwards. Call it once nothing drives the App. For a
+    /// host that closes a session before it can free it (#254: the
+    /// multi-session daemon's destroy stops the work at once; only memory waits
+    /// for the last lease). Idempotent; `deinit` calls it first.
+    pub fn stopBackgroundWork(app: *App) void {
+        if (app.agent_jobs) |*jobs| jobs.stop();
+        app.swarm.detachTeam();
+        if (app.jobs) |*jobs| _ = jobs.killAll();
+    }
+
+    /// Shut down this App's in-flight provider request for `signal` (after the
+    /// caller set it): the call another thread makes to wake a run blocked in a
+    /// provider read. Serialized with a route switch, which may build the
+    /// transport client `provider()` then selects (`route_mutex`).
+    pub fn cancelInFlightRequest(app: *App, signal: *const AbortSignal) void {
+        app.route_mutex.lock();
+        defer app.route_mutex.unlock();
+        app.provider().cancel(signal);
     }
 
     /// 当前 session 目录(transcript.jsonl / suspend.json 所在)。无 writer → null。

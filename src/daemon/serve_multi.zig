@@ -5,21 +5,25 @@
 //! 与销毁,活跃 session 数以 M 为上限。
 //!
 //! **Leases, not borrowed snapshots.** A session is a heap `SessionSlot` with
-//! an atomic `refs` and a `state` (live / closing). The table maps the ids of
-//! live slots to them under `mutex`; `resolve` takes a lease there
+//! an atomic `refs` and a `state` (live / closing / closed). The table maps
+//! the ids of live slots to them under `mutex`; `resolve` takes a lease there
 //! (`refs += 1`) and the transport gives it back exactly once (`Lease.release`),
 //! after the request — after the whole SSE stream, after a whole UDS attach.
-//! `destroy` takes the slot out of the table and marks it closing under the
-//! mutex (it can no longer be resolved, and its id can be created again at
-//! once), then outside the mutex stops and joins the driver (abort interrupts
-//! an in-flight run, see app_driver.abortFn), appends
+//! `destroy` takes the slot out of the table, marks it closing and puts it on
+//! the retired list under the mutex: it can no longer be resolved, and its id
+//! is refused to a create (409 "session is still closing") until it is reaped,
+//! because its App still owns the session directory. Then, outside the mutex,
+//! it stops and joins the driver (abort interrupts an in-flight run, see
+//! app_driver.abortFn) and the session's background work (agent jobs,
+//! teammates, background shells: `App.stopBackgroundWork`), appends
 //! `session_lifecycle.closed` and closes the journal, which ends every SSE
-//! stream and attachment so their leases come back. Destroy never waits for
-//! leases (a lease API that blocks close on user refs once turned a failed
-//! assertion into a ten-minute hang). The memory a lease holder may still
-//! touch — journal, backend, queues, the App behind `/state`, its abort
-//! signal — is freed by `reap`, on the daemon's main loop, once `refs` is 0;
-//! releasing never tears anything down itself.
+//! stream and attachment so their leases come back, and marks it closed.
+//! Destroy stops the work at once and never waits for leases (a lease API that
+//! blocks close on user refs once turned a failed assertion into a ten-minute
+//! hang). The memory a lease holder may still touch — journal, backend,
+//! queues, the App behind `/state`, its abort signal — is freed by `reap`, on
+//! the daemon's main loop, once a closed slot's `refs` is 0; releasing never
+//! tears anything down itself.
 //!
 //! **每 App 独立 io_runtime,分配走通用分配器**(设计 §5):
 //! - 分配器:新建 session 的 App 用 c_allocator(线程安全)。不用 arena:arena 什么都不释放,一个
@@ -108,13 +112,25 @@ const SessionSlot = struct {
     /// Leases out. Taken only from the table under `MultiDaemon.mutex`, so a
     /// slot that has left the table never gains one; `reap` frees it at 0.
     refs: std.atomic.Value(usize) = .init(0),
-    /// Guarded by `MultiDaemon.mutex`. A live slot is in the table; a
-    /// closing one is on the retired list until it is reaped.
+    /// Guarded by `MultiDaemon.mutex`. A live slot is in the table; a closing
+    /// or closed one is on the retired list (and its id is refused to a
+    /// create) until it is reaped.
     state: State = .live,
     /// The retired list's link (guarded by `MultiDaemon.mutex`).
     next_retired: ?*SessionSlot = null,
+    /// `stop`'s own list of the slots it took from the table (only `stop`'s
+    /// thread touches it).
+    next_stopping: ?*SessionSlot = null,
 
-    const State = enum { live, closing };
+    const State = enum {
+        /// In the table; leases can be taken.
+        live,
+        /// Out of the table; the destroying thread is stopping its driver
+        /// and background work. Not reapable.
+        closing,
+        /// Stopped and its journal closed; freed by `reap` at `refs == 0`.
+        closed,
+    };
 
     fn view(slot: *SessionSlot) SessionView {
         return .{
@@ -150,7 +166,8 @@ pub const Stats = struct {
     drivers_joined: usize,
     /// Destroyed sessions whose memory has been freed.
     reaped: usize,
-    /// Destroyed sessions still waiting for their last lease.
+    /// Destroyed sessions not reaped yet: being stopped, or waiting for
+    /// their last lease.
     retired: usize,
 };
 
@@ -332,8 +349,9 @@ pub const MultiDaemon = struct {
             defer md.mutex.unlock();
             var link: *?*SessionSlot = &md.retired;
             while (link.*) |slot| {
-                std.debug.assert(slot.state == .closing);
-                if (slot.refs.load(.acquire) == 0) {
+                std.debug.assert(slot.state != .live);
+                // A closing slot still belongs to the thread stopping it.
+                if (slot.state == .closed and slot.refs.load(.acquire) == 0) {
                     link.* = slot.next_retired;
                     slot.next_retired = ready;
                     ready = slot;
@@ -354,7 +372,7 @@ pub const MultiDaemon = struct {
     /// stopped and closed, the transports drain every connection (so every
     /// lease comes back), and everything is reaped. Idempotent.
     pub fn stop(md: *MultiDaemon) void {
-        var closing: ?*SessionSlot = null;
+        var stopping: ?*SessionSlot = null;
         {
             md.mutex.lock();
             defer md.mutex.unlock();
@@ -362,18 +380,17 @@ pub const MultiDaemon = struct {
             var it = md.table.valueIterator();
             while (it.next()) |entry| {
                 const slot = entry.*;
-                slot.state = .closing;
-                slot.next_retired = closing;
-                closing = slot;
+                md.unpublishLocked(slot);
+                slot.next_stopping = stopping;
+                stopping = slot;
             }
             md.table.clearRetainingCapacity();
-            md.live.store(0, .release);
         }
         // Every driver winds down at once; each join below is then short.
-        var slot = closing;
-        while (slot) |s| : (slot = s.next_retired) s.host.signalStop();
-        while (closing) |s| {
-            closing = s.next_retired;
+        var slot = stopping;
+        while (slot) |s| : (slot = s.next_stopping) s.host.signalStop();
+        while (stopping) |s| {
+            stopping = s.next_stopping;
             md.retire(s);
         }
         if (md.srv) |srv| {
@@ -494,18 +511,33 @@ pub const MultiDaemon = struct {
             md.mutex.lock();
             defer md.mutex.unlock();
             const entry = md.table.fetchRemove(id.bytes) orelse return error.UnknownSession;
-            entry.value.state = .closing;
-            _ = md.live.fetchSub(1, .acq_rel);
+            md.unpublishLocked(entry.value);
             break :slot entry.value;
         };
         md.retire(slot);
     }
 
-    /// A slot that has left the table: stop and join its driver, close its
-    /// journal (after `session_lifecycle.closed`, so a stream sees the run end
-    /// and then the session close), and hand it to the reaper.
+    /// A slot leaves the live set (the caller takes it out of the table):
+    /// closing, on the retired list at once, so its id is refused to a create
+    /// for the whole stop and until it is reaped. Caller holds `mutex`.
+    fn unpublishLocked(md: *MultiDaemon, slot: *SessionSlot) void {
+        std.debug.assert(slot.state == .live);
+        slot.state = .closing;
+        slot.next_retired = md.retired;
+        md.retired = slot;
+        _ = md.live.fetchSub(1, .acq_rel);
+    }
+
+    /// A closing slot: stop and join its driver and its background work,
+    /// close its journal (after `session_lifecycle.closed`, so a stream sees
+    /// the run end and then the session close), and hand it to the reaper.
     fn retire(md: *MultiDaemon, slot: *SessionSlot) void {
         slot.host.stopDriver();
+        // Then the work the driver started beside itself: background agent
+        // jobs, teammates, background shells. They write into the session
+        // directory, and a destroy stops the session's work at once; only its
+        // memory waits for the last lease.
+        slot.app.stopBackgroundWork();
         _ = md.drivers_joined.fetchAdd(1, .acq_rel);
         web_session.journalSessionLifecycle(&slot.host.journal, md.gpa, .{ .closed = slot.id.asSlice() });
         slot.host.journal.close(); // every SSE stream and UDS attach ends; their leases come back
@@ -513,8 +545,8 @@ pub const MultiDaemon = struct {
         log.info("daemon", "session {s} closed", .{slot.id.asSlice()});
         md.mutex.lock();
         defer md.mutex.unlock();
-        slot.next_retired = md.retired;
-        md.retired = slot;
+        std.debug.assert(slot.state == .closing);
+        slot.state = .closed; // the reaper's from here
     }
 
     fn reserve(md: *MultiDaemon, id: SessionId) CreateError!void {
@@ -522,6 +554,12 @@ pub const MultiDaemon = struct {
         defer md.mutex.unlock();
         if (md.shutting_down) return error.ShuttingDown;
         if (md.table.contains(id.bytes) or md.reserved.contains(id.bytes)) return error.SessionLive;
+        // A destroyed session keeps its id until it is reaped: its App still
+        // owns the session directory (transcript writer, records) until then.
+        var retired = md.retired;
+        while (retired) |slot| : (retired = slot.next_retired) {
+            if (std.mem.eql(u8, &slot.id.bytes, &id.bytes)) return error.SessionClosing;
+        }
         if (md.table.count() + md.reserved.count() >= md.max_sessions) return error.SessionLimit;
         md.reserved.put(md.gpa, id.bytes, {}) catch return error.CreateFailed;
     }
@@ -771,7 +809,7 @@ fn rootPage(ctx: *anyopaque, allocator: std.mem.Allocator) ?[]u8 {
         "GET  /sessions               {\"sessions\":[{\"session_id\",\"generating\",\"model\",\"permission_mode\",\"pending_request_id\"}]}\n" ++
         "POST /sessions/create        {\"session_id\"?:\"&lt;24 hex&gt;\",\"resume\"?:true} → 201 {\"session_id\",\"messages\"}\n" ++
         "POST /sessions/&lt;id&gt;/resume   200 if live, 404 if not (loads nothing)\n" ++
-        "POST /sessions/&lt;id&gt;/destroy  200 once the driver is stopped\n" ++
+        "POST /sessions/&lt;id&gt;/destroy  200 once its run and background work are stopped\n" ++
         "POST /s/&lt;id&gt;/message       {\"text\":\"...\"}\n" ++
         "GET  /s/&lt;id&gt;/events        (SSE)\n" ++
         "POST /s/&lt;id&gt;/respond       {\"id\":N,...}\n" ++
