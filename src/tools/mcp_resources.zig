@@ -25,7 +25,7 @@ const result_spool = @import("result_spool.zig");
 
 const LAST_ERROR_DETAIL_MAX_BYTES: usize = 512;
 
-const NO_MCP_SESSIONS_DETAIL = "No MCP servers are connected in this session. Declare servers in <state root>/config.json under \"mcp_servers\" (see /mcp) and restart; their tools then register as <server>__<tool> and are listed under \"# Deferred tools\".";
+const NO_MCP_SESSIONS_DETAIL = "No MCP servers are connected in this session. Declare servers under \"mcpServers\" in <state root>/config.json (Claude Code's ~/.claude.json and Codex's ~/.codex/config.toml are read too; see /mcp) and restart; their tools then register as mcp__<server>__<tool> and are listed under \"# Deferred tools\".";
 
 fn extractDecodedField(a: std.mem.Allocator, args: []const u8, field: []const u8) !?[]u8 {
     const raw = common.extractJsonArg(args, field) orelse return null;
@@ -448,7 +448,7 @@ test "list: zero connected servers is NoMcpSessions with a config hint, not an e
     var empty: []McpSessionEntry = &.{};
     const ctx = ToolContext{ .allocator = a, .mcp_sessions = &empty, .error_detail = &detail };
     try testing.expectError(error.NoMcpSessions, listExecute(&ctx, "{}"));
-    try testing.expect(std.mem.indexOf(u8, detail.?, "mcp_servers") != null);
+    try testing.expect(std.mem.indexOf(u8, detail.?, "mcpServers") != null);
     a.free(detail.?);
     detail = null;
     // 带 server 过滤同样先报"没连"——不是 server_not_found,更不是空数组。

@@ -146,9 +146,9 @@ pub fn validateCompleteResult(
     // A vendor extension with that name must not be interpreted as a Modern
     // input-required or unsupported-result response.
     if (era != .modern_2026_07_28) return null;
-    const result_type = result.object.get("resultType") orelse {
-        return canonical.Diagnostic.init(.missing_result_type, phase);
-    };
+    // "the client MUST treat the absent field as `complete`"
+    // (2026-07-28 schema.ts, `Result.resultType`).
+    const result_type = result.object.get("resultType") orelse return null;
     if (result_type != .string)
         return canonical.Diagnostic.init(.invalid_field, phase);
     if (std.mem.eql(u8, result_type.string, "complete")) return null;
@@ -176,12 +176,11 @@ fn validateInputRequired(result: std.json.Value, limits: canonical.Limits) canon
             try canonical.validateText(entry.key_ptr.*, limits.max_text_bytes);
             const request = entry.value_ptr.*;
             if (request != .object) return error.InvalidValue;
-            const jsonrpc = request.object.get("jsonrpc") orelse return error.InvalidValue;
-            const id = request.object.get("id") orelse return error.InvalidValue;
+            // An InputRequest is `{method, params}`: it is embedded in a result,
+            // not a JSON-RPC message, so it has no `jsonrpc` or `id`
+            // (2026-07-28 examples/InputRequiredResult).
             const method = request.object.get("method") orelse return error.InvalidValue;
-            if (jsonrpc != .string or !std.mem.eql(u8, jsonrpc.string, JSON_RPC_VERSION) or
-                (id != .string and numberAsI64(id) == null) or method != .string)
-                return error.InvalidValue;
+            if (method != .string) return error.InvalidValue;
             if (!std.mem.eql(u8, method.string, "sampling/createMessage") and
                 !std.mem.eql(u8, method.string, "roots/list") and
                 !std.mem.eql(u8, method.string, "elicitation/create"))
@@ -363,10 +362,8 @@ test "modern complete result requires resultType after validating input required
     try std.testing.expectEqual(canonical.DiagnosticCode.input_required_unsupported, diagnostic.code);
     var missing = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{}", .{});
     defer missing.deinit();
-    try std.testing.expectEqual(
-        canonical.DiagnosticCode.missing_result_type,
-        validateCompleteResult(missing.value, .modern_2026_07_28, .tools_call, .{}).?.code,
-    );
+    // An absent resultType is "complete" in every era.
+    try std.testing.expect(validateCompleteResult(missing.value, .modern_2026_07_28, .tools_call, .{}) == null);
     try std.testing.expect(validateCompleteResult(missing.value, .classic_2025_11_25, .tools_call, .{}) == null);
     try std.testing.expect(validateCompleteResult(missing.value, .classic_2025_06_18, .tools_call, .{}) == null);
 

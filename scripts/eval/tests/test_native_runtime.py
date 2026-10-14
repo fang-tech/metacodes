@@ -19,6 +19,12 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 BIN = os.environ.get("METACODES_NATIVE_E2E_BIN")
 
 
+def _host_env():
+    """The caller's environment minus what a temporary HOME does not isolate:
+    an absolute CODEX_HOME would load the host's Codex Skills and MCP servers."""
+    return {key: value for key, value in os.environ.items() if key != "CODEX_HOME"}
+
+
 @unittest.skipUnless(BIN, "set METACODES_NATIVE_E2E_BIN to run the native runtime smoke test")
 class NativeRuntimeTest(unittest.TestCase):
     def test_real_repl_evaluation_tool_policy_filters_provider_schema(self):
@@ -92,7 +98,7 @@ class NativeRuntimeTest(unittest.TestCase):
                     stderr=subprocess.STDOUT,
                     cwd=workspace,
                     env={
-                        **os.environ,
+                        **_host_env(),
                         "HOME": str(home),
                         "METACODES_KG_AUTOSTART": "0",
                         "METACODES_EVAL_METADATA_FD": str(metadata_fd),
@@ -181,7 +187,7 @@ class NativeRuntimeTest(unittest.TestCase):
                     stderr=subprocess.STDOUT,
                     cwd=workspace,
                     env={
-                        **os.environ,
+                        **_host_env(),
                         "HOME": str(home),
                         "METACODES_KG_AUTOSTART": "0",
                         "METACODES_EVAL_METADATA_FD": str(metadata_fd),
@@ -262,7 +268,7 @@ class NativeRuntimeTest(unittest.TestCase):
                 stderr=subprocess.STDOUT,
                 cwd=workspace,
                 env={
-                    **os.environ,
+                    **_host_env(),
                     "HOME": str(home),
                     "METACODES_KG_AUTOSTART": "0",
                     "METACODES_EVAL_METADATA_FD": str(metadata_fd),
@@ -338,7 +344,7 @@ class NativeRuntimeTest(unittest.TestCase):
                 ]
             ) as server:
                 env = {
-                    **os.environ,
+                    **_host_env(),
                     "HOME": str(home),
                     "METACODES_KG_AUTOSTART": "0",
                     "METACODES_EVAL_METADATA_FD": str(metadata_fd),

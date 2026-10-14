@@ -1,17 +1,33 @@
-//! MCP 高层客户端。
+//! MCP 高层客户端(stdio)。
 //!
-//! 用途：代理 agent_loop 调用 MCP server 的 tools。
-//! 生命周期：init → initialize → 反复 listTools / callTool → close。
+//! 生命周期:connect → (发现协议版本) → listTools / callTool / resources → close。
 //!
-//! 本期简化：
-//! - 同步请求/响应（不做并发 in-flight）—— 每次 send 后立即 recvLine，id 自增
-//! - 无重试、无重连；server 崩溃返回 error.McpServerCrashed
-//! - 只支持 stdio transport（future: sse/websocket）
+//! 协议版本(对齐 2026-07-28 规范的"双时代"客户端,见 basic/transports/stdio.mdx
+//! "Backward Compatibility"):
+//! - `.auto`(默认):先发 `server/discover`。得到 DiscoverResult(或带 `supported`
+//!   的 -32022)且支持 2026-07-28 → Modern:无握手,每个请求带
+//!   `_meta["io.modelcontextprotocol/…"]`,结果带 `resultType`,输入需求走 MRTR。
+//!   其余任何错误 / 超时 / 子进程退出 → Classic(不按某个错误码判定,规范 MUST)。
+//!   探测让子进程退出或超时时重启子进程再握手(Rust SDK 一类 server 在
+//!   initialize 前收到请求会直接退出)。
+//! - Classic:`initialize` 请求 2025-11-25,接受 server 选定的
+//!   2025-11-25 / 2025-06-18 / 2025-03-26 / 2024-11-05;其后 `notifications/initialized`。
+//!   回应 server→client 的 `ping`、`elicitation/create`(form 模式);未声明的
+//!   `roots/list`、`sampling/createMessage` 回 method_not_found。
+//!
+//! 共通:`tools/list` 按 `nextCursor` 翻页(空串游标也表示还有下一页);中断/超时
+//! 发 `notifications/cancelled`;`notifications/tools/list_changed` 记入 `tools_changed`。
+//! stdio 是单一有序 JSON-RPC 流,同一时刻只允许一个请求占用收发循环(request_mutex)。
 
 const std = @import("std");
 const protocol = @import("protocol.zig");
 const StdioTransport = @import("transport_stdio.zig").StdioTransport;
-const sync = @import("platform").sync;
+const transport_mod = @import("transport.zig");
+const Transport = transport_mod.Transport;
+const HttpTransport = transport_mod.HttpTransport;
+const platform = @import("platform");
+const sync = platform.sync;
+const process = platform.process;
 const AbortSignal = @import("../util/abort.zig").AbortSignal;
 const artifact_store = @import("../core/tool_result_artifact.zig");
 const ToolResultBody = @import("../core/tool_result.zig").ToolResultBody;
@@ -19,10 +35,27 @@ const tool_error = @import("../core/tool_error.zig");
 const ToolError = tool_error.ToolError;
 const result_budget = @import("../core/result_budget.zig");
 const result_stream = @import("../agentcore/mcp_result_stream.zig");
+const json_util = @import("../util/json.zig");
+const util_time = @import("../util/time.zig");
 
-/// elicitation 回调:server 在 tool 执行中发 `elicitation/create` 请求用户输入时被调。
-/// 入参 = elicitation params JSON(含 message/requestedSchema);返回 = 用户回复的 content 对象 JSON
-/// (owned by 传入 allocator)或 null=用户拒绝(client 回 {"action":"decline"})。
+pub const MODERN_VERSION = "2026-07-28";
+pub const CLASSIC_VERSION = "2025-11-25";
+/// Classic revisions this client speaks, newest first.
+pub const CLASSIC_VERSIONS = [_][]const u8{ "2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05" };
+
+/// The client's capabilities: form-mode elicitation only. (`{}` means form
+/// mode from 2025-11-25 on, and plain elicitation support in 2025-06-18.)
+const CLIENT_CAPABILITIES_JSON = "{\"elicitation\":{}}";
+
+/// MRTR rounds one request may take before the client gives up.
+const MAX_INPUT_ROUNDS: usize = 8;
+/// `tools/list` pagination bounds (Codex main: 100 pages, 2048 tools).
+const MAX_LIST_PAGES: usize = 100;
+const MAX_LISTED_TOOLS: usize = 2048;
+
+/// elicitation 回调:server 请求用户输入时被调(Classic 的 `elicitation/create` 请求与
+/// Modern 的 MRTR 输入需求共用)。入参 = elicitation params JSON(含 message/requestedSchema);
+/// 返回 = 用户回复的 content 对象 JSON(owned by 传入 allocator)或 null=用户拒绝。
 pub const ElicitHandler = struct {
     ctx: *anyopaque,
     handleFn: *const fn (ctx: *anyopaque, params_json: []const u8, alloc: std.mem.Allocator) ?[]u8,
@@ -36,9 +69,51 @@ pub const ElicitHandler = struct {
 /// `result_budget.PER_RESULT_MAX_BYTES`: the bytes are already in memory.
 pub const CONTROL_FRAME_MATERIALIZE_BYTES: usize = 1024 * 1024;
 
+pub const ProtocolPolicy = enum {
+    /// Probe `server/discover`, fall back to the `initialize` handshake.
+    auto,
+    /// Require 2026-07-28.
+    modern_only,
+    /// Skip the probe and speak the handshake revisions only.
+    classic_only,
+};
+
+pub const SpawnSpec = struct {
+    argv: []const ?[*:0]const u8,
+    /// Exact child environment (`KEY=VALUE`); null = `inherit_env` semantics.
+    env: ?[]const [:0]const u8 = null,
+    inherit_env: bool = false,
+    cwd: ?[]const u8 = null,
+    /// Descriptor receiving the server's stderr; null discards it.
+    stderr_fd: ?c_int = null,
+
+    fn options(self: SpawnSpec) process.PipeSpawnOptions {
+        return .{ .env = self.env, .inherit_env = self.inherit_env, .cwd = self.cwd, .stderr_fd = self.stderr_fd };
+    }
+};
+
+pub const ConnectOptions = struct {
+    spawn: SpawnSpec,
+    /// Bound on the handshake (probe included). null = unbounded.
+    startup_timeout_ms: ?u32 = null,
+    /// Bound on each tool call / resource read. null = only the user's interrupt.
+    request_timeout_ms: ?u32 = null,
+    protocol: ProtocolPolicy = .auto,
+    /// Bound on the `server/discover` probe in `.auto`. A Classic server
+    /// answers an unknown method at once (or exits); one that ignores it
+    /// costs this long before the handshake.
+    probe_timeout_ms: u32 = 10_000,
+};
+
+pub const ServerCapabilities = struct {
+    tools: bool = false,
+    resources: bool = false,
+    prompts: bool = false,
+};
+
 pub const McpClient = struct {
     allocator: std.mem.Allocator,
-    transport: StdioTransport,
+    transport: Transport,
     next_id: u64 = 1,
     initialized: bool = false,
     /// stdio transport is one ordered JSON-RPC stream. Parallel agent tools
@@ -47,19 +122,104 @@ pub const McpClient = struct {
     request_mutex: sync.Mutex = .{},
     /// server→client elicitation 回调(可选)。未设 → 一律 decline(协议仍正确闭合,server 不卡)。
     elicit: ?ElicitHandler = null,
+    /// Negotiated revision (a static string).
+    protocol_version: []const u8 = CLASSIC_VERSION,
+    /// 2026-07-28: no session; every request carries `_meta`.
+    modern: bool = false,
+    capabilities: ServerCapabilities = .{},
+    request_timeout_ms: ?u32 = null,
+    /// Set when the server announces `notifications/tools/list_changed`.
+    tools_changed: std.atomic.Value(bool) = .init(false),
+    /// `Mcp-Param-*` headers of the call in flight (borrowed; guarded by the
+    /// request mutex taken in `requestBody`).
+    param_headers: []const transport_mod.Header = &.{},
 
+    /// Historical entry point: empty environment, no deadlines, `.auto` protocol.
     pub fn connect(
         allocator: std.mem.Allocator,
         argv: []const ?[*:0]const u8,
     ) !McpClient {
-        var t = try StdioTransport.spawn(allocator, argv);
-        errdefer t.close();
+        return connectWith(allocator, .{ .spawn = .{ .argv = argv } });
+    }
 
+    pub fn connectWith(allocator: std.mem.Allocator, options: ConnectOptions) !McpClient {
         var client = McpClient{
             .allocator = allocator,
-            .transport = t,
+            .transport = .{ .stdio = try StdioTransport.spawnWith(allocator, options.spawn.argv, options.spawn.options()) },
+            .request_timeout_ms = options.request_timeout_ms,
         };
-        try client.initialize();
+        // Whichever child is current (the probe may have replaced it) is
+        // reaped on failure.
+        errdefer client.transport.close();
+        // request_mutex has not been used yet: McpClient is still a local value
+        // that will be moved into caller storage on return. Never lock a pthread
+        // mutex before that move.
+        const started = util_time.nowMs();
+        const startup_deadline: ?i64 = if (options.startup_timeout_ms) |ms| started + ms else null;
+        if (options.protocol != .classic_only) {
+            const probe_deadline = minDeadline(startup_deadline, started + options.probe_timeout_ms);
+            switch (try client.probeModern(probe_deadline)) {
+                .modern => {
+                    client.transport.setDeadline(null);
+                    client.initialized = true;
+                    return client;
+                },
+                .classic => {},
+                .restart => {
+                    // The probe killed or wedged the server: start a fresh one
+                    // for the handshake, unless the startup budget is spent.
+                    if (startup_deadline) |deadline| {
+                        if (util_time.nowMs() >= deadline) return error.McpRequestTimeout;
+                    }
+                    // Spawn first: if that fails, the errdefer still owns a
+                    // valid transport to reap.
+                    const replacement = try StdioTransport.spawnWith(allocator, options.spawn.argv, options.spawn.options());
+                    client.transport.close();
+                    client.transport = .{ .stdio = replacement };
+                },
+            }
+            if (options.protocol == .modern_only) return error.UnsupportedProtocolVersion;
+        }
+        client.transport.setDeadline(startup_deadline);
+        try client.initializeClassic();
+        client.transport.setDeadline(null);
+        return client;
+    }
+
+    pub const HttpSpec = struct {
+        io: std.Io,
+        url: []const u8,
+        /// Configured headers, `Authorization` included.
+        headers: []const transport_mod.Header = &.{},
+    };
+
+    /// Streamable HTTP. The probe falls back to the handshake only on a
+    /// completed non-Modern answer; a timeout, a network failure or 401/403
+    /// is an error, never evidence of an older server.
+    pub fn connectHttp(allocator: std.mem.Allocator, spec: HttpSpec, options: ConnectOptions) !McpClient {
+        var client = McpClient{
+            .allocator = allocator,
+            .transport = .{ .http = try HttpTransport.create(allocator, spec.io, spec.url, spec.headers) },
+            .request_timeout_ms = options.request_timeout_ms,
+        };
+        errdefer client.transport.close();
+        const started = util_time.nowMs();
+        const startup_deadline: ?i64 = if (options.startup_timeout_ms) |ms| started + ms else null;
+        if (options.protocol != .classic_only) {
+            switch (try client.probeModern(minDeadline(startup_deadline, started + options.probe_timeout_ms))) {
+                .modern => {
+                    client.transport.setDeadline(null);
+                    client.initialized = true;
+                    return client;
+                },
+                .classic => {},
+                .restart => return error.McpConnectFailed,
+            }
+            if (options.protocol == .modern_only) return error.UnsupportedProtocolVersion;
+        }
+        client.transport.setDeadline(startup_deadline);
+        try client.initializeClassic();
+        client.transport.setDeadline(null);
         return client;
     }
 
@@ -67,80 +227,322 @@ pub const McpClient = struct {
         self.transport.close();
     }
 
-    fn initialize(self: *McpClient) !void {
-        const params = try protocol.initializeParams(self.allocator);
-        defer self.allocator.free(params);
+    fn nextId(self: *McpClient) u64 {
+        const id = self.next_id;
+        self.next_id += 1;
+        return id;
+    }
 
-        // request_mutex has not been used yet: McpClient is still a local value
-        // that will be moved into caller storage on return. Never lock a pthread
-        // mutex before that move.
-        const resp = try self.requestUnlocked("initialize", params, null);
-        defer self.allocator.free(resp);
-        // 发 notifications/initialized 完成握手
+    fn setModern(self: *McpClient, modern: bool) void {
+        self.modern = modern;
+        if (self.transport == .http) {
+            self.transport.http.modern = modern;
+            self.transport.http.protocol_version = if (modern) MODERN_VERSION else null;
+        }
+    }
+
+    const ProbeOutcome = enum { modern, classic, restart };
+
+    /// `server/discover` with the Modern `_meta`. Only a Modern answer selects
+    /// Modern; every other outcome falls back (never keyed to one error code).
+    fn probeModern(self: *McpClient, deadline: i64) !ProbeOutcome {
+        const id = self.nextId();
+        self.setModern(true);
+        defer if (!self.initialized) self.setModern(false);
+        const params = try self.wireParams(self.allocator, "{}");
+        defer self.allocator.free(params);
+        const request_bytes = try protocol.serializeRequest(self.allocator, id, "server/discover", params);
+        defer self.allocator.free(request_bytes);
+        self.transport.setDeadline(deadline);
+        defer self.transport.setDeadline(null);
+        const is_http = self.transport.isHttp();
+        self.transport.send(request_bytes, .{ .method = "server/discover" }) catch |err| {
+            // HTTP: no reply is not evidence of an older server.
+            if (is_http) return err;
+            return .restart;
+        };
+        while (true) {
+            const line = self.transport.recvLine() catch |err| {
+                if (is_http) return if (err == error.Eof) .classic else err;
+                return .restart;
+            };
+            defer self.allocator.free(line);
+            var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, line, .{}) catch continue;
+            defer parsed.deinit();
+            if (parsed.value != .object) continue;
+            const object = parsed.value.object;
+            if (object.get("method") != null) continue; // a pre-handshake log notification
+            if (responseId(object) != id) continue;
+            if (object.get("result")) |result| {
+                if (result == .object and listsVersion(result.object.get("supportedVersions"), MODERN_VERSION)) {
+                    self.protocol_version = MODERN_VERSION;
+                    self.capabilities = parseCapabilities(result.object.get("capabilities"));
+                    self.initialized = true;
+                    return .modern;
+                }
+                return .classic;
+            }
+            if (object.get("error")) |err| {
+                // -32022 UnsupportedProtocolVersion carries `data.supported`.
+                if (err == .object) if (err.object.get("data")) |data| if (data == .object) {
+                    if (listsVersion(data.object.get("supported"), MODERN_VERSION)) {
+                        self.protocol_version = MODERN_VERSION;
+                        self.capabilities = .{ .tools = true };
+                        self.initialized = true;
+                        return .modern;
+                    }
+                };
+            }
+            return .classic;
+        }
+    }
+
+    fn initializeClassic(self: *McpClient) !void {
+        var out: std.Io.Writer.Allocating = .init(self.allocator);
+        defer out.deinit();
+        try out.writer.print("{{\"protocolVersion\":\"{s}\",\"capabilities\":{s},\"clientInfo\":{{\"name\":\"metacodes\",\"version\":", .{ CLASSIC_VERSION, CLIENT_CAPABILITIES_JSON });
+        try json_util.writeJsonString(&out.writer, @import("../version.zig").semver);
+        try out.writer.writeAll("}}");
+        const params = out.written();
+
+        const result = try self.requestUnlocked("initialize", params, null);
+        defer self.allocator.free(result);
+        var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, result, .{}) catch
+            return error.McpMalformedResponse;
+        defer parsed.deinit();
+        if (parsed.value != .object) return error.McpMalformedResponse;
+        const chosen = parsed.value.object.get("protocolVersion") orelse return error.McpMalformedResponse;
+        if (chosen != .string) return error.McpMalformedResponse;
+        // The server picks; disconnect when it picks a revision we do not speak
+        // (lifecycle.mdx "Version Negotiation").
+        self.protocol_version = for (CLASSIC_VERSIONS) |version| {
+            if (std.mem.eql(u8, version, chosen.string)) break version;
+        } else return error.UnsupportedProtocolVersion;
+        self.capabilities = parseCapabilities(parsed.value.object.get("capabilities"));
+
+        // HTTP: later requests carry the negotiated revision.
+        if (self.transport == .http) self.transport.http.protocol_version = self.protocol_version;
         const notif = try protocol.serializeNotification(self.allocator, "notifications/initialized", "{}");
         defer self.allocator.free(notif);
-        try self.transport.send(notif);
-
+        try self.transport.send(notif, .{ .method = "notifications/initialized" });
         self.initialized = true;
     }
 
+    /// Request params as sent on the wire: Modern requests carry the protocol
+    /// version, client capabilities and client info in `_meta`.
+    fn wireParams(self: *const McpClient, allocator: std.mem.Allocator, params_json: []const u8) ![]u8 {
+        if (!self.modern) return allocator.dupe(u8, params_json);
+        const trimmed = std.mem.trim(u8, params_json, " \t\r\n");
+        if (trimmed.len < 2 or trimmed[0] != '{' or trimmed[trimmed.len - 1] != '}') return error.McpInvalidParams;
+        const inner = std.mem.trim(u8, trimmed[1 .. trimmed.len - 1], " \t\r\n");
+        var out: std.Io.Writer.Allocating = .init(allocator);
+        defer out.deinit();
+        try out.writer.print(
+            "{{\"_meta\":{{\"io.modelcontextprotocol/protocolVersion\":\"{s}\",\"io.modelcontextprotocol/clientCapabilities\":{s},\"io.modelcontextprotocol/clientInfo\":{{\"name\":\"metacodes\",\"version\":",
+            .{ MODERN_VERSION, CLIENT_CAPABILITIES_JSON },
+        );
+        try json_util.writeJsonString(&out.writer, @import("../version.zig").semver);
+        try out.writer.writeAll("}}");
+        if (inner.len != 0) {
+            try out.writer.writeByte(',');
+            try out.writer.writeAll(inner);
+        }
+        try out.writer.writeByte('}');
+        return out.toOwnedSlice();
+    }
+
     /// 发请求并返回 result_json（owned，caller free）。失败返 error.McpError。
-    /// **JSON-RPC 循环**:读到 server→client 请求(有 method+id,如 elicitation/create)就地处理并回复,
-    /// 通知(有 method 无 id)忽略,继续读直到拿到本请求 id 的响应。否则 server 发 elicitation 会把
-    /// 单次 recvLine 的响应假设打破(旧版直接解析失败)。
     fn request(self: *McpClient, method: []const u8, params_json: []const u8, abort: ?*const AbortSignal) ![]u8 {
         self.request_mutex.lock();
         defer self.request_mutex.unlock();
         return self.requestUnlocked(method, params_json, abort);
     }
 
+    /// One logical request, including Modern MRTR rounds (each retry is a new
+    /// JSON-RPC id carrying `inputResponses` and the echoed `requestState`).
     fn requestUnlocked(self: *McpClient, method: []const u8, params_json: []const u8, abort: ?*const AbortSignal) ![]u8 {
-        const id = self.next_id;
-        self.next_id += 1;
+        var params = try self.allocator.dupe(u8, params_json);
+        defer self.allocator.free(params);
+        var round: usize = 0;
+        while (true) : (round += 1) {
+            const result = try self.exchangeUnlocked(method, params, abort);
+            if (!self.modern or !isInputRequired(self.allocator, result)) return result;
+            defer self.allocator.free(result);
+            if (round + 1 >= MAX_INPUT_ROUNDS or !mrtrMethod(method)) return error.McpInputRequired;
+            const retry = try self.retryParams(params, result);
+            self.allocator.free(params);
+            params = retry;
+        }
+    }
 
-        const req = try protocol.serializeRequest(self.allocator, id, method, params_json);
+    /// Send one JSON-RPC request and read until its response. Server→client
+    /// requests (Classic) are answered in place, notifications recorded.
+    fn exchangeUnlocked(self: *McpClient, method: []const u8, params_json: []const u8, abort: ?*const AbortSignal) ![]u8 {
+        const id = self.nextId();
+        const params = try self.wireParams(self.allocator, params_json);
+        defer self.allocator.free(params);
+        const req = try protocol.serializeRequest(self.allocator, id, method, params);
         defer self.allocator.free(req);
-        self.transport.abort = abort;
-        defer self.transport.abort = null;
-        self.transport.send(req) catch return error.McpServerCrashed;
+        self.transport.setAbort(abort);
+        defer self.transport.setAbort(null);
+        var meta_scratch = std.heap.ArenaAllocator.init(self.allocator);
+        defer meta_scratch.deinit();
+        self.transport.send(req, try sendMeta(meta_scratch.allocator(), method, params_json)) catch |err| return sendFailure(err);
 
         while (true) {
-            const line = self.transport.recvLine() catch return error.McpServerCrashed;
+            const line = self.transport.recvLine() catch |err| return self.failInFlight(id, err);
             defer self.allocator.free(line);
 
             // **按顶层字段分类**(不是全文子串扫):JSON-RPC 铁律——请求/通知有顶层 method,响应有顶层
             // result/error 且从不有 method。子串扫会被 params/requestedSchema 里名为 method/result/error
             // 的**嵌套属性**误导(Linus:elicitation 的 requestedSchema 含 "result" 属性 → 死锁)。
-            // 用 std.json 解顶层一次(MCP 每行是完整 JSON,小)。
             var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, line, .{}) catch {
-                // 不可解析 → 当无效响应(退化;正常 MCP 行都是完整 JSON)。
                 return error.McpMalformedResponse;
             };
             defer parsed.deinit();
             if (parsed.value != .object) return error.McpMalformedResponse;
             const obj = parsed.value.object;
 
-            // 顶层有 method → server→client 请求(带 id)或通知(无 id),不是本请求的响应。
-            if (obj.get("method")) |mv| {
-                if (mv == .string) {
-                    if (obj.get("id")) |idv| {
-                        if (idv == .integer and idv.integer >= 0) {
-                            self.handleServerRequest(@intCast(idv.integer), mv.string, line);
-                        }
-                    } // 无 id/非整数 = 通知 → 忽略
-                    continue;
-                }
-            }
+            if (try self.handleIncoming(obj, line)) continue;
 
             // 否则是响应:按顶层 id 匹配;result/error 从原行提取(顶层)。
-            const resp_id: ?u64 = if (obj.get("id")) |idv| (if (idv == .integer and idv.integer >= 0) @intCast(idv.integer) else null) else null;
-            if (resp_id != null and resp_id.? != id) continue; // 非本请求 → 丢弃继续读
+            const resp_id = responseId(obj);
+            if (resp_id != null and resp_id.? != id) continue; // 非本请求(如已取消请求的迟到响应)→ 丢弃
             if (obj.get("error") != null) return error.McpError;
             const resp = protocol.parseResponse(line) catch return error.McpMalformedResponse;
             if (!resp.isSuccess()) return error.McpError;
             if (resp.result_json) |r| return try self.allocator.dupe(u8, r);
             return try self.allocator.dupe(u8, "null");
         }
+    }
+
+    /// A message with a top-level `method` is a server request or a
+    /// notification, never the awaited response. Returns true when handled.
+    fn handleIncoming(self: *McpClient, obj: std.json.ObjectMap, line: []const u8) !bool {
+        const method_value = obj.get("method") orelse return false;
+        if (method_value != .string) return false;
+        if (obj.get("id")) |idv| {
+            if (idv == .integer and idv.integer >= 0) {
+                self.handleServerRequest(@intCast(idv.integer), method_value.string, line);
+            }
+            return true;
+        }
+        if (std.mem.eql(u8, method_value.string, "notifications/tools/list_changed"))
+            self.tools_changed.store(true, .release);
+        return true;
+    }
+
+    /// Interrupted or timed out: tell the server (stdio cancels with a
+    /// notification in every revision), then report the failure.
+    fn failInFlight(self: *McpClient, id: u64, err: anyerror) anyerror {
+        switch (err) {
+            error.Aborted, error.Timeout => {
+                // HTTP cancels by closing the response stream (already done by
+                // the transport); stdio sends notifications/cancelled.
+                if (self.transport.isHttp()) return if (err == error.Timeout) error.McpRequestTimeout else err;
+                const reason = if (err == error.Aborted) "Interrupted by the user" else "Request timed out";
+                const params = std.fmt.allocPrint(self.allocator, "{{\"requestId\":{d},\"reason\":\"{s}\"}}", .{ id, reason }) catch
+                    return err;
+                defer self.allocator.free(params);
+                const note = protocol.serializeNotification(self.allocator, "notifications/cancelled", params) catch return err;
+                defer self.allocator.free(note);
+                // The request's deadline (or interrupt) must not stop the
+                // notice that ends it.
+                self.transport.setDeadline(null);
+                self.transport.setAbort(null);
+                self.transport.send(note, .{ .method = "notifications/cancelled" }) catch {};
+                return if (err == error.Timeout) error.McpRequestTimeout else err;
+            },
+            error.McpAuthRequired, error.McpSessionExpired, error.McpServerError, error.McpConnectFailed, error.McpLineTooLarge => return err,
+            else => return error.McpServerCrashed,
+        }
+    }
+
+    /// Fulfil a Modern `InputRequiredResult` and return the retry params:
+    /// the original params plus `inputResponses` and the echoed `requestState`.
+    fn retryParams(self: *McpClient, params_json: []const u8, result_json: []const u8) ![]u8 {
+        var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, result_json, .{});
+        defer parsed.deinit();
+        const result = parsed.value.object;
+
+        var responses: std.Io.Writer.Allocating = .init(self.allocator);
+        defer responses.deinit();
+        try responses.writer.writeByte('{');
+        var first = true;
+        if (result.get("inputRequests")) |requests| if (requests == .object) {
+            var iterator = requests.object.iterator();
+            while (iterator.next()) |entry| {
+                const request_value = entry.value_ptr.*;
+                if (request_value != .object) return error.McpMalformedResponse;
+                const input_method = (request_value.object.get("method") orelse return error.McpMalformedResponse);
+                if (input_method != .string) return error.McpMalformedResponse;
+                const input_params = request_value.object.get("params");
+                if (!first) try responses.writer.writeByte(',');
+                first = false;
+                try json_util.writeJsonString(&responses.writer, entry.key_ptr.*);
+                try responses.writer.writeByte(':');
+                if (std.mem.eql(u8, input_method.string, "elicitation/create")) {
+                    const answer = try self.elicitationResult(input_params);
+                    defer self.allocator.free(answer);
+                    try responses.writer.writeAll(answer);
+                } else if (std.mem.eql(u8, input_method.string, "roots/list")) {
+                    // Roots are not declared; an empty list exposes nothing.
+                    try responses.writer.writeAll("{\"roots\":[]}");
+                } else {
+                    // sampling/createMessage is not declared, so it cannot be fulfilled.
+                    return error.McpInputUnsupported;
+                }
+            }
+        };
+        try responses.writer.writeByte('}');
+
+        const trimmed = std.mem.trim(u8, params_json, " \t\r\n");
+        const inner = std.mem.trim(u8, trimmed[1 .. trimmed.len - 1], " \t\r\n");
+        var out: std.Io.Writer.Allocating = .init(self.allocator);
+        defer out.deinit();
+        try out.writer.writeByte('{');
+        // Strip a previous round's fields: each retry carries only the new ones.
+        var wrote = false;
+        var original = try std.json.parseFromSlice(std.json.Value, self.allocator, trimmed, .{ .parse_numbers = false });
+        defer original.deinit();
+        _ = inner;
+        var fields = original.value.object.iterator();
+        while (fields.next()) |field| {
+            if (std.mem.eql(u8, field.key_ptr.*, "inputResponses") or std.mem.eql(u8, field.key_ptr.*, "requestState")) continue;
+            if (wrote) try out.writer.writeByte(',');
+            wrote = true;
+            try json_util.writeJsonString(&out.writer, field.key_ptr.*);
+            try out.writer.writeByte(':');
+            try std.json.Stringify.value(field.value_ptr.*, .{}, &out.writer);
+        }
+        if (wrote) try out.writer.writeByte(',');
+        try out.writer.writeAll("\"inputResponses\":");
+        try out.writer.writeAll(responses.written());
+        if (result.get("requestState")) |state| {
+            if (state != .string) return error.McpMalformedResponse;
+            try out.writer.writeAll(",\"requestState\":");
+            try json_util.writeJsonString(&out.writer, state.string);
+        }
+        try out.writer.writeByte('}');
+        return out.toOwnedSlice();
+    }
+
+    /// `ElicitResult` JSON for an elicitation request: accept with the
+    /// handler's content, or decline. URL mode is not declared, so decline.
+    fn elicitationResult(self: *McpClient, params: ?std.json.Value) ![]u8 {
+        const params_value = params orelse return self.allocator.dupe(u8, "{\"action\":\"decline\"}");
+        if (params_value == .object) if (params_value.object.get("mode")) |mode| {
+            if (mode == .string and !std.mem.eql(u8, mode.string, "form"))
+                return self.allocator.dupe(u8, "{\"action\":\"decline\"}");
+        };
+        const handler = self.elicit orelse return self.allocator.dupe(u8, "{\"action\":\"decline\"}");
+        const params_json = try std.json.Stringify.valueAlloc(self.allocator, params_value, .{});
+        defer self.allocator.free(params_json);
+        const content = handler.handleFn(handler.ctx, params_json, self.allocator) orelse
+            return self.allocator.dupe(u8, "{\"action\":\"decline\"}");
+        defer self.allocator.free(content);
+        if (!isValidJson(self.allocator, content)) return self.allocator.dupe(u8, "{\"action\":\"decline\"}");
+        return std.fmt.allocPrint(self.allocator, "{{\"action\":\"accept\",\"content\":{s}}}", .{content});
     }
 
     /// Typed byte-zero request path used by model-visible MCP tools/resources.
@@ -161,15 +563,30 @@ pub const McpClient = struct {
     ) !ToolResultBody {
         self.request_mutex.lock();
         defer self.request_mutex.unlock();
-        return self.requestBodyUnlocked(
-            method,
-            params_json,
-            artifact_root,
-            budget,
-            abort,
-            require_content,
-        );
+        self.transport.setDeadline(if (self.request_timeout_ms) |ms| util_time.nowMs() + ms else null);
+        defer self.transport.setDeadline(null);
+        var params = try self.allocator.dupe(u8, params_json);
+        defer self.allocator.free(params);
+        var round: usize = 0;
+        while (true) : (round += 1) {
+            switch (try self.requestBodyUnlocked(method, params, artifact_root, budget, abort, require_content)) {
+                .body => |body| return body,
+                .input_required => |result| {
+                    defer self.allocator.free(result);
+                    if (round + 1 >= MAX_INPUT_ROUNDS) return error.McpInputRequired;
+                    const retry = try self.retryParams(params, result);
+                    self.allocator.free(params);
+                    params = retry;
+                },
+            }
+        }
     }
+
+    const BodyOutcome = union(enum) {
+        body: ToolResultBody,
+        /// Modern MRTR: the owned result JSON to fulfil and retry.
+        input_required: []u8,
+    };
 
     fn requestBodyUnlocked(
         self: *McpClient,
@@ -179,15 +596,20 @@ pub const McpClient = struct {
         budget: result_budget.Budget,
         abort: ?*const AbortSignal,
         require_content: bool,
-    ) !ToolResultBody {
+    ) !BodyOutcome {
         if (artifact_root.len == 0) return error.ArtifactRootUnavailable;
-        const id = self.next_id;
-        self.next_id += 1;
-        const req = try protocol.serializeRequest(self.allocator, id, method, params_json);
+        const id = self.nextId();
+        const params = try self.wireParams(self.allocator, params_json);
+        defer self.allocator.free(params);
+        const req = try protocol.serializeRequest(self.allocator, id, method, params);
         defer self.allocator.free(req);
-        self.transport.abort = abort;
-        defer self.transport.abort = null;
-        self.transport.send(req) catch return error.McpServerCrashed;
+        self.transport.setAbort(abort);
+        defer self.transport.setAbort(null);
+        var meta_scratch = std.heap.ArenaAllocator.init(self.allocator);
+        defer meta_scratch.deinit();
+        var meta = try sendMeta(meta_scratch.allocator(), method, params_json);
+        meta.param_headers = self.param_headers;
+        self.transport.send(req, meta) catch |err| return sendFailure(err);
 
         while (true) {
             var capture = try artifact_store.Capture.begin(
@@ -196,7 +618,7 @@ pub const McpClient = struct {
                 result_stream.MAX_RESPONSE_BYTES,
             );
             defer capture.deinit();
-            self.transport.recvLineCapture(&capture) catch return error.McpServerCrashed;
+            self.transport.recvLineCapture(&capture) catch |err| return self.failInFlight(id, err);
             try capture.seal();
 
             // Server→client requests are intentionally bounded control-plane
@@ -215,45 +637,33 @@ pub const McpClient = struct {
                 defer parsed.deinit();
                 if (parsed.value != .object) return error.McpMalformedResponse;
                 const obj = parsed.value.object;
-                if (obj.get("method")) |method_value| {
-                    if (method_value == .string) {
-                        if (obj.get("id")) |id_value| {
-                            if (id_value == .integer and id_value.integer >= 0)
-                                self.handleServerRequest(
-                                    @intCast(id_value.integer),
-                                    method_value.string,
-                                    line,
-                                );
-                        }
-                        continue;
-                    }
-                }
-                const response_id: ?u64 = if (obj.get("id")) |id_value|
-                    (if (id_value == .integer and id_value.integer >= 0)
-                        @intCast(id_value.integer)
-                    else
-                        null)
-                else
-                    null;
+                if (try self.handleIncoming(obj, line)) continue;
+                const response_id = responseId(obj);
                 if (response_id != null and response_id.? != id) continue;
                 if (obj.get("error") != null)
-                    return try self.structuredMcpError(line, .other, .user_error);
+                    return .{ .body = try self.structuredMcpError(line, .other, .user_error) };
                 const response = protocol.parseResponse(line) catch
                     return error.McpMalformedResponse;
                 if (!response.isSuccess())
-                    return try self.structuredMcpError(line, .other, .user_error);
+                    return .{ .body = try self.structuredMcpError(line, .other, .user_error) };
                 const result = response.result_json orelse "null";
+                if (self.modern and isInputRequired(self.allocator, result)) {
+                    if (!mrtrMethod(method)) return error.McpInputRequired;
+                    return .{ .input_required = try self.allocator.dupe(u8, result) };
+                }
                 if (result.len <= budget.per_result_bytes)
-                    return ToolResultBody.initInline(try self.allocator.dupe(u8, result));
-                return sealJsonResult(self.allocator, artifact_root, result) catch |err| {
-                    // Keep a complete bounded result renderable when CAS publication fails.
-                    if (!result_budget.retainInlineAfterFailedPublish(
-                        err,
-                        result.len,
-                        true,
-                        CONTROL_FRAME_MATERIALIZE_BYTES,
-                    )) return err;
-                    return ToolResultBody.initInline(try self.allocator.dupe(u8, result));
+                    return .{ .body = ToolResultBody.initInline(try self.allocator.dupe(u8, result)) };
+                return .{
+                    .body = sealJsonResult(self.allocator, artifact_root, result) catch |err| {
+                        // Keep a complete bounded result renderable when CAS publication fails.
+                        if (!result_budget.retainInlineAfterFailedPublish(
+                            err,
+                            result.len,
+                            true,
+                            CONTROL_FRAME_MATERIALIZE_BYTES,
+                        )) return err;
+                        return .{ .body = ToolResultBody.initInline(try self.allocator.dupe(u8, result)) };
+                    },
                 };
             }
 
@@ -262,27 +672,27 @@ pub const McpClient = struct {
                 &capture,
                 artifact_root,
                 id,
-                .classic_2025_11_25,
+                if (self.modern) .modern_2026_07_28 else .classic_2025_11_25,
                 .{},
                 budget,
                 false,
                 require_content,
             );
             switch (projected) {
-                .result => |body| return body,
+                .result => |body| return .{ .body = body },
                 .diagnostic => |diagnostic| {
                     if (diagnostic.code == .response_id_mismatch) continue;
                     if (diagnostic.code == .resource_limit)
-                        return try self.structuredMcpError(
+                        return .{ .body = try self.structuredMcpError(
                             @tagName(diagnostic.code),
                             .io_error,
                             .system_error,
-                        );
-                    return try self.structuredMcpError(
+                        ) };
+                    return .{ .body = try self.structuredMcpError(
                         @tagName(diagnostic.code),
                         .other,
                         .user_error,
-                    );
+                    ) };
                 },
             }
         }
@@ -303,41 +713,89 @@ pub const McpClient = struct {
         return ToolResultBody.initStructuredError(self.allocator, encoded);
     }
 
-    /// 处理 server→client 请求并回复。elicitation/create → 回调(或 decline);其它 → method_not_found。
+    /// 处理 server→client 请求并回复(Classic;Modern server 不发请求)。
+    /// ping → 空结果(规范 MUST 及时应答);elicitation/create → 回调(或 decline);
+    /// 其余(未声明的 roots/sampling 等)→ method_not_found。
     fn handleServerRequest(self: *McpClient, server_id: u64, method: []const u8, line: []const u8) void {
-        if (std.mem.eql(u8, method, "elicitation/create")) {
-            // 取 params 喂回调;回调给合法 content → {"action":"accept","content":<content>};否则 decline。
-            const params = protocol.findObjectField(line, "params") orelse "{}";
-            var reply_buf: ?[]u8 = null;
-            defer if (reply_buf) |rb| self.allocator.free(rb);
-            if (self.elicit) |h| {
-                if (h.handleFn(h.ctx, params, self.allocator)) |content| {
-                    defer self.allocator.free(content);
-                    // **校验 content 是合法 JSON**再 splice——回调可能喂模型脏输出,裸拼会破 JSON-RPC 帧
-                    // (Linus #4 腐化向量)。非法 → 当 decline(不发损坏回复)。
-                    if (isValidJson(self.allocator, content)) {
-                        const result = std.fmt.allocPrint(self.allocator, "{{\"action\":\"accept\",\"content\":{s}}}", .{content}) catch return;
-                        defer self.allocator.free(result); // 无论 serializeResult 成败都释放(Linus #5 泄漏修)
-                        reply_buf = protocol.serializeResult(self.allocator, server_id, result) catch null;
-                    }
-                }
-            }
-            if (reply_buf == null) {
-                // 无回调 / 拒绝 / content 非法 → decline(协议正确闭合,server 不卡)。
-                reply_buf = protocol.serializeResult(self.allocator, server_id, "{\"action\":\"decline\"}") catch return;
-            }
-            self.transport.send(reply_buf.?) catch {};
+        if (std.mem.eql(u8, method, "ping")) {
+            const reply = protocol.serializeResult(self.allocator, server_id, "{}") catch return;
+            defer self.allocator.free(reply);
+            self.transport.send(reply, .{}) catch {};
             return;
         }
-        // 其它 server→client 方法未实现 → method_not_found(回错误,不静默)。
+        if (std.mem.eql(u8, method, "elicitation/create")) {
+            var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, line, .{}) catch return;
+            defer parsed.deinit();
+            const params = if (parsed.value == .object) parsed.value.object.get("params") else null;
+            // An undeclared mode (URL) is invalid params (client/elicitation.mdx).
+            if (params) |value| if (value == .object) if (value.object.get("mode")) |mode| {
+                if (mode == .string and !std.mem.eql(u8, mode.string, "form")) {
+                    const err = protocol.serializeErrorResponse(self.allocator, server_id, @intFromEnum(protocol.ErrorCode.invalid_params), "elicitation mode not supported") catch return;
+                    defer self.allocator.free(err);
+                    self.transport.send(err, .{}) catch {};
+                    return;
+                }
+            };
+            const result = self.elicitationResult(params) catch return;
+            defer self.allocator.free(result);
+            const reply = protocol.serializeResult(self.allocator, server_id, result) catch return;
+            defer self.allocator.free(reply);
+            self.transport.send(reply, .{}) catch {};
+            return;
+        }
+        // 其它 server→client 方法未声明 → method_not_found(回错误,不静默)。
         const err = protocol.serializeErrorResponse(self.allocator, server_id, @intFromEnum(protocol.ErrorCode.method_not_found), "not supported") catch return;
         defer self.allocator.free(err);
-        self.transport.send(err) catch {};
+        self.transport.send(err, .{}) catch {};
     }
 
-    /// 返回 tools 列表（owned JSON string，caller free）。
+    /// 返回 tools 列表 `{"tools":[...]}`(owned JSON string,caller free),跨页聚合。
     pub fn listTools(self: *McpClient) ![]u8 {
-        return try self.request("tools/list", protocol.EMPTY_PARAMS, null);
+        self.request_mutex.lock();
+        defer self.request_mutex.unlock();
+        var tools: std.Io.Writer.Allocating = .init(self.allocator);
+        defer tools.deinit();
+        try tools.writer.writeAll("{\"tools\":[");
+        var count: usize = 0;
+        var cursor: ?[]u8 = null;
+        defer if (cursor) |value| self.allocator.free(value);
+        var pages: usize = 0;
+        while (pages < MAX_LIST_PAGES) : (pages += 1) {
+            const params = if (cursor) |value| blk: {
+                var out: std.Io.Writer.Allocating = .init(self.allocator);
+                errdefer out.deinit();
+                try out.writer.writeAll("{\"cursor\":");
+                try json_util.writeJsonString(&out.writer, value);
+                try out.writer.writeByte('}');
+                break :blk try out.toOwnedSlice();
+            } else try self.allocator.dupe(u8, protocol.EMPTY_PARAMS);
+            defer self.allocator.free(params);
+            const result = try self.requestUnlocked("tools/list", params, null);
+            defer self.allocator.free(result);
+            var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, result, .{ .parse_numbers = false }) catch
+                return error.McpMalformedResponse;
+            defer parsed.deinit();
+            if (parsed.value != .object) return error.McpMalformedResponse;
+            const page = parsed.value.object.get("tools") orelse return error.McpMalformedResponse;
+            if (page != .array) return error.McpMalformedResponse;
+            for (page.array.items) |tool| {
+                if (count == MAX_LISTED_TOOLS) break;
+                if (count != 0) try tools.writer.writeByte(',');
+                try std.json.Stringify.value(tool, .{}, &tools.writer);
+                count += 1;
+            }
+            // Cursors are opaque; "" is a valid cursor, only absence ends the list.
+            const next = parsed.value.object.get("nextCursor") orelse break;
+            if (next != .string or count == MAX_LISTED_TOOLS) break;
+            if (cursor) |previous| {
+                if (std.mem.eql(u8, previous, next.string)) return error.McpRepeatedCursor;
+                self.allocator.free(previous);
+                cursor = null;
+            }
+            cursor = try self.allocator.dupe(u8, next.string);
+        }
+        try tools.writer.writeAll("]}");
+        return tools.toOwnedSlice();
     }
 
     /// 调用某个 tool。arguments_json 必须是合法 JSON object。
@@ -359,8 +817,24 @@ pub const McpClient = struct {
         budget: result_budget.Budget,
         abort: ?*const AbortSignal,
     ) !ToolResultBody {
+        return self.callToolBodyWithHeaders(name, arguments_json, artifact_root, budget, abort, &.{});
+    }
+
+    /// `callToolBodyAbortable` with the call's `Mcp-Param-*` headers
+    /// (Streamable HTTP; stdio ignores them).
+    pub fn callToolBodyWithHeaders(
+        self: *McpClient,
+        name: []const u8,
+        arguments_json: []const u8,
+        artifact_root: []const u8,
+        budget: result_budget.Budget,
+        abort: ?*const AbortSignal,
+        headers: []const transport_mod.Header,
+    ) !ToolResultBody {
         const params = try protocol.callToolParams(self.allocator, name, arguments_json);
         defer self.allocator.free(params);
+        self.param_headers = headers;
+        defer self.param_headers = &.{};
         return self.requestBody("tools/call", params, artifact_root, budget, abort, true);
     }
 
@@ -405,6 +879,81 @@ pub const McpClient = struct {
         return self.requestBody("resources/read", params, artifact_root, budget, abort, false);
     }
 };
+
+/// HTTP routing headers for a 2026-07-28 request: `Mcp-Method`, and
+/// `Mcp-Name` from `params.name` (tools/call, prompts/get) or `params.uri`
+/// (resources/read).
+fn sendMeta(arena: std.mem.Allocator, method: []const u8, params_json: []const u8) !transport_mod.SendMeta {
+    var meta = transport_mod.SendMeta{ .method = method };
+    const key: ?[]const u8 = if (std.mem.eql(u8, method, "tools/call") or std.mem.eql(u8, method, "prompts/get"))
+        "name"
+    else if (std.mem.eql(u8, method, "resources/read"))
+        "uri"
+    else
+        null;
+    if (key) |field| {
+        const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, params_json, .{}) catch return meta;
+        if (parsed == .object) if (parsed.object.get(field)) |value| if (value == .string) {
+            meta.name = value.string;
+        };
+    }
+    return meta;
+}
+
+/// A request that never left: the deadline expired while the child stopped
+/// draining stdin, or the child is gone.
+fn sendFailure(err: anyerror) anyerror {
+    return switch (err) {
+        error.Timeout => error.McpRequestTimeout,
+        error.Aborted, error.McpAuthRequired, error.McpSessionExpired, error.McpServerError, error.McpConnectFailed => err,
+        else => error.McpServerCrashed,
+    };
+}
+
+fn minDeadline(first: ?i64, second: i64) i64 {
+    return if (first) |value| @min(value, second) else second;
+}
+
+fn responseId(object: std.json.ObjectMap) ?u64 {
+    const value = object.get("id") orelse return null;
+    return if (value == .integer and value.integer >= 0) @intCast(value.integer) else null;
+}
+
+fn listsVersion(value: ?std.json.Value, version: []const u8) bool {
+    const list = value orelse return false;
+    if (list != .array) return false;
+    for (list.array.items) |item| {
+        if (item == .string and std.mem.eql(u8, item.string, version)) return true;
+    }
+    return false;
+}
+
+fn parseCapabilities(value: ?std.json.Value) ServerCapabilities {
+    const object = (value orelse return .{});
+    if (object != .object) return .{};
+    return .{
+        .tools = object.object.get("tools") != null,
+        .resources = object.object.get("resources") != null,
+        .prompts = object.object.get("prompts") != null,
+    };
+}
+
+/// Only `tools/call`, `resources/read` and `prompts/get` may return
+/// `input_required` (2026-07-28 MRTR).
+fn mrtrMethod(method: []const u8) bool {
+    return std.mem.eql(u8, method, "tools/call") or std.mem.eql(u8, method, "resources/read") or
+        std.mem.eql(u8, method, "prompts/get");
+}
+
+/// A 2026-07-28 result whose `resultType` is `input_required`. An absent
+/// `resultType` means `complete`.
+fn isInputRequired(allocator: std.mem.Allocator, result_json: []const u8) bool {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, result_json, .{}) catch return false;
+    defer parsed.deinit();
+    if (parsed.value != .object) return false;
+    const result_type = parsed.value.object.get("resultType") orelse return false;
+    return result_type == .string and std.mem.eql(u8, result_type.string, "input_required");
+}
 
 /// content 是否可解析为合法 JSON 值(elicitation accept 前校验,防裸拼破帧)。
 fn isValidJson(alloc: std.mem.Allocator, s: []const u8) bool {

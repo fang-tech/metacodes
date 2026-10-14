@@ -781,6 +781,11 @@ pub fn build(b: *std.Build) void {
     // all; set before any step copies it.
     // `off`, not an empty value: Windows cannot be relied on to pass one.
     b.graph.environ_map.put("METACODES_JEV_URL", "off") catch @panic("OOM");
+    // Tests isolate the product with a temporary HOME, but `CODEX_HOME` names
+    // an absolute directory that a temporary HOME does not move: left in place,
+    // every App a test builds would load the developer's Codex Skills and start
+    // the MCP servers in its config.toml (doc/SKILLS_AND_MCP.md).
+    _ = b.graph.environ_map.orderedRemove("CODEX_HOME");
     const target = b.standardTargetOptions(.{});
     const target_was_explicit = b.user_input_options.contains("target");
     const optimize = b.standardOptimizeOption(.{});

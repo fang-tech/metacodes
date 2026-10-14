@@ -671,6 +671,9 @@ def _inventory(
             if not key.startswith("METACODES_")
             and not key.startswith("METASK_")
             and not key.startswith("E2E_")
+            # Absolute, so the temporary HOME below does not move it: the
+            # App would load Codex's Skills and start its MCP servers.
+            and key != "CODEX_HOME"
         }
     )
     clean_env["METACODES_PLUGIN_RUNTIME_BINARY"] = str(runtime_binary)
