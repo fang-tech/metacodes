@@ -121,12 +121,19 @@ const input = document.getElementById("input");
 const overlay = document.getElementById("dialog-overlay");
 const dialog = document.getElementById("dialog");
 
-let lastSeq = -1;          // 已消费的最大 SSE id
+let lastSeq = -1;          // 已消费的最大 SSE seq
+let lastEpoch = "";        // lastSeq 所属 journal 的 epoch(SSE id = "<epoch>-<seq>")
 let curText = null;        // 正在流式追加的 assistant 文本(累积原始 markdown 源)
 let curTextRaw = "";       // 当前 assistant 段的 markdown 源
 let toolCards = {};        // tool_use id → {el, bodyEl}
 let curTurn = 0, curToolCalls = 0;
 
+// Start the view over: the DOM and every reference into it (a streaming text block or a
+// tool card left over would receive replayed events on a detached node and lose them).
+function resetView() {
+  scroll.innerHTML = ""; curText = null; curTextRaw = ""; toolCards = {};
+  curTurn = 0; curToolCalls = 0; hideDialog();
+}
 function atBottom() { return scroll.scrollHeight - scroll.scrollTop - scroll.clientHeight < 80; }
 function stick(fn) { const b = atBottom(); fn(); if (b) scroll.scrollTop = scroll.scrollHeight; }
 function el(cls, text) { const d = document.createElement("div"); if (cls) d.className = cls; if (text != null) d.textContent = text; return d; }
@@ -136,14 +143,23 @@ function jparse(s) { try { return JSON.parse(s); } catch { return null; } }
 
 // ── SSE ─────────────────────────────────────────────────────────────────────
 function connect() {
-  const es = new EventSource("/events?since=" + (lastSeq + 1));
+  const es = new EventSource("/events?since=" + (lastSeq + 1) + (lastEpoch ? "&epoch=" + lastEpoch : ""));
   document.getElementById("st-conn").textContent = "";
   es.onmessage = (m) => {
-    lastSeq = parseInt(m.lastEventId, 10);
+    const dash = m.lastEventId.lastIndexOf("-");
+    lastEpoch = m.lastEventId.slice(0, dash); lastSeq = parseInt(m.lastEventId.slice(dash + 1), 10);
     const ev = jparse(m.data); if (!ev) return;
     stick(() => dispatch(ev));
   };
   es.addEventListener("session_closed", () => { es.close(); sysline("· session closed"); });
+  // The server could not continue the cursor: another journal (the host restarted or the
+  // session was rebuilt) or one past its end. It replays from the oldest event it kept, so
+  // start the view over. "evicted" only means old events fell out of the window.
+  es.addEventListener("resync", (m) => {
+    const r = jparse(m.data) || {};
+    if (r.reason && r.reason !== "evicted") { resetView(); lastEpoch = r.epoch || ""; lastSeq = (r.from || 0) - 1; }
+    refreshState();
+  });
   es.onerror = () => {
     document.getElementById("st-conn").textContent = "reconnecting…";
     es.close(); setTimeout(connect, 1000);
@@ -152,18 +168,20 @@ function connect() {
 
 // ── 顶层信封分发:处理每一种响应 ─────────────────────────────────────────────
 function dispatch(ev) {
-  if ("core_event" in ev) return coreEvent(ev.core_event);
+  // Kernel events and UI requests arrive as versioned wire lines (core/protocol/wire.zig).
+  if (ev.v === 1) {
+    if (ev.type === "ui_request") return showDialog(ev.id, ev.kind, ev.request);
+    if (ev.type === "ui_request_closed") return hideDialog();
+    return coreEvent(ev.type, ev.data);
+  }
   if ("user_message" in ev) { endAssistant(); scroll.appendChild(el("msg-user", ev.user_message)); return; }
   if ("run_done" in ev) { endAssistant(); setGenerating(false);
     const sr = ev.run_done.stop_reason || "done";
     if (sr !== "end_turn") sysline("· " + sr + (ev.run_done.err ? ": " + ev.run_done.err : "")); return; }
-  if ("ui_request" in ev) return showDialog(ev.ui_request.id, ev.ui_request.request);
-  if ("ui_request_done" in ev || "ui_request_cancelled" in ev) return hideDialog();
   if ("command_result" in ev) { const r = ev.command_result; sysline((r.ok ? "· " : "⚠ ") + (r.message || ""), !r.ok); if (r.ok) refreshState(); return; }
 }
 
-function coreEvent(ce) {
-  const tag = Object.keys(ce)[0], p = ce[tag];
+function coreEvent(tag, p) {
   switch (tag) {
     case "text_chunk": appendAssistant(p); break;
     case "thinking_chunk": appendAssistant(p); break; // 暂与 text 同渲染(后续可折叠)
@@ -193,7 +211,7 @@ function coreEvent(ce) {
     // 诊断事件:顶层页面不渲染(turn 计数已由 progress 提供)
     case "diag_turn_begin": case "diag_turn_end": case "diag_run_end":
     case "diag_breaker_tripped": case "diag_cache_break": case "diag_continuation": break;
-    default: console.warn("unhandled core_event:", tag, p); break;
+    default: console.warn("unhandled event:", tag, p); break;
   }
 }
 
@@ -453,9 +471,8 @@ function renderGeneric(body, name, content) {
 
 // ── UI 请求对话框(permission / ask_question / plan_approval / custom)──────────
 let pendingReqId = 0;
-function showDialog(id, req) {
+function showDialog(id, tag, p) {
   pendingReqId = id; dialog.innerHTML = "";
-  const tag = Object.keys(req)[0], p = req[tag];
   if (tag === "permission") {
     dialog.appendChild(Object.assign(document.createElement("h3"), { textContent: "Permission: " + p.tool }));
     const pre = document.createElement("pre"); pre.textContent = trunc(p.args, 1200); dialog.appendChild(pre);
@@ -470,7 +487,7 @@ function showDialog(id, req) {
       ["Yes, proceed", "approve_default"], ["Yes, and auto-accept edits", "approve_accept_edits"],
       ["No, keep planning", "reject"],
     ], (c) => respond({ id, choice: c }));
-  } else if (tag === "ask_question") { renderAsk(id, p); }
+  } else if (tag === "ask_question") { renderAsk(id, p.questions); }
   else { dialog.appendChild(Object.assign(document.createElement("h3"), { textContent: "Unsupported UI request: " + tag }));
     choiceButtons([["Dismiss", "x"]], () => respond({ id, result: null })); }
   overlay.style.display = "flex";
@@ -481,7 +498,7 @@ function renderAsk(id, questions) {
   const step = () => {
     dialog.innerHTML = ""; const q = questions[idx];
     dialog.appendChild(Object.assign(document.createElement("h3"), { textContent: (questions.length > 1 ? (idx + 1) + "/" + questions.length + " · " : "") + (q.header ? q.header + " · " : "") + q.question }));
-    if (q.multi) {
+    if (q.multi_select) {
       const boxes = [];
       for (const o of q.options) { const lab = document.createElement("label"); const cb = document.createElement("input"); cb.type = "checkbox"; cb.value = o.label; lab.appendChild(cb); lab.appendChild(document.createTextNode(" " + o.label + (o.description ? " — " + o.description : ""))); dialog.appendChild(lab); boxes.push(cb); }
       const done = document.createElement("button"); done.textContent = "Submit"; done.onclick = () => { answers[idx] = boxes.filter(b => b.checked).map(b => b.value).join(", "); next(); }; dialog.appendChild(done);
@@ -549,7 +566,7 @@ function runCommand(text) {
   const name = text.split(" ")[0];
   const spec = COMMANDS.find(c => c.name === name);
   if (spec && spec.kind === "client") {
-    if (name === "/clear") { scroll.innerHTML = ""; return; }
+    if (name === "/clear") { resetView(); return; }
     if (name === "/help") { const d = el("md"); d.innerHTML = renderMarkdown("**Commands**\n" + COMMANDS.map(c => "- `" + c.name + "` — " + c.desc).join("\n") + "\n- `!<cmd>` — run a shell command (output joins the conversation context)"); scroll.appendChild(d); return; }
     if (name === "/cost") { fetch("/state").then(r => r.json()).then(s => sysline("tokens: " + (s.input_tokens || 0) + " in / " + (s.output_tokens || 0) + " out · $" + Number(s.cost_usd || 0).toFixed(4))); return; }
   }

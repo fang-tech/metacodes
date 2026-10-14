@@ -15,7 +15,7 @@
 
 const std = @import("std");
 const time = @import("../util/time.zig");
-const journal_mod = @import("journal.zig");
+const journal_mod = @import("../core/event_journal.zig");
 const backend_mod = @import("backend.zig");
 const msg_queue_mod = @import("../repl/msg_queue.zig");
 const abort_mod = @import("../util/abort.zig");
@@ -364,16 +364,26 @@ pub const WebServer = struct {
         };
     }
 
-    /// SSE 长连接:从 since 重放 + 阻塞推新。since 来源优先级:?since=N > Last-Event-ID 头 > 0。
-    /// id 语义:该行的 seq(0-based);浏览器重连带 Last-Event-ID=最后收到的 seq → 从 seq+1 续。
+    /// SSE 长连接:从游标重放 + 阻塞推新。游标来源优先级:?since=N(&epoch=E) > Last-Event-ID 头 > 0。
+    /// id 语义:`<journal epoch hex>-<seq>`(seq 0-based);浏览器重连带 Last-Event-ID → 从 seq+1 续。
+    /// 游标属于另一份 journal(宿主重启、会话重建)或超出本 journal 末尾,都无法续接:从最老保留行
+    /// 整体重放,并先发 `resync` 说明原因,客户端据此清空视图(否则静默等到 seq 追上,漏掉之间的事件)。
     fn serveSse(self: *WebServer, fd: net.Socket, line: RequestLine, head: []const u8, sv: SessionView) void {
-        var since = resolveSince(line.query, head);
+        const plan = sv.journal.planResume(resolveCursor(line.query, head));
+        const epoch = sv.journal.epochHex();
+        var since = plan.from;
 
         if (!writeAll(fd, "HTTP/1.1 200 OK\r\n" ++
             "Content-Type: text/event-stream\r\n" ++
             "Cache-Control: no-cache\r\n" ++
             "Connection: keep-alive\r\n\r\n" ++
             "retry: 1000\n\n")) return;
+
+        if (plan.restart) |reason| {
+            const rsx = std.fmt.allocPrint(self.allocator, "event: resync\ndata: {{\"reason\":\"{s}\",\"epoch\":\"{s}\",\"from\":{d}}}\n\n", .{ @tagName(reason), &epoch, since }) catch return;
+            defer self.allocator.free(rsx);
+            if (!writeAll(fd, rsx)) return;
+        }
 
         while (true) {
             // U7:waitSinceFrom 报出 effective start(批次首行逻辑 seq)。若 > since,说明
@@ -382,7 +392,7 @@ pub const WebServer = struct {
             var eff_start: usize = since;
             const batch = sv.journal.waitSinceFrom(self.allocator, since, 15_000, &eff_start) catch return;
             if (eff_start > since) {
-                const rsx = std.fmt.allocPrint(self.allocator, "event: resync\ndata: {{\"dropped_to\":{d}}}\n\n", .{eff_start}) catch return;
+                const rsx = std.fmt.allocPrint(self.allocator, "event: resync\ndata: {{\"reason\":\"evicted\",\"epoch\":\"{s}\",\"from\":{d},\"dropped_to\":{d}}}\n\n", .{ &epoch, eff_start, eff_start }) catch return;
                 defer self.allocator.free(rsx);
                 if (!writeAll(fd, rsx)) return;
                 since = eff_start; // 跳到保留窗起点,后续 frame id 与 since 一致
@@ -393,7 +403,8 @@ pub const WebServer = struct {
                     self.allocator.free(lines);
                 }
                 for (lines, 0..) |l, i| {
-                    const frame = std.fmt.allocPrint(self.allocator, "id: {d}\ndata: {s}\n\n", .{ since + i, l }) catch return;
+                    var id_buffer: [40]u8 = undefined;
+                    const frame = std.fmt.allocPrint(self.allocator, "id: {s}\ndata: {s}\n\n", .{ sv.journal.eventId(&id_buffer, since + i), l }) catch return;
                     defer self.allocator.free(frame);
                     if (!writeAll(fd, frame)) return;
                 }
@@ -433,19 +444,12 @@ pub fn originAllowed(head: []const u8, port: u16) bool {
     return std.mem.eql(u8, origin, o2);
 }
 
-/// SSE 起点 seq。优先 ?since=N;否则 Last-Event-ID 头(重连,取该 seq+1);都无 = 0。
-/// **saturating +1**:Last-Event-ID 来自客户端(可伪造 usize max),`l+1` 裸加会溢出
-/// panic 整个 daemon(与 body 413 溢出同类)。`+|` 饱和到 max → waitSince 恒等待,坏
-/// 输入自食其果,不崩进程。
-pub fn resolveSince(query: []const u8, head: []const u8) usize {
-    if (queryParam(query, "since")) |s| {
-        return std.fmt.parseInt(usize, s, 10) catch 0;
-    }
-    if (headerValue(head, "last-event-id")) |s| {
-        const last = std.fmt.parseInt(usize, s, 10) catch return 0;
-        return last +| 1;
-    }
-    return 0;
+/// SSE 游标来源优先级:?since=N(&epoch=E) > Last-Event-ID 头 > 0。解析与续接判定在
+/// core/event_journal.zig(`Cursor`、`EventJournal.planResume`),任何宿主共用同一规则。
+pub fn resolveCursor(query: []const u8, head: []const u8) journal_mod.Cursor {
+    if (queryParam(query, "since")) |since| return journal_mod.Cursor.fromSince(since, queryParam(query, "epoch"));
+    if (headerValue(head, "last-event-id")) |raw| return journal_mod.Cursor.fromLastEventId(raw);
+    return .{};
 }
 
 // ── 纯函数(可单测)─────────────────────────────────────────────────────────
@@ -574,17 +578,11 @@ test "originAllowed: 同源放行 / 无 Origin 放行(CLI)/ 跨域拒绝(CSRF)" 
     try testing.expect(!originAllowed("POST /m HTTP/1.1\r\nOrigin: https://127.0.0.1:7777", 7777));
 }
 
-test "resolveSince: ?since 优先 / Last-Event-ID+1 / 恶意 usize max 饱和不溢出" {
-    // ?since 直接用
-    try testing.expectEqual(@as(usize, 42), resolveSince("since=42", "GET /events?since=42 HTTP/1.1"));
-    // Last-Event-ID → +1(重连续传)
-    try testing.expectEqual(@as(usize, 10), resolveSince("", "GET /events HTTP/1.1\r\nLast-Event-ID: 9"));
-    // P1-B 回归:恶意 Last-Event-ID = usize max,+| 饱和不 panic
-    try testing.expectEqual(std.math.maxInt(usize), resolveSince("", "GET /events HTTP/1.1\r\nLast-Event-ID: 18446744073709551615"));
-    // 都无 → 0(全量重放)
-    try testing.expectEqual(@as(usize, 0), resolveSince("", "GET /events HTTP/1.1"));
-    // 坏 since → 0
-    try testing.expectEqual(@as(usize, 0), resolveSince("since=abc", "GET /events HTTP/1.1"));
+test "resolveCursor: ?since 优先于 Last-Event-ID;都无 = 从头" {
+    const Cursor = journal_mod.Cursor;
+    try testing.expectEqualDeep(Cursor{ .next = 42, .epoch = .{ .named = 0xabc } }, resolveCursor("since=42&epoch=0000000000000abc", "GET /events HTTP/1.1\r\nLast-Event-ID: 00000000000000ff-9"));
+    try testing.expectEqualDeep(Cursor{ .next = 10, .epoch = .{ .named = 0xff } }, resolveCursor("", "GET /events HTTP/1.1\r\nLast-Event-ID: 00000000000000ff-9"));
+    try testing.expectEqualDeep(Cursor{}, resolveCursor("", "GET /events HTTP/1.1"));
 }
 
 test "queryParam / headerValue / parseContentLength" {
@@ -718,7 +716,7 @@ test "loopback: /interrupt 打 abort;/respond 无挂起 409" {
 test "loopback: SSE 重放已有事件(带 id 帧)" {
     var j = EventJournal.init(testing.allocator);
     defer j.deinit();
-    j.append("{\"core_event\":{\"text_chunk\":\"hey\"}}");
+    j.append("{\"v\":1,\"type\":\"text_chunk\",\"data\":\"hey\"}");
     var wb = WebBackend.init(testing.allocator, &j);
     defer wb.deinit();
     var inbox = MsgQueue.init(testing.allocator);
@@ -744,7 +742,9 @@ test "loopback: SSE 重放已有事件(带 id 帧)" {
     defer j.close();
     const resp = try httpRoundtripPartial(testing.allocator, srv.port, "GET /events HTTP/1.1\r\n\r\n", "text_chunk");
     defer testing.allocator.free(resp);
-    try testing.expect(std.mem.indexOf(u8, resp, "id: 0\ndata: {\"core_event\"") != null);
+    var frame_buf: [96]u8 = undefined;
+    const frame = try std.fmt.bufPrint(&frame_buf, "id: {s}-0\ndata: {{\"v\":1,\"type\":\"text_chunk\"", .{&j.epochHex()});
+    try testing.expect(std.mem.indexOf(u8, resp, frame) != null);
     try testing.expect(std.mem.indexOf(u8, resp, "hey") != null);
 }
 

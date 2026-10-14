@@ -706,6 +706,9 @@ pub const App = struct {
         // Session 级权限记忆挂到 permission_ctx(persist 路径复用 match_ctx.home/project_root,
         // 在 settings 加载处统一设,无需独立 persist context)。
         app.permission_ctx.session_rules = &app.session_rules;
+        // The App's settings loader reads `.claude/settings*.json` back on the
+        // next start, so here an "allow always" answer may outlive the Session.
+        app.permission_ctx.always_allow = .settings_file;
         app.permission_ctx.session = app.session_id; // 权限对话框路由到本会话视图(M5/M6)
 
         // Model-facing Skill is present only when the canonical snapshot has
@@ -1969,7 +1972,7 @@ pub const App = struct {
         defer app.allocator.free(cwd);
 
         // session_id 传入,使 transcript 目录名 == App.session_id(统一,不再两个独立 gen)。
-        const w = try transcript.Writer.init(app.allocator, cwd, state_dir, app.activeModel(), app.session_id);
+        const w = try transcript.Writer.init(app.allocator, cwd, .{ .path = state_dir }, app.activeModel(), app.session_id);
         app.transcript_writer = w;
     }
 
@@ -3516,7 +3519,7 @@ test "U5 B3: 附着无缺口不变式——快照(seq,model)绝不撕出漏读�
     //   降级出 (旧 model, 新 seq) 缺口(同 journal.append 自身 OOM 丢行,整层 best-effort)。本测
     //   在充足内存下证不变式;OOM 路径 setModel 已 warn 记账(不静默)。
     const a = std.testing.allocator;
-    const EventJournal = @import("web/journal.zig").EventJournal; // test-scoped:不进 app.zig 非测试面
+    const EventJournal = @import("core/event_journal.zig").EventJournal; // test-scoped:不进 app.zig 非测试面
     const N: usize = 3000;
 
     var journal = EventJournal.init(a);
@@ -3579,7 +3582,7 @@ test "U5 B3(判别性): 确定性证明读序**必须** seq→cache——正序�
     //   · 逆序(cache 先) → 驱动器在两读之间步进 → 快照给出(旧 model, 新 seq)= 缺口。
     // 这是"读序 load-bearing"的真凭据,非并发运气。
     const a = std.testing.allocator;
-    const EventJournal = @import("web/journal.zig").EventJournal;
+    const EventJournal = @import("core/event_journal.zig").EventJournal;
 
     var journal = EventJournal.init(a);
     defer journal.deinit();
