@@ -232,9 +232,14 @@ def test_ctrl_o_box_top_idempotent(bin_path):
                           per_key_drain=0.04, startup_drain=0.8), rows=24, cols=80)
         return a.box_top_row()
 
+    # 2026-10-14 去 flake(Windows ConPTY):!cmd 在 Windows 走 PowerShell,每条起进程常要数秒,
+    # 固定 sleep:0.5 时最后一屏可能停在命令执行中(框未回位)→ box_top 定位失败,box0 或 box2
+    # 哪个 None 随时序而定(CI 两次分别命中)。改为等每条命令的输出行(waitline:整行匹配,
+    # 回显行 `❯ !echo X` 不算)出现再发下一条,两 run 都在全部命令结束后才截屏。单 token
+    # 输出:PowerShell 的 echo 会把多个参数各占一行,单个 token 在 sh/PowerShell/cmd 都是一行。
     msgs = []
     for i in range(6):
-        msgs += ["type:!echo msg %d zig" % i, "key:enter", "sleep:0.5"]
+        msgs += ["type:!echo zigmsg%d" % i, "key:enter", "waitline:zigmsg%d:30" % i]
 
     box0 = box_only(msgs)
     box2 = box_only(msgs + ["key:ctrl_x", "key:ctrl_o", "sleep:0.6", "key:ctrl_o", "sleep:0.6"])

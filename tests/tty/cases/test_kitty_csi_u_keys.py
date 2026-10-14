@@ -87,9 +87,14 @@ def test_csi_u_ctrl_o_opens_transcript_during_generation(bin_path):
 
 def test_csi_u_ctrl_b_backgrounds_during_generation(bin_path):
     # 生成期 CSI-u Ctrl+B(cp=98)→ 转后台。慢 turn 以 tool_use 收尾 → 有 turn2 边界被拦截。
+    # 2026-10-14 去 flake(Windows ConPTY):旧版固定 sleep:2.0 后发 Ctrl+B、再固定等 5s。慢 turn
+    # 约 7s 文本后才到 tool_use 边界,Windows 起得慢时 Ctrl+B 可能早于生成态(成空操作),或边界
+    # 落在 5s 窗口之外(CI 截屏:Thinking 10s 仍未见转后台提示)。改为等生成态(footer 出现
+    # "esc to interrupt")再发 Ctrl+B,再等转后台提示本身出现。
     from slow_mock_server import SlowMockServer
     with SlowMockServer(_slow_turn()) as srv:
-        raw = run(bin_path, ["sleep:0.8", "type:go", "key:enter", "sleep:2.0", csi_u(98), "sleep:5.0", "type:x", "sleep:0.5"],
+        raw = run(bin_path, ["sleep:0.8", "type:go", "key:enter", "wait:esc to interrupt:15", csi_u(98),
+                             "wait:已转后台续跑:30", "type:x", "sleep:0.5"],
                   base_url=srv.url, startup_drain=0.8, per_key_drain=0.15)
     txt = _ANSI.sub(b"", raw).decode("utf-8", "replace")
     assert "已转后台续跑" in txt, "生成期 CSI-u Ctrl+B 未触发转后台:\n" + txt[-1200:]
