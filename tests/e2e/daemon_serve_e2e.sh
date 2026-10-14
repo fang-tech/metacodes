@@ -83,7 +83,11 @@ check_health "$url" "$version" 1 # no token needed
 [[ "$(http_code -X POST "$url/message?token=$token" -H "Origin: $url" -d '{"text":"query"}')" == 401 ]] ||
   fail "a POST authenticated by query"
 [[ "$(http_code "$url/")" == 401 ]] || fail "the SPA loads without a token"
-"${CURL[@]}" "$url/?token=$token" | grep -q "<title>metacodes web</title>" || fail "the SPA does not load with ?token="
+# Read the whole page first: `curl | grep -q` lets grep exit at the title, curl
+# then fails writing the rest of the 39 KB page (exit 23) and pipefail fails a
+# check that matched.
+spa="$("${CURL[@]}" "$url/?token=$token")" || fail "GET /?token= failed"
+grep -q "<title>metacodes web</title>" <<<"$spa" || fail "the SPA does not load with ?token="
 "${CURL[@]}" "${auth[@]}" "$url/state" | grep -q '"session_id"' || fail "/state with the token failed"
 ack="$("${CURL[@]}" "${auth[@]}" -X POST "$url/message" -H "Origin: $url" -d '{"text":"with token"}')"
 grep -q '"ok":true' <<<"$ack" || fail "/message with the token not accepted: $ack"
