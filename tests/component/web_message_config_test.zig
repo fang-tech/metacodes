@@ -74,6 +74,11 @@ const AppFixture = struct {
     app: *cc.app_module.App,
 
     fn setup(self: *AppFixture, responses: []const []const u8) !void {
+        return self.setupWithSettings(responses, null);
+    }
+
+    /// `settings_json`, when given, is the session's `--settings` layer.
+    fn setupWithSettings(self: *AppFixture, responses: []const []const u8, settings_json: ?[]const u8) !void {
         self.guard_count = 0;
         self.tmp = std.testing.tmpDir(.{});
         errdefer self.tmp.cleanup();
@@ -99,6 +104,10 @@ const AppFixture = struct {
         try std.testing.expect(config.parse_error == null);
         config.state_root = root;
         config.long_horizon_arm = .codex_style; // no TinyKG service in a unit of this size
+        if (settings_json) |bytes| {
+            try self.tmp.dir.writeFile(std.testing.io, .{ .sub_path = "cli-settings.json", .data = bytes });
+            config.settings_path = try std.fs.path.join(allocator, &.{ root, "cli-settings.json" });
+        }
 
         self.io_rt = std.Io.Threaded.init(allocator, .{});
         errdefer self.io_rt.deinit();
@@ -540,6 +549,152 @@ test "L2 web: /state seq grows across a run; pending_request_id names the open q
     try std.testing.expectEqual(@as(i64, 0), done.int("pending_request_id"));
     try std.testing.expect(done.int("seq") > pending.int("seq"));
     try std.testing.expectEqualStrings(idle.str("epoch"), done.str("epoch"));
+
+    try web.stop();
+    stopped = true;
+}
+
+// ── modes the settings disable (disableBypassPermissionsMode, disableAutoMode) ─
+
+fn postCommand(a: std.mem.Allocator, port: u16, cmd: []const u8) !void {
+    var body_buf: [128]u8 = undefined;
+    const body = try std.fmt.bufPrint(&body_buf, "{{\"cmd\":\"{s}\"}}", .{cmd});
+    const resp = try request(a, port, "POST", "/command", body, null);
+    defer a.free(resp);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "200 OK") != null);
+}
+
+/// The `command_result` line for `cmd`, posted after `from` (caller frees). A
+/// refused command must not have announced a change on the way.
+fn commandResult(a: std.mem.Allocator, port: u16, cmd: []const u8, from: *const State) ![]u8 {
+    try postCommand(a, port, cmd);
+    const sse = try eventsFrom(a, port, from, "\"command_result\"");
+    defer a.free(sse);
+    const lines = try dataLines(a, sse);
+    defer a.free(lines);
+    const result = lines[try expectLine(lines, "\"command_result\"")];
+    if (std.mem.indexOf(u8, result, "\"ok\":false") != null)
+        try std.testing.expectEqual(@as(usize, 0), countLines(lines, "\"type\":\"config_changed\""));
+    return a.dupe(u8, result);
+}
+
+const ESCALATE = "{\"text\":\"escalate\",\"model\":\"" ++ TURN_MODEL ++ "\",\"permission_mode\":\"bypassPermissions\"}";
+
+test "L2 web: a mode the settings disable is refused on a message and by /mode, and nothing else applies" {
+    const a = std.testing.allocator;
+    var fx: AppFixture = undefined;
+    try fx.setupWithSettings(&.{TEXT_SSE}, "{\"permissions\":{\"disableBypassPermissionsMode\":true}}");
+    defer fx.deinit();
+    try fx.saveLoginModel(START_MODEL);
+
+    var web = WebRun{ .app = fx.app, .port = try freePort() };
+    try web.start();
+    var stopped = false;
+    defer if (!stopped) web.stop() catch {};
+
+    var before = try getState(a, web.port);
+    defer before.deinit();
+    const requests_before = fx.mock.requestCount();
+
+    // The message also names a valid model: it must not be switched either.
+    const ack = try postMessage(a, web.port, ESCALATE);
+    defer a.free(ack);
+    try std.testing.expect(std.mem.indexOf(u8, ack, "200 OK") != null);
+    const sse = try eventsFrom(a, web.port, &before, "\"message_rejected\"");
+    defer a.free(sse);
+    const lines = try dataLines(a, sse);
+    defer a.free(lines);
+    try std.testing.expectEqualStrings(
+        "{\"message_rejected\":{\"message\":\"bypassPermissions is disabled by settings\",\"text\":\"escalate\",\"model\":\"" ++ TURN_MODEL ++ "\",\"permission_mode\":\"bypass_permissions\"}}",
+        lines[try expectLine(lines, "\"message_rejected\"")],
+    );
+    try std.testing.expectEqual(@as(usize, 0), countLines(lines, "\"user_message\""));
+    try std.testing.expectEqual(@as(usize, 0), countLines(lines, "\"type\":\"config_changed\""));
+
+    var after_message = try getState(a, web.port);
+    defer after_message.deinit();
+    try std.testing.expectEqualStrings("default", after_message.str("permission_mode"));
+    try std.testing.expectEqualStrings(START_MODEL, after_message.str("model"));
+
+    // `/mode` goes through the same check (SessionService.setPermMode), on every surface.
+    for ([_][]const u8{ "/mode bypass", "/mode bypassPermissions", "/mode bypass-permissions" }) |cmd| {
+        var from = try getState(a, web.port);
+        defer from.deinit();
+        const result = try commandResult(a, web.port, cmd, &from);
+        defer a.free(result);
+        try std.testing.expectEqualStrings("{\"command_result\":{\"ok\":false,\"message\":\"bypassPermissions is disabled by settings\"}}", result);
+        var after = try getState(a, web.port);
+        defer after.deinit();
+        try std.testing.expectEqualStrings("default", after.str("permission_mode"));
+    }
+
+    try std.testing.expectEqual(requests_before, fx.mock.requestCount());
+    try fx.expectLoginModel(START_MODEL);
+    try web.stop();
+    stopped = true;
+    try std.testing.expect(!fx.conversationHas("escalate"));
+    try std.testing.expectEqual(cc.types_mod.PermissionMode.default, fx.app.permMode());
+}
+
+test "L2 web: without that setting the same message and /mode apply; disableAutoMode refuses auto" {
+    const a = std.testing.allocator;
+    var fx: AppFixture = undefined;
+    try fx.setupWithSettings(&.{TEXT_SSE}, "{\"permissions\":{\"disableAutoMode\":true}}");
+    defer fx.deinit();
+    try fx.saveLoginModel(START_MODEL);
+
+    var web = WebRun{ .app = fx.app, .port = try freePort() };
+    try web.start();
+    var stopped = false;
+    defer if (!stopped) web.stop() catch {};
+
+    var before = try getState(a, web.port);
+    defer before.deinit();
+    const requests_before = fx.mock.requestCount();
+    const ack = try postMessage(a, web.port, ESCALATE);
+    defer a.free(ack);
+    try std.testing.expect(std.mem.indexOf(u8, ack, "200 OK") != null);
+    const sse = try eventsFrom(a, web.port, &before, "\"run_done\"");
+    defer a.free(sse);
+    const lines = try dataLines(a, sse);
+    defer a.free(lines);
+    const user = try expectLine(lines, "{\"user_message\":\"escalate\"}");
+    try std.testing.expectEqual(user, 2 + try expectLine(lines, "{\"v\":1,\"type\":\"config_changed\",\"data\":{\"model\":\"" ++ TURN_MODEL ++ "\"}}"));
+    try std.testing.expectEqual(user, 1 + try expectLine(lines, "{\"v\":1,\"type\":\"config_changed\",\"data\":{\"mode\":\"bypass_permissions\"}}"));
+    try std.testing.expectEqual(@as(usize, 0), countLines(lines, "\"message_rejected\""));
+    try std.testing.expectEqualStrings("\"" ++ TURN_MODEL ++ "\"", try requestModel(fx.mock, requests_before));
+
+    var applied = try getState(a, web.port);
+    defer applied.deinit();
+    try std.testing.expectEqualStrings("bypass_permissions", applied.str("permission_mode"));
+    try std.testing.expectEqualStrings(TURN_MODEL, applied.str("model"));
+
+    // disableAutoMode refuses auto, and only auto.
+    {
+        const result = try commandResult(a, web.port, "/mode auto", &applied);
+        defer a.free(result);
+        try std.testing.expectEqualStrings("{\"command_result\":{\"ok\":false,\"message\":\"auto mode is disabled by settings\"}}", result);
+        var after = try getState(a, web.port);
+        defer after.deinit();
+        try std.testing.expectEqualStrings("bypass_permissions", after.str("permission_mode"));
+    }
+    {
+        var from = try getState(a, web.port);
+        defer from.deinit();
+        const result = try commandResult(a, web.port, "/mode default", &from);
+        defer a.free(result);
+        try std.testing.expect(std.mem.indexOf(u8, result, "\"ok\":true") != null);
+    }
+    {
+        var from = try getState(a, web.port);
+        defer from.deinit();
+        const result = try commandResult(a, web.port, "/mode bypass", &from);
+        defer a.free(result);
+        try std.testing.expect(std.mem.indexOf(u8, result, "\"ok\":true") != null);
+        var after = try getState(a, web.port);
+        defer after.deinit();
+        try std.testing.expectEqualStrings("bypass_permissions", after.str("permission_mode"));
+    }
 
     try web.stop();
     stopped = true;

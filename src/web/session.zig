@@ -248,15 +248,25 @@ const session_service_mod = @import("../session_service.zig");
 /// A given field is announced even when its value was already in force, so a
 /// client sees what the turn runs with.
 ///
-/// The model is checked before anything changes (tier names resolve, the
-/// model must be usable with the current provider). If it cannot be applied,
-/// neither field is applied, the text stays out of the conversation, and
-/// `{"message_rejected":{...}}` takes the place of `user_message`. The model
-/// is switched for the session only: the login's saved selection, which
-/// `/model` writes, is left alone (SessionService.setTurnModel).
+/// Both fields are checked before anything changes: the mode must not be one
+/// the settings disable (`disableBypassPermissionsMode`, `disableAutoMode`),
+/// and the model must resolve (tier names) and be usable with the current
+/// provider. If either is refused, neither is applied, the text stays out of
+/// the conversation, and `{"message_rejected":{...}}` takes the place of
+/// `user_message`. The model is switched for the session only: the login's
+/// saved selection, which `/model` writes, is left alone
+/// (SessionService.setTurnModel).
 pub fn startSubmission(app: *app_mod.App, journal: *EventJournal, web_alloc: std.mem.Allocator, submission: *const Submission) bool {
     var svc = session_service_mod.SessionService.init(app);
     var reason_buf: [256]u8 = undefined;
+    // Check the mode before switching the model: a refusal found after setTurnModel would
+    // leave the model switched for a message that is then refused.
+    if (submission.permission_mode) |mode| {
+        if (svc.checkPermMode(mode)) |refusal| {
+            journalRejected(journal, web_alloc, submission, refusal.render(&reason_buf));
+            return false;
+        }
+    }
     if (submission.model) |model| {
         const outcome = svc.setTurnModel(web_alloc, model);
         if (!outcome.ok) {
@@ -264,7 +274,15 @@ pub fn startSubmission(app: *app_mod.App, journal: *EventJournal, web_alloc: std
             return false;
         }
     }
-    if (submission.permission_mode) |mode| _ = svc.setPermMode(mode);
+    if (submission.permission_mode) |mode| {
+        // Allowed by the check above; nothing between it and here reloads settings. Should
+        // that ever change, refuse the turn rather than run it in a mode the settings forbid.
+        const applied = svc.setPermMode(mode);
+        if (!applied.ok) {
+            journalRejected(journal, web_alloc, submission, applied.render(&reason_buf));
+            return false;
+        }
+    }
     const d = svc.submitPrompt(submission.text);
     if (d.run == null) {
         // Only an allocation failure gets here (the transport refuses empty text). Whatever

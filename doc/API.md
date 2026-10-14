@@ -632,11 +632,14 @@ three fields with the same checks (replies `{"ok":true}` or
   queued. `200 {"ok":true}` means queued.
 
 The session's driver takes messages one at a time, after the turn in progress
-and after queued `POST /command`s. For each message it checks the model (tier
+and after queued `POST /command`s. For each message it checks the permission
+mode (a mode the session's settings disable — `disableBypassPermissionsMode`,
+`disableAutoMode` — is refused, as `/mode` refuses it) and the model (tier
 names resolve as `/model` resolves them; the model must be usable with the
-session's provider), switches to it for this session only — unlike `/model`,
-the login's saved model selection is not written — sets the permission mode,
-journals `user_message` and runs the turn. Each field the message gives is
+session's provider), switches to the model for this session only — unlike
+`/model`, the login's saved model selection is not written — sets the
+permission mode, journals `user_message` and runs the turn. Each field the
+message gives is
 announced, even when its value was already in force, so the journal for one
 message reads, with nothing from the driver in between:
 
@@ -648,12 +651,12 @@ message reads, with nothing from the driver in between:
 {"run_done":{"stop_reason":"end_turn","err":null}}
 ```
 
-If the model cannot be applied, neither field is applied, the text stays out
-of the conversation, no turn runs, and this line takes the place of
-`user_message`:
+If either field is refused, neither is applied, the text stays out of the
+conversation, no turn runs, and this line takes the place of `user_message`:
 
 ```text
 {"message_rejected":{"message":"model not available for current provider","text":"...","model":"...","permission_mode":"bypass_permissions"}}
+{"message_rejected":{"message":"bypassPermissions is disabled by settings","text":"...","model":"...","permission_mode":"bypass_permissions"}}
 ```
 
 `model` and `permission_mode` repeat what the message asked for (`null` when

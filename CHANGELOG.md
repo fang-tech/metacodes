@@ -67,8 +67,9 @@ status, compatibility boundaries, and entry points are defined by
   session only, without writing the login's saved selection as `/model` does —
   and journals one `config_changed` line per given field ahead of the turn's
   `user_message`. A bad `permission_mode` is refused with 400 before anything
-  is queued; a model the provider cannot serve applies neither field, runs no
-  turn and journals `message_rejected`. A control plane no longer has to send
+  is queued; a model the provider cannot serve, or a mode the settings
+  disable, applies neither field, runs no turn and journals
+  `message_rejected`. A control plane no longer has to send
   `/command`, poll `/state` and race a busy session before each message.
   `/state`'s `seq`, `permission_mode` and `pending_request_id` are documented
   for reconnecting clients (doc/API.md).
@@ -168,6 +169,12 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- `/mode` could switch a session into a permission mode its settings disable
+  (`disableBypassPermissionsMode`, `disableAutoMode`): they were enforced only
+  when the settings were loaded. `/mode` now refuses such a mode on every
+  surface (terminal, `--web`/`serve` `POST /command`), leaving the mode
+  unchanged, and a `--web`/`serve` message asking for it is refused with
+  `message_rejected` before anything else in it is applied.
 - Sockets no longer leak into child processes. The `--web`, OAuth callback
   and UDS daemon listeners, and every connection they accepted, were
   inheritable, so each later Bash command, hook, MCP server or browser launch

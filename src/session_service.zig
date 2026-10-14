@@ -205,7 +205,25 @@ pub const SessionService = struct {
         return .{ .kind = .mode_changed, .ok = true, .data = .{ .mode = self.app.permMode() } };
     }
 
+    /// The refusal for a mode the settings disable (`disableBypassPermissionsMode`,
+    /// `disableAutoMode`; PermissionContext.modeAllowed), or null when `mode` may be
+    /// set. Changes nothing. Every mode switch on every surface goes through
+    /// `setPermMode`, which asks this first; the web/daemon message asks it before
+    /// applying anything else (web/session.zig startSubmission).
+    pub fn checkPermMode(self: *SessionService, mode: types.PermissionMode) ?CommandOutcome {
+        if (self.app.permission_ctx.modeAllowed(mode)) return null;
+        const text = switch (permission_mode.canonical(mode)) {
+            .bypass_permissions => "bypassPermissions is disabled by settings",
+            .auto => "auto mode is disabled by settings",
+            else => "permission mode is disabled by settings",
+        };
+        return .{ .kind = .err, .ok = false, .data = .{ .text = text } };
+    }
+
+    /// Set the permission mode; a mode the settings disable is refused and
+    /// nothing changes (no config_changed).
     pub fn setPermMode(self: *SessionService, mode: types.PermissionMode) CommandOutcome {
+        if (self.checkPermMode(mode)) |refusal| return refusal;
         self.app.setPermMode(mode);
         return .{ .kind = .mode_changed, .ok = true, .data = .{ .mode = self.app.permMode() } };
     }
