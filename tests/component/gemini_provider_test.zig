@@ -25,7 +25,7 @@ test "C3: 同一 agent_loop 喂 Gemini provider(异协议)跑通到 end_turn" {
     const url = try srv.urlOwned(a);
     defer a.free(url);
 
-    var io_rt = std.Io.Threaded.init(a, .{});
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
     defer io_rt.deinit();
     var client = gemini.GeminiClient.init(a, io_rt.io(), "test-key", "gemini-2.5-flash", url);
     defer client.deinit();
@@ -73,7 +73,7 @@ test "P0.5: parent=Gemini → spawnAgentSink 继承 Gemini provider(子请求是
     const url = try srv.urlOwned(a);
     defer a.free(url);
 
-    var io_rt = std.Io.Threaded.init(a, .{});
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
     defer io_rt.deinit();
     var client = gemini.GeminiClient.init(a, io_rt.io(), "test-key", "gemini-2.5-flash", url);
     defer client.deinit();
@@ -127,7 +127,7 @@ test "C3: Gemini functionCall → 中立工具循环 → 第二轮 end_turn(工�
     const url = try srv.urlOwned(a);
     defer a.free(url);
 
-    var io_rt = std.Io.Threaded.init(a, .{});
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
     defer io_rt.deinit();
     var client = gemini.GeminiClient.init(a, io_rt.io(), "test-key", "gemini-2.5-flash", url);
     defer client.deinit();
@@ -183,7 +183,7 @@ test "C3/P0.1: 并行 functionCall 两个都执行 + name 干净 + 第二轮双 
     const url = try srv.urlOwned(a);
     defer a.free(url);
 
-    var io_rt = std.Io.Threaded.init(a, .{});
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
     defer io_rt.deinit();
     var client = gemini.GeminiClient.init(a, io_rt.io(), "test-key", "gemini-2.5-flash", url);
     defer client.deinit();
@@ -239,7 +239,7 @@ test "C3/缓存: 有状态句柄命中 → 请求体带 cachedContent 引用(sta
     const url = try srv.urlOwned(a);
     defer a.free(url);
 
-    var io_rt = std.Io.Threaded.init(a, .{});
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
     defer io_rt.deinit();
     var client = gemini.GeminiClient.init(a, io_rt.io(), "test-key", "gemini-2.5-flash", url);
     defer client.deinit();
@@ -280,7 +280,7 @@ test "C3/缓存: usage 与 content 同 chunk 时 usage 不丢(E 修复)" {
     const url = try srv.urlOwned(a);
     defer a.free(url);
 
-    var io_rt = std.Io.Threaded.init(a, .{});
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
     defer io_rt.deinit();
     var client = gemini.GeminiClient.init(a, io_rt.io(), "test-key", "gemini-2.5-flash", url);
     defer client.deinit();
@@ -323,6 +323,62 @@ test "C3/缓存: usage 与 content 同 chunk 时 usage 不丢(E 修复)" {
     try std.testing.expectEqual(@as(u64, 3000), cache_read);
 }
 
+// issue #258 同类:`"usageMetadata":null` 不是 usage。旧实现按 substring 判存在,每个这样
+// 的 chunk 都发一个全零 usage(把"未计量"报成"已计量为 0")。修复后只有 object 才计,
+// 数值只从该对象读;对照组(GEMINI_TEXT_SSE,末块带 usage 对象)恰好一次 usage。
+const GEMINI_NULL_USAGE_SSE =
+    "data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"hello \"}]}}],\"usageMetadata\":null}\n\n" ++
+    "data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"world\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":null}\n\n";
+
+test "issue #258: Gemini usageMetadata:null 不产 usage 事件,对象才计且数值来自对象" {
+    const a = std.testing.allocator;
+    const Case = struct { sse: []const u8, usages: []const cc.api_stream.UsageDelta };
+    const cases = [_]Case{
+        .{ .sse = GEMINI_NULL_USAGE_SSE, .usages = &.{} },
+        // promptTokenCount 含 cachedContentTokenCount:input = 10 -| 3000 = 0(饱和减)。
+        .{ .sse = GEMINI_TEXT_SSE, .usages = &.{.{ .input_tokens = 0, .output_tokens = 2, .cache_read_input_tokens = 3000 }} },
+    };
+    for (cases) |case| {
+        var srv = try harness.MockServer.startCassette(&[_][]const u8{case.sse}, 0);
+        defer srv.stop();
+        const url = try srv.urlOwned(a);
+        defer a.free(url);
+
+        var io_rt = @import("platform").signal.threadedIo(a, .{});
+        defer io_rt.deinit();
+        var client = gemini.GeminiClient.init(a, io_rt.io(), "test-key", "gemini-2.5-flash", url);
+        defer client.deinit();
+
+        const p = client.provider();
+        const msgs = [_]cc.types_mod.ApiMessage{
+            .{ .role = .user, .content = &[_]cc.types_mod.ApiContent{.{ .text = "hi" }} },
+        };
+        var handle = try p.sendStream(&msgs, null, null, null, null, null, "");
+        defer handle.deinit();
+
+        var text_buf: std.ArrayList(u8) = .empty;
+        defer text_buf.deinit(a);
+        var usages: std.ArrayList(cc.api_stream.UsageDelta) = .empty;
+        defer usages.deinit(a);
+        while (try handle.next()) |ev| switch (ev) {
+            .text => |t| {
+                defer a.free(t);
+                try text_buf.appendSlice(a, t);
+            },
+            .usage => |u| try usages.append(a, u),
+            .tool_use_start => |tu| {
+                a.free(tu.id);
+                a.free(tu.name);
+                a.free(tu.input_json);
+            },
+            else => {},
+        };
+        try std.testing.expectEqualStrings("hello world", text_buf.items);
+        try std.testing.expectEqualSlices(cc.api_stream.UsageDelta, case.usages, usages.items);
+        try std.testing.expectEqual(cc.api_stream.StopReason.end_turn, handle.stopReason());
+    }
+}
+
 // 发射侧审查 2026-08-17 #1:GeminiStream 每请求新建,fc_counter 每轮归零,
 // 裸 call_N 会跨轮碰撞——dispatch_id 是观察日志/规则门/审计的全局身份,
 // 重复 id = trace fail-closed + journal 封死。修法 = id 掺本请求 RequestId。
@@ -336,7 +392,7 @@ test "Gemini functionCall id 跨请求唯一(掺 RequestId,防跨轮碰撞)" {
     const url = try srv.urlOwned(a);
     defer a.free(url);
 
-    var io_rt = std.Io.Threaded.init(a, .{});
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
     defer io_rt.deinit();
     var client = gemini.GeminiClient.init(a, io_rt.io(), "test-key", "gemini-2.5-flash", url);
     defer client.deinit();

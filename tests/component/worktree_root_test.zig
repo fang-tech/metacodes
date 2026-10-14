@@ -220,7 +220,7 @@ const Fixture = struct {
         try chdirZ(self.repo);
         errdefer chdirZ(self.previous_cwd) catch {};
 
-        self.io_rt = std.Io.Threaded.init(allocator, .{});
+        self.io_rt = @import("platform").signal.threadedIo(allocator, .{});
         errdefer self.io_rt.deinit();
         // The general-purpose allocator, as the product's `init.gpa`: memory a
         // per-call arena hands back is really freed (and poisoned) here.

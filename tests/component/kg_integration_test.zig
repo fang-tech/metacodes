@@ -466,7 +466,7 @@ test "L2 KG: 注入段经 inject_user_context 进请求体(字节断言,DoD)" {
     const url = try srv.urlOwned(a);
     defer a.free(url);
 
-    var io_runtime = std.Io.Threaded.init(a, .{});
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
     defer io_runtime.deinit();
     const io = io_runtime.io();
 
@@ -503,7 +503,7 @@ test "L2 KG governance: freshness and contradiction contract enters the actual A
     const url = try srv.urlOwned(a);
     defer a.free(url);
 
-    var io_runtime = std.Io.Threaded.init(a, .{});
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
     defer io_runtime.deinit();
     const io = io_runtime.io();
 
@@ -971,7 +971,7 @@ test "L2 KG governance: real agent loop batches enumeration recall and host cont
     const url = try srv.urlOwned(a);
     defer a.free(url);
 
-    var io_runtime = std.Io.Threaded.init(a, .{});
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
     defer io_runtime.deinit();
     var api_client = cc.client_mod.Client.initWithBaseUrl(a, io_runtime.io(), "test-key", "claude-sonnet-4-20250514", url);
     defer api_client.deinit();
@@ -1067,7 +1067,7 @@ test "L2 KG governance: malformed GLM seed batch becomes audited exact-only exec
     const url = try srv.urlOwned(a);
     defer a.free(url);
 
-    var io_runtime = std.Io.Threaded.init(a, .{});
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
     defer io_runtime.deinit();
     var api_client = cc.client_mod.Client.initWithBaseUrl(a, io_runtime.io(), "test-key", "glm-5.2", url);
     defer api_client.deinit();
@@ -3194,7 +3194,7 @@ test "L2 KG experience feedback: claim exposes verified prior execution before w
     const url = try srv.urlOwned(a);
     defer a.free(url);
 
-    var io_runtime = std.Io.Threaded.init(a, .{});
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
     defer io_runtime.deinit();
     var api_client = cc.client_mod.Client.initWithBaseUrl(a, io_runtime.io(), "test-key", "claude-sonnet-4-20250514", url);
     defer api_client.deinit();
@@ -3379,7 +3379,7 @@ test "L2 KG: general-purpose child gets read tools and an isolated KgClient" {
     const url = try srv.urlOwned(a);
     defer a.free(url);
 
-    var io_runtime = std.Io.Threaded.init(a, .{});
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
     defer io_runtime.deinit();
     var client = cc.client_mod.Client.initWithBaseUrl(a, io_runtime.io(), "test-key", "claude-sonnet-4-20250514", url);
     defer client.deinit();

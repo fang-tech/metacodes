@@ -1,115 +1,119 @@
 #!/usr/bin/env bash
-# U10-C serve-multi e2e:真跑 `metacodes serve --sessions 2`,验 WebServer resolver 按 /s/<id>/* 路由到
-# 各自 session,**消息路由隔离**(A 的消息绝不进 B 的 journal)+ 未知 session→404 + SIGINT 优雅关停全部。
-# Python mock 假 Anthropic 后端(ThreadingHTTPServer,并发 2 driver 各自生成),返回 end_turn "DAEMON_OK"。
-# 需 python3 + curl + 已 `zig build`。断言失败 → exit 1。跑法:bash tests/e2e/daemon_serve_multi_e2e.sh
-set -u
-ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-BIN="$ROOT/zig-out/bin/metacodes"
-[ -x "$BIN" ] || { echo "FAIL: $BIN 不存在(先 zig build)"; exit 1; }
-command -v python3 >/dev/null || { echo "SKIP: 无 python3"; exit 0; }
+# serve-multi e2e: the real `metacodes serve --sessions 2 --uds <path>` against a
+# loopback mock provider (tests/e2e/daemon_mock_provider.py; no network, no
+# paid call), with bearer-token auth from METACODES_WEB_TOKEN (#252).
+#
+#   - GET /health (#251): open, version as `--version` prints it, sessions 2.
+#   - The HTTP surface needs the token on every other route (the landing page
+#     and session routes included); the UDS transport does not: its access
+#     control stays the socket file's 0600 mode.
+#   - The resolver routes /s/<id>/* to its own session: message isolation,
+#     unknown session → 404, the idle /interrupt gate (409), per-session rich
+#     /state and /command (/mode dont-ask) isolation.
+#   - UDS + NDJSON: list / message / attach (since, streaming) / interrupt,
+#     mid-run interrupt ends the run as aborted, consecutive messages.
+#   - #254 dynamic lifecycle: GET /sessions, POST /sessions/create (201, 409
+#     live duplicate, 400 malformed id), /sessions/<id>/resume (200 live, 404
+#     not), /sessions/<id>/destroy (200, then 404 everywhere, /health drops,
+#     the main loop reaps it), create {"resume":true} restores the transcript;
+#     a second daemon with --sessions 0 starts empty and answers 429 at
+#     --max-sessions.
+#   - SIGINT shuts every driver down cleanly.
+#
+# Run by `zig build test` on POSIX hosts (build.zig sets
+# METACODES_DAEMON_E2E_BIN); by hand: `zig build && bash tests/e2e/daemon_serve_multi_e2e.sh`.
+set -euo pipefail
+# Responses are read whole before grep: under pipefail, `curl | grep -q` fails
+# a matching check whenever grep exits before curl has written everything.
+# shellcheck source=tests/e2e/daemon_e2e_lib.sh
+source "$(dirname "$0")/daemon_e2e_lib.sh"
 
-TMP="$(mktemp -d)"; export HOME="$TMP/home"; mkdir -p "$HOME"
-mport=18095; dport=18096; out="$TMP/daemon.txt"
-cleanup(){ kill -9 "${dpid:-0}" "${mpid:-0}" 2>/dev/null; rm -rf "$TMP"; }
-trap cleanup EXIT
-
-cat > "$TMP/mock.py" <<'PY'
-import http.server, sys, time
-SSE=(b'data: {"type":"message_start","message":{"id":"m","role":"assistant","model":"x","usage":{"input_tokens":1,"output_tokens":0}}}\n\n'
- b'data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n'
- b'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"DAEMON_OK"}}\n\n'
- b'data: {"type":"content_block_stop","index":0}\n\n'
- b'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":2}}\n\n'
- b'data: {"type":"message_stop"}\n\n')
-class H(http.server.BaseHTTPRequestHandler):
-    def do_POST(s):
-        body = s.rfile.read(int(s.headers.get('Content-Length',0)))
-        # body 含 SLOWGEN 标记 → 延 2s 再回(保持该 session generating,供 UDS interrupt 真打进来)。
-        # 只对 interrupt 测试那一发生效,其余生成保持瞬时,不拖慢主体。
-        if b'SLOWGEN' in body:
-            time.sleep(2.0)
-        s.send_response(200); s.send_header('Content-Type','text/event-stream'); s.end_headers()
-        s.wfile.write(SSE); s.wfile.flush()
-    def log_message(s,*a): pass
-http.server.ThreadingHTTPServer.allow_reuse_address=True
-http.server.ThreadingHTTPServer(("127.0.0.1",int(sys.argv[1])),H).serve_forever()
-PY
-
+start_mock
+version="$(binary_version)"
+[[ -n "$version" ]] || fail "metacodes --version printed no version"
+token="e2e-$(python3 -c 'import secrets; print(secrets.token_hex(16))')"
+auth=(-H "Authorization: Bearer $token")
 usock="$TMP/daemon.sock"
-python3 "$TMP/mock.py" $mport & mpid=$!
-sleep 1
-NO_PROBE=1 METACODES_NO_PROBE=1 "$BIN" serve $dport --sessions 2 --uds "$usock" --api-key test --base-url "http://127.0.0.1:$mport" >"$out" 2>&1 & dpid=$!
-sleep 2
 
-grep -q "daemon.*http://127.0.0.1:$dport" "$out" || { echo "FAIL: daemon 未监听"; cat "$out"; exit 1; }
-# 提取两个 session id(启动时各印一行 "session <id> ready")。bash 3.2 兼容(macOS 无 mapfile)。
-sids=($(grep -oE "session [0-9a-f]{24} ready" "$out" | awk '{print $2}' | sort -u))
-[ "${#sids[@]}" -eq 2 ] || { echo "FAIL: 期望 2 个 session,实得 ${#sids[@]}"; cat "$out"; exit 1; }
-A="${sids[0]}"; B="${sids[1]}"
+# daemon:info puts "session <id> reaped" in the log: the main loop's reaper at work.
+start_daemon "$TMP/multi.out" METACODES_WEB_TOKEN="$token" METACODES_LOG=daemon:info \
+  "$BIN" serve 0 --sessions 2 --uds "$usock" --api-key test --base-url "$BASE_URL"
+wait_listening "$TMP/multi.out"
+url="$DAEMON_URL"
+[[ "$url" == http://127.0.0.1:* ]] || fail "default bind is not 127.0.0.1: $url"
+grep -q "daemon (2 sessions): $url" "$TMP/multi.out" || fail "unexpected startup line"
+if grep -qF "$token" "$TMP/multi.out"; then fail "the token was printed"; fi
+# Both session ids (each printed as "session <id> ready"). bash 3.2 compatible.
+sids=($(grep -oE "session [0-9a-f]{24} ready" "$TMP/multi.out" | awk '{print $2}' | sort -u))
+[[ "${#sids[@]}" -eq 2 ]] || fail "expected 2 sessions, got ${#sids[@]}"
+A="${sids[0]}"
+B="${sids[1]}"
 echo "session A=$A  B=$B"
 
-# 未知 session → 404。
-code=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$dport/s/deadbeefdeadbeefdeadbeef/events")
-[ "$code" = 404 ] || { echo "FAIL: 未知 session 应 404,实得 $code"; exit 1; }
+# ── #251/#252: /health is open, everything else needs the token ─────────────
+check_health "$url" "$version" 2
+[[ "$(http_code "$url/")" == 401 ]] || fail "landing page served without the token"
+[[ "$(http_code "$url/s/$A/state")" == 401 ]] || fail "/s/<id>/state served without the token"
+[[ "$(http_code --max-time 2 "$url/s/$A/events")" == 401 ]] || fail "/s/<id>/events served without the token"
+[[ "$(http_code -X POST "$url/s/$A/message?token=$token" -H "Origin: $url" -d '{"text":"query"}')" == 401 ]] ||
+  fail "a POST authenticated by query"
 
-# M1:多 session GET / 返回**诚实落地页**(非死 SPA):标注多 session + API 级路由 + 列出 session id。
-root=$(curl -s "http://127.0.0.1:$dport/")
-echo "$root" | grep -q "multi-session" || { echo "FAIL: GET / 未返多 session 落地页(疑返死 SPA)"; echo "$root" | head -c 300; exit 1; }
-echo "$root" | grep -q "$A" || { echo "FAIL: 落地页未列 session A"; exit 1; }
-echo "$root" | grep -q "$B" || { echo "FAIL: 落地页未列 session B"; exit 1; }
+# Unknown session → 404 (authenticated).
+[[ "$(http_code "${auth[@]}" "$url/s/deadbeefdeadbeefdeadbeef/events")" == 404 ]] || fail "unknown session is not 404"
 
-# **只**给 A 发消息(证隔离:B 不应收到)。
-ack=$(curl -s -X POST "http://127.0.0.1:$dport/s/$A/message" -H "Origin: http://127.0.0.1:$dport" -d '{"text":"hi-A"}')
-echo "$ack" | grep -q '"ok":true' || { echo "FAIL: /s/$A/message 未接受: $ack"; exit 1; }
+# The landing page: an honest multi-session page, not the single-session SPA.
+root="$("${CURL[@]}" "${auth[@]}" "$url/")"
+grep -q "multi-session" <<<"$root" || fail "GET / is not the multi-session landing page"
+grep -q "$A" <<<"$root" || fail "landing page does not list session A"
+grep -q "$B" <<<"$root" || fail "landing page does not list session B"
+grep -q "/health" <<<"$root" || fail "landing page does not list /health"
 
-# A 的 /events 应有 DAEMON_OK + run_done end_turn。
-evA=$(curl -s --max-time 3 "http://127.0.0.1:$dport/s/$A/events")
-echo "$evA" | grep -q "DAEMON_OK" || { echo "FAIL: A 的 SSE 无 assistant 文本(driver 未跑?)"; echo "$evA"; exit 1; }
-echo "$evA" | grep -q '"run_done".*end_turn' || { echo "FAIL: A 无 run_done end_turn"; echo "$evA"; exit 1; }
+# ── routing isolation ────────────────────────────────────────────────────────
+ack="$("${CURL[@]}" "${auth[@]}" -X POST "$url/s/$A/message" -H "Origin: $url" -d '{"text":"hi-A"}')"
+grep -q '"ok":true' <<<"$ack" || fail "/s/A/message not accepted: $ack"
+evA="$(events_until '"run_done".*end_turn' "${auth[@]}" "$url/s/$A/events")" || fail "A has no run_done end_turn: $evA"
+grep -q "DAEMON_OK" <<<"$evA" || fail "A's stream has no assistant text"
+evB="$("${CURL[@]}" --max-time 1 "${auth[@]}" "$url/s/$B/events" 2>/dev/null || true)"
+if grep -q "DAEMON_OK" <<<"$evB"; then fail "A's message reached B's journal"; fi
+if grep -q '"run_done"' <<<"$evB"; then fail "B ran without a message"; fi
 
-# **路由隔离铁证**:B 的 /events 绝不含 A 的生成(B 从未收到消息 → 无 run_done/DAEMON_OK)。
-evB=$(curl -s --max-time 3 "http://127.0.0.1:$dport/s/$B/events")
-echo "$evB" | grep -q "DAEMON_OK" && { echo "FAIL: 路由串台!A 的消息进了 B 的 journal"; echo "$evB"; exit 1; }
-echo "$evB" | grep -q '"run_done"' && { echo "FAIL: 路由串台!B 出现 run_done(未发消息却跑了)"; echo "$evB"; exit 1; }
+# S1: an idle /interrupt is refused by the generating gate and must not
+# swallow the next message.
+[[ "$(http_code "${auth[@]}" -X POST "$url/s/$B/interrupt" -H "Origin: $url")" == 409 ]] ||
+  fail "idle /interrupt is not 409 (generating gate missing)"
+ackB="$("${CURL[@]}" "${auth[@]}" -X POST "$url/s/$B/message" -H "Origin: $url" -d '{"text":"hi-B"}')"
+grep -q '"ok":true' <<<"$ackB" || fail "/s/B/message not accepted: $ackB"
+events_until "DAEMON_OK" "${auth[@]}" "$url/s/$B/events" >/dev/null || fail "B produced nothing after its message"
 
-# S1:B 空闲期误打 /interrupt 应被 generating 门挡(409),**绝不吞掉随后的消息**。
-# 真牙:若 SessionView 丢 generating 门(回归),此 interrupt 会 abort → 下面 B 的消息被 already-aborted
-# 即刻中断 → 无 DAEMON_OK → 后续断言 FAIL。
-icode=$(curl -s -o /dev/null -w '%{http_code}' -X POST "http://127.0.0.1:$dport/s/$B/interrupt" -H "Origin: http://127.0.0.1:$dport")
-[ "$icode" = 409 ] || { echo "FAIL: 空闲期 /interrupt 应 409(generating 门缺失=S1 回归),实得 $icode"; exit 1; }
+# ── per-session /state and /command ──────────────────────────────────────────
+stateA="$("${CURL[@]}" "${auth[@]}" "$url/s/$A/state")" || fail "GET A's /state failed"
+grep -q "\"session_id\":\"$A\"" <<<"$stateA" || fail "A's /state is not its own snapshot"
+cackA="$("${CURL[@]}" "${auth[@]}" -X POST "$url/s/$A/command" -H "Origin: $url" -d '{"cmd":"/mode dont-ask"}')"
+grep -q '"ok":true' <<<"$cackA" || fail "A's /command not queued: $cackA"
+events_until 'permission mode → dont_ask' "${auth[@]}" "$url/s/$A/events" >/dev/null || fail "A has no command_result mode → dont_ask"
+stateA="$("${CURL[@]}" "${auth[@]}" "$url/s/$A/state")" || fail "GET A's /state failed"
+grep -q '"permission_mode":"dont_ask"' <<<"$stateA" || fail "A's /state does not show dont_ask"
+stateB="$("${CURL[@]}" "${auth[@]}" "$url/s/$B/state")" || fail "GET B's /state failed"
+if grep -q '"permission_mode":"dont_ask"' <<<"$stateB"; then
+  fail "A's /mode changed B"
+fi
 
-# B 独立可用:给 B 发消息 → B 的 /events 现出 DAEMON_OK(证 B driver 真跑 + 上面误 interrupt 未吞消息)。
-ackB=$(curl -s -X POST "http://127.0.0.1:$dport/s/$B/message" -H "Origin: http://127.0.0.1:$dport" -d '{"text":"hi-B"}')
-echo "$ackB" | grep -q '"ok":true' || { echo "FAIL: /s/$B/message 未接受: $ackB"; exit 1; }
-evB2=$(curl -s --max-time 3 "http://127.0.0.1:$dport/s/$B/events")
-echo "$evB2" | grep -q "DAEMON_OK" || { echo "FAIL: B 发消息后仍无生成(B driver 死?)"; echo "$evB2"; exit 1; }
-
-# ── U11:per-session rich /state + /command(此前 multi 是 "{}" + 501)+ 命令隔离 ──
-stA=$(curl -s "http://127.0.0.1:$dport/s/$A/state")
-echo "$stA" | grep -q "\"session_id\":\"$A\"" || { echo "FAIL: A /state 非本 session rich 快照: $stA"; exit 1; }
-cackA=$(curl -s -X POST "http://127.0.0.1:$dport/s/$A/command" -H "Origin: http://127.0.0.1:$dport" -d '{"cmd":"/mode plan"}')
-echo "$cackA" | grep -q '"ok":true' || { echo "FAIL: A /command 未入队: $cackA"; exit 1; }
-sleep 1
-curl -s "http://127.0.0.1:$dport/s/$A/state" | grep -q '"permission_mode":"plan"' || { echo "FAIL: A /state 未反映 mode plan"; exit 1; }
-# 命令隔离铁证:A 的 /mode 绝不改 B。
-curl -s "http://127.0.0.1:$dport/s/$B/state" | grep -q '"permission_mode":"plan"' && { echo "FAIL: 命令串台!A 的 /mode 改了 B"; exit 1; }
-evA2=$(curl -s --max-time 3 "http://127.0.0.1:$dport/s/$A/events")
-echo "$evA2" | grep -q 'permission mode → plan' || { echo "FAIL: A 无 command_result mode→plan"; echo "$evA2"; exit 1; }
-
-# U10-B:UDS+NDJSON 绑定(与 web 共享 registry)。此时 A/B 均已跑完 → 空闲。
-[ -S "$usock" ] || { echo "FAIL: UDS socket 未创建: $usock"; cat "$out"; exit 1; }
-uds_out=$(python3 - "$usock" "$A" "$B" <<'PY'
+# ── UDS + NDJSON: no token; the socket file's 0600 mode is the access control ─
+[[ -S "$usock" ]] || fail "UDS socket not created: $usock"
+mode="$(python3 -c 'import os, stat, sys; print(oct(stat.S_IMODE(os.stat(sys.argv[1]).st_mode)))' "$usock")"
+[[ "$mode" == 0o600 ]] || fail "UDS socket mode is $mode, not 0600"
+# Written out first: bash 3.2 mis-parses a heredoc inside $(...) that has an apostrophe.
+cat >"$TMP/uds_check.py" <<'PY'
 import socket, sys, json, time
 path, A, B = sys.argv[1], sys.argv[2], sys.argv[3]
 def conn():
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); s.connect(path); return s
-def req(obj):  # 一发一收(单响应 op)
+def req(obj):  # one request, one response line
     s = conn(); s.sendall((json.dumps(obj)+"\n").encode()); s.settimeout(3)
     try: data = s.recv(65536).decode()
     except socket.timeout: data = ""
     s.close(); return data
-def attach_lines(sid, since, secs):  # attach 流,读 secs 秒内的所有 NDJSON 行
+def attach_lines(sid, since, secs):  # the attach stream's NDJSON lines within secs seconds
     s = conn(); s.sendall((json.dumps({"op":"attach","session":sid,"since":since})+"\n").encode())
     s.settimeout(secs); buf=""
     try:
@@ -121,72 +125,124 @@ def attach_lines(sid, since, secs):  # attach 流,读 secs 秒内的所有 NDJSO
     s.close()
     return [ln for ln in buf.split("\n") if ln]
 
-# list：两个 session id 都在
-lst = req({"op":"list"}); assert A in lst and B in lst, "list 缺 session id: "+lst
-# 未知 session → 拒
+lst = req({"op":"list"}); assert A in lst and B in lst, "list lacks a session id: "+lst
 unk = req({"op":"message","session":"deadbeefdeadbeefdeadbeef","text":"x"})
-assert '"ok":false' in unk and "unknown session" in unk, "未知 session 未拒: "+unk
+assert '"ok":false' in unk and "unknown session" in unk, "unknown session not refused: "+unk
 
-# ── M1:since / streaming / 消息投递 / 路由隔离 全部给牙 ──────────────────────────
-# 基线:attach A since=0 数出当前 journal 行数 n0。
+# since / streaming / delivery / isolation.
 base = attach_lines(A, 0, 2); n0 = len(base)
-assert n0 > 0, "A 基线 journal 为空"
-# UDS 发一条**唯一标记**消息到 A(标记不会来自早先 web 流量 → 无 vacuous)。
+assert n0 > 0, "A's baseline journal is empty"
 MARK = "uds-mark-A-7f3c9"
-m = req({"op":"message","session":A,"text":MARK}); assert '"ok":true' in m, "UDS message 未接受: "+m
-# 投递+streaming+since:attach A since=n0 只收 n0 之后的新行,必须含 MARK 的 echo。
+m = req({"op":"message","session":A,"text":MARK}); assert '"ok":true' in m, "UDS message not accepted: "+m
 newl = attach_lines(A, n0, 3); joined = "\n".join(newl)
-assert MARK in joined, "since=n0 未流式收到 UDS 新消息 echo(投递/streaming/since 失效): "+joined[:300]
-# since 真被尊重:attach A since=n0+1000(远超) → MARK 不该出现(否则 since 被忽略当 0 回放)。
+assert MARK in joined, "since=n0 did not stream the new UDS message echo: "+joined[:300]
 far = attach_lines(A, n0+1000, 2)
-assert MARK not in "\n".join(far), "since 被忽略:远期 since 仍回放了旧标记"
-# 路由隔离(UDS 侧):A 的标记消息绝不进 B 的 journal。
+assert MARK not in "\n".join(far), "since ignored: a far cursor replayed the old mark"
 bl = attach_lines(B, 0, 2)
-assert MARK not in "\n".join(bl), "UDS 路由串台:A 的消息出现在 B 的 journal"
+assert MARK not in "\n".join(bl), "UDS routing leak: A's message is in B's journal"
 
-# ── M2:interrupt 成功分支(真打到 generating 的 session,非仅门挡)─────────────────
-# 空闲期 interrupt B → generating 门挡(not generating,409 语义)。
+# interrupt: refused while idle, accepted while generating.
 it = req({"op":"interrupt","session":B})
-assert '"ok":false' in it and "not generating" in it, "空闲 interrupt 门(S1)失效: "+it
-# 发 SLOWGEN 消息到 B → driver POST 到 mock,mock 延 2s → B 进入 generating。
+assert '"ok":false' in it and "not generating" in it, "idle interrupt gate (S1) broken: "+it
 sg = req({"op":"message","session":B,"text":"SLOWGEN interrupt-me"}); assert '"ok":true' in sg
-time.sleep(0.7)  # 等 driver 起 POST、mock 开始 sleep(B generating=true)
-# 此刻 interrupt B → 命中成功分支(generating→abort→ok:true),非 409。
+time.sleep(0.7)  # the driver is now inside the mock's 2 s hold: B is generating
 it2 = req({"op":"interrupt","session":B})
-assert '"ok":true' in it2, "generating 期 interrupt 未走成功分支(仍被门挡?): "+it2
+assert '"ok":true' in it2, "interrupt while generating was refused: "+it2
 
-# ── U10-E:mid-run interrupt **真中断**(不止返 ok,run 要真以 aborted 收尾)────────────
-# mock 延 2s 后送数据,client 在 SSE 事件检查点见 abort → run 以 aborted 结束(agent_loop 751)。
-import time as _t
-deadline = _t.time() + 6; aborted_done = False
-while _t.time() < deadline:
+# The interrupt really ends the run as aborted.
+deadline = time.time() + 6; aborted_done = False
+while time.time() < deadline:
     if any('"run_done"' in l and '"aborted"' in l for l in attach_lines(B, 0, 1)):
         aborted_done = True; break
-    _t.sleep(0.3)
-assert aborted_done, "SLOWGEN interrupt 未使 B 的 run 真以 aborted 收尾(仅返 ok 不够)"
+    time.sleep(0.3)
+assert aborted_done, "the SLOWGEN interrupt did not end B's run as aborted"
 
-# ── U10-E:多消息连续对话(daemon driver 多轮)──────────────────────────────────
+# Consecutive messages each run.
 rd_before = sum(1 for l in attach_lines(A, 0, 1) if '"run_done"' in l)
 assert '"ok":true' in req({"op":"message","session":A,"text":"multi-one-abc"})
-_t.sleep(0.5)
+time.sleep(0.5)
 assert '"ok":true' in req({"op":"message","session":A,"text":"multi-two-def"})
-_t.sleep(1.0)
+time.sleep(1.0)
 allA = attach_lines(A, 0, 2); joinedA = "\n".join(allA)
 rd_after = sum(1 for l in allA if '"run_done"' in l)
-assert rd_after >= rd_before + 2, "多消息未各产 run_done: %d→%d" % (rd_before, rd_after)
-assert "multi-one-abc" in joinedA and "multi-two-def" in joinedA, "多消息 echo 缺失"
+assert rd_after >= rd_before + 2, "consecutive messages did not each run: %d→%d" % (rd_before, rd_after)
+assert "multi-one-abc" in joinedA and "multi-two-def" in joinedA, "a consecutive message echo is missing"
 
 print("UDS_OK")
 PY
-) || { echo "FAIL: UDS 检查异常"; echo "$uds_out"; exit 1; }
-echo "$uds_out" | grep -q "UDS_OK" || { echo "FAIL: UDS+NDJSON 检查未过: $uds_out"; exit 1; }
+uds_out="$(python3 "$TMP/uds_check.py" "$usock" "$A" "$B" 2>&1)" || fail "UDS checks failed: $uds_out"
+grep -q "UDS_OK" <<<"$uds_out" || fail "UDS checks did not finish: $uds_out"
 
-# SIGINT → 两 driver 优雅 join,退出码 0。
-kill -INT $dpid
-for i in $(seq 1 60); do kill -0 $dpid 2>/dev/null || break; sleep 0.1; done
-if kill -0 $dpid 2>/dev/null; then echo "FAIL: SIGINT 后挂死(关停 join 未收敛)"; exit 1; fi
-wait $dpid; rc=$?
-[ "$rc" = 0 ] || { echo "FAIL: daemon 退出码 $rc(非 0)"; exit 1; }
-grep -q "daemon closed" "$out" || { echo "FAIL: 无 'daemon closed'"; exit 1; }
+# ── #254: dynamic session lifecycle over HTTP ───────────────────────────────
+# lifecycle <method> <path> [body]: prints "<status> <body>" (authenticated).
+lifecycle() {
+  local method="$1" path="$2" body="${3:-}"
+  "${CURL[@]}" --max-time 30 "${auth[@]}" -X "$method" "$url$path" -H "Origin: $url" \
+    ${body:+-d "$body"} -w ' %{http_code}' || true
+}
+# The token guards the lifecycle routes like every other.
+[[ "$(http_code "$url/sessions")" == 401 ]] || fail "GET /sessions served without the token"
+[[ "$(http_code -X POST "$url/sessions/create" -H "Origin: $url" -d '{}')" == 401 ]] || fail "create without the token"
+[[ "$(http_code -X POST "$url/sessions/$A/destroy" -H "Origin: $url")" == 401 ]] || fail "destroy without the token"
+check_health "$url" "$version" 2
 
-echo "PASS: serve-multi e2e — 路由隔离 + UDS(list/message/attach/interrupt) + U10-E(真中断/多消息连续) + U11(/state·/command 按 session 隔离) + SIGINT 优雅关停"
+# GET /sessions lists the two startup sessions with their state.
+listed="$("${CURL[@]}" "${auth[@]}" "$url/sessions")"
+python3 - "$listed" "$A" "$B" <<'PY' || fail "unexpected GET /sessions: $listed"
+import json, sys
+doc = json.loads(sys.argv[1])
+ids = [s["session_id"] for s in doc["sessions"]]
+assert sorted(ids) == sorted(sys.argv[2:4]), ids
+for s in doc["sessions"]:
+    assert set(s) == {"session_id", "generating", "model", "permission_mode", "pending_request_id"}, s
+    assert isinstance(s["generating"], bool) and s["pending_request_id"] == 0, s
+PY
+
+# create → 201; it is an ordinary session: /s/<id>/*, its own driver.
+created="$(lifecycle POST /sessions/create '{}')"
+[[ "$created" == *" 201" ]] || fail "create did not answer 201: $created"
+C="$(python3 -c 'import json, sys; print(json.loads(sys.argv[1].rsplit(" ", 1)[0])["session_id"])' "$created")"
+echo "session C=$C (created over HTTP)"
+check_health "$url" "$version" 3
+[[ "$(lifecycle POST "/sessions/$C/resume")" == *'"live":true}'*" 200" ]] || fail "resume of a live session is not 200"
+grep -q '"ok":true' <<<"$("${CURL[@]}" "${auth[@]}" -X POST "$url/s/$C/message" -H "Origin: $url" -d '{"text":"hi-C"}')" ||
+  fail "/s/C/message not accepted"
+events_until '"run_done".*end_turn' "${auth[@]}" "$url/s/$C/events" >/dev/null || fail "C produced no run"
+[[ "$(lifecycle POST /sessions/create "{\"session_id\":\"$C\"}")" == *" 409" ]] || fail "a live duplicate is not 409"
+[[ "$(lifecycle POST /sessions/create '{"session_id":"NOT-AN-ID"}')" == *" 400" ]] || fail "a malformed id is not 400"
+
+# destroy → 200 once the driver is joined; the session is gone, the reaper frees it.
+[[ "$(lifecycle POST "/sessions/$C/destroy")" == *'"ok":true'*" 200" ]] || fail "destroy did not answer 200"
+[[ "$(http_code "${auth[@]}" "$url/s/$C/state")" == 404 ]] || fail "/s/C/state after destroy is not 404"
+[[ "$(lifecycle POST "/sessions/$C/resume")" == *" 404" ]] || fail "resume of a destroyed session is not 404"
+[[ "$(lifecycle POST "/sessions/$C/destroy")" == *" 404" ]] || fail "a second destroy is not 404"
+check_health "$url" "$version" 2
+after_destroy="$("${CURL[@]}" "${auth[@]}" "$url/sessions")" || fail "GET /sessions after destroy failed"
+if grep -q "$C" <<<"$after_destroy"; then fail "GET /sessions still lists C"; fi
+wait_for_line "$TMP/multi.out" "$DAEMON_PID" "session $C reaped" || fail "the main loop never reaped C"
+
+# The conversation survives the destroy: restore it from the transcript.
+restored="$(lifecycle POST /sessions/create "{\"session_id\":\"$C\",\"resume\":true}")"
+[[ "$restored" == "{\"session_id\":\"$C\",\"messages\":2} 201" ]] || fail "restore did not bring back 2 messages: $restored"
+check_health "$url" "$version" 3
+[[ "$(lifecycle POST "/sessions/$C/destroy")" == *" 200" ]] || fail "destroy of the restored session"
+
+stop_daemon "$TMP/multi.out"
+
+# ── #254: --sessions 0 starts empty; the cap answers 429 ────────────────────
+start_daemon "$TMP/zero.out" METACODES_WEB_TOKEN="$token" \
+  "$BIN" serve 0 --sessions 0 --max-sessions 1 --api-key test --base-url "$BASE_URL"
+wait_listening "$TMP/zero.out"
+url="$DAEMON_URL"
+check_health "$url" "$version" 0
+[[ "$("${CURL[@]}" "${auth[@]}" "$url/sessions")" == '{"sessions":[]}' ]] || fail "--sessions 0 did not start empty"
+first="$(lifecycle POST /sessions/create)"
+[[ "$first" == *" 201" ]] || fail "create on an empty daemon: $first"
+D="$(python3 -c 'import json, sys; print(json.loads(sys.argv[1].rsplit(" ", 1)[0])["session_id"])' "$first")"
+[[ "$(lifecycle POST /sessions/create)" == '{"error":"session limit reached","max_sessions":1} 429' ]] || fail "the cap did not answer 429"
+grep -q '"ok":true' <<<"$("${CURL[@]}" "${auth[@]}" -X POST "$url/s/$D/message" -H "Origin: $url" -d '{"text":"hi-D"}')" ||
+  fail "/s/D/message not accepted"
+events_until '"run_done".*end_turn' "${auth[@]}" "$url/s/$D/events" >/dev/null || fail "D produced no run"
+stop_daemon "$TMP/zero.out"
+
+echo "PASS: serve-multi e2e — /health, bearer token (HTTP) vs 0600 UDS, routing isolation, UDS list/message/attach/interrupt, per-session /state·/command, dynamic create/list/resume/destroy/restore (#254), --sessions 0 and the 429 cap, SIGINT shutdown"

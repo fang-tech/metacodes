@@ -185,7 +185,7 @@ test "L2 ①: OpenAI chat vision — tool 消息短文本 + 紧随 user 消息 i
     const url = try srv.urlOwned(a);
     defer a.free(url);
 
-    var io_rt = std.Io.Threaded.init(a, .{});
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
     defer io_rt.deinit();
     var client = cc.api_openai.OpenAIClient.init(a, io_rt.io(), "test-key", "gpt-4o", url);
     defer client.deinit();
@@ -204,7 +204,7 @@ test "L2 ②: OpenAI chat 非 vision — 占位文本到达 wire,body 无 base64
     const url = try srv.urlOwned(a);
     defer a.free(url);
 
-    var io_rt = std.Io.Threaded.init(a, .{});
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
     defer io_rt.deinit();
     var client = cc.api_openai.OpenAIClient.init(a, io_rt.io(), "test-key", "deepseek-chat", url);
     defer client.deinit();
@@ -223,7 +223,7 @@ test "L2 ③: OpenAI Responses vision — function_call_output.output 为 input_
     const url = try srv.urlOwned(a);
     defer a.free(url);
 
-    var io_rt = std.Io.Threaded.init(a, .{});
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
     defer io_rt.deinit();
     var client = cc.api_openai.OpenAIClient.init(a, io_rt.io(), "test-key", "gpt-5.2", url);
     defer client.deinit();
@@ -242,7 +242,7 @@ test "L2 ④: Anthropic 网关非 vision(glm-5.2)— tool_result 占位文本到
     const url = try srv.urlOwned(a);
     defer a.free(url);
 
-    var io_rt = std.Io.Threaded.init(a, .{});
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
     defer io_rt.deinit();
     var client = cc.client_mod.Client.initWithBaseUrl(a, io_rt.io(), "test-key", "glm-5.2", url);
     defer client.deinit();
@@ -261,7 +261,7 @@ test "L2 ⑤: Gemini 2.5 — functionResponse 指向文本 + 同级 inline_data 
     const url = try srv.urlOwned(a);
     defer a.free(url);
 
-    var io_rt = std.Io.Threaded.init(a, .{});
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
     defer io_rt.deinit();
     var client = cc.api_gemini.GeminiClient.init(a, io_rt.io(), "test-key", "gemini-2.5-pro", url);
     defer client.deinit();
@@ -279,7 +279,7 @@ test "L2 ⑥: Gemini 3 — 官方 multimodal functionResponse(嵌套 inlineData)
     const url = try srv.urlOwned(a);
     defer a.free(url);
 
-    var io_rt = std.Io.Threaded.init(a, .{});
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
     defer io_rt.deinit();
     var client = cc.api_gemini.GeminiClient.init(a, io_rt.io(), "test-key", "gemini-3-flash", url);
     defer client.deinit();
@@ -360,7 +360,7 @@ test "L2 ⑯: 超过投影上限的真实 Read 图片经 agent_loop 到达 wire 
     const url = try srv.urlOwned(a);
     defer a.free(url);
 
-    var io_rt = std.Io.Threaded.init(a, .{});
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
     defer io_rt.deinit();
     var client = cc.client_mod.Client.initWithBaseUrl(a, io_rt.io(), "test-key", "claude-sonnet-4-20250514", url);
     defer client.deinit();
@@ -429,7 +429,7 @@ test "L2 ⑰: 第二次请求被 4xx 拒绝时 tool_result 保持未送达——
     const url = try srv.urlOwned(a);
     defer a.free(url);
 
-    var io_rt = std.Io.Threaded.init(a, .{});
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
     defer io_rt.deinit();
     var client = cc.client_mod.Client.initWithBaseUrl(a, io_rt.io(), "test-key", "claude-sonnet-4-20250514", url);
     defer client.deinit();
@@ -509,7 +509,7 @@ fn runReadImageCase(a: std.mem.Allocator, base_model: []const u8, override: ?[]c
     defer srv.stop();
     const url = try srv.urlOwned(a);
     defer a.free(url);
-    var io_rt = std.Io.Threaded.init(a, .{});
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
     defer io_rt.deinit();
     var client = cc.client_mod.Client.initWithBaseUrl(a, io_rt.io(), "test-key", base_model, url);
     defer client.deinit();
@@ -581,7 +581,7 @@ test "L2 ㉑: 运行时方言 profile 说支持图像但序列化器拒绝时—
     defer srv.stop();
     const url = try srv.urlOwned(a);
     defer a.free(url);
-    var io_rt = std.Io.Threaded.init(a, .{});
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
     defer io_rt.deinit();
     // vision 模型 + fail-closed 方言:能力表说能看图,序列化器实际发的是占位。
     var client = cc.client_mod.Client.initWithBaseUrl(a, io_rt.io(), "test-key", "claude-sonnet-4-20250514", url);
@@ -620,7 +620,7 @@ test "L2 ㉒: 请求级图片字节上限——历史里最老的已送达图片
     defer srv.stop();
     const url = try srv.urlOwned(a);
     defer a.free(url);
-    var io_rt = std.Io.Threaded.init(a, .{});
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
     defer io_rt.deinit();
     var client = cc.client_mod.Client.initWithBaseUrl(a, io_rt.io(), "test-key", "claude-sonnet-4-20250514", url);
     defer client.deinit();
@@ -698,7 +698,7 @@ test "L2 ㉔: 一等用户图片占掉额度后,新读入的图片结果在投�
     defer srv.stop();
     const url = try srv.urlOwned(a);
     defer a.free(url);
-    var io_rt = std.Io.Threaded.init(a, .{});
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
     defer io_rt.deinit();
     var client = cc.client_mod.Client.initWithBaseUrl(a, io_rt.io(), "test-key", "claude-sonnet-4-20250514", url);
     defer client.deinit();
@@ -772,7 +772,7 @@ test "L2 ㉓: transcript resume 后(送达标记随 transcript 持久化)请求�
     defer srv.stop();
     const url = try srv.urlOwned(a);
     defer a.free(url);
-    var io_rt = std.Io.Threaded.init(a, .{});
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
     defer io_rt.deinit();
     var client = cc.client_mod.Client.initWithBaseUrl(a, io_rt.io(), "test-key", "claude-sonnet-4-20250514", url);
     defer client.deinit();
@@ -872,7 +872,7 @@ test "L2 ⑦: 超阈值图像经真实投影后仍以 Anthropic 原生 image blo
     const url = try srv.urlOwned(a);
     defer a.free(url);
 
-    var io_rt = std.Io.Threaded.init(a, .{});
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
     defer io_rt.deinit();
     var client = cc.client_mod.Client.initWithBaseUrl(a, io_rt.io(), "test-key", "claude-sonnet-4", url);
     defer client.deinit();
@@ -898,7 +898,7 @@ test "L2 ⑦b: 超阈值图像 → OpenAI chat 紧随 user 消息的 image_url d
     const url = try srv.urlOwned(a);
     defer a.free(url);
 
-    var io_rt = std.Io.Threaded.init(a, .{});
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
     defer io_rt.deinit();
     var client = cc.api_openai.OpenAIClient.init(a, io_rt.io(), "test-key", "gpt-4o", url);
     defer client.deinit();
@@ -922,7 +922,7 @@ test "L2 ⑦c: 超阈值图像 → OpenAI Responses function_call_output input_i
     const url = try srv.urlOwned(a);
     defer a.free(url);
 
-    var io_rt = std.Io.Threaded.init(a, .{});
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
     defer io_rt.deinit();
     var client = cc.api_openai.OpenAIClient.init(a, io_rt.io(), "test-key", "gpt-5.2", url);
     defer client.deinit();
@@ -947,7 +947,7 @@ test "L2 ⑦d: 超阈值图像 → Gemini 3 multimodal functionResponse inlineDa
     const url = try srv.urlOwned(a);
     defer a.free(url);
 
-    var io_rt = std.Io.Threaded.init(a, .{});
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
     defer io_rt.deinit();
     var client = cc.api_gemini.GeminiClient.init(a, io_rt.io(), "test-key", "gemini-3-flash", url);
     defer client.deinit();
@@ -971,7 +971,7 @@ test "L2 ⑧: 超阈值图像在非 vision 模型上仍是占位文本,不是 ar
     const url = try srv.urlOwned(a);
     defer a.free(url);
 
-    var io_rt = std.Io.Threaded.init(a, .{});
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
     defer io_rt.deinit();
     var client = cc.api_openai.OpenAIClient.init(a, io_rt.io(), "test-key", "deepseek-chat", url);
     defer client.deinit();

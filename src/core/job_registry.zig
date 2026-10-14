@@ -412,6 +412,27 @@ pub const JobRegistry = struct {
         return self.kill(id);
     }
 
+    /// Kill (and reap) every running job, whatever its owner; their records
+    /// and spools stay until `deinit`. Returns how many were killed.
+    pub fn killAll(self: *JobRegistry) usize {
+        var killed: usize = 0;
+        while (true) {
+            var id: ?[12]u8 = null;
+            self.lock();
+            for (self.jobs.items) |j| {
+                if (j.status == .running) {
+                    id = j.id;
+                    break;
+                }
+            }
+            self.unlock();
+            const selected = id orelse break;
+            self.kill(selected[0..]) catch continue;
+            killed += 1;
+        }
+        return killed;
+    }
+
     /// Kill all running jobs belonging to one session.  Pick one id at a time
     /// under the lock, then perform the blocking kill outside it. This avoids
     /// an allocation-sized snapshot (and the silent partial cleanup an OOM

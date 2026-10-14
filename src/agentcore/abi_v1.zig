@@ -989,7 +989,9 @@ const AbiSession = struct {
             .ask => .ask,
             .allow => .allow,
         } else .undecided;
-        const permission_mode = self.core_session.permission_ctx.modeValue();
+        // The mode decisions run under: one the Session's settings disable is
+        // decided as `default` (decision.effectiveMode), here as in the shared layer.
+        const permission_mode = self.core_session.permission_ctx.effectiveMode();
         const external_fallback: session_permission.Decision = if (tool.namespace == .builtin)
             .ask
         else switch (permission_mode) {
@@ -1716,7 +1718,7 @@ const AbiSession = struct {
         // `dont_ask` is a Session mode contract, not a UI preference. Core
         // safety prompts are produced before the AgentCore override seam, so
         // close that path here without calling the Host.
-        if (self.core_session.permission_ctx.modeValue() == .dont_ask) {
+        if (self.core_session.permission_ctx.effectiveMode() == .dont_ask) {
             try self.recordPermissionCallback(request, .answered, .deny_once);
             out.* = .{ .permission = .deny_once };
             return .answered;
@@ -2920,11 +2922,16 @@ const AbiSession = struct {
     /// export and a matching restore agree on it. Setting the current mode is
     /// a no-op that keeps the generation and the grants. Everything fallible
     /// runs before publication; a failure leaves mode, generation, grants and
-    /// policy frame unchanged.
+    /// policy frame unchanged. A mode the Session's settings disable is refused
+    /// first (`PermissionModeDisabled` → `INVALID_ARGUMENT`); an AgentCore
+    /// Session's settings are the Host-imported rules, which cannot disable a
+    /// mode, so today the Host owns which modes it offers.
     fn updatePermissionModeAdmitted(
         self: *AbiSession,
         mode: core.types.PermissionMode,
     ) !void {
+        if (!self.core_session.permission_ctx.modeAllowed(mode))
+            return error.PermissionModeDisabled;
         const current_mode = self.core_session.permission_ctx.modeValue();
         if (current_mode == mode) return;
         const next_generation = std.math.add(
@@ -4472,6 +4479,7 @@ fn sessionMutationStatus(err: anyerror) u32 {
         error.InvalidSessionState, error.SkillCatalogNotBound, error.RuntimeUnavailable => wire.STATUS_INVALID_STATE,
         error.InvalidModel,
         error.InvalidRule,
+        error.PermissionModeDisabled,
         error.InvalidPromptProfile,
         error.InvalidSkillId,
         error.DuplicateSkillId,
@@ -9448,6 +9456,34 @@ test "Revision 6 MCP schema denial precedes Permission callback eligibility" {
             ),
         );
     }
+    // A mode the Session's settings disable, put on the context past every
+    // setter, is decided as `default`: the external fallback reads the
+    // effective mode, so bypass asks instead of allowing (the twin is the
+    // bypass case above, with no such settings).
+    const no_rules: []const core.permission_settings.Rule = &.{};
+    const disabling_layers = [_]core.permission_settings.Layer{.{
+        .source = .host,
+        .allow = no_rules,
+        .ask = no_rules,
+        .deny = no_rules,
+        .disable_bypass_permissions_mode = true,
+        .disable_auto_mode = true,
+    }};
+    const disabling = core.permission_settings.MergedSettings{ .layers = &disabling_layers, .allocator = std.testing.allocator };
+    try std.testing.expect(session.core_session.permission_ctx.settings == null);
+    session.core_session.permission_ctx.settings = &disabling;
+    defer session.core_session.permission_ctx.settings = null;
+    for ([_]core.types.PermissionMode{ .bypass_permissions, .bypass, .auto }) |mode| {
+        session.core_session.permission_ctx.setMode(mode);
+        try std.testing.expectEqual(
+            core.permission.PermissionResult.ask,
+            core.permission.checkPermission(
+                &session.core_session.permission_ctx,
+                model_name,
+                "{\"city\":\"Paris\"}",
+            ),
+        );
+    }
     session.core_session.permission_ctx.setMode(.default);
 }
 
@@ -11887,6 +11923,93 @@ test "permission mode update starts a generation, revokes Session grants and fai
             .{ .decision = .ask, .source = .mode_fallback },
         )).decision,
     );
+}
+
+test "permission mode update refuses a mode the Session's settings disable; decisions never run under one" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const native_runtime = try core.agent_session.AgentRuntime.create(
+        std.testing.allocator,
+        .{ .builtin_tools = &.{} },
+    );
+    defer native_runtime.destroy() catch unreachable;
+    const native_session = try native_runtime.createSession(.{
+        .provider_kind = .anthropic,
+        .api_key = "test-key",
+        .model = "test-model",
+        .workspace = .{ .root = root_buffer[0..root_len] },
+        .allowed_tools = &.{},
+    });
+    defer native_session.destroy() catch unreachable;
+    var session = AbiSession{
+        .callbacks = std.mem.zeroes(wire.SessionCallbacksV1),
+        .callback_status = .init(wire.STATUS_OK),
+        .facade_poisoned = .init(false),
+        .core_session = native_session,
+        .permission_state = try session_permission.State.init(std.testing.allocator, 1),
+    };
+    defer session.permission_state.deinit();
+    session.policy_root = try policy_frame.PolicyFrame.createRoot(
+        std.testing.allocator,
+        &.{"Bash"},
+        native_session.workspace.shell,
+        .default,
+        native_session.permission_ctx.match_ctx,
+    );
+    defer if (session.policy_root) |root| root.release();
+
+    // An AgentCore Session's settings are the Host-imported rule layer, which
+    // cannot disable a mode. Put on a layer that does, as a settings-bearing
+    // Session would carry.
+    const no_rules: []const core.permission_settings.Rule = &.{};
+    const layers = [_]core.permission_settings.Layer{.{
+        .source = .host,
+        .allow = no_rules,
+        .ask = no_rules,
+        .deny = no_rules,
+        .disable_bypass_permissions_mode = true,
+        .disable_auto_mode = true,
+    }};
+    const disabling = core.permission_settings.MergedSettings{ .layers = &layers, .allocator = std.testing.allocator };
+    try std.testing.expect(native_session.permission_ctx.settings == null);
+    native_session.permission_ctx.settings = &disabling;
+    defer native_session.permission_ctx.settings = null;
+
+    const fingerprint = session.policy_fingerprint;
+    const root = session.policy_root;
+    const usage_before = session.budget_state.durable_usage_bytes;
+    for ([_]core.types.PermissionMode{ .bypass_permissions, .bypass, .auto }) |mode| {
+        try std.testing.expectError(error.PermissionModeDisabled, session.updatePermissionMode(mode));
+    }
+    var diagnostic = std.mem.zeroes(wire.OwnedBytesV1);
+    defer bufferRelease(&diagnostic);
+    try std.testing.expectEqual(
+        wire.STATUS_INVALID_ARGUMENT,
+        sessionUpdatePermissionMode(session.handle(), wire.PERMISSION_FULL_ACCESS, &diagnostic),
+    );
+    const detail = diagnostic.ptr.?[0..@intCast(diagnostic.len)];
+    try std.testing.expect(std.mem.indexOf(u8, detail, "PermissionModeDisabled") != null);
+    try std.testing.expectEqual(core.types.PermissionMode.default, native_session.permission_ctx.modeValue());
+    try std.testing.expectEqual(@as(u64, 1), session.policy_generation);
+    try std.testing.expectEqualSlices(u8, &fingerprint, &session.policy_fingerprint);
+    try std.testing.expect(session.policy_root == root);
+    try std.testing.expectEqual(usage_before, session.budget_state.durable_usage_bytes);
+    try std.testing.expectEqual(AbiSession.CallState.idle, session.call_state);
+    // An allowed mode still applies through the same entry.
+    var accepted = std.mem.zeroes(wire.OwnedBytesV1);
+    defer bufferRelease(&accepted);
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        sessionUpdatePermissionMode(session.handle(), wire.PERMISSION_ACCEPT_EDITS, &accepted),
+    );
+    try std.testing.expectEqual(core.types.PermissionMode.accept_edits, native_session.permission_ctx.modeValue());
+
+    // Twin: without the switches the refused mode applies.
+    native_session.permission_ctx.settings = null;
+    try session.updatePermissionMode(.bypass_permissions);
+    try std.testing.expectEqual(core.types.PermissionMode.bypass_permissions, native_session.permission_ctx.modeValue());
 }
 
 test "Session Skill selection update is explicit atomic and selection-only" {

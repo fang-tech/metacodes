@@ -53,7 +53,7 @@ const Harness = struct {
 
         const io_runtime = try allocator.create(std.Io.Threaded);
         errdefer allocator.destroy(io_runtime);
-        io_runtime.* = std.Io.Threaded.init(allocator, .{});
+        io_runtime.* = @import("platform").signal.threadedIo(allocator, .{});
 
         // Staging is required and validated against a trusted root, exactly as
         // the service supplies it; a harness that omitted it would exercise a
@@ -740,7 +740,7 @@ test "Kgd: what install wrote is what the service starts from" {
     // install created, the key it generated, the executables it resolved.
     const handoff_staging = try std.fmt.allocPrint(a, "{s}/.metacodes/kg/import", .{home});
     defer a.free(handoff_staging);
-    var io_runtime = std.Io.Threaded.init(a, .{});
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
     defer io_runtime.deinit();
     const supervisor = try Supervisor.start(a, .{
         .store_path = config.store_path,

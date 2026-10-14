@@ -32,11 +32,19 @@ pub const DriverCtx = struct {
     wb: *WebBackend, // serve 建、绑 host.journal,driver 取 backend() 喂 agent_loop
 };
 
-/// SessionHost.abort_fn:中断该 session 的 in-flight run(戳 app.abort)。requestStop 调它 → agent_loop
-/// 的网络 IO 阻塞立即返回,join 不挂(见 registry.SessionHost.destroy)。
+/// SessionHost.abort_fn:中断该 session 的 in-flight run(戳 app.abort)。requestStop/stopDriver 调它 →
+/// agent_loop 的网络 IO 阻塞立即返回,join 不挂(见 registry.SessionHost.destroy)。
+/// A socket read blocked on a silent provider never polls the flag, so the
+/// in-flight request is shut down as well (the TUI's SIGINT bridge does the
+/// same); a request that registers after this sees the flag and shuts itself
+/// down. Without it a destroy over HTTP waits out the stream idle limit. This
+/// runs off the driver thread while the driver may be switching routes, hence
+/// `cancelInFlightRequest` (serialized with the switch) rather than
+/// `provider().cancel`.
 pub fn abortFn(ctx: *anyopaque, reason: abort.Reason) void {
     const dctx: *DriverCtx = @ptrCast(@alignCast(ctx));
     dctx.app.abort.abort(reason);
+    dctx.app.cancelInFlightRequest(&dctx.app.abort);
 }
 
 /// SessionHost.driver_fn:真 App 驱动循环(mirror web/session.zig run() 的 outer 循环,用 host 资源)。
@@ -89,21 +97,16 @@ pub fn driverFn(host: *SessionHost, ctx: *anyopaque) void {
         if (app.abort.isAborted() and app.abort.reason() == .user_interrupt) app.abort.reset();
 
         if (!pending_run) {
-            const msg = host.inbox.popFront() orelse {
+            var msg = host.inbox.popFront() orelse {
                 reapAgentDone(app, &be, host.id, infra); // 空闲期也 reap:后台 job 可能在无新消息时完成
                 time.sleepMs(50);
                 continue;
             };
-            defer infra.free(msg); // msg 来自 host.inbox(infra alloc)
+            defer msg.deinit(infra); // msg 来自 host.inbox(infra alloc)
 
-            // U11:prompt 提交经 service.submitPrompt(clearActiveSkill + append 与 TUI/web
-            // 同源;此前 daemon 直 appendText 漏 clearActiveSkill)。空文本/失败 → 无 run。
-            var svc = @import("../session_service.zig").SessionService.init(app);
-            const d = svc.submitPrompt(msg);
-            if (d.run == null) {
-                if (!d.outcome.ok) log.warn("daemon", "submitPrompt failed", .{});
-                continue;
-            }
+            // 与 web run() 同一入口:先应用消息自带的 model/permission_mode,再提交 prompt
+            // (service.submitPrompt)并回显 user_message;应用失败 → message_rejected,无 run。
+            if (!web_session.startSubmission(app, &host.journal, infra, &msg)) continue;
         }
 
         const run_control: ?*project_activation.RunControl = if (app.sessionDir()) |dir|

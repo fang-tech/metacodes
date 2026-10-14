@@ -177,6 +177,24 @@ class _Capture:
         sc = self._screen
         return any(pattern in sc.line_text(r) for r in range(sc.rows))
 
+    def screen_has_line(self, text):
+        """渲染后的屏幕某一行(去首尾空白)恰好等于 text。区别于 screen_has 的子串匹配:
+        刚提交的命令回显(`❯ !echo X`)含 X,只有输出行本身才整行等于 X。"""
+        self.screen_has("")  # 把新输出喂进持久 Screen
+        sc = self._screen
+        return any(sc.line_text(r).strip() == text for r in range(sc.rows))
+
+    def wait_line(self, text, timeout):
+        """等屏幕出现整行 text,至多 timeout 秒;命中后短 settle。超时返回 False。"""
+        end = time.time() + timeout
+        while True:
+            if self.screen_has_line(text):
+                self.drain(SETTLE_AFTER_HIT)
+                return True
+            if time.time() >= end or self.eof:
+                return False
+            self._pump(0.1)
+
     def wait_pattern(self, pattern, timeout):
         """等屏幕出现 pattern,至多 timeout 秒;命中后短 settle。超时静默返回 False。"""
         end = time.time() + timeout
@@ -279,6 +297,12 @@ def _drive(key_events, write, cap, set_size, per_key_drain):
         elif ev.startswith("wait:"):
             pattern, _, t = ev[5:].rpartition(":")
             cap.wait_pattern(pattern, float(t))
+        elif ev.startswith("waitline:"):
+            text, _, t = ev[9:].rpartition(":")
+            if not cap.wait_line(text, float(t)):
+                # 前提没建立:当场失败并带上屏幕,而不是让后面的断言莫名其妙地挂。
+                screen = "\n".join(cap._screen.line_text(r) for r in range(cap._screen.rows))
+                raise AssertionError(f"waitline: no screen line equal to {text!r} within {t}s:\n{screen}")
         elif ev.startswith("resize:"):
             spec = ev[7:]
             r2, c2 = spec.split("x")
@@ -305,7 +329,9 @@ def run(bin_path, key_events, term_size=(24, 80), env=None,
       "key:NAME"         SPECIAL[NAME]
       "sleep:N"          settle 睡眠:至多 N 秒,输出静默 QUIET_SLEEP 秒即提前返回
       "strictsleep:N"    睡满 N 秒(时序断言/否定断言窗口专用)
-      "wait:PATTERN:N"   等屏幕出现 PATTERN,至多 N 秒(命中后短 settle)
+      "wait:PATTERN:N"   等屏幕出现 PATTERN,至多 N 秒(命中后短 settle;超时静默继续)
+      "waitline:TEXT:N"  等屏幕某一整行(去首尾空白)等于 TEXT,至多 N 秒;超时抛 AssertionError
+                         (等命令输出用:回显行 `❯ !echo X` 含 X 但整行不等于 X)
       "resize:RxC"       运行中改窗口(触 SIGWINCH / ConPTY resize)
       "raw:..."          原样字节(用 \\xNN 转义)
     """

@@ -99,13 +99,17 @@ fn run(init: std.process.Init) !void {
         .remaining_output_tokens = CAPS.max_output_tokens,
     });
 
+    // No state root: the runner hands the credential over METACODES_API_KEY_FD,
+    // and a login stored under some install's root must never become the
+    // paying credential when that FD is missing.
     var credential = try cc.auth.resolveRuntimeCredential(
         allocator,
+        "",
         null,
         .api_key_first,
     );
     defer credential.deinit(allocator);
-    var io_runtime = std.Io.Threaded.init(allocator, .{});
+    var io_runtime = @import("platform").signal.threadedIo(allocator, .{});
     defer io_runtime.deinit();
     var client = cc.client.Client.init(
         allocator,

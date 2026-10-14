@@ -4,7 +4,9 @@
 //!
 //! **协议(每行一 JSON 请求 → NDJSON 行回)**:
 //!   {"op":"list"}                                  → {"sessions":["<id>",...]}
-//!   {"op":"message","session":"<id>","text":"..."} → {"ok":true}(入 session inbox,driver 消费)
+//!   {"op":"message","session":"<id>","text":"...","model"?:"...","permission_mode"?:"..."}
+//!                                                  → {"ok":true}(入 session inbox,driver 消费;
+//!                                                     字段与校验同 HTTP POST /message,见 web/submission.zig)
 //!   {"op":"interrupt","session":"<id>"}            → {"ok":true|false}(生成期门,同 web /interrupt)
 //!   {"op":"attach","session":"<id>","since":N}     → 从 seq N 起流式推 journal 行(每行原样 JSON),
 //!                                                     直到 session 关停({"type":"session_closed"})或断连。
@@ -13,21 +15,29 @@
 //!
 //! **生命周期(mirror WebServer)**:accept 线程 + per-conn detached 线程 + live_conns 计数;stop 先置
 //! closing 后 shutdown+close(listen_fd) 唤 accept，再 join、drain live_conns(≤12s)、unlink socket 文件。attach 流靠
-//! journal.close(关停时 serve 先调)唤醒 waitSince → session_closed → 退出(与 SSE 同机制)。
+//! journal.close(destroy 与关停都先调)唤醒 waitSince → session_closed → 退出(与 SSE 同机制)。
+//!
+//! **Leases (#254).** Every op that names a session resolves it to a
+//! `server.Lease` and releases it exactly once, by `defer` in `dispatch`: a
+//! one-line op holds it for that line, `attach` for the whole attachment.
+//! Destroying a session over HTTP never waits for an attachment; it closes the
+//! journal, the attachment ends with `session_closed`, and the lease comes
+//! back.
 
 const std = @import("std");
 const net = @import("platform").net;
 const log = @import("../util/log.zig");
 const time = @import("../util/time.zig");
 const server_mod = @import("../web/server.zig");
-const json_util = @import("../util/json.zig");
+const submission_mod = @import("../web/submission.zig");
 const SessionView = server_mod.SessionView;
+const Lease = server_mod.Lease;
 
 pub const Deps = struct {
     /// 线程安全(连接线程并发分配)。
     allocator: std.mem.Allocator,
-    /// 按 session id 解析 SessionView(复用 server.zig 的 resolver;UDS 只用 journal/inbox/abort/generating)。
-    resolver: *const fn (ctx: *anyopaque, id: []const u8) ?SessionView,
+    /// 按 session id 租用 session(复用 server.zig 的 resolver;UDS 只用 journal/inbox/abort/generating)。
+    resolver: *const fn (ctx: *anyopaque, id: []const u8) ?Lease,
     resolver_ctx: *anyopaque,
     /// `list` op:返回 NDJSON session 列表(caller-allocated,dispatch 用完 free)。null → 返 {"sessions":[]}。
     list_fn: ?*const fn (ctx: *anyopaque, allocator: std.mem.Allocator) ?[]u8 = null,
@@ -62,6 +72,12 @@ pub const UdsServer = struct {
     }
 
     pub fn stop(self: *UdsServer) void {
+        _ = self.stopDrained();
+    }
+
+    /// `stop`, reporting whether every connection thread finished (see
+    /// `WebServer.stopDrained`).
+    pub fn stopDrained(self: *UdsServer) bool {
         self.closing.store(true, .release);
         net.shutdownSocket(self.listen_fd); // Linux:跨线程 close 不保证唤醒已阻塞的 accept
         net.closeSocket(self.listen_fd);
@@ -71,16 +87,16 @@ pub const UdsServer = struct {
         while (self.live_conns.load(.acquire) > 0 and waited < 12_000) : (waited += 10) time.sleepMs(10);
         if (self.live_conns.load(.acquire) > 0) {
             // 兜底(理论上不达:12s > 1s recv 超时)。存活连接线程仍读 self.closing/self.deps,
-            // free/destroy 会 UAF → 泄漏 self(对齐 web/server.zig stop)。**只堵 self 这一个 UAF
-            // 源**:deps(journal/inbox 等)由调用方无条件释放,线程真 hang(非超时可醒)时照样死
-            // ——此路径只应在未定义环境触发。socket 文件仍 unlink 不残留。
+            // free/destroy 会 UAF → 泄漏 self(对齐 web/server.zig stop),and report it so the
+            // caller keeps its deps alive too。socket 文件仍 unlink 不残留。
             log.warn("uds", "stop: {d} conn thread(s) still live after 12s, leaking UdsServer", .{self.live_conns.load(.acquire)});
             net.unlinkUnixPath(self.path);
-            return;
+            return false;
         }
         net.unlinkUnixPath(self.path);
         self.allocator.free(self.path);
         self.allocator.destroy(self);
+        return true;
     }
 
     fn acceptLoop(self: *UdsServer) void {
@@ -176,27 +192,24 @@ pub const UdsServer = struct {
             _ = self.writeLine(conn, "{\"ok\":false,\"error\":\"missing session\"}");
             return false;
         };
-        const sv = self.deps.resolver(self.deps.resolver_ctx, sid) orelse {
+        const lease = self.deps.resolver(self.deps.resolver_ctx, sid) orelse {
             _ = self.writeLine(conn, "{\"ok\":false,\"error\":\"unknown session\"}");
             return false;
         };
+        defer lease.release(); // after the op, and for attach after the whole attachment
+        const sv = lease.view;
 
         if (std.mem.eql(u8, op, "message")) {
-            const text = getStr(v, "text") orelse {
-                _ = self.writeLine(conn, "{\"ok\":false,\"error\":\"missing text\"}");
+            // Same fields and checks as HTTP POST /message: a bad field is refused before
+            // anything is queued, and the driver journals user_message when the turn starts.
+            // inbox.push copies, so the arena-backed request can go in as is.
+            const request = submission_mod.parseObject(v.object) catch |err| {
+                var reply_buf: [192]u8 = undefined;
+                const reply = std.fmt.bufPrint(&reply_buf, "{{\"ok\":false,\"error\":\"{s}\"}}", .{submission_mod.reason(err)}) catch "{\"ok\":false}";
+                _ = self.writeLine(conn, reply);
                 return false;
             };
-            // 回显先于入队(附着的 attach 立刻见已提交消息)。inbox.push 内部 dupe,text(arena)传入即可。
-            const raw_echo = std.json.Stringify.valueAlloc(self.allocator, .{ .user_message = text }, .{}) catch null;
-            if (raw_echo) |raw| {
-                defer self.allocator.free(raw);
-                const echo = json_util.repairJsonUtf8(self.allocator, raw) catch null;
-                if (echo) |e| {
-                    defer self.allocator.free(e);
-                    sv.journal.append(e);
-                }
-            }
-            if (!sv.inbox.push(text)) {
+            if (!sv.inbox.push(request)) {
                 _ = self.writeLine(conn, "{\"ok\":false,\"error\":\"queue push failed\"}");
                 return false;
             }

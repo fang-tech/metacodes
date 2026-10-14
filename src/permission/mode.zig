@@ -31,6 +31,19 @@ pub fn parseStrict(s: []const u8) ?Mode {
     return null;
 }
 
+/// A mode name as a person or a client types it: everything `parseStrict`
+/// accepts, plus the hyphenated spelling of the underscore variants
+/// (`accept-edits`, `dont-ask`, `bypass-permissions`). Unknown → null.
+/// `/mode <name>` and the web/daemon `permission_mode` message field share it,
+/// so the two surfaces cannot drift apart on which names they accept.
+pub fn parseName(s: []const u8) ?Mode {
+    if (parseStrict(s)) |m| return m;
+    var buf: [32]u8 = undefined;
+    if (s.len > buf.len) return null;
+    for (s, 0..) |ch, i| buf[i] = if (ch == '-') '_' else ch;
+    return parseStrict(buf[0..s.len]);
+}
+
 /// 宽松解析(settings/config 层沿用):未知值退化为 .default。
 pub fn parse(s: []const u8) Mode {
     return parseStrict(s) orelse .default;
@@ -70,6 +83,20 @@ test "parse unknown → default" {
 
 test "plan is no longer a permission mode" {
     try std.testing.expect(parseStrict("plan") == null);
+    try std.testing.expect(parseName("plan") == null);
+}
+
+test "parseName: strict names, hyphenated spellings, nothing else" {
+    try std.testing.expect(parseName("acceptEdits") == .accept_edits);
+    try std.testing.expect(parseName("accept_edits") == .accept_edits);
+    try std.testing.expect(parseName("accept-edits") == .accept_edits);
+    try std.testing.expect(parseName("dont-ask") == .dont_ask);
+    try std.testing.expect(parseName("bypass-permissions") == .bypass_permissions);
+    try std.testing.expect(parseName("default") == .default);
+    try std.testing.expect(parseName("") == null);
+    try std.testing.expect(parseName("accept edits") == null);
+    try std.testing.expect(parseName("-") == null);
+    try std.testing.expect(parseName("a" ** 33) == null);
 }
 
 test "canonical maps aliases" {

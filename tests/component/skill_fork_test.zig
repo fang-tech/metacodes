@@ -207,7 +207,7 @@ test "L2: shared Runtime fork sends rendered body to child" {
     defer server.stop();
     const url = try server.urlOwned(allocator);
     defer allocator.free(url);
-    var io_runtime = std.Io.Threaded.init(allocator, .{});
+    var io_runtime = @import("platform").signal.threadedIo(allocator, .{});
     defer io_runtime.deinit();
     var client = cc.client_mod.Client.initWithBaseUrl(
         allocator,
@@ -257,7 +257,7 @@ test "L2: shared Runtime inline does not spawn child" {
     defer server.stop();
     const url = try server.urlOwned(allocator);
     defer allocator.free(url);
-    var io_runtime = std.Io.Threaded.init(allocator, .{});
+    var io_runtime = @import("platform").signal.threadedIo(allocator, .{});
     defer io_runtime.deinit();
     var client = cc.client_mod.Client.initWithBaseUrl(
         allocator,
@@ -300,7 +300,7 @@ test "L2: shared Runtime fork honors model override" {
     defer server.stop();
     const url = try server.urlOwned(allocator);
     defer allocator.free(url);
-    var io_runtime = std.Io.Threaded.init(allocator, .{});
+    var io_runtime = @import("platform").signal.threadedIo(allocator, .{});
     defer io_runtime.deinit();
     var client = cc.client_mod.Client.initWithBaseUrl(
         allocator,
@@ -346,7 +346,7 @@ test "L2: unknown agent binding fails before any child request" {
     defer server.stop();
     const url = try server.urlOwned(allocator);
     defer allocator.free(url);
-    var io_runtime = std.Io.Threaded.init(allocator, .{});
+    var io_runtime = @import("platform").signal.threadedIo(allocator, .{});
     defer io_runtime.deinit();
     var client = cc.client_mod.Client.initWithBaseUrl(allocator, io_runtime.io(), "test-key", "claude-sonnet-4-20250514", url);
     defer client.deinit();
@@ -381,7 +381,7 @@ test "L2: agent binding runs the fork under that subagent's tool set" {
     defer server.stop();
     const url = try server.urlOwned(allocator);
     defer allocator.free(url);
-    var io_runtime = std.Io.Threaded.init(allocator, .{});
+    var io_runtime = @import("platform").signal.threadedIo(allocator, .{});
     defer io_runtime.deinit();
     var client = cc.client_mod.Client.initWithBaseUrl(allocator, io_runtime.io(), "test-key", "claude-sonnet-4-20250514", url);
     defer client.deinit();
@@ -413,6 +413,204 @@ test "L2: agent binding runs the fork under that subagent's tool set" {
     const messages = capture.jsonField("messages") orelse return error.MessagesFieldMissing;
     try std.testing.expect(std.mem.indexOf(u8, messages, "Base directory for this skill:") != null);
     try std.testing.expect(std.mem.indexOf(u8, messages, "READER_FORK_BODY") != null);
+}
+
+/// The child's one Write tool_use, the path JSON-escaped twice (into the
+/// tool input, then into partial_json).
+fn writeToolSse(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+    var input: std.Io.Writer.Allocating = .init(allocator);
+    defer input.deinit();
+    try input.writer.writeAll("{\"file_path\":");
+    try std.json.Stringify.encodeJsonString(path, .{}, &input.writer);
+    try input.writer.writeAll(",\"content\":\"forked\\n\"}");
+    var escaped: std.Io.Writer.Allocating = .init(allocator);
+    defer escaped.deinit();
+    try std.json.Stringify.encodeJsonString(input.written(), .{}, &escaped.writer);
+    return std.fmt.allocPrint(
+        allocator,
+        "data: {{\"type\":\"message_start\",\"message\":{{\"id\":\"msg_w\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{{\"input_tokens\":1,\"output_tokens\":1}}}}}}\n\n" ++
+            "data: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{{\"type\":\"tool_use\",\"id\":\"tu_w\",\"name\":\"Write\",\"input\":{{}}}}}}\n\n" ++
+            "data: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"input_json_delta\",\"partial_json\":{s}}}}}\n\n" ++
+            "data: {{\"type\":\"content_block_stop\",\"index\":0}}\n\n" ++
+            "data: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"tool_use\"}},\"usage\":{{\"output_tokens\":1}}}}\n\n" ++
+            "data: {{\"type\":\"message_stop\"}}\n\n",
+        .{escaped.written()},
+    );
+}
+
+/// Answers every permission prompt "deny once" and counts the Write prompts.
+const DenyingPrompter = struct {
+    write_prompts: usize = 0,
+
+    fn request(
+        raw: *anyopaque,
+        _: cc.session_id.SessionId,
+        _: std.mem.Allocator,
+        req: *const cc.ui_request.UiRequest,
+        out: *cc.ui_request.UiResponse,
+    ) anyerror!cc.ui_request.RequestOutcome {
+        const self: *DenyingPrompter = @ptrCast(@alignCast(raw));
+        switch (req.*) {
+            .permission => |prompt| {
+                if (std.mem.eql(u8, prompt.tool, "Write")) self.write_prompts += 1;
+                out.* = .{ .permission = .deny_once };
+                return .answered;
+            },
+            else => return error.UnexpectedUiRequest,
+        }
+    }
+};
+
+const ForkedWrite = struct { output: []u8, followup: []u8, created: bool, write_prompts: usize };
+
+/// A forked Skill bound to an agent whose `permissionMode` is bypassPermissions
+/// writes one file, under a `default` parent whose settings carry `layer`.
+fn runBypassFork(allocator: std.mem.Allocator, tag: []const u8, layer: cc.permission_settings.Layer) !ForkedWrite {
+    return runForkedWrite(allocator, tag, .default, "permissionMode: bypassPermissions\n", layer);
+}
+
+/// A forked Skill bound to an agent (frontmatter extra `agent_mode_line`) writes
+/// one file, under a parent in `parent_mode` whose settings carry `layer`.
+fn runForkedWrite(
+    allocator: std.mem.Allocator,
+    tag: []const u8,
+    parent_mode: cc.types_mod.PermissionMode,
+    agent_mode_line: []const u8,
+    layer: cc.permission_settings.Layer,
+) !ForkedWrite {
+    var root_buf: [512]u8 = undefined;
+    const root = fixtureRoot(&root_buf, tag);
+    defer cleanup(root, "bypassfork");
+    try makeSkill(
+        root,
+        "bypassfork",
+        "---\nname: bypassfork\ndescription: bound to a bypass agent\ncontext: fork\nagent: bypasser\n---\nWrite the file.\n",
+    );
+    const target = try std.fmt.allocPrintSentinel(allocator, "{s}/forked-write.txt", .{root}, 0);
+    defer allocator.free(target);
+    defer pfs.unlinkPath(target) catch {};
+    const write_sse = try writeToolSse(allocator, target);
+    defer allocator.free(write_sse);
+    const bodies = [_][]const u8{ write_sse, MINIMAL_END_TURN_SSE };
+    var server = try harness.MockServer.startCassette(&bodies, 0);
+    defer server.stop();
+    const url = try server.urlOwned(allocator);
+    defer allocator.free(url);
+    var io_runtime = @import("platform").signal.threadedIo(allocator, .{});
+    defer io_runtime.deinit();
+    var client = cc.client_mod.Client.initWithBaseUrl(allocator, io_runtime.io(), "test-key", "claude-sonnet-4-20250514", url);
+    defer client.deinit();
+
+    var fixture: Fixture = undefined;
+    try fixture.init(allocator, io_runtime.io(), root);
+    defer fixture.deinit(allocator);
+    const layers = [_]cc.permission_settings.Layer{layer};
+    const settings = cc.permission_settings.MergedSettings{ .layers = &layers, .allocator = allocator };
+    var prompter = DenyingPrompter{};
+    fixture.permission.mode = .init(parent_mode);
+    fixture.permission.settings = &settings;
+    fixture.permission.ui_requester = .{ .ctx = &prompter, .requestFn = DenyingPrompter.request };
+    fixture.permission.no_interactive_prompt = true;
+    var agents = cc.agents_set.AgentSet.init(allocator);
+    defer agents.deinit();
+    const agent_md = try std.fmt.allocPrint(
+        allocator,
+        "---\nname: bypasser\ndescription: writes\ntools: Write\n{s}---\nBYPASS_AGENT\n",
+        .{agent_mode_line},
+    );
+    defer allocator.free(agent_md);
+    try agents.agents.append(allocator, try cc.agents_def.parseAgentMd(
+        allocator,
+        agent_md,
+        "/fake/bypasser.md",
+        .project,
+    ));
+    var ctx = fixture.context(allocator, root, &client);
+    ctx.agents = &agents;
+    const entry = fixture.registry.find("Skill").?;
+    var output_body = try entry.execute(&ctx, "{\"name\":\"bypassfork\"}");
+    defer output_body.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 2), server.requestCount());
+    const output = try allocator.dupe(u8, output_body.@"inline".bytes);
+    errdefer allocator.free(output);
+    const followup = try allocator.dupe(u8, (server.lastRequest() orelse return error.NoRequestCaptured).body());
+    return .{
+        .output = output,
+        .followup = followup,
+        .created = pfs.exists(target.ptr),
+        .write_prompts = prompter.write_prompts,
+    };
+}
+
+test "L2: a forked Skill's agent permissionMode the settings disable runs as default and is reported" {
+    const allocator = std.testing.allocator;
+    const no_rules: []const cc.permission_settings.Rule = &.{};
+    const run = try runBypassFork(allocator, "cc-zig-skill-fork-bypass-off", .{
+        .source = .managed,
+        .allow = no_rules,
+        .ask = no_rules,
+        .deny = no_rules,
+        .disable_bypass_permissions_mode = true,
+    });
+    defer allocator.free(run.output);
+    defer allocator.free(run.followup);
+    // The write bypass would auto-allow is asked (and refused), as in default.
+    try std.testing.expectEqual(@as(usize, 1), run.write_prompts);
+    try std.testing.expect(!run.created);
+    try std.testing.expect(std.mem.indexOf(u8, run.followup, "permission_denied") != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        run.output,
+        "permissionMode bypassPermissions is disabled by settings; the subagent runs as default",
+    ) != null);
+
+    // Twin: only disableAutoMode → the agent's bypass applies.
+    const twin = try runBypassFork(allocator, "cc-zig-skill-fork-bypass-on", .{
+        .source = .managed,
+        .allow = no_rules,
+        .ask = no_rules,
+        .deny = no_rules,
+        .disable_auto_mode = true,
+    });
+    defer allocator.free(twin.output);
+    defer allocator.free(twin.followup);
+    try std.testing.expectEqual(@as(usize, 0), twin.write_prompts);
+    try std.testing.expect(twin.created);
+    try std.testing.expect(std.mem.indexOf(u8, twin.output, "disabled by settings") == null);
+}
+
+test "L2: a fork inheriting a mode the parent's settings disable is decided as default (backstop)" {
+    // No AgentDef override here: the child inherits its parent's context, whose
+    // bypass reached it past every setter. Only the decision-time backstop
+    // stands between that and an auto-allowed write.
+    const allocator = std.testing.allocator;
+    const no_rules: []const cc.permission_settings.Rule = &.{};
+    const run = try runForkedWrite(allocator, "cc-zig-skill-fork-inherit-off", .bypass_permissions, "", .{
+        .source = .managed,
+        .allow = no_rules,
+        .ask = no_rules,
+        .deny = no_rules,
+        .disable_bypass_permissions_mode = true,
+    });
+    defer allocator.free(run.output);
+    defer allocator.free(run.followup);
+    try std.testing.expectEqual(@as(usize, 1), run.write_prompts);
+    try std.testing.expect(!run.created);
+    try std.testing.expect(std.mem.indexOf(u8, run.followup, "permission_denied") != null);
+
+    // Twin: the same inherited bypass with the switch off writes unasked.
+    const twin = try runForkedWrite(allocator, "cc-zig-skill-fork-inherit-on", .bypass_permissions, "", .{
+        .source = .managed,
+        .allow = no_rules,
+        .ask = no_rules,
+        .deny = no_rules,
+        .disable_auto_mode = true,
+    });
+    defer allocator.free(twin.output);
+    defer allocator.free(twin.followup);
+    try std.testing.expectEqual(@as(usize, 0), twin.write_prompts);
+    try std.testing.expect(twin.created);
 }
 
 test "L2: fork without child runner fails closed and never falls back inline" {
@@ -482,7 +680,7 @@ test "L2: AgentCore fork capture preserves raw boundaries at true child depth" {
     const url = try server.urlOwned(allocator);
     defer allocator.free(url);
 
-    var io_runtime = std.Io.Threaded.init(allocator, .{});
+    var io_runtime = @import("platform").signal.threadedIo(allocator, .{});
     defer io_runtime.deinit();
     var client = cc.client_mod.Client.initWithBaseUrl(
         allocator,

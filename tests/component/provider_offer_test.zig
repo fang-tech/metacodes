@@ -69,7 +69,7 @@ fn captureAnthropicRequest(
     route: *const cc.provider_startup.StartupRoute,
     secret: []const u8,
 ) !harness.CapturedRequest {
-    var io_runtime = std.Io.Threaded.init(std.testing.allocator, .{});
+    var io_runtime = @import("platform").signal.threadedIo(std.testing.allocator, .{});
     defer io_runtime.deinit();
     var client = cc.client_mod.Client.initWithBaseUrl(
         std.testing.allocator,
@@ -146,7 +146,7 @@ test "L2: the GLM OpenAI-wire route reaches the coding-plan path with the OpenAI
     try std.testing.expectEqual(cc.types_mod.ProviderKind.openai, route.transport);
     try std.testing.expectEqual(cc.types_mod.OpenAIProtocol.chat_completions, route.openai_protocol);
 
-    var io_runtime = std.Io.Threaded.init(a, .{});
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
     defer io_runtime.deinit();
     var client = cc.api_openai.OpenAIClient.init(
         a,
@@ -1030,7 +1030,7 @@ test "L2: a picker-driven selection reaches the endpoint, path, and wire model i
     );
     try std.testing.expectEqual(cc.types_mod.ProviderKind.openai, binding.transport);
 
-    var io_runtime = std.Io.Threaded.init(a, .{});
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
     defer io_runtime.deinit();
     var client = cc.api_openai.OpenAIClient.init(
         a,
@@ -1143,7 +1143,7 @@ test "L2: a configured relay reaches its own path, header, and wire model id" {
     try std.testing.expectEqualStrings("relay-glm-pro", route.request_model_id);
     try std.testing.expectEqual(@as(?u32, 200_000), route.limits.context_window);
 
-    var io_runtime = std.Io.Threaded.init(a, .{});
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
     defer io_runtime.deinit();
     var client = cc.api_openai.OpenAIClient.init(
         a,
@@ -1257,7 +1257,7 @@ test "L2: an expired provider token refreshes over real HTTP and persists the ro
         .expires_in_seconds = 10,
     }, 1_000);
 
-    var io_runtime = std.Io.Threaded.init(a, .{});
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
     defer io_runtime.deinit();
     var exchange = cc.api_oauth_exchange.HttpExchange{
         .allocator = a,
@@ -1305,7 +1305,7 @@ test "L2: a rejected refresh is terminal and leaves the stored login untouched" 
         .expires_in_seconds = 10,
     }, 1_000);
 
-    var io_runtime = std.Io.Threaded.init(a, .{});
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
     defer io_runtime.deinit();
     var exchange = cc.api_oauth_exchange.HttpExchange{
         .allocator = a,
@@ -1358,7 +1358,7 @@ test "L2: an OAuth access token authenticates the provider's own route" {
     );
     try std.testing.expectEqualStrings("oauth-access-token", binding.secret);
 
-    var io_runtime = std.Io.Threaded.init(a, .{});
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
     defer io_runtime.deinit();
     var client = cc.api_openai.OpenAIClient.init(
         a,
@@ -1492,7 +1492,7 @@ test "L2: a control the offer declares changes the bytes actually sent" {
                 false,
             );
 
-            var io_runtime = std.Io.Threaded.init(allocator, .{});
+            var io_runtime = @import("platform").signal.threadedIo(allocator, .{});
             defer io_runtime.deinit();
             var client = cc.api_openai.OpenAIClient.init(
                 allocator,
@@ -1581,40 +1581,13 @@ test "L2: a provider metadata extension round-trips through the generic client v
 
 test "L2: a route change is broadcast as an ordered, replayable event carrying identity" {
     const a = std.testing.allocator;
-    const ui_event = cc.ui_event;
 
-    const Collector = struct {
-        lines: std.ArrayList([]u8) = .empty,
-        allocator: std.mem.Allocator,
-
-        fn emit(ctx: *anyopaque, ev: ui_event.ConfigChange) void {
-            const self: *@This() = @ptrCast(@alignCast(ctx));
-            // The same serialization the Web journal performs, so the test sees
-            // exactly what a browser would.
-            const line = std.json.Stringify.valueAlloc(
-                self.allocator,
-                .{ .config_changed = ev },
-                .{},
-            ) catch return;
-            self.lines.append(self.allocator, line) catch self.allocator.free(line);
-        }
-
-        fn deinit(self: *@This()) void {
-            for (self.lines.items) |line| self.allocator.free(line);
-            self.lines.deinit(self.allocator);
-        }
-    };
-
-    var collector = Collector{ .allocator = a };
-    defer collector.deinit();
-    const sink = ui_event.ConfigEventSink{
-        .ctx = @ptrCast(&collector),
-        .emitFn = struct {
-            fn run(ctx: *anyopaque, ev: ui_event.ConfigChange) void {
-                Collector.emit(ctx, ev);
-            }
-        }.run,
-    };
+    // The Web journal's own sink (also the daemon's), so the test sees exactly
+    // what a browser or an attached client reads.
+    var journal = cc.event_journal.EventJournal.init(a);
+    defer journal.deinit();
+    var web_sink = cc.web_session.WebConfigSink{ .journal = &journal, .alloc = a };
+    const sink = web_sink.sink();
 
     // A route event as `bindCommittedSelection` produces one.
     sink.emit(.{ .route = .{
@@ -1627,13 +1600,17 @@ test "L2: a route change is broadcast as an ordered, replayable event carrying i
         .scope = "session",
     } });
 
-    try std.testing.expectEqual(@as(usize, 1), collector.lines.items.len);
-    const line = collector.lines.items[0];
+    const lines = (try journal.waitSince(a, 0, 0)) orelse return error.TestExpectedRouteEvent;
+    defer {
+        for (lines) |l| a.free(l);
+        a.free(lines);
+    }
+    try std.testing.expectEqual(@as(usize, 1), lines.len);
+    const line = lines[0];
     // Identity, not just a display name: a second client can tell this route
     // from another that shows the same model name.
     for ([_][]const u8{
-        "\"config_changed\"",
-        "\"route\"",
+        "{\"v\":1,\"type\":\"config_changed\",\"data\":{\"route\":",
         "zai-coding-plan",
         "cn-openai",
         "openai_chat",
@@ -1841,7 +1818,7 @@ test "L2: a catalog endpoint answering non-2xx releases its body exactly once" {
     const origin = try server.urlOwned(a);
     defer a.free(origin);
 
-    var io_runtime = std.Io.Threaded.init(a, .{});
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
     defer io_runtime.deinit();
 
     // The failure path freed the body *and* let an errdefer free it again, so
@@ -1862,7 +1839,7 @@ test "L2: an unreachable catalog endpoint leaves the previous catalog in place" 
     defer host.destroy();
     const before = host.kernel.catalogSnapshot().items().len;
 
-    var io_runtime = std.Io.Threaded.init(a, .{});
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
     defer io_runtime.deinit();
     // Port 1 on loopback refuses immediately.
     try std.testing.expect(cc.api_catalog_fetch.fetch(a, io_runtime.io(), .{

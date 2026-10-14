@@ -3851,7 +3851,12 @@ fn handleAgents(app: *app_mod.App) !void {
                 std.debug.print("    model: {s}\n", .{a.model});
             }
             if (a.permission_mode) |m| {
-                std.debug.print("    permissionMode: {s}\n", .{@tagName(m)});
+                const agent_tool = @import("../tools/agent.zig");
+                const refused = !app.permission_ctx.modeAllowed(agent_tool.mapPermissionMode(m));
+                std.debug.print("    permissionMode: {s}{s}\n", .{
+                    @tagName(m),
+                    if (refused) " \x1b[33m(disabled by settings; runs as default)\x1b[0m" else "",
+                });
             }
             if (a.preload_skills.len > 0) {
                 std.debug.print("    preloaded skills: ", .{});
@@ -4607,7 +4612,7 @@ test "L2 #16: /resume 切 app.session_id + permission_ctx.session(路由键随�
     // App 用独立 arena(App 是 arena 生命周期设计,避免 testing.allocator 噪声);测试自身用 a。
     var app_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer app_arena.deinit();
-    var io_rt = std.Io.Threaded.init(a, .{});
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
     defer io_rt.deinit();
     const cfg = types_mod.Config{ .model = "claude-sonnet-4-20250514" };
     const app = try app_mod.App.init(app_arena.allocator(), io_rt.io(), cfg, "test-key");

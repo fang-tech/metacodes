@@ -367,6 +367,12 @@ pub const App = struct {
     openai_client: ?openai_mod.OpenAIClient = null,
     /// Gemini 后端(config.provider_kind==.gemini 时非 null)。持有状态缓存句柄表(C3)。
     gemini_client: ?gemini_mod.GeminiClient = null,
+    /// Held while a route switch builds a transport client and while it moves
+    /// `config.provider_kind`, and by `cancelInFlightRequest`: another thread
+    /// calling `provider()` would otherwise read the new kind before the new
+    /// client is visible to it (or the client half-written). Clients are never
+    /// freed before `deinit`, so this is the only window.
+    route_mutex: sync.Mutex = .{},
     /// Built once in `init` and kept for the whole session, so the slices,
     /// the dynamic descriptions (`describe_fn`, env overrides) and
     /// `enabled_tool_names` live in `tool_defs_arena`, released in `deinit`.
@@ -1038,6 +1044,9 @@ pub const App = struct {
         const allocator = app.allocator;
         const state_root_default = app.state_root_default;
         defer if (state_root_default) |owned| allocator.free(owned);
+        // Every background worker stops (and is joined) before anything it
+        // shares is freed; a host may already have done this (idempotent).
+        app.stopBackgroundWork();
         // 最先 drain 后台 subagent：abort 全部 running → join 全部线程 → free。
         // 必须早于任何共享资源（agents/dyn_registry/skills/allocator）释放，
         // 否则在跑的后台线程会触碰已释放内存（UAF）。job 用专属 Client，不依赖 api_client。
@@ -1607,30 +1616,36 @@ pub const App = struct {
         // The target transport must exist before the model seam runs, or the
         // new client would never receive the model.
         const io = app.api_client.http_client.io;
-        switch (binding.transport) {
-            .anthropic => {},
-            .openai => if (app.openai_client == null) {
-                app.openai_client = openai_mod.OpenAIClient.init(
-                    app.allocator,
-                    io,
-                    secret,
-                    binding.request_model_id,
-                    endpoint,
-                );
-                app.openai_client.?.dialect_resolver = app.api_client.dialect_resolver;
-                app.openai_client.?.overrides = buildOverridesFromConfig(app.config);
-            },
-            .gemini => if (app.gemini_client == null) {
-                app.gemini_client = gemini_mod.GeminiClient.init(
-                    app.allocator,
-                    io,
-                    secret,
-                    binding.request_model_id,
-                    endpoint,
-                );
-                app.gemini_client.?.dialect_resolver = app.api_client.dialect_resolver;
-                app.gemini_client.?.overrides = buildOverridesFromConfig(app.config);
-            },
+        // A cancel from another thread (`cancelInFlightRequest`) must see a
+        // complete client whenever it sees the kind that selects it.
+        {
+            app.route_mutex.lock();
+            defer app.route_mutex.unlock();
+            switch (binding.transport) {
+                .anthropic => {},
+                .openai => if (app.openai_client == null) {
+                    app.openai_client = openai_mod.OpenAIClient.init(
+                        app.allocator,
+                        io,
+                        secret,
+                        binding.request_model_id,
+                        endpoint,
+                    );
+                    app.openai_client.?.dialect_resolver = app.api_client.dialect_resolver;
+                    app.openai_client.?.overrides = buildOverridesFromConfig(app.config);
+                },
+                .gemini => if (app.gemini_client == null) {
+                    app.gemini_client = gemini_mod.GeminiClient.init(
+                        app.allocator,
+                        io,
+                        secret,
+                        binding.request_model_id,
+                        endpoint,
+                    );
+                    app.gemini_client.?.dialect_resolver = app.api_client.dialect_resolver;
+                    app.gemini_client.?.overrides = buildOverridesFromConfig(app.config);
+                },
+            }
         }
 
         try app.switchModel(binding.request_model_id);
@@ -1644,7 +1659,12 @@ pub const App = struct {
         // generation makes the worst case a wrong-but-in-bounds string.
         app.route_strings.install(endpoint, secret);
 
-        app.config.provider_kind = binding.transport;
+        {
+            // Published under the lock that built the client it selects.
+            app.route_mutex.lock();
+            defer app.route_mutex.unlock();
+            app.config.provider_kind = binding.transport;
+        }
         app.config.openai_protocol = binding.openai_protocol;
         app.config.auth_scheme = binding.auth_scheme;
         // `config` is the snapshot subagent and swarm workers are constructed
@@ -1823,6 +1843,13 @@ pub const App = struct {
         }
     }
 
+    /// Broadcast the active model as `config_changed{model}` without switching:
+    /// the confirmation a per-message model override gets when it names the
+    /// model already in force (SessionService.setTurnModel).
+    pub fn announceModel(app: *App) void {
+        app.emitConfig(.{ .model = app.activeModel() });
+    }
+
     pub fn pendingModelSwitchCompact(app: *const App) ?agent_loop.ModelSwitchCompact {
         const previous_model = app.pending_previous_model_for_compact orelse return null;
         return .{
@@ -1998,6 +2025,64 @@ pub const App = struct {
                 app.goal_state.clearInMemory();
             },
         };
+    }
+
+    /// Rebuild the conversation persisted under this App's own session
+    /// directory, for an App built with `config.session_id` naming a session
+    /// that ran before and that has not run since (#254: the daemon's
+    /// `POST /sessions/create {"resume":true}`). The same steps as `/resume`:
+    /// `transcript.loadTranscript`, a writer reopened past the restored
+    /// messages (App.init opened one at zero, which would append them a second
+    /// time), the session's goal and its own model route. Returns the number of
+    /// messages restored; leaves the App unchanged on error.
+    pub fn resumePersistedConversation(app: *App) !usize {
+        std.debug.assert(app.conversation.len() == 0);
+        const writer = if (app.transcript_writer) |*w| w else return error.NoSessionDir;
+        var path_buffer: [std.fs.max_path_bytes + 1]u8 = undefined;
+        const path = std.fmt.bufPrintZ(&path_buffer, "{s}/transcript.jsonl", .{writer.dir}) catch return error.TranscriptNotFound;
+        if (!pfs.exists(path.ptr)) return error.TranscriptNotFound;
+
+        var staged = Conversation.init(app.allocator);
+        errdefer staged.deinit();
+        try transcript.loadTranscript(&staged, writer.dir, app.allocator);
+        const dir_owned = try app.allocator.dupe(u8, writer.dir);
+        // Nothing below fails: switch to the restored conversation and its writer.
+        app.conversation.deinit();
+        app.conversation = staged;
+        writer.deinit();
+        writer.* = transcript.Writer.openExisting(app.allocator, dir_owned, app.activeModel(), app.conversation.len());
+        app.loadGoalFromSessionDir(dir_owned);
+        if (app.restoreSessionSelection()) |restored| {
+            if (restored) writer.model = app.activeModel();
+        } else |err| {
+            @import("util/log.zig").warn("session", "stored model route of session {s} is unavailable ({s}); the current route is kept", .{ app.session_id.asSlice(), @errorName(err) });
+        }
+        return app.conversation.len();
+    }
+
+    /// Stop the work this session runs beside its driver and wait for each
+    /// piece to end: background agent jobs (nested ones included), swarm
+    /// teammates (in-process and process ones; the team is detached as
+    /// `deinit` would), and background shell jobs. Records stay readable
+    /// (`/state` rosters, TaskOutput) until `deinit`, and no new background
+    /// work can start afterwards. Call it once nothing drives the App. For a
+    /// host that closes a session before it can free it (#254: the
+    /// multi-session daemon's destroy stops the work at once; only memory waits
+    /// for the last lease). Idempotent; `deinit` calls it first.
+    pub fn stopBackgroundWork(app: *App) void {
+        if (app.agent_jobs) |*jobs| jobs.stop();
+        app.swarm.detachTeam();
+        if (app.jobs) |*jobs| _ = jobs.killAll();
+    }
+
+    /// Shut down this App's in-flight provider request for `signal` (after the
+    /// caller set it): the call another thread makes to wake a run blocked in a
+    /// provider read. Serialized with a route switch, which may build the
+    /// transport client `provider()` then selects (`route_mutex`).
+    pub fn cancelInFlightRequest(app: *App, signal: *const AbortSignal) void {
+        app.route_mutex.lock();
+        defer app.route_mutex.unlock();
+        app.provider().cancel(signal);
     }
 
     /// 当前 session 目录(transcript.jsonl / suspend.json 所在)。无 writer → null。
@@ -3350,9 +3435,19 @@ pub const App = struct {
     /// 故 g_abort_signal 单指针不是多 session 缺陷——它是 TUI 单终端的正确机制,GUI 旁路它。
     /// (不预包 requestStop wrapper:GUI 真来时直接调 abort.abort + 那时定确切语义,避孤儿 API。)
     pub fn installSigintHandler(app: *App) !void {
-        g_abort_signal = &app.abort;
+        @atomicStore(?*AbortSignal, &g_abort_signal, &app.abort, .seq_cst);
         // 可移植:POSIX=SIGINT sigaction;Windows=SetConsoleCtrlHandler(见 platform/signal.zig)。
         platform_signal.installInterrupt(onSigint);
+    }
+
+    /// Stop SIGINT from aborting this App's run; SIGINT still requests process
+    /// shutdown. For the multi-session daemon (#254), which frees the App it
+    /// was started with while the process lives on (`--sessions 0`, or a
+    /// destroy of the session that adopted it): a later SIGINT must not write
+    /// into it. The daemon's shutdown path aborts every session itself. A
+    /// no-op when another App is the target.
+    pub fn detachSigintAbort(app: *App) void {
+        _ = @cmpxchgStrong(?*AbortSignal, &g_abort_signal, &app.abort, null, .seq_cst, .seq_cst);
     }
 };
 
@@ -3502,7 +3597,7 @@ fn buildOverridesFromConfig(config: types.Config) request_overrides.RequestOverr
 /// (唤醒 N=1 宿主的 run,兼容既有行为;daemon 未绑单 session 时此指针为 null,靠 accept EINTR 醒)。
 fn onSigint() void {
     @import("core/shutdown.zig").request();
-    if (g_abort_signal) |s| {
+    if (@atomicLoad(?*AbortSignal, &g_abort_signal, .seq_cst)) |s| {
         s.abort(.user_ctrl_c);
     }
 }
@@ -3602,7 +3697,7 @@ test "U4 A3: reasoning/dirs 单写侧 emit config_changed;setConfigEventSink 同
     app.additional_dirs_abs = null; // setConfigEventSink seed 读 additionalDirs()
     app.permission_ctx = permission_mod.createContext(.default, std.testing.allocator);
     // api_client 被 setReasoningEffort 写 reasoning_effort 字段——需真 Client。
-    var io_rt = std.Io.Threaded.init(std.testing.allocator, .{});
+    var io_rt = @import("platform").signal.threadedIo(std.testing.allocator, .{});
     defer io_rt.deinit();
     app.api_client = client_mod.Client.initWithBaseUrl(std.testing.allocator, io_rt.io(), "k", "m", null);
     defer app.api_client.deinit();
@@ -3866,7 +3961,7 @@ test "U2 S2: permission_mode 单一源 — permMode 读 ctx,cyclePermMode 只写
 
 test "U3 syncModelMirrors: 所有 model 镜像同步(含 swarm.model,Linus U3 抓的第7点)" {
     const a = std.testing.allocator;
-    var io_rt = std.Io.Threaded.init(a, .{});
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
     defer io_rt.deinit();
     const io = io_rt.io();
 

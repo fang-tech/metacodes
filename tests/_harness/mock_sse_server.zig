@@ -82,6 +82,8 @@ pub const MockServer = struct {
     /// 与 flaky(断连)、midstream_cut(截断后断连)相互独立:那两种服务端会关连接,这种不会。
     silent_index: ?usize = null,
     silent_prefix_bytes: usize = 0,
+    /// `silent_index` covers every response from it on, not that one only.
+    silent_from: bool = false,
     /// 指定响应发完 prefix 后零字节等待,再正常发完余下正文。
     delayed_burst: ?DelayedBurst = null,
     /// 在飞的沉默连接持有线程数:每条沉默连接由独立线程握着(accept 循环不能被它堵住,否则
@@ -197,6 +199,15 @@ pub const MockServer = struct {
         const self = try startCassette(bodies, 0);
         self.silent_index = silent_index;
         self.silent_prefix_bytes = silent_prefix_bytes;
+        return self;
+    }
+
+    /// cassette 多轮 + 从 `first_silent` 起的每个响应都沉默(连响应头都不发):its requests
+    /// arrive in any order (a session and its background job, say) and all of them stall.
+    pub fn startCassetteSilentFrom(bodies: []const []const u8, first_silent: usize) !*MockServer {
+        const self = try startCassette(bodies, 0);
+        self.silent_index = first_silent;
+        self.silent_from = true;
         return self;
     }
 
@@ -383,7 +394,7 @@ pub const MockServer = struct {
             }
 
             // 沉默:交给持有线程(发 prefix 后什么都不做,连接一直开着到 stop()),accept 循环继续。
-            if (self.silent_index) |silent| if (response_index == silent) {
+            if (self.silent_index) |silent| if (response_index == silent or (self.silent_from and response_index > silent)) {
                 _ = self.silent_holders.fetchAdd(1, .acq_rel);
                 const holder = std.Thread.spawn(.{}, holdSilent, .{ conn, self }) catch {
                     _ = self.silent_holders.fetchSub(1, .acq_rel);

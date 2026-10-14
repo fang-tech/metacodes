@@ -124,7 +124,52 @@ pub const SessionService = struct {
 
     // ── 直接 mutation API（exec 内部调；也供非命令触发点直调，如 Shift+Tab/model-picker 键）──
 
+    /// `/model <id>`: switch the session's model and save it as the login's
+    /// selected model, so the next session starts on it.
     pub fn setModel(self: *SessionService, alloc: std.mem.Allocator, model_id: []const u8) CommandOutcome {
+        const resolved = switch (self.resolveModel(alloc, model_id)) {
+            .model => |m| m,
+            .refused => |outcome| return outcome,
+        };
+        self.app.switchModel(resolved) catch |e| {
+            return .{ .kind = .err, .ok = false, .data = .{ .err_name = @errorName(e) } };
+        };
+        self.app.persistLoginSelection();
+        return .{ .kind = .model_changed, .ok = true, .data = .{ .model = self.app.activeModel() } };
+    }
+
+    /// The `model` field of a web/daemon message: the same resolution and
+    /// provider guard as `setModel`, but for this session only. It never writes
+    /// the login's saved selection — a model a control plane picks for one
+    /// message must not become the user's default for every later session.
+    ///
+    /// A model that is already active is not switched again (no system prompt
+    /// rebuild, the usage anchor is kept); `config_changed{model}` is still
+    /// emitted so whoever sent the message can see what the turn runs on.
+    /// On a refusal or a failed switch nothing has changed.
+    pub fn setTurnModel(self: *SessionService, alloc: std.mem.Allocator, model_id: []const u8) CommandOutcome {
+        const resolved = switch (self.resolveModel(alloc, model_id)) {
+            .model => |m| m,
+            .refused => |outcome| return outcome,
+        };
+        if (std.mem.eql(u8, resolved, self.app.activeModel())) {
+            self.app.announceModel();
+        } else {
+            self.app.switchModel(resolved) catch |e| {
+                return .{ .kind = .err, .ok = false, .data = .{ .err_name = @errorName(e) } };
+            };
+        }
+        return .{ .kind = .model_changed, .ok = true, .data = .{ .model = self.app.activeModel() } };
+    }
+
+    const ModelResolution = union(enum) {
+        /// Borrowed from the caller's `model_id` or the App's tier table.
+        model: []const u8,
+        refused: CommandOutcome,
+    };
+
+    /// Tier/alias resolution, then the provider guard. Changes nothing.
+    fn resolveModel(self: *SessionService, alloc: std.mem.Allocator, model_id: []const u8) ModelResolution {
         // U11:档位/别名解析先于守卫——对齐 loop.zig /model use 路径。档位名
         // (low/mid/high;兼容 haiku/sonnet/opus)查当前 provider 档位表;未配置时
         // 按字面交给 provider 守卫拒绝(明确报错,不静默映射硬编码 ID,不无声 no-op)。
@@ -137,28 +182,19 @@ pub const SessionService = struct {
         // provider 守卫(对齐 loop.zig 旧 /model；顺带修 web /model 之前漏守卫)：收集当前
         // provider 的候选，拒绝跨 provider 的 model。候选 slice owned,元素借 catalog/BUILTINS。
         const candidates = model_command.collectCandidates(alloc, self.app.config.provider_kind, self.app.api_client.catalog.entries.items) catch {
-            return .{ .kind = .err, .ok = false, .data = .{ .text = "model catalog unavailable" } };
+            return .{ .refused = .{ .kind = .err, .ok = false, .data = .{ .text = "model catalog unavailable" } } };
         };
         defer alloc.free(candidates);
         if (!model_command.canUseInCurrentProvider(self.app.config.provider_kind, candidates, resolved)) {
-            return .{ .kind = .err, .ok = false, .data = .{ .text = "model not available for current provider" } };
+            return .{ .refused = .{ .kind = .err, .ok = false, .data = .{ .text = "model not available for current provider" } } };
         }
-        self.app.switchModel(resolved) catch |e| {
-            return .{ .kind = .err, .ok = false, .data = .{ .err_name = @errorName(e) } };
-        };
-        self.app.persistLoginSelection();
-        return .{ .kind = .model_changed, .ok = true, .data = .{ .model = self.app.activeModel() } };
+        return .{ .model = resolved };
     }
 
     /// `/mode <name>`:按名设权限模式(U11 新增;TUI 此前只有 Shift+Tab 轮换,web 只有
-    /// cycle——两侧都补齐命名设置)。接受官方驼峰/下划线/历史名(parseStrict)及连字符形式。
+    /// cycle——两侧都补齐命名设置)。接受官方驼峰/下划线/历史名及连字符形式(parseName)。
     pub fn setPermModeNamed(self: *SessionService, name: []const u8) CommandOutcome {
-        const mode = permission_mode.parseStrict(name) orelse blk: {
-            if (name.len > 32) break :blk null;
-            var buf: [32]u8 = undefined;
-            for (name, 0..) |ch, i| buf[i] = if (ch == '-') '_' else ch;
-            break :blk permission_mode.parseStrict(buf[0..name.len]);
-        } orelse {
+        const mode = permission_mode.parseName(name) orelse {
             return .{ .kind = .err, .ok = false, .data = .{ .text = "unknown mode (try: default, accept-edits, auto, dont-ask, bypass)" } };
         };
         return self.setPermMode(mode);
@@ -169,7 +205,25 @@ pub const SessionService = struct {
         return .{ .kind = .mode_changed, .ok = true, .data = .{ .mode = self.app.permMode() } };
     }
 
+    /// The refusal for a mode the settings disable (`disableBypassPermissionsMode`,
+    /// `disableAutoMode`; PermissionContext.modeAllowed), or null when `mode` may be
+    /// set. Changes nothing. Every mode switch on every surface goes through
+    /// `setPermMode`, which asks this first; the web/daemon message asks it before
+    /// applying anything else (web/session.zig startSubmission).
+    pub fn checkPermMode(self: *SessionService, mode: types.PermissionMode) ?CommandOutcome {
+        if (self.app.permission_ctx.modeAllowed(mode)) return null;
+        const text = switch (permission_mode.canonical(mode)) {
+            .bypass_permissions => "bypassPermissions is disabled by settings",
+            .auto => "auto mode is disabled by settings",
+            else => "permission mode is disabled by settings",
+        };
+        return .{ .kind = .err, .ok = false, .data = .{ .text = text } };
+    }
+
+    /// Set the permission mode; a mode the settings disable is refused and
+    /// nothing changes (no config_changed).
     pub fn setPermMode(self: *SessionService, mode: types.PermissionMode) CommandOutcome {
+        if (self.checkPermMode(mode)) |refusal| return refusal;
         self.app.setPermMode(mode);
         return .{ .kind = .mode_changed, .ok = true, .data = .{ .mode = self.app.permMode() } };
     }
@@ -558,7 +612,7 @@ test "U11: execLine 管线 —— prompt/宏 append + RunPlan;失败前零 mutat
     app.active_skill = null;
     app.permission_ctx = @import("permission.zig").createContext(.default, a);
     app.session_id = @import("core/session_id.zig").SessionId.single;
-    var io_rt = std.Io.Threaded.init(a, .{});
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
     defer io_rt.deinit();
     app.skill_runtime = @import("skills/cli_adapter.zig").Runtime.init(a, io_rt.io());
     defer app.skill_runtime.deinit();

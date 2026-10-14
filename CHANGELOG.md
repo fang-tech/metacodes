@@ -60,9 +60,89 @@ status, compatibility boundaries, and entry points are defined by
   could not reach a pending prompt and a fresh session that resumed the old
   transcript; this is the kernel-side version. `EventJournal` moved from
   `web/` to `core/event_journal.zig` and is exported.
+- `GET /health` on `--web`, `serve` and `serve --sessions` (#251): `200
+  {"status":"ok","version":"<v>","sessions":N}`, unauthenticated and
+  independent of any session, for container liveness and readiness probes.
+  `version` is exactly what `metacodes --version` prints first, so an
+  orchestrator can check the running release against the one it pinned.
+- Bearer-token authentication for that HTTP surface (#252):
+  `METACODES_WEB_TOKEN` (or `--web-token`, visible in `ps`) makes every route
+  but `/health` require `Authorization: Bearer <token>`; a GET may pass
+  `?token=` (EventSource, opening the browser UI), a POST may not. A wrong or
+  missing token is `401` with `WWW-Authenticate: Bearer`, decided before any
+  request body is read and compared in constant time. The bundled UI is
+  opened as `/?token=<token>`; it drops the token from the address bar and
+  sends it on every request. Without a token, requests whose `Host` is not a
+  loopback name are now refused (DNS rebinding), and a POST's `Origin` is
+  compared with its own `Host` (`[::1]` and TLS-terminating proxies work).
+  Unset, local use is unchanged. The `--uds` transport keeps its 0600
+  socket-file access control.
+- `--web-bind <addr>` / `METACODES_WEB_BIND` (#253): bind the HTTP surface to
+  any IPv4 or IPv6 literal (`0.0.0.0`, `::` dual-stack, `::1`, ...) instead of
+  only `127.0.0.1`; the startup line shows the address actually bound. A
+  non-loopback address without a token exits 2 unless `--web-allow-unauth` is
+  given. Normative rules: [doc/API.md](doc/API.md#web-and-daemon-http-surface);
+  trust model: [SECURITY.md](SECURITY.md#web-and-daemon-trust-model).
+- A `--web`/`serve` message can carry its turn's configuration (#255):
+  `POST /message` (`/s/<id>/message` under `serve --sessions N`) and the UDS
+  `message` op take optional `model` and `permission_mode` beside `text`. The
+  session applies them right before that message's turn — the model for this
+  session only, without writing the login's saved selection as `/model` does —
+  and journals one `config_changed` line per given field ahead of the turn's
+  `user_message`. A bad `permission_mode` is refused with 400 before anything
+  is queued; a model the provider cannot serve, or a mode the settings
+  disable, applies neither field, runs no turn and journals
+  `message_rejected`. A control plane no longer has to send
+  `/command`, poll `/state` and race a busy session before each message.
+  `/state`'s `seq`, `permission_mode` and `pending_request_id` are documented
+  for reconnecting clients (doc/API.md).
+- Dynamic sessions in the multi-session daemon (#254): `GET /sessions` lists
+  the live sessions (`generating`, `model`, `permission_mode`,
+  `pending_request_id`); `POST /sessions/create` (`{"session_id"?,
+  "resume"?}`) starts one, under the caller's id or a generated one, and with
+  `"resume":true` rebuilds its conversation from the transcript persisted under
+  the state root, so a session survives a container rebuild;
+  `POST /sessions/<id>/resume` answers 200 when the session is live and 404
+  otherwise; `POST /sessions/<id>/destroy` aborts its run and stops its
+  background agent jobs, teammates and background shells, joins them all,
+  ends every SSE stream and UDS attach with `session_lifecycle.closed`, and
+  returns. `serve --sessions 0` starts with no session, and
+  `--max-sessions M` (default 32) caps live sessions, answering 429 beyond it.
+  Requests now hold a counted lease on the session they address for as long
+  as they run (an SSE stream or UDS attach for its whole life); a destroy
+  never waits for one and frees the session after the last is returned; until
+  then its id is refused to a create (409 `session is still closing`). A
+  create holds its connection while the session starts; after a timed-out
+  create, check `GET /sessions`. Normative rules:
+  [doc/API.md](doc/API.md#web-and-daemon-http-surface).
 
 ### Changed
 
+- `--web`/`serve`: `user_message` is journaled by the session when the
+  message's turn starts, no longer by the transport when the message is
+  queued, so it always means "this turn started with this text". A message
+  sent while a turn runs now appears after that turn's `run_done`; the bundled
+  page shows it as queued until then. Over UDS, the `message` text is trimmed
+  and must not be empty, as over HTTP: an empty text is refused instead of
+  queued and dropped, and a missing one is reported as `empty message` (was
+  `missing text`).
+- `config_changed` on the `--web`/`serve` stream is a `protocol.wire` v1 line,
+  `{"v":1,"type":"config_changed","data":{...}}`, instead of
+  `{"config_changed":{...}}`. The bundled page now updates its model and mode
+  display from it; a client reading the stream directly must follow.
+- `serve --sessions 1` now runs the multi-session daemon (one startup session
+  under `/s/<id>/`, plus the `/sessions` routes), as doc/API.md already
+  described; it used to fall back to the single-session `serve`. Plain `serve`
+  is unchanged. `--sessions` takes a count of 0 or more and rejects anything
+  else (it used to read a bad value as 1), and `--sessions`, `--max-sessions`
+  and `--uds` without `serve` are argument errors (exit 2) instead of being
+  ignored.
+- Destroying or shutting down a daemon session now also cancels its in-flight
+  provider request, so a session whose provider stopped sending stops at once
+  instead of after the stream idle limit (up to 120 s by default). Stopping a
+  background agent job or a swarm teammate (session close, App teardown) now
+  cancels its in-flight provider request too, instead of waiting out that
+  limit.
 - MCP tools are named `mcp__<server>__<tool>` (Claude Code's form, so its
   permission rules and `allowed-tools` lists match); invalid characters become
   `_` and over-long or colliding names get a stable hash suffix. A subagent
@@ -143,6 +223,67 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- OpenAI Chat Completions streams no longer drop text (issue #258). metacodes
+  always asks for `stream_options.include_usage`, under which every ordinary
+  chunk carries `"usage": null`; the parser took any chunk containing the key
+  `usage` for the usage report and returned before reading the rest, so the
+  chunk's text, reasoning, tool-call deltas and `finish_reason` were lost. A
+  Host or AgentCore SDK consumer could receive no text at all, tool calls never
+  formed, and the stop reason came back unknown. Usage now counts only when its
+  value is an object (at the top level, or inside a choice where some
+  compatible endpoints put it), its numbers are read from that object alone,
+  and a chunk that carries both content and a usage object yields both,
+  content first. The Responses API and Gemini paths had the same presence test:
+  a `null` `response.usage` or `usageMetadata` was reported as a measured zero,
+  and Responses read token counts from the whole terminal event, where an
+  echoed tool schema with an `input_tokens` property could supply them. Both
+  now read only the usage object and report nothing when there is none.
+- The daemon end-to-end tests (`tests/e2e/daemon_serve_e2e.sh`,
+  `daemon_serve_multi_e2e.sh`) run again and now run in `zig build test` on
+  POSIX hosts. They still sent `/mode plan`, which no longer exists, and
+  used fixed ports; they now use `/mode dont-ask`, kernel-picked ports, an
+  isolated state root with TinyKG autostart off, and also cover `/health`, the
+  token, an IPv6 bind and the non-loopback refusal.
+- **SIGPIPE no longer interrupts blocking calls with EINTR.**
+  - **Cause:** `metacodes` ignores SIGPIPE at startup, but every `std.Io.Threaded.init` swapped that for a do-nothing handler installed without SA_RESTART. Its `deinit` put back whatever it had found, so overlapping lifetimes could leave another instance's handler in place.
+  - **Effect:** a handler, unlike SIG_IGN, gets the signal delivered. On macOS a write to a closed socket signals the whole process, so any thread's blocked `recv`/`poll`/`accept`/`waitpid` could return EINTR:
+    - the web server reads `recv <= 0` as the end of a request and dropped it;
+    - the TinyKG autostart probe once took it for "no answer".
+  - **Fix:** every `std.Io.Threaded` is now created through `platform.signal.threadedIo`, which keeps SIGPIPE ignored when the process asked for it, and in tests. A library embedded by a host keeps std's behavior; the host owns its signal policy.
+  - **Children:** they get the default SIGPIPE back before `execve`. An ignored disposition survives exec, and without the reset a child pipeline such as `yes | head` would see EPIPE errors instead of ending normally.
+  - **Enforcement:** `zig build test` fails on a direct `std.Io.Threaded.init` call (`test:io-threaded`).
+- `/mode` could switch a session into a permission mode its settings disable
+  (`disableBypassPermissionsMode`, `disableAutoMode`): they were enforced only
+  when the settings were loaded. `/mode` now refuses such a mode on every
+  surface (terminal, `--web`/`serve` `POST /command`), leaving the mode
+  unchanged, and a `--web`/`serve` message asking for it is refused with
+  `message_rejected` before anything else in it is applied.
+- Work could still run under a permission mode the settings disable
+  (`disableBypassPermissionsMode`, `disableAutoMode`) without passing a mode
+  switch: an AgentDef's `permissionMode` (Task subagents, background jobs,
+  in-process teammates) and a forked Skill bound to such an agent applied it
+  as is, so a project `.claude/agents/x.md` with `permissionMode:
+  bypassPermissions` ran a subagent in bypass. Such a spawn now runs as
+  `default`, logs a warning and says so in its result
+  (`permission_mode_notice` on the Task result; a leading line on the forked
+  Skill's result; `/agents` marks the mode). Every permission decision now
+  runs under `default` when the mode on its context is disabled, whatever
+  put it there, including the ApplyPatch path gate and the AgentCore
+  external-Tool fallback. `AgentSession.setPermissionMode` and AgentCore
+  `update_permission_mode` refuse such a mode with
+  `error.PermissionModeDisabled` / `INVALID_ARGUMENT`; an AgentCore Session's
+  settings are the Host-imported rules, which cannot disable a mode, so
+  today the Host owns which modes it offers.
+- `zig build eval:rule-author-build` and `eval:project-rule-mac-pilot` build
+  again. Both had stopped compiling on 2026-10-01, when the state root became
+  an explicit parameter. The rule-author probe passes no state root, so a
+  missing `METACODES_API_KEY_FD` fails it instead of a stored login paying.
+  The pilot's simulated TinyKG daemon was also stale against the client: it
+  reported store format 2 instead of 3, and lacked the `set-node-property`
+  project binding that snapshots need since 2026-08-18. It now reads the
+  expected versions from `src/kg/client.zig` and checks the binding before
+  serving a snapshot. `zig build test` compiles both drivers on POSIX hosts
+  and runs the zero-paid pilot on macOS.
 - **The production release gate's calibration can no longer go stale silently.**
   - **What went wrong:** `cli.py gate --thresholds evals/gates/default.json` had refused every release since the evaluation contract moved to v4 (2026-08-23). Its calibration still named contract v3 and a release-contract fingerprint that suite repins had since changed. CI stayed green because every gate test repaired the calibration before using it.
   - **What changed:**

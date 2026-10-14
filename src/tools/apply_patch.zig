@@ -507,8 +507,9 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     //    tool_name 或 file_path 都匹配不到 → 会绕过整套细粒度权限。补救:phase 2 前把每个计划
     //    路径当 Write 语义逐个喂回权限引擎,任一 deny 或 protected → 整批拒(对齐 Linus 要求)。
     //    bypass 模式(用户明确豁免一切门)跳过。批量的单次 tool 审批不覆盖 explicit deny/protected。
+    //    Read the effective mode: a bypass the settings disable is not bypass here either.
     if (ctx.permission_ctx) |pctx| {
-        if (pctx.modeValue() != .bypass) {
+        if (pctx.effectiveMode() != .bypass) {
             const settings_mod = @import("../permission/settings.zig");
             for (plans.items) |pl| {
                 if (settings_mod.isProtectedPath(pl.path)) {
@@ -1039,6 +1040,54 @@ test "execute: protected path(.env)拦住 ApplyPatch(不再绕过细粒度权限
     const kept = try readWhole(a, fpath);
     defer a.free(kept);
     try testing.expectEqualStrings("SECRET=1\n", kept);
+}
+
+test "execute: a bypass the settings disable does not skip the path gate; allowed, it does" {
+    const a = testing.allocator;
+    const permission = @import("../permission.zig");
+    const settings_mod = @import("../permission/settings.zig");
+    const no_rules: []const settings_mod.Rule = &.{};
+    const off_layers = [_]settings_mod.Layer{
+        .{ .source = .managed, .allow = no_rules, .ask = no_rules, .deny = no_rules, .disable_bypass_permissions_mode = true },
+    };
+    const bypass_off = settings_mod.MergedSettings{ .layers = &off_layers, .allocator = a };
+    const plain_layers = [_]settings_mod.Layer{.{ .source = .managed, .allow = no_rules, .ask = no_rules, .deny = no_rules }};
+    const plain = settings_mod.MergedSettings{ .layers = &plain_layers, .allocator = a };
+
+    var pb: [256]u8 = undefined;
+    const fpath = tt.path(&pb, ".env");
+    defer pfs.unlinkPath(fpath.ptr) catch {};
+    const patch_body = try std.fmt.allocPrint(a, "*** Begin Patch\\n*** Update File: {s}\\n@@\\n-SECRET=1\\n+SECRET=2\\n*** End Patch\\n", .{fpath});
+    defer a.free(patch_body);
+    const args = try std.fmt.allocPrint(a, "{{\"patch\":\"{s}\"}}", .{patch_body});
+    defer a.free(args);
+
+    for ([_]struct { settings: *const settings_mod.MergedSettings, gated: bool }{
+        .{ .settings = &bypass_off, .gated = true },
+        .{ .settings = &plain, .gated = false },
+    }) |case| {
+        {
+            const fd = pfs.open(fpath.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+            try testing.expect(fd >= 0);
+            _ = pfs.write(fd, "SECRET=1\n");
+            _ = pfs.close(fd);
+        }
+        // The `bypass` alias is the mode this gate skips for.
+        var pctx = permission.createContext(.bypass, a);
+        pctx.settings = case.settings;
+        var ctx = ToolContext.simple(a);
+        ctx.cwd_abs = "/";
+        ctx.permission_ctx = &pctx;
+        if (case.gated) {
+            try testing.expectError(error.PermissionDenied, execute(&ctx, args));
+        } else {
+            const out = try execute(&ctx, args);
+            a.free(out);
+        }
+        const now = try readWhole(a, fpath);
+        defer a.free(now);
+        try testing.expectEqualStrings(if (case.gated) "SECRET=1\n" else "SECRET=2\n", now);
+    }
 }
 
 test "接线: ApplyPatch 在 registry 且 dispatch 路由到它" {

@@ -12,11 +12,12 @@
 //! 红灯测试是假绿(testing.allocator 无 UAF 页保护,去掉 fix 照样过)。**故收缩到"任何绑定层都必然
 //! 需要"的核心**:创建/移除/关停 + driver 注入 + **abort_fn(优雅关停必须能中断 in-flight run)**。
 //!
-//! **不含(等真消费者 U10-C/D 出现,按其真实需求再加)**:
-//! - **按 id 借用 host 的访问 API**(postMessage/acquire)——绑定层如何路由消息、是否需要跨阻塞调用
-//!   持有 host,取决于 UDS/web attach 的真实形态。**没有 borrow API ⇒ 没有跨线程借用 ⇒ 没有 UAF
-//!   ⇒ 现在不需要 refcount**。这才是零消费者阶段的诚实姿态。
-//! - idle-reap/max-sessions/closing 等治理——有 reaper/accept 循环消费者时再加(设计 §4 已登记 TODO)。
+//! **不含**:按 id 借用 host 的访问 API、refcount、max-sessions、reaper。The consumer
+//! that needed them arrived with #254: the multi-session daemon
+//! (serve_multi.zig) keeps its own table of leased, refcounted session slots
+//! over `SessionHost` and frees a destroyed one only after its last lease. This
+//! registry stays the single-session `serve`'s lifecycle, where nothing else
+//! borrows a host.
 //!
 //! ## 并发/所有权
 //! - SessionHost **堆分配**(*SessionHost 地址稳:其 journal 内含 mutex/condvar 被 driver 线程 + 未来
@@ -32,13 +33,14 @@ const abort = @import("../util/abort.zig");
 const SessionId = @import("../core/session_id.zig").SessionId;
 const EventJournal = @import("../core/event_journal.zig").EventJournal;
 const MsgQueue = @import("../repl/msg_queue.zig").MsgQueue;
+const SubmissionQueue = @import("../web/submission.zig").SubmissionQueue;
 
 /// 一个 session 的运行时宿主单元。堆分配,registry 持 *SessionHost。
 pub const SessionHost = struct {
     id: SessionId,
     allocator: std.mem.Allocator,
     journal: EventJournal,
-    inbox: MsgQueue, // 客户端消息;driver 线程消费(绑定层如何 push 待其定义)
+    inbox: SubmissionQueue, // 客户端消息(text + 可选 model/permission_mode);driver 线程消费
     /// U11:斜杠命令队列(transport 线程只入队,driver 线程独占执行——对齐 web
     /// StateSource.command 的"HTTP 线程绝不碰 App"契约)。
     cmdbox: MsgQueue,
@@ -69,7 +71,7 @@ pub const SessionHost = struct {
             .id = id,
             .allocator = allocator,
             .journal = EventJournal.init(allocator),
-            .inbox = MsgQueue.init(allocator),
+            .inbox = SubmissionQueue.init(allocator),
             .cmdbox = MsgQueue.init(allocator),
             .driver_ctx = driver_ctx,
             .driver_fn = driver_fn,
@@ -96,6 +98,24 @@ pub const SessionHost = struct {
         self.journal.close();
     }
 
+    /// Stop the driver and wait for it, leaving the journal open (#254): the
+    /// multi-session daemon's per-session destroy appends the driver's last
+    /// events and `session_lifecycle.closed` before it closes the journal, so
+    /// an attached client sees the run end and then the session close.
+    /// Bounded by `abort_fn` (it interrupts an in-flight run). Idempotent.
+    pub fn stopDriver(self: *SessionHost) void {
+        self.signalStop();
+        self.join();
+    }
+
+    /// `stopDriver` without the join: interrupt the run and ask the driver to
+    /// exit. Lets a shutdown wind every driver down at once before joining
+    /// them one by one. Idempotent.
+    pub fn signalStop(self: *SessionHost) void {
+        if (self.abort_fn) |f| f(self.driver_ctx, .user_ctrl_c);
+        self.stop_flag.store(true, .seq_cst);
+    }
+
     pub fn stopRequested(self: *const SessionHost) bool {
         return self.stop_flag.load(.seq_cst);
     }
@@ -108,8 +128,10 @@ pub const SessionHost = struct {
     }
 
     /// 全清(锁外调):requestStop(中断 driver + 唤醒附着者)→ join driver(退出后不再碰 journal/inbox)
-    /// → ctx_deinit + deinit journal/inbox + free。**无 borrow API ⇒ 无需等 refcount**:除 driver 线程
-    /// (由 join 收敛)外,没有别的线程持有本 host(绑定层的按 id 借用 API 尚未引入)。
+    /// → ctx_deinit + deinit journal/inbox + free。The caller guarantees that no
+    /// transport thread still points at this host: the single-session `serve`
+    /// stops its transport first; the multi-session daemon calls this only
+    /// once the session's last lease is released (serve_multi.zig, #254).
     pub fn destroy(self: *SessionHost) void {
         self.requestStop();
         self.join();
@@ -222,9 +244,10 @@ const testing = std.testing;
 fn echoDriver(host: *SessionHost, ctx: *anyopaque) void {
     _ = ctx;
     while (!host.stopRequested()) {
-        if (host.inbox.popFront()) |m| {
-            defer host.allocator.free(m);
-            host.journal.append(m);
+        if (host.inbox.popFront()) |popped| {
+            var m = popped;
+            defer m.deinit(host.allocator);
+            host.journal.append(m.text);
         } else {
             time.sleepMs(2);
         }
@@ -269,8 +292,8 @@ test "U10-A: 两 session 各自 journal 独立,消息不串台" {
     try testing.expectEqual(@as(usize, 2), reg.count());
 
     // 测试持有 h1/h2 的直接引用(创建者),直接 push——绑定层的按 id 路由 API 尚未引入(option B)。
-    _ = h1.inbox.push("hello-A");
-    _ = h2.inbox.push("hello-B");
+    _ = h1.inbox.push(.{ .text = "hello-A" });
+    _ = h2.inbox.push(.{ .text = "hello-B" });
 
     var waited: usize = 0;
     while ((h1.journal.count() == 0 or h2.journal.count() == 0) and waited < 500) : (waited += 1) {

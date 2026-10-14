@@ -1581,8 +1581,14 @@ pub const AgentJobRegistry = struct {
         return try out.toOwnedSlice(allocator);
     }
 
-    /// abort 全部 running → join 全部线程 → free。drain 循环覆盖迟注册的嵌套 job。
-    pub fn deinit(self: *AgentJobRegistry) void {
+    /// Stop every job and wait for it: refuse new spawns, abort each job and
+    /// shut down its in-flight provider request (a read blocked on a silent
+    /// provider never checks the flag), join each worker, nested jobs that
+    /// register meanwhile included. Entries stay readable (roster snapshots,
+    /// TaskOutput) until `deinit`. Idempotent; called by the session's owner
+    /// before it can free the registry (#254: a destroyed daemon session
+    /// stops its work at once while its memory waits for the last lease).
+    pub fn stop(self: *AgentJobRegistry) void {
         self.listLock();
         self.closing = true;
         self.listUnlock();
@@ -1608,6 +1614,11 @@ pub const AgentJobRegistry = struct {
             var pending = false;
             for (snapshot) |e| {
                 e.abort.abort(.user_ctrl_c);
+                // The worker withdraws this view under the entry lock before it
+                // frees the provider, so the call never reaches a freed client.
+                e.lock();
+                if (e.cancel_provider) |p| p.cancel(&e.abort);
+                e.unlock();
                 if (e.thread) |t| {
                     t.join();
                     e.thread = null; // 标记已 join
@@ -1617,6 +1628,11 @@ pub const AgentJobRegistry = struct {
             if (own_snapshot) self.allocator.free(snapshot);
             if (!pending) break;
         }
+    }
+
+    /// abort 全部 running → join 全部线程(`stop`)→ free。
+    pub fn deinit(self: *AgentJobRegistry) void {
+        self.stop();
 
         // TaskOutput may still be between lookup and its final snapshot. Its
         // reader reference is independent of the worker join above, so wait
@@ -1724,12 +1740,11 @@ fn jobThreadMain(input: *JobInput) void {
     e.lock();
     e.cancel_provider = input.owned.provider();
     e.unlock();
-    // worker 结束(无论成败)都先撤下 cancel 视图,再由 input.cleanup() deinit owned。
-    defer {
-        e.lock();
-        e.cancel_provider = null;
-        e.unlock();
-    }
+    // worker 结束(无论成败)都先撤下 cancel 视图,再由 input.cleanup() deinit owned:
+    // both exits below clear it under the entry lock, together with the final
+    // status, before `input.cleanup()`. A `defer` here ran after cleanup, so a
+    // `stop`/TaskStop that saw the job finish could cancel through a freed
+    // client in between (the #254 review's full run caught it, twice).
 
     const result = subagent.spawnAgentSink(
         input.allocator,
@@ -1744,6 +1759,7 @@ fn jobThreadMain(input: *JobInput) void {
     ) catch |err| {
         input.finalizeWorktree();
         e.lock();
+        e.cancel_provider = null;
         e.flushPendingOutput();
         e.status = .failed;
         e.err_name = @errorName(err);
@@ -1755,6 +1771,7 @@ fn jobThreadMain(input: *JobInput) void {
 
     input.finalizeWorktree();
     e.lock();
+    e.cancel_provider = null;
     e.final_text = result.final_text; // 偷走所有权;不调 result.deinit()
     e.stop_reason = result.stop_reason;
     e.turns = result.turns;

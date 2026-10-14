@@ -139,6 +139,23 @@ pub const TeammateEntry = struct {
     /// SW3/SW4:本 teammate 当前持有的 KG 任务租约(self-claim 得来)。shutdown/退出时
     /// 逐个 releaseTask,防任务卡到 TTL(7200s)才可被别人重领(PM F4)。mutex 保护。
     claimed_task_ids: std.ArrayList(u64) = .empty,
+    /// The worker's provider while it may be in a request (mutex). `deinit`
+    /// cancels through it: an abort alone does not wake a read blocked on a
+    /// silent provider. The worker withdraws it before freeing the provider.
+    cancel_provider: ?@import("../api/provider.zig").Provider = null,
+
+    /// Shut down the worker's in-flight provider request, if any.
+    fn cancelInFlight(self: *TeammateEntry) void {
+        self.lockPublic();
+        defer self.unlockPublic();
+        if (self.cancel_provider) |p| p.cancel(&self.abort);
+    }
+
+    fn setCancelProvider(self: *TeammateEntry, provider: ?@import("../api/provider.zig").Provider) void {
+        self.lockPublic();
+        defer self.unlockPublic();
+        self.cancel_provider = provider;
+    }
 
     pub fn lockPublic(self: *TeammateEntry) void {
         _ = self.mutex.lock();
@@ -943,6 +960,9 @@ pub const TeammateRegistry = struct {
         self.entries = .empty;
         for (detached.items) |e| e.abort.abort(.user_ctrl_c);
         self.listUnlock();
+        // A worker blocked in a provider read never checks the abort flag:
+        // shut its request down so the join below is bounded (#254).
+        for (detached.items) |e| e.cancelInFlight();
         // join 不持 list 锁(线程退出路径不再注册新 entry,teammate 无嵌套 spawn)。
         for (detached.items) |e| {
             if (e.thread) |t| {
@@ -1415,6 +1435,10 @@ fn teammateThreadMain(input: *TeammateInput) void {
 
     const be = e.backend();
 
+    // From here every exit withdraws this view before `input.cleanup()` frees
+    // the provider (see `TeammateEntry.cancel_provider`).
+    e.setCancelProvider(input.owned.provider());
+
     // The teammate shares DynRegistry but may only execute tools selected into
     // its AgentDef-derived definition snapshot.
     var child_tool_policy = @import("../tools/context.zig").ToolSetExecutionPolicy{
@@ -1488,6 +1512,7 @@ fn teammateThreadMain(input: *TeammateInput) void {
             // 失败必须到达 lead 邮箱(PM F1:静默失败 = roster 里躺着一个与健康 idle
             // 无法区分的尸体;cc 同款发 idleReason:'failed'+failureReason)。
             sendIdleNotification(a, e, "failed", null, @errorName(err));
+            e.setCancelProvider(null);
             input.cleanup();
             return;
         };
@@ -1534,6 +1559,7 @@ fn teammateThreadMain(input: *TeammateInput) void {
     releaseHeldTasks(e, kg_ptr); // 退出前释放持有租约(PM F4/Linus M1:abort/shutdown 不卡 TTL)
     setMemberActiveBestEffort(a, e.config_path, e.name, input.session, e.agent_ident, false);
     e.setStatus(.terminated);
+    e.setCancelProvider(null);
     input.cleanup();
 }
 
