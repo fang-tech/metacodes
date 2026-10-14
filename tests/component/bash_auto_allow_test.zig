@@ -209,11 +209,9 @@ test "L2 Bash auto-allow: the reported bypasses ask in default, acceptEdits and 
         }
     }
     // The restricting and the permissive modes keep their meaning.
-    const plan = cc.permission.createContext(.plan, std.testing.allocator);
     const dont_ask = cc.permission.createContext(.dont_ask, std.testing.allocator);
     const bypass = cc.permission.createContext(.bypass_permissions, std.testing.allocator);
     for (BYPASSES) |command| {
-        try std.testing.expectEqual(Decision.deny, try decide(&plan, command));
         try std.testing.expectEqual(Decision.deny, try decide(&dont_ask, command));
         try std.testing.expectEqual(Decision.allow, try decide(&bypass, command));
     }

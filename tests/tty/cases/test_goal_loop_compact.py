@@ -1,7 +1,8 @@
 """TTY coverage for local goal/loop/compact slash commands.
 
 These cases are intentionally offline: they exercise the user-visible command
-surface and final input-box recovery without sending a model request.
+surface and final input-box recovery. A case that needs a model turn talks to
+the local mock below, never to a real provider.
 """
 
 import http.server
@@ -75,28 +76,38 @@ def test_tty_goal_command_lifecycle(bin_path):
 
 
 def test_tty_loop_requires_goal_then_enables_and_stops(bin_path):
-    raw = run(bin_path, [
-        "sleep:0.8",
-        "type:/loop on 2",
-        "key:enter",
-        "sleep:0.2",
-        "type:/goal set continue tty work",
-        "key:enter",
-        "sleep:0.2",
-        "type:/loop on 2",
-        "key:enter",
-        "sleep:0.2",
-        "type:/loop off",
-        "key:enter",
-        "sleep:0.2",
-        "type:/exit",
-        "key:enter",
-        "sleep:0.3",
-    ], permission="plan")
+    # With an active goal and nothing queued, `/loop on` starts a continuation at
+    # the next REPL turn. This case used to start in plan mode, whose loop gate
+    # kept the continuation from running; with plan mode gone the continuation
+    # talks to the local mock and the case also checks it stops at its limit.
+    server, base_url = _start_mock()
+    try:
+        raw = run(bin_path, [
+            "sleep:0.8",
+            "type:/loop on 2",
+            "key:enter",
+            "sleep:0.2",
+            "type:/goal set continue tty work",
+            "key:enter",
+            "sleep:0.2",
+            "type:/loop on 2",
+            "key:enter",
+            "wait:limit reached:8",
+            "type:/loop off",
+            "key:enter",
+            "sleep:0.2",
+            "type:/exit",
+            "key:enter",
+            "sleep:0.3",
+        ], base_url=base_url)
+    finally:
+        server.shutdown()
     a = TTYAssert(raw)
     a.assert_prose_contains("Set a goal first")
     a.assert_prose_contains("Loop continuation: on (2 remaining)")
     a.assert_prose_contains("Goal status: active")
+    a.assert_prose_contains("[loop continuation: 1 remaining]")
+    a.assert_prose_contains("[loop continuation stopped: limit reached]")
     a.assert_prose_contains("Loop continuation stopped.")
     a.assert_clean_exit()
 

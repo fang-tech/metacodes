@@ -1,8 +1,7 @@
 //! 统一的"后端调用 UI"请求/响应抽象。
 //!
-//! 背景:cc-zig 曾有 3 套各自为政的同步阻塞 UI 回调——AskUserQuestion(ask_question_fn)、
-//! ExitPlanMode 审批(exit_plan_fn)、权限确认(permission/prompt.zig 的 g_dialog_runner)。
-//! 三者本质相同:**agent_loop/工具(主线程)同步阻塞地问 UI 一个问题 → UI 返回一个选择**,
+//! 背景:cc-zig 曾有多套各自为政的同步阻塞 UI 回调——AskUserQuestion(ask_question_fn)、
+//! 权限确认(permission/prompt.zig 的 g_dialog_runner)等。它们本质相同:**agent_loop/工具(主线程)同步阻塞地问 UI 一个问题 → UI 返回一个选择**,
 //! 终端接管骨架逐字节相同。本模块把它们统一成一组 UiRequest/UiResponse + 单一回调。
 //!
 //! 分离架构:UiRequest/UiResponse 是**纯数据 union**(slice/enum,无函数指针),符合
@@ -16,7 +15,6 @@ const util_json = @import("../../util/json.zig");
 pub const AskQuestion = context.AskQuestion;
 pub const AskOption = context.AskOption;
 pub const PermissionChoice = @import("permission_choice.zig").PermissionChoice;
-pub const PlanApproval = context.ToolContext.PlanApproval;
 
 /// UI 请求(backend → 渲染对应对话框,同步阻塞拿用户选择)。
 pub const UiRequest = union(enum) {
@@ -24,14 +22,10 @@ pub const UiRequest = union(enum) {
     ask_question: []const AskQuestion,
     /// 权限确认:工具名 + 参数预览。
     permission: struct { tool: []const u8, args: []const u8 },
-    /// ExitPlanMode 计划审批:展示计划 markdown,三选项。
-    /// kg_step_count>0 时对话框显示"批准后将存为 N 步持久任务图"(PM P0-1:让用户
-    /// 看见计划将入图;0 = KG 不可用或无结构,不显示。批准前 parse,与实际落图同源)。
-    plan_approval: struct { plan_md: []const u8, kg_step_count: usize = 0 },
     /// L2:可扩展信封(动态 UI 北极星)。core 不理解 kind 的语义,只把它**转发**给 backend;
     /// backend(可能是临时起的 web 服务/GUI/客户端)据 kind 渲染对应界面、收集结构化结果。
     /// 例:kind="video_timeline",payload_json=时间线规格(HTML/参数 schema),响应是用户编辑后的
-    /// 剪辑参数 JSON。三个具名变体(ask_question/permission/plan_approval)保留——它们高频且语义
+    /// 剪辑参数 JSON。两个具名变体(ask_question/permission)保留——它们高频且语义
     /// 稳定,具名比 custom 更类型安全;custom 是 escape hatch,不是替代。
     /// 同步终端 backend(TuiBackend)无法渲染任意界面 → 返 error.CustomUiUnsupported(工具兜底)。
     ///
@@ -48,8 +42,6 @@ pub const UiResponse = union(enum) {
     answers: []const []const u8,
     /// 权限选择。
     permission: PermissionChoice,
-    /// 计划审批选择。
-    plan_approval: PlanApproval,
     /// L2:custom 请求的结构化结果 JSON(backend 收集、序列化)。owned by allocator(caller free)。
     /// core/工具不解析其语义,原样回传给发起的工具(工具自己懂 kind 对应的 schema)。
     custom: []const u8,
@@ -112,10 +104,10 @@ test "UiRequest/UiResponse 是纯数据(可 @sizeOf,无 comptime-only)" {
 }
 
 test "UiRequest tag 与 UiResponse 对应" {
-    const req = UiRequest{ .plan_approval = .{ .plan_md = "do x" } };
-    try testing.expect(req == .plan_approval);
-    const resp = UiResponse{ .plan_approval = .reject };
-    try testing.expect(resp == .plan_approval);
+    const req = UiRequest{ .permission = .{ .tool = "Bash", .args = "{}" } };
+    try testing.expect(req == .permission);
+    const resp = UiResponse{ .permission = .deny_once };
+    try testing.expect(resp == .permission);
 }
 
 test "UiRequest.permission 携带工具名+参数" {
@@ -150,7 +142,7 @@ test "UiRequester.request 经接口触达回调" {
         var hits: u32 = 0;
         fn cb(_: *anyopaque, _: SessionId, _: std.mem.Allocator, _: *const UiRequest, out: *UiResponse) anyerror!RequestOutcome {
             hits += 1;
-            out.* = .{ .plan_approval = .reject };
+            out.* = .{ .permission = .deny_once };
             return .answered;
         }
     };

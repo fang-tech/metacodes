@@ -754,8 +754,8 @@ test "pollLeadInbox: plain + idle_notification 消费,协议回执留未读" {
     // A legacy notification without the durable identity is consumed but
     // must not affect the visible roster.
     try mailbox.deliver(a, lead_inbox, "bob", "{\"type\":\"idle_notification\",\"from\":\"bob\",\"idleReason\":\"available\"}", null, null);
-    // plan_approval_response 归 SW4 审批代理消费,pollLeadInbox 留未读(不吞)。
-    try mailbox.deliver(a, lead_inbox, "bob", "{\"type\":\"plan_approval_response\",\"request_id\":\"r1\",\"approve\":true}", null, null);
+    // permission_response 归 SW4 审批代理消费,pollLeadInbox 留未读(不吞)。
+    try mailbox.deliver(a, lead_inbox, "bob", "{\"type\":\"permission_response\",\"request_id\":\"r1\",\"approve\":true}", null, null);
 
     const pulled = (try pollLeadInbox(a, &sw)) orelse return error.NothingPulled;
     defer a.free(pulled);
@@ -766,9 +766,9 @@ test "pollLeadInbox: plain + idle_notification 消费,协议回执留未读" {
     try testing.expect(std.mem.indexOf(u8, pulled, "stopReason=\"&lt;stop&gt;\"") != null);
     try testing.expect(std.mem.indexOf(u8, pulled, "&lt;boom&gt;") != null);
 
-    // plan_approval_response 留未读(SW4 审批代理消费,不被 poll 吞掉)。
+    // permission_response 留未读(SW4 审批代理消费,不被 poll 吞掉)。
     var unread = try mailbox.readUnread(a, lead_inbox);
     defer unread.deinit();
     try testing.expectEqual(@as(usize, 1), unread.items.items.len);
-    try testing.expect(std.mem.indexOf(u8, unread.items.items[0].text, "plan_approval_response") != null);
+    try testing.expect(std.mem.indexOf(u8, unread.items.items[0].text, "permission_response") != null);
 }

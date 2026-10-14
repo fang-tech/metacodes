@@ -197,7 +197,7 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
                 \\  /history         Show recent commands
                 \\  /model [name]    Show or switch the active model
                 \\  /login <id>      Sign in to a provider with OAuth (flags: /login)
-                \\  /mode [name]     Cycle or set permission mode (default|accept-edits|plan|auto|dont-ask|bypass)
+                \\  /mode [name]     Cycle or set permission mode (default|accept-edits|auto|dont-ask|bypass)
                 \\  /effort [level]  Show or set reasoning effort (none|minimal|low|medium|high|xhigh)
                 \\  /resume [id]     List recent sessions, or resume one by id
                 \\  /retry           Resend the last user message
@@ -474,7 +474,7 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
             continue;
         }
         // /mode [name] —— 无参轮换权限模式(同 Shift+Tab);有参命名设置
-        // (default|accept-edits|plan|auto|dont-ask|bypass)。U11 新增:与 web/daemon 同一命令面。
+        // (default|accept-edits|auto|dont-ask|bypass)。U11 新增:与 web/daemon 同一命令面。
         if (std.mem.eql(u8, trimmed, "/mode") or std.mem.startsWith(u8, trimmed, "/mode ")) {
             const rest = std.mem.trim(u8, trimmed[5..], " \t");
             const o = if (rest.len == 0) svc.cyclePermMode() else svc.setPermModeNamed(rest);
@@ -776,7 +776,6 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
             app.permission_ctx.ui_requester = null;
         };
         const usage_before = app.usage;
-        const mode_before = app.permission_ctx.modeValue();
         const started_ns = util_time.nowNs();
         // scoped 自动召回(一等公民 P1):按用户请求自动装配相关记忆到尾部(cache-safe,有命中才注入)。
         const scoped_recall = if (app.kg) |*k| (scoped_recall_mod.build(allocator, k, &app.conversation, &app.abort, .{ .advisor = app.jevAdvisor() }) catch null) else null;
@@ -878,7 +877,7 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
         };
         if (run_control) |control| try control.finishRun(@tagName(result.stop_reason));
         app.clearPendingModelSwitchCompact();
-        accountGoalUsageAfterRun(app, usage_before, mode_before, started_ns);
+        accountGoalUsageAfterRun(app, usage_before, started_ns);
         // 停 watcher + 清 stdin 缓冲（生成期间用户可能误按的键，别污染下一轮）
         if (tui_be) |*tb| tb.stopInput();
         if (gen_region) |*r| r.leaveGenerating(app);
@@ -3503,7 +3502,6 @@ fn shouldRunLoopContinuation(app: *const app_mod.App, queued_count: usize) bool 
         .loop_remaining = app.loop_remaining,
         .queued_count = queued_count,
         .goal_status = goal_status,
-        .permission_mode = app.permission_ctx.modeValue(),
         .aborted = app.abort.isAborted(),
     });
 }
@@ -3530,7 +3528,6 @@ pub const LoopGateInput = struct {
     loop_remaining: u32,
     queued_count: usize,
     goal_status: ?goal_mod.Status,
-    permission_mode: types_mod.PermissionMode,
     aborted: bool,
 };
 
@@ -3539,13 +3536,11 @@ pub fn shouldRunLoopContinuationInput(input_state: LoopGateInput) bool {
     if (input_state.queued_count > 0) return false;
     const status = input_state.goal_status orelse return false;
     if (status != .active) return false;
-    if (input_state.permission_mode == .plan) return false;
     if (input_state.aborted) return false;
     return true;
 }
 
-fn accountGoalUsageAfterRun(app: *app_mod.App, before: usage_mod.UsageTotals, mode_before: types_mod.PermissionMode, started_ns: util_time.Nanos) void {
-    if (mode_before == .plan) return;
+fn accountGoalUsageAfterRun(app: *app_mod.App, before: usage_mod.UsageTotals, started_ns: util_time.Nanos) void {
     if (app.goal_state.current == null) return;
     const delta = goalBudgetTokenDelta(before, app.usage);
     const elapsed_ms = elapsedSinceMs(started_ns);
@@ -4302,7 +4297,6 @@ fn runInjectedAgentWithSynthetic(app: *app_mod.App, allocator: std.mem.Allocator
     // cron/host_services 等字段——注入 run 里模型能力被静默削弱的漂移在此修复);
     // emit_tool_cards 维持本路径既有关闭状态(WriterBackend 文本流,卡片会刷屏)。
     const usage_before = app.usage;
-    const mode_before = app.permission_ctx.modeValue();
     const started_ns = util_time.nowNs();
     var run_opts = session_service.buildRunOptions(app, synthetic_user_input);
     run_opts.emit_tool_cards = false;
@@ -4320,7 +4314,7 @@ fn runInjectedAgentWithSynthetic(app: *app_mod.App, allocator: std.mem.Allocator
         return;
     };
     app.clearPendingModelSwitchCompact();
-    accountGoalUsageAfterRun(app, usage_before, mode_before, started_ns);
+    accountGoalUsageAfterRun(app, usage_before, started_ns);
     app.persistTranscript();
     if (result.stop_reason == .aborted) {
         std.debug.print("\x1b[33m^C (cancelled)\x1b[0m\n", .{});
@@ -4514,13 +4508,12 @@ test "/login parses the CLI's flags and fails closed on an argument it does not 
     try std.testing.expectEqualStrings("--device-cod", typo.unknown);
 }
 
-test "/loop gate: requires active goal, no queued input, non-plan mode, non-aborted run" {
+test "/loop gate: requires active goal, no queued input, non-aborted run" {
     const base = LoopGateInput{
         .loop_enabled = true,
         .loop_remaining = 3,
         .queued_count = 0,
         .goal_status = .active,
-        .permission_mode = .default,
         .aborted = false,
     };
     try std.testing.expect(shouldRunLoopContinuationInput(base));
@@ -4540,10 +4533,6 @@ test "/loop gate: requires active goal, no queued input, non-plan mode, non-abor
     var queued = base;
     queued.queued_count = 1;
     try std.testing.expect(!shouldRunLoopContinuationInput(queued));
-
-    var plan = base;
-    plan.permission_mode = .plan;
-    try std.testing.expect(!shouldRunLoopContinuationInput(plan));
 
     var aborted = base;
     aborted.aborted = true;

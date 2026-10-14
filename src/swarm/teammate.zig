@@ -56,8 +56,6 @@
 //!     兜底(deny/NotATty)。完整代理(teammate→lead 邮箱 permission_request→lead 弹框→回填)
 //!     需模型在环审批语义,best validated with 真模型 e2e(SW7)。当前 teammate 常跑 bypass/继承
 //!     模式,无交互 prompt。
-//!   - **plan 审批(register,SW7)**:teammate 在 plan 模式的 plan_approval_request→lead auto-approve
-//!     同上,归 SW7 真模型验证。
 //!
 //! SW5 边界(数据面 + 资源上限已做,tty 渲染登记 SW7):
 //!   - ✅ **资源上限**:MAX_TEAMMATES(并发 cap)/ output_buf 512K cap / **reapTerminated**(spawn
@@ -1175,7 +1173,7 @@ fn waitForMail(a: std.mem.Allocator, e: *TeammateEntry, kg: ?*@import("../kg/cli
             appendPlainFrom(a, e, &out, &unread, team_mod.TEAM_LEAD_NAME, false, &consumed);
 
             // **只标读真正消费的 plain**(Linus MED-2/PM F4):协议消息(task_assignment/
-            // plan_approval_response…)留在未读,SW3/SW4 的消费者接手;绝不 mark-all 吞掉。
+            // permission_response…)留在未读,SW3/SW4 的消费者接手;绝不 mark-all 吞掉。
             if (consumed.items.len > 0) {
                 mailbox.markReadAt(a, e.inbox_path, consumed.items) catch {};
                 return out.toOwnedSlice(a) catch null;

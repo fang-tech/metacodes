@@ -53,7 +53,6 @@ test "L2 loop: continuation gate rejects non-idle and non-active goal states" {
         .loop_remaining = 2,
         .queued_count = 0,
         .goal_status = .active,
-        .permission_mode = .default,
         .aborted = false,
     };
     try std.testing.expect(cc.repl_loop.shouldRunLoopContinuationInput(base));
@@ -61,10 +60,6 @@ test "L2 loop: continuation gate rejects non-idle and non-active goal states" {
     var queued = base;
     queued.queued_count = 1;
     try std.testing.expect(!cc.repl_loop.shouldRunLoopContinuationInput(queued));
-
-    var plan = base;
-    plan.permission_mode = .plan;
-    try std.testing.expect(!cc.repl_loop.shouldRunLoopContinuationInput(plan));
 
     var paused = base;
     paused.goal_status = .paused;

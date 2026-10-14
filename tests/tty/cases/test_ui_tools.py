@@ -292,52 +292,6 @@ def test_T37_taskcreate_shows_tasktab(bin_path):
         a._fail(f"TaskCreate/Update 后 TaskTab 未显示 activeForm:row={top-1!r} '{tab}'")
 
 
-def test_T38_enterplanmode_updates_footer(bin_path):
-    """EnterPlanMode 工具 → footer 反映 "plan mode on"(回归:config/ctx mode 同步 bug)。"""
-    raw = _run_cassette(
-        [("a", _sse_tool("tu1", "EnterPlanMode", {})),
-         ("b", _sse_text("in plan"))],
-        ["sleep:0.8", "type:plan it", "key:enter", "sleep:2.0"],
-    )
-    a = TTYAssert(raw)
-    foot = None
-    for r in range(a.final.rows):
-        lt = a.final.line_text(r)
-        # CC 风格 footer:"{symbol} {title} on · shift+tab to cycle · …"。
-        if "shift+tab to cycle" in lt:
-            foot = lt
-    # 2026-06-05:footer mode part 改为 cc title 形式 "plan mode on"(原 "plan on")。
-    if foot is None or "plan mode on" not in foot:
-        a._fail(f"EnterPlanMode 后 footer 未显示 'plan mode on':{foot!r}")
-
-
-def test_T39_plan_mode_reflects_during_generation(bin_path):
-    """#11:EnterPlanMode 在生成期触发 → footer 在生成窗口内即反映 plan(非等 turn 结束)。
-
-    cassette:step a 发 EnterPlanMode(tool_use)→ 工具写 permission_ctx.mode=plan;
-    step b 发文本(生成继续)。生成期 drawFooter 读 permission_ctx.mode(live),tickSpinner
-    重画即反映。断言:某个生成期帧的 footer 已含 'plan mode'(修 #11 前只在 turn 结束后才同步)。
-    """
-    raw = _run_cassette(
-        [("a", _sse_tool("tu1", "EnterPlanMode", {})),
-         ("b", _sse_text("now in plan mode generating some text"))],
-        ["sleep:0.8", "type:plan it", "key:enter", "sleep:2.0"],
-    )
-    a = TTYAssert(raw)
-    # 扫所有捕获帧(含生成期),只要有一帧 footer 含 plan mode 即证生成期已联动。
-    found = False
-    for sc in a.frame_screens:
-        for r in range(sc.rows):
-            lt = sc.line_text(r)
-            if "shift+tab to cycle" in lt and "plan mode" in lt:
-                found = True
-                break
-        if found:
-            break
-    if not found:
-        a._fail("生成期无任何帧 footer 反映 plan mode(#11:生成期联动失效)")
-
-
 def test_T40_assistant_markdown_render(bin_path):
     """#22+#23:live 助手文本 markdown 轻度渲染 + 缩进 + 段首 ⏺。
 

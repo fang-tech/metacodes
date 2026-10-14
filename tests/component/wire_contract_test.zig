@@ -104,7 +104,6 @@ const questions = [_]cc.ui_request.AskQuestion{
 };
 const requests = [_]UiRequest{
     .{ .permission = .{ .tool = "Bash", .args = "{\"command\":\"rm -r build\"}" } },
-    .{ .plan_approval = .{ .plan_md = "# Plan\n1. do it", .kg_step_count = 2 } },
     .{ .ask_question = &questions },
     .{ .custom = .{ .kind = "video_timeline", .payload_json = "{\"clips\":[]}" } },
 };

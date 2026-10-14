@@ -26,7 +26,7 @@ from e2e_helpers import (  # noqa: E402
 
 
 def _assert_no_crash(raw, home):
-    """进程 panic 任何阶段都是硬失败,绝不当漂移跳过(对齐 plan_mode e2e)。"""
+    """进程 panic 任何阶段都是硬失败,绝不当漂移跳过。"""
     for m in (b"panic", b"reached unreachable", b"index out of bounds",
               b"integer overflow", b"error return trace"):
         if m in raw:

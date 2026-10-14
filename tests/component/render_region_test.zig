@@ -21,7 +21,7 @@ test "L2 TUI: formatTokens 紧凑格式" {
 test "L2 TUI: modeName 覆盖权限模式" {
     try std.testing.expectEqualStrings("default", cc.tui_status_bar.modeName(.default));
     try std.testing.expectEqualStrings("acceptEdits", cc.tui_status_bar.modeName(.accept_edits));
-    try std.testing.expectEqualStrings("plan", cc.tui_status_bar.modeName(.plan));
+    try std.testing.expectEqualStrings("dontAsk", cc.tui_status_bar.modeName(.dont_ask));
     try std.testing.expectEqualStrings("bypassPermissions", cc.tui_status_bar.modeName(.bypass_permissions));
 }
 

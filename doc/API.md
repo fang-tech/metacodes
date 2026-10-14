@@ -583,7 +583,7 @@ with the schema version `v` (currently 1) and a `type`:
 
 ```text
 {"v":1,"type":"<CoreEvent tag>","data":<payload or null>}
-{"v":1,"type":"ui_request","id":N,"kind":"permission|plan_approval|ask_question|custom","request":{...}}
+{"v":1,"type":"ui_request","id":N,"kind":"permission|ask_question|custom","request":{...}}
 {"v":1,"type":"ui_request_closed","id":N,"outcome":"answered|cancelled|malformed"}
 ```
 

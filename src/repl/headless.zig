@@ -485,7 +485,7 @@ pub fn run(
 
 /// 构造 agent_loop.Options(run + resumeSuspended 共用,消两份字段漂移)。
 /// scoped_recall = 本轮尾注入的召回记忆(fresh run 传;resume 传 null——续跑不重新召回)。
-/// **task#20:headless 挂起 requester**。恒返 .pending → UI 工具(ask_user/plan_mode)返 error.UiPending
+/// **task#20:headless 挂起 requester**。恒返 .pending → UI 工具(ask_user/custom)返 error.UiPending
 /// → agent_loop 挂起(写 suspend.json)。out 不写(响应经 subprocess resume 的 --resume-response 迟来)。
 const ui_request_mod = @import("../core/protocol/ui_request.zig");
 fn pendingRequestFn(
@@ -559,7 +559,6 @@ fn buildOptions(
         .job_wait = .{ .timeout_ms = HEADLESS_JOB_WAIT_TIMEOUT_MS },
         .agent_jobs = if (app.agent_jobs) |*aj| aj else null,
         .swarm = &app.swarm, // SW7:headless 也接 swarm
-        .plan_prev_mode = &app.plan_prev_mode,
         .tasks = &app.tasks,
         .kg = if (app.kg) |*k| k else null,
         .jev = app.jevAdvisor(),
@@ -600,7 +599,7 @@ fn buildOptions(
 /// 重写(resume 可链式)。**这是把此前只有 write 侧的挂起机制补成完整闭环**(read 侧原零调用者)。
 ///
 /// 前置:app 已用与挂起时**同一 session_id** init(transcript 目录一致);response_json 是挂起工具
-/// (AskUserQuestion/ExitPlanMode/custom)的迟来结果(工具结果 JSON,直接作 tool_result content)。
+/// (AskUserQuestion/custom)的迟来结果(工具结果 JSON,直接作 tool_result content)。
 pub fn resumeSuspended(
     app: *app_mod.App,
     allocator: std.mem.Allocator,
@@ -774,7 +773,7 @@ test "headless tool policy intersects exact CLI denies with its parent" {
         }
     };
     var policy = HeadlessToolPolicy{
-        .disallowed_rules = " EnterPlanMode, Bash(git push *), Agent ",
+        .disallowed_rules = " TeamCreate, Bash(git push *), Agent ",
         .parent = .{
             .ctx = @ptrCast(&Parent.sentinel),
             .allowsToolFn = Parent.allowsTool,
@@ -782,7 +781,7 @@ test "headless tool policy intersects exact CLI denies with its parent" {
         },
     };
     const execution = policy.executionPolicy();
-    try std.testing.expect(!execution.allowsTool("EnterPlanMode"));
+    try std.testing.expect(!execution.allowsTool("TeamCreate"));
     try std.testing.expect(!execution.allowsInvocation("Agent", "{}"));
     try std.testing.expect(!execution.allowsTool("Write"));
     try std.testing.expect(execution.allowsTool("Bash"));

@@ -19,7 +19,7 @@ pub fn getToolCategory(tool_name: []const u8) ToolCategory {
     {
         return .write;
     }
-    // KgRemember 是持久写(跨会话 store);plan 模式(只读探索)不该静默放行(M5)。
+    // KgRemember 是持久写(跨会话 store);按 read 分类会被 auto 等模式静默放行(M5)。
     // KgRecall/KgContext 是只读检索/遍历 → read。
     if (std.mem.eql(u8, tool_name, "KgRemember")) return .write;
     if (std.mem.eql(u8, tool_name, "Bash")) return .execute;

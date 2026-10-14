@@ -400,8 +400,8 @@ pub const ToolContext = struct {
     /// The run's user request, for System-One judgments that need more than a
     /// tool argument (KgRecall evidence). Empty when unknown or no advisor.
     jev_request: []const u8 = "",
-    /// KG per-project 指针目录(`{home}/.metacodes/projects/<git根hash>`)。plan 落图写 kg_root
-    /// 到此。空串 = 未配置。设计 KG_DESIGN v3-final §3。
+    /// KG per-project 指针目录(`{home}/.metacodes/projects/<git根hash>`)。任务锚指针
+    /// (kg_task_anchor)写到此;旧会话的 kg_root 指针仍从此读回。空串 = 未配置。
     kg_projects_dir: []const u8 = "",
     /// AutoMem memdir 绝对路径(B/C 合并:Write/Edit 落盘 memdir markdown 自动入图用)。
     /// 空串=禁用。
@@ -434,10 +434,8 @@ pub const ToolContext = struct {
     jobs: ?*JobRegistry = null,
     /// 后台 subagent 作业注册表：Task(run_in_background) + TaskOutput + TaskStop(agent_ id) 用
     agent_jobs: ?*AgentJobRegistry = null,
-    /// 权限上下文：EnterPlanMode/ExitPlanMode 需要写 mode
+    /// 权限上下文(子执行据此派生 scoped ctx;工具读 mode / no_interactive_prompt)。
     permission_ctx: ?*PermissionContext = null,
-    /// 进入 plan 模式前的原 mode；ExitPlanMode 时恢复
-    plan_prev_mode: ?*?@import("../types.zig").PermissionMode = null,
     /// Task 清单：TaskCreate/Get/List/Update/Stop 共享的 scratchpad
     tasks: ?*TaskStore = null,
     /// 用于 Agent 工具 spawn 子 agent：共享 API client + tool defs + permission ctx
@@ -522,11 +520,6 @@ pub const ToolContext = struct {
     /// only so that sub executions (Agent / Skill / TaskBatch) inherit the
     /// parent's journal — a subagent's edits are still this Run's edits.
     file_change_journal: ?*@import("../core/file_change.zig").Journal = null,
-    /// 当前 session plan 文件全路径(ExitPlanMode 模型未传 plan 时从此读回兜底)。空=无。
-    plan_file_path: []const u8 = "",
-    /// 末轮助手消息里提取的 `<proposed_plan>` 内容(agent_loop 在 plan 模式末轮填;
-    /// ExitPlanMode 优先读它作为计划来源)。空=本轮无 proposed_plan。借用 conversation 内存。
-    last_proposed_plan: []const u8 = "",
     /// Subagent 定义集合(Task 工具据此找 subagent_type → AgentDef)。
     agents: ?*const @import("../agents/set.zig").AgentSet = null,
     /// 父 model(供 subagent model 字段 `inherit` 解析)。
@@ -599,10 +592,10 @@ pub const ToolContext = struct {
     /// 比 progress_fn 简单:只报 (elapsed_ms, argv0),不分 phase——是 Bash spawn 的轻量 ticker。
     spawn_tick_fn: ?*const fn (elapsed_ms: u64, argv0: []const u8) void = null,
 
-    /// 统一 UI 请求回调(替代旧 ask_question_fn / exit_plan_fn / 权限 dialog_runner 三套)。
+    /// 统一 UI 请求回调(替代旧 ask_question_fn / 权限 dialog_runner 等多套)。
     /// 工具(主线程)构造一个 UiRequest 交给 TUI backend,backend 停 watcher + 持渲染锁 +
     /// 独占 fd0 渲染对应对话框,把用户选择写回 out。state 指向 *TuiBackend(经 trampoline)。
-    /// null = 无 TUI(headless/单测/子 agent)→ 各工具按语义兜底(ask→NotATty;plan→answer_queue/reject)。
+    /// null = 无 TUI(headless/单测/子 agent)→ 各工具按语义兜底(ask→NotATty)。
     /// req/out 借用(回调同步消费);ask_question 的 answers slice owned by allocator(caller free)。见 UiRequester。
     ui_requester: ?@import("../core/protocol/ui_request.zig").UiRequester = null,
     /// 本 ToolContext 归属的会话(UiRequest 路由到对应 session 视图)。默认 .single(N=1)。
@@ -611,11 +604,6 @@ pub const ToolContext = struct {
     /// SessionContext 后两者都从 SessionContext.id 取,本字段消失。
     session: @import("../core/session_id.zig").SessionId = @import("../core/session_id.zig").SessionId.single,
 
-    /// ExitPlanMode 审批结果(对齐 cc 三选项)。
-    /// - approve_default:批准 → 恢复进 plan 前的原模式(通常 default),模型继续执行。
-    /// - approve_accept_edits:批准并自动接受编辑 → 切 accept_edits。
-    /// - reject:留在 plan 模式,模型继续打磨计划(不执行)。
-    pub const PlanApproval = enum { approve_default, approve_accept_edits, reject };
     /// 工具进度阶段(对齐 cc WebSearchProgress 两态)。
     pub const ProgressPhase = enum { query_update, results_received };
 
@@ -655,7 +643,7 @@ pub const ToolContext = struct {
     }
 
     /// 发一个统一 UI 请求(同步阻塞)。有回调 + state → 调它写 out 返回 true;否则返回 false
-    /// (调用方按语义兜底:ask→NotATty;plan→answer_queue/reject)。req/out 调用方栈上提供。
+    /// (调用方按语义兜底:ask→NotATty)。req/out 调用方栈上提供。
     /// 返回 RequestOutcome:answered=out 已写;pending=异步前端挂起(工具应返 error.UiPending);
     /// unavailable=无 requester(工具按语义兜底)。
     pub fn requestUi(

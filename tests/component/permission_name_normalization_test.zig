@@ -2,8 +2,8 @@
 //! 将被执行的真名**。
 //!
 //! 缺陷形态:CLI 真实 run 无 tool_dispatcher;弱模型发小写 "bash" → 旧分类按原始名
-//! 走 unknown→.read 兜底 → plan 模式 allow;随后 executeOne 的 P0.6 归一化把
-//! "bash"→"Bash" **真执行**——分类与执行看的不是同一个名字,plan(只读探索)被穿透。
+//! 走 unknown→.read 兜底 → 免询问 allow;随后 executeOne 的 P0.6 归一化把
+//! "bash"→"Bash" **真执行**——分类与执行看的不是同一个名字,询问/拒绝门被穿透。
 //! 修复:分类/规则匹配前用同一把 resolveToolNameExact 归一化;真未知名保持遗留
 //! read 兜底 + dispatch UnknownTool。
 //!
@@ -18,6 +18,17 @@ const LOWERCASE_BASH_SSE =
     "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_lc\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n" ++
     "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"tu_lc\",\"name\":\"bash\",\"input\":{}}}\n\n" ++
     "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"command\\\":\\\"echo PLAN_ESCAPE_MARKER\\\"}\"}}\n\n" ++
+    "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n" ++
+    "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":1}}\n\n" ++
+    "data: {\"type\":\"message_stop\"}\n\n";
+
+/// 同上,但命令**不是**只读(`sh -c` 不在只读语法里):修复后它在 default 模式落 ask →
+/// 无 UI fail-closed deny;若分类仍按原始名 "bash" 走 read 兜底,则免询问 allow 并真执行。
+/// (`echo` 本身是只读命令,default 下按真名 Bash 也会免询问放行,不能用来判别。)
+const LOWERCASE_MUTATING_BASH_SSE =
+    "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_lcm\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n" ++
+    "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"tu_lcm\",\"name\":\"bash\",\"input\":{}}}\n\n" ++
+    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"command\\\":\\\"sh -c 'echo PLAN_ESCAPE_MARKER'\\\"}\"}}\n\n" ++
     "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n" ++
     "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":1}}\n\n" ++
     "data: {\"type\":\"message_stop\"}\n\n";
@@ -60,7 +71,7 @@ const ToolResultCapture = struct {
 
 fn runLowercaseBash(mode: cc.types_mod.PermissionMode) !struct { content: []u8, allocator: std.mem.Allocator } {
     const a = std.testing.allocator;
-    const responses = [_][]const u8{ LOWERCASE_BASH_SSE, FINAL_SSE };
+    const responses = [_][]const u8{ LOWERCASE_MUTATING_BASH_SSE, FINAL_SSE };
     var server = try harness.MockServer.startCassette(&responses, 0);
     defer server.stop();
     const url = try server.urlOwned(a);
@@ -95,16 +106,16 @@ fn runLowercaseBash(mode: cc.types_mod.PermissionMode) !struct { content: []u8, 
     return .{ .content = content, .allocator = a };
 }
 
-test "L2 D1回归: 遗留分支小写 bash 在 plan 模式被 deny(不再经 read 兜底穿透执行)" {
-    var run = try runLowercaseBash(.plan);
+test "L2 D1回归: 遗留分支小写 bash 的写命令在 default 模式不免询问(不再经 read 兜底穿透执行)" {
+    var run = try runLowercaseBash(.default);
     defer run.allocator.free(run.content);
-    // 分类看归一化真名 Bash → .execute → plan deny。旧缺陷:按 "bash" 归 .read →
-    // allow → P0.6 归一化后真执行(tool_result 会含 echo 的 PLAN_ESCAPE_MARKER)。
+    // 分类看归一化真名 Bash → 非只读 → .execute → ask → 无 UI deny。旧缺陷:按 "bash" 归
+    // .read → allow → P0.6 归一化后真执行(tool_result 会含 echo 的 PLAN_ESCAPE_MARKER)。
     try std.testing.expect(std.mem.indexOf(u8, run.content, "permission_denied") != null);
     try std.testing.expect(std.mem.indexOf(u8, run.content, "PLAN_ESCAPE_MARKER") == null);
 }
 
-test "L2 D1回归: 真未知名(typo)保持遗留 read 兜底 → plan 下仍 UnknownTool 引导" {
+test "L2 D1回归: 真未知名(typo)保持遗留 read 兜底 → 仍 UnknownTool 引导" {
     // 归一化解析不中的名字不改行为:分类仍 read 兜底,dispatch UnknownTool 供模型自纠。
     const a = std.testing.allocator;
     const TYPO_SSE =
@@ -126,7 +137,7 @@ test "L2 D1回归: 真未知名(typo)保持遗留 read 兜底 → plan 下仍 Un
     var conversation = cc.conversation.Conversation.init(a);
     defer conversation.deinit();
     try conversation.appendText(.user, "call the typo tool");
-    var permission = cc.permission.createContext(.plan, a);
+    var permission = cc.permission.createContext(.default, a);
     permission.no_interactive_prompt = true;
     var capture = ToolResultCapture{ .allocator = a };
     errdefer capture.deinit();

@@ -107,12 +107,12 @@ pub const Config = struct {
     /// 用途:subprocess resume——B 进程用挂起 session 的 id 复用其 transcript 目录 + suspend.json。
     /// null = gen 新 id。非 24-char 回退 gen。
     session_id: ?[]const u8 = null,
-    /// **task#20:`--suspendable`**:headless 遇 UI 工具(AskUserQuestion/ExitPlanMode)时**挂起**
+    /// **task#20:`--suspendable`**:headless 遇 UI 工具(AskUserQuestion/custom)时**挂起**
     /// (写 suspend.json 退出)而非 NotATty 报错。装一个恒返 .pending 的 requester。默认 false(保持旧
     /// headless 语义:无 requester → NotATty)。用于 subprocess suspend/resume 闭环(外部工具据 suspend.json 应答)。
     suspendable: bool = false,
     /// **U8:`--resume-response <json|@file>`**:恢复一个挂起(suspend.json)的 session。
-    /// 值 = 挂起工具(AskUserQuestion/ExitPlanMode/custom)的迟来结果 JSON(`@path` 从文件读)。
+    /// 值 = 挂起工具(AskUserQuestion/custom)的迟来结果 JSON(`@path` 从文件读)。
     /// 走 headless.resumeSuspended(read suspend.json→resumeRun→清/重写)。需同 session_id
     /// (--session / 持久化 transcript 目录一致)。null = 不启用。
     resume_response: ?[]const u8 = null,
@@ -343,12 +343,10 @@ pub const ReasoningEffort = enum {
     }
 };
 
-/// 权限模式
-/// 权限模式(对齐 Claude Code 6 模式 + 历史别名)。
+/// 权限模式(Claude Code 的 5 个执行模式 + 历史别名;不含 plan 模式)。
 ///
 /// - default      :仅只读工具免询问(对齐官方;旧 cc-zig 的 `prompt` 等价)
 /// - accept_edits :读 + 文件编辑 + fs 命令(mkdir/touch/mv/cp/rm/rmdir/sed) 免询问(限工作目录)
-/// - plan         :读 + 只读 bash 免询问;写/执行 deny
 /// - auto         :全部尝试 ALLOW + 后台分类器(短期用 risk-level 近似)
 /// - dont_ask     :只放行 permissions.allow 预批准的;其它全 deny
 /// - bypass_permissions :跳过所有 prompt;rm -rf / 仍 prompt 作为电路断路器
@@ -356,18 +354,20 @@ pub const ReasoningEffort = enum {
 /// 兼容别名:
 ///   prompt → default
 ///   bypass → bypass_permissions
+///
+/// 数值显式钉住:2 曾是已移除的 `plan`,留空不复用,任何仍按整数存放模式的地方
+/// (AgentCore 检查点字节、测试里的"非法字节")都不会因删除而错位。
 pub const PermissionMode = enum(u8) {
-    default,
-    accept_edits,
-    plan,
-    auto,
-    dont_ask,
-    bypass_permissions,
+    default = 0,
+    accept_edits = 1,
+    auto = 3,
+    dont_ask = 4,
+    bypass_permissions = 5,
     // ---- 历史别名(已弃用,仍接受) ----
     /// @deprecated 用 default
-    prompt,
+    prompt = 6,
     /// @deprecated 用 bypass_permissions
-    bypass,
+    bypass = 7,
 };
 
 /// 消息角色

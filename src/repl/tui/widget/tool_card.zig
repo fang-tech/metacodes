@@ -57,7 +57,6 @@ pub const ResultRenderMode = enum { hidden, summary };
 pub fn resultRenderMode(tool_name: []const u8) ResultRenderMode {
     // opt-out(故意 hidden):
     // - Task 族:状态在 Task 面板反馈,不刷消息流。
-    // - plan mode:模式切换,无输出。
     // - AskUserQuestion:走专门的交互 UI(选项菜单),非工具卡片。
     // - Skill:结果(rendered body)内联进对话文本,本身就是可见内容,无需卡片。
     // Task 写操作(建/改/闭)→ **可见一行确认**(用户对任务建/闭合有感;cc 的 TodoWrite 也
@@ -67,7 +66,6 @@ pub fn resultRenderMode(tool_name: []const u8) ResultRenderMode {
         std.mem.eql(u8, tool_name, "TaskUpdate") or
         std.mem.eql(u8, tool_name, "TaskStop")) return .summary;
     if (std.mem.startsWith(u8, tool_name, "Task")) return .hidden;
-    if (std.mem.eql(u8, tool_name, "EnterPlanMode") or std.mem.eql(u8, tool_name, "ExitPlanMode")) return .hidden;
     if (std.mem.eql(u8, tool_name, "AskUserQuestion")) return .hidden;
     if (std.mem.eql(u8, tool_name, "Skill")) return .hidden;
     // 有专用 summary 渲染器的工具(renderResultBody 分发到 diff/搜索/Read/WebFetch 渲染器)。
@@ -89,12 +87,11 @@ pub fn resultRenderMode(tool_name: []const u8) ResultRenderMode {
 /// 是否在工具开始时渲染起始卡(⏺ <tool>)。与 resultRenderMode(它管*结果体*显示)分离。
 ///
 /// Task/Agent:起始卡可见(用户必须看到 subagent 被启动),但结果体仍 hidden
-/// (状态在 Task 面板反馈)。AskUserQuestion/plan-mode/Skill:无起始卡(走专门 UI)。
+/// (状态在 Task 面板反馈)。AskUserQuestion/Skill:无起始卡(走专门 UI)。
 /// 历史 bug:agent_loop 旧逻辑直接用 resultRenderMode==hidden 跳过起始卡 → Task 被调用时
 /// TUI 完全无感(用户看不到 subagent 启动)。本函数把"是否打起始卡"独立出来修复之。
 pub fn showStartCard(tool_name: []const u8) bool {
     if (std.mem.eql(u8, tool_name, "AskUserQuestion")) return false;
-    if (std.mem.eql(u8, tool_name, "EnterPlanMode") or std.mem.eql(u8, tool_name, "ExitPlanMode")) return false;
     if (std.mem.eql(u8, tool_name, "Skill")) return false;
     // Task/Agent:起始卡可见(精确匹配,避免 TaskCreate/TaskUpdate 等子工具噪声)。
     if (std.mem.eql(u8, tool_name, "Task") or std.mem.eql(u8, tool_name, "Agent")) return true;
@@ -2008,8 +2005,6 @@ test "resultRenderMode: 故意 hidden vs 应显示" {
     try testing.expectEqual(ResultRenderMode.summary, resultRenderMode("TaskCreate"));
     try testing.expectEqual(ResultRenderMode.summary, resultRenderMode("TaskUpdate"));
     try testing.expectEqual(ResultRenderMode.summary, resultRenderMode("TaskStop"));
-    try testing.expectEqual(ResultRenderMode.hidden, resultRenderMode("EnterPlanMode"));
-    try testing.expectEqual(ResultRenderMode.hidden, resultRenderMode("ExitPlanMode"));
     try testing.expectEqual(ResultRenderMode.hidden, resultRenderMode("AskUserQuestion"));
     try testing.expectEqual(ResultRenderMode.hidden, resultRenderMode("Skill"));
     // 完全未知的工具 hidden(绝不裸吐 JSON)。
@@ -2080,8 +2075,6 @@ test "showStartCard: Task/Agent 起始卡可见但结果仍 hidden(#8)" {
     try testing.expectEqual(ResultRenderMode.hidden, resultRenderMode("Task"));
     // 走专门 UI 的工具:不打起始卡。
     try testing.expect(!showStartCard("AskUserQuestion"));
-    try testing.expect(!showStartCard("EnterPlanMode"));
-    try testing.expect(!showStartCard("ExitPlanMode"));
     try testing.expect(!showStartCard("Skill"));
     // 普通可见工具:打起始卡(沿用 resultRenderMode != hidden)。
     try testing.expect(showStartCard("Bash"));

@@ -1660,7 +1660,7 @@ fn modeByte(mode: core.types.PermissionMode) ?u8 {
     return switch (mode) {
         .default => 0,
         .accept_edits => 1,
-        .plan => 2,
+        // 2 was `plan`; the byte stays reserved and decodes as corrupt.
         .auto => 3,
         .dont_ask => 4,
         .bypass_permissions => 5,
@@ -1672,7 +1672,6 @@ fn modeFromByte(raw: u8) ?core.types.PermissionMode {
     const mode: core.types.PermissionMode = switch (raw) {
         0 => .default,
         1 => .accept_edits,
-        2 => .plan,
         3 => .auto,
         4 => .dont_ask,
         5 => .bypass_permissions,

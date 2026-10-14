@@ -1675,9 +1675,8 @@ ABI v1 UI response JSON is one of:
 ```
 
 Permission also accepts `allow_session`, `deny_once`, and
-`deny_session`. ABI v1 does not expose plan mode or plan approval because
-AgentSession does not own the complete `EnterPlanMode`/`ExitPlanMode`
-lifecycle. KG counts and Workbench plan-progress state are likewise not part
+`deny_session`. The kernel has no plan mode and no plan-approval request, so
+ABI v1 has neither. KG counts and Workbench plan-progress state are likewise not part
 of this protocol. There is no unversioned `custom` escape hatch. Host tool
 input schemas use the AgentCore object-schema subset: `type`, `properties`,
 and `required`.
