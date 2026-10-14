@@ -77,12 +77,12 @@
     {
       "declaration": "AgentDef.permission_mode",
       "test_file": "tests/component/subagent_agentdef_fields_test.zig",
-      "test_name": "L2 AgentDef.permission_mode=plan: Task 注入真实子请求 Plan Mode",
+      "test_name": "L2 AgentDef.permission_mode=dontAsk: 子 run 按自己的模式拒写,不继承父 bypass",
       "feedback_step": "test:agentdef-fields",
       "assertion_markers": [
-        "permissionMode: plan",
-        "# Plan Mode (active)",
-        "<proposed_plan>"
+        "permissionMode: dontAsk",
+        "inherited.created",
+        "permission_denied"
       ]
     },
     {

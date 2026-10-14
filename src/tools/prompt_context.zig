@@ -9,7 +9,7 @@ const std = @import("std");
 const PermissionMode = @import("../types.zig").PermissionMode;
 
 pub const PromptContext = struct {
-    /// 当前权限模式(plan/auto/...)。预留:未来可让描述按权限收紧措辞。
+    /// 当前权限模式(auto/dont_ask/...)。预留:未来可让描述按权限收紧措辞。
     permission_mode: PermissionMode = .default,
     /// 当前启用的工具名集合。描述里引用其它工具(如 Grep 提"多轮搜索用 Agent")时,
     /// 据此判断该工具是否存在——不存在则省略那句(对齐 TS embedded 分支)。

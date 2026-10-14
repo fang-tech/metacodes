@@ -350,8 +350,8 @@ pub const App = struct {
     //
     // ── SessionContext 区(每会话独立可变;就是"一个 App = 一个 session"的本体)────
     // conversation / read_state / edit_hl_cache / jobs / agent_jobs / tasks / cron_registry /
-    // mcp_sessions / worktree_stack / abort / permission_ctx / session_rules / plan_prev_mode /
-    // plan_file_path / usage / transcript_writer / activated_tools / active_skill /
+    // mcp_sessions / worktree_stack / abort / permission_ctx / session_rules /
+    // usage / transcript_writer / activated_tools / active_skill /
     // cwd_abs / project_dir / system_prompt。
     // 这些是会话状态,每 App 实例独立 = 天然 per-session 隔离。
     // **注:此分区是注释级"地图"(未来真拆分的指引),非编译器 enforced 边界——
@@ -461,12 +461,6 @@ pub const App = struct {
     /// Swarm 会话状态（teams/teammates）。lead(主 App)持有;TeamCreate 时惰性建 teammates
     /// registry。teammate 不 spawn teammate → subagent 侧不挂 swarm。
     swarm: @import("swarm/context.zig").SwarmContext = undefined,
-    /// 进入 plan 模式前的原 mode；ExitPlanMode 用它恢复
-    plan_prev_mode: ?types.PermissionMode = null,
-    /// 当前 session 的 plan 文件全路径(`{home}/.metacodes/plans/{slug}.md`,owned)。
-    /// init 时算一次,挂到 permission_ctx.plan_file_path(plan 模式特许写)+ ToolContext。
-    /// 空串 = home 缺失,plan 文件机制降级(模型把计划写对话文本)。
-    plan_file_path: []u8 = &.{},
     /// 本 session 的 memdir 绝对路径(通道 B 自动记忆;`{home}/.metacodes/projects/<hash>/memory`,
     /// owned)。init 时算一次,挂 permission_ctx.memdir_abs(写豁免)。空串=禁用/无 home。
     memdir_abs: []u8 = &.{},
@@ -854,10 +848,6 @@ pub const App = struct {
             @import("util/log.zig").warn("transcript", "init failed: {s} (session will not persist)", .{@errorName(err)});
         };
 
-        // 计算本 session 的 plan 文件路径(plan 模式下模型把计划写这里;唯一可写)。
-        // slug seed 优先用 transcript session id(每 session 稳定),否则时间兜底。
-        app.initPlanFilePath();
-
         // 计算本 session 的 memdir 路径(通道 B 自动记忆)+ mkdir + 挂权限豁免。
         app.initMemdir();
 
@@ -1107,7 +1097,6 @@ pub const App = struct {
             app.activated_tools.deinit();
         }
         if (app.project_dir) |p| app.allocator.free(p);
-        if (app.plan_file_path.len > 0) app.allocator.free(app.plan_file_path);
         if (app.memdir_abs.len > 0) app.allocator.free(app.memdir_abs);
         app.agents.deinit();
         if (app.plugin_snapshot) |snapshot| snapshot.destroy();
@@ -1951,9 +1940,6 @@ pub const App = struct {
         if (std.mem.eql(u8, app.session_id.asSlice(), session.asSlice())) return;
         if (app.transcript_writer) |*w| w.deinit();
         app.transcript_writer = null;
-        if (app.plan_file_path.len > 0) app.allocator.free(app.plan_file_path);
-        app.plan_file_path = &.{};
-        app.permission_ctx.plan_file_path = "";
         app.session_id = session;
         app.permission_ctx.session = session;
         app.swarm.session = session;
@@ -1961,7 +1947,6 @@ pub const App = struct {
             @import("util/log.zig").warn("transcript", "adopt session writer failed: {s}", .{@errorName(err)});
             return err;
         };
-        app.initPlanFilePath();
     }
 
     fn initTranscriptWriter(app: *App) !void {
@@ -2004,31 +1989,6 @@ pub const App = struct {
     pub fn sessionDir(app: *App) ?[]const u8 {
         if (app.transcript_writer) |*w| return w.dir;
         return null;
-    }
-
-    /// 计算本 session 的 plan 文件路径 + mkdir。seed 优先用 transcript session id(每 session
-    /// 稳定),否则时间兜底。失败仅降级(plan_file_path 留空,plan 模式靠对话文本)。
-    fn initPlanFilePath(app: *App) void {
-        const plan_file = @import("core/plan_file.zig");
-        const state_dir = app.stateRoot();
-        if (state_dir.len == 0) return;
-        // seed:session id(transcript dir basename)哈希;无 transcript → 时间。
-        const seed: u64 = blk: {
-            if (app.transcript_writer) |*w| {
-                const base = std.fs.path.basename(w.dir);
-                if (base.len > 0) break :blk std.hash.Wyhash.hash(0, base);
-            }
-            break :blk @as(u64, @bitCast(@import("util/time.zig").nowMs()));
-        };
-        var slug_buf: [64]u8 = undefined;
-        const slug = plan_file.slugFromSeed(seed, &slug_buf);
-        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-        const path = plan_file.planFilePath(state_dir, slug, &path_buf);
-        if (path.len == 0) return;
-        plan_file.ensureDir(state_dir) catch {}; // mkdir 失败不致命:写盘时模型会拿到错误
-        app.plan_file_path = app.allocator.dupe(u8, path) catch return;
-        // 挂到 permission_ctx,plan 模式下 decision 据此特许写 plan 文件。
-        app.permission_ctx.plan_file_path = app.plan_file_path;
     }
 
     /// 计算本 session 的 memdir 绝对路径(通道 B)+ mkdir + 挂权限豁免。
@@ -2554,14 +2514,13 @@ pub const App = struct {
         return std.fmt.allocPrint(app.allocator, "{s}-{s}", .{ safe_base, anchor_hash[0..8] });
     }
 
-    /// Shift+Tab 的纯状态机:当前 mode → 下一个 mode(对齐 Claude Code)。
-    /// 循环档(default/acceptEdits/plan)三者轮转;非循环档(bypass/auto/dont_ask)→ default。
+    /// Shift+Tab 的纯状态机:当前 mode → 下一个 mode。
+    /// 循环档(default/acceptEdits)两者轮转;非循环档(bypass/auto/dont_ask)→ default。
     /// 抽成纯函数让状态机可纯单测(不构造 App),cyclePermMode 只做副作用接线。
     pub fn nextPermMode(mode: types.PermissionMode) types.PermissionMode {
         return switch (mode) {
             .default, .prompt => .accept_edits,
-            .accept_edits => .plan,
-            .plan => .default,
+            .accept_edits => .default,
             .auto, .dont_ask, .bypass_permissions, .bypass => .default,
         };
     }
@@ -2575,23 +2534,15 @@ pub const App = struct {
         return app.permission_ctx.modeValue();
     }
 
-    /// 设置权限模式 + 维护 plan_prev_mode 簿记:进 plan 记 from(ExitPlanMode approve 据此
-    /// 恢复真实前态),离开 plan 清。Shift+Tab 轮换与 `/mode` 命名设置(U11)**必须共用此路**
-    /// ——命名路径若直写 setMode 会漏簿记,stale prev 可让 plan approve 恢复到更宽的历史模式
-    /// (如 bypass)。**只写 permission_ctx.mode(单一源,U2 S2)**;读方走 permMode()。
-    pub fn setPermModeTracked(app: *App, to: types.PermissionMode) void {
-        const from = app.permMode();
-        if (to == .plan and from != .plan) {
-            app.plan_prev_mode = from;
-        } else if (from == .plan and to != .plan) {
-            app.plan_prev_mode = null;
-        }
+    /// 设置权限模式。Shift+Tab 轮换与 `/mode` 命名设置(U11)共用此路。
+    /// **只写 permission_ctx.mode(单一源,U2 S2)**;读方走 permMode()。
+    pub fn setPermMode(app: *App, to: types.PermissionMode) void {
         app.permission_ctx.setMode(to);
     }
 
-    /// Shift+Tab:循环权限模式 default → acceptEdits → plan → default(对齐 Claude Code)。
+    /// Shift+Tab:循环权限模式 default → acceptEdits → default。
     pub fn cyclePermMode(app: *App) void {
-        app.setPermModeTracked(nextPermMode(app.permMode()));
+        app.setPermMode(nextPermMode(app.permMode()));
     }
 
     /// 设置 TUI 主题(变体 → 派生 theme → 持久化 <state root>/config.json)。U2 S1:抽出
@@ -3391,12 +3342,11 @@ test "App init/deinit" {
     _ = App;
 }
 
-test "nextPermMode: Shift+Tab 循环状态机(对齐 cc)" {
-    // 循环档三者轮转:default → acceptEdits → plan → default。
+test "nextPermMode: Shift+Tab 循环状态机" {
+    // 循环档两者轮转:default → acceptEdits → default(plan 模式已移除)。
     // 此前只有慢 PTY(test_mode_commit T08)覆盖;下沉成纯单测。
     try std.testing.expectEqual(types.PermissionMode.accept_edits, App.nextPermMode(.default));
-    try std.testing.expectEqual(types.PermissionMode.plan, App.nextPermMode(.accept_edits));
-    try std.testing.expectEqual(types.PermissionMode.default, App.nextPermMode(.plan));
+    try std.testing.expectEqual(types.PermissionMode.default, App.nextPermMode(.accept_edits));
     // prompt 别名等价 default → acceptEdits。
     try std.testing.expectEqual(types.PermissionMode.accept_edits, App.nextPermMode(.prompt));
     // 非循环档(bypass/auto/dont_ask)→ default(对齐 cc:从特殊模式按一次回循环起点)。
@@ -3404,10 +3354,10 @@ test "nextPermMode: Shift+Tab 循环状态机(对齐 cc)" {
     try std.testing.expectEqual(types.PermissionMode.default, App.nextPermMode(.bypass));
     try std.testing.expectEqual(types.PermissionMode.default, App.nextPermMode(.auto));
     try std.testing.expectEqual(types.PermissionMode.default, App.nextPermMode(.dont_ask));
-    // 三步回到起点(完整一圈)。
+    // 两步回到起点(完整一圈)。
     try std.testing.expectEqual(
         types.PermissionMode.default,
-        App.nextPermMode(App.nextPermMode(App.nextPermMode(.default))),
+        App.nextPermMode(App.nextPermMode(.default)),
     );
 }
 
@@ -3449,8 +3399,8 @@ test "U4 A3: reasoning/dirs 单写侧 emit config_changed;setConfigEventSink 同
     try std.testing.expectEqual(@as(usize, 1), rec.count);
 
     // mode 走 permission_ctx.setMode(setConfigEventSink 已同步)→ emit .mode
-    app.permission_ctx.setMode(.plan);
-    try std.testing.expectEqual(types.PermissionMode.plan, rec.last.?.mode);
+    app.permission_ctx.setMode(.auto);
+    try std.testing.expectEqual(types.PermissionMode.auto, rec.last.?.mode);
     try std.testing.expectEqual(@as(usize, 2), rec.count);
 
     // 清 sink:不再 emit
@@ -3679,26 +3629,21 @@ test "U2 S1: compactWindow 结构化返回 {dropped,before,after}(loop/web 共�
 }
 
 test "U2 S2: permission_mode 单一源 — permMode 读 ctx,cyclePermMode 只写 ctx,工具 setMode 即时反映" {
-    // cyclePermMode 只触及 permission_ctx + plan_prev_mode → 用 undefined App 只初始化这两个字段
+    // cyclePermMode 只触及 permission_ctx → 用 undefined App 只初始化这一个字段
     // (其余字段永不被读,安全)。锁住"config.permission_mode 不再是运行时真理源"这个不变式。
     var app: App = undefined;
     app.permission_ctx = permission_mod.createContext(.default, std.testing.allocator);
-    app.plan_prev_mode = null;
 
     try std.testing.expectEqual(types.PermissionMode.default, app.permMode());
     app.cyclePermMode(); // default → accept_edits
     try std.testing.expectEqual(types.PermissionMode.accept_edits, app.permMode());
-    app.cyclePermMode(); // accept_edits → plan:记 plan_prev_mode=from
-    try std.testing.expectEqual(types.PermissionMode.plan, app.permMode());
-    try std.testing.expectEqual(types.PermissionMode.accept_edits, app.plan_prev_mode.?);
-    app.cyclePermMode(); // plan → default:清 plan_prev_mode
+    app.cyclePermMode(); // accept_edits → default
     try std.testing.expectEqual(types.PermissionMode.default, app.permMode());
-    try std.testing.expect(app.plan_prev_mode == null);
 
-    // task#14 修复机制:工具(EnterPlanMode/ExitPlanMode)只写 permission_ctx.mode,
-    // permMode()=ctx 即时反映(旧版靠 loop.zig sync-back 补 config,web 漏了它致 /state 陈旧)。
-    app.permission_ctx.setMode(.plan);
-    try std.testing.expectEqual(types.PermissionMode.plan, app.permMode()); // web /state 现在读这个,不陈旧
+    // task#14 修复机制:直写 permission_ctx.mode 的路径,permMode()=ctx 即时反映
+    // (旧版靠 loop.zig sync-back 补 config,web 漏了它致 /state 陈旧)。
+    app.permission_ctx.setMode(.auto);
+    try std.testing.expectEqual(types.PermissionMode.auto, app.permMode()); // web /state 现在读这个,不陈旧
 }
 
 test "U3 syncModelMirrors: 所有 model 镜像同步(含 swarm.model,Linus U3 抓的第7点)" {

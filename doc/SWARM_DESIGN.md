@@ -67,7 +67,7 @@ metacodes swarm = **一组对等 teammate agent + lead**,经**文件邮箱**通�
 - **shutdown 协议**:lead 发 → teammate 回 `shutdown_approved`(echo request_id)+ 优雅退出(在 idle 处理,不打断进行中 turn,比 cc 模型审批更简洁安全)+ 释放租约。lead pollLeadInbox 消费回执 → 摘牌(**仅当线程确已 terminated**,防仍在跑的 teammate 自摘成不可寻址)。
 - **orphan 清理**:lead deinit 删会话 team 目录——**生产安全** `removeTeamDirTree`(护栏:路径须含 `/.metacodes/teams/` + 拒 `..` + symlink 不跟随 lstat)。
 - **teammate fail-closed 权限**:`no_interactive_prompt=true` → `.ask` 无 ui_requester 直接 deny,**绝不读 fd 0**(teammate 线程与 lead REPL 共享 fd 0,读会争抢/卡死)。
-- **register SW7**:permission 代理(teammate→lead 弹框)/ plan 审批 auto-approve / plan/mode 响应 from-gate(消费者建时补)。
+- **register SW7**:permission 代理(teammate→lead 弹框)/ mode 响应 from-gate(消费者建时补)。plan 审批随 plan 模式移除,不再登记。
 
 ## 6. UX + 资源边界(SW5)
 
@@ -81,14 +81,14 @@ metacodes swarm = **一组对等 teammate agent + lead**,经**文件邮箱**通�
 
 - **`--teammate` runtime**:身份 CLI args(--agent-name/--team-name/--parent-session-id/--teammate-lease-id/--teammate-cwd);worktree chdir + **同步更新 app.cwd_abs/project_dir**(光 chdir 没用,工具用 cwd_abs 解析路径);mailbox 消息循环(waitForWork 镜像 in-process);fail-closed 权限。
 - **lead-spawn**:`--teammate-mode process` → Task(name) 走 `spawnTeammateProcess`(createWorktree `git -C repo` + 登记 member `backend_type=process`/worktree_path + `forkExecTeammate` fork **零分配**只 async-signal-safe + 追踪 `process_teammates` 供 deinit kill+removeWorktree)。
-- **进程启动绑定**:父 session 在 `App.init` 之前注入子进程配置，保证 KG、prompt、权限、plan
+- **进程启动绑定**:父 session 在 `App.init` 之前注入子进程配置，保证 KG、prompt、权限
   和 transcript 从第一帧就使用同一个 session；子进程另生成独立的 agent identity，避免把
   协调身份和会话路由身份混用。team 名必须是 canonical sanitized 形式，成员从持久化配置
   被删除、换绑或 cwd/worktree 改变后，进程在启动和下一次轮询前 fail closed；指定的
   worktree 无法 chdir/realpath 时也直接退出，绝不降级到 lead cwd。spawn 后尚未登记成功
   时的子进程会被 kill+reap，避免留下无主进程。
 - **排除(用户指令)**:Linux bubblewrap 沙箱不做。macOS Seatbelt 沙箱复用(同 App/同 Bash 工具,settings 开则自然套 wrapCommand)。
-- register SW7:真 fork+exec e2e / plan-mode 非继承显式 guard / Seatbelt 验证。
+- register SW7:真 fork+exec e2e / Seatbelt 验证。
 
 ## 8. 真模型 e2e(SW7)
 
@@ -106,8 +106,7 @@ metacodes swarm = **一组对等 teammate agent + lead**,经**文件邮箱**通�
 |----|------|
 | Linux bubblewrap 沙箱 | 排除(用户指令) |
 | permission 代理(teammate→lead 弹框) | register SW7(当前 fail-closed 安全) |
-| plan 审批 auto-approve | register SW7 |
-| plan/mode 响应 from-gate | register(消费者建时补) |
+| mode 响应 from-gate | register(消费者建时补) |
 | 真 fork+exec 进程外完整 e2e | register SW7(干净进程 harness) |
 | agent switcher teammate 视图 | register(tty) |
 | lease TTL 续期(长任务>7200s) | register |

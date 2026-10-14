@@ -41,8 +41,8 @@ pub const AlwaysAllowScope = enum {
 
 /// 旧版 PermissionContext。新 decision.Context 更简洁，但此处保留字段兼容 agent_loop。
 pub const PermissionContext = struct {
-    /// 权限模式。跨线程读写(主线程 agent_loop 读 / plan_mode 工具写 / 生成期 watcher
-    /// 线程 Shift+Tab 写)→ 用原子保证可见性。读 modeValue()/写 setMode()。
+    /// 权限模式。跨线程读写(主线程 agent_loop 读 / 生成期 watcher 线程 Shift+Tab 写)
+    /// → 用原子保证可见性。读 modeValue()/写 setMode()。
     mode: std.atomic.Value(types.PermissionMode) = std.atomic.Value(types.PermissionMode).init(.prompt),
     allocator: std.mem.Allocator,
     /// 可选的细粒度规则集；null 时只靠四模式兜底。
@@ -58,8 +58,6 @@ pub const PermissionContext = struct {
     sandbox: ?*const @import("sandbox/config.zig").SandboxSettings = null,
     /// PreToolUse hook 集合(从 settings.hooks.PreToolUse 解析)。
     hooks: ?*const @import("permission/hooks.zig").HookSet = null,
-    /// 当前 session plan 文件全路径(plan 模式特许写;App init 时算,挂此处)。空串=无。
-    plan_file_path: []const u8 = "",
     /// memdir 绝对路径(通道 B 自动记忆;App init 时算,挂此处)。空串=禁用。
     /// 写此子树内文件任何模式豁免(对齐 cc isAutoMemPath),deny/protected 仍优先。
     memdir_abs: []const u8 = "",
@@ -92,7 +90,7 @@ pub const PermissionContext = struct {
 
     /// **配置变更事件出口(U4)**:permission_mode 是 setMode 单写侧(model/dirs/reasoning
     /// 各在 App 方法 emit)。App 只给 `app.permission_ctx` 设 sink;setMode 有 sink 才 emit,
-    /// 故 mode 变更(含 plan_mode 工具直写 ctx.setMode——最该出事件的转移)自动广播。
+    /// 故任何直写 ctx.setMode 的 mode 变更都自动广播。
     /// **scoped 值拷贝(subagent/agent_loop/agent)必须 null sink**——用 scopedDerive() 单 seam
     /// 保证(不手工 null N 点,清单会漏)。null = 不 emit(无 UI / 单测 / scoped 拷贝)。
     event_sink: ?@import("core/protocol/ui_event.zig").ConfigEventSink = null,
@@ -152,7 +150,6 @@ pub fn checkPermissionClassified(
         .sandbox = ctx.sandbox,
         .hooks = ctx.hooks,
         .hook_allocator = ctx.allocator,
-        .plan_file_path = ctx.plan_file_path,
         .memdir_abs = ctx.memdir_abs,
         .memdir_allocator = ctx.allocator,
         .path_check_allocator = ctx.allocator,
@@ -179,10 +176,10 @@ test "shim checkPermission bypass" {
     try std.testing.expect(checkPermission(&ctx, "Bash", "rm -rf /") == .allow);
 }
 
-test "shim createContext + check plan" {
-    const ctx = createContext(.plan, std.testing.allocator);
-    try std.testing.expect(checkPermission(&ctx, "Read", "") == .allow);
+test "shim createContext + check dont_ask" {
+    const ctx = createContext(.dont_ask, std.testing.allocator);
     try std.testing.expect(checkPermission(&ctx, "Write", "") == .deny);
+    try std.testing.expect(checkPermission(&ctx, "Bash", "{\"command\":\"ls\"}") == .deny);
 }
 
 test "optional decision override is inert by default and receives imported action" {
@@ -218,14 +215,14 @@ test "PermissionContext.mode 原子跨线程 write-read(无撕裂,release-acquir
     var ctx = createContext(.default, std.testing.allocator);
     const Writer = struct {
         fn run(c: *PermissionContext) void {
-            // 另一线程连写多个 mode(模拟生成期 watcher Shift+Tab / plan_mode 工具)。
+            // 另一线程连写多个 mode(模拟生成期 watcher Shift+Tab)。
             var i: usize = 0;
             while (i < 1000) : (i += 1) {
-                c.setMode(.plan);
+                c.setMode(.auto);
                 c.setMode(.accept_edits);
                 c.setMode(.default);
             }
-            c.setMode(.plan); // 末态确定为 plan
+            c.setMode(.auto); // 末态确定为 auto
         }
     };
     var th = try std.Thread.spawn(.{}, Writer.run, .{&ctx});
@@ -234,10 +231,10 @@ test "PermissionContext.mode 原子跨线程 write-read(无撕裂,release-acquir
     while (j < 1000) : (j += 1) {
         const m = ctx.modeValue();
         // 合法枚举值之一(原子读不会读到半更新的垃圾)。
-        try std.testing.expect(m == .plan or m == .accept_edits or m == .default);
+        try std.testing.expect(m == .auto or m == .accept_edits or m == .default);
     }
     th.join();
-    try std.testing.expectEqual(types.PermissionMode.plan, ctx.modeValue()); // 末态可见
+    try std.testing.expectEqual(types.PermissionMode.auto, ctx.modeValue()); // 末态可见
 }
 
 test "U4 A2: setMode 有 sink 则 emit mode_changed;无 sink 不 emit" {
@@ -252,16 +249,16 @@ test "U4 A2: setMode 有 sink 则 emit mode_changed;无 sink 不 emit" {
     var rec = Recorder{};
     var ctx = PermissionContext{ .allocator = std.testing.allocator };
     // 无 sink:setMode 不 emit
-    ctx.setMode(.plan);
+    ctx.setMode(.auto);
     try std.testing.expect(rec.got == null);
     // 挂 sink:setMode emit mode_changed，值=store 后的 mode
     ctx.event_sink = .{ .ctx = @ptrCast(&rec), .emitFn = &Recorder.emit };
     ctx.setMode(.accept_edits);
     try std.testing.expect(rec.got != null);
     try std.testing.expectEqual(types.PermissionMode.accept_edits, rec.got.?.mode);
-    // 关键:工具路径(plan_mode 直写 ctx.setMode)同样 emit（这就是 task#14/plan 转移的事件源）
-    ctx.setMode(.plan);
-    try std.testing.expectEqual(types.PermissionMode.plan, rec.got.?.mode);
+    // 关键:任何直写 ctx.setMode 的路径同样 emit(task#14 的事件源是 setMode 本身,不是调用方)
+    ctx.setMode(.auto);
+    try std.testing.expectEqual(types.PermissionMode.auto, rec.got.?.mode);
 }
 
 test "U4 A2: scopedDerive null 掉 sink(scoped 拷贝的 override 绝不 emit 到 session sink)" {
@@ -282,13 +279,13 @@ test "U4 A2: scopedDerive null 掉 sink(scoped 拷贝的 override 绝不 emit �
     try std.testing.expect(derived.event_sink == null); // sink 被 null
     try std.testing.expectEqual(types.PermissionMode.bypass_permissions, derived.modeValue()); // override 生效
     // derived.setMode 不 emit 到 session sink（scoped override 不污染 session 事件）
-    derived.setMode(.plan);
+    derived.setMode(.auto);
     try std.testing.expectEqual(@as(usize, 0), rec.count);
     // **task#15 核心:mode 隔离**——derived(后台 subagent/teammate)改 mode 绝不回灌 lead。
     // scopedDerive 值拷贝 → derived.mode 是独立 atomic,session_ctx.mode 不受影响(仍默认 .prompt)。
     try std.testing.expectEqual(types.PermissionMode.prompt, session_ctx.modeValue());
     // 对照:session_ctx.setMode 才 emit
-    session_ctx.setMode(.plan);
+    session_ctx.setMode(.auto);
     try std.testing.expectEqual(@as(usize, 1), rec.count);
     // scopedDerive(null):无 override，保留原 mode，仍 null sink
     var derived2 = session_ctx.scopedDerive(null);

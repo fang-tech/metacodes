@@ -5,15 +5,27 @@ from asserts import TTYAssert
 
 def test_T08_shift_tab_cycle(bin_path):
     # 起始 bypassPermissions(--permission bypassPermissions)。shift+tab 循环按
-    # loop.zig:default/prompt→acceptEdits→plan→default;非循环模式(bypass)→default。
-    # 按一次:bypass→default;再按:default→acceptEdits;再按:→plan。
-    # 对齐 cc(2026-06-05 改):mode 区分在 footer mode part(`⏸ plan mode on` + 着色),
+    # App.nextPermMode:default/prompt→acceptEdits→default;非循环模式(bypass)→default。
+    # 按一次:bypass→default;再按:default→acceptEdits。
+    # 对齐 cc(2026-06-05 改):mode 区分在 footer mode part(`⏵⏵ accept edits on` + 着色),
     # 边框色恒为 accent 不随 mode 变(cc getBorderColor 恒 promptBorder,仅 bash 例外)。
+    raw = run(bin_path, ["sleep:0.8", "key:shift_tab", "sleep:0.2",
+                         "key:shift_tab", "sleep:0.3"])
+    a = TTYAssert(raw)
+    a.assert_footer_mode("accept edits")    # footer 显示 cc 风格 title "accept edits on"
+    a.assert_border_class("accent")          # 边框不随 mode 变(对齐 cc,撤销旧 plan→warn)
+
+
+def test_T08b_shift_tab_cycle_closes_after_accept_edits(bin_path):
+    # 循环只有两档(plan 模式已移除):第三下从 acceptEdits 回到 default。
     raw = run(bin_path, ["sleep:0.8", "key:shift_tab", "sleep:0.2",
                          "key:shift_tab", "sleep:0.2", "key:shift_tab", "sleep:0.3"])
     a = TTYAssert(raw)
-    a.assert_footer_mode("plan mode")       # footer 显示 cc 风格 title "plan mode on"
-    a.assert_border_class("accent")          # 边框不随 mode 变(对齐 cc,撤销旧 plan→warn)
+    fr = a.footer_row()
+    if fr is None:
+        a._fail("无 footer 行")
+    if "? for shortcuts" not in a.final.line_text(fr):
+        a._fail(f"三下 Shift+Tab 后应回到 default,实际 '{a.final.line_text(fr)}'")
 
 
 def test_T10_submit_local_command(bin_path):

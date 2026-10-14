@@ -710,6 +710,12 @@ test "Revision 6 Permission authority preserves canonical mode" {
         error.Corrupt,
         decodePermissionState(std.testing.allocator, corrupt),
     );
+    // Byte 2 was the removed `plan` mode: it stays reserved, never decodes.
+    corrupt[10] = 2;
+    try std.testing.expectError(
+        error.Corrupt,
+        decodePermissionState(std.testing.allocator, corrupt),
+    );
     try std.testing.expectError(
         error.Corrupt,
         decodePermissionState(

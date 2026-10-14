@@ -2768,9 +2768,9 @@ test "AgentSession initializes per-session permission state" {
     defer runtime.destroy() catch unreachable;
     const cwd = try testCwd();
     defer std.testing.allocator.free(cwd);
-    const self = try createTestSession(runtime, .plan, cwd);
+    const self = try createTestSession(runtime, .dont_ask, cwd);
     defer self.destroy() catch unreachable;
-    try std.testing.expectEqual(types.PermissionMode.plan, self.permission_ctx.modeValue());
+    try std.testing.expectEqual(types.PermissionMode.dont_ask, self.permission_ctx.modeValue());
     try std.testing.expectEqualSlices(u8, self.session_id.asSlice(), self.permission_ctx.session.asSlice());
 }
 

@@ -22,7 +22,6 @@ const push_notification_tool = @import("tools/push_notification.zig");
 const cron_tool = @import("tools/cron.zig");
 const web_fetch_tool = @import("tools/web_fetch.zig");
 const ask_user_tool = @import("tools/ask_user.zig");
-const plan_mode_tool = @import("tools/plan_mode.zig");
 const task_tools = @import("tools/task_tools.zig");
 /// pub:v36 读平面 supersede 的纯判定(hitSupersededByArtifact)需 L2 直测。
 pub const kg_tools = @import("tools/kg_tools.zig");
@@ -449,20 +448,6 @@ pub const registry: []const ToolEntry = &.{
             .required = &.{"questions"},
         },
         .execute = .{ .legacy_inline = ask_user_tool.execute },
-    },
-    .{
-        .name = "EnterPlanMode",
-        .description = "Enter plan mode to research and design before implementing. Use this tool PROACTIVELY at the start of any non-trivial task — new features, multi-file changes, refactors, architectural decisions, anything with multiple valid approaches, or when the user asks for a plan/design. In plan mode only read-only tools (Read/Grep/Glob) are allowed; write/exec are denied, so you investigate first, then call ExitPlanMode with your plan for the user to approve. Skip it only for trivial one-line fixes or pure questions. When in doubt, prefer entering plan mode — getting sign-off before writing code prevents wasted work.",
-        .input_schema = .{ .type = "object", .properties = null, .required = &.{} },
-        .execute = .{ .legacy_inline = plan_mode_tool.executeEnter },
-    },
-    .{
-        .name = "ExitPlanMode",
-        .description = "Present your plan and request approval to exit plan mode. Shows the plan to the user in an approval dialog: they choose to proceed (restores execution mode), proceed with auto-accept edits, or keep planning. Only call this once you have a complete plan. Pass the plan as markdown in the `plan` field so the user can review it. If rejected, keep refining and call again.",
-        .input_schema = .{ .type = "object", .prop_specs = &.{
-            .{ .name = "plan", .type = "string", .description = "The plan to present to the user for approval, as concise markdown." },
-        }, .required = &.{} },
-        .execute = .{ .legacy_inline = plan_mode_tool.executeExit },
     },
     .{
         .name = "KgRemember",
@@ -1329,8 +1314,8 @@ test "getTool by name" {
     try std.testing.expect(getTool("KillShell") != null);
     try std.testing.expect(getTool("WebFetch") != null);
     try std.testing.expect(getTool("AskUserQuestion") != null);
-    try std.testing.expect(getTool("EnterPlanMode") != null);
-    try std.testing.expect(getTool("ExitPlanMode") != null);
+    try std.testing.expect(getTool("EnterPlanMode") == null);
+    try std.testing.expect(getTool("ExitPlanMode") == null);
     try std.testing.expect(getTool("TaskCreate") != null);
     try std.testing.expect(getTool("TaskGet") != null);
     try std.testing.expect(getTool("TaskList") != null);
@@ -1570,7 +1555,6 @@ test {
     _ = &cron_tool;
     _ = &web_fetch_tool;
     _ = &ask_user_tool;
-    _ = &plan_mode_tool;
     _ = &task_tools;
     _ = &agent_tool;
     _ = &code_map_tool;

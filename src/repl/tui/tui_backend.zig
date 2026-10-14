@@ -51,8 +51,6 @@ const picker_host = @import("../picker_host.zig");
 const term = @import("term.zig");
 const ask_dialog = @import("dialog/ask_question.zig");
 const perm_dialog = @import("dialog/permission.zig");
-const exit_plan_dialog = @import("dialog/exit_plan_mode.zig");
-const tool_ctx = @import("../../tools/context.zig");
 const ui_request = @import("../../core/protocol/ui_request.zig");
 const terminal_title = @import("terminal_title.zig");
 
@@ -545,19 +543,6 @@ pub const TuiBackend = struct {
                 const choice = self.withTerminalTakeover(perm_dialog.PermissionChoice, &Ctx.run) orelse .deny_once;
                 out.* = .{ .permission = choice };
             },
-            .plan_approval => |pa| {
-                const Ctx = struct {
-                    threadlocal var plan_md: []const u8 = "";
-                    threadlocal var kg_steps: usize = 0;
-                    fn run(fd: c_int, th: Theme, a: std.mem.Allocator) tool_ctx.ToolContext.PlanApproval {
-                        return exit_plan_dialog.runWithKg(a, th, fd, 2, plan_md, kg_steps) orelse .reject;
-                    }
-                };
-                Ctx.plan_md = pa.plan_md;
-                Ctx.kg_steps = pa.kg_step_count;
-                const choice = self.withTerminalTakeover(tool_ctx.ToolContext.PlanApproval, &Ctx.run) orelse .reject;
-                out.* = .{ .plan_approval = choice };
-            },
             .custom => {
                 // L2:同步终端 backend 无法渲染任意动态 UI(它只会画固定对话框)。custom 信封
                 // 是给未来 GUI/web 后端的——TUI 返 error,工具据此兜底(对齐 ask→NotATty)。
@@ -796,7 +781,6 @@ test {
     std.testing.refAllDecls(@This());
     // 显式收录子模块 test(refAllDecls 非递归):ask_question dialog 的 render/joinChecked 单测。
     _ = ask_dialog;
-    _ = exit_plan_dialog; // ExitPlanMode 审批对话框 render/键映射单测
 }
 
 test "tool_result(Edit): renderCardResult 用 region.cols(回归:diff 矩形填充)" {

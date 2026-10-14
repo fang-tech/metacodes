@@ -211,7 +211,7 @@ test "L2: spawnAgent(tool_defs_override) → 请求体 tools 收窄" {
 }
 
 // L2:subagent permission_mode_override → 子 agent 用覆盖后的 mode(路径贯通)
-test "L2: spawnAgent(permission_mode_override=plan) 生效" {
+test "L2: spawnAgent(permission_mode_override=dont_ask) 生效" {
     const a = std.heap.page_allocator;
 
     var srv = try harness.MockServer.start(MINIMAL_END_TURN_SSE, 0);
@@ -236,7 +236,7 @@ test "L2: spawnAgent(permission_mode_override=plan) 生效" {
         &perm_ctx,
         null,
         "hi",
-        .{ .max_turns = 2, .permission_mode_override = .plan },
+        .{ .max_turns = 2, .permission_mode_override = .dont_ask },
     ) catch return error.SkipZigTest;
     defer result.deinit();
 

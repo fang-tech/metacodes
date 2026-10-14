@@ -2,8 +2,7 @@
 //!
 //! 规则(对齐 Claude Code):
 //!   1. **永远禁用集** 先移除(UI/session 依赖,无法在子 agent 跑):
-//!      Agent / Task / AskUserQuestion / EnterPlanMode / ExitPlanMode / ScheduleWakeup / WaitForMcpServers
-//!      (ExitPlanMode 例外:permission_mode==.plan 时保留 — 让 plan-mode subagent 能退出)
+//!      Agent / Task / AskUserQuestion / ScheduleWakeup / WaitForMcpServers / KgRemember
 //!   2. **disallowed_tools 黑名单**(def 字段)从池里去掉
 //!   3. **tools 白名单**(def 字段)若非空,取交集
 //!
@@ -12,15 +11,12 @@
 const std = @import("std");
 const json = @import("../json.zig");
 const AgentDef = @import("def.zig").AgentDef;
-const PermissionMode = @import("def.zig").PermissionMode;
 
 /// 永远不可用于 subagent 的工具名(对齐 Claude Code 官方表)。
 pub const PERMANENTLY_DISABLED = [_][]const u8{
     "Agent",
     "Task",
     "AskUserQuestion",
-    "EnterPlanMode",
-    "ExitPlanMode",
     "ScheduleWakeup",
     "WaitForMcpServers",
     // KG 长期记忆保持单写者：subagent 只读并返报告，父 agent 验收后才沉淀新记忆。
@@ -39,7 +35,7 @@ pub fn filterToolDefs(
 
     for (parent_defs) |d| {
         // 1. 永久禁用集
-        if (isPermanentlyDisabled(d.name, def.permission_mode)) continue;
+        if (isPermanentlyDisabled(d.name)) continue;
         // 2. disallowed_tools 黑名单
         if (matchesAny(def.disallowed_tools, d.name)) continue;
         // 3. mcpServers 非空时是 server allowlist。来源由注册桥显式标记；
@@ -81,10 +77,8 @@ fn isMemoryTool(name: []const u8) bool {
     return std.mem.eql(u8, name, "Read") or std.mem.eql(u8, name, "Write") or std.mem.eql(u8, name, "Edit");
 }
 
-fn isPermanentlyDisabled(name: []const u8, mode: ?PermissionMode) bool {
+fn isPermanentlyDisabled(name: []const u8) bool {
     for (PERMANENTLY_DISABLED) |banned| {
-        // ExitPlanMode 例外:plan 模式下保留
-        if (std.mem.eql(u8, banned, "ExitPlanMode") and mode != null and mode.? == .plan) continue;
         if (std.mem.eql(u8, banned, name)) return true;
     }
     return false;
@@ -107,20 +101,18 @@ fn matchesAny(patterns: []const []const u8, name: []const u8) bool {
 const testing = std.testing;
 const parseAgentMd = @import("def.zig").parseAgentMd;
 
-fn makeFakeDef(allocator: std.mem.Allocator, tools_raw: []const u8, disallowed_raw: []const u8, perm: ?PermissionMode) !AgentDef {
+fn makeFakeDef(allocator: std.mem.Allocator, tools_raw: []const u8, disallowed_raw: []const u8) !AgentDef {
     var md_buf: [512]u8 = undefined;
     const md = try std.fmt.bufPrint(
         &md_buf,
         "---\nname: t\ndescription: d\ntools: {s}\ndisallowedTools: {s}\n---\nbody",
         .{ tools_raw, disallowed_raw },
     );
-    var d = try parseAgentMd(allocator, md, "/x", .personal);
-    d.permission_mode = perm;
-    return d;
+    return parseAgentMd(allocator, md, "/x", .personal);
 }
 
 fn fakeDefs(allocator: std.mem.Allocator) ![]json.ToolDefinition {
-    const names = [_][]const u8{ "Read", "Write", "Edit", "Bash", "Grep", "Agent", "Task", "AskUserQuestion", "EnterPlanMode", "ExitPlanMode" };
+    const names = [_][]const u8{ "Read", "Write", "Edit", "Bash", "Grep", "Agent", "Task", "AskUserQuestion", "ScheduleWakeup" };
     var out = try allocator.alloc(json.ToolDefinition, names.len);
     for (names, 0..) |n, i| {
         out[i] = .{ .name = n, .description = "", .input_schema = .{ .type = "object", .properties = null, .required = &.{} } };
@@ -130,7 +122,7 @@ fn fakeDefs(allocator: std.mem.Allocator) ![]json.ToolDefinition {
 
 test "filterToolDefs: subagent keeps read-only KG tools but never KgRemember" {
     const a = testing.allocator;
-    var def = try makeFakeDef(a, "", "", null);
+    var def = try makeFakeDef(a, "", "");
     defer def.deinit(a);
     const parent = [_]json.ToolDefinition{
         .{ .name = "Read", .description = "", .input_schema = .{} },
@@ -149,7 +141,7 @@ test "filterToolDefs: subagent keeps read-only KG tools but never KgRemember" {
 
 test "filterToolDefs: permanently disabled removed" {
     const a = testing.allocator;
-    var def = try makeFakeDef(a, "", "", null);
+    var def = try makeFakeDef(a, "", "");
     defer def.deinit(a);
     const parent = try fakeDefs(a);
     defer a.free(parent);
@@ -157,13 +149,12 @@ test "filterToolDefs: permanently disabled removed" {
     const filtered = try filterToolDefs(a, parent, &def);
     defer a.free(filtered);
 
-    // Agent / Task / AskUserQuestion / EnterPlanMode / ExitPlanMode 不应在结果里
+    // Agent / Task / AskUserQuestion / ScheduleWakeup 不应在结果里
     for (filtered) |d| {
         try testing.expect(!std.mem.eql(u8, d.name, "Agent"));
         try testing.expect(!std.mem.eql(u8, d.name, "Task"));
         try testing.expect(!std.mem.eql(u8, d.name, "AskUserQuestion"));
-        try testing.expect(!std.mem.eql(u8, d.name, "EnterPlanMode"));
-        try testing.expect(!std.mem.eql(u8, d.name, "ExitPlanMode"));
+        try testing.expect(!std.mem.eql(u8, d.name, "ScheduleWakeup"));
     }
     // Read/Write/Bash 应保留
     var found_read = false;
@@ -176,26 +167,9 @@ test "filterToolDefs: permanently disabled removed" {
     try testing.expect(found_write);
 }
 
-test "filterToolDefs: plan mode keeps ExitPlanMode" {
-    const a = testing.allocator;
-    var def = try makeFakeDef(a, "", "", .plan);
-    defer def.deinit(a);
-    const parent = try fakeDefs(a);
-    defer a.free(parent);
-
-    const filtered = try filterToolDefs(a, parent, &def);
-    defer a.free(filtered);
-
-    var found = false;
-    for (filtered) |d| {
-        if (std.mem.eql(u8, d.name, "ExitPlanMode")) found = true;
-    }
-    try testing.expect(found);
-}
-
 test "filterToolDefs: tools allowlist restricts pool" {
     const a = testing.allocator;
-    var def = try makeFakeDef(a, "Read, Grep", "", null);
+    var def = try makeFakeDef(a, "Read, Grep", "");
     defer def.deinit(a);
     const parent = try fakeDefs(a);
     defer a.free(parent);
@@ -216,7 +190,7 @@ test "filterToolDefs: tools allowlist restricts pool" {
 
 test "filterToolDefs: disallowedTools removes from pool" {
     const a = testing.allocator;
-    var def = try makeFakeDef(a, "", "Write, Edit", null);
+    var def = try makeFakeDef(a, "", "Write, Edit");
     defer def.deinit(a);
     const parent = try fakeDefs(a);
     defer a.free(parent);
@@ -238,7 +212,7 @@ test "filterToolDefs: disallowedTools removes from pool" {
 
 test "filterToolDefs: tools and disallowedTools both — disallowed wins" {
     const a = testing.allocator;
-    var def = try makeFakeDef(a, "Read, Write", "Write", null);
+    var def = try makeFakeDef(a, "Read, Write", "Write");
     defer def.deinit(a);
     const parent = try fakeDefs(a);
     defer a.free(parent);

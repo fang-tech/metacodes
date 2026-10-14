@@ -164,9 +164,9 @@ test "dispatch: resize 更新几何" {
 
 test "dispatch: usage 更新 footer 快照" {
     var s = UiState{};
-    _ = ui.dispatch(&s, .{ .usage = .{ .input_tokens = 100, .output_tokens = 50, .mode = .plan } });
+    _ = ui.dispatch(&s, .{ .usage = .{ .input_tokens = 100, .output_tokens = 50, .mode = .auto } });
     try testing.expectEqual(@as(u64, 150), s.footer.totalTokens());
-    try testing.expectEqual(@import("cc").types_mod.PermissionMode.plan, s.footer.mode);
+    try testing.expectEqual(@import("cc").types_mod.PermissionMode.auto, s.footer.mode);
 }
 
 test "dispatch: text_chunk → emit_scroll(不改固定区)" {

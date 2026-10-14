@@ -348,7 +348,7 @@ const ToolResultCapture = struct {
 };
 
 /// 分类层验收:dispatcher 在场时,目录无法解析的名字按 .execute 分类
-/// (plan deny / default ask),绝不落回按名字猜 .read 的 legacy 兜底。
+/// (default/auto 都落 ask),绝不落回按名字猜 .read 的 legacy 兜底。
 fn runUnknownNameClassification(
     mode: core.types.PermissionMode,
 ) !struct { content: []u8, allocator: std.mem.Allocator } {
@@ -398,13 +398,13 @@ fn runUnknownNameClassification(
     return .{ .content = content, .allocator = a };
 }
 
-test "L2 验收③: dispatcher 在场的未知名在 plan 模式被 deny" {
-    var run = try runUnknownNameClassification(.plan);
+test "L2 验收③: dispatcher 在场的未知名在 auto 模式不按低风险放行" {
+    var run = try runUnknownNameClassification(.auto);
     defer run.allocator.free(run.content);
-    // .execute 分类 → plan deny;若错落 legacy unknown-read 会被 allow 并
-    // 执行出 "does not exist" 的 UnknownTool 引导。
+    // .execute 分类 → auto 只放行低风险(read)→ ask → 无 UI fail-closed 拒绝;若错落
+    // legacy unknown-read 会被当低风险 allow 并执行出 "does not exist" 的 UnknownTool 引导。
     try std.testing.expect(std.mem.indexOf(u8, run.content, "permission_denied") != null);
-    try std.testing.expect(std.mem.indexOf(u8, run.content, "denied by permission rule or plan mode") != null);
+    try std.testing.expect(std.mem.indexOf(u8, run.content, "user declined") != null);
     try std.testing.expect(std.mem.indexOf(u8, run.content, "does not exist") == null);
 }
 

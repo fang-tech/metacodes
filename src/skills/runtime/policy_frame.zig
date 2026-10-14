@@ -507,7 +507,7 @@ test "concurrent siblings share an immutable retained parent without interferenc
         std.testing.allocator,
         &.{ "Read", "Bash" },
         .disabled,
-        .plan,
+        .dont_ask,
         .{},
     );
     const read_child = try PolicyFrame.derive(root, &.{"Read"}, &.{});

@@ -220,8 +220,8 @@ test "L2: denied tool attempt has paired lifecycle and exact policy id" {
     defer client.deinit();
     var conv = cc.conversation.Conversation.init(a);
     defer conv.deinit();
-    try conv.appendText(.user, "write outside the plan file");
-    const perm = cc.permission.createContext(.plan, a);
+    try conv.appendText(.user, "write without permission");
+    const perm = cc.permission.createContext(.dont_ask, a);
     const tool_defs = try cc.tools.toToolDefinitions(a);
     defer a.free(tool_defs);
 

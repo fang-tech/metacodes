@@ -33,7 +33,7 @@ test "render: help_open 在输入帧 footer 区投影多列快捷键(非模态,�
 }
 
 test "render: input 帧含 editor view + footer,绝不含 \\x1b[2J" {
-    var s = UiState{ .phase = .input, .editor = .{ .view = "abc", .cursor = 3 }, .footer = .{ .mode = .plan } };
+    var s = UiState{ .phase = .input, .editor = .{ .view = "abc", .cursor = 3 }, .footer = .{ .mode = .accept_edits } };
     var cw = capture.CaptureWriter.init(testing.allocator);
     defer cw.deinit();
     _ = try ui.render(&cw, mkInputs(&s));
@@ -41,8 +41,8 @@ test "render: input 帧含 editor view + footer,绝不含 \\x1b[2J" {
     const stripped = try capture.stripAnsi(testing.allocator, cw.output());
     defer testing.allocator.free(stripped);
     try capture.expectContains(stripped, "abc");
-    try capture.expectContains(stripped, "plan mode on"); // footer CC 风格 mode part(symbol+title)
-    // 非 default(plan)态 footer 含 cycle 提示;default 态才显 "? for shortcuts"(2026-06-05 对齐 cc)。
+    try capture.expectContains(stripped, "accept edits on"); // footer CC 风格 mode part(symbol+title)
+    // 非 default(acceptEdits)态 footer 含 cycle 提示;default 态才显 "? for shortcuts"(2026-06-05 对齐 cc)。
     try capture.expectContains(stripped, "shift+tab to cycle");
 }
 

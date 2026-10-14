@@ -98,9 +98,6 @@ pub const RenderRegion = struct {
     md_buf: std.ArrayList(u8) = .empty,
     md_state: @import("../render.zig").StreamState = .{},
     md_at_segment_start: bool = true, // 段首行用 ⏺ 前缀,续行用缩进
-    /// plan 模式:位于 <proposed_plan>...</proposed_plan> 块内(块内容不进 scrollback,
-    /// 计划由审批框单独展示;对齐 mecode strip_proposed_plan_blocks)。
-    in_proposed_plan: bool = false,
 
     // markdown 表格累积(GFM):流式逐行到达,需缓冲整块再渲染(对齐 cc 框线)。
     tbl_rows: std.ArrayList([]u8) = .empty, // 原始行 owned dup(含分隔行)
@@ -600,7 +597,7 @@ pub const RenderRegion = struct {
         self.flush();
     }
 
-    /// 边框色:plan→warn(黄),bash(留待)→danger,其它→accent。
+    /// 边框色:恒 accent(bash 模式留待 → danger)。
     fn borderColor(self: *RenderRegion, mode: types.PermissionMode) []const u8 {
         // cc 输入框边框色恒为 promptBorder,不随 permission mode 变(仅 bash 模式例外,cc-zig 暂无)。
         // mode 的视觉区分全交给 footer 的 mode part(drawFooter + status_bar.modeColor)。
@@ -835,13 +832,13 @@ pub const RenderRegion = struct {
     /// footer(纯左对齐,对齐 cc:无右侧 token):
     ///   非 default → `{symbol} {title} on (shift+tab to cycle)`[生成期 ` · esc to interrupt`]
     ///   default → 生成期 `esc to interrupt` / 输入期 `? for shortcuts`
-    /// mode part 用 modeColor 单独着色(plan→cyan/acceptEdits→magenta/bypass·dontAsk→red/auto→yellow);
+    /// mode part 用 modeColor 单独着色(acceptEdits→magenta/bypass·dontAsk→red/auto→yellow);
     /// 其余文字 dim。token 用量走 /cost,不进 footer。
     fn drawFooter(self: *RenderRegion, w: *std.Io.Writer, app: *const app_mod.App) void {
         const th = self.theme;
         const sb = @import("widget/status_bar.zig");
-        // mode 真相源 = app.permission_ctx.mode(live):输入期与 config 同步,生成期工具
-        // (EnterPlanMode/ExitPlanMode)直接写它 → spinner tick 重画即反映(修 #11 生成期不联动)。
+        // mode 真相源 = app.permission_ctx.mode(live):输入期与 config 同步,生成期 watcher
+        // (Shift+Tab)直接写它 → spinner tick 重画即反映(修 #11 生成期不联动)。
         // self.ui.footer.mode 仅当 ctx 为 default 但 footer 被 .usage 喂过非默认值时兜底(罕见)。
         const live = app.permission_ctx.modeValue();
         const mode_pm = if (live != .default) live else self.ui.footer.mode;
@@ -1459,7 +1456,6 @@ pub const RenderRegion = struct {
         self.md_buf.clearRetainingCapacity();
         self.md_state = .{};
         self.md_at_segment_start = true;
-        self.in_proposed_plan = false; // 新一轮助手文本,重置 plan 块状态
         self.resetTableLocked();
     }
 
@@ -1496,20 +1492,6 @@ pub const RenderRegion = struct {
     /// 表格识别须前瞻分隔行,但流式逐行到达 → pipe 行先当暂定表头,下行确认或回滚。
     fn handleAssistantLine(self: *RenderRegion, line: []const u8) void {
         const md_render = @import("../render.zig");
-
-        // <proposed_plan> 块过滤:整行标签开/闭块,块内容不显示(计划走审批框)。
-        // 不在 code-block 内才识别(代码块里出现同名行按字面)。对齐 mecode 整行匹配规则。
-        if (!self.md_state.in_code_block) {
-            const t = std.mem.trim(u8, line, " \t\r");
-            if (!self.in_proposed_plan and std.mem.eql(u8, t, "<proposed_plan>")) {
-                self.in_proposed_plan = true;
-                return; // 吞标签行
-            }
-            if (self.in_proposed_plan) {
-                if (std.mem.eql(u8, t, "</proposed_plan>")) self.in_proposed_plan = false;
-                return; // 吞块内容 + 闭标签行
-            }
-        }
 
         if (self.in_table) {
             if (self.tbl_unconfirmed) {

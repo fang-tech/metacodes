@@ -993,7 +993,7 @@ const AbiSession = struct {
         const external_fallback: session_permission.Decision = if (tool.namespace == .builtin)
             .ask
         else switch (permission_mode) {
-            .plan, .dont_ask => .deny,
+            .dont_ask => .deny,
             .bypass_permissions, .bypass => .allow,
             .default, .accept_edits, .auto, .prompt => .ask,
         };
@@ -4587,9 +4587,8 @@ fn permissionMode(code: u32) ?core.types.PermissionMode {
 }
 
 /// The public name of a mode, matching its PERMISSION_* constant. Create,
-/// restore and the mode update admit only the five public codes and ABI v1
-/// selects no plan-mode tool, so the deprecated aliases and `plan` are only
-/// a total fallback, never a public value.
+/// restore and the mode update admit only the five public codes, so the
+/// deprecated aliases are only a total fallback, never a public value.
 fn permissionModeName(mode: core.types.PermissionMode) []const u8 {
     return switch (mode) {
         .default, .prompt => "default",
@@ -4597,7 +4596,6 @@ fn permissionModeName(mode: core.types.PermissionMode) []const u8 {
         .auto => "auto",
         .dont_ask => "dont_ask",
         .bypass_permissions, .bypass => "full_access",
-        .plan => "plan",
     };
 }
 
@@ -9439,7 +9437,6 @@ test "Revision 6 MCP schema denial precedes Permission callback eligibility" {
         .{ .mode = .auto, .expected = .ask },
         .{ .mode = .dont_ask, .expected = .deny },
         .{ .mode = .bypass_permissions, .expected = .allow },
-        .{ .mode = .plan, .expected = .deny },
     }) |case| {
         session.core_session.permission_ctx.setMode(case.mode);
         try std.testing.expectEqual(

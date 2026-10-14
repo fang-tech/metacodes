@@ -247,8 +247,8 @@ const EXPLORE_PROMPT =
     \\
 ;
 
-/// Plan 内置 — plan-mode 下的研究 agent。
-const PLAN_DESC = "Research agent used during plan mode to gather context. Read-only. Same role as Explore but optimized for planning decisions.";
+/// Plan 内置 — 设计实现前的只读研究 agent。
+const PLAN_DESC = "Research agent that gathers context before an implementation is designed. Read-only. Same role as Explore but optimized for planning decisions.";
 
 const PLAN_PROMPT =
     \\You are a Plan subagent. Your job is to gather codebase context for the parent agent's planning step.
@@ -273,8 +273,12 @@ fn injectBuiltins(set: *AgentSet) !void {
     // Explore pin 档位名 "low"(非具体型号):按当前 provider 档位表解析;未配置
     // 档位表时 inherit 父模型——探索型任务用低档模型省成本,但绝不注入跨 provider
     // 的硬编码模型 ID(issue #11)。
-    try addBuiltin(set, "Explore", EXPLORE_DESC, EXPLORE_PROMPT, &.{ "Read", "Grep", "Glob", "Bash" }, &.{ "Write", "Edit" }, "low", .plan, 30, .blue);
-    try addBuiltin(set, "Plan", PLAN_DESC, PLAN_PROMPT, &.{ "Read", "Grep", "Glob", "KgRecall", "KgContext" }, &.{ "Write", "Edit", "Bash" }, "inherit", .plan, 30, .purple);
+    //
+    // 只读由工具白名单构造保证,不靠权限模式:两者都只拿只读工具,permission_mode 留空
+    // (继承父 mode)。Explore 不给 Bash——plan 模式移除前它的 Bash 在 .plan 下恒被 deny,
+    // 白名单里留着只会让它在 bypass 父会话下变成可写。
+    try addBuiltin(set, "Explore", EXPLORE_DESC, EXPLORE_PROMPT, &.{ "Read", "Grep", "Glob" }, &.{ "Write", "Edit", "Bash" }, "low", null, 30, .blue);
+    try addBuiltin(set, "Plan", PLAN_DESC, PLAN_PROMPT, &.{ "Read", "Grep", "Glob", "KgRecall", "KgContext" }, &.{ "Write", "Edit", "Bash" }, "inherit", null, 30, .purple);
     try addBuiltin(set, "general-purpose", GENERAL_DESC, GENERAL_PROMPT, &.{}, &.{}, "inherit", null, 50, .green);
 }
 
@@ -399,6 +403,23 @@ test "AgentSet: injectBuiltins gives Explore/Plan/general-purpose" {
     try testing.expect(saw_context);
     // general-purpose: 绿色,继承父全部工具(tools 空 + disallowed 空)
     try testing.expect(set.find("general-purpose").?.tools.len == 0);
+}
+
+test "AgentSet: Explore/Plan are read-only by tool allowlist, not by a permission mode" {
+    var set = AgentSet.init(testing.allocator);
+    defer set.deinit();
+    try injectBuiltins(&set);
+    const read_only = [_][]const u8{ "Read", "Grep", "Glob", "KgRecall", "KgContext" };
+    for ([_][]const u8{ "Explore", "Plan" }) |name| {
+        const def = set.find(name).?;
+        try testing.expect(def.permission_mode == null);
+        try testing.expect(def.tools.len > 0);
+        for (def.tools) |tool_name| {
+            var allowed = false;
+            for (read_only) |r| allowed = allowed or std.mem.eql(u8, r, tool_name);
+            try testing.expect(allowed);
+        }
+    }
 }
 
 test "AgentSet: load custom from dir" {
