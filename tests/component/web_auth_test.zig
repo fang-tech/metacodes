@@ -491,15 +491,51 @@ test "#252 a malformed token never starts a server" {
         fx.inbox.deinit();
         fx.journal.deinit();
     }
-    try std.testing.expectError(error.EmptyToken, startWithToken(&fx, a, ""));
-    try std.testing.expectError(error.TokenCharset, startWithToken(&fx, a, "with space"));
-    try std.testing.expectError(error.TokenCharset, startWithToken(&fx, a, "line\r\nX-Injected: 1"));
+    try std.testing.expectError(error.EmptyToken, startSurface(&fx, a, .{ .version = VERSION, .token = "" }));
+    try std.testing.expectError(error.TokenCharset, startSurface(&fx, a, .{ .version = VERSION, .token = "with space" }));
+    try std.testing.expectError(error.TokenCharset, startSurface(&fx, a, .{ .version = VERSION, .token = "line\r\nX-Injected: 1" }));
 }
 
-fn startWithToken(fx: *Fixture, a: std.mem.Allocator, token: []const u8) !void {
+test "#253 WebServer.start itself refuses an unauthenticated non-loopback surface, before any socket" {
+    const a = std.testing.allocator;
+    var fx = Fixture.init(a);
+    defer {
+        fx.inbox.deinit();
+        fx.journal.deinit();
+    }
+
+    // A port nothing listens on any more: reserved on loopback, then released.
+    const reserved = try pnet.listenLoopback(0, 1);
+    const port = reserved.port;
+    pnet.closeSocket(reserved.sock);
+
+    try std.testing.expectError(error.UnauthenticatedNonLoopback, startSurface(&fx, a, .{
+        .address = try pnet.parseIpLiteral("0.0.0.0", port),
+        .version = VERSION,
+    }));
+    // A wildcard listener on that port would also take loopback connections.
+    switch (pnet.loopbackListenState(port)) {
+        .listening => return error.TestUnexpectedResult,
+        .not_listening => {},
+        .unknown => try std.testing.expectError(error.ConnectFailed, pnet.connectLoopback(port)),
+    }
+    // `::`, and an address this host does not own (TEST-NET-1): bind would
+    // fail on the latter, so this error can only come from the check before it.
+    try std.testing.expectError(error.UnauthenticatedNonLoopback, startSurface(&fx, a, .{
+        .address = try pnet.parseIpLiteral("::", 0),
+        .version = VERSION,
+    }));
+    try std.testing.expectError(error.UnauthenticatedNonLoopback, startSurface(&fx, a, .{
+        .address = try pnet.parseIpLiteral("192.0.2.1", 0),
+        .version = VERSION,
+    }));
+}
+
+/// Start a server for `surface` on the fixture and stop it again at once.
+fn startSurface(fx: *Fixture, a: std.mem.Allocator, surface: Surface) !void {
     fx.wb = WebBackend.init(a, &fx.journal);
     defer fx.wb.deinit();
-    const srv = try WebServer.start(a, .{ .version = VERSION, .token = token }, .{
+    const srv = try WebServer.start(a, surface, .{
         .journal = &fx.journal,
         .web_backend = &fx.wb,
         .inbox = &fx.inbox,

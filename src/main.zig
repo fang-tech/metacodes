@@ -2968,11 +2968,17 @@ pub fn resolveWebSurface(config: *types.Config, env: WebEnv, allocator: std.mem.
 }
 
 /// The HTTP surface `--web`/`serve` start with: the resolved bind address on
-/// `port`, the token, and the text `--version` prints for `GET /health`.
+/// `port`, the token, the operator's `--web-allow-unauth`, and the text
+/// `--version` prints for `GET /health`.
 fn webSurface(config: *const types.Config, port: u16, version: []const u8) web_server.Surface {
     var address = config.web_bind orelse platform_net.loopback(port);
     address.setPort(port);
-    return .{ .address = address, .token = config.web_token, .version = version };
+    return .{
+        .address = address,
+        .token = config.web_token,
+        .allow_unauth = config.web_allow_unauth,
+        .version = version,
+    };
 }
 
 /// 读 stdin 全部内容（headless `-` 模式）。EOF 即停;读错误显式报错(不把

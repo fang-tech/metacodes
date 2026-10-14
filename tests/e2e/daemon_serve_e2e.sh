@@ -58,9 +58,11 @@ stop_daemon "$TMP/plain.out"
 
 # ── 2. bearer token (environment) on an IPv6 loopback bind ──────────────────
 token="e2e-$(python3 -c 'import secrets; print(secrets.token_hex(16))')"
-bind="127.0.0.1"
-if python3 -c 'import socket; s = socket.socket(socket.AF_INET6); s.bind(("::1", 0))' 2>/dev/null; then
-  bind="::1"
+bind="::1"
+# A v4-only host (many containers) has no ::1: skip only the IPv6 part.
+if ! python3 -c 'import socket; s = socket.socket(socket.AF_INET6); s.bind(("::1", 0))' 2>/dev/null; then
+  echo "SKIP: IPv6 bind (no ::1 on this host); the token checks run on 127.0.0.1"
+  bind="127.0.0.1"
 fi
 start_daemon "$TMP/token.out" METACODES_WEB_TOKEN="$token" "$BIN" serve 0 --web-bind "$bind" --api-key test --base-url "$BASE_URL"
 wait_listening "$TMP/token.out"
@@ -94,4 +96,4 @@ stop_daemon "$TMP/token.out"
 expect_refusal "$TMP/refuse-flag.out" "$BIN" serve 0 --web-bind 0.0.0.0 --api-key test --base-url "$BASE_URL"
 expect_refusal "$TMP/refuse-env.out" METACODES_WEB_BIND=:: "$BIN" serve 0 --api-key test --base-url "$BASE_URL"
 
-echo "PASS: daemon e2e — /health, message→agent_loop→journal→SSE, /state·/command, bearer token, IPv6 bind, non-loopback refusal, SIGINT shutdown"
+echo "PASS: daemon e2e — /health, message→agent_loop→journal→SSE, /state·/command, bearer token, bind $bind, non-loopback refusal, SIGINT shutdown"

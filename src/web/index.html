@@ -118,14 +118,15 @@
 <script>
 "use strict";
 // Bearer token (server started with --web-token / METACODES_WEB_TOKEN). The page is opened
-// as /?token=<t> (the server needs it to serve this page) or with #token=<t>; read it once,
-// then drop it from the address bar so it does not stay in history or get copied along.
-// URLSearchParams would turn a literal "+" into a space, so decode the raw value instead.
+// as /?token=<t>: the server only serves this page to a request that carries the token, and
+// a URL fragment never reaches it. Read the token once, then drop the query from the address
+// bar so it does not stay in history or get copied along. URLSearchParams would turn a
+// literal "+" into a space, so decode the raw value instead.
 const TOKEN = (() => {
-  const take = (s) => { const m = /(?:^|[?#&])token=([^&#]*)/.exec(s); if (!m) return ""; try { return decodeURIComponent(m[1]); } catch { return ""; } };
-  const t = take(location.hash) || take(location.search);
-  if (/(?:^|[?#&])token=/.test(location.search + location.hash)) history.replaceState(null, "", location.pathname);
-  return t;
+  const m = /(?:^|[?&])token=([^&#]*)/.exec(location.search);
+  if (!m) return "";
+  history.replaceState(null, "", location.pathname);
+  try { return decodeURIComponent(m[1]); } catch { return ""; }
 })();
 // Every API call carries the token as a Bearer header (a POST is never authenticated by query).
 function api(path, init) {

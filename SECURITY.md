@@ -36,7 +36,12 @@ the session's directories, and answer its permission questions. The rules
   or logged. It travels in clear text: across a network, put the server behind
   TLS (a reverse proxy or a gateway). A browser opened with `/?token=<token>`
   removes it from the address bar; it remains in that request's line, so keep
-  proxy access logs private.
+  proxy access logs private. `METACODES_WEB_TOKEN` stays in the process
+  environment, so every command the session runs (Bash, hooks, MCP servers,
+  process teammates) inherits it, exactly as it inherits provider keys:
+  metacodes never edits its libc environment after startup, because that
+  environment block is borrowed and an `unsetenv` could leave a dangling read
+  (see `src/core/auth.zig`).
 - **Bind.** `--web-bind` / `METACODES_WEB_BIND` may name any IP literal. A
   non-loopback address is refused at startup unless a token is set or
   `--web-allow-unauth` is given; the latter hands the session to anyone who

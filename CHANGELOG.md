@@ -70,8 +70,8 @@ status, compatibility boundaries, and entry points are defined by
   but `/health` require `Authorization: Bearer <token>`; a GET may pass
   `?token=` (EventSource, opening the browser UI), a POST may not. A wrong or
   missing token is `401` with `WWW-Authenticate: Bearer`, decided before any
-  request body is read and compared in constant time. The bundled UI reads
-  the token from `?token=` or `#token=`, drops it from the address bar and
+  request body is read and compared in constant time. The bundled UI is
+  opened as `/?token=<token>`; it drops the token from the address bar and
   sends it on every request. Without a token, requests whose `Host` is not a
   loopback name are now refused (DNS rebinding), and a POST's `Origin` is
   compared with its own `Host` (`[::1]` and TLS-terminating proxies work).

@@ -35,7 +35,8 @@
 //! Trust model: by default the server binds 127.0.0.1 without a token, the
 //! same trust level as the TUI on this machine (single user). Any other bind
 //! address (#253) needs a token or the operator's explicit
-//! `--web-allow-unauth`; main refuses to start otherwise (`checkExposure`).
+//! `--web-allow-unauth` (`checkExposure`): main refuses to start otherwise,
+//! and `WebServer.start` refuses again before it opens a socket.
 //! The daemon's UDS transport (daemon/uds.zig) keeps file-mode 0600 as its
 //! only access control and takes no token.
 
@@ -91,9 +92,12 @@ pub fn validateToken(token: []const u8) TokenError!void {
 pub const Surface = struct {
     /// IP literal to bind; its port is the requested one (0 = kernel-assigned).
     address: net.IpAddress = net.loopback(0),
-    /// Bearer token every route but `GET /health` requires; null = none. Main
-    /// allows null only on a loopback address unless `--web-allow-unauth`.
+    /// Bearer token every route but `GET /health` requires; null = none, which
+    /// `start` accepts only on a loopback address unless `allow_unauth`.
     token: ?[]const u8 = null,
+    /// `--web-allow-unauth`: the operator accepts a non-loopback address
+    /// without a token.
+    allow_unauth: bool = false,
     /// What `metacodes --version` prints (semver, plus `+commit` on dev
     /// builds), reported by `GET /health` so an orchestrator can check the
     /// running release.
@@ -215,10 +219,13 @@ pub const WebServer = struct {
     deps: Deps,
 
     /// 绑 surface.address(端口 0 = 内核分配,读回真实端口)并起 accept 线程。
-    /// The exposure rule (`checkExposure`) is main's to enforce before this;
-    /// a malformed token is refused here too.
+    /// Main refuses an unauthenticated non-loopback surface before anything
+    /// starts; `start` refuses it again, before any socket exists, so no other
+    /// host of this server can expose a session by mistake. A malformed token
+    /// is refused here too.
     pub fn start(allocator: std.mem.Allocator, surface: Surface, deps: Deps) !*WebServer {
         if (surface.token) |token| try validateToken(token);
+        try checkExposure(surface.address, surface.token, surface.allow_unauth);
         // 可移植 listen(POSIX socket/Windows WSAStartup+ws2_32),内部含 REUSEADDR+getsockname。
         const l = try net.listenAddress(surface.address, 16);
         errdefer net.closeSocket(l.sock);
