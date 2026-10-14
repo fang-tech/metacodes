@@ -2553,6 +2553,21 @@ pub fn build(b: *std.Build) void {
             eval_test_cmd.step.dependOn(b.getInstallStep());
             eval_test_cmd.setEnvironmentVariable("METACODES_NATIVE_E2E_BIN", b.getInstallPath(.bin, exe.out_filename));
         }
+        // The daemon HTTP surface end to end: the installed product's `serve`
+        // and `serve --sessions 2 --uds` against a loopback mock provider
+        // (paid=0, external network=0, kernel-picked ports, TinyKG autostart
+        // off): /health, bearer token, bind address, the non-loopback
+        // refusal, routing, UDS, SIGINT shutdown. Unwired, both scripts rotted
+        // (fixed ports, a `/mode plan` that no longer exists). POSIX only:
+        // they are bash, use curl and Unix-domain sockets, and send SIGINT.
+        if (@import("builtin").os.tag != .windows) {
+            for ([_][]const u8{ "tests/e2e/daemon_serve_e2e.sh", "tests/e2e/daemon_serve_multi_e2e.sh" }) |script| {
+                const daemon_e2e = b.addSystemCommand(&.{ "bash", script });
+                daemon_e2e.step.dependOn(b.getInstallStep());
+                daemon_e2e.setEnvironmentVariable("METACODES_DAEMON_E2E_BIN", b.getInstallPath(.bin, exe.out_filename));
+                test_step.dependOn(&daemon_e2e.step);
+            }
+        }
         // The native project-Harness suites (E3 runtime and templates, the
         // E2 evolution lifecycle, the calibration matrix) run the installed
         // product, both zero-provider drivers, the project kernel and the

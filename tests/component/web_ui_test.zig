@@ -71,7 +71,7 @@ const Fixture = struct {
                 return allocator.dupe(u8, "{}");
             }
         };
-        self.srv = try WebServer.start(a, 0, .{
+        self.srv = try WebServer.start(a, .{ .version = "web-ui-test" }, .{
             .journal = &self.journal,
             .web_backend = &self.wb,
             .inbox = &self.inbox,
@@ -272,7 +272,7 @@ test "L2 web: /command 端点经 commandFn 入队 + extractStringKey" {
     };
     S.box = &cmdbox;
     var dummy: u8 = 0;
-    const srv = try WebServer.start(a, 0, .{
+    const srv = try WebServer.start(a, .{ .version = "web-ui-test" }, .{
         .journal = &j,
         .web_backend = &wb,
         .inbox = &inbox,
@@ -398,7 +398,7 @@ test "L2 web: /interrupt 空闲期 409 不打 abort;生成期 200 打 abort" {
         }
     };
     var dummy: u8 = 0;
-    const srv = try WebServer.start(a, 0, .{
+    const srv = try WebServer.start(a, .{ .version = "web-ui-test" }, .{
         .journal = &j,
         .web_backend = &wb,
         .inbox = &inbox,
@@ -460,7 +460,7 @@ test "L2 web:MAX_CONNS 连接上限——第 N+1 条被立即拒绝(close),存�
 /// SSE request with a raw header block (e.g. Last-Event-ID).
 fn sseWithHeaders(a: std.mem.Allocator, port: u16, path: []const u8, headers: []const u8, needle: []const u8) ![]u8 {
     var req_buf: [512]u8 = undefined;
-    const req = try std.fmt.bufPrint(&req_buf, "GET {s} HTTP/1.1\r\nHost: l\r\n{s}\r\n", .{ path, headers });
+    const req = try std.fmt.bufPrint(&req_buf, "GET {s} HTTP/1.1\r\nHost: 127.0.0.1\r\n{s}\r\n", .{ path, headers });
     return roundtrip(a, port, req, needle);
 }
 
@@ -539,13 +539,13 @@ test "L2 web: 本 journal 的游标照常续接,不 resync、不重放已见事�
 
 fn httpGetUntil(a: std.mem.Allocator, port: u16, path: []const u8, needle: []const u8) ![]u8 {
     var req_buf: [256]u8 = undefined;
-    const req = try std.fmt.bufPrint(&req_buf, "GET {s} HTTP/1.1\r\nHost: l\r\n\r\n", .{path});
+    const req = try std.fmt.bufPrint(&req_buf, "GET {s} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n", .{path});
     return roundtrip(a, port, req, needle);
 }
 
 fn httpPost(a: std.mem.Allocator, port: u16, path: []const u8, body: []const u8) ![]u8 {
     var req_buf: [512]u8 = undefined;
-    const req = try std.fmt.bufPrint(&req_buf, "POST {s} HTTP/1.1\r\nHost: l\r\nContent-Length: {d}\r\n\r\n{s}", .{ path, body.len, body });
+    const req = try std.fmt.bufPrint(&req_buf, "POST {s} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: {d}\r\n\r\n{s}", .{ path, body.len, body });
     return roundtrip(a, port, req, null);
 }
 

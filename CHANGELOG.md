@@ -60,6 +60,29 @@ status, compatibility boundaries, and entry points are defined by
   could not reach a pending prompt and a fresh session that resumed the old
   transcript; this is the kernel-side version. `EventJournal` moved from
   `web/` to `core/event_journal.zig` and is exported.
+- `GET /health` on `--web`, `serve` and `serve --sessions` (#251): `200
+  {"status":"ok","version":"<v>","sessions":N}`, unauthenticated and
+  independent of any session, for container liveness and readiness probes.
+  `version` is exactly what `metacodes --version` prints first, so an
+  orchestrator can check the running release against the one it pinned.
+- Bearer-token authentication for that HTTP surface (#252):
+  `METACODES_WEB_TOKEN` (or `--web-token`, visible in `ps`) makes every route
+  but `/health` require `Authorization: Bearer <token>`; a GET may pass
+  `?token=` (EventSource, opening the browser UI), a POST may not. A wrong or
+  missing token is `401` with `WWW-Authenticate: Bearer`, decided before any
+  request body is read and compared in constant time. The bundled UI reads
+  the token from `?token=` or `#token=`, drops it from the address bar and
+  sends it on every request. Without a token, requests whose `Host` is not a
+  loopback name are now refused (DNS rebinding), and a POST's `Origin` is
+  compared with its own `Host` (`[::1]` and TLS-terminating proxies work).
+  Unset, local use is unchanged. The `--uds` transport keeps its 0600
+  socket-file access control.
+- `--web-bind <addr>` / `METACODES_WEB_BIND` (#253): bind the HTTP surface to
+  any IPv4 or IPv6 literal (`0.0.0.0`, `::` dual-stack, `::1`, ...) instead of
+  only `127.0.0.1`; the startup line shows the address actually bound. A
+  non-loopback address without a token exits 2 unless `--web-allow-unauth` is
+  given. Normative rules: [doc/API.md](doc/API.md#web-and-daemon-http-surface);
+  trust model: [SECURITY.md](SECURITY.md#web-and-daemon-trust-model).
 
 ### Changed
 
@@ -143,6 +166,12 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- The daemon end-to-end tests (`tests/e2e/daemon_serve_e2e.sh`,
+  `daemon_serve_multi_e2e.sh`) run again and now run in `zig build test` on
+  POSIX hosts. They still sent `/mode plan`, which no longer exists, and
+  used fixed ports; they now use `/mode dont-ask`, kernel-picked ports, an
+  isolated state root with TinyKG autostart off, and also cover `/health`, the
+  token, an IPv6 bind and the non-loopback refusal.
 - Sockets no longer leak into child processes. The `--web`, OAuth callback
   and UDS daemon listeners, and every connection they accepted, were
   inheritable, so each later Bash command, hook, MCP server or browser launch
