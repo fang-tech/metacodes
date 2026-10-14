@@ -143,6 +143,16 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- `zig build eval:rule-author-build` and `eval:project-rule-mac-pilot` build
+  again. Both had stopped compiling on 2026-10-01, when the state root became
+  an explicit parameter. The rule-author probe passes no state root, so a
+  missing `METACODES_API_KEY_FD` fails it instead of a stored login paying.
+  The pilot's simulated TinyKG daemon was also stale against the client: it
+  reported store format 2 instead of 3, and lacked the `set-node-property`
+  project binding that snapshots need since 2026-08-18. It now reads the
+  expected versions from `src/kg/client.zig` and checks the binding before
+  serving a snapshot. `zig build test` compiles both drivers on POSIX hosts
+  and runs the zero-paid pilot on macOS.
 - Sockets no longer leak into child processes. The `--web`, OAuth callback
   and UDS daemon listeners, and every connection they accepted, were
   inheritable, so each later Bash command, hook, MCP server or browser launch

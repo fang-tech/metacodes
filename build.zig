@@ -2278,6 +2278,23 @@ pub fn build(b: *std.Build) void {
     // Built by nothing else in the suite; compiling it here keeps it in step
     // with the runtime API it calls.
     test_step.dependOn(&jev_recall_eval_driver.step);
+    // The same holds for the rule-author probe and the project-rule pilot:
+    // left to their eval steps, both stopped compiling when the state root
+    // became an explicit parameter and nothing noticed. Check-only compiles
+    // (no binary is requested, so no code generation). The pilot is zero-paid
+    // and hermetic, so macOS also runs it: a drifted TinyKG daemon or provider
+    // contract fails here rather than on the next manual run.
+    if (@import("builtin").os.tag != .windows) {
+        test_step.dependOn(&b.addExecutable(.{
+            .name = "rule-author-feasibility-check",
+            .root_module = rule_author_trial_mod,
+        }).step);
+        test_step.dependOn(&b.addExecutable(.{
+            .name = "project-rule-mac-pilot-check",
+            .root_module = project_rule_mac_pilot_mod,
+        }).step);
+    }
+    if (@import("builtin").os.tag == .macos) test_step.dependOn(&project_rule_mac_pilot_run.step);
     test_step.dependOn(release_test_step);
     test_step.dependOn(http_status_gate_step);
     test_step.dependOn(subsystem_boundary_step);
