@@ -3851,7 +3851,12 @@ fn handleAgents(app: *app_mod.App) !void {
                 std.debug.print("    model: {s}\n", .{a.model});
             }
             if (a.permission_mode) |m| {
-                std.debug.print("    permissionMode: {s}\n", .{@tagName(m)});
+                const agent_tool = @import("../tools/agent.zig");
+                const refused = !app.permission_ctx.modeAllowed(agent_tool.mapPermissionMode(m));
+                std.debug.print("    permissionMode: {s}{s}\n", .{
+                    @tagName(m),
+                    if (refused) " \x1b[33m(disabled by settings; runs as default)\x1b[0m" else "",
+                });
             }
             if (a.preload_skills.len > 0) {
                 std.debug.print("    preloaded skills: ", .{});

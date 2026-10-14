@@ -105,6 +105,8 @@ pub const DecisionOverride = struct {
 };
 
 pub const Context = struct {
+    /// The mode as it was put on the context. `checkClassified` decides under
+    /// `effectiveMode(mode, settings)`, never under this field directly.
     mode: Mode,
     /// 旧 schema rule_set(保留兼容,新代码用 settings)。
     rules: ?*const rule_matcher.RuleSet = null,
@@ -142,6 +144,19 @@ pub const Context = struct {
     /// Bash 免询问判定同理:命令先按 bash.zig 的方式 unescape 再判;null → 栈上定长缓冲。
     path_check_allocator: ?std.mem.Allocator = null,
 };
+
+/// The mode a permission decision runs under: `mode`, or `default` when the
+/// settings disable it (`disableBypassPermissionsMode`, `disableAutoMode`;
+/// MergedSettings.allowsMode). Setters already refuse such a mode
+/// (SessionService.setPermMode, AgentSession.setPermissionMode) and spawns
+/// clamp an AgentDef's or a forked Skill's override; this is the backstop for
+/// every path that still puts one on a context — a setter that does not ask,
+/// a `scopedDerive` override (it keeps the `settings` pointer), a direct store.
+/// The alias is preserved when allowed (`bypass` stays `bypass`).
+pub fn effectiveMode(mode: Mode, settings: ?*const settings_mod.MergedSettings) Mode {
+    const merged = settings orelse return mode;
+    return if (merged.allowsMode(mode)) mode else .default;
+}
 
 fn resolveImported(
     ctx: *const Context,
@@ -193,6 +208,14 @@ pub fn checkClassified(
     args: []const u8,
     category_override: ?category.ToolCategory,
 ) Decision {
+    // The only mode this decision reads (steps 4 and 5 below). A mode the settings
+    // disable never reaches them: it is decided exactly as `default` is.
+    const mode = effectiveMode(ctx.mode, ctx.settings);
+    if (mode != ctx.mode) log.debug("permission", "mode {s} is disabled by settings; deciding tool={s} as default", .{
+        @tagName(ctx.mode),
+        tool_name,
+    });
+
     // -1. 最高优先:PreToolUse hook(deny-first)。任一 hook block → deny,
     //     hook 看不到的工具(matcher 不匹配)直接 proceed 到下层。
     if (ctx.hooks) |h| {
@@ -311,7 +334,7 @@ pub fn checkClassified(
     //    b. autoAllowBashIfSandboxed 且本次调用**确实**进沙箱(sandbox_exec.plan)→ ALLOW
     //    其余落到下方模式兜底(default/acceptEdits/auto 下即 ask)。
     if (std.mem.eql(u8, tool_name, "Bash")) {
-        const m4 = @import("mode.zig").canonical(ctx.mode);
+        const m4 = @import("mode.zig").canonical(mode);
         if (m4 != .dont_ask and bashAutoAllowed(ctx, args)) return .allow;
     }
 
@@ -325,7 +348,7 @@ pub fn checkClassified(
     };
 
     const mode_mod = @import("mode.zig");
-    const m = mode_mod.canonical(ctx.mode);
+    const m = mode_mod.canonical(mode);
     const decision: Decision = blk: {
         if (m == .bypass_permissions) break :blk .allow;
         if (m == .auto) break :blk if (risk == .low) .allow else .ask;
@@ -364,7 +387,7 @@ pub fn checkClassified(
 
     log.debug("permission", "decide tool={s} mode={s} category={s} risk={s} -> {s}", .{
         tool_name,
-        @tagName(ctx.mode),
+        @tagName(mode),
         @tagName(cat),
         @tagName(risk),
         @tagName(decision),
@@ -909,4 +932,108 @@ test "accept_edits: 无 cwd 信息或无路径参数保持旧 allow(最小上下
     // 有 cwd 但无路径参数(malformed,execute 层会报 MissingRequiredField)→ allow 不打扰用户
     const ctx = Context{ .mode = .accept_edits, .match_ctx = .{ .cwd = "/proj" } };
     try std.testing.expect(check(&ctx, "Write", "{\"content\":\"x\"}") == .allow);
+}
+
+test "effectiveMode: a mode the settings disable is default; others and aliases pass through" {
+    const no_rules: []const settings_mod.Rule = &.{};
+    const off_layers = [_]settings_mod.Layer{.{
+        .source = .managed,
+        .allow = no_rules,
+        .ask = no_rules,
+        .deny = no_rules,
+        .disable_bypass_permissions_mode = true,
+        .disable_auto_mode = true,
+    }};
+    const off = settings_mod.MergedSettings{ .layers = &off_layers, .allocator = std.testing.allocator };
+    const plain_layers = [_]settings_mod.Layer{.{ .source = .managed, .allow = no_rules, .ask = no_rules, .deny = no_rules }};
+    const plain = settings_mod.MergedSettings{ .layers = &plain_layers, .allocator = std.testing.allocator };
+
+    try std.testing.expectEqual(Mode.default, effectiveMode(.bypass_permissions, &off));
+    try std.testing.expectEqual(Mode.default, effectiveMode(.bypass, &off));
+    try std.testing.expectEqual(Mode.default, effectiveMode(.auto, &off));
+    try std.testing.expectEqual(Mode.accept_edits, effectiveMode(.accept_edits, &off));
+    try std.testing.expectEqual(Mode.dont_ask, effectiveMode(.dont_ask, &off));
+    try std.testing.expectEqual(Mode.prompt, effectiveMode(.prompt, &off));
+    // Allowed: the value is untouched, alias included.
+    try std.testing.expectEqual(Mode.bypass_permissions, effectiveMode(.bypass_permissions, &plain));
+    try std.testing.expectEqual(Mode.bypass, effectiveMode(.bypass, &plain));
+    try std.testing.expectEqual(Mode.auto, effectiveMode(.auto, &plain));
+    try std.testing.expectEqual(Mode.bypass_permissions, effectiveMode(.bypass_permissions, null));
+}
+
+test "a mode the settings disable is decided exactly as default; allowed, it keeps its own decisions" {
+    const a = std.testing.allocator;
+    const no_rules: []const settings_mod.Rule = &.{};
+    const off_layers = [_]settings_mod.Layer{
+        .{ .source = .user, .allow = no_rules, .ask = no_rules, .deny = no_rules },
+        .{ .source = .managed, .allow = no_rules, .ask = no_rules, .deny = no_rules, .disable_bypass_permissions_mode = true, .disable_auto_mode = true },
+    };
+    const off = settings_mod.MergedSettings{ .layers = &off_layers, .allocator = a };
+    const plain_layers = [_]settings_mod.Layer{.{ .source = .user, .allow = no_rules, .ask = no_rules, .deny = no_rules }};
+    const plain = settings_mod.MergedSettings{ .layers = &plain_layers, .allocator = a };
+    const sandbox = sandbox_config.SandboxSettings{ .enabled = true, .auto_allow_bash_if_sandboxed = true };
+
+    const Call = struct { tool: []const u8, args: []const u8, cat: ?category.ToolCategory = null };
+    const calls = [_]Call{
+        .{ .tool = "Read", .args = "{\"file_path\":\"/proj/a.txt\"}" },
+        .{ .tool = "Glob", .args = "{\"pattern\":\"*\"}" },
+        .{ .tool = "Write", .args = "{\"file_path\":\"/proj/a.txt\",\"content\":\"x\"}" },
+        .{ .tool = "Write", .args = "{\"file_path\":\"/elsewhere/a.txt\",\"content\":\"x\"}" },
+        .{ .tool = "Write", .args = "{\"file_path\":\"/proj/.env\",\"content\":\"x\"}" },
+        .{ .tool = "Edit", .args = "{\"file_path\":\"/proj/a.txt\"}" },
+        .{ .tool = "NotebookEdit", .args = "{\"notebook_path\":\"/proj/n.ipynb\"}" },
+        .{ .tool = "ApplyPatch", .args = "{\"patch\":\"x\"}" },
+        .{ .tool = "Bash", .args = "{\"command\":\"ls\"}" },
+        .{ .tool = "Bash", .args = "{\"command\":\"npm install\"}" },
+        .{ .tool = "Bash", .args = "{\"command\":\"npm install\",\"dangerouslyDisableSandbox\":true}" },
+        .{ .tool = "WebFetch", .args = "{\"url\":\"https://example.com\"}" },
+        .{ .tool = "mcp__srv__run", .args = "{}", .cat = .execute },
+        .{ .tool = "mcp__srv__put", .args = "{}", .cat = .write },
+    };
+    const base = Context{
+        .mode = .default,
+        .settings = &off,
+        .match_ctx = .{ .cwd = "/proj", .alloc = a },
+        .sandbox = &sandbox,
+        .path_check_allocator = a,
+    };
+    for ([_]Mode{ .bypass_permissions, .bypass, .auto }) |forbidden_mode| {
+        var forbidden = base;
+        forbidden.mode = forbidden_mode;
+        for (calls) |call| {
+            const as_default = checkClassified(&base, call.tool, call.args, call.cat);
+            const got = checkClassified(&forbidden, call.tool, call.args, call.cat);
+            std.testing.expectEqual(as_default, got) catch |err| {
+                std.debug.print("mode={s} tool={s} args={s}\n", .{ @tagName(forbidden_mode), call.tool, call.args });
+                return err;
+            };
+        }
+    }
+
+    // Twin: the same settings minus the two switches change nothing — each mode
+    // decides as it does with no settings at all, and bypass is not default.
+    for ([_]Mode{ .bypass_permissions, .bypass, .auto }) |allowed_mode| {
+        var with_plain = base;
+        with_plain.mode = allowed_mode;
+        with_plain.settings = &plain;
+        var without = with_plain;
+        without.settings = null;
+        for (calls) |call| try std.testing.expectEqual(
+            checkClassified(&without, call.tool, call.args, call.cat),
+            checkClassified(&with_plain, call.tool, call.args, call.cat),
+        );
+    }
+    var bypass_allowed = base;
+    bypass_allowed.mode = .bypass_permissions;
+    bypass_allowed.settings = &plain;
+    var bypass_forbidden = bypass_allowed;
+    bypass_forbidden.settings = &off;
+    for ([_]Call{
+        .{ .tool = "Write", .args = "{\"file_path\":\"/proj/a.txt\",\"content\":\"x\"}" },
+        .{ .tool = "Bash", .args = "{\"command\":\"npm install\",\"dangerouslyDisableSandbox\":true}" },
+        .{ .tool = "mcp__srv__run", .args = "{}", .cat = .execute },
+    }) |call| {
+        try std.testing.expectEqual(Decision.allow, checkClassified(&bypass_allowed, call.tool, call.args, call.cat));
+        try std.testing.expectEqual(Decision.ask, checkClassified(&bypass_forbidden, call.tool, call.args, call.cat));
+    }
 }

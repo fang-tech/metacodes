@@ -430,8 +430,9 @@ pub const Runtime = struct {
         defer self.allocator.free(tool_names);
         for (definitions, tool_names) |definition, *name| name.* = definition.name;
 
+        // The frame records the mode decisions run under (never one the settings disable).
         const permission_mode = if (ctx.permission_ctx) |permission|
-            permission.mode.load(.acquire)
+            permission.effectiveMode()
         else
             .default;
         const match_context = if (ctx.permission_ctx) |permission|
@@ -622,7 +623,7 @@ pub fn handleSlash(
     defer allocator.free(user_message);
 
     if (record.definition.context == .fork) {
-        const final_text = executeFork(
+        const fork = executeFork(
             &app.skill_runtime,
             &tool_context,
             activation,
@@ -633,7 +634,12 @@ pub fn handleSlash(
             );
             return .handled;
         };
+        const final_text = fork.text;
         defer allocator.free(final_text);
+        if (fork.refused_mode) |refused| std.debug.print(
+            "\x1b[33m/{s}: {s}\x1b[0m\n",
+            .{ head, agent_tool.modeNotice(refused) },
+        );
         app.skill_runtime.finishActivation(
             app.session_id,
             activation,
@@ -764,15 +770,22 @@ fn executeModelTool(
         return error.SkillNotFound;
 
     if (record.definition.context == .fork) {
-        const final_text = try executeFork(self, ctx, activation);
-        defer ctx.allocator.free(final_text);
+        const fork = try executeFork(self, ctx, activation);
+        defer ctx.allocator.free(fork.text);
         try self.finishActivation(ctx.agent_ident, activation);
         activation_live = false;
+        // A refused permissionMode leads the result, so the parent learns the
+        // fork ran as default rather than in the mode the agent asks for.
+        const noticed: ?[]u8 = if (fork.refused_mode) |refused|
+            try std.fmt.allocPrint(ctx.allocator, "[{s}]\n\n{s}", .{ agent_tool.modeNotice(refused), fork.text })
+        else
+            null;
+        defer if (noticed) |text| ctx.allocator.free(text);
         return formatSkillResult(
             ctx.allocator,
             record.definition.name,
             activation,
-            final_text,
+            noticed orelse fork.text,
             true,
         );
     }
@@ -811,11 +824,18 @@ fn formatSkillResult(
     return runtime.model_tool.formatResult(allocator, display_name, with_base, false);
 }
 
+/// A forked Skill's outcome: the child's final text (owned by `ctx.allocator`)
+/// and the bound agent's `permissionMode` when the parent's settings refused it.
+const ForkOutput = struct {
+    text: []u8,
+    refused_mode: ?@import("../agents/def.zig").PermissionMode = null,
+};
+
 fn executeFork(
     self: *Runtime,
     ctx: *const ToolContext,
     activation: *const runtime.activation.Activation,
-) ![]u8 {
+) !ForkOutput {
     const api_client = ctx.api_client orelse return error.ForkUnavailable;
     const tool_defs = ctx.tool_defs orelse return error.ForkUnavailable;
     const permission = ctx.permission_ctx orelse return error.ForkUnavailable;
@@ -871,11 +891,13 @@ fn executeFork(
         agent_tool_cap.executionPolicy()
     else
         activation.frame.executionPolicy();
-    const mode_override: ?@import("../types.zig").PermissionMode = if (named_agent) |agent|
-        (if (agent.permission_mode) |mode| agent_tool.mapPermissionMode(mode) else null)
+    // The bound agent's permissionMode, unless the parent's settings disable it
+    // (then the fork runs as default and the result says so).
+    const mode_override: agent_tool.ModeOverride = if (named_agent) |agent|
+        agent_tool.resolvePermissionMode(permission, agent.name, agent.permission_mode)
     else
-        null;
-    var child_permission = permission.scopedDerive(mode_override);
+        .{};
+    var child_permission = permission.scopedDerive(mode_override.mode);
     child_permission.active_skill = null;
     const child_ident = session_id.gen();
     try self.registerChildContext(
@@ -924,7 +946,7 @@ fn executeFork(
         ctx.allocator.free(output);
         return error.CoreError;
     };
-    return output;
+    return .{ .text = output, .refused_mode = mode_override.refused };
 }
 
 fn shellPolicy(ctx: *const ToolContext) @import("../core/workspace_policy.zig").ShellPolicy {
