@@ -515,24 +515,44 @@ serializes byte-identically to before.
 
 `metacodes --web [port]` (one session with the bundled browser UI),
 `metacodes serve [port]` (one session) and `metacodes serve --sessions N
-[--uds <path>] [port]` (N static sessions) serve one HTTP/1.1 surface
-(`src/web/server.zig`). Port 0 lets the kernel pick; the startup line prints
-the address actually bound, `<label>: http://<address>:<port>  (Ctrl+C to quit)`.
+[--max-sessions M] [--uds <path>] [port]` (the multi-session daemon: N
+sessions at startup, N ≥ 0, then created and destroyed over HTTP, at most M
+live) serve one HTTP/1.1 surface (`src/web/server.zig`). Port 0 lets the
+kernel pick; the startup line prints the address actually bound,
+`<label>: http://<address>:<port>  (Ctrl+C to quit)`.
 
 **Endpoints.** With one session the routes below sit at the root; with
-`--sessions N` (or `--uds`) every session route is under `/s/<id>/` and an
-unknown id is 404. Bodies are JSON unless noted.
+`--sessions N` (any N, 1 included) or `--uds` every session route is under
+`/s/<id>/`, and an unknown id, or one being destroyed, is 404. Bodies are JSON
+unless noted.
 
 | Method and path | Purpose |
 |---|---|
-| `GET /health` | Liveness probe: `200 {"status":"ok","version":"<v>","sessions":N}`. `<v>` is the version `metacodes --version` prints on its first line (the semver, plus `+<commit12>` on a development build); `N` is 1, or the number of sessions the daemon hosts. Never under `/s/<id>/`, never authenticated, and it reads no session, journal or lock. |
-| `GET /` | The bundled single-session browser UI; in the `/s/<id>/` daemon, a page listing the session ids and these endpoints. |
+| `GET /health` | Liveness probe: `200 {"status":"ok","version":"<v>","sessions":N}`. `<v>` is the version `metacodes --version` prints on its first line (the semver, plus `+<commit12>` on a development build); `N` is 1, or the number of live sessions the daemon hosts. Never under `/s/<id>/`, never authenticated, and it reads no session, journal or lock. |
+| `GET /` | The bundled single-session browser UI; in the `/s/<id>/` daemon, a page listing the live session ids and these endpoints. |
 | `GET /events` | SSE stream of the session's wire lines ([Wire lines](#wire-lines-for-out-of-process-hosts): ids `<epoch>-<seq>`, `Last-Event-ID` or `?since=<seq>&epoch=<epoch>`, `event: resync`). |
 | `POST /message` | `{"text":"..."}`: queue a prompt; echoed as `user_message`. |
 | `POST /respond` | `{"id":N,...}`: answer the pending `ui_request` N; 409 when N is not pending. |
 | `POST /command` | `{"cmd":"/verb ..."}`: queue a [service verb](#session-command-surface-ui-neutral); the result arrives as `command_result`. |
 | `POST /interrupt` | Interrupt the running generation; 409 when idle. |
 | `GET /state` | Session snapshot (model, mode, usage, journal epoch and seq, ...). |
+
+**Session lifecycle (multi-session daemon only, #254).** These routes sit at
+the top level, never under `/s/<id>/`, and go through the same admission
+(token, `Host`, `Origin`) as every other route. On `--web` and the
+single-session `serve` they are 404. A session id is 24 lowercase hex
+characters.
+
+| Method and path | Result |
+|---|---|
+| `GET /sessions` | `200 {"sessions":[{"session_id","generating","model","permission_mode","pending_request_id"}]}`, live sessions in id order (ids sort by creation time). The fields are read the way `/state` reads them; `pending_request_id` is the pending `ui_request` id, 0 when none. |
+| `POST /sessions/create` | Body empty or `{"session_id"?:"<id>","resume"?:bool}`. `201 {"session_id":"<id>","messages":N}`: a new session (the given id, or a generated one), the same as a startup session; `N` is the number of messages restored, 0 for a fresh one. `"resume":true` rebuilds the conversation persisted under that id (its transcript under the state root, the session's goal and its own model route). `400` for a malformed body or id, or `resume` without `session_id`; `409` when the id is live, when it names a destroyed session that is not freed yet (`{"error":"session is still closing"}`; see destroy), or when a fresh create names an id whose transcript is persisted (restore it with `"resume":true`; a fresh create never overwrites a conversation); `404` when `"resume":true` names an id with no transcript; `429 {"error":"session limit reached","max_sessions":M}` at the cap; `503` while the daemon shuts down. A refused create builds nothing and writes nothing. The request holds its connection for the whole session construction, which starts the session's MCP and language servers and can take seconds; a client that gives up waiting may still have created the session, so after a timed-out create it should look in `GET /sessions` (or create again with its own `session_id`, which answers 409 if the first one landed) and destroy what it does not want. |
+| `POST /sessions/<id>/resume` | `200 {"session_id":"<id>","live":true}` when the session is live, `404` otherwise; it loads nothing (a caller restores with `create {"resume":true}`). |
+| `POST /sessions/<id>/destroy` | `200 {"ok":true,"session_id":"<id>"}` once the session's work has stopped and been joined: its driver (an in-flight run is aborted and its provider request cancelled) and its background work (background agent jobs, swarm teammates, background shell commands); `404` when it is not live. From then on the id resolves nowhere (`/s/<id>/...` is 404); every `GET /s/<id>/events` stream and UDS `attach` receives the aborted run's last events, then `session_lifecycle.closed`, then its transport's close, and ends. The destroy never waits for such readers: the session's memory is freed once the last request using it has finished, normally milliseconds later. Until then the session still owns its directory, and a create with its id answers `409 {"error":"session is still closing"}`; retry. The persisted transcript stays. |
+
+`--max-sessions M` (default 32, M ≥ 1 and ≥ N) caps live sessions; a session
+being destroyed no longer counts. With `--sessions 0` the daemon starts with no
+session. The UDS `list` op lists the same live sessions.
 
 **Admission.** Each request is judged on its head, before any body byte is
 read, in this order:
@@ -572,7 +592,10 @@ code 2 before anything starts and names `METACODES_WEB_TOKEN`. Invalid values
 (a malformed address, an empty or non-ASCII token) also exit 2, and
 `--web-bind`, `--web-token` and `--web-allow-unauth` without `--web` or
 `serve` are argument errors. The environment variables are ignored when no
-web surface is requested.
+web surface is requested. Likewise `--sessions`, `--max-sessions` and `--uds`
+without `serve`, `--max-sessions` without `--sessions` or `--uds`, a
+`--sessions` value that is not a count, `--max-sessions 0`, and N above M exit
+with code 2.
 
 The `--uds` transport of `serve` is not HTTP and takes no token: its access
 control is the socket file's mode 0600 (owner only).
@@ -641,6 +664,37 @@ non-null value with `error.AgentEffortUnsupportedProvider`.
 `accept_edits` auto-approval of Write/Edit/NotebookEdit and sandboxed shell
 writes. It is not named in the system prompt. These two are source-level only;
 AgentCore revision 19 does not carry them.
+
+### Permission modes the settings disable
+
+`disableBypassPermissionsMode` and `disableAutoMode`, in any settings layer,
+are hard constraints on the mode work runs under, not only on what `/mode`
+accepts:
+
+- **Mode switches are refused.** A session that starts in such a mode is
+  downgraded to `default` when the settings load. `/mode` on every surface
+  and the `--web`/`serve` message's `permission_mode` refuse it (see below).
+  `AgentSession.setPermissionMode` returns `error.PermissionModeDisabled` and
+  AgentCore `update_permission_mode` returns `INVALID_ARGUMENT` (diagnostic
+  `PermissionModeDisabled`); the mode, policy generation and grants stay as
+  they were.
+- **Spawns do not apply it.** An AgentDef's `permissionMode` (a Task
+  subagent, a background job, an in-process teammate) and a forked Skill
+  bound to that agent with `agent:` run as `default` instead, and log one
+  warning. The Task result carries `"permission_mode_notice": "permissionMode
+  bypassPermissions is disabled by settings; the subagent runs as default"`,
+  the forked Skill's result opens with the same sentence in brackets, and
+  `/agents` marks the mode `(disabled by settings; runs as default)`.
+- **Decisions never run under it.** Whatever puts such a mode on a permission
+  context, each decision is the one `default` makes
+  (`permission/decision.zig` `effectiveMode`), including the ApplyPatch path
+  gate and the AgentCore fallback for external Tools.
+
+An `AgentSession`'s settings are only the Host-imported rule layer
+(`permission_rules`, `updatePermissionRules`: allow/ask/deny), which has no
+way to disable a mode, so the refusal above cannot trigger for a Session today:
+the Host owns which modes it offers its users and must not pass one it
+forbids. The check is in place for a Session that does carry such settings.
 
 ### Wire lines for out-of-process Hosts
 

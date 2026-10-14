@@ -22,6 +22,7 @@
 
 const std = @import("std");
 const rule_spec = @import("rule_spec.zig");
+const mode_mod = @import("mode.zig");
 
 // ============================================================================
 // Settings 数据结构
@@ -97,6 +98,20 @@ pub const MergedSettings = struct {
     pub fn isAutoModeDisabled(self: *const MergedSettings) bool {
         for (self.layers) |L| if (L.disable_auto_mode) return true;
         return false;
+    }
+
+    /// Whether these settings let anything run in mode `m`.
+    /// `disableBypassPermissionsMode` and `disableAutoMode` (any layer) are
+    /// hard constraints; historical aliases are judged by what they mean
+    /// (`bypass` is bypass_permissions). The single rule behind both
+    /// `PermissionContext.modeAllowed` (setters refuse such a mode) and
+    /// `decision.effectiveMode` (a decision never runs under it).
+    pub fn allowsMode(self: *const MergedSettings, m: mode_mod.Mode) bool {
+        return switch (mode_mod.canonical(m)) {
+            .bypass_permissions => !self.isBypassDisabled(),
+            .auto => !self.isAutoModeDisabled(),
+            else => true,
+        };
     }
 
     /// 收集所有 additionalDirectories

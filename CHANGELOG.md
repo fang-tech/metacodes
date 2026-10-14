@@ -96,6 +96,25 @@ status, compatibility boundaries, and entry points are defined by
   `/command`, poll `/state` and race a busy session before each message.
   `/state`'s `seq`, `permission_mode` and `pending_request_id` are documented
   for reconnecting clients (doc/API.md).
+- Dynamic sessions in the multi-session daemon (#254): `GET /sessions` lists
+  the live sessions (`generating`, `model`, `permission_mode`,
+  `pending_request_id`); `POST /sessions/create` (`{"session_id"?,
+  "resume"?}`) starts one, under the caller's id or a generated one, and with
+  `"resume":true` rebuilds its conversation from the transcript persisted under
+  the state root, so a session survives a container rebuild;
+  `POST /sessions/<id>/resume` answers 200 when the session is live and 404
+  otherwise; `POST /sessions/<id>/destroy` aborts its run and stops its
+  background agent jobs, teammates and background shells, joins them all,
+  ends every SSE stream and UDS attach with `session_lifecycle.closed`, and
+  returns. `serve --sessions 0` starts with no session, and
+  `--max-sessions M` (default 32) caps live sessions, answering 429 beyond it.
+  Requests now hold a counted lease on the session they address for as long
+  as they run (an SSE stream or UDS attach for its whole life); a destroy
+  never waits for one and frees the session after the last is returned; until
+  then its id is refused to a create (409 `session is still closing`). A
+  create holds its connection while the session starts; after a timed-out
+  create, check `GET /sessions`. Normative rules:
+  [doc/API.md](doc/API.md#web-and-daemon-http-surface).
 
 ### Changed
 
@@ -111,7 +130,19 @@ status, compatibility boundaries, and entry points are defined by
   `{"v":1,"type":"config_changed","data":{...}}`, instead of
   `{"config_changed":{...}}`. The bundled page now updates its model and mode
   display from it; a client reading the stream directly must follow.
-
+- `serve --sessions 1` now runs the multi-session daemon (one startup session
+  under `/s/<id>/`, plus the `/sessions` routes), as doc/API.md already
+  described; it used to fall back to the single-session `serve`. Plain `serve`
+  is unchanged. `--sessions` takes a count of 0 or more and rejects anything
+  else (it used to read a bad value as 1), and `--sessions`, `--max-sessions`
+  and `--uds` without `serve` are argument errors (exit 2) instead of being
+  ignored.
+- Destroying or shutting down a daemon session now also cancels its in-flight
+  provider request, so a session whose provider stopped sending stops at once
+  instead of after the stream idle limit (up to 120 s by default). Stopping a
+  background agent job or a swarm teammate (session close, App teardown) now
+  cancels its in-flight provider request too, instead of waiting out that
+  limit.
 - MCP tools are named `mcp__<server>__<tool>` (Claude Code's form, so its
   permission rules and `allowed-tools` lists match); invalid characters become
   `_` and over-long or colliding names get a stable hash suffix. A subagent
@@ -227,6 +258,22 @@ status, compatibility boundaries, and entry points are defined by
   surface (terminal, `--web`/`serve` `POST /command`), leaving the mode
   unchanged, and a `--web`/`serve` message asking for it is refused with
   `message_rejected` before anything else in it is applied.
+- Work could still run under a permission mode the settings disable
+  (`disableBypassPermissionsMode`, `disableAutoMode`) without passing a mode
+  switch: an AgentDef's `permissionMode` (Task subagents, background jobs,
+  in-process teammates) and a forked Skill bound to such an agent applied it
+  as is, so a project `.claude/agents/x.md` with `permissionMode:
+  bypassPermissions` ran a subagent in bypass. Such a spawn now runs as
+  `default`, logs a warning and says so in its result
+  (`permission_mode_notice` on the Task result; a leading line on the forked
+  Skill's result; `/agents` marks the mode). Every permission decision now
+  runs under `default` when the mode on its context is disabled, whatever
+  put it there, including the ApplyPatch path gate and the AgentCore
+  external-Tool fallback. `AgentSession.setPermissionMode` and AgentCore
+  `update_permission_mode` refuse such a mode with
+  `error.PermissionModeDisabled` / `INVALID_ARGUMENT`; an AgentCore Session's
+  settings are the Host-imported rules, which cannot disable a mode, so
+  today the Host owns which modes it offers.
 - `zig build eval:rule-author-build` and `eval:project-rule-mac-pilot` build
   again. Both had stopped compiling on 2026-10-01, when the state root became
   an explicit parameter. The rule-author probe passes no state root, so a

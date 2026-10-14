@@ -147,6 +147,14 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         }
     }
 
+    // permission mode override: the AgentDef's permissionMode, unless the parent's
+    // settings disable it (then default, reported in the result below).
+    const mode_override: ModeOverride = if (def_opt) |d|
+        resolvePermissionMode(perm, d.name, d.permission_mode)
+    else
+        .{};
+    const perm_override = mode_override.mode;
+
     // 准备 effective tool_defs:若 def 存在,filter;否则用父全集
     var effective_tool_defs: []const @import("../json.zig").ToolDefinition = tool_defs;
     var filtered_owned: ?[]@import("../json.zig").ToolDefinition = null;
@@ -178,7 +186,7 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         effective_tool_names = names;
         for (filtered, 0..) |fd, i| names[i] = fd.name;
         const sub_prompt_ctx = tools_mod.PromptContext{
-            .permission_mode = if (d.permission_mode) |m| mapPermissionMode(m) else .default,
+            .permission_mode = mode_override.mode orelse .default,
             .enabled_tool_names = names,
             .agent_type = d.name,
             .include_git = true,
@@ -210,12 +218,6 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         if (def_opt) |d| break :blk d.max_turns;
         break :blk 20;
     };
-
-    // permission mode override
-    var perm_override: ?@import("../types.zig").PermissionMode = null;
-    if (def_opt) |d| {
-        if (d.permission_mode) |m| perm_override = mapPermissionMode(m);
-    }
 
     // model override:Task 工具参数 > AgentDef.model > null(继承父)。
     // "inherit" / 空 / 缺失 → null;档位名(low/mid/high;兼容别名 haiku/sonnet/opus)
@@ -338,6 +340,7 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         try teammate_out.writer.writeAll(",\"agent_id\":");
         try util_json.writeJsonString(&teammate_out.writer, entry.agent_id);
         try teammate_out.writer.writeAll(",\"status\":\"spawned\"");
+        try writeModeNotice(&teammate_out.writer, mode_override.refused);
         if (teammate_worktree_path) |path| {
             try teammate_out.writer.writeAll(",\"worktree_path\":");
             try util_json.writeJsonString(&teammate_out.writer, path);
@@ -408,6 +411,7 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         try util_json.writeJsonString(&background_out.writer, job_id);
         try background_out.writer.writeAll(",\"status\":\"running\",\"subagent_type\":");
         try util_json.writeJsonString(&background_out.writer, subagent_type_raw);
+        try writeModeNotice(&background_out.writer, mode_override.refused);
         if (background_worktree_path) |path| {
             try background_out.writer.writeAll(",\"worktree_path\":");
             try util_json.writeJsonString(&background_out.writer, path);
@@ -574,6 +578,10 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     );
     defer ctx.allocator.free(numeric_tail);
     try out.appendSlice(ctx.allocator, numeric_tail);
+    if (mode_override.refused) |refused| {
+        try out.appendSlice(ctx.allocator, ",\"permission_mode_notice\":");
+        try util_json.serializeString(modeNotice(refused), &out, ctx.allocator);
+    }
     if (agent_worktree != null) {
         try out.appendSlice(ctx.allocator, ",\"worktree_path\":");
         try util_json.serializeString(worktree_path, &out, ctx.allocator);
@@ -594,6 +602,53 @@ pub fn mapPermissionMode(mode: @import("../agents/def.zig").PermissionMode) @imp
         .dontAsk => .dont_ask,
         .bypassPermissions => .bypass_permissions,
     };
+}
+
+/// The permission mode a spawn gives its child for an AgentDef's `permissionMode`
+/// (a Task subagent, background job or in-process teammate, or a forked Skill
+/// bound to that agent).
+pub const ModeOverride = struct {
+    /// null = no `permissionMode`: the child inherits the parent's mode.
+    mode: ?@import("../types.zig").PermissionMode = null,
+    /// The `permissionMode` the parent's settings disable, which was not applied.
+    refused: ?@import("../agents/def.zig").PermissionMode = null,
+};
+
+/// Resolve an AgentDef's `permissionMode` against the parent's settings. A mode the
+/// settings disable (`disableBypassPermissionsMode`, `disableAutoMode`;
+/// PermissionContext.modeAllowed) is not applied: the child runs as `default` —
+/// what the decision-time backstop (permission/decision.zig effectiveMode) would
+/// make of it anyway — and one warning is logged for this spawn. The caller
+/// reports `refused` where the parent can see it (modeNotice).
+pub fn resolvePermissionMode(
+    perm: *const @import("../permission.zig").PermissionContext,
+    agent_name: []const u8,
+    requested: ?@import("../agents/def.zig").PermissionMode,
+) ModeOverride {
+    const def_mode = requested orelse return .{};
+    const mode = mapPermissionMode(def_mode);
+    if (perm.modeAllowed(mode)) return .{ .mode = mode };
+    @import("../util/log.zig").warn(
+        "agent",
+        "subagent '{s}': permissionMode {s} is disabled by settings; it runs as default",
+        .{ agent_name, @tagName(def_mode) },
+    );
+    return .{ .mode = .default, .refused = def_mode };
+}
+
+/// What the parent is told about a refused `permissionMode` (the Task result's
+/// `permission_mode_notice`, the forked Skill's result).
+pub fn modeNotice(refused: @import("../agents/def.zig").PermissionMode) []const u8 {
+    return switch (refused) {
+        inline else => |tag| "permissionMode " ++ @tagName(tag) ++ " is disabled by settings; the subagent runs as default",
+    };
+}
+
+/// `,"permission_mode_notice":"..."` when the spawn refused the AgentDef's mode.
+fn writeModeNotice(writer: *std.Io.Writer, refused: ?@import("../agents/def.zig").PermissionMode) !void {
+    const mode = refused orelse return;
+    try writer.writeAll(",\"permission_mode_notice\":");
+    try util_json.writeJsonString(writer, modeNotice(mode));
 }
 
 /// 结果为 borrowed 引用,不分配(借档位表 / def.model / args 的字符串内存)。
@@ -701,6 +756,37 @@ test "resolveModelSelection: 参数 > def;档位查表;未配置档位与 inheri
     try testing.expect(inherit.model == null and inherit.effort == null);
     const no_table = resolveModelSelection(null, "opus", null);
     try testing.expect(no_table.model == null and no_table.effort == null);
+}
+
+test "resolvePermissionMode: a mode the parent's settings disable becomes default and is reported" {
+    const permission = @import("../permission.zig");
+    const settings_mod = @import("../permission/settings.zig");
+    const no_rules: []const settings_mod.Rule = &.{};
+    const layers = [_]settings_mod.Layer{
+        .{ .source = .managed, .allow = no_rules, .ask = no_rules, .deny = no_rules, .disable_bypass_permissions_mode = true, .disable_auto_mode = true },
+    };
+    const disabling = settings_mod.MergedSettings{ .layers = &layers, .allocator = testing.allocator };
+    var perm = permission.createContext(.default, testing.allocator);
+    perm.settings = &disabling;
+
+    try testing.expectEqual(ModeOverride{}, resolvePermissionMode(&perm, "a", null));
+    const refused = resolvePermissionMode(&perm, "a", .bypassPermissions);
+    try testing.expectEqual(@as(?@import("../types.zig").PermissionMode, .default), refused.mode);
+    try testing.expectEqual(@as(?@import("../agents/def.zig").PermissionMode, .bypassPermissions), refused.refused);
+    try testing.expectEqual(@as(?@import("../agents/def.zig").PermissionMode, .auto), resolvePermissionMode(&perm, "a", .auto).refused);
+    const edits = resolvePermissionMode(&perm, "a", .acceptEdits);
+    try testing.expectEqual(@as(?@import("../types.zig").PermissionMode, .accept_edits), edits.mode);
+    try testing.expect(edits.refused == null);
+    try testing.expectEqualStrings(
+        "permissionMode bypassPermissions is disabled by settings; the subagent runs as default",
+        modeNotice(.bypassPermissions),
+    );
+
+    // Twin: no settings → applied as asked.
+    perm.settings = null;
+    const applied = resolvePermissionMode(&perm, "a", .bypassPermissions);
+    try testing.expectEqual(@as(?@import("../types.zig").PermissionMode, .bypass_permissions), applied.mode);
+    try testing.expect(applied.refused == null);
 }
 
 test "parseUintField extracts max_turns" {

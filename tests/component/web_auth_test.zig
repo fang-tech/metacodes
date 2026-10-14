@@ -32,6 +32,7 @@ const VERSION = "9.8.7-dev+0123456789ab";
 const Probe = struct {
     state_calls: std.atomic.Value(usize) = .init(0),
     resolve_calls: std.atomic.Value(usize) = .init(0),
+    release_calls: std.atomic.Value(usize) = .init(0),
     sessions: std.atomic.Value(usize) = .init(0),
     view: ?cc.web_server.SessionView = null,
 
@@ -41,11 +42,17 @@ const Probe = struct {
         return allocator.dupe(u8, "{\"model\":\"probe\"}");
     }
 
-    fn resolve(ctx: *anyopaque, id: []const u8) ?cc.web_server.SessionView {
+    fn resolve(ctx: *anyopaque, id: []const u8) ?cc.web_server.Lease {
         const self: *Probe = @ptrCast(@alignCast(ctx));
         _ = self.resolve_calls.fetchAdd(1, .acq_rel);
         if (!std.mem.eql(u8, id, "s1")) return null;
-        return self.view;
+        return .{ .view = self.view.?, .ctx = ctx, .release_fn = &release };
+    }
+
+    /// Every lease a request took comes back (#254).
+    fn release(ctx: *anyopaque) void {
+        const self: *Probe = @ptrCast(@alignCast(ctx));
+        _ = self.release_calls.fetchAdd(1, .acq_rel);
     }
 };
 
@@ -171,11 +178,13 @@ test "#251 GET /health (resolver host): the session count, without calling the r
     defer a.free(later);
     try expectHealth(a, later, 5);
 
-    // Positive control: a session route does go through the resolver.
+    // Positive control: a session route does go through the resolver, and
+    // gives its lease back once the response is out.
     const state = try request(a, fx.srv.port, "GET /s/s1/state HTTP/1.1\r\n\r\n");
     defer a.free(state);
     try std.testing.expect(statusIs(state, "200"));
     try std.testing.expectEqual(@as(usize, 1), fx.probe.resolve_calls.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 1), fx.probe.release_calls.load(.acquire));
 }
 
 test "#251/#252 GET /health needs no token and no loopback Host while auth is on" {

@@ -744,6 +744,12 @@ pub const PermissionRuleMutationError = error{
 pub const PermissionModeMutationError = error{
     SessionBusy,
     InvalidSessionState,
+    /// The Session's settings disable the mode (`disableBypassPermissionsMode`,
+    /// `disableAutoMode`; PermissionContext.modeAllowed). A Session's settings
+    /// today are only the Host-imported allow/ask/deny layer, which cannot
+    /// disable a mode, so the Host owns which modes it offers; the check is
+    /// here so a Session that does carry such settings refuses the mode.
+    PermissionModeDisabled,
 };
 
 pub const AdditionalDirectoriesMutationError = error{
@@ -1724,7 +1730,9 @@ pub const AgentSession = struct {
 
     /// Replace the Session's permission mode at the idle mutation boundary.
     /// The next permission decision uses it. Imported rules and Session-local
-    /// allow/deny memory are separate layers and are left as they are.
+    /// allow/deny memory are separate layers and are left as they are. A mode
+    /// the Session's settings disable is refused with
+    /// `error.PermissionModeDisabled` and the mode stays as it was.
     pub fn setPermissionMode(
         self: *AgentSession,
         mode: types.PermissionMode,
@@ -1746,6 +1754,13 @@ pub const AgentSession = struct {
             },
         }
         self.mutex.unlock();
+
+        // Settings are stable while this mutation holds the Session (a rule
+        // update is another mutation).
+        if (!self.permission_ctx.modeAllowed(mode)) {
+            self.cancelMutation();
+            return error.PermissionModeDisabled;
+        }
 
         // The mode sink, when one is attached, runs outside the Session lock.
         self.permission_ctx.setMode(mode);
@@ -3057,6 +3072,46 @@ test "AgentSession permission mode update is idle-only and keeps the imported ru
     try self.updatePermissionRules(.{});
     const empty = try self.importedPermissionRuleInput(std.testing.allocator);
     try std.testing.expect(empty.isEmpty());
+}
+
+test "AgentSession permission mode update refuses a mode the Session's settings disable" {
+    const runtime = try createTestRuntime(std.testing.allocator);
+    defer runtime.destroy() catch unreachable;
+    const cwd = try testCwd();
+    defer std.testing.allocator.free(cwd);
+    const self = try createTestSession(runtime, .default, cwd);
+    defer self.destroy() catch unreachable;
+
+    // A Session's settings are the Host-imported rule layer, which has no mode
+    // switches. Put on one that has them, as a settings-bearing Session would.
+    const no_rules: []const permission_settings.Rule = &.{};
+    const layers = [_]permission_settings.Layer{.{
+        .source = .host,
+        .allow = no_rules,
+        .ask = no_rules,
+        .deny = no_rules,
+        .disable_bypass_permissions_mode = true,
+        .disable_auto_mode = true,
+    }};
+    const disabling = permission_settings.MergedSettings{ .layers = &layers, .allocator = std.testing.allocator };
+    const imported = self.permission_ctx.settings;
+    self.permission_ctx.settings = &disabling;
+    defer self.permission_ctx.settings = imported;
+
+    for ([_]types.PermissionMode{ .bypass_permissions, .bypass, .auto }) |mode| {
+        try std.testing.expectError(error.PermissionModeDisabled, self.setPermissionMode(mode));
+        try std.testing.expectEqual(types.PermissionMode.default, self.permission_ctx.modeValue());
+        try std.testing.expectEqual(State.idle, self.state);
+    }
+    // The refusal leaves the Session mutable: an allowed mode still applies.
+    try self.setPermissionMode(.accept_edits);
+    try std.testing.expectEqual(types.PermissionMode.accept_edits, self.permission_ctx.modeValue());
+
+    // Twin: without the switches the same mode applies.
+    self.permission_ctx.settings = imported;
+    try self.setPermissionMode(.bypass_permissions);
+    try std.testing.expectEqual(types.PermissionMode.bypass_permissions, self.permission_ctx.modeValue());
+    try std.testing.expectEqual(State.idle, self.state);
 }
 
 const CompactTestProvider = struct {
