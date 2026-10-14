@@ -8,7 +8,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from scripts.eval.cli import main
+from scripts.eval.cli import main, release_calibration_drift
 from scripts.eval.e2e_adapter import EVALUATION_CONTRACT_VERSION, grounding_fingerprints
 from scripts.eval.experiment import arm_config_ids, fixed_rollout_budget
 from scripts.eval.model import load_json, stable_json, write_rollouts
@@ -450,6 +450,74 @@ class CliTest(unittest.TestCase):
                 )
             self.assertEqual(code, 2)
             self.assertIn("production calibration", error.getvalue())
+
+    def _suites_by_id(self):
+        suites = {}
+        for path in sorted((ROOT / "evals/suites").glob("*.json")):
+            suite = load_json(path)
+            suites[suite["suite_id"]] = suite
+        return suites
+
+    def test_checked_in_calibration_is_current_or_marked_stale(self):
+        # Every other gate test repairs the calibration before using it, so
+        # this is the only check on the committed one. Without it a
+        # contract-v3 calibration and a drifted contract fingerprint refused
+        # every release from 2026-08-23 to 2026-10-14 unnoticed.
+        config = load_json(ROOT / "evals/gates/default.json")
+        calibration = config["calibration"]
+        if calibration.get("status") == "stale":
+            self.assertTrue(str(calibration.get("stale_reason", "")).strip())
+            return
+        self.assertEqual(calibration.get("status"), "production")
+        self.assertEqual(release_calibration_drift(config, self._suites_by_id()), [])
+
+    def test_calibration_drift_names_what_moved(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = load_json(self._production_gate_config(Path(directory), all_suites=True))
+        suites = self._suites_by_id()
+        self.assertEqual(release_calibration_drift(config, suites), [])
+
+        moved = copy.deepcopy(config)
+        moved["release_contract"]["suites"][1]["suite_fingerprint"] = "0000000000000000"
+        drift = release_calibration_drift(moved, suites)
+        self.assertTrue(any("release contract changed" in item for item in drift), drift)
+        self.assertTrue(any("metacodes-agentdef-release-v1 grounding" in item for item in drift), drift)
+
+        old_contract = copy.deepcopy(config)
+        old_contract["calibration"]["evaluation_contract_version"] = EVALUATION_CONTRACT_VERSION - 1
+        self.assertEqual(
+            release_calibration_drift(old_contract, suites),
+            [f"evaluation contract v{EVALUATION_CONTRACT_VERSION - 1} != current v{EVALUATION_CONTRACT_VERSION}"],
+        )
+
+    def test_stale_calibration_reports_its_reason(self):
+        with tempfile.TemporaryDirectory() as directory:
+            stale_config = load_json(ROOT / "evals/gates/default.json")
+            stale_config["calibration"]["status"] = "stale"
+            stale_config["calibration"]["stale_reason"] = "suite repinned without a calibration run."
+            stale_path = Path(directory) / "stale-gate.json"
+            stale_path.write_text(json.dumps(stale_config, sort_keys=True) + "\n", encoding="utf-8")
+            candidate = Path(directory) / "candidate.jsonl"
+            baseline = Path(directory) / "baseline.jsonl"
+            write_rollouts(candidate, [rollout("00_smoke", True, "candidate")])
+            write_rollouts(baseline, [rollout("00_smoke", True, "baseline")])
+            error = io.StringIO()
+            with contextlib.redirect_stderr(error):
+                code = main(
+                    [
+                        "gate",
+                        str(candidate),
+                        "--baseline",
+                        str(baseline),
+                        "--thresholds",
+                        str(stale_path),
+                        "--suite",
+                        str(ROOT / "evals/suites/core-e2e.json"),
+                    ]
+                )
+            self.assertEqual(code, 2)
+            self.assertIn("production calibration is stale", error.getvalue())
+            self.assertIn("suite repinned without a calibration run.", error.getvalue())
 
     def test_production_gate_requires_and_accepts_all_contracted_suites(self):
         with tempfile.TemporaryDirectory() as directory:

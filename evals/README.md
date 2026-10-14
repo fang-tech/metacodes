@@ -311,6 +311,19 @@ fail-closed 先将 evaluation contract 升到 v2；随后可信匿名 fd、no-fo
 64 MiB artifact 上限将 contract 升到 v3。该 v1 校准已机器可读地标记为 `stale`。重新完成
 当前 contract 的 6-trial order-balanced native 校准前，默认 production gate 必须拒绝发布。
 
+校准必须跟着它描述的东西走。`evals/gates/default.json` 的 `calibration` 只有两种合法状态:
+`production`(evaluation contract 版本、阈值、release contract 指纹和每个 suite 的 grounding 都与
+当前仓库一致)或 `stale`(带 `stale_reason`,门禁拒绝时原样打印)。CI 的
+`test_checked_in_calibration_is_current_or_marked_stale` 直接检查提交的那份校准——其余门禁测试都先把
+校准修成 production 再用,所以 2026-08-23 contract 升到 v4 之后,一份 v3 校准在 CI 全绿的情况下
+拒绝了每一次发布,直到 2026-10-14 才被发现。改 release suite、grader 或 evaluation contract 的
+变更,要么在同一变更里重新校准,要么把校准改成 `stale` 并写明原因。
+
+重新校准:用 release contract 的模型对两套 suite 各跑 `run-paired`(基线取上一个发布、候选取待发布
+revision,`trials` 与合同一致),把候选校准块(`status: production`、当前 contract 版本、按
+`release_calibration_drift` 同口径算出的指纹)写进门禁配置,在**不改阈值**的前提下用 `gate`
+跑完 9 项检查。全部通过才提交;原始 rollout 含本机路径,不进 Git,校准块记录它们的 SHA-256。
+
 ## 与现有 L1-L5 的关系
 
 - L1/L2/L3/L4 继续验证纯逻辑、跨模块接线、真实本地副作用和确定性回放；

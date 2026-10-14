@@ -124,6 +124,21 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- **The production release gate's calibration can no longer go stale silently.**
+  - **What went wrong:** `cli.py gate --thresholds evals/gates/default.json` had refused every release since the evaluation contract moved to v4 (2026-08-23). Its calibration still named contract v3 and a release-contract fingerprint that suite repins had since changed. CI stayed green because every gate test repaired the calibration before using it.
+  - **What changed:**
+    - A calibration is now either `production` and current, or `stale` with a `stale_reason` that the gate prints when it refuses.
+    - `test_checked_in_calibration_is_current_or_marked_stale` checks the committed calibration, using `release_calibration_drift`.
+    - The release contract now names glm-5.3-flash.
+- The AgentDef release suite no longer fails `42_agentdef_isolation` on how
+  the model spells a fact. Its "modified worktree is kept" check looked for
+  the literal `worktree_kept=true` in the model's proof file, so a model that
+  copied the same Task result as `worktree_kept: true` failed: 7 of 12
+  rollouts in a 2026-10-14 paired run, while in all 12 the worktree was kept,
+  held the subagent's file and nothing leaked. The check is now the validator
+  `evals/validators/42_agentdef_isolation.py`, which grades the Task tool's own
+  structured result and the kept worktree on disk (grader
+  `agentdef-release-v2`); the suite fingerprint is repinned.
 - Sockets no longer leak into child processes. The `--web`, OAuth callback
   and UDS daemon listeners, and every connection they accepted, were
   inheritable, so each later Bash command, hook, MCP server or browser launch
