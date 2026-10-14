@@ -60,8 +60,33 @@ status, compatibility boundaries, and entry points are defined by
   could not reach a pending prompt and a fresh session that resumed the old
   transcript; this is the kernel-side version. `EventJournal` moved from
   `web/` to `core/event_journal.zig` and is exported.
+- A `--web`/`serve` message can carry its turn's configuration (#255):
+  `POST /message` (`/s/<id>/message` under `serve --sessions N`) and the UDS
+  `message` op take optional `model` and `permission_mode` beside `text`. The
+  session applies them right before that message's turn — the model for this
+  session only, without writing the login's saved selection as `/model` does —
+  and journals one `config_changed` line per given field ahead of the turn's
+  `user_message`. A bad `permission_mode` is refused with 400 before anything
+  is queued; a model the provider cannot serve applies neither field, runs no
+  turn and journals `message_rejected`. A control plane no longer has to send
+  `/command`, poll `/state` and race a busy session before each message.
+  `/state`'s `seq`, `permission_mode` and `pending_request_id` are documented
+  for reconnecting clients (doc/API.md).
 
 ### Changed
+
+- `--web`/`serve`: `user_message` is journaled by the session when the
+  message's turn starts, no longer by the transport when the message is
+  queued, so it always means "this turn started with this text". A message
+  sent while a turn runs now appears after that turn's `run_done`; the bundled
+  page shows it as queued until then. Over UDS, the `message` text is trimmed
+  and must not be empty, as over HTTP: an empty text is refused instead of
+  queued and dropped, and a missing one is reported as `empty message` (was
+  `missing text`).
+- `config_changed` on the `--web`/`serve` stream is a `protocol.wire` v1 line,
+  `{"v":1,"type":"config_changed","data":{...}}`, instead of
+  `{"config_changed":{...}}`. The bundled page now updates its model and mode
+  display from it; a client reading the stream directly must follow.
 
 - MCP tools are named `mcp__<server>__<tool>` (Claude Code's form, so its
   permission rules and `allowed-tools` lists match); invalid characters become

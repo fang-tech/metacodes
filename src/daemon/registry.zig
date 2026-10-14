@@ -32,13 +32,14 @@ const abort = @import("../util/abort.zig");
 const SessionId = @import("../core/session_id.zig").SessionId;
 const EventJournal = @import("../core/event_journal.zig").EventJournal;
 const MsgQueue = @import("../repl/msg_queue.zig").MsgQueue;
+const SubmissionQueue = @import("../web/submission.zig").SubmissionQueue;
 
 /// 一个 session 的运行时宿主单元。堆分配,registry 持 *SessionHost。
 pub const SessionHost = struct {
     id: SessionId,
     allocator: std.mem.Allocator,
     journal: EventJournal,
-    inbox: MsgQueue, // 客户端消息;driver 线程消费(绑定层如何 push 待其定义)
+    inbox: SubmissionQueue, // 客户端消息(text + 可选 model/permission_mode);driver 线程消费
     /// U11:斜杠命令队列(transport 线程只入队,driver 线程独占执行——对齐 web
     /// StateSource.command 的"HTTP 线程绝不碰 App"契约)。
     cmdbox: MsgQueue,
@@ -69,7 +70,7 @@ pub const SessionHost = struct {
             .id = id,
             .allocator = allocator,
             .journal = EventJournal.init(allocator),
-            .inbox = MsgQueue.init(allocator),
+            .inbox = SubmissionQueue.init(allocator),
             .cmdbox = MsgQueue.init(allocator),
             .driver_ctx = driver_ctx,
             .driver_fn = driver_fn,
@@ -222,9 +223,10 @@ const testing = std.testing;
 fn echoDriver(host: *SessionHost, ctx: *anyopaque) void {
     _ = ctx;
     while (!host.stopRequested()) {
-        if (host.inbox.popFront()) |m| {
-            defer host.allocator.free(m);
-            host.journal.append(m);
+        if (host.inbox.popFront()) |popped| {
+            var m = popped;
+            defer m.deinit(host.allocator);
+            host.journal.append(m.text);
         } else {
             time.sleepMs(2);
         }
@@ -269,8 +271,8 @@ test "U10-A: 两 session 各自 journal 独立,消息不串台" {
     try testing.expectEqual(@as(usize, 2), reg.count());
 
     // 测试持有 h1/h2 的直接引用(创建者),直接 push——绑定层的按 id 路由 API 尚未引入(option B)。
-    _ = h1.inbox.push("hello-A");
-    _ = h2.inbox.push("hello-B");
+    _ = h1.inbox.push(.{ .text = "hello-A" });
+    _ = h2.inbox.push(.{ .text = "hello-B" });
 
     var waited: usize = 0;
     while ((h1.journal.count() == 0 or h2.journal.count() == 0) and waited < 500) : (waited += 1) {

@@ -1823,6 +1823,13 @@ pub const App = struct {
         }
     }
 
+    /// Broadcast the active model as `config_changed{model}` without switching:
+    /// the confirmation a per-message model override gets when it names the
+    /// model already in force (SessionService.setTurnModel).
+    pub fn announceModel(app: *App) void {
+        app.emitConfig(.{ .model = app.activeModel() });
+    }
+
     pub fn pendingModelSwitchCompact(app: *const App) ?agent_loop.ModelSwitchCompact {
         const previous_model = app.pending_previous_model_for_compact orelse return null;
         return .{

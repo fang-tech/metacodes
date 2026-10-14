@@ -63,6 +63,10 @@
   .searchlist a:hover { text-decoration: underline; }
   .sysline { color: var(--dim); font-style: italic; margin: 4px 0; font-size: 12px; }
   .sysline.warn { color: var(--err); font-style: normal; }
+  /* Sent but not started: the server echoes a message when its turn starts. */
+  #queued { padding: 0 14px; flex-shrink: 0; }
+  #queued .msg-user { opacity: .55; margin: 4px 0; }
+  #queued .msg-user::after { content: "  · queued"; color: var(--dim); font-size: 12px; }
 
   #dialog-overlay { position: fixed; inset: 0; background: rgba(0,0,0,.55);
                     display: none; align-items: center; justify-content: center; z-index: 10; }
@@ -107,6 +111,7 @@
   <span id="st-conn"></span>
 </div>
 <div id="scroll"></div>
+<div id="queued"></div>
 <div id="dialog-overlay"><div id="dialog"></div></div>
 <div id="palette"></div>
 <div id="inputbar">
@@ -174,7 +179,9 @@ function dispatch(ev) {
     if (ev.type === "ui_request_closed") return hideDialog();
     return coreEvent(ev.type, ev.data);
   }
-  if ("user_message" in ev) { endAssistant(); scroll.appendChild(el("msg-user", ev.user_message)); return; }
+  if ("user_message" in ev) { endAssistant(); unqueue(ev.user_message); scroll.appendChild(el("msg-user", ev.user_message)); return; }
+  if ("message_rejected" in ev) { const r = ev.message_rejected; unqueue(r.text);
+    sysline("⚠ message not run: " + (r.message || "rejected") + " · " + trunc(r.text, 80), true); return; }
   if ("run_done" in ev) { endAssistant(); setGenerating(false);
     const sr = ev.run_done.stop_reason || "done";
     if (sr !== "end_turn") sysline("· " + sr + (ev.run_done.err ? ": " + ev.run_done.err : "")); return; }
@@ -199,6 +206,7 @@ function coreEvent(tag, p) {
       document.getElementById("st-turn").textContent = "turn " + p.turn + " · " + p.tool_calls + " tools";
       break;
 
+    case "config_changed": configChanged(p); break;
     case "usage": refreshStateSoon(); break;
     case "context_warning":
       sysline("⚠ context " + p.level + " — " + p.current_tokens + " / " + p.auto_compact_threshold + " tokens", true); break;
@@ -567,13 +575,37 @@ function runCommand(text) {
   backendCommand(text);
 }
 
+// Messages sent from this page whose turn has not started. The server echoes a message
+// (user_message) when its turn starts, so one sent during a run waits here, dimmed, until
+// then, or until message_rejected says it will not run. Shown after a short delay so an
+// idle session's immediate echo does not flicker.
+const queued = [];
+function enqueueShown(text) {
+  const entry = { text, node: el("msg-user", text) };
+  queued.push(entry);
+  setTimeout(() => { if (queued.includes(entry)) document.getElementById("queued").appendChild(entry.node); }, 250);
+  return entry;
+}
+function unqueue(text) {
+  const i = queued.findIndex(e => e.text === text); if (i < 0) return;
+  queued[i].node.remove(); queued.splice(i, 1);
+}
+function configChanged(p) {
+  if (p.model != null) document.getElementById("st-model").textContent = "model: " + p.model;
+  if (p.mode != null) document.getElementById("st-mode").textContent = "mode: " + p.mode;
+  if (p.route != null) refreshStateSoon();
+}
+
 function send() {
   const text = input.value.trim(); if (!text) return;
   palette.style.display = "none"; input.value = ""; autoResize();
   history.push(text); histIdx = history.length;
   if (text.startsWith("/")) { runCommand(text); return; } // 斜杠命令不进对话
   if (text.startsWith("!")) { backendCommand(text); return; } // U11:shell 车道(不是模型 prompt)
-  fetch("/message", { method: "POST", body: JSON.stringify({ text }) }).then(r => { if (!r.ok) sysline("send failed: " + r.status, true); });
+  const entry = enqueueShown(text);
+  fetch("/message", { method: "POST", body: JSON.stringify({ text }) })
+    .then(r => { if (!r.ok) { unqueue(entry.text); sysline("send failed: " + r.status, true); } })
+    .catch(() => { unqueue(entry.text); sysline("send failed", true); });
 }
 function autoResize() { input.style.height = "auto"; input.style.height = Math.min(input.scrollHeight, window.innerHeight * 0.4) + "px"; }
 

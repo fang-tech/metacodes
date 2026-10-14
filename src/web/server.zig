@@ -3,7 +3,7 @@
 //! 职责:把 web 前端的 HTTP 动词翻成协议层动作,自身不懂任何业务语义:
 //!   GET  /            → 内嵌 index.html(单页,自包含)
 //!   GET  /events      → SSE:重放 journal(?since=N / Last-Event-ID)+ condvar 推新事件
-//!   POST /message     → 入 inbox 队列(session driver 消费)+ journal 回显 user_message
+//!   POST /message     → 入 inbox 队列(session driver 消费;user_message 由 driver 在该轮开跑时回显)
 //!   POST /respond     → 回填 WebBackend 挂起的 UiRequest({"id":N,...})
 //!   POST /interrupt   → 打 AbortSignal(与 TUI esc 同通道)
 //!   GET  /state       → session 状态快照(经回调,server 不依赖 App)
@@ -17,7 +17,7 @@ const std = @import("std");
 const time = @import("../util/time.zig");
 const journal_mod = @import("../core/event_journal.zig");
 const backend_mod = @import("backend.zig");
-const msg_queue_mod = @import("../repl/msg_queue.zig");
+const submission_mod = @import("submission.zig");
 const abort_mod = @import("../util/abort.zig");
 const log = @import("../util/log.zig");
 const net = @import("platform").net;
@@ -26,7 +26,7 @@ const util_json = @import("../util/json.zig");
 
 const EventJournal = journal_mod.EventJournal;
 const WebBackend = backend_mod.WebBackend;
-const MsgQueue = msg_queue_mod.MsgQueue;
+const SubmissionQueue = submission_mod.SubmissionQueue;
 
 fn stringifyJson(allocator: std.mem.Allocator, value: anytype) ![]u8 {
     const raw = try std.json.Stringify.valueAlloc(allocator, value, .{});
@@ -51,7 +51,7 @@ pub const CommandFn = *const fn (ctx: *anyopaque, allocator: std.mem.Allocator, 
 pub const SessionView = struct {
     journal: *EventJournal,
     web_backend: *WebBackend,
-    inbox: *MsgQueue,
+    inbox: *SubmissionQueue,
     abort: *abort_mod.AbortSignal,
     generating: ?*const std.atomic.Value(bool) = null,
     state_ctx: *anyopaque,
@@ -62,7 +62,7 @@ pub const SessionView = struct {
 pub const Deps = struct {
     journal: *EventJournal,
     web_backend: *WebBackend,
-    inbox: *MsgQueue,
+    inbox: *SubmissionQueue,
     /// 中断信号。**语义 = 中断当前生成**,不是退出进程——/interrupt 只在 generating
     /// 时打它(见 route);进程退出属于宿主(SIGINT/driver),不给浏览器这个权力。
     abort: *abort_mod.AbortSignal,
@@ -274,18 +274,23 @@ pub const WebServer = struct {
             return;
         }
         if (std.mem.eql(u8, line.method, "POST") and std.mem.eql(u8, eff_path, "/message")) {
-            const text = extractMessageText(self.allocator, body) orelse {
-                writeSimple(fd, "400 Bad Request", "application/json", "{\"error\":\"empty message\"}");
+            // {"text", "model"?, "permission_mode"?}: a bad field is refused here, before
+            // anything is queued. The model is checked by the driver (it needs the App), and
+            // the driver journals user_message when the turn starts — not here, where the
+            // message may wait behind a running turn (web/session.zig startSubmission).
+            var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+            defer arena.deinit();
+            const request = submission_mod.parseHttpBody(arena.allocator(), body) catch |err| {
+                var reply_buf: [192]u8 = undefined;
+                const reply = std.fmt.bufPrint(&reply_buf, "{{\"error\":\"{s}\"}}", .{submission_mod.reason(err)}) catch "{}";
+                if (err == error.OutOfMemory) {
+                    writeSimple(fd, "500 Internal Server Error", "application/json", reply);
+                } else {
+                    writeSimple(fd, "400 Bad Request", "application/json", reply);
+                }
                 return;
             };
-            defer self.allocator.free(text);
-            // 回显先于入队:浏览器(含其它标签页)立刻看到已提交的消息,即使正在生成期排队。
-            const echo = stringifyJson(self.allocator, .{ .user_message = text }) catch null;
-            if (echo) |e| {
-                defer self.allocator.free(e);
-                sv.journal.append(e);
-            }
-            if (!sv.inbox.push(text)) {
+            if (!sv.inbox.push(request)) {
                 writeSimple(fd, "500 Internal Server Error", "application/json", "{\"error\":\"queue push failed\"}");
                 return;
             }
@@ -463,23 +468,6 @@ pub const queryParam = http.queryParam;
 pub const headerValue = http.headerValue;
 pub const parseContentLength = http.parseContentLength;
 
-/// POST /message body → 文本(owned by allocator,caller free)。
-/// JSON {"text":"..."} 优先(转义已由 parser 解开,多行消息 OK);非 JSON 时整个 body 当纯文本。
-/// 空文本(trim 后)/ JSON object 无 text 字段 → null。
-pub fn extractMessageText(allocator: std.mem.Allocator, body: []const u8) ?[]u8 {
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer arena.deinit();
-    if (std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), body, .{})) |v| {
-        if (v == .object) {
-            if (v.object.get("text")) |t| {
-                if (t == .string) return dupeTrimmedOrNull(allocator, t.string);
-            }
-            return null; // 是 JSON object 但没有 text 字段 → 视为坏请求
-        }
-    } else |_| {}
-    return dupeTrimmedOrNull(allocator, body);
-}
-
 fn dupeTrimmedOrNull(allocator: std.mem.Allocator, s: []const u8) ?[]u8 {
     const t = std.mem.trim(u8, s, " \t\r\n");
     if (t.len == 0) return null;
@@ -593,32 +581,18 @@ test "queryParam / headerValue / parseContentLength" {
     try testing.expectEqualStrings("9", headerValue(head, "last-event-id").?);
 }
 
-test "extractMessageText: JSON text 字段(含转义多行)/ 纯文本 / 空拒绝" {
-    const a = extractMessageText(testing.allocator, "{\"text\":\"hi there\"}").?;
-    defer testing.allocator.free(a);
-    try testing.expectEqualStrings("hi there", a);
-    const b = extractMessageText(testing.allocator, "{\"text\":\"line1\\nline2\"}").?;
-    defer testing.allocator.free(b);
-    try testing.expectEqualStrings("line1\nline2", b);
-    const c = extractMessageText(testing.allocator, "raw body").?;
-    defer testing.allocator.free(c);
-    try testing.expectEqualStrings("raw body", c);
-    try testing.expectEqual(@as(?[]u8, null), extractMessageText(testing.allocator, "   "));
-    try testing.expectEqual(@as(?[]u8, null), extractMessageText(testing.allocator, "{\"nottext\":1}"));
-}
-
 test "extractRespondId" {
     try testing.expectEqual(@as(u64, 7), extractRespondId("{\"id\":7,\"choice\":\"allow_once\"}").?);
     try testing.expectEqual(@as(?u64, null), extractRespondId("{\"choice\":\"x\"}"));
     try testing.expectEqual(@as(?u64, null), extractRespondId("junk"));
 }
 
-test "loopback: /message 入队+回显, /state 快照, 404" {
+test "loopback: /message 入队(不回显), /state 快照, 404" {
     var j = EventJournal.init(testing.allocator);
     defer j.deinit();
     var wb = WebBackend.init(testing.allocator, &j);
     defer wb.deinit();
-    var inbox = MsgQueue.init(testing.allocator);
+    var inbox = SubmissionQueue.init(testing.allocator);
     defer inbox.deinit();
     var sig = abort_mod.AbortSignal.init();
     const S = struct {
@@ -643,17 +617,22 @@ test "loopback: /message 入队+回显, /state 快照, 404" {
         defer testing.allocator.free(resp);
         try testing.expect(std.mem.indexOf(u8, resp, "200 OK") != null);
     }
-    const msg = inbox.popFront().?;
-    defer testing.allocator.free(msg);
-    try testing.expectEqualStrings("hola", msg);
-    // journal 有 user_message 回显
-    const batch = (try j.waitSince(testing.allocator, 0, 100)).?;
-    defer {
-        for (batch) |l| testing.allocator.free(l);
-        testing.allocator.free(batch);
+    var msg = inbox.popFront().?;
+    defer msg.deinit(testing.allocator);
+    try testing.expectEqualStrings("hola", msg.text);
+    // user_message is the driver's to journal when the turn starts, not the transport's.
+    try testing.expectEqual(@as(usize, 0), j.count());
+    // A bad permission_mode is refused before anything is queued.
+    {
+        const bad = "{\"text\":\"x\",\"permission_mode\":\"plan\"}";
+        var req_buf: [160]u8 = undefined;
+        const req = try std.fmt.bufPrint(&req_buf, "POST /message HTTP/1.1\r\nContent-Length: {d}\r\n\r\n{s}", .{ bad.len, bad });
+        const resp = try httpRoundtrip(testing.allocator, srv.port, req);
+        defer testing.allocator.free(resp);
+        try testing.expect(std.mem.indexOf(u8, resp, "400 Bad Request") != null);
+        try testing.expect(std.mem.indexOf(u8, resp, "invalid permission_mode") != null);
     }
-    try testing.expect(std.mem.indexOf(u8, batch[0], "user_message") != null);
-    try testing.expect(std.mem.indexOf(u8, batch[0], "hola") != null);
+    try testing.expectEqual(@as(usize, 0), inbox.len());
 
     // GET /state
     {
@@ -680,7 +659,7 @@ test "loopback: /interrupt 打 abort;/respond 无挂起 409" {
     defer j.deinit();
     var wb = WebBackend.init(testing.allocator, &j);
     defer wb.deinit();
-    var inbox = MsgQueue.init(testing.allocator);
+    var inbox = SubmissionQueue.init(testing.allocator);
     defer inbox.deinit();
     var sig = abort_mod.AbortSignal.init();
     const S = struct {
@@ -719,7 +698,7 @@ test "loopback: SSE 重放已有事件(带 id 帧)" {
     j.append("{\"v\":1,\"type\":\"text_chunk\",\"data\":\"hey\"}");
     var wb = WebBackend.init(testing.allocator, &j);
     defer wb.deinit();
-    var inbox = MsgQueue.init(testing.allocator);
+    var inbox = SubmissionQueue.init(testing.allocator);
     defer inbox.deinit();
     var sig = abort_mod.AbortSignal.init();
     const S = struct {

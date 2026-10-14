@@ -605,6 +605,84 @@ position without an epoch, or lies past the journal's end, the server sends
 and replays from the oldest event it kept; when old events were evicted under
 the cursor, the reason is `evicted`. Deduplicate on `(session, epoch, seq)`.
 
+### Web and daemon messages: `POST /message` and `GET /state`
+
+`--web` and `serve` take a message at `POST /message`, `serve --sessions N`
+at `POST /s/<id>/message`:
+
+```json
+{"text": "...", "model": "claude-opus-4-6", "permission_mode": "acceptEdits"}
+```
+
+The UDS transport's `{"op":"message","session":"<id>",...}` reads the same
+three fields with the same checks (replies `{"ok":true}` or
+`{"ok":false,"error":"..."}`).
+
+- `text` is required and must not be empty after trimming. A body that is not
+  a JSON object is the text itself.
+- `model` and `permission_mode` are optional and hold for this message's turn
+  and the turns after it. Absent or `null` keeps what is in force; nothing is
+  ever reset.
+- `permission_mode` takes the names `/mode` takes: `default`, `acceptEdits`,
+  `auto`, `dontAsk`, `bypassPermissions`, their underscore and hyphen
+  spellings (`accept_edits`, `accept-edits`) and the historical
+  `prompt`/`bypass`. Any other value, an empty string or a non-string is
+  answered `400 {"error":"invalid permission_mode (...)"}`, a `model` that is
+  not a non-empty string `400 {"error":"invalid model: ..."}`, and nothing is
+  queued. `200 {"ok":true}` means queued.
+
+The session's driver takes messages one at a time, after the turn in progress
+and after queued `POST /command`s. For each message it checks the model (tier
+names resolve as `/model` resolves them; the model must be usable with the
+session's provider), switches to it for this session only — unlike `/model`,
+the login's saved model selection is not written — sets the permission mode,
+journals `user_message` and runs the turn. Each field the message gives is
+announced, even when its value was already in force, so the journal for one
+message reads, with nothing from the driver in between:
+
+```text
+{"v":1,"type":"config_changed","data":{"model":"claude-opus-4-6"}}   if model was given
+{"v":1,"type":"config_changed","data":{"mode":"accept_edits"}}      if permission_mode was given
+{"user_message":"..."}
+... the turn's events ...
+{"run_done":{"stop_reason":"end_turn","err":null}}
+```
+
+If the model cannot be applied, neither field is applied, the text stays out
+of the conversation, no turn runs, and this line takes the place of
+`user_message`:
+
+```text
+{"message_rejected":{"message":"model not available for current provider","text":"...","model":"...","permission_mode":"bypass_permissions"}}
+```
+
+`model` and `permission_mode` repeat what the message asked for (`null` when
+not given; the mode in the spelling `/state` uses). Every accepted message
+therefore ends in exactly one `user_message` or `message_rejected`.
+`user_message` is journaled when the turn starts, not when the message is
+queued: a message sent during a turn appears after that turn's `run_done`.
+
+`config_changed` lines, whatever caused the change (a message, `/command`, a
+tool), are wire v1 lines whose `data` holds one of `model`, `mode`, `dirs`,
+`reasoning` or `route`. The other host lines (`user_message`, `run_done`,
+`command_result`, `message_rejected`, `session_lifecycle`) keep their
+`{"<name>":...}` shape.
+
+`GET /state` (`/s/<id>/state`) is the snapshot a client reconciles with after
+connecting or reconnecting:
+
+| Field | Meaning |
+|---|---|
+| `seq`, `epoch` | Journal position of the next line and the journal it belongs to. `seq` never decreases within an epoch; `/events?since=<seq>&epoch=<epoch>` continues exactly after the snapshot. |
+| `model`, `permission_mode` | In force now; the mode as `default`, `accept_edits`, `auto`, `dont_ask` or `bypass_permissions`. |
+| `generating` | A turn or a command is running. |
+| `pending_request_id` | The UI request waiting for `POST /respond`, `0` when none. |
+
+It also carries `session_id`, `additional_dirs`, token usage and cost, the
+agent roster, tasks and `plugin_inventory`.
+`tests/component/web_message_config_test.zig` holds both drivers (`--web` and
+`serve`, over HTTP and UDS) to this section.
+
 ### SessionHost: a multi-session service for network Hosts
 
 `mc.session_host.SessionHost` is what a Host puts behind its own transport
