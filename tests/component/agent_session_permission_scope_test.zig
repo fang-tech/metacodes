@@ -201,7 +201,7 @@ test "L2 App answers allow_always into the project settings file its loader read
     const argv = [_][*:0]const u8{"metacodes"};
     const config = cc.parseArgsForTest(&argv, allocator);
     try std.testing.expect(config.parse_error == null);
-    var io_rt = std.Io.Threaded.init(allocator, .{});
+    var io_rt = @import("platform").signal.threadedIo(allocator, .{});
     defer io_rt.deinit();
     const app = try cc.app_module.App.init(allocator, io_rt.io(), config, "test-key");
     defer app.deinit();

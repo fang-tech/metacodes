@@ -71,7 +71,7 @@ const AppFixture = struct {
         const config = cc.parseArgsForTest(&argv, allocator);
         try std.testing.expect(config.parse_error == null);
 
-        self.io_rt = std.Io.Threaded.init(allocator, .{});
+        self.io_rt = @import("platform").signal.threadedIo(allocator, .{});
         errdefer self.io_rt.deinit();
         self.app = try cc.app_module.App.init(allocator, self.io_rt.io(), config, "test-key");
     }

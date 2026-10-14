@@ -4612,7 +4612,7 @@ test "L2 #16: /resume 切 app.session_id + permission_ctx.session(路由键随�
     // App 用独立 arena(App 是 arena 生命周期设计,避免 testing.allocator 噪声);测试自身用 a。
     var app_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer app_arena.deinit();
-    var io_rt = std.Io.Threaded.init(a, .{});
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
     defer io_rt.deinit();
     const cfg = types_mod.Config{ .model = "claude-sonnet-4-20250514" };
     const app = try app_mod.App.init(app_arena.allocator(), io_rt.io(), cfg, "test-key");

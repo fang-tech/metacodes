@@ -161,7 +161,7 @@ const Run = struct {
 };
 
 fn runLoop(allocator: std.mem.Allocator, fixture: *const Fixture, url: []const u8, run: *Run) !cc.agent_loop.RunResult {
-    run.io_runtime = std.Io.Threaded.init(allocator, .{});
+    run.io_runtime = @import("platform").signal.threadedIo(allocator, .{});
     run.client = cc.client_mod.Client.initWithBaseUrl(allocator, run.io_runtime.io(), "test-key", "claude-sonnet-4-20250514", url);
     run.conversation = cc.conversation.Conversation.init(allocator);
     try run.conversation.appendText(.user, "produce a large result");

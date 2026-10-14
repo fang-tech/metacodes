@@ -79,7 +79,7 @@ fn withApp(
     config.state_root = state_root;
     config.jev_builtin_default = builtin_default;
 
-    var io_runtime = std.Io.Threaded.init(allocator, .{});
+    var io_runtime = @import("platform").signal.threadedIo(allocator, .{});
     defer io_runtime.deinit();
     const app = try cc.app_module.App.init(allocator, io_runtime.io(), config, "test-key");
     defer app.deinit();

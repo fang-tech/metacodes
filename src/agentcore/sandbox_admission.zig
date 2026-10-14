@@ -48,7 +48,7 @@ pub fn validate(allocator: std.mem.Allocator) AdmissionError!void {
         .not_executable => return error.NotExecutable,
     }
 
-    var io_runtime = std.Io.Threaded.init(allocator, .{});
+    var io_runtime = @import("platform").signal.threadedIo(allocator, .{});
     defer io_runtime.deinit();
     const result = std.process.run(allocator, io_runtime.io(), .{
         .argv = &.{ sandbox_exec, "-p", minimal_profile, true_exec },

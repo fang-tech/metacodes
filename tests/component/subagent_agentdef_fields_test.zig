@@ -90,7 +90,7 @@ test "L2 AgentDef.background=true: Task 未传 run_in_background 仍返回 agent
     const url = try srv.urlOwned(a);
     defer a.free(url);
 
-    var io_rt = std.Io.Threaded.init(a, .{});
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
     defer io_rt.deinit();
     var client = cc.client_mod.Client.initWithBaseUrl(a, io_rt.io(), "k", "claude-sonnet-4-20250514", url);
     defer client.deinit();
@@ -116,7 +116,7 @@ test "L2 AgentDef.effort=high: 子请求含 output_config.effort 且父 Client �
     defer srv.stop();
     const url = try srv.urlOwned(a);
     defer a.free(url);
-    var io_rt = std.Io.Threaded.init(a, .{});
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
     defer io_rt.deinit();
     var client = cc.client_mod.Client.initWithBaseUrl(a, io_rt.io(), "k", "claude-sonnet-4-20250514", url);
     defer client.deinit();
@@ -139,7 +139,7 @@ test "L2 Task preserves proxy-spaced text_delta in final_text" {
     defer srv.stop();
     const url = try srv.urlOwned(a);
     defer a.free(url);
-    var io_rt = std.Io.Threaded.init(a, .{});
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
     defer io_rt.deinit();
     var client = cc.client_mod.Client.initWithBaseUrl(a, io_rt.io(), "k", "glm-5.2", url);
     defer client.deinit();
@@ -160,7 +160,7 @@ test "L2 AgentDef.effort=high: GLM-5.2 effort 走顶层 reasoning_effort body �
     defer srv.stop();
     const url = try srv.urlOwned(a);
     defer a.free(url);
-    var io_rt = std.Io.Threaded.init(a, .{});
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
     defer io_rt.deinit();
     var client = cc.api_openai.OpenAIClient.init(a, io_rt.io(), "k", "glm-5.2", url);
     defer client.deinit();
@@ -195,7 +195,7 @@ test "L2 AgentDef.overrides: frontmatter reaches child request and preserves par
     defer srv.stop();
     const url = try srv.urlOwned(a);
     defer a.free(url);
-    var io_rt = std.Io.Threaded.init(a, .{});
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
     defer io_rt.deinit();
     var client = cc.api_openai.OpenAIClient.init(a, io_rt.io(), "k", "gpt-4o", url);
     defer client.deinit();
@@ -228,7 +228,7 @@ test "L2 AgentDef.model=haiku: 档位表命中时覆盖真实子请求 model" {
     defer srv.stop();
     const url = try srv.urlOwned(a);
     defer a.free(url);
-    var io_rt = std.Io.Threaded.init(a, .{});
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
     defer io_rt.deinit();
     var client = cc.client_mod.Client.initWithBaseUrl(a, io_rt.io(), "k", "claude-sonnet-4-20250514", url);
     defer client.deinit();
@@ -254,7 +254,7 @@ test "L2 AgentDef.model=haiku 未配置档位表: 不映射硬编码 ID,子请�
     defer srv.stop();
     const url = try srv.urlOwned(a);
     defer a.free(url);
-    var io_rt = std.Io.Threaded.init(a, .{});
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
     defer io_rt.deinit();
     var client = cc.client_mod.Client.initWithBaseUrl(a, io_rt.io(), "k", "claude-sonnet-4-20250514", url);
     defer client.deinit();
@@ -336,7 +336,7 @@ fn runChildWriteWith(
     defer srv.stop();
     const url = try srv.urlOwned(a);
     defer a.free(url);
-    var io_rt = std.Io.Threaded.init(a, .{});
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
     defer io_rt.deinit();
     var client = cc.client_mod.Client.initWithBaseUrl(a, io_rt.io(), "k", "claude-sonnet-4-20250514", url);
     defer client.deinit();
@@ -502,7 +502,7 @@ test "L2 background AgentDef with a disabled permissionMode reports it and runs 
     defer srv.stop();
     const url = try srv.urlOwned(a);
     defer a.free(url);
-    var io_rt = std.Io.Threaded.init(a, .{});
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
     defer io_rt.deinit();
     var client = cc.client_mod.Client.initWithBaseUrl(a, io_rt.io(), "k", "claude-sonnet-4-20250514", url);
     defer client.deinit();
@@ -558,7 +558,7 @@ test "L2 AgentDef.max_turns=1: Task 在一次真实 tool_use 后停止" {
     defer srv.stop();
     const url = try srv.urlOwned(a);
     defer a.free(url);
-    var io_rt = std.Io.Threaded.init(a, .{});
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
     defer io_rt.deinit();
     var client = cc.client_mod.Client.initWithBaseUrl(a, io_rt.io(), "k", "claude-sonnet-4-20250514", url);
     defer client.deinit();
@@ -590,7 +590,7 @@ test "L2 AgentDef.tools/disallowed_tools: 白名单与黑名单共同裁剪真�
     defer srv.stop();
     const url = try srv.urlOwned(a);
     defer a.free(url);
-    var io_rt = std.Io.Threaded.init(a, .{});
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
     defer io_rt.deinit();
     var client = cc.client_mod.Client.initWithBaseUrl(a, io_rt.io(), "k", "claude-sonnet-4-20250514", url);
     defer client.deinit();
@@ -617,7 +617,7 @@ test "L2 Plan runtime tool snapshot keeps TinyKG capability and system prompt al
     defer srv.stop();
     const url = try srv.urlOwned(a);
     defer a.free(url);
-    var io_rt = std.Io.Threaded.init(a, .{});
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
     defer io_rt.deinit();
     var client = cc.client_mod.Client.initWithBaseUrl(a, io_rt.io(), "k", "claude-sonnet-4-20250514", url);
     defer client.deinit();
@@ -649,7 +649,7 @@ test "L2 AgentDef.preload_skills: skill 正文进入真实子请求 system" {
     defer srv.stop();
     const url = try srv.urlOwned(a);
     defer a.free(url);
-    var io_rt = std.Io.Threaded.init(a, .{});
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
     defer io_rt.deinit();
     var client = cc.client_mod.Client.initWithBaseUrl(a, io_rt.io(), "k", "claude-sonnet-4-20250514", url);
     defer client.deinit();
@@ -709,7 +709,7 @@ test "L2 AgentDef.memory_scope=project: prompt + tools + permission + sandbox di
     defer srv.stop();
     const url = try srv.urlOwned(a);
     defer a.free(url);
-    var io_rt = std.Io.Threaded.init(a, .{});
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
     defer io_rt.deinit();
     var client = cc.client_mod.Client.initWithBaseUrl(a, io_rt.io(), "k", "claude-sonnet-4-20250514", url);
     defer client.deinit();
@@ -779,7 +779,7 @@ test "L2 AgentDef.mcp_servers: 请求 tools 与子 ToolContext sessions 使用�
     defer srv.stop();
     const url = try srv.urlOwned(a);
     defer a.free(url);
-    var io_rt = std.Io.Threaded.init(a, .{});
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
     defer io_rt.deinit();
     var client = cc.client_mod.Client.initWithBaseUrl(a, io_rt.io(), "k", "claude-sonnet-4-20250514", url);
     defer client.deinit();
@@ -919,7 +919,7 @@ test "L2 后台组合: effort/memory_scope/mcp_servers/isolation 穿过 JobInput
     defer srv.stop();
     const url = try srv.urlOwned(a);
     defer a.free(url);
-    var io_rt = std.Io.Threaded.init(a, .{});
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
     defer io_rt.deinit();
     var client = cc.client_mod.Client.initWithBaseUrl(a, io_rt.io(), "k", "claude-sonnet-4-20250514", url);
     defer client.deinit();
@@ -1023,7 +1023,7 @@ test "L3 AgentDef.isolation=worktree: 相对 Write 只落隔离树，有变化�
     defer srv.stop();
     const url = try srv.urlOwned(a);
     defer a.free(url);
-    var io_rt = std.Io.Threaded.init(a, .{});
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
     defer io_rt.deinit();
     var client = cc.client_mod.Client.initWithBaseUrl(a, io_rt.io(), "k", "claude-sonnet-4-20250514", url);
     defer client.deinit();
@@ -1085,7 +1085,7 @@ test "L2 AgentDef isolation cleanup failure reports worktree_kept true" {
     defer srv.stop();
     const url = try srv.urlOwned(a);
     defer a.free(url);
-    var io_rt = std.Io.Threaded.init(a, .{});
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
     defer io_rt.deinit();
     var client = cc.client_mod.Client.initWithBaseUrl(a, io_rt.io(), "k", "claude-sonnet-4-20250514", url);
     defer client.deinit();

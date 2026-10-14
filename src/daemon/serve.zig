@@ -18,7 +18,8 @@ const app_driver = @import("app_driver.zig");
 const shutdown = @import("../core/shutdown.zig");
 const web_session = @import("../web/session.zig");
 const WebBackend = @import("../web/backend.zig").WebBackend;
-const WebServer = @import("../web/server.zig").WebServer;
+const server_mod = @import("../web/server.zig");
+const WebServer = server_mod.WebServer;
 
 const SessionRegistry = registry.SessionRegistry;
 const SessionHost = registry.SessionHost;
@@ -26,8 +27,8 @@ const SessionHost = registry.SessionHost;
 // U11:trivialState 已废——复用 web_session.StateSource(rich /state + /command 入队),
 // 单/多 session daemon 与 --web 同一份快照与命令面。
 
-/// 跑 daemon(单 session MVP)直到 SIGINT。返回进程退出码。
-pub fn serve(app: *app_mod.App, allocator: std.mem.Allocator, port: u16) !u8 {
+/// 跑 daemon(单 session MVP)直到 SIGINT。返回进程退出码。`surface`:bind/token/版本(#251-#253)。
+pub fn serve(app: *app_mod.App, allocator: std.mem.Allocator, surface: server_mod.Surface) !u8 {
     _ = allocator; // agent_loop 用 app.allocator(见 app_driver);web 基建用 c_allocator
     const web_alloc = std.heap.c_allocator; // journal/wb/inbox 跨线程并发,须线程安全
 
@@ -77,7 +78,7 @@ pub fn serve(app: *app_mod.App, allocator: std.mem.Allocator, port: u16) !u8 {
         .journal = &host.journal,
         .generating = &host.generating,
     };
-    const srv = try WebServer.start(web_alloc, port, .{
+    const srv = try WebServer.start(web_alloc, surface, .{
         .journal = &host.journal,
         .web_backend = &wb,
         .inbox = &host.inbox, // POST /message → host.inbox(driver 消费)
@@ -88,8 +89,7 @@ pub fn serve(app: *app_mod.App, allocator: std.mem.Allocator, port: u16) !u8 {
         .command_fn = &web_session.StateSource.command,
     });
 
-    std.debug.print("metacodes daemon (1 session): http://127.0.0.1:{d}  (Ctrl+C to quit)\n", .{srv.port});
-    log.info("daemon", "serve listening on 127.0.0.1:{d}", .{srv.port});
+    srv.announce("metacodes daemon (1 session)");
 
     // ── 主循环:poll 进程级停机 ────────────────────────────────────────────────
     while (!shutdown.requested()) time.sleepMs(50);

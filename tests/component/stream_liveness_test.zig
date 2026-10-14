@@ -155,7 +155,7 @@ test "L2 liveness ①: 收头阶段对端沉默 → 空闲监视 shutdown 连接
     defer srv.stop();
     const url = try srv.urlOwned(a);
     defer a.free(url);
-    var io_rt = std.Io.Threaded.init(a, .{});
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
     defer io_rt.deinit();
     // 正文阶段上限故意远大于用例时长:收头阶段的严上限必须独立于它生效。
     var client = mkClient(a, io_rt.io(), url, IDLE_MS, 60_000);
@@ -180,7 +180,7 @@ test "L2 liveness ②: 正文阶段对端沉默 → StreamStalled 结束本轮(a
     defer srv.stop();
     const url = try srv.urlOwned(a);
     defer a.free(url);
-    var io_rt = std.Io.Threaded.init(a, .{});
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
     defer io_rt.deinit();
     var client = mkClient(a, io_rt.io(), url, IDLE_MS, IDLE_MS);
     defer client.deinit();
@@ -236,7 +236,7 @@ test "L2 liveness ③: TaskBatch 并发——一个 item 对端沉默,整批仍�
     var reg = try cc.agent_job_registry.AgentJobRegistry.init(std.heap.c_allocator, "k", url, "claude-3-5-haiku-20241022", .anthropic);
     defer reg.deinit();
     reg.stream_idle_timeout_ms = IDLE_MS;
-    var io_rt = std.Io.Threaded.init(a, .{});
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
     defer io_rt.deinit();
     var client = cc.client_mod.Client.initWithBaseUrl(a, io_rt.io(), "k", "claude-3-5-haiku-20241022", url);
     defer client.deinit();
@@ -270,7 +270,7 @@ test "L2 liveness ④: 父 abort → watchdog 同时 cancel 在飞请求:空闲�
     var reg = try cc.agent_job_registry.AgentJobRegistry.init(std.heap.c_allocator, "k", url, "claude-3-5-haiku-20241022", .anthropic);
     defer reg.deinit();
     reg.stream_idle_timeout_ms = 60_000; // 空闲监视故意远大于用例时长:只有 cancel 能救
-    var io_rt = std.Io.Threaded.init(a, .{});
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
     defer io_rt.deinit();
     var client = cc.client_mod.Client.initWithBaseUrl(a, io_rt.io(), "k", "claude-3-5-haiku-20241022", url);
     defer client.deinit();
@@ -301,7 +301,7 @@ test "L2 liveness ⑤: input_json_delta 帧滴流(帧间隔 < 空闲上限,总�
     defer srv.stop();
     const url = try srv.urlOwned(a);
     defer a.free(url);
-    var io_rt = std.Io.Threaded.init(a, .{});
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
     defer io_rt.deinit();
     var client = mkClient(a, io_rt.io(), url, IDLE_MS, IDLE_MS);
     defer client.deinit();
@@ -345,7 +345,7 @@ test "L2 liveness ⑥: 只有 ping 的保活不算进展 → 超过正文上限�
     defer srv.stop();
     const url = try srv.urlOwned(a);
     defer a.free(url);
-    var io_rt = std.Io.Threaded.init(a, .{});
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
     defer io_rt.deinit();
     var client = mkClient(a, io_rt.io(), url, IDLE_MS, PING_ONLY_BODY_MS);
     defer client.deinit();
@@ -372,7 +372,7 @@ test "L2 liveness ⑥b: ping 之间夹着真实进展(进展间隔 < 上限)→ 
     defer srv.stop();
     const url = try srv.urlOwned(a);
     defer a.free(url);
-    var io_rt = std.Io.Threaded.init(a, .{});
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
     defer io_rt.deinit();
     // 进展间隔 2 × TRICKLE_MS = 300ms;正文上限 1.5s 留 5× 余量给满载 CI(⑤ 的 150ms/400ms 已是下限)。
     var client = mkClient(a, io_rt.io(), url, IDLE_MS, PING_ONLY_BODY_MS);
@@ -396,7 +396,7 @@ test "L2 liveness ⑦: 收头/正文阶段各用各的上限——正文沉默�
     defer srv.stop();
     const url = try srv.urlOwned(a);
     defer a.free(url);
-    var io_rt = std.Io.Threaded.init(a, .{});
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
     defer io_rt.deinit();
     const body_ms: u64 = 1_500;
     var client = mkClient(a, io_rt.io(), url, IDLE_MS, body_ms);
@@ -423,7 +423,7 @@ test "L2 liveness ⑧: 非流式请求正文阶段沉默 → StreamStalled 并�
     defer srv.stop();
     const url = try srv.urlOwned(a);
     defer a.free(url);
-    var io_rt = std.Io.Threaded.init(a, .{});
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
     defer io_rt.deinit();
     var client = mkClient(a, io_rt.io(), url, IDLE_MS, IDLE_MS);
     defer client.deinit();
@@ -466,7 +466,7 @@ test "L2 liveness ⑨: 短文本后零字节沉默超过收头上限,正文上�
     defer srv.stop();
     const url = try srv.urlOwned(a);
     defer a.free(url);
-    var io_rt = std.Io.Threaded.init(a, .{});
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
     defer io_rt.deinit();
     var client = mkClient(a, io_rt.io(), url, 300, body_ms);
     defer client.deinit();
@@ -533,7 +533,7 @@ test "L2 liveness ⑩: 正文阶段用户取消(abort + provider.cancel)→ abor
     defer srv.stop();
     const url = try srv.urlOwned(a);
     defer a.free(url);
-    var io_rt = std.Io.Threaded.init(a, .{});
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
     defer io_rt.deinit();
     var client = mkClient(a, io_rt.io(), url, IDLE_MS, 60_000);
     defer client.deinit();

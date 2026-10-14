@@ -100,7 +100,7 @@ fn runCassette(a: std.mem.Allocator, bodies: []const []const u8, capture: *Captu
     const url = try srv.urlOwned(a);
     defer a.free(url);
 
-    var io_rt = std.Io.Threaded.init(a, .{});
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
     defer io_rt.deinit();
     var client = openai.OpenAIClient.init(a, io_rt.io(), "k", "gpt-4o", url);
     defer client.deinit();
@@ -180,7 +180,7 @@ test "environment_fault 事件排在它所属的 tool_result 之后(TUI 才能�
     defer srv.stop();
     const url = try srv.urlOwned(a);
     defer a.free(url);
-    var io_rt = std.Io.Threaded.init(a, .{});
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
     defer io_rt.deinit();
     var client = openai.OpenAIClient.init(a, io_rt.io(), "k", "gpt-4o", url);
     defer client.deinit();

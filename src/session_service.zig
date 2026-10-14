@@ -612,7 +612,7 @@ test "U11: execLine 管线 —— prompt/宏 append + RunPlan;失败前零 mutat
     app.active_skill = null;
     app.permission_ctx = @import("permission.zig").createContext(.default, a);
     app.session_id = @import("core/session_id.zig").SessionId.single;
-    var io_rt = std.Io.Threaded.init(a, .{});
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
     defer io_rt.deinit();
     app.skill_runtime = @import("skills/cli_adapter.zig").Runtime.init(a, io_rt.io());
     defer app.skill_runtime.deinit();

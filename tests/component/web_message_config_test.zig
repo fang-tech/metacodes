@@ -109,7 +109,7 @@ const AppFixture = struct {
             config.settings_path = try std.fs.path.join(allocator, &.{ root, "cli-settings.json" });
         }
 
-        self.io_rt = std.Io.Threaded.init(allocator, .{});
+        self.io_rt = @import("platform").signal.threadedIo(allocator, .{});
         errdefer self.io_rt.deinit();
         self.app = try cc.app_module.App.init(allocator, self.io_rt.io(), config, "test-key");
     }
@@ -166,16 +166,13 @@ const AppFixture = struct {
 
 fn request(a: std.mem.Allocator, port: u16, method: []const u8, path: []const u8, body: []const u8, until: ?[]const u8) ![]u8 {
     var buf: [1024]u8 = undefined;
-    const raw = try std.fmt.bufPrint(&buf, "{s} {s} HTTP/1.1\r\nHost: l\r\nContent-Length: {d}\r\n\r\n{s}", .{ method, path, body.len, body });
+    const raw = try std.fmt.bufPrint(&buf, "{s} {s} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: {d}\r\n\r\n{s}", .{ method, path, body.len, body });
     return roundtrip(a, port, raw, until);
 }
 
 /// Send `raw`, read until `until` appears (null: until the server closes),
-/// for at most 10 s. Unlike harness.clientRoundtrip, an interrupted or
-/// timed-out socket call is retried: each std.Io.Threaded (the App's included)
-/// installs a no-op SIGPIPE handler without SA_RESTART, and on macOS a write to
-/// a closed socket signals the process, so a server thread's EPIPE can land on
-/// this thread as EINTR.
+/// for at most 10 s: each recv waits 500 ms and a timed-out one is retried, so
+/// a reply that arrives only when the driver gets to the message is still read.
 fn roundtrip(a: std.mem.Allocator, port: u16, raw: []const u8, until: ?[]const u8) ![]u8 {
     const deadline = cc.util_time.nowMs() + 10_000;
     const conn = pnet.connectLoopback(port) catch return error.ConnectFailed;
@@ -197,7 +194,7 @@ fn roundtrip(a: std.mem.Allocator, port: u16, raw: []const u8, until: ?[]const u
         const n = pnet.recv(conn, &chunk);
         if (n == 0) break;
         if (n < 0) {
-            if (!pnet.recvRetriable()) break; // EAGAIN (the 500 ms timeout) or EINTR: keep waiting
+            if (!pnet.recvRetriable()) break; // the 500 ms timeout: keep waiting
             continue;
         }
         try out.appendSlice(a, chunk[0..@intCast(n)]);
@@ -313,11 +310,16 @@ const WebRun = struct {
             st.deinit();
             return;
         }
+        // Stop the loop before reporting: the caller tears the App down next,
+        // and a run() still serving on it would read freed memory.
+        self.app.abort.abort(.user_ctrl_c);
+        self.thread.join();
+        if (self.failure) |err| return err;
         return error.TestWebRunDidNotListen;
     }
 
     fn main(self: *WebRun) void {
-        self.exit_code = cc.web_session.run(self.app, self.app.allocator, self.port) catch |err| {
+        self.exit_code = cc.web_session.run(self.app, self.app.allocator, .{ .address = pnet.loopback(self.port), .version = "0.0.0-test" }) catch |err| {
             self.failure = err;
             return;
         };
@@ -728,7 +730,7 @@ const DaemonHost = struct {
         app.permission_ctx.ui_requester = self.wb.requester();
         errdefer app.permission_ctx.ui_requester = null;
         self.state_src = .{ .app = app, .wb = &self.wb, .cmdbox = &self.host.cmdbox, .journal = &self.host.journal, .generating = &self.host.generating };
-        self.srv = try cc.web_server.WebServer.start(a, 0, .{
+        self.srv = try cc.web_server.WebServer.start(a, .{ .version = "0.0.0-test" }, .{
             .journal = &self.host.journal,
             .web_backend = &self.wb,
             .inbox = &self.host.inbox,
@@ -865,7 +867,7 @@ test "L2 serve: the UDS message op carries the same fields, checks and order" {
 }
 
 /// Send one NDJSON request line and read one reply line (without the newline).
-/// Interrupted or timed-out calls are retried for up to 10 s (see `roundtrip`).
+/// A timed-out recv is retried for up to 10 s (see `roundtrip`).
 fn udsRoundtrip(a: std.mem.Allocator, conn: pnet.Socket, line: []const u8) ![]u8 {
     const deadline = cc.util_time.nowMs() + 10_000;
     var off: usize = 0;

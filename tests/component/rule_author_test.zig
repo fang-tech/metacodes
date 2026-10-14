@@ -338,7 +338,7 @@ test "L2 rule author: admitted no-tools provider call persists a receipt-bound c
     defer server.stop();
     const url = try server.urlOwned(a);
     defer a.free(url);
-    var io_runtime = std.Io.Threaded.init(a, .{});
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
     defer io_runtime.deinit();
     var client = cc.client_mod.Client.initWithBaseUrl(a, io_runtime.io(), "author-test-key", TEST_MODEL, url);
     defer client.deinit();
@@ -449,7 +449,7 @@ test "L2 ontology projection drives isolated v2 rule author without actor contex
     defer server.stop();
     const url = try server.urlOwned(a);
     defer a.free(url);
-    var io_runtime = std.Io.Threaded.init(a, .{});
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
     defer io_runtime.deinit();
     var client = cc.client_mod.Client.initWithBaseUrl(a, io_runtime.io(), "author-v2-test-key", TEST_MODEL, url);
     defer client.deinit();
@@ -536,7 +536,7 @@ test "L2 governed rule author preserves actor independence and lifecycle reopens
     defer server.stop();
     const url = try server.urlOwned(a);
     defer a.free(url);
-    var io_runtime = std.Io.Threaded.init(a, .{});
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
     defer io_runtime.deinit();
     var client = cc.client_mod.Client.initWithBaseUrl(
         a,
@@ -772,7 +772,7 @@ test "L2 ontology drift after prepare blocks v2 author before provider request" 
     defer server.stop();
     const url = try server.urlOwned(a);
     defer a.free(url);
-    var io_runtime = std.Io.Threaded.init(a, .{});
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
     defer io_runtime.deinit();
     var client = cc.client_mod.Client.initWithBaseUrl(a, io_runtime.io(), "author-v2-test-key", TEST_MODEL, url);
     defer client.deinit();
@@ -883,7 +883,7 @@ test "L2 rule author: permit packet provider and model drift fail before network
     defer server.stop();
     const url = try server.urlOwned(a);
     defer a.free(url);
-    var io_runtime = std.Io.Threaded.init(a, .{});
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
     defer io_runtime.deinit();
     var client = cc.client_mod.Client.initWithBaseUrl(a, io_runtime.io(), "author-test-key", TEST_MODEL, url);
     defer client.deinit();
@@ -958,7 +958,7 @@ test "L2 rule author: malformed response and tool events fail closed" {
     defer malformed_server.stop();
     const malformed_url = try malformed_server.urlOwned(a);
     defer a.free(malformed_url);
-    var io_runtime = std.Io.Threaded.init(a, .{});
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
     defer io_runtime.deinit();
     var malformed_client = cc.client_mod.Client.initWithBaseUrl(a, io_runtime.io(), "key", TEST_MODEL, malformed_url);
     defer malformed_client.deinit();
@@ -1019,7 +1019,7 @@ test "L2 rule author: oversized provider text is rejected" {
     defer server.stop();
     const url = try server.urlOwned(a);
     defer a.free(url);
-    var io_runtime = std.Io.Threaded.init(a, .{});
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
     defer io_runtime.deinit();
     var client = cc.client_mod.Client.initWithBaseUrl(a, io_runtime.io(), "key", TEST_MODEL, url);
     defer client.deinit();

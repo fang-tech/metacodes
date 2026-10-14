@@ -69,7 +69,7 @@ fn captureAnthropicRequest(
     route: *const cc.provider_startup.StartupRoute,
     secret: []const u8,
 ) !harness.CapturedRequest {
-    var io_runtime = std.Io.Threaded.init(std.testing.allocator, .{});
+    var io_runtime = @import("platform").signal.threadedIo(std.testing.allocator, .{});
     defer io_runtime.deinit();
     var client = cc.client_mod.Client.initWithBaseUrl(
         std.testing.allocator,
@@ -146,7 +146,7 @@ test "L2: the GLM OpenAI-wire route reaches the coding-plan path with the OpenAI
     try std.testing.expectEqual(cc.types_mod.ProviderKind.openai, route.transport);
     try std.testing.expectEqual(cc.types_mod.OpenAIProtocol.chat_completions, route.openai_protocol);
 
-    var io_runtime = std.Io.Threaded.init(a, .{});
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
     defer io_runtime.deinit();
     var client = cc.api_openai.OpenAIClient.init(
         a,
@@ -1030,7 +1030,7 @@ test "L2: a picker-driven selection reaches the endpoint, path, and wire model i
     );
     try std.testing.expectEqual(cc.types_mod.ProviderKind.openai, binding.transport);
 
-    var io_runtime = std.Io.Threaded.init(a, .{});
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
     defer io_runtime.deinit();
     var client = cc.api_openai.OpenAIClient.init(
         a,
@@ -1143,7 +1143,7 @@ test "L2: a configured relay reaches its own path, header, and wire model id" {
     try std.testing.expectEqualStrings("relay-glm-pro", route.request_model_id);
     try std.testing.expectEqual(@as(?u32, 200_000), route.limits.context_window);
 
-    var io_runtime = std.Io.Threaded.init(a, .{});
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
     defer io_runtime.deinit();
     var client = cc.api_openai.OpenAIClient.init(
         a,
@@ -1257,7 +1257,7 @@ test "L2: an expired provider token refreshes over real HTTP and persists the ro
         .expires_in_seconds = 10,
     }, 1_000);
 
-    var io_runtime = std.Io.Threaded.init(a, .{});
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
     defer io_runtime.deinit();
     var exchange = cc.api_oauth_exchange.HttpExchange{
         .allocator = a,
@@ -1305,7 +1305,7 @@ test "L2: a rejected refresh is terminal and leaves the stored login untouched" 
         .expires_in_seconds = 10,
     }, 1_000);
 
-    var io_runtime = std.Io.Threaded.init(a, .{});
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
     defer io_runtime.deinit();
     var exchange = cc.api_oauth_exchange.HttpExchange{
         .allocator = a,
@@ -1358,7 +1358,7 @@ test "L2: an OAuth access token authenticates the provider's own route" {
     );
     try std.testing.expectEqualStrings("oauth-access-token", binding.secret);
 
-    var io_runtime = std.Io.Threaded.init(a, .{});
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
     defer io_runtime.deinit();
     var client = cc.api_openai.OpenAIClient.init(
         a,
@@ -1492,7 +1492,7 @@ test "L2: a control the offer declares changes the bytes actually sent" {
                 false,
             );
 
-            var io_runtime = std.Io.Threaded.init(allocator, .{});
+            var io_runtime = @import("platform").signal.threadedIo(allocator, .{});
             defer io_runtime.deinit();
             var client = cc.api_openai.OpenAIClient.init(
                 allocator,
@@ -1818,7 +1818,7 @@ test "L2: a catalog endpoint answering non-2xx releases its body exactly once" {
     const origin = try server.urlOwned(a);
     defer a.free(origin);
 
-    var io_runtime = std.Io.Threaded.init(a, .{});
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
     defer io_runtime.deinit();
 
     // The failure path freed the body *and* let an errdefer free it again, so
@@ -1839,7 +1839,7 @@ test "L2: an unreachable catalog endpoint leaves the previous catalog in place" 
     defer host.destroy();
     const before = host.kernel.catalogSnapshot().items().len;
 
-    var io_runtime = std.Io.Threaded.init(a, .{});
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
     defer io_runtime.deinit();
     // Port 1 on loopback refuses immediately.
     try std.testing.expect(cc.api_catalog_fetch.fetch(a, io_runtime.io(), .{

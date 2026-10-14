@@ -259,7 +259,7 @@ test "L2 CLI plugin package reaches App canonical Skill Agent and provider reque
     var probe_guard = try EnvGuard.set(std.testing.allocator, "METACODES_NO_PROBE", "1");
     defer probe_guard.restore();
 
-    var io_runtime = std.Io.Threaded.init(allocator, .{});
+    var io_runtime = @import("platform").signal.threadedIo(allocator, .{});
     defer io_runtime.deinit();
     const app = try cc.app_module.App.init(allocator, io_runtime.io(), config, "test-key");
     defer app.deinit();
@@ -336,7 +336,7 @@ test "L2 external plugin manifest changes canonical Skill schema sent to provide
     try std.testing.expectEqualStrings("acme_dreview", snapshot.skill_sources[0].namespace);
     try std.testing.expectEqual(@as(usize, 1), snapshot.plugins[0].contribution_count);
 
-    var io_runtime = std.Io.Threaded.init(allocator, .{});
+    var io_runtime = @import("platform").signal.threadedIo(allocator, .{});
     defer io_runtime.deinit();
     var skill_runtime = cc.skills_cli_adapter.Runtime.init(allocator, io_runtime.io());
     defer skill_runtime.deinit();
@@ -395,7 +395,7 @@ test "L2 required-first survives an ignoring GLM gateway and blocks earlier tool
     const url = try server.urlOwned(allocator);
     defer allocator.free(url);
 
-    var io_runtime = std.Io.Threaded.init(allocator, .{});
+    var io_runtime = @import("platform").signal.threadedIo(allocator, .{});
     defer io_runtime.deinit();
     var client = cc.client_mod.Client.initWithBaseUrl(
         allocator,
@@ -472,7 +472,7 @@ test "L2 required-first satisfaction survives compact boundary without schema ca
     const url = try server.urlOwned(allocator);
     defer allocator.free(url);
 
-    var io_runtime = std.Io.Threaded.init(allocator, .{});
+    var io_runtime = @import("platform").signal.threadedIo(allocator, .{});
     defer io_runtime.deinit();
     var client = cc.client_mod.Client.initWithBaseUrl(
         allocator,

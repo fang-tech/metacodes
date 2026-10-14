@@ -103,7 +103,7 @@ test "L2 compact abort actively interrupts in-flight provider IO" {
         "http://127.0.0.1:{d}/v1/messages",
         .{server.port},
     );
-    var io_runtime = std.Io.Threaded.init(std.testing.allocator, .{});
+    var io_runtime = @import("platform").signal.threadedIo(std.testing.allocator, .{});
     defer io_runtime.deinit();
     var client = cc.client_mod.Client.initWithBaseUrl(
         std.testing.allocator,
