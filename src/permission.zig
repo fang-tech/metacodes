@@ -106,6 +106,21 @@ pub const PermissionContext = struct {
         if (self.event_sink) |sink| sink.emit(.{ .mode = m });
     }
 
+    /// Whether the settings let a session switch into `m`. `disableBypassPermissionsMode`
+    /// and `disableAutoMode` (any layer) are hard constraints: App init downgrades a
+    /// session that starts in such a mode, and every later switch must ask here first
+    /// (SessionService.setPermMode, the web/daemon message's `permission_mode`).
+    /// Historical aliases are judged by what they mean (`bypass` is bypass_permissions).
+    /// No settings loaded → every mode is allowed.
+    pub fn modeAllowed(self: *const PermissionContext, m: types.PermissionMode) bool {
+        const settings = self.settings orelse return true;
+        return switch (mode_mod.canonical(m)) {
+            .bypass_permissions => !settings.isBypassDisabled(),
+            .auto => !settings.isAutoModeDisabled(),
+            else => true,
+        };
+    }
+
     /// **scoped 派生的唯一入口(U4)**:值拷贝本 ctx + **null 掉 event_sink**(scoped ctx 不是
     /// session ctx,其 mode override 绝不 emit 到 session sink),可选覆盖 mode。所有"值拷贝
     /// permission_ctx 做 override"必须走它(subagent/agent_loop prefetch·nohooks/agent)。
@@ -259,6 +274,39 @@ test "U4 A2: setMode 有 sink 则 emit mode_changed;无 sink 不 emit" {
     // 关键:任何直写 ctx.setMode 的路径同样 emit(task#14 的事件源是 setMode 本身,不是调用方)
     ctx.setMode(.auto);
     try std.testing.expectEqual(types.PermissionMode.auto, rec.got.?.mode);
+}
+
+test "modeAllowed: disableBypassPermissionsMode / disableAutoMode, aliases, no settings" {
+    const no_rules: []const settings_mod.Rule = &.{};
+    var ctx = PermissionContext{ .allocator = std.testing.allocator };
+    // No settings: nothing is forbidden.
+    inline for (std.meta.fields(types.PermissionMode)) |f| {
+        try std.testing.expect(ctx.modeAllowed(@enumFromInt(f.value)));
+    }
+
+    // A later layer disables bypass, another disables auto: any layer counts.
+    const layers = [_]settings_mod.Layer{
+        .{ .source = .user, .allow = no_rules, .ask = no_rules, .deny = no_rules },
+        .{ .source = .cli, .allow = no_rules, .ask = no_rules, .deny = no_rules, .disable_bypass_permissions_mode = true },
+    };
+    const bypass_off = settings_mod.MergedSettings{ .layers = &layers, .allocator = std.testing.allocator };
+    ctx.settings = &bypass_off;
+    try std.testing.expect(!ctx.modeAllowed(.bypass_permissions));
+    try std.testing.expect(!ctx.modeAllowed(.bypass)); // historical alias of the same mode
+    try std.testing.expect(ctx.modeAllowed(.auto));
+    try std.testing.expect(ctx.modeAllowed(.default));
+    try std.testing.expect(ctx.modeAllowed(.prompt));
+    try std.testing.expect(ctx.modeAllowed(.accept_edits));
+    try std.testing.expect(ctx.modeAllowed(.dont_ask));
+
+    const auto_layers = [_]settings_mod.Layer{
+        .{ .source = .managed, .allow = no_rules, .ask = no_rules, .deny = no_rules, .disable_auto_mode = true },
+    };
+    const auto_off = settings_mod.MergedSettings{ .layers = &auto_layers, .allocator = std.testing.allocator };
+    ctx.settings = &auto_off;
+    try std.testing.expect(!ctx.modeAllowed(.auto));
+    try std.testing.expect(ctx.modeAllowed(.bypass_permissions));
+    try std.testing.expect(ctx.modeAllowed(.accept_edits));
 }
 
 test "U4 A2: scopedDerive null 掉 sink(scoped 拷贝的 override 绝不 emit 到 session sink)" {

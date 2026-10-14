@@ -487,14 +487,17 @@ const GeminiStream = struct {
         // 一个 chunk 只能返回一个 StreamEvent,故:先把 usage 算好存进 pending_usage;若本 chunk 还有
         // 内容(text/functionCall)→ 下面 emit 内容,usage 由 next() 下次吐;若本 chunk 无内容 → 直接吐 usage。
         // 这保证"内容+usage 同 chunk"时 usage 不被静默丢(旧逻辑只在无内容 chunk emit usage = 丢)。
-        if (std.mem.indexOf(u8, data, "\"usageMetadata\"") != null) {
-            const cu = cache.parseGeminiCacheUsage(data);
+        // 只认**值为 object** 的顶层 usageMetadata,数值只从该对象读:`"usageMetadata":null`
+        // 若按 substring 判存在,会发一个全零 usage,把"未计量"报成"已计量为 0"
+        // (同 OpenAI issue #258 的判定错误)。
+        if (util_json.topLevelObjectField(data, "usageMetadata")) |usage_obj| {
+            const cu = cache.parseGeminiCacheUsage(usage_obj);
             // 语义归一(Anthropic-exclusive):Gemini 的 promptTokenCount **包含**
             // cachedContentTokenCount;中立 UsageDelta 的 input_tokens 不含 cache,
             // 消费方按 in+cache_r+cache_w 求和(usage 锚点/成本)——不减会双计。
             const usage = UsageDelta{
-                .input_tokens = util_json.extractIntField(data, "promptTokenCount") -| cu.read_tokens,
-                .output_tokens = util_json.extractIntField(data, "candidatesTokenCount"),
+                .input_tokens = util_json.extractIntField(usage_obj, "promptTokenCount") -| cu.read_tokens,
+                .output_tokens = util_json.extractIntField(usage_obj, "candidatesTokenCount"),
                 .cache_read_input_tokens = cu.read_tokens,
                 .cache_creation_input_tokens = cu.creation_tokens,
             };
@@ -1134,7 +1137,7 @@ test "M7 Gemini: reasoning_effort=null 不发 generation_config(自适应)" {
 
 test "Gemini 有状态缓存句柄表:命中/过期/剔除" {
     const a = std.testing.allocator;
-    var io_rt = std.Io.Threaded.init(a, .{});
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
     defer io_rt.deinit();
     var client = GeminiClient.init(a, io_rt.io(), "k", "gemini-2.5-flash", "http://localhost");
     defer client.deinit();

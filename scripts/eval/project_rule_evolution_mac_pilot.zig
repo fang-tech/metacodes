@@ -135,7 +135,7 @@ fn run(init: std.process.Init) !void {
     // state root a host with this home and no other configuration resolves.
     const state_root = try cc.util_state_root.legacyDefault(allocator, home);
     defer allocator.free(state_root);
-    var io_runtime = std.Io.Threaded.init(allocator, .{});
+    var io_runtime = @import("platform").signal.threadedIo(allocator, .{});
     defer io_runtime.deinit();
     var kg = try cc.kg_client.KgClient.init(allocator, .{
         .state_root = state_root,

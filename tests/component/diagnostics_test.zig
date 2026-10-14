@@ -56,7 +56,7 @@ test "L4: DiagnosticsBackend 经 TeeBackend 收集真 agent_loop 的 trace" {
     const url = try srv.urlOwned(a);
     defer a.free(url);
 
-    var io_runtime = std.Io.Threaded.init(a, .{});
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
     defer io_runtime.deinit();
     const io = io_runtime.io();
 
@@ -139,7 +139,7 @@ test "L2 cache detector consumes one aggregate per real provider response" {
     const url = try srv.urlOwned(a);
     defer a.free(url);
 
-    var io_runtime = std.Io.Threaded.init(a, .{});
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
     defer io_runtime.deinit();
     var client = cc.client_mod.Client.initWithBaseUrl(a, io_runtime.io(), "test-key", "model-a", url);
     defer client.deinit();
@@ -165,7 +165,7 @@ test "L2: EvaluationBackend projects a real agent_loop into stable events" {
     const url = try srv.urlOwned(a);
     defer a.free(url);
 
-    var io_runtime = std.Io.Threaded.init(a, .{});
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
     defer io_runtime.deinit();
     const io = io_runtime.io();
     var client = cc.client_mod.Client.initWithBaseUrl(a, io, "test-key", "model-a", url);
@@ -214,7 +214,7 @@ test "L2: denied tool attempt has paired lifecycle and exact policy id" {
     const url = try srv.urlOwned(a);
     defer a.free(url);
 
-    var io_runtime = std.Io.Threaded.init(a, .{});
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
     defer io_runtime.deinit();
     var client = cc.client_mod.Client.initWithBaseUrl(a, io_runtime.io(), "test-key", "model-a", url);
     defer client.deinit();

@@ -109,7 +109,7 @@ fn run(init: std.process.Init) !void {
         .api_key_first,
     );
     defer credential.deinit(allocator);
-    var io_runtime = std.Io.Threaded.init(allocator, .{});
+    var io_runtime = @import("platform").signal.threadedIo(allocator, .{});
     defer io_runtime.deinit();
     var client = cc.client.Client.init(
         allocator,

@@ -143,7 +143,7 @@ test "L2: WebSearch content:[] 时靠模型摘要作答(非 no-results)" {
     const url = try srv.urlOwned(a);
     defer a.free(url);
 
-    var io_runtime = std.Io.Threaded.init(a, .{});
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
     defer io_runtime.deinit();
     var client = makeClient(a, io_runtime.io(), url);
     defer client.deinit();
@@ -184,7 +184,7 @@ test "L2: WebSearch 两阶段驱动 progress 回调(query_update + results_recei
     const url = try srv.urlOwned(a);
     defer a.free(url);
 
-    var io_runtime = std.Io.Threaded.init(a, .{});
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
     defer io_runtime.deinit();
     var client = makeClient(a, io_runtime.io(), url);
     defer client.deinit();

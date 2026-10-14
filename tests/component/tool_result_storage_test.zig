@@ -216,7 +216,7 @@ test "L2 runner projects after raw UI observation and recovers artifact on the n
         }
     };
 
-    var io_runtime = std.Io.Threaded.init(allocator, .{});
+    var io_runtime = @import("platform").signal.threadedIo(allocator, .{});
     defer io_runtime.deinit();
     var client = cc.client_mod.Client.initWithBaseUrl(allocator, io_runtime.io(), "test-key", "claude-sonnet-4-20250514", url);
     defer client.deinit();
@@ -497,7 +497,7 @@ test "L2 native Grep spools 17MiB from byte zero and keeps the cached tool prefi
     const url = try server.urlOwned(allocator);
     defer allocator.free(url);
 
-    var io_runtime = std.Io.Threaded.init(allocator, .{});
+    var io_runtime = @import("platform").signal.threadedIo(allocator, .{});
     defer io_runtime.deinit();
     var client = cc.client_mod.Client.initWithBaseUrl(allocator, io_runtime.io(), "test-key", "claude-sonnet-4-20250514", url);
     defer client.deinit();

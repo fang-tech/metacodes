@@ -4,7 +4,9 @@
 //!
 //! **协议(每行一 JSON 请求 → NDJSON 行回)**:
 //!   {"op":"list"}                                  → {"sessions":["<id>",...]}
-//!   {"op":"message","session":"<id>","text":"..."} → {"ok":true}(入 session inbox,driver 消费)
+//!   {"op":"message","session":"<id>","text":"...","model"?:"...","permission_mode"?:"..."}
+//!                                                  → {"ok":true}(入 session inbox,driver 消费;
+//!                                                     字段与校验同 HTTP POST /message,见 web/submission.zig)
 //!   {"op":"interrupt","session":"<id>"}            → {"ok":true|false}(生成期门,同 web /interrupt)
 //!   {"op":"attach","session":"<id>","since":N}     → 从 seq N 起流式推 journal 行(每行原样 JSON),
 //!                                                     直到 session 关停({"type":"session_closed"})或断连。
@@ -20,7 +22,7 @@ const net = @import("platform").net;
 const log = @import("../util/log.zig");
 const time = @import("../util/time.zig");
 const server_mod = @import("../web/server.zig");
-const json_util = @import("../util/json.zig");
+const submission_mod = @import("../web/submission.zig");
 const SessionView = server_mod.SessionView;
 
 pub const Deps = struct {
@@ -182,21 +184,16 @@ pub const UdsServer = struct {
         };
 
         if (std.mem.eql(u8, op, "message")) {
-            const text = getStr(v, "text") orelse {
-                _ = self.writeLine(conn, "{\"ok\":false,\"error\":\"missing text\"}");
+            // Same fields and checks as HTTP POST /message: a bad field is refused before
+            // anything is queued, and the driver journals user_message when the turn starts.
+            // inbox.push copies, so the arena-backed request can go in as is.
+            const request = submission_mod.parseObject(v.object) catch |err| {
+                var reply_buf: [192]u8 = undefined;
+                const reply = std.fmt.bufPrint(&reply_buf, "{{\"ok\":false,\"error\":\"{s}\"}}", .{submission_mod.reason(err)}) catch "{\"ok\":false}";
+                _ = self.writeLine(conn, reply);
                 return false;
             };
-            // 回显先于入队(附着的 attach 立刻见已提交消息)。inbox.push 内部 dupe,text(arena)传入即可。
-            const raw_echo = std.json.Stringify.valueAlloc(self.allocator, .{ .user_message = text }, .{}) catch null;
-            if (raw_echo) |raw| {
-                defer self.allocator.free(raw);
-                const echo = json_util.repairJsonUtf8(self.allocator, raw) catch null;
-                if (echo) |e| {
-                    defer self.allocator.free(e);
-                    sv.journal.append(e);
-                }
-            }
-            if (!sv.inbox.push(text)) {
+            if (!sv.inbox.push(request)) {
                 _ = self.writeLine(conn, "{\"ok\":false,\"error\":\"queue push failed\"}");
                 return false;
             }

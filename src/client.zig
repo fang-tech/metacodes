@@ -1790,7 +1790,7 @@ test "doGetModels uses sendBodiless (no sendBodyComplete on GET)" {
 
 test "task#13: setModel/modelSnapshot round-trip + 并发无撕裂(mutex 串行)" {
     const a = std.testing.allocator;
-    var io_rt = std.Io.Threaded.init(a, .{});
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
     defer io_rt.deinit();
     var client = Client.initWithBaseUrl(a, io_rt.io(), "k", "claude-3-5-haiku-20241022", "http://x");
     defer client.deinit();

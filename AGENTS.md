@@ -24,6 +24,10 @@ These rules apply to the entire repository.
   Windows; use `finalPath` when you need the physical path. Read errno through
   `pfs.lastErrnoIs`/`pfs.errnoTag`, not a bare `@enumFromInt` or
   `std.posix.errno`.
+- Create every `std.Io.Threaded` through `platform.signal.threadedIo`, never
+  `std.Io.Threaded.init`: std's init replaces the ignored SIGPIPE with a
+  handler, and a delivered SIGPIPE turns any thread's blocked syscall into
+  EINTR (`zig build test:io-threaded` enforces it).
 - Preserve the kernel boundaries: plugins cannot replace the AgentLoop or bypass
   permission, sandbox, budget, formal verdicts, TinyKG admission, or artifact CAS.
 - Provider-visible bytes are a cache contract. Runtime generation, plugin paths,
