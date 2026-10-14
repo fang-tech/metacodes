@@ -498,8 +498,13 @@ const OpenAIStream = struct {
     /// 序列化时走占位的图像 tool_result id(owned),随 StreamHandle 回传。
     image_placeholder_ids: []const []const u8 = &.{},
     done: bool = false,
-    /// Responses 协议:终止事件(completed/incomplete)已发 usage,flush 队列排空后
-    /// 补发一个 .done(Responses 无 [DONE] 哨兵行)。
+    /// chat 协议:与内容增量**同 chunk** 到达的 usage(部分兼容端把 usage 挂在末个内容
+    /// chunk 上)。parseChunk 一次只能返回一个事件,故先返回内容事件、usage 存这里,
+    /// 下一次 next() 经 takeQueued 紧接着吐出。单槽即可:每个 chunk 至多一个 usage
+    /// 对象,且槽在读下一行之前必被 takeQueued 清空。
+    pending_usage: ?UsageDelta = null,
+    /// Responses 协议:终止事件(completed/incomplete)已处理完(有 usage 对象则已发),
+    /// flush 队列排空后补发一个 .done(Responses 无 [DONE] 哨兵行)。
     pending_done: bool = false,
     last_stop: StopReason = .unknown,
     // 并行 tool_calls 增量累积(P0.1):OpenAI 流式把每个 tool_call 按 `index` 分槽分块发
@@ -546,6 +551,15 @@ const OpenAIStream = struct {
     }
 
     fn deinit(self: *OpenAIStream) void {
+        self.releaseParseState();
+        if (self.abort_registry) |registry| registry.unregister(self.request);
+        self.request.deinit();
+        self.allocator.destroy(self.request);
+    }
+
+    /// 释放解析侧状态(累积槽、未 drain 的 flush 事件、去重键、溢出行缓冲),不碰 HTTP
+    /// request。deinit 的前半段;单测用固定 reader 直驱 next() 时只走这一半。
+    fn releaseParseState(self: *OpenAIStream) void {
         self.allocator.free(self.image_placeholder_ids);
         for (self.tcs.items) |*tc| tc.deinit(self.allocator);
         self.tcs.deinit(self.allocator);
@@ -563,9 +577,6 @@ const OpenAIStream = struct {
         for (self.reasoning_keys.items) |key| self.allocator.free(key);
         self.reasoning_keys.deinit(self.allocator);
         self.line_overflow.deinit(self.allocator);
-        if (self.abort_registry) |registry| registry.unregister(self.request);
-        self.request.deinit();
-        self.allocator.destroy(self.request);
     }
 
     /// 读一行(到 '\n',不含)。port 自 stream.zig EventIterator.takeLine——同一机制、同一上限。
@@ -626,20 +637,35 @@ const OpenAIStream = struct {
         registry.touch(self.request);
     }
 
-    /// 读下一个中立事件。逐行读 SSE,翻译 OpenAI chunk → StreamEvent。
-    fn next(self: *OpenAIStream) anyerror!?StreamEvent {
-        // 先把已排队的 flush 事件(并行 tool_use_start)逐个吐出。
+    /// 已排队事件的唯一出口;next() 每次读新行之前先走这里。出队顺序固定:
+    ///   1. pending_usage —— 与内容同 chunk 的 usage,紧跟在该 chunk 的内容事件之后;
+    ///   2. flush_q       —— 终止时 flush 的 reasoning_item / tool_use_start(按入队顺序);
+    ///   3. pending_done  —— Responses 终止后补发的 done。
+    /// 1 与 2 不会同时非空:pending_usage 只在 parseChunk 返回内容事件时写入,而下一次
+    /// next() 在读任何新行(含触发 flush 的 [DONE]/EOF/终止事件)之前就把它吐掉了。
+    /// 所以这个顺序就是 wire 上的到达顺序。
+    fn takeQueued(self: *OpenAIStream) ?StreamEvent {
+        if (self.pending_usage) |u| {
+            self.pending_usage = null;
+            return StreamEvent{ .usage = u };
+        }
         if (self.flush_pos < self.flush_q.items.len) {
             const ev = self.flush_q.items[self.flush_pos];
             self.flush_pos += 1;
             return ev;
         }
-        // Responses 终止事件已发 usage、flush 已排空 → 补发 done 并收流。
+        // Responses 终止事件已处理、flush 已排空 → 补发 done 并收流。
         if (self.pending_done) {
             self.pending_done = false;
             self.done = true;
             return StreamEvent{ .done = {} };
         }
+        return null;
+    }
+
+    /// 读下一个中立事件。逐行读 SSE,翻译 OpenAI chunk → StreamEvent。
+    fn next(self: *OpenAIStream) anyerror!?StreamEvent {
+        if (self.takeQueued()) |ev| return ev;
         if (self.done) return null;
         if (self.reader == null) {
             const raw = self.response.reader(&self.transfer_buf);
@@ -697,23 +723,27 @@ const OpenAIStream = struct {
     fn parseChunk(self: *OpenAIStream, data: []const u8) !?StreamEvent {
         // Responses API 走 typed 事件解析路径(chat/completions 的启发式对它不适用)。
         if (self.protocol == .responses) return self.parseResponsesChunk(data);
-        // usage chunk(include_usage 时末尾发):{"choices":[],"usage":{prompt_tokens,completion_tokens,
-        // prompt_tokens_details:{cached_tokens}}}。归一成中立 UsageDelta(prompt→input、completion→output、
-        // cached_tokens→cache_read,经 cache.parseOpenAICacheUsage)。让缓存命中能上抛 UI,与 Anthropic 一致。
-        if (std.mem.indexOf(u8, data, "\"usage\"") != null) {
-            const cu = cache.parseOpenAICacheUsage(data);
-            // 语义归一(Anthropic-exclusive):OpenAI 的 prompt_tokens **包含** cached_tokens,
-            // 中立 UsageDelta 约定 input_tokens 不含 cache(Anthropic 语义)。消费方
-            // (usage 锚点/成本累计)按 in+cache_r+cache_w 求和——不减会把缓存双计。
-            return StreamEvent{
-                .usage = UsageDelta{
-                    .input_tokens = util_json.extractIntField(data, "prompt_tokens") -| cu.read_tokens,
-                    .output_tokens = util_json.extractIntField(data, "completion_tokens"),
-                    .cache_read_input_tokens = cu.read_tokens,
-                    .cache_creation_input_tokens = cu.creation_tokens, // OpenAI 无写区分 → 0
-                },
-            };
+        // takeQueued 在读本行之前已清空槽(见其注释);这里写入前它必为空。
+        std.debug.assert(self.pending_usage == null);
+        // usage 只在**值为 object** 时存在(见 chatUsageObject)。include_usage 下每个普通
+        // chunk 都带 `"usage":null`——旧实现按 substring `"usage"` 判存在并立即 return,
+        // 把这些 chunk 的文本/推理/tool_call 增量/finish_reason 全部吞掉(issue #258)。
+        const usage: ?UsageDelta = if (chatUsageObject(data)) |obj| chatUsageDelta(obj) else null;
+        // 内容侧照常处理。同 chunk 既有内容事件又有 usage 对象时,两个都发且顺序固定:
+        // 先内容、后 usage(存 pending_usage,下一次 next() 经 takeQueued 吐出)。
+        // tool_call 增量本身不产事件(终止时才 flush),故"tool_calls + usage 同 chunk"时
+        // usage 直接返回,先于对应的 tool_use_start。
+        if (try self.parseChatDelta(data)) |ev| {
+            self.pending_usage = usage;
+            return ev;
         }
+        if (usage) |u| return StreamEvent{ .usage = u };
+        return null;
+    }
+
+    /// chat chunk 的内容侧:finish_reason、content、reasoning(方言)、tool_calls 增量。
+    /// 返回至多一个内容事件(text/thinking),或 null(无可 emit 内容 / 增量累积中)。
+    fn parseChatDelta(self: *OpenAIStream, data: []const u8) !?StreamEvent {
         // finish_reason → StopReason(末 chunk)。
         if (util_json.extractStringField(data, "finish_reason")) |fr| {
             if (!std.mem.eql(u8, fr, "null")) self.last_stop = mapFinish(fr);
@@ -848,26 +878,18 @@ const OpenAIStream = struct {
     }
 
     /// Responses 终止事件(completed/incomplete)公共尾:usage 归一 + flush + 排队 done。
+    /// 事件顺序:usage(仅当 `response.usage` 是 object)→ reasoning_item → tool_use_start → done。
     fn finishResponsesTerminal(self: *OpenAIStream, data: []const u8) ?StreamEvent {
-        // cached_tokens 嵌在 usage.input_tokens_details 下;first-match 模式安全——
-        // `"input_tokens":` 含闭引号+冒号,不会命中 `"input_tokens_details"`。
-        const cached = util_json.extractIntField(data, "cached_tokens");
-        // 语义归一(同 chat usage 分支):Responses 的 input_tokens **包含** cached_tokens,
-        // 中立 UsageDelta 约定 input_tokens 不含 cache(Anthropic 语义)。消费方
-        // (usage 锚点/成本累计)按 in+cache_r+cache_w 求和——不减会把缓存双计。
-        const usage = UsageDelta{
-            .input_tokens = util_json.extractIntField(data, "input_tokens") -| cached,
-            .output_tokens = util_json.extractIntField(data, "output_tokens"),
-            .cache_read_input_tokens = cached,
-            .cache_creation_input_tokens = 0, // Responses 无写区分 → 0
-        };
         // 先排 reasoning item、后排 tool_use_start:next() 按入队顺序 drain,消费者
         // 因此在拿到工具调用之前就收齐了本轮的推理状态。
         self.queueTerminalReasoningItems(data);
         self.buildFlush();
         self.flushed = true;
         self.pending_done = true;
-        return StreamEvent{ .usage = usage };
+        if (responsesUsageObject(data)) |usage_obj| return StreamEvent{ .usage = responsesUsageDelta(usage_obj) };
+        // 无 usage 对象(缺失或 `"usage":null`):不伪造全零 usage——那会把"未计量"
+        // 报成"已计量为 0"(cache_break.ResponseUsage.reported)。直接吐队首事件。
+        return self.takeQueued();
     }
 
     /// 终止事件的 `response.output` 全量数组:补上任何没经 `output_item.done` 到达的
@@ -1170,6 +1192,61 @@ fn mapFinish(fr: []const u8) StopReason {
     if (std.mem.eql(u8, fr, "tool_calls")) return .tool_use;
     if (std.mem.eql(u8, fr, "length")) return .max_tokens;
     return .unknown;
+}
+
+/// chat chunk 携带的 usage 对象(含两端花括号,借用 data);没有则 null。
+/// 只认**值为 JSON object** 的 `usage` 成员,按位置优先级:
+///   1. 顶层 `usage`——OpenAI include_usage 的规范位置(末尾 `{"choices":[],"usage":{...}}`,
+///      部分兼容端挂在末个内容 chunk 上);
+///   2. 否则 `choices[i].usage`——部分兼容端(如 Moonshot)把末块 usage 放进 choice。
+///      旧实现的 substring 判定碰巧也接住了这种形态,保留以免回退。
+/// `"usage":null`(include_usage 下每个普通 chunk 的常态)、缺失、非 object 值、只出现在
+/// 字符串内容里(如 delta.content 恰为 "usage")都不算——issue #258。
+fn chatUsageObject(data: []const u8) ?[]const u8 {
+    if (util_json.topLevelObjectField(data, "usage")) |obj| return obj;
+    const choices = util_json.topLevelField(data, "choices") orelse return null;
+    if (choices[0] != '[') return null;
+    var it = ElemIter{ .s = choices[1 .. choices.len - 1] };
+    while (it.next()) |choice| {
+        if (util_json.topLevelObjectField(choice, "usage")) |obj| return obj;
+    }
+    return null;
+}
+
+/// OpenAI chat usage 对象 → 中立 UsageDelta。数值只从 usage 对象本身读,不扫整个 chunk。
+/// 语义归一(Anthropic-exclusive):OpenAI 的 prompt_tokens **包含** cached_tokens
+/// (prompt_tokens_details 下,经 cache.parseOpenAICacheUsage),中立 UsageDelta 约定
+/// input_tokens 不含 cache。消费方(usage 锚点/成本累计)按 in+cache_r+cache_w 求和——
+/// 不减会把缓存双计。`"prompt_tokens":` 含闭引号+冒号,不会命中 `prompt_tokens_details`。
+fn chatUsageDelta(usage_obj: []const u8) UsageDelta {
+    const cu = cache.parseOpenAICacheUsage(usage_obj);
+    return .{
+        .input_tokens = util_json.extractIntField(usage_obj, "prompt_tokens") -| cu.read_tokens,
+        .output_tokens = util_json.extractIntField(usage_obj, "completion_tokens"),
+        .cache_read_input_tokens = cu.read_tokens,
+        .cache_creation_input_tokens = cu.creation_tokens, // OpenAI 无写区分 → 0
+    };
+}
+
+/// Responses 终止事件的 `response.usage` 对象(含两端花括号,借用 data);缺失或非 object
+/// (如 `"usage":null`)→ null。只在规范位置找:终止事件的 `response` 还回显 tools(参数
+/// schema 可能恰有名为 input_tokens 的属性)、instructions 等,扫整个事件会读错数。
+fn responsesUsageObject(data: []const u8) ?[]const u8 {
+    const response = util_json.topLevelObjectField(data, "response") orelse return null;
+    return util_json.topLevelObjectField(response, "usage");
+}
+
+/// Responses usage 对象 → 中立 UsageDelta(归一同 chatUsageDelta:input_tokens **包含**
+/// input_tokens_details.cached_tokens,减掉防双计)。`"input_tokens":` 含闭引号+冒号,
+/// 不会命中 `"input_tokens_details"`。
+fn responsesUsageDelta(usage_obj: []const u8) UsageDelta {
+    const cached = util_json.extractIntField(usage_obj, "cached_tokens");
+    return .{
+        .input_tokens = util_json.extractIntField(usage_obj, "input_tokens") -| cached,
+        .output_tokens = util_json.extractIntField(usage_obj, "output_tokens"),
+        .cache_read_input_tokens = cached,
+        .cache_creation_input_tokens = 0, // Responses 无写区分 → 0
+    };
 }
 
 /// 中立 Conversation/tools → OpenAI chat/completions 请求 body。caller free。
@@ -2326,4 +2403,385 @@ test "itemTypeIs: 按值过滤,不依赖服务端把顶层 type 排在嵌套对�
     // 转义后的字符串内容撞不上键模式(工具参数里出现同样的文本也不会误判)。
     const escaped = "{\"id\":\"fc_2\",\"type\":\"function_call\",\"arguments\":\"{\\\"type\\\":\\\"reasoning\\\"}\"}";
     try std.testing.expect(!itemTypeIs(escaped, "reasoning"));
+}
+
+// ── issue #258:`usage:null` 不得截断 chunk;usage 只从 usage 对象读 ────────────────
+//
+// 直驱真实的 OpenAIStream.next()(含 takeQueued 出队顺序),只把 HTTP body reader 换成
+// 固定字节——SSE 分行、parseChunk、flush、事件顺序都与生产同一条路径。每个 usage:null
+// 用例配一个"只删掉 usage 字段"的对照,断言两者事件序列逐项一致(双侧)。
+
+/// 接管自 tool_use_start 的 owned 三元组(Replay.deinit 释放)。
+const ReplayTool = struct { id: []const u8, name: []const u8, input: []const u8 };
+
+/// 一次回放的可观察结果:事件种类序列 + 拼接文本/思考 + 工具调用 + usage 序列 + stop。
+const Replay = struct {
+    kinds: std.ArrayList(std.meta.Tag(StreamEvent)) = .empty,
+    text: std.ArrayList(u8) = .empty,
+    thinking: std.ArrayList(u8) = .empty,
+    tools: std.ArrayList(ReplayTool) = .empty,
+    usages: std.ArrayList(UsageDelta) = .empty,
+    stop: StopReason = .unknown,
+
+    fn deinit(self: *Replay, a: std.mem.Allocator) void {
+        self.kinds.deinit(a);
+        self.text.deinit(a);
+        self.thinking.deinit(a);
+        for (self.tools.items) |t| {
+            a.free(t.id);
+            a.free(t.name);
+            a.free(t.input);
+        }
+        self.tools.deinit(a);
+        self.usages.deinit(a);
+    }
+
+    fn expectSame(expected: *const Replay, actual: *const Replay) !void {
+        try std.testing.expectEqualSlices(std.meta.Tag(StreamEvent), expected.kinds.items, actual.kinds.items);
+        try std.testing.expectEqualStrings(expected.text.items, actual.text.items);
+        try std.testing.expectEqualStrings(expected.thinking.items, actual.thinking.items);
+        try std.testing.expectEqual(expected.tools.items.len, actual.tools.items.len);
+        for (expected.tools.items, actual.tools.items) |e, g| {
+            try std.testing.expectEqualStrings(e.id, g.id);
+            try std.testing.expectEqualStrings(e.name, g.name);
+            try std.testing.expectEqualStrings(e.input, g.input);
+        }
+        try std.testing.expectEqualSlices(UsageDelta, expected.usages.items, actual.usages.items);
+        try std.testing.expectEqual(expected.stop, actual.stop);
+    }
+};
+
+fn replaySse(a: std.mem.Allocator, model: []const u8, protocol: types.OpenAIProtocol, sse: []const u8) !Replay {
+    var stream = OpenAIStream{
+        .allocator = a,
+        .model = model,
+        .dialect = dialect_mod.dialectFor(.openai, model),
+        .protocol = protocol,
+        .request = undefined, // 固定 reader 直驱:不建 HTTP 请求,releaseParseState 不碰它
+        .response = undefined,
+        .id = .{ .bytes = .{0} ** 12 },
+    };
+    defer stream.releaseParseState();
+    var body = std.Io.Reader.fixed(sse);
+    stream.reader = &body;
+
+    var out: Replay = .{};
+    errdefer out.deinit(a);
+    while (try stream.next()) |ev| {
+        switch (ev) {
+            .text => |t| {
+                defer a.free(t);
+                try out.text.appendSlice(a, t);
+            },
+            .thinking => |t| {
+                defer a.free(t);
+                try out.thinking.appendSlice(a, t);
+            },
+            .tool_use_start => |tu| out.tools.append(a, .{ .id = tu.id, .name = tu.name, .input = tu.input_json }) catch |e| {
+                a.free(tu.id);
+                a.free(tu.name);
+                a.free(tu.input_json);
+                return e;
+            },
+            .reasoning_item => |bytes| a.free(bytes),
+            .web_search_result => |w| {
+                a.free(w.ui_text);
+                a.free(w.content_json);
+            },
+            .web_search_query => |q| a.free(q),
+            .usage => |u| try out.usages.append(a, u),
+            .done => {},
+        }
+        try out.kinds.append(a, std.meta.activeTag(ev));
+    }
+    out.stop = stream.last_stop;
+    return out;
+}
+
+/// 回放 `with_usage_null` 与其去掉 usage 字段的对照,断言两者一致并返回前者(caller deinit)。
+fn replayAgainstControl(a: std.mem.Allocator, model: []const u8, with_usage_null: []const u8, control: []const u8) !Replay {
+    var got = try replaySse(a, model, .chat_completions, with_usage_null);
+    errdefer got.deinit(a);
+    var want = try replaySse(a, model, .chat_completions, control);
+    defer want.deinit(a);
+    try Replay.expectSame(&want, &got);
+    return got;
+}
+
+test "issue #258: usage:null 在 choices 之后——文本与 stop 照常,不产 usage 事件(对照同)" {
+    const a = std.testing.allocator;
+    var got = try replayAgainstControl(
+        a,
+        "gpt-4o",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello\"}}],\"usage\":null}\n\n" ++
+            "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":null}\n\n" ++
+            "data: [DONE]\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello\"}}]}\n\n" ++
+            "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n" ++
+            "data: [DONE]\n\n",
+    );
+    defer got.deinit(a);
+    try std.testing.expectEqualSlices(std.meta.Tag(StreamEvent), &.{ .text, .done }, got.kinds.items);
+    try std.testing.expectEqualStrings("Hello", got.text.items);
+    try std.testing.expectEqual(StopReason.end_turn, got.stop);
+    try std.testing.expectEqual(@as(usize, 0), got.usages.items.len);
+}
+
+test "issue #258: usage:null 在 choices 之前 + role-only delta + 空 delta/finish_reason(对照同)" {
+    const a = std.testing.allocator;
+    var got = try replayAgainstControl(
+        a,
+        "gpt-4o",
+        "data: {\"usage\":null,\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"}}]}\n\n" ++
+            "data: {\"usage\":null,\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\"}}]}\n\n" ++
+            "data: {\"usage\":null,\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hi\"}}]}\n\n" ++
+            "data: {\"usage\": null, \"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"length\"}]}\n\n" ++
+            "data: [DONE]\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"}}]}\n\n" ++
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\"}}]}\n\n" ++
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hi\"}}]}\n\n" ++
+            "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"length\"}]}\n\n" ++
+            "data: [DONE]\n\n",
+    );
+    defer got.deinit(a);
+    try std.testing.expectEqualSlices(std.meta.Tag(StreamEvent), &.{ .text, .done }, got.kinds.items);
+    try std.testing.expectEqualStrings("Hi", got.text.items);
+    // 末块 finish_reason 与 usage:null 同 chunk 也必须被记下(旧实现会提前 return 丢掉)。
+    try std.testing.expectEqual(StopReason.max_tokens, got.stop);
+    try std.testing.expectEqual(@as(usize, 0), got.usages.items.len);
+}
+
+test "issue #258: tool_call 增量带 usage:null 仍完整成型(对照同)" {
+    const a = std.testing.allocator;
+    var got = try replayAgainstControl(
+        a,
+        "gpt-4o",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"get_time\",\"arguments\":\"\"}}]}}],\"usage\":null}\n\n" ++
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"tz\\\":\"}}]}}],\"usage\":null}\n\n" ++
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\"utc\\\"}\"}}]}}],\"usage\":null}\n\n" ++
+            "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}],\"usage\":null}\n\n" ++
+            "data: [DONE]\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"get_time\",\"arguments\":\"\"}}]}}]}\n\n" ++
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"tz\\\":\"}}]}}]}\n\n" ++
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\"utc\\\"}\"}}]}}]}\n\n" ++
+            "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n" ++
+            "data: [DONE]\n\n",
+    );
+    defer got.deinit(a);
+    try std.testing.expectEqualSlices(std.meta.Tag(StreamEvent), &.{.tool_use_start}, got.kinds.items);
+    try std.testing.expectEqualStrings("call_1", got.tools.items[0].id);
+    try std.testing.expectEqualStrings("get_time", got.tools.items[0].name);
+    try std.testing.expectEqualStrings("{\"tz\":\"utc\"}", got.tools.items[0].input);
+    try std.testing.expectEqual(StopReason.tool_use, got.stop);
+    try std.testing.expectEqual(@as(usize, 0), got.usages.items.len);
+}
+
+test "issue #258: reasoning_content 带 usage:null 仍产 thinking(deepseek 方言,对照同)" {
+    const a = std.testing.allocator;
+    var got = try replayAgainstControl(
+        a,
+        "deepseek-chat",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":null,\"reasoning_content\":\"think\"}}],\"usage\":null}\n\n" ++
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\",\"reasoning_content\":null}}],\"usage\":null}\n\n" ++
+            "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":null}\n\n" ++
+            "data: [DONE]\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":null,\"reasoning_content\":\"think\"}}]}\n\n" ++
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\",\"reasoning_content\":null}}]}\n\n" ++
+            "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n" ++
+            "data: [DONE]\n\n",
+    );
+    defer got.deinit(a);
+    try std.testing.expectEqualSlices(std.meta.Tag(StreamEvent), &.{ .thinking, .text, .done }, got.kinds.items);
+    try std.testing.expectEqualStrings("think", got.thinking.items);
+    try std.testing.expectEqualStrings("ok", got.text.items);
+    try std.testing.expectEqual(StopReason.end_turn, got.stop);
+}
+
+test "issue #258: 末尾 {choices:[],usage:{...}} 仍产正确 token/缓存数(前面 chunk 带 usage:null,对照同)" {
+    const a = std.testing.allocator;
+    const final_usage = "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":2006,\"completion_tokens\":10,\"total_tokens\":2016," ++
+        "\"prompt_tokens_details\":{\"cached_tokens\":1920},\"completion_tokens_details\":{\"reasoning_tokens\":0}}}\n\n";
+    var got = try replayAgainstControl(
+        a,
+        "gpt-4o",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}],\"usage\":null}\n\n" ++
+            "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":null}\n\n" ++
+            final_usage ++ "data: [DONE]\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n" ++
+            "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n" ++
+            final_usage ++ "data: [DONE]\n\n",
+    );
+    defer got.deinit(a);
+    try std.testing.expectEqualSlices(std.meta.Tag(StreamEvent), &.{ .text, .usage, .done }, got.kinds.items);
+    // prompt_tokens 含 cached:input = 2006-1920 = 86;cache_read = 1920;output = completion。
+    try std.testing.expectEqualSlices(UsageDelta, &.{.{
+        .input_tokens = 86,
+        .output_tokens = 10,
+        .cache_read_input_tokens = 1920,
+        .cache_creation_input_tokens = 0,
+    }}, got.usages.items);
+    try std.testing.expectEqual(StopReason.end_turn, got.stop);
+}
+
+test "issue #258: 同 chunk 既有内容又有 usage 对象——两个都发,内容在前 usage 在后" {
+    const a = std.testing.allocator;
+    const want_usage = [_]UsageDelta{.{ .input_tokens = 8, .output_tokens = 2, .cache_read_input_tokens = 4 }};
+    // usage 在 choices 之后 / 之前,结果一致。
+    const fixtures = [_][]const u8{
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hel\"}}]}\n\n" ++
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"lo\"},\"finish_reason\":\"stop\"}]," ++
+            "\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":2,\"prompt_tokens_details\":{\"cached_tokens\":4}}}\n\n" ++
+            "data: [DONE]\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hel\"}}]}\n\n" ++
+            "data: {\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":2,\"prompt_tokens_details\":{\"cached_tokens\":4}}," ++
+            "\"choices\":[{\"index\":0,\"delta\":{\"content\":\"lo\"},\"finish_reason\":\"stop\"}]}\n\n" ++
+            "data: [DONE]\n\n",
+    };
+    for (fixtures) |sse| {
+        var got = try replaySse(a, "gpt-4o", .chat_completions, sse);
+        defer got.deinit(a);
+        try std.testing.expectEqualSlices(std.meta.Tag(StreamEvent), &.{ .text, .text, .usage, .done }, got.kinds.items);
+        try std.testing.expectEqualStrings("Hello", got.text.items);
+        try std.testing.expectEqualSlices(UsageDelta, &want_usage, got.usages.items);
+        try std.testing.expectEqual(StopReason.end_turn, got.stop);
+    }
+
+    // reasoning 增量 + usage 同 chunk:thinking 在前,usage 紧随。
+    var reasoning = try replaySse(
+        a,
+        "deepseek-chat",
+        .chat_completions,
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"r\"}}],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":1}}\n\n" ++
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"a\"},\"finish_reason\":\"stop\"}]}\n\n" ++
+            "data: [DONE]\n\n",
+    );
+    defer reasoning.deinit(a);
+    try std.testing.expectEqualSlices(std.meta.Tag(StreamEvent), &.{ .thinking, .usage, .text, .done }, reasoning.kinds.items);
+    try std.testing.expectEqualSlices(UsageDelta, &.{.{ .input_tokens = 3, .output_tokens = 1 }}, reasoning.usages.items);
+
+    // tool_call 增量 + finish_reason + usage 同 chunk:增量不产事件,usage 先发,tool_use_start 在 flush 时到。
+    var tool = try replaySse(
+        a,
+        "gpt-4o",
+        .chat_completions,
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_9\",\"type\":\"function\"," ++
+            "\"function\":{\"name\":\"get_time\",\"arguments\":\"{}\"}}]},\"finish_reason\":\"tool_calls\"}]," ++
+            "\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":3}}\n\n" ++
+            "data: [DONE]\n\n",
+    );
+    defer tool.deinit(a);
+    try std.testing.expectEqualSlices(std.meta.Tag(StreamEvent), &.{ .usage, .tool_use_start }, tool.kinds.items);
+    try std.testing.expectEqualStrings("call_9", tool.tools.items[0].id);
+    try std.testing.expectEqual(StopReason.tool_use, tool.stop);
+    try std.testing.expectEqualSlices(UsageDelta, &.{.{ .input_tokens = 5, .output_tokens = 3 }}, tool.usages.items);
+}
+
+test "issue #258: content 恰为 \"usage\" 是文本,不是 usage 事件" {
+    const a = std.testing.allocator;
+    var got = try replaySse(
+        a,
+        "gpt-4o",
+        .chat_completions,
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"usage\"}}]}\n\n" ++
+            "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n" ++
+            "data: [DONE]\n\n",
+    );
+    defer got.deinit(a);
+    try std.testing.expectEqualSlices(std.meta.Tag(StreamEvent), &.{ .text, .done }, got.kinds.items);
+    try std.testing.expectEqualStrings("usage", got.text.items);
+    try std.testing.expectEqual(@as(usize, 0), got.usages.items.len);
+}
+
+test "issue #258: choices[i].usage(兼容端位置)按 object 才计,null 不计;同块 finish_reason 保留" {
+    const a = std.testing.allocator;
+    var obj = try replaySse(
+        a,
+        "moonshot-v1-8k",
+        .chat_completions,
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"usage\":null}]}\n\n" ++
+            "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"," ++
+            "\"usage\":{\"prompt_tokens\":19,\"completion_tokens\":13,\"total_tokens\":32}}]}\n\n" ++
+            "data: [DONE]\n\n",
+    );
+    defer obj.deinit(a);
+    try std.testing.expectEqualSlices(std.meta.Tag(StreamEvent), &.{ .text, .usage, .done }, obj.kinds.items);
+    try std.testing.expectEqualStrings("hi", obj.text.items);
+    try std.testing.expectEqualSlices(UsageDelta, &.{.{ .input_tokens = 19, .output_tokens = 13 }}, obj.usages.items);
+    try std.testing.expectEqual(StopReason.end_turn, obj.stop);
+
+    // 顶层 usage 对象优先于 choice 内的(只发一次,数取顶层)。
+    var both = try replaySse(
+        a,
+        "gpt-4o",
+        .chat_completions,
+        "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\",\"usage\":{\"prompt_tokens\":1}}]," ++
+            "\"usage\":{\"prompt_tokens\":40,\"completion_tokens\":2}}\n\n" ++
+            "data: [DONE]\n\n",
+    );
+    defer both.deinit(a);
+    try std.testing.expectEqualSlices(UsageDelta, &.{.{ .input_tokens = 40, .output_tokens = 2 }}, both.usages.items);
+}
+
+// Responses:usage 只在 `response.usage` 是 object 时发,数值只从该对象读。
+test "issue #258 Responses: usage 从 response.usage 读——回显的 tools schema 里同名属性不干扰" {
+    const a = std.testing.allocator;
+    var got = try replaySse(
+        a,
+        "gpt-5.2",
+        .responses,
+        "event: response.created\n" ++
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"status\":\"in_progress\",\"usage\":null}}\n\n" ++
+            "event: response.output_text.delta\n" ++
+            "data: {\"type\":\"response.output_text.delta\",\"item_id\":\"msg_1\",\"output_index\":0,\"delta\":\"hi\"}\n\n" ++
+            "event: response.completed\n" ++
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\":\"completed\"," ++
+            "\"tools\":[{\"type\":\"function\",\"name\":\"count\",\"parameters\":{\"type\":\"object\",\"properties\":" ++
+            "{\"input_tokens\":{\"type\":\"integer\"},\"output_tokens\":{\"type\":\"integer\"},\"cached_tokens\":{\"type\":\"integer\"}}}}]," ++
+            "\"usage\":{\"input_tokens\":2006,\"input_tokens_details\":{\"cached_tokens\":1920},\"output_tokens\":10}}}\n\n",
+    );
+    defer got.deinit(a);
+    try std.testing.expectEqualSlices(std.meta.Tag(StreamEvent), &.{ .text, .usage, .done }, got.kinds.items);
+    try std.testing.expectEqualStrings("hi", got.text.items);
+    try std.testing.expectEqualSlices(UsageDelta, &.{.{
+        .input_tokens = 86,
+        .output_tokens = 10,
+        .cache_read_input_tokens = 1920,
+    }}, got.usages.items);
+    try std.testing.expectEqual(StopReason.end_turn, got.stop);
+}
+
+test "issue #258 Responses: 终止事件 usage:null 不伪造全零 usage,flush 与 done 照常" {
+    const a = std.testing.allocator;
+    var text = try replaySse(
+        a,
+        "gpt-5.2",
+        .responses,
+        "event: response.output_text.delta\n" ++
+            "data: {\"type\":\"response.output_text.delta\",\"item_id\":\"msg_1\",\"output_index\":0,\"delta\":\"hi\"}\n\n" ++
+            "event: response.completed\n" ++
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_2\",\"status\":\"completed\",\"usage\":null}}\n\n",
+    );
+    defer text.deinit(a);
+    try std.testing.expectEqualSlices(std.meta.Tag(StreamEvent), &.{ .text, .done }, text.kinds.items);
+    try std.testing.expectEqualStrings("hi", text.text.items);
+    try std.testing.expectEqual(@as(usize, 0), text.usages.items.len);
+    try std.testing.expectEqual(StopReason.end_turn, text.stop);
+
+    var tool = try replaySse(
+        a,
+        "gpt-5.2",
+        .responses,
+        "event: response.output_item.added\n" ++
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"call_r1\",\"name\":\"get_time\",\"arguments\":\"\"}}\n\n" ++
+            "event: response.function_call_arguments.done\n" ++
+            "data: {\"type\":\"response.function_call_arguments.done\",\"item_id\":\"fc_1\",\"output_index\":0,\"arguments\":\"{}\"}\n\n" ++
+            "event: response.incomplete\n" ++
+            "data: {\"type\":\"response.incomplete\",\"response\":{\"id\":\"resp_3\",\"status\":\"incomplete\"," ++
+            "\"incomplete_details\":{\"reason\":\"max_output_tokens\"}}}\n\n",
+    );
+    defer tool.deinit(a);
+    try std.testing.expectEqualSlices(std.meta.Tag(StreamEvent), &.{ .tool_use_start, .done }, tool.kinds.items);
+    try std.testing.expectEqualStrings("call_r1", tool.tools.items[0].id);
+    try std.testing.expectEqual(@as(usize, 0), tool.usages.items.len);
+    try std.testing.expectEqual(StopReason.max_tokens, tool.stop);
 }

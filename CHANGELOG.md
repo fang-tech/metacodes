@@ -166,6 +166,21 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- OpenAI Chat Completions streams no longer drop text (issue #258). metacodes
+  always asks for `stream_options.include_usage`, under which every ordinary
+  chunk carries `"usage": null`; the parser took any chunk containing the key
+  `usage` for the usage report and returned before reading the rest, so the
+  chunk's text, reasoning, tool-call deltas and `finish_reason` were lost. A
+  Host or AgentCore SDK consumer could receive no text at all, tool calls never
+  formed, and the stop reason came back unknown. Usage now counts only when its
+  value is an object (at the top level, or inside a choice where some
+  compatible endpoints put it), its numbers are read from that object alone,
+  and a chunk that carries both content and a usage object yields both,
+  content first. The Responses API and Gemini paths had the same presence test:
+  a `null` `response.usage` or `usageMetadata` was reported as a measured zero,
+  and Responses read token counts from the whole terminal event, where an
+  echoed tool schema with an `input_tokens` property could supply them. Both
+  now read only the usage object and report nothing when there is none.
 - The daemon end-to-end tests (`tests/e2e/daemon_serve_e2e.sh`,
   `daemon_serve_multi_e2e.sh`) run again and now run in `zig build test` on
   POSIX hosts. They still sent `/mode plan`, which no longer exists, and

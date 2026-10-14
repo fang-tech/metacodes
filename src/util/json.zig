@@ -482,6 +482,131 @@ pub fn extractIntField(data: []const u8, field: []const u8) u64 {
     return std.fmt.parseInt(u64, data[start..i], 10) catch 0;
 }
 
+/// 顶层成员原值:`data` 是一个 JSON object 文本,返回其**顶层**(深度 1)成员 `key` 的
+/// 完整值字节(借用 data;string 含引号,object/array 含两端括号,标量原样)。
+/// 与上面的 extract*Field 不同,这里不做首次 substring 匹配:键只出现在嵌套对象里、或
+/// 只以字符串内容出现,都不算命中。缺失、`data` 不是 object、值截断未闭合、结构不合法
+/// → null。键按原始字节比较(调用方传的都是不含转义的 ASCII 键名)。重复键取首个。
+pub fn topLevelField(data: []const u8, key: []const u8) ?[]const u8 {
+    var i = skipJsonWhitespace(data, 0);
+    if (i >= data.len or data[i] != '{') return null;
+    i = skipJsonWhitespace(data, i + 1);
+    if (i < data.len and data[i] == '}') return null;
+    while (i < data.len) {
+        if (data[i] != '"') return null;
+        const key_end = jsonValueEnd(data, i) orelse return null;
+        const member_key = data[i + 1 .. key_end - 1];
+        i = skipJsonWhitespace(data, key_end);
+        if (i >= data.len or data[i] != ':') return null;
+        const value_start = skipJsonWhitespace(data, i + 1);
+        const value_end = jsonValueEnd(data, value_start) orelse return null;
+        if (std.mem.eql(u8, member_key, key)) return data[value_start..value_end];
+        i = skipJsonWhitespace(data, value_end);
+        if (i >= data.len or data[i] != ',') return null;
+        i = skipJsonWhitespace(data, i + 1);
+    }
+    return null;
+}
+
+/// 顶层成员,且值是**完整闭合的 JSON object**(含两端花括号,借用 data)。键在但值是
+/// null/标量/数组 → null。"有无即语义"的字段(provider usage 等)必须用它判存在:
+/// OpenAI `stream_options.include_usage` 下每个普通 chunk 都带 `"usage":null`,
+/// substring 判存在会把它当成 usage(issue #258)。
+pub fn topLevelObjectField(data: []const u8, key: []const u8) ?[]const u8 {
+    const value = topLevelField(data, key) orelse return null;
+    return if (value[0] == '{') value else null;
+}
+
+fn skipJsonWhitespace(data: []const u8, from: usize) usize {
+    var i = from;
+    while (i < data.len and (data[i] == ' ' or data[i] == '\t' or data[i] == '\n' or data[i] == '\r')) : (i += 1) {}
+    return i;
+}
+
+/// 从 data[start] 起一个完整 JSON 值的结束下标(不含)。string 走转义奇偶状态机
+/// (`\\"` 不早断);object/array 按括号深度配平并整体跳过其中的字符串;标量取到
+/// 分隔符/空白之前。截断未闭合、或 start 处不是值的起点 → null。不做完整语法校验。
+fn jsonValueEnd(data: []const u8, start: usize) ?usize {
+    if (start >= data.len) return null;
+    switch (data[start]) {
+        '"' => {
+            var i = start + 1;
+            var escaped = false;
+            while (i < data.len) : (i += 1) {
+                if (escaped) {
+                    escaped = false;
+                    continue;
+                }
+                switch (data[i]) {
+                    '\\' => escaped = true,
+                    '"' => return i + 1,
+                    else => {},
+                }
+            }
+            return null;
+        },
+        '{', '[' => {
+            var depth: usize = 0;
+            var i = start;
+            while (i < data.len) : (i += 1) {
+                switch (data[i]) {
+                    // 字符串整体跳过:其中的括号/引号不参与配平。
+                    '"' => i = (jsonValueEnd(data, i) orelse return null) - 1,
+                    '{', '[' => depth += 1,
+                    '}', ']' => {
+                        depth -= 1;
+                        if (depth == 0) return i + 1;
+                    },
+                    else => {},
+                }
+            }
+            return null;
+        },
+        ',', ':', '}', ']', ' ', '\t', '\n', '\r' => return null,
+        else => {
+            var i = start;
+            while (i < data.len) : (i += 1) switch (data[i]) {
+                ',', '}', ']', ' ', '\t', '\n', '\r' => break,
+                else => {},
+            };
+            return i;
+        },
+    }
+}
+
+test "topLevelObjectField: 只认顶层、值为 object 的成员" {
+    const usage_obj = "{\"prompt_tokens\":7,\"prompt_tokens_details\":{\"cached_tokens\":2}}";
+    // 顶层 object(前后位置、冒号两侧空白都行)。
+    try std.testing.expectEqualStrings(usage_obj, topLevelObjectField("{\"choices\":[],\"usage\":" ++ usage_obj ++ "}", "usage").?);
+    try std.testing.expectEqualStrings(usage_obj, topLevelObjectField(" { \"usage\" : " ++ usage_obj ++ " , \"choices\":[]}", "usage").?);
+    // 值为 null / 数组 / 数字 / 字符串:键在但不是 object → null。
+    try std.testing.expect(topLevelObjectField("{\"choices\":[{\"delta\":{}}],\"usage\":null}", "usage") == null);
+    try std.testing.expect(topLevelObjectField("{\"usage\":null,\"choices\":[{\"delta\":{\"content\":\"x\"}}]}", "usage") == null);
+    try std.testing.expect(topLevelObjectField("{\"usage\":[1]}", "usage") == null);
+    try std.testing.expect(topLevelObjectField("{\"usage\":0}", "usage") == null);
+    try std.testing.expect(topLevelObjectField("{\"usage\":\"{}\"}", "usage") == null);
+    // 只在嵌套层 / 字符串内容里出现 → 不是顶层成员。
+    try std.testing.expect(topLevelObjectField("{\"choices\":[{\"usage\":{\"prompt_tokens\":1}}]}", "usage") == null);
+    try std.testing.expect(topLevelObjectField("{\"delta\":{\"content\":\"\\\"usage\\\":{}\"}}", "usage") == null);
+    try std.testing.expect(topLevelObjectField("{\"content\":\"usage\"}", "usage") == null);
+    // 前一个成员的字符串值里含括号/转义引号,不影响后续成员定位。
+    try std.testing.expectEqualStrings("{\"a\":1}", topLevelObjectField("{\"s\":\"}{]\\\"[\",\"usage\":{\"a\":1}}", "usage").?);
+    // 截断未闭合 / 非 object 文本 / 空 object → null。
+    try std.testing.expect(topLevelObjectField("{\"usage\":{\"prompt_tokens\":1", "usage") == null);
+    try std.testing.expect(topLevelObjectField("[{\"usage\":{}}]", "usage") == null);
+    try std.testing.expect(topLevelObjectField("{}", "usage") == null);
+    try std.testing.expect(topLevelObjectField("", "usage") == null);
+}
+
+test "topLevelField: 返回任意类型顶层成员的完整值" {
+    const data = "{\"a\":\"x\\\"y\",\"b\":[1,{\"c\":2}],\"n\":null,\"k\":12}";
+    try std.testing.expectEqualStrings("\"x\\\"y\"", topLevelField(data, "a").?);
+    try std.testing.expectEqualStrings("[1,{\"c\":2}]", topLevelField(data, "b").?);
+    try std.testing.expectEqualStrings("null", topLevelField(data, "n").?);
+    try std.testing.expectEqualStrings("12", topLevelField(data, "k").?);
+    try std.testing.expect(topLevelField(data, "c") == null);
+}
+
 test "extractIntField basic + nested + missing" {
     try std.testing.expectEqual(@as(u64, 42), extractIntField("{\"a\":42,\"b\":7}", "a"));
     // 嵌套子对象里的字段
