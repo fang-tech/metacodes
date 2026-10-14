@@ -48,6 +48,16 @@ the session's directories, and answer its permission questions. The rules
   can reach the port and is meant only for networks that are already isolated.
 - **`GET /health`** is unauthenticated by design: it reports only liveness,
   the version and the session count.
+- **Session lifecycle** (`serve --sessions`, #254). The `/sessions` routes
+  pass the same token, `Host` and `Origin` checks as every other route, so
+  whoever may use one session may also create, restore and destroy sessions;
+  it grants nothing a session did not already (a session can read the state
+  root's transcripts through its tools). A caller-supplied id must be 24
+  lowercase hex characters, so it cannot reach outside the state root's
+  session directories. `--max-sessions` (default 32) bounds how many Apps,
+  with their MCP and language-server children, one client can make the
+  daemon hold. A fresh create never overwrites a persisted conversation, and
+  a refused create builds and writes nothing.
 - **UDS.** The `serve --uds <path>` transport takes no token; its only access
   control is the socket file's mode 0600. Put the socket in a private (0700)
   directory: the mode is tightened right after `bind`, and some BSD-derived

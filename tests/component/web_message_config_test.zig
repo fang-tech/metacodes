@@ -759,19 +759,27 @@ const DaemonHost = struct {
         self.wb.deinit();
     }
 
-    fn resolve(ctx: *anyopaque, id: []const u8) ?cc.web_server.SessionView {
+    fn resolve(ctx: *anyopaque, id: []const u8) ?cc.web_server.Lease {
         const self: *DaemonHost = @ptrCast(@alignCast(ctx));
         if (!std.mem.eql(u8, id, self.dctx.app.session_id.asSlice())) return null;
         return .{
-            .journal = &self.host.journal,
-            .web_backend = &self.wb,
-            .inbox = &self.host.inbox,
-            .abort = &self.dctx.app.abort,
-            .generating = &self.host.generating,
-            .state_ctx = @ptrCast(&self.state_src),
-            .state_fn = &cc.web_session.StateSource.snapshot,
+            .view = .{
+                .journal = &self.host.journal,
+                .web_backend = &self.wb,
+                .inbox = &self.host.inbox,
+                .abort = &self.dctx.app.abort,
+                .generating = &self.host.generating,
+                .state_ctx = @ptrCast(&self.state_src),
+                .state_fn = &cc.web_session.StateSource.snapshot,
+            },
+            .ctx = ctx,
+            .release_fn = &release,
         };
     }
+
+    /// The one session outlives every transport here (`stop` stops them
+    /// first), so a lease has nothing to give back (#254).
+    fn release(_: *anyopaque) void {}
 
     /// The journal's lines since `from`, waiting (bounded) for `needle`.
     fn linesUntil(self: *DaemonHost, a: std.mem.Allocator, from: usize, needle: []const u8) ![][]u8 {

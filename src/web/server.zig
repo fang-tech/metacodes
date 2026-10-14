@@ -10,6 +10,11 @@
 //!   POST /interrupt   → 打 AbortSignal(与 TUI esc 同通道)
 //!   GET  /state       → session 状态快照(经回调,server 不依赖 App)
 //! 多 session(`Deps.resolver`)下,`/` 与 `/health` 之外的路径都在 `/s/<id>/` 之下。
+//! The multi-session daemon also hands over `Deps.lifecycle` (#254): `GET
+//! /sessions`, `POST /sessions/create`, `POST /sessions/<id>/resume` and
+//! `POST /sessions/<id>/destroy` sit at the top level. This file only parses
+//! the request and maps the callback's typed result to a status; what a
+//! session is, and when one may be created or destroyed, is the daemon's.
 //!
 //! Admission is decided from the request head, before a byte of body is read:
 //!   1. `GET /health` answers at once: no token, no Host check, no session,
@@ -50,6 +55,7 @@ const log = @import("../util/log.zig");
 const net = @import("platform").net;
 const http = @import("../util/http.zig");
 const util_json = @import("../util/json.zig");
+const SessionId = @import("../core/session_id.zig").SessionId;
 
 const EventJournal = journal_mod.EventJournal;
 const WebBackend = backend_mod.WebBackend;
@@ -155,21 +161,96 @@ pub const SessionView = struct {
     command_fn: ?CommandFn = null,
 };
 
-/// Multi-session routing (`Deps.resolver`).
+/// One resolved session, held for one request — for `GET /events` the whole
+/// SSE stream, for a UDS `attach` the whole attachment (#254).
 ///
-/// **⚠️ 生命周期契约(PM/Linus review,必守)**:`resolve` 返回的 SessionView 是 **borrow 快照**(裸指针
-/// 指向该 session 的 journal/inbox/wb/abort)。handler 在**整个请求期**持这些指针——**尤其 serveSse 阻塞
-/// waitSinceFrom 最多 15s**。故 resolver **必须保证:被解析的 session 活过所有在飞请求**,即 host
-/// 绝不可在某连接持其指针时被 destroy。**MVP 满足此约束靠 session 静态**(fixed-N at startup,无
-/// per-session destroy);引入 dynamic destroy / idle-reap 前**必须**先把签名改成 refcount handle /
-/// lock-hold(见 doc/history/U9_U10_DAEMON_TIER_DESIGN.md §4)。否则 = 重现 U10-A 删掉的 borrow-UAF。
+/// Lifetime contract: everything `view` points at (journal, backend, queues,
+/// the App behind `state_ctx`, the abort signal) stays valid until `release`.
+/// The holder calls `release` exactly once, by `defer` right after a
+/// successful `resolve`. Destroying a session never waits for leases: the
+/// host stops the session's driver and background work, appends `session_lifecycle.closed` and
+/// closes the journal (which ends every SSE stream and attachment, so their
+/// leases come back), and frees the session's memory only once the last lease
+/// is released. A session that is being destroyed is never resolved again.
+pub const Lease = struct {
+    view: SessionView,
+    ctx: *anyopaque,
+    release_fn: *const fn (ctx: *anyopaque) void,
+
+    /// Give the session back; exactly once per lease.
+    pub fn release(self: Lease) void {
+        self.release_fn(self.ctx);
+    }
+};
+
+/// Multi-session routing (`Deps.resolver`).
 pub const Resolver = struct {
-    /// id → SessionView; null = unknown session (404).
-    resolve: *const fn (ctx: *anyopaque, id: []const u8) ?SessionView,
+    /// id → a leased session (see `Lease`); null = unknown, or being
+    /// destroyed (404).
+    resolve: *const fn (ctx: *anyopaque, id: []const u8) ?Lease,
     ctx: *anyopaque,
     /// How many sessions `resolve` answers for. `GET /health` reads this and
     /// never calls `resolve` (#251): a probe must not touch session state.
     sessions: *const std.atomic.Value(usize),
+};
+
+/// `POST /sessions/create`, parsed (#254). A restore always names its id, so
+/// "resume without an id" cannot be expressed.
+pub const CreateRequest = union(enum) {
+    /// A new conversation, under the caller's id or a generated one.
+    fresh: ?SessionId,
+    /// The conversation persisted under this id (`"resume":true`).
+    restore: SessionId,
+};
+
+pub const Created = struct {
+    id: SessionId,
+    /// Messages restored from the transcript; 0 for a fresh session.
+    messages: usize,
+};
+
+/// Why a create was refused; each maps to one status in `serveLifecycle`.
+pub const CreateError = error{
+    /// The id names a live session (409).
+    SessionLive,
+    /// The id names a destroyed session that is not reaped yet: its App still
+    /// owns the session directory (409, normally for milliseconds after the
+    /// last request using it ends).
+    SessionClosing,
+    /// A fresh create names an id whose transcript is persisted; it would
+    /// overwrite that conversation (409; `"resume":true` restores it).
+    TranscriptExists,
+    /// `"resume":true` names an id with no persisted transcript (404).
+    TranscriptNotFound,
+    /// The live-session cap is reached (429).
+    SessionLimit,
+    /// The daemon is shutting down (503).
+    ShuttingDown,
+    /// The transcript exists but could not be loaded (500).
+    RestoreFailed,
+    /// Building the session failed (500).
+    CreateFailed,
+};
+
+pub const DestroyError = error{
+    /// Not a live session: unknown, or already being destroyed (404).
+    UnknownSession,
+};
+
+/// Dynamic session lifecycle (#254), present only for the multi-session
+/// daemon. Every callback runs on an HTTP connection thread.
+pub const Lifecycle = struct {
+    ctx: *anyopaque,
+    /// The cap `create` enforces, reported with a 429.
+    max_sessions: usize,
+    create: *const fn (ctx: *anyopaque, request: CreateRequest) CreateError!Created,
+    /// Whether `id` names a live session; loads nothing.
+    is_live: *const fn (ctx: *anyopaque, id: SessionId) bool,
+    /// Returns once the session's driver and background work have stopped
+    /// and been joined.
+    destroy: *const fn (ctx: *anyopaque, id: SessionId) DestroyError!void,
+    /// `{"sessions":[...]}` (owned by `allocator`).
+    list: *const fn (ctx: *anyopaque, allocator: std.mem.Allocator) anyerror![]u8,
 };
 
 pub const Deps = struct {
@@ -185,9 +266,13 @@ pub const Deps = struct {
     state_fn: StateFn,
     /// 斜杠命令处理(可空:单测不接)。ctx 复用 state_ctx。
     command_fn: ?CommandFn = null,
-    /// **U10-C:多 session 解析器**。非 null 时,路径 `/s/<id>/rest` 按 id 解析 SessionView(未知
-    /// session→404);无 /s/ 前缀的非 `/`、非 `/health` 路径→404。null=单 session 模式(--web,直用上面字段)。
+    /// **U10-C:多 session 解析器**。非 null 时,路径 `/s/<id>/rest` 按 id 租用 session(`Lease`,未知
+    /// 或正在销毁→404);无 /s/ 前缀的非 `/`、非 `/health`、非 `/sessions` 路径→404。null=单 session
+    /// 模式(--web,直用上面字段)。
     resolver: ?Resolver = null,
+    /// #254: the `/sessions` routes. Null (`--web`, single-session `serve`)
+    /// makes them 404 like any unknown path.
+    lifecycle: ?Lifecycle = null,
     /// **U10-C:`GET /` 落地页覆盖**。非 null → `GET /` 调它取 HTML(caller-allocated,route 用完 free);
     /// null → 返内嵌单 session SPA(INDEX_HTML)。多 session(resolver≠null)下 SPA 的 fetch 全走无前缀
     /// 路径会 404(PM M1),故 serve-multi 用它回一张**诚实落地页**(列 session id + API 端点,不假装 SPA 可用)。
@@ -275,6 +360,14 @@ pub const WebServer = struct {
     /// shutdown+关 listen fd(accept 返负退出)+ join + 等连接线程归零。SSE 连接线程靠
     /// journal.close() 醒来收尾——调用方(session driver)须**先 close journal 再 stop**。
     pub fn stop(self: *WebServer) void {
+        _ = self.stopDrained();
+    }
+
+    /// `stop`, reporting whether every connection thread finished. False: one
+    /// was still running after 12 s, and the server leaked itself rather than
+    /// free memory that thread reads; the caller must then keep what `Deps`
+    /// points at alive as well (the multi-session daemon leaks itself, #254).
+    pub fn stopDrained(self: *WebServer) bool {
         self.closing.store(true, .release); // 先标记再 close:accept 醒来据它判定主动退出
         net.shutdownSocket(self.listen_fd); // Linux:跨线程 close 不保证唤醒已阻塞的 accept
         net.closeSocket(self.listen_fd);
@@ -290,12 +383,14 @@ pub const WebServer = struct {
             waited_ms += 10;
         }
         if (self.live_conns.load(.acquire) > 0) {
-            // 兜底(理论上不达:12s > socket 超时)。宁泄漏 self 不 UAF——但 deps 仍会被
-            // run() 释放,故此路径只应在真·线程 hang(非超时可醒)时触发,已属未定义环境。
+            // 兜底:socket 超时可醒的线程 12s 内必退。宁泄漏 self 不 UAF。A thread
+            // still here is hung, or inside a long daemon callback (a create whose
+            // App.init is slow); `stopDrained` tells the caller so.
             log.warn("web", "stop: {d} connection thread(s) still live after 12s, leaking WebServer", .{self.live_conns.load(.acquire)});
-            return;
+            return false;
         }
         self.allocator.destroy(self);
+        return true;
     }
 
     fn acceptLoop(self: *WebServer) void {
@@ -426,23 +521,31 @@ pub const WebServer = struct {
             writeSimple(fd, "200 OK", "text/html; charset=utf-8", INDEX_HTML);
             return;
         }
+        if (self.deps.lifecycle) |lifecycle| {
+            if (parseLifecyclePath(line.path)) |target| {
+                serveLifecycle(fd, self.allocator, line.method, target, body, lifecycle);
+                return;
+            }
+        }
         // U10-C:解析 session view + 有效路径。单 session(resolver=null)直取 self.deps(向后兼容
-        // --web);多 session 路径 /s/<id>/rest 经 resolver 按 id 解析(未知→404),rest 作有效路径。
+        // --web);多 session 路径 /s/<id>/rest 经 resolver 按 id 租用(未知/销毁中→404),rest 作有效
+        // 路径。The lease covers the whole request, the SSE stream included,
+        // and goes back exactly once here (#254).
         var eff_path = line.path;
-        var sv: SessionView = undefined;
-        if (self.deps.resolver) |r| {
+        var lease: ?Lease = null;
+        defer if (lease) |held| held.release();
+        const sv: SessionView = if (self.deps.resolver) |r| leased: {
             const sp = parseSessionPrefix(line.path) orelse {
                 writeSimple(fd, "404 Not Found", "application/json", "{\"error\":\"session path required (/s/<id>/...)\"}");
                 return;
             };
-            sv = r.resolve(r.ctx, sp.id) orelse {
+            lease = r.resolve(r.ctx, sp.id) orelse {
                 writeSimple(fd, "404 Not Found", "application/json", "{\"error\":\"unknown session\"}");
                 return;
             };
             eff_path = sp.rest;
-        } else {
-            sv = self.singleView();
-        }
+            break :leased lease.?.view;
+        } else self.singleView();
 
         if (std.mem.eql(u8, line.method, "GET") and std.mem.eql(u8, eff_path, "/events")) {
             self.serveSse(fd, line, head, sv);
@@ -532,6 +635,8 @@ pub const WebServer = struct {
 
     /// U10-C:从 self.deps 单 session 字段构 SessionView(resolver=null 时用)。
     fn singleView(self: *WebServer) SessionView {
+        // With a resolver every session path is leased; these fields are placeholders.
+        std.debug.assert(self.deps.resolver == null);
         return .{
             .journal = self.deps.journal,
             .web_backend = self.deps.web_backend,
@@ -715,6 +820,144 @@ pub fn parseSessionPrefix(path: []const u8) ?struct { id: []const u8, rest: []co
     return .{ .id = after[0..slash], .rest = after[slash..] };
 }
 
+/// A `/sessions` route (#254). Ids are taken as written; the handler
+/// validates them.
+pub const LifecyclePath = union(enum) {
+    /// `/sessions`
+    list,
+    /// `/sessions/create`
+    create,
+    /// `/sessions/<id>/resume`
+    @"resume": []const u8,
+    /// `/sessions/<id>/destroy`
+    destroy: []const u8,
+    /// Any other path under `/sessions/`: 404.
+    unknown,
+};
+
+/// `/sessions` and the paths below it; null for any other path.
+pub fn parseLifecyclePath(path: []const u8) ?LifecyclePath {
+    const root = "/sessions";
+    if (!std.mem.startsWith(u8, path, root)) return null;
+    const rest = path[root.len..];
+    if (rest.len == 0) return .list;
+    if (rest[0] != '/') return null; // "/sessionsX" is not under /sessions
+    const tail = rest[1..];
+    if (std.mem.eql(u8, tail, "create")) return .create;
+    const slash = std.mem.indexOfScalar(u8, tail, '/') orelse return .unknown;
+    const id = tail[0..slash];
+    const verb = tail[slash + 1 ..];
+    if (std.mem.eql(u8, verb, "resume")) return .{ .@"resume" = id };
+    if (std.mem.eql(u8, verb, "destroy")) return .{ .destroy = id };
+    return .unknown;
+}
+
+pub const CreateParse = union(enum) {
+    ok: CreateRequest,
+    /// Why the body was refused (400); a fixed ASCII message.
+    invalid: []const u8,
+};
+
+/// The body of `POST /sessions/create`: empty, or a JSON object with an
+/// optional `"session_id"` (a valid session id) and `"resume"` (a boolean,
+/// which needs the id). Unknown keys are ignored; `null` counts as absent.
+pub fn parseCreateRequest(body: []const u8) CreateParse {
+    if (std.mem.trim(u8, body, " \t\r\n").len == 0) return .{ .ok = .{ .fresh = null } };
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const value = std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), body, .{}) catch
+        return .{ .invalid = "body is not JSON" };
+    if (value != .object) return .{ .invalid = "body must be a JSON object" };
+    var id: ?SessionId = null;
+    if (value.object.get("session_id")) |field| switch (field) {
+        .null => {},
+        .string => |text| id = SessionId.fromSlice(text) orelse
+            return .{ .invalid = "session_id must be 24 lowercase hex characters" },
+        else => return .{ .invalid = "session_id must be a string" },
+    };
+    var restore = false;
+    if (value.object.get("resume")) |field| switch (field) {
+        .null => {},
+        .bool => |flag| restore = flag,
+        else => return .{ .invalid = "resume must be a boolean" },
+    };
+    if (!restore) return .{ .ok = .{ .fresh = id } };
+    return .{ .ok = .{ .restore = id orelse return .{ .invalid = "resume requires session_id" } } };
+}
+
+/// One `/sessions` request (#254): parse, call the daemon, map its typed
+/// answer to a status. A method the route does not take is 404, as anywhere
+/// else on this server.
+fn serveLifecycle(fd: net.Socket, allocator: std.mem.Allocator, method: []const u8, target: LifecyclePath, body: []const u8, lifecycle: Lifecycle) void {
+    const is_get = std.mem.eql(u8, method, "GET");
+    const is_post = std.mem.eql(u8, method, "POST");
+    switch (target) {
+        .list => {
+            if (!is_get) return writeError(fd, "404 Not Found", "not found");
+            const json = lifecycle.list(lifecycle.ctx, allocator) catch
+                return writeError(fd, "500 Internal Server Error", "session list failed");
+            defer allocator.free(json);
+            writeSimple(fd, "200 OK", "application/json", json);
+        },
+        .create => {
+            if (!is_post) return writeError(fd, "404 Not Found", "not found");
+            const request = switch (parseCreateRequest(body)) {
+                .ok => |request| request,
+                .invalid => |why| return writeError(fd, "400 Bad Request", why),
+            };
+            const created = lifecycle.create(lifecycle.ctx, request) catch |err| return writeCreateError(fd, err, lifecycle.max_sessions);
+            var buffer: [96]u8 = undefined;
+            const json = std.fmt.bufPrint(&buffer, "{{\"session_id\":\"{s}\",\"messages\":{d}}}", .{ created.id.asSlice(), created.messages }) catch unreachable;
+            writeSimple(fd, "201 Created", "application/json", json);
+        },
+        .@"resume" => |text| {
+            if (!is_post) return writeError(fd, "404 Not Found", "not found");
+            const id = SessionId.fromSlice(text) orelse return writeError(fd, "404 Not Found", "session not live");
+            if (!lifecycle.is_live(lifecycle.ctx, id)) return writeError(fd, "404 Not Found", "session not live");
+            var buffer: [64]u8 = undefined;
+            const json = std.fmt.bufPrint(&buffer, "{{\"session_id\":\"{s}\",\"live\":true}}", .{id.asSlice()}) catch unreachable;
+            writeSimple(fd, "200 OK", "application/json", json);
+        },
+        .destroy => |text| {
+            if (!is_post) return writeError(fd, "404 Not Found", "not found");
+            const id = SessionId.fromSlice(text) orelse return writeError(fd, "404 Not Found", "unknown session");
+            lifecycle.destroy(lifecycle.ctx, id) catch |err| switch (err) {
+                error.UnknownSession => return writeError(fd, "404 Not Found", "unknown session"),
+            };
+            var buffer: [64]u8 = undefined;
+            const json = std.fmt.bufPrint(&buffer, "{{\"ok\":true,\"session_id\":\"{s}\"}}", .{id.asSlice()}) catch unreachable;
+            writeSimple(fd, "200 OK", "application/json", json);
+        },
+        .unknown => writeError(fd, "404 Not Found", "not found"),
+    }
+}
+
+fn writeCreateError(fd: net.Socket, err: CreateError, max_sessions: usize) void {
+    switch (err) {
+        error.SessionLive => writeError(fd, "409 Conflict", "session already live"),
+        error.SessionClosing => writeError(fd, "409 Conflict", "session is still closing"),
+        error.TranscriptExists => writeError(fd, "409 Conflict", "a transcript is persisted under this session_id; create with resume true to restore it"),
+        error.TranscriptNotFound => writeError(fd, "404 Not Found", "no persisted transcript for this session_id"),
+        error.SessionLimit => {
+            var buffer: [80]u8 = undefined;
+            const json = std.fmt.bufPrint(&buffer, "{{\"error\":\"session limit reached\",\"max_sessions\":{d}}}", .{max_sessions}) catch unreachable;
+            writeSimple(fd, "429 Too Many Requests", "application/json", json);
+        },
+        error.ShuttingDown => writeError(fd, "503 Service Unavailable", "daemon is shutting down"),
+        error.RestoreFailed => writeError(fd, "500 Internal Server Error", "the persisted transcript could not be restored"),
+        error.CreateFailed => writeError(fd, "500 Internal Server Error", "session could not be created"),
+    }
+}
+
+/// `{"error":"<message>"}` with `status`.
+fn writeError(fd: net.Socket, comptime status: []const u8, message: []const u8) void {
+    var buffer: [256]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buffer);
+    std.json.Stringify.value(.{ .@"error" = message }, .{}, &writer) catch
+        return writeSimple(fd, status, "application/json", "{\"error\":\"?\"}");
+    writeSimple(fd, status, "application/json", writer.buffered());
+}
+
 /// SSE 游标来源优先级:?since=N(&epoch=E) > Last-Event-ID 头 > 0。解析与续接判定在
 /// core/event_journal.zig(`Cursor`、`EventJournal.planResume`),任何宿主共用同一规则。
 pub fn resolveCursor(query: []const u8, head: []const u8) journal_mod.Cursor {
@@ -842,6 +1085,49 @@ test "U10-C: parseSessionPrefix 拆 /s/<id>/rest(边界)" {
     try testing.expectEqual(@as(?@TypeOf(ok), null), parseSessionPrefix("/s/abc")); // id 后无 /rest
     try testing.expectEqual(@as(?@TypeOf(ok), null), parseSessionPrefix("/s/")); // 无 id 无 /
     try testing.expectEqual(@as(?@TypeOf(ok), null), parseSessionPrefix("/s//events")); // 空 id
+}
+
+test "#254 parseLifecyclePath: /sessions, create, <id>/resume, <id>/destroy; anything else below is unknown" {
+    try testing.expectEqual(LifecyclePath.list, parseLifecyclePath("/sessions").?);
+    try testing.expectEqual(LifecyclePath.create, parseLifecyclePath("/sessions/create").?);
+    try testing.expectEqualStrings("abc", parseLifecyclePath("/sessions/abc/resume").?.@"resume");
+    try testing.expectEqualStrings("abc", parseLifecyclePath("/sessions/abc/destroy").?.destroy);
+    for ([_][]const u8{ "/sessions/", "/sessions/abc", "/sessions/abc/", "/sessions/abc/reboot", "/sessions/abc/destroy/x", "/sessions/create/x" }) |path| {
+        try testing.expectEqual(LifecyclePath.unknown, parseLifecyclePath(path).?);
+    }
+    // Not under /sessions at all: the session router's business.
+    for ([_][]const u8{ "/", "/session", "/sessionsX", "/s/abc/events", "/health" }) |path| {
+        try testing.expectEqual(@as(?LifecyclePath, null), parseLifecyclePath(path));
+    }
+}
+
+test "#254 parseCreateRequest: empty is fresh; a valid id, resume with an id; every malformed body is refused" {
+    const id_text = "0123456789abcdef01234567";
+    const id = SessionId.fromSlice(id_text).?;
+    try testing.expectEqualDeep(CreateRequest{ .fresh = null }, parseCreateRequest("").ok);
+    try testing.expectEqualDeep(CreateRequest{ .fresh = null }, parseCreateRequest(" \r\n").ok);
+    try testing.expectEqualDeep(CreateRequest{ .fresh = null }, parseCreateRequest("{}").ok);
+    try testing.expectEqualDeep(CreateRequest{ .fresh = null }, parseCreateRequest("{\"session_id\":null,\"resume\":false,\"other\":1}").ok);
+    try testing.expectEqualDeep(CreateRequest{ .fresh = id }, parseCreateRequest("{\"session_id\":\"" ++ id_text ++ "\"}").ok);
+    try testing.expectEqualDeep(CreateRequest{ .restore = id }, parseCreateRequest("{\"session_id\":\"" ++ id_text ++ "\",\"resume\":true}").ok);
+    const refused = [_][]const u8{
+        "{\"resume\":true}",
+        "{\"resume\":true,\"session_id\":null}",
+        "{\"session_id\":\"short\"}",
+        "{\"session_id\":\"0123456789ABCDEF01234567\"}",
+        "{\"session_id\":\"../../../../../../etc/pwd\"}",
+        "{\"session_id\":7}",
+        "{\"resume\":1,\"session_id\":\"" ++ id_text ++ "\"}",
+        "not json",
+        "[]",
+        "\"text\"",
+    };
+    for (refused) |body| {
+        testing.expect(parseCreateRequest(body) == .invalid) catch |err| {
+            std.debug.print("accepted: {s}\n", .{body});
+            return err;
+        };
+    }
 }
 
 test "originAllowed: 同源放行 / 无 Origin 放行(CLI)/ 跨域拒绝(CSRF)" {
