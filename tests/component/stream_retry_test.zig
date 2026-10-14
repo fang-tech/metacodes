@@ -49,7 +49,7 @@ test "L2: receiveHead 断连分类为 TransientNetwork(可重试,不塌缩)" {
     const url = try srv.urlOwned(a);
     defer a.free(url);
 
-    var io_runtime = std.Io.Threaded.init(a, .{});
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
     defer io_runtime.deinit();
     var client = mkClient(a, io_runtime.io(), url);
     defer client.deinit();
@@ -82,7 +82,7 @@ test "L2: 建连断一次 → 重试包装第2次成功(短退避)" {
     const url = try srv.urlOwned(a);
     defer a.free(url);
 
-    var io_runtime = std.Io.Threaded.init(a, .{});
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
     defer io_runtime.deinit();
     var client = mkClient(a, io_runtime.io(), url);
     defer client.deinit();
@@ -103,7 +103,7 @@ test "L2 evaluation gate retries transient connect failure inside one semantic r
     const url = try srv.urlOwned(a);
     defer a.free(url);
 
-    var io_runtime = std.Io.Threaded.init(a, .{});
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
     defer io_runtime.deinit();
     var client = mkClient(a, io_runtime.io(), url);
     defer client.deinit();
@@ -136,7 +136,7 @@ test "L2 AgentLoop journals every physical provider attempt before retry" {
     const url = try srv.urlOwned(a);
     defer a.free(url);
 
-    var io_runtime = std.Io.Threaded.init(a, .{});
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
     defer io_runtime.deinit();
     var client = mkClient(a, io_runtime.io(), url);
     defer client.deinit();
@@ -243,7 +243,7 @@ test "L2 #6: 429 Retry-After header 覆盖本地退避并进入第二次请求" 
     const url = try srv.urlOwned(a);
     defer a.free(url);
 
-    var io_runtime = std.Io.Threaded.init(a, .{});
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
     defer io_runtime.deinit();
     var client = mkClient(a, io_runtime.io(), url);
     defer client.deinit();
@@ -282,7 +282,7 @@ test "L2 #7: injected TLS setup failure is retried before a successful real requ
     const url = try srv.urlOwned(a);
     defer a.free(url);
 
-    var io_runtime = std.Io.Threaded.init(a, .{});
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
     defer io_runtime.deinit();
     var client = mkClient(a, io_runtime.io(), url);
     defer client.deinit();
@@ -309,7 +309,7 @@ test "L2 #7: persistent TLS setup failure preserves concrete error and stops at 
     const url = try srv.urlOwned(a);
     defer a.free(url);
 
-    var io_runtime = std.Io.Threaded.init(a, .{});
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
     defer io_runtime.deinit();
     var client = mkClient(a, io_runtime.io(), url);
     defer client.deinit();
@@ -335,7 +335,7 @@ test "L2 #221: Windows request-setup Unexpected is a retried, named connect fail
     const url = try srv.urlOwned(a);
     defer a.free(url);
 
-    var io_runtime = std.Io.Threaded.init(a, .{});
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
     defer io_runtime.deinit();
     var client = mkClient(a, io_runtime.io(), url);
     defer client.deinit();
@@ -366,7 +366,7 @@ test "L2 #221: request-setup Unexpected elsewhere is not a connect failure" {
     const url = try srv.urlOwned(a);
     defer a.free(url);
 
-    var io_runtime = std.Io.Threaded.init(a, .{});
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
     defer io_runtime.deinit();
     var client = mkClient(a, io_runtime.io(), url);
     defer client.deinit();
@@ -385,7 +385,7 @@ test "L2 #221: request-setup Unexpected elsewhere is not a connect failure" {
 
 test "L2 #221: a refused connection is retried and the summary names the cause" {
     const a = std.testing.allocator;
-    var io_runtime = std.Io.Threaded.init(a, .{});
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
     defer io_runtime.deinit();
     // Nothing listens on port 1: the connect is refused on every platform.
     var client = mkClient(a, io_runtime.io(), "http://127.0.0.1:1");
@@ -415,7 +415,7 @@ test "L2: 401 不可重试 → 立即 Unauthorized(重试包装不吞)" {
     const url = try srv.urlOwned(a);
     defer a.free(url);
 
-    var io_runtime = std.Io.Threaded.init(a, .{});
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
     defer io_runtime.deinit();
     var client = mkClient(a, io_runtime.io(), url);
     defer client.deinit();
@@ -435,7 +435,7 @@ test "L2: 永远断 → max_retries 后返 TransientNetwork(不无限循环)" {
     const url = try srv.urlOwned(a);
     defer a.free(url);
 
-    var io_runtime = std.Io.Threaded.init(a, .{});
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
     defer io_runtime.deinit();
     var client = mkClient(a, io_runtime.io(), url);
     defer client.deinit();

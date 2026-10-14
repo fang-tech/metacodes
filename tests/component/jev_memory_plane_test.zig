@@ -148,7 +148,7 @@ test "L2 jev memory plane: scoped recall shadow keeps baseline bytes, advisory f
     defer baseline.deinit(a);
     try std.testing.expect(baseline.system_one == null);
 
-    var io_runtime = std.Io.Threaded.init(a, .{});
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
     defer io_runtime.deinit();
     // The judge finds only the second-ranked memory relevant.
     const second_only = try answersBody(a, &.{ .{ "c0", 0.05 }, .{ "c1", 0.97 }, .{ "c2", 0.02 } });
@@ -333,7 +333,7 @@ test "L2 jev memory plane: the recall judge reads the query-focused window of a 
     try std.testing.expect(std.mem.indexOf(u8, hit.focus_text, decision) != null);
     try std.testing.expect(hit.focus_text.len <= cc.jev_excerpt.JUDGE_WINDOW_BYTES);
 
-    var io_runtime = std.Io.Threaded.init(a, .{});
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
     defer io_runtime.deinit();
     const body = try answersBody(a, &.{ .{ "c0", 0.9 }, .{ "c1", 0.1 } });
     defer a.free(body);
@@ -397,7 +397,7 @@ test "L2 jev memory plane: KgRemember advisory surfaces a contradiction, shadow 
     _ = harness.normalizeSlashes(pbuf[0..dir_len]);
     const dir = pbuf[0..dir_len];
 
-    var io_runtime = std.Io.Threaded.init(a, .{});
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
     defer io_runtime.deinit();
     const contradiction = try answersBody(a, &.{ .{ "same0", 0.10 }, .{ "contradicts0", 0.93 } });
     defer a.free(contradiction);
@@ -500,7 +500,7 @@ fn runEnumerationTurn(
     var judge_srv = try harness.MockServer.startCassette(&.{judge_body}, 0);
     defer judge_srv.stop();
 
-    var io_runtime = std.Io.Threaded.init(a, .{});
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
     defer io_runtime.deinit();
     const runtime = try startRuntime(a, io_runtime.io(), judge_srv, mode);
     defer runtime.destroy(a);
@@ -609,7 +609,7 @@ test "L2 jev memory plane: KgRecall never consults the judge" {
     _ = try kg.remember(.observation, "quokka deploy uses a blue green switch behind the load balancer", "decision", false);
     _ = try kg.remember(.observation, "quokka deploy dashboard colors follow the brand palette", "observation", false);
 
-    var io_runtime = std.Io.Threaded.init(a, .{});
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
     defer io_runtime.deinit();
     const body = try answersBody(a, &.{ .{ "c0", 0.05 }, .{ "c1", 0.95 } });
     defer a.free(body);
@@ -646,7 +646,7 @@ test "L2 jev memory plane: KgRecall never consults the judge" {
 
 test "L2 jev memory plane: the relation judge asks two questions per existing memory, up to three" {
     const a = std.testing.allocator;
-    var io_runtime = std.Io.Threaded.init(a, .{});
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
     defer io_runtime.deinit();
     // `n` was inferred as `u2` from `@min(len, 3)`, so `2 * n` overflowed for
     // two or more memories: Debug panicked, ReleaseSmall sent no questions.

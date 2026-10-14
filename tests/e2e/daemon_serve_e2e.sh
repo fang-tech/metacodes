@@ -15,6 +15,8 @@
 # Run by `zig build test` on POSIX hosts (build.zig sets
 # METACODES_DAEMON_E2E_BIN); by hand: `zig build && bash tests/e2e/daemon_serve_e2e.sh`.
 set -euo pipefail
+# Responses are read whole before grep: under pipefail, `curl | grep -q` fails
+# a matching check whenever grep exits before curl has written everything.
 # shellcheck source=tests/e2e/daemon_e2e_lib.sh
 source "$(dirname "$0")/daemon_e2e_lib.sh"
 
@@ -43,7 +45,8 @@ grep -q '"permission_mode"' <<<"$state" || fail "/state lacks permission_mode: $
 cack="$("${CURL[@]}" -X POST "$url/command" -H "Origin: $url" -d '{"cmd":"/mode dont-ask"}')"
 grep -q '"ok":true' <<<"$cack" || fail "/command not queued: $cack"
 events="$(events_until 'permission mode → dont_ask' "$url/events")" || fail "no command_result mode → dont_ask: $events"
-"${CURL[@]}" "$url/state" | grep -q '"permission_mode":"dont_ask"' || fail "/state does not show dont_ask"
+state="$("${CURL[@]}" "$url/state")" || fail "GET /state failed"
+grep -q '"permission_mode":"dont_ask"' <<<"$state" || fail "/state does not show dont_ask"
 # The `!cmd` shell lane: runs, and its stdout comes back in command_result.
 sack="$("${CURL[@]}" -X POST "$url/command" -H "Origin: $url" -d '{"cmd":"!echo WIRE_SHELL_OK"}')"
 grep -q '"ok":true' <<<"$sack" || fail "shell /command not queued: $sack"
@@ -83,8 +86,10 @@ check_health "$url" "$version" 1 # no token needed
 [[ "$(http_code -X POST "$url/message?token=$token" -H "Origin: $url" -d '{"text":"query"}')" == 401 ]] ||
   fail "a POST authenticated by query"
 [[ "$(http_code "$url/")" == 401 ]] || fail "the SPA loads without a token"
-"${CURL[@]}" "$url/?token=$token" | grep -q "<title>metacodes web</title>" || fail "the SPA does not load with ?token="
-"${CURL[@]}" "${auth[@]}" "$url/state" | grep -q '"session_id"' || fail "/state with the token failed"
+spa="$("${CURL[@]}" "$url/?token=$token")" || fail "GET /?token= failed"
+grep -q "<title>metacodes web</title>" <<<"$spa" || fail "the SPA does not load with ?token="
+state="$("${CURL[@]}" "${auth[@]}" "$url/state")" || fail "GET /state with the token failed"
+grep -q '"session_id"' <<<"$state" || fail "/state with the token failed"
 ack="$("${CURL[@]}" "${auth[@]}" -X POST "$url/message" -H "Origin: $url" -d '{"text":"with token"}')"
 grep -q '"ok":true' <<<"$ack" || fail "/message with the token not accepted: $ack"
 events="$(events_until '"run_done".*end_turn' "$url/events?token=$token")" || fail "SSE with ?token= did not stream: $events"

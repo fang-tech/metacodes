@@ -86,7 +86,7 @@ fn runLedger(
     defer server.stop();
     const url = try server.urlOwned(allocator);
     defer allocator.free(url);
-    var io_runtime = std.Io.Threaded.init(allocator, .{});
+    var io_runtime = @import("platform").signal.threadedIo(allocator, .{});
     defer io_runtime.deinit();
     var client = cc.client_mod.Client.initWithBaseUrl(allocator, io_runtime.io(), "key", "model", url);
     defer client.deinit();
@@ -299,7 +299,7 @@ fn claimantRecordedByLoop(
     defer server.stop();
     const url = try server.urlOwned(a);
     defer a.free(url);
-    var io_runtime = std.Io.Threaded.init(a, .{});
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
     defer io_runtime.deinit();
     var client = cc.client_mod.Client.initWithBaseUrl(a, io_runtime.io(), "key", "model", url);
     defer client.deinit();
@@ -376,7 +376,7 @@ test "L2 the loop claims under its KG identity and a close lists only its own ot
     defer server.stop();
     const url = try server.urlOwned(a);
     defer a.free(url);
-    var io_runtime = std.Io.Threaded.init(a, .{});
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
     defer io_runtime.deinit();
     var client = cc.client_mod.Client.initWithBaseUrl(a, io_runtime.io(), "key", "model", url);
     defer client.deinit();

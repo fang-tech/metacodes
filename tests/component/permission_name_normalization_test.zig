@@ -77,7 +77,7 @@ fn runLowercaseBash(mode: cc.types_mod.PermissionMode) !struct { content: []u8, 
     const url = try server.urlOwned(a);
     defer a.free(url);
 
-    var io_runtime = std.Io.Threaded.init(a, .{});
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
     defer io_runtime.deinit();
     var client = cc.client_mod.Client.initWithBaseUrl(a, io_runtime.io(), "test-key", "claude-sonnet-4-20250514", url);
     defer client.deinit();
@@ -130,7 +130,7 @@ test "L2 D1回归: 真未知名(typo)保持遗留 read 兜底 → 仍 UnknownToo
     defer server.stop();
     const url = try server.urlOwned(a);
     defer a.free(url);
-    var io_runtime = std.Io.Threaded.init(a, .{});
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
     defer io_runtime.deinit();
     var client = cc.client_mod.Client.initWithBaseUrl(a, io_runtime.io(), "test-key", "claude-sonnet-4-20250514", url);
     defer client.deinit();
@@ -168,7 +168,7 @@ test "L2 R4-1回归: 小写 bash 成功执行后义务 met(dispatch 记账与结
     defer server.stop();
     const url = try server.urlOwned(a);
     defer a.free(url);
-    var io_runtime = std.Io.Threaded.init(a, .{});
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
     defer io_runtime.deinit();
     var client = cc.client_mod.Client.initWithBaseUrl(a, io_runtime.io(), "test-key", "claude-sonnet-4-20250514", url);
     defer client.deinit();

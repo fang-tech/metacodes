@@ -551,7 +551,7 @@ test "U6 A4: /state 快照含 agent roster(attach 见已 spawn 的 agent)" {
     app.usage = .{};
     app.session_id = session_id.SessionId.single;
     app.permission_ctx = @import("../permission.zig").createContext(.default, a);
-    var io_rt = std.Io.Threaded.init(a, .{});
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
     defer io_rt.deinit();
     app.api_client = @import("../client.zig").Client.initWithBaseUrl(a, io_rt.io(), "k", "m", null);
     defer app.api_client.deinit();

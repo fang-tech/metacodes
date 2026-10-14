@@ -3602,7 +3602,7 @@ test "U4 A3: reasoning/dirs 单写侧 emit config_changed;setConfigEventSink 同
     app.additional_dirs_abs = null; // setConfigEventSink seed 读 additionalDirs()
     app.permission_ctx = permission_mod.createContext(.default, std.testing.allocator);
     // api_client 被 setReasoningEffort 写 reasoning_effort 字段——需真 Client。
-    var io_rt = std.Io.Threaded.init(std.testing.allocator, .{});
+    var io_rt = @import("platform").signal.threadedIo(std.testing.allocator, .{});
     defer io_rt.deinit();
     app.api_client = client_mod.Client.initWithBaseUrl(std.testing.allocator, io_rt.io(), "k", "m", null);
     defer app.api_client.deinit();
@@ -3866,7 +3866,7 @@ test "U2 S2: permission_mode 单一源 — permMode 读 ctx,cyclePermMode 只写
 
 test "U3 syncModelMirrors: 所有 model 镜像同步(含 swarm.model,Linus U3 抓的第7点)" {
     const a = std.testing.allocator;
-    var io_rt = std.Io.Threaded.init(a, .{});
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
     defer io_rt.deinit();
     const io = io_rt.io();
 

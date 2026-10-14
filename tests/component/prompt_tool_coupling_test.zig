@@ -384,7 +384,7 @@ test "L2 e2e: 请求体 tools 携带动态长描述" {
     const url = try srv.urlOwned(a);
     defer a.free(url);
 
-    var io_runtime = std.Io.Threaded.init(a, .{});
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
     defer io_runtime.deinit();
     const io = io_runtime.io();
 
@@ -422,7 +422,7 @@ test "L2 e2e: execution policy hides deferred tools from schema and system promp
     const url = try srv.urlOwned(a);
     defer a.free(url);
 
-    var io_runtime = std.Io.Threaded.init(a, .{});
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
     defer io_runtime.deinit();
     var client = cc.client_mod.Client.initWithBaseUrl(a, io_runtime.io(), "test-key", "claude-sonnet-4-20250514", url);
     defer client.deinit();
@@ -528,7 +528,7 @@ test "L2 e2e: 动态(MCP)deferred 工具列进 system prompt、不进 tools;Tool
     defer srv.stop();
     const url = try srv.urlOwned(a);
     defer a.free(url);
-    var io_runtime = std.Io.Threaded.init(a, .{});
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
     defer io_runtime.deinit();
     var client = cc.client_mod.Client.initWithBaseUrl(a, io_runtime.io(), "test-key", "claude-sonnet-4-20250514", url);
     defer client.deinit();

@@ -41,7 +41,7 @@ test "L2 baseline: Client.model 字段进入请求体" {
     const url = try srv.urlOwned(a);
     defer a.free(url);
 
-    var io_runtime = std.Io.Threaded.init(a, .{});
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
     defer io_runtime.deinit();
     const io = io_runtime.io();
 
@@ -78,7 +78,7 @@ test "L2 GAP: subagent 期望用 haiku 但当前用父 model" {
     const url = try srv.urlOwned(a);
     defer a.free(url);
 
-    var io_runtime = std.Io.Threaded.init(a, .{});
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
     defer io_runtime.deinit();
     const io = io_runtime.io();
 
@@ -132,7 +132,7 @@ test "L2 production path: spawnAgent(model_override=haiku) → 请求体 model �
     const url = try srv.urlOwned(a);
     defer a.free(url);
 
-    var io_runtime = std.Io.Threaded.init(a, .{});
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
     defer io_runtime.deinit();
     const io = io_runtime.io();
 
@@ -175,7 +175,7 @@ test "L2: spawnAgent(tool_defs_override) → 请求体 tools 收窄" {
     const url = try srv.urlOwned(a);
     defer a.free(url);
 
-    var io_runtime = std.Io.Threaded.init(a, .{});
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
     defer io_runtime.deinit();
     const io = io_runtime.io();
 
@@ -219,7 +219,7 @@ test "L2: spawnAgent(permission_mode_override=dont_ask) 生效" {
     const url = try srv.urlOwned(a);
     defer a.free(url);
 
-    var io_runtime = std.Io.Threaded.init(a, .{});
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
     defer io_runtime.deinit();
     const io = io_runtime.io();
 
@@ -268,7 +268,7 @@ test "L2 #12: 父 sandbox 透传到 subagent(ctx.sandbox 到达子 agent 工具)
     const url = try srv.urlOwned(a);
     defer a.free(url);
 
-    var io_rt = std.Io.Threaded.init(a, .{});
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
     defer io_rt.deinit();
     var client = cc.client_mod.Client.initWithBaseUrl(a, io_rt.io(), "k", "claude-sonnet-4-20250514", url);
     defer client.deinit();
@@ -320,7 +320,7 @@ test "L2 #12(Linus review): 后台 subagent 也继承父 sandbox(run_in_backgrou
     const url = try srv.urlOwned(a);
     defer a.free(url);
 
-    var io_rt = std.Io.Threaded.init(a, .{});
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
     defer io_rt.deinit();
     var client = cc.client_mod.Client.initWithBaseUrl(a, io_rt.io(), "k", "claude-sonnet-4-20250514", url);
     defer client.deinit();

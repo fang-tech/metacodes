@@ -187,6 +187,14 @@ status, compatibility boundaries, and entry points are defined by
   used fixed ports; they now use `/mode dont-ask`, kernel-picked ports, an
   isolated state root with TinyKG autostart off, and also cover `/health`, the
   token, an IPv6 bind and the non-loopback refusal.
+- **SIGPIPE no longer interrupts blocking calls with EINTR.**
+  - **Cause:** `metacodes` ignores SIGPIPE at startup, but every `std.Io.Threaded.init` swapped that for a do-nothing handler installed without SA_RESTART. Its `deinit` put back whatever it had found, so overlapping lifetimes could leave another instance's handler in place.
+  - **Effect:** a handler, unlike SIG_IGN, gets the signal delivered. On macOS a write to a closed socket signals the whole process, so any thread's blocked `recv`/`poll`/`accept`/`waitpid` could return EINTR:
+    - the web server reads `recv <= 0` as the end of a request and dropped it;
+    - the TinyKG autostart probe once took it for "no answer".
+  - **Fix:** every `std.Io.Threaded` is now created through `platform.signal.threadedIo`, which keeps SIGPIPE ignored when the process asked for it, and in tests. A library embedded by a host keeps std's behavior; the host owns its signal policy.
+  - **Children:** they get the default SIGPIPE back before `execve`. An ignored disposition survives exec, and without the reset a child pipeline such as `yes | head` would see EPIPE errors instead of ending normally.
+  - **Enforcement:** `zig build test` fails on a direct `std.Io.Threaded.init` call (`test:io-threaded`).
 - Sockets no longer leak into child processes. The `--web`, OAuth callback
   and UDS daemon listeners, and every connection they accepted, were
   inheritable, so each later Bash command, hook, MCP server or browser launch

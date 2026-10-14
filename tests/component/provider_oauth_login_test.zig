@@ -135,7 +135,7 @@ test "L2 provider login: a loopback PKCE grant becomes a durable per-provider lo
     var instructions = Instructions{ .allocator = a };
     defer instructions.deinit();
 
-    var io_runtime = std.Io.Threaded.init(a, .{});
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
     defer io_runtime.deinit();
 
     var run = LoopbackRun{
@@ -251,7 +251,7 @@ test "L2 provider login: a device grant polls through authorization_pending" {
 
     var instructions = Instructions{ .allocator = a };
     defer instructions.deinit();
-    var io_runtime = std.Io.Threaded.init(a, .{});
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
     defer io_runtime.deinit();
 
     const token_json = try oauth_login.acquireFirstToken(a, io_runtime.io(), .{
@@ -297,7 +297,7 @@ test "L2 provider login: a denied device grant fails instead of polling to expir
     const url = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}/oauth", .{server.port});
     defer a.free(url);
 
-    var io_runtime = std.Io.Threaded.init(a, .{});
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
     defer io_runtime.deinit();
     try std.testing.expectError(oauth_login.Error.OAuthDeviceAccessDenied, oauth_login.acquireFirstToken(
         a,
@@ -351,7 +351,7 @@ test "L2 provider login: the recorded client is the one the refresh grant presen
     const token_url = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}/oauth/token", .{token_server.port});
     defer a.free(token_url);
 
-    var io_runtime = std.Io.Threaded.init(a, .{});
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
     defer io_runtime.deinit();
     var exchange = cc.api_oauth_exchange.HttpExchange{
         .allocator = a,
@@ -592,7 +592,7 @@ test "loginInteractive persists the login and reports through the notify sink" {
 
     var instructions = Instructions{ .allocator = a };
     defer instructions.deinit();
-    var io_runtime = std.Io.Threaded.init(a, .{});
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
     defer io_runtime.deinit();
     var run = InteractiveRun{ .allocator = a, .io = io_runtime.io(), .host = host, .notify = instructions.notify() };
     var thread = try std.Thread.spawn(.{}, InteractiveRun.run, .{&run});
@@ -649,7 +649,7 @@ test "loginInteractive fails closed with typed errors and persists nothing" {
     );
     var quiet = Instructions{ .allocator = a };
     defer quiet.deinit();
-    var io_runtime = std.Io.Threaded.init(a, .{});
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
     defer io_runtime.deinit();
     const io = io_runtime.io();
     const no_browser: provider_login.Options = .{ .open_browser = false, .port = 0, .state_root = "" };
@@ -730,7 +730,7 @@ test "L2 picker credential stage: the login worker lands a loopback grant as a d
         .oauth_token_url = token_url,
         .oauth_authorize_url = "http://127.0.0.1:1/authorize",
     };
-    var io_runtime = std.Io.Threaded.init(a, .{});
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
     defer io_runtime.deinit();
 
     // What picker_host does on MissingCredentials: prepare (typed refusals

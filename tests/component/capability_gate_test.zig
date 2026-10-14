@@ -42,7 +42,7 @@ test "P2: provider 不支持 web_search → WebSearch 从请求 tools 剔除(门
     const url = try srv.urlOwned(a);
     defer a.free(url);
 
-    var io_rt = std.Io.Threaded.init(a, .{});
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
     defer io_rt.deinit();
     var client = cc.client_mod.Client.initWithBaseUrl(a, io_rt.io(), "test-key", "claude-sonnet-4-20250514", url);
     defer client.deinit();

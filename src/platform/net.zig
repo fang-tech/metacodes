@@ -818,7 +818,7 @@ test "listenAddress on an explicit IPv4 address reports the kernel-assigned port
 /// Whether this host can listen on [::1], asked of std's own socket layer so
 /// a defect in `listenAddress` cannot turn into a skip.
 fn ipv6LoopbackAvailable() bool {
-    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    var threaded = @import("signal.zig").threadedIo(testing.allocator, .{});
     defer threaded.deinit();
     const io = threaded.io();
     const address: IpAddress = .{ .ip6 = .loopback(0) };

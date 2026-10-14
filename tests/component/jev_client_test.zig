@@ -38,7 +38,7 @@ fn originFor(buf: []u8, srv: *const harness.MockServer) ![]const u8 {
 
 test "L2 jev: typed questions reach the wire and calibrated answers come back" {
     const a = std.testing.allocator;
-    var io_runtime = std.Io.Threaded.init(a, .{});
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
     defer io_runtime.deinit();
     var srv = try harness.MockServer.start(ANSWER_BODY, 0);
     defer srv.stop();
@@ -64,7 +64,7 @@ test "L2 jev: typed questions reach the wire and calibrated answers come back" {
 
 test "L2 jev: refusals, server errors and malformed answers map to distinct errors" {
     const a = std.testing.allocator;
-    var io_runtime = std.Io.Threaded.init(a, .{});
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
     defer io_runtime.deinit();
     var origin_buf: [64]u8 = undefined;
     {
@@ -103,7 +103,7 @@ test "L2 jev: refusals, server errors and malformed answers map to distinct erro
 
 test "L2 jev: a service that does not declare itself free is refused" {
     const a = std.testing.allocator;
-    var io_runtime = std.Io.Threaded.init(a, .{});
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
     defer io_runtime.deinit();
     var origin_buf: [64]u8 = undefined;
     const priced = [_][]const u8{
@@ -125,7 +125,7 @@ test "L2 jev: a service that does not declare itself free is refused" {
 
 test "L2 jev: a pinned model refuses answers from any other model" {
     const a = std.testing.allocator;
-    var io_runtime = std.Io.Threaded.init(a, .{});
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
     defer io_runtime.deinit();
     var origin_buf: [64]u8 = undefined;
     {
@@ -156,7 +156,7 @@ test "L2 jev: a stalled service costs one deadline, then the breaker fails fast"
     const a = std.testing.allocator;
     // std.testing.io does not run Select tasks concurrently; the deadline
     // race needs a real threaded Io.
-    var io_runtime = std.Io.Threaded.init(a, .{});
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
     defer io_runtime.deinit();
     const io = io_runtime.io();
     var srv = try harness.MockServer.startCassetteSilent(&.{ANSWER_BODY}, 0, 0);
@@ -187,7 +187,7 @@ test "L2 jev: a stalled service costs one deadline, then the breaker fails fast"
 
 test "L2 jev: an abort while waiting propagates as Aborted and leaves the breaker closed" {
     const a = std.testing.allocator;
-    var io_runtime = std.Io.Threaded.init(a, .{});
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
     defer io_runtime.deinit();
     var srv = try harness.MockServer.startCassetteSilent(&.{ANSWER_BODY}, 0, 0);
     defer srv.stop();

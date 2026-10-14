@@ -1878,7 +1878,7 @@ const PublicHttpMcpConnector = struct {
     }
 
     fn post(self: *@This(), era_code: u32, body: []const u8) !HttpResult {
-        var io_runtime = std.Io.Threaded.init(std.heap.c_allocator, .{});
+        var io_runtime = @import("platform").signal.threadedIo(std.heap.c_allocator, .{});
         defer io_runtime.deinit();
         var client = std.http.Client{
             .allocator = std.heap.c_allocator,

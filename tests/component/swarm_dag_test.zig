@@ -223,7 +223,7 @@ test "L2 SW3: TeamCreate 建共享 root + teammate 线程自领跑起来(端到�
     defer srv.stop();
     const url = try srv.urlOwned(a);
     defer a.free(url);
-    var io_runtime = std.Io.Threaded.init(a, .{});
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
     defer io_runtime.deinit();
     var client = cc.client_mod.Client.initWithBaseUrl(a, io_runtime.io(), "k", "claude-sonnet-4-20250514", url);
     defer client.deinit();

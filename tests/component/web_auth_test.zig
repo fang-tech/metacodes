@@ -408,7 +408,7 @@ test "DNS rebinding: without a token a non-loopback Host is refused, loopback na
 /// Whether this host can listen on [::1], asked of std's own sockets so a
 /// defect in the code under test cannot turn into a skip.
 fn ipv6LoopbackAvailable() bool {
-    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    var threaded = @import("platform").signal.threadedIo(std.testing.allocator, .{});
     defer threaded.deinit();
     const io = threaded.io();
     const address: std.Io.net.IpAddress = .{ .ip6 = .loopback(0) };

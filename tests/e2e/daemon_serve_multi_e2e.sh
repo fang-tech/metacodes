@@ -17,6 +17,8 @@
 # Run by `zig build test` on POSIX hosts (build.zig sets
 # METACODES_DAEMON_E2E_BIN); by hand: `zig build && bash tests/e2e/daemon_serve_multi_e2e.sh`.
 set -euo pipefail
+# Responses are read whole before grep: under pipefail, `curl | grep -q` fails
+# a matching check whenever grep exits before curl has written everything.
 # shellcheck source=tests/e2e/daemon_e2e_lib.sh
 source "$(dirname "$0")/daemon_e2e_lib.sh"
 
@@ -77,12 +79,15 @@ grep -q '"ok":true' <<<"$ackB" || fail "/s/B/message not accepted: $ackB"
 events_until "DAEMON_OK" "${auth[@]}" "$url/s/$B/events" >/dev/null || fail "B produced nothing after its message"
 
 # ── per-session /state and /command ──────────────────────────────────────────
-"${CURL[@]}" "${auth[@]}" "$url/s/$A/state" | grep -q "\"session_id\":\"$A\"" || fail "A's /state is not its own snapshot"
+stateA="$("${CURL[@]}" "${auth[@]}" "$url/s/$A/state")" || fail "GET A's /state failed"
+grep -q "\"session_id\":\"$A\"" <<<"$stateA" || fail "A's /state is not its own snapshot"
 cackA="$("${CURL[@]}" "${auth[@]}" -X POST "$url/s/$A/command" -H "Origin: $url" -d '{"cmd":"/mode dont-ask"}')"
 grep -q '"ok":true' <<<"$cackA" || fail "A's /command not queued: $cackA"
 events_until 'permission mode → dont_ask' "${auth[@]}" "$url/s/$A/events" >/dev/null || fail "A has no command_result mode → dont_ask"
-"${CURL[@]}" "${auth[@]}" "$url/s/$A/state" | grep -q '"permission_mode":"dont_ask"' || fail "A's /state does not show dont_ask"
-if "${CURL[@]}" "${auth[@]}" "$url/s/$B/state" | grep -q '"permission_mode":"dont_ask"'; then
+stateA="$("${CURL[@]}" "${auth[@]}" "$url/s/$A/state")" || fail "GET A's /state failed"
+grep -q '"permission_mode":"dont_ask"' <<<"$stateA" || fail "A's /state does not show dont_ask"
+stateB="$("${CURL[@]}" "${auth[@]}" "$url/s/$B/state")" || fail "GET B's /state failed"
+if grep -q '"permission_mode":"dont_ask"' <<<"$stateB"; then
   fail "A's /mode changed B"
 fi
 

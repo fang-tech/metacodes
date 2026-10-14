@@ -52,7 +52,7 @@ test "issue#10 e2e: Anthropic 请求体含 image source block(text 在前,顺序
     const url = try srv.urlOwned(a);
     defer a.free(url);
 
-    var io_rt = std.Io.Threaded.init(a, .{});
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
     defer io_rt.deinit();
     var client = cc.client_mod.Client.initWithBaseUrl(a, io_rt.io(), "test-key", "claude-sonnet-4-20250514", url);
     defer client.deinit();
@@ -85,7 +85,7 @@ test "issue#10 e2e: OpenAI chat 请求体含 image_url data URL parts(顺序保�
     const url = try srv.urlOwned(a);
     defer a.free(url);
 
-    var io_rt = std.Io.Threaded.init(a, .{});
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
     defer io_rt.deinit();
     var client = cc.api_openai.OpenAIClient.init(a, io_rt.io(), "test-key", "gpt-4o", url);
     defer client.deinit();
@@ -137,7 +137,7 @@ test "issue#10 e2e: transcript resume 后图像仍到达请求(恢复语义活�
     defer srv.stop();
     const url = try srv.urlOwned(a);
     defer a.free(url);
-    var io_rt = std.Io.Threaded.init(a, .{});
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
     defer io_rt.deinit();
     var client = cc.client_mod.Client.initWithBaseUrl(a, io_rt.io(), "test-key", "claude-sonnet-4-20250514", url);
     defer client.deinit();
@@ -163,7 +163,7 @@ test "issue#10 e2e: 非 vision 模型带图经 Provider vtable 显式报能力�
     const url = try srv.urlOwned(a);
     defer a.free(url);
 
-    var io_rt = std.Io.Threaded.init(a, .{});
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
     defer io_rt.deinit();
     var client = cc.api_openai.OpenAIClient.init(a, io_rt.io(), "test-key", "deepseek-chat", url);
     defer client.deinit();

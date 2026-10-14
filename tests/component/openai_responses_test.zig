@@ -236,7 +236,7 @@ test "Responses(a): agent_loop e2e 文本流 → end_turn;请求是 input/instru
     const url = try srv.urlOwned(a);
     defer a.free(url);
 
-    var io_rt = std.Io.Threaded.init(a, .{});
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
     defer io_rt.deinit();
     var client = initResponsesClient(a, io_rt.io(), "gpt-5.2", url);
     defer client.deinit();
@@ -289,7 +289,7 @@ test "Responses(b): function_call 闭环 → 第二请求含 function_call_outpu
     const url = try srv.urlOwned(a);
     defer a.free(url);
 
-    var io_rt = std.Io.Threaded.init(a, .{});
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
     defer io_rt.deinit();
     var client = initResponsesClient(a, io_rt.io(), "gpt-5.2", url);
     defer client.deinit();
@@ -351,7 +351,7 @@ test "Responses(c): usage 归一(input 减 cached)+ 补发 .done + stopReason=en
     const url = try srv.urlOwned(a);
     defer a.free(url);
 
-    var io_rt = std.Io.Threaded.init(a, .{});
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
     defer io_rt.deinit();
     var client = initResponsesClient(a, io_rt.io(), "gpt-5.2", url);
     defer client.deinit();
@@ -437,7 +437,7 @@ test "issue #258 Responses L2: response.usage null → Host 无 usage 事件;有
         const url = try srv.urlOwned(a);
         defer a.free(url);
 
-        var io_rt = std.Io.Threaded.init(a, .{});
+        var io_rt = @import("platform").signal.threadedIo(a, .{});
         defer io_rt.deinit();
         var client = initResponsesClient(a, io_rt.io(), "gpt-5.2", url);
         defer client.deinit();
@@ -473,7 +473,7 @@ test "Responses(d): response.incomplete reason=max_output_tokens → stopReason=
     const url = try srv.urlOwned(a);
     defer a.free(url);
 
-    var io_rt = std.Io.Threaded.init(a, .{});
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
     defer io_rt.deinit();
     var client = initResponsesClient(a, io_rt.io(), "gpt-5.2", url);
     defer client.deinit();
@@ -508,7 +508,7 @@ test "Responses(e): response.failed 与流级 error 事件都上抛 RequestFaile
         const url = try srv.urlOwned(a);
         defer a.free(url);
 
-        var io_rt = std.Io.Threaded.init(a, .{});
+        var io_rt = @import("platform").signal.threadedIo(a, .{});
         defer io_rt.deinit();
         var client = initResponsesClient(a, io_rt.io(), "gpt-5.2", url);
         defer client.deinit();
@@ -538,7 +538,7 @@ test "Responses(f): output_text.delta 解除 JSON 转义(真实换行进 .text)"
     const url = try srv.urlOwned(a);
     defer a.free(url);
 
-    var io_rt = std.Io.Threaded.init(a, .{});
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
     defer io_rt.deinit();
     var client = initResponsesClient(a, io_rt.io(), "gpt-5.2", url);
     defer client.deinit();
@@ -683,7 +683,7 @@ test "Responses(h): >8KB SSE 行走 line_overflow 慢路径,完整吐文本且�
     const url = try srv.urlOwned(a);
     defer a.free(url);
 
-    var io_rt = std.Io.Threaded.init(a, .{});
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
     defer io_rt.deinit();
     var client = initResponsesClient(a, io_rt.io(), "gpt-5.2", url);
     defer client.deinit();
@@ -719,7 +719,7 @@ test "Responses(i): \\ud83c/\\udf89 拆进两个 arguments delta → 终值是�
     const url = try srv.urlOwned(a);
     defer a.free(url);
 
-    var io_rt = std.Io.Threaded.init(a, .{});
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
     defer io_rt.deinit();
     var client = initResponsesClient(a, io_rt.io(), "gpt-5.2", url);
     defer client.deinit();
@@ -757,7 +757,7 @@ test "Responses(j): item 序列化在 type 前的 output_item.added 仍注册 fu
     const url = try srv.urlOwned(a);
     defer a.free(url);
 
-    var io_rt = std.Io.Threaded.init(a, .{});
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
     defer io_rt.deinit();
     var client = initResponsesClient(a, io_rt.io(), "gpt-5.2", url);
     defer client.deinit();
@@ -793,7 +793,7 @@ test "Responses(k): 文本与两个 function_call 交错流,分槽 call_id/argum
     const url = try srv.urlOwned(a);
     defer a.free(url);
 
-    var io_rt = std.Io.Threaded.init(a, .{});
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
     defer io_rt.deinit();
     var client = initResponsesClient(a, io_rt.io(), "gpt-5.2", url);
     defer client.deinit();
@@ -875,7 +875,7 @@ test "Responses(i): 工具续跑的第二请求回放 reasoning item(id/summary/
     const url = try srv.urlOwned(a);
     defer a.free(url);
 
-    var io_rt = std.Io.Threaded.init(a, .{});
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
     defer io_rt.deinit();
     var client = initResponsesClient(a, io_rt.io(), "gpt-5.2", url);
     defer client.deinit();
@@ -943,7 +943,7 @@ test "Responses(i2): reasoning item 只出现在终止事件的 output 里时同
     const url = try srv.urlOwned(a);
     defer a.free(url);
 
-    var io_rt = std.Io.Threaded.init(a, .{});
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
     defer io_rt.deinit();
     var client = initResponsesClient(a, io_rt.io(), "gpt-5.2", url);
     defer client.deinit();
@@ -982,7 +982,7 @@ test "Responses(i3): 无 reasoning 的对照回合 → 第二请求里没有任�
     const url = try srv.urlOwned(a);
     defer a.free(url);
 
-    var io_rt = std.Io.Threaded.init(a, .{});
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
     defer io_rt.deinit();
     var client = initResponsesClient(a, io_rt.io(), "gpt-5.2", url);
     defer client.deinit();
@@ -1017,7 +1017,7 @@ test "Responses(i4): 只有 reasoning 的一轮不落进会话(估算与 wire �
     const url = try srv.urlOwned(a);
     defer a.free(url);
 
-    var io_rt = std.Io.Threaded.init(a, .{});
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
     defer io_rt.deinit();
     var client = initResponsesClient(a, io_rt.io(), "gpt-5.2", url);
     defer client.deinit();

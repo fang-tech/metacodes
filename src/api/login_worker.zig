@@ -175,7 +175,7 @@ fn settled(worker: *LoginWorker) bool {
 
 test "login worker: a loopback login that never gets its callback is cancelled through the signal" {
     const a = std.testing.allocator;
-    var io_runtime = std.Io.Threaded.init(a, .{});
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
     defer io_runtime.deinit();
     const profile = testProfile("worker-loopback", "http://127.0.0.1:1/token", "http://127.0.0.1:1/authorize", null);
     // A test must never launch a browser; port 0 keeps a developer's real
@@ -201,7 +201,7 @@ test "login worker: a loopback login that never gets its callback is cancelled t
 // stack trace on Windows into a passing test's log.
 test "login worker: the transcript is bounded and says when it was cut" {
     const a = std.testing.allocator;
-    var io_runtime = std.Io.Threaded.init(a, .{});
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
     defer io_runtime.deinit();
     const profile = testProfile("worker-bounded", "http://127.0.0.1:1/token", "http://127.0.0.1:1/authorize", null);
     const prepared = try provider_login.prepareProfile(&profile, .{ .open_browser = false, .port = 0, .client_id = "worker-client", .state_root = "" });

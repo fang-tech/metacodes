@@ -241,7 +241,7 @@ pub fn serveMulti(app0: *app_mod.App, allocator: std.mem.Allocator, config: anyt
             // 全新 App:c_allocator(线程安全,逐次释放)+ 独立 io_runtime。
             const io_rt = try web_alloc.create(std.Io.Threaded);
             errdefer web_alloc.destroy(io_rt);
-            io_rt.* = std.Io.Threaded.init(web_alloc, .{});
+            io_rt.* = @import("platform").signal.threadedIo(web_alloc, .{});
             errdefer io_rt.deinit();
             const app = try app_mod.App.init(web_alloc, io_rt.io(), config, api_key);
             // App.init 成功 → app 归本 slot;上面 errdefer 只覆盖 App.init 之前的失败(io_rt)。

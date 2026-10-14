@@ -282,7 +282,7 @@ test "L2 usage 锚点接线: message_start usage → conversation.usageAnchor(in
     const url = try srv.urlOwned(a);
     defer a.free(url);
 
-    var io_runtime = std.Io.Threaded.init(a, .{});
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
     defer io_runtime.deinit();
     const io = io_runtime.io();
 
