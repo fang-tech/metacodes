@@ -282,7 +282,10 @@ shell）、`permission_mode`、`permission_rules`（Host 导入的规则层）�
 `setModel`、`setPermissionMode`、`updatePermissionRules`、`setPromptProfile`、
 `setReasoningEffort`、`setAdditionalDirectories`，忙时返回 `SessionBusy`。哪些设置
 idle 可改、哪些要换 Runtime 代际、哪些只能新建 Session，见
-[API.md 的配置分类表](API.md#session-configuration-classes)。
+[API.md 的配置分类表](API.md#session-configuration-classes)。`setPermissionMode`
+对 settings 禁用的模式返回 `PermissionModeDisabled`；Session 的 settings 只有
+Host 导入的规则层，禁用不了模式，所以给用户开放哪些模式由 Host 决定，见
+[API.md](API.md#permission-modes-the-settings-disable)。
 
 用户在 Host 的权限框里选 `allow_always`，库路径只把该工具记进这个 Session 的
 `session_rules`：同一 Runtime、同一工作区的另一个 Session 仍会询问，磁盘上什么也不写。

@@ -175,6 +175,22 @@ status, compatibility boundaries, and entry points are defined by
   surface (terminal, `--web`/`serve` `POST /command`), leaving the mode
   unchanged, and a `--web`/`serve` message asking for it is refused with
   `message_rejected` before anything else in it is applied.
+- Work could still run under a permission mode the settings disable
+  (`disableBypassPermissionsMode`, `disableAutoMode`) without passing a mode
+  switch: an AgentDef's `permissionMode` (Task subagents, background jobs,
+  in-process teammates) and a forked Skill bound to such an agent applied it
+  as is, so a project `.claude/agents/x.md` with `permissionMode:
+  bypassPermissions` ran a subagent in bypass. Such a spawn now runs as
+  `default`, logs a warning and says so in its result
+  (`permission_mode_notice` on the Task result; a leading line on the forked
+  Skill's result; `/agents` marks the mode). Every permission decision now
+  runs under `default` when the mode on its context is disabled, whatever
+  put it there, including the ApplyPatch path gate and the AgentCore
+  external-Tool fallback. `AgentSession.setPermissionMode` and AgentCore
+  `update_permission_mode` refuse such a mode with
+  `error.PermissionModeDisabled` / `INVALID_ARGUMENT`; an AgentCore Session's
+  settings are the Host-imported rules, which cannot disable a mode, so
+  today the Host owns which modes it offers.
 - Sockets no longer leak into child processes. The `--web`, OAuth callback
   and UDS daemon listeners, and every connection they accepted, were
   inheritable, so each later Bash command, hook, MCP server or browser launch

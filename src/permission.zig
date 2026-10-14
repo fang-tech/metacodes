@@ -109,16 +109,21 @@ pub const PermissionContext = struct {
     /// Whether the settings let a session switch into `m`. `disableBypassPermissionsMode`
     /// and `disableAutoMode` (any layer) are hard constraints: App init downgrades a
     /// session that starts in such a mode, and every later switch must ask here first
-    /// (SessionService.setPermMode, the web/daemon message's `permission_mode`).
-    /// Historical aliases are judged by what they mean (`bypass` is bypass_permissions).
-    /// No settings loaded → every mode is allowed.
+    /// (SessionService.setPermMode, the web/daemon message's `permission_mode`,
+    /// AgentSession.setPermissionMode, an AgentDef's or forked Skill's `permissionMode`
+    /// at spawn). Historical aliases are judged by what they mean (`bypass` is
+    /// bypass_permissions). No settings loaded → every mode is allowed.
     pub fn modeAllowed(self: *const PermissionContext, m: types.PermissionMode) bool {
         const settings = self.settings orelse return true;
-        return switch (mode_mod.canonical(m)) {
-            .bypass_permissions => !settings.isBypassDisabled(),
-            .auto => !settings.isAutoModeDisabled(),
-            else => true,
-        };
+        return settings.allowsMode(m);
+    }
+
+    /// The mode permission decisions run under now: `modeValue()`, or `default` when
+    /// the settings disable it (decision.effectiveMode, the backstop). A reader that
+    /// changes behaviour by mode outside decision.zig reads this, not `modeValue()`;
+    /// `modeValue()` stays the stored value for display and state round trips.
+    pub fn effectiveMode(self: *const PermissionContext) types.PermissionMode {
+        return decision_mod.effectiveMode(self.modeValue(), self.settings);
     }
 
     /// **scoped 派生的唯一入口(U4)**:值拷贝本 ctx + **null 掉 event_sink**(scoped ctx 不是
@@ -307,6 +312,39 @@ test "modeAllowed: disableBypassPermissionsMode / disableAutoMode, aliases, no s
     try std.testing.expect(!ctx.modeAllowed(.auto));
     try std.testing.expect(ctx.modeAllowed(.bypass_permissions));
     try std.testing.expect(ctx.modeAllowed(.accept_edits));
+}
+
+test "a scopedDerive override into a disabled mode keeps the settings and decides as default" {
+    const no_rules: []const settings_mod.Rule = &.{};
+    const layers = [_]settings_mod.Layer{
+        .{ .source = .managed, .allow = no_rules, .ask = no_rules, .deny = no_rules, .disable_bypass_permissions_mode = true },
+    };
+    const bypass_off = settings_mod.MergedSettings{ .layers = &layers, .allocator = std.testing.allocator };
+    var session_ctx = createContext(.default, std.testing.allocator);
+    session_ctx.settings = &bypass_off;
+    const write = "{\"file_path\":\"/proj/a.txt\",\"content\":\"x\"}";
+
+    // An AgentDef/Skill override, or any later store, that the setters never saw.
+    const derived = session_ctx.scopedDerive(.bypass_permissions);
+    try std.testing.expect(derived.settings == session_ctx.settings);
+    try std.testing.expectEqual(types.PermissionMode.bypass_permissions, derived.modeValue()); // stored as asked
+    try std.testing.expectEqual(types.PermissionMode.default, derived.effectiveMode()); // decided as default
+    try std.testing.expectEqual(PermissionResult.ask, checkPermission(&derived, "Write", write));
+    try std.testing.expectEqual(PermissionResult.ask, checkPermission(&derived, "Bash", "{\"command\":\"npm install\"}"));
+    var stored = createContext(.default, std.testing.allocator);
+    stored.settings = &bypass_off;
+    stored.mode.store(.bypass, .release); // the historical alias, written past every setter
+    try std.testing.expectEqual(PermissionResult.ask, checkPermission(&stored, "Write", write));
+
+    // Twin: no switch → the override is bypass in force.
+    var free_ctx = createContext(.default, std.testing.allocator);
+    const plain_layers = [_]settings_mod.Layer{.{ .source = .managed, .allow = no_rules, .ask = no_rules, .deny = no_rules }};
+    const plain = settings_mod.MergedSettings{ .layers = &plain_layers, .allocator = std.testing.allocator };
+    free_ctx.settings = &plain;
+    const free_derived = free_ctx.scopedDerive(.bypass_permissions);
+    try std.testing.expectEqual(types.PermissionMode.bypass_permissions, free_derived.effectiveMode());
+    try std.testing.expectEqual(PermissionResult.allow, checkPermission(&free_derived, "Write", write));
+    try std.testing.expectEqual(PermissionResult.allow, checkPermission(&free_derived, "Bash", "{\"command\":\"npm install\"}"));
 }
 
 test "U4 A2: scopedDerive null 掉 sink(scoped 拷贝的 override 绝不 emit 到 session sink)" {

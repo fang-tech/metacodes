@@ -306,6 +306,22 @@ const ChildWrite = struct {
 
 /// 父会话 bypassPermissions 下,让 `subagent_type` 的子 agent 尝试 Write 一个临时文件。
 fn runChildWrite(a: std.mem.Allocator, agent_md: ?[]const u8, subagent_type: []const u8) !ChildWrite {
+    return runChildWriteWith(a, agent_md, subagent_type, .{});
+}
+
+/// The parent session a child Write runs under.
+const ParentSession = struct {
+    mode: cc.types_mod.PermissionMode = .bypass_permissions,
+    settings: ?*const cc.permission_settings.MergedSettings = null,
+    ui_requester: ?cc.ui_request.UiRequester = null,
+};
+
+fn runChildWriteWith(
+    a: std.mem.Allocator,
+    agent_md: ?[]const u8,
+    subagent_type: []const u8,
+    parent: ParentSession,
+) !ChildWrite {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var root_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -329,7 +345,11 @@ fn runChildWrite(a: std.mem.Allocator, agent_md: ?[]const u8, subagent_type: []c
     if (agent_md) |md| try addAgent(a, &agents, md) else try agents.loadFromStandardPaths("");
     const defs = try cc.tools.toToolDefinitions(a);
     defer a.free(defs);
-    const perm = cc.permission.createContext(.bypass_permissions, a);
+    var perm = cc.permission.createContext(parent.mode, a);
+    perm.settings = parent.settings;
+    perm.ui_requester = parent.ui_requester;
+    // A prompt nobody answers is a denial, never a read of fd 0.
+    perm.no_interactive_prompt = true;
     const ctx = baseContext(a, &client, &agents, &perm, defs);
 
     const args = try std.fmt.allocPrint(a, "{{\"subagent_type\":\"{s}\",\"prompt\":\"write\"}}", .{subagent_type});
@@ -354,6 +374,172 @@ test "L2 AgentDef.permission_mode=dontAsk: 子 run 按自己的模式拒写,不�
     defer guarded.deinit(a);
     try std.testing.expect(!guarded.created);
     try std.testing.expect(std.mem.indexOf(u8, guarded.followup, "permission_denied") != null);
+}
+
+/// Answers every permission prompt "deny once" and counts the Write prompts.
+const DenyingPrompter = struct {
+    write_prompts: std.atomic.Value(usize) = .init(0),
+
+    fn request(
+        raw: *anyopaque,
+        _: cc.session_id.SessionId,
+        _: std.mem.Allocator,
+        req: *const cc.ui_request.UiRequest,
+        out: *cc.ui_request.UiResponse,
+    ) anyerror!cc.ui_request.RequestOutcome {
+        const self: *DenyingPrompter = @ptrCast(@alignCast(raw));
+        switch (req.*) {
+            .permission => |prompt| {
+                if (std.mem.eql(u8, prompt.tool, "Write")) _ = self.write_prompts.fetchAdd(1, .acq_rel);
+                out.* = .{ .permission = .deny_once };
+                return .answered;
+            },
+            else => return error.UnexpectedUiRequest,
+        }
+    }
+
+    fn requester(self: *DenyingPrompter) cc.ui_request.UiRequester {
+        return .{ .ctx = self, .requestFn = request };
+    }
+};
+
+fn testLayer(disable_bypass: bool, disable_auto: bool) cc.permission_settings.Layer {
+    const no_rules: []const cc.permission_settings.Rule = &.{};
+    return .{
+        .source = .managed,
+        .allow = no_rules,
+        .ask = no_rules,
+        .deny = no_rules,
+        .disable_bypass_permissions_mode = disable_bypass,
+        .disable_auto_mode = disable_auto,
+    };
+}
+
+const BYPASS_WRITER_MD = "---\nname: bypass-writer\ntools: Write\npermissionMode: bypassPermissions\n---\nWrite the file.";
+const BYPASS_NOTICE = "\"permission_mode_notice\":\"permissionMode bypassPermissions is disabled by settings; the subagent runs as default\"";
+
+test "L2 AgentDef.permissionMode=bypassPermissions under disableBypassPermissionsMode: the child is asked, as default is" {
+    const a = std.testing.allocator;
+    const layers = [_]cc.permission_settings.Layer{testLayer(true, false)};
+    const bypass_off = cc.permission_settings.MergedSettings{ .layers = &layers, .allocator = a };
+    var prompter = DenyingPrompter{};
+    var run = try runChildWriteWith(a, BYPASS_WRITER_MD, "bypass-writer", .{
+        .mode = .default,
+        .settings = &bypass_off,
+        .ui_requester = prompter.requester(),
+    });
+    defer run.deinit(a);
+    // The write bypass would auto-allow is put to the user (who says no), as in default.
+    try std.testing.expectEqual(@as(usize, 1), prompter.write_prompts.load(.acquire));
+    try std.testing.expect(!run.created);
+    try std.testing.expect(std.mem.indexOf(u8, run.followup, "permission_denied") != null);
+    // The parent is told why the agent's mode did not apply.
+    try std.testing.expect(std.mem.indexOf(u8, run.out, BYPASS_NOTICE) != null);
+}
+
+test "L2 AgentDef.permissionMode=bypassPermissions with only disableAutoMode: bypass applies (twin)" {
+    const a = std.testing.allocator;
+    const layers = [_]cc.permission_settings.Layer{testLayer(false, true)};
+    const auto_off = cc.permission_settings.MergedSettings{ .layers = &layers, .allocator = a };
+    var prompter = DenyingPrompter{};
+    var run = try runChildWriteWith(a, BYPASS_WRITER_MD, "bypass-writer", .{
+        .mode = .default,
+        .settings = &auto_off,
+        .ui_requester = prompter.requester(),
+    });
+    defer run.deinit(a);
+    try std.testing.expectEqual(@as(usize, 0), prompter.write_prompts.load(.acquire));
+    try std.testing.expect(run.created);
+    try std.testing.expect(std.mem.indexOf(u8, run.out, "permission_mode_notice") == null);
+}
+
+test "L2 a subagent inheriting a mode the parent's settings disable is decided as default (backstop)" {
+    // No permissionMode on the AgentDef: the child inherits its parent's context,
+    // whose bypass reached it past every setter. Only the decision-time backstop
+    // stands between that and an auto-allowed write.
+    const a = std.testing.allocator;
+    const md = "---\nname: plain-writer\ntools: Write\n---\nWrite the file.";
+    const off_layers = [_]cc.permission_settings.Layer{testLayer(true, false)};
+    const bypass_off = cc.permission_settings.MergedSettings{ .layers = &off_layers, .allocator = a };
+    var prompter = DenyingPrompter{};
+    var run = try runChildWriteWith(a, md, "plain-writer", .{
+        .mode = .bypass_permissions,
+        .settings = &bypass_off,
+        .ui_requester = prompter.requester(),
+    });
+    defer run.deinit(a);
+    try std.testing.expectEqual(@as(usize, 1), prompter.write_prompts.load(.acquire));
+    try std.testing.expect(!run.created);
+    try std.testing.expect(std.mem.indexOf(u8, run.followup, "permission_denied") != null);
+    try std.testing.expect(std.mem.indexOf(u8, run.out, "permission_mode_notice") == null);
+
+    // Twin: the same inherited bypass with the switch off writes unasked.
+    const on_layers = [_]cc.permission_settings.Layer{testLayer(false, true)};
+    const auto_off = cc.permission_settings.MergedSettings{ .layers = &on_layers, .allocator = a };
+    var twin_prompter = DenyingPrompter{};
+    var twin = try runChildWriteWith(a, md, "plain-writer", .{
+        .mode = .bypass_permissions,
+        .settings = &auto_off,
+        .ui_requester = twin_prompter.requester(),
+    });
+    defer twin.deinit(a);
+    try std.testing.expectEqual(@as(usize, 0), twin_prompter.write_prompts.load(.acquire));
+    try std.testing.expect(twin.created);
+}
+
+test "L2 background AgentDef with a disabled permissionMode reports it and runs as default" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = harness.normalizeSlashes(root_buf[0..try tmp.dir.realPath(std.testing.io, &root_buf)]);
+    const target = try std.fmt.allocPrint(a, "{s}/bg-write.txt", .{root});
+    defer a.free(target);
+    const write_sse = try writeToolSse(a, target);
+    defer a.free(write_sse);
+    const bodies = [_][]const u8{ write_sse, END_TURN_SSE };
+    var srv = try harness.MockServer.startCassette(&bodies, 0);
+    defer srv.stop();
+    const url = try srv.urlOwned(a);
+    defer a.free(url);
+    var io_rt = std.Io.Threaded.init(a, .{});
+    defer io_rt.deinit();
+    var client = cc.client_mod.Client.initWithBaseUrl(a, io_rt.io(), "k", "claude-sonnet-4-20250514", url);
+    defer client.deinit();
+    var agents = cc.agents_set.AgentSet.init(a);
+    defer agents.deinit();
+    try addAgent(a, &agents, "---\nname: bg-bypass\ntools: Write\nbackground: true\npermissionMode: bypassPermissions\n---\nWrite the file.");
+    const defs = try cc.tools.toToolDefinitions(a);
+    defer a.free(defs);
+    const layers = [_]cc.permission_settings.Layer{testLayer(true, false)};
+    const bypass_off = cc.permission_settings.MergedSettings{ .layers = &layers, .allocator = a };
+    var prompter = DenyingPrompter{};
+    var perm = cc.permission.createContext(.default, a);
+    perm.settings = &bypass_off;
+    perm.ui_requester = prompter.requester();
+    perm.no_interactive_prompt = true;
+    var jobs = try cc.agent_job_registry.AgentJobRegistry.init(a, "k", url, "claude-sonnet-4-20250514", .anthropic);
+    defer jobs.deinit();
+    var ctx = baseContext(a, &client, &agents, &perm, defs);
+    ctx.agent_jobs = &jobs;
+
+    const out = try cc.agent_tool.execute(&ctx, "{\"subagent_type\":\"bg-bypass\",\"prompt\":\"write\"}");
+    defer a.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"status\":\"running\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, BYPASS_NOTICE) != null);
+    const job_id = try extractJsonString(a, out, "agent_job_id");
+    defer a.free(job_id);
+    const entry = jobs.get(job_id) orelse return error.JobMissing;
+    var waited: usize = 0;
+    while (!entry.waitForOutputOrTerminal(null, 100 * std.time.ns_per_ms)) : (waited += 1) {
+        if (waited > 300) return error.JobDidNotFinish;
+    }
+    try std.testing.expectEqual(@as(usize, 2), srv.requestCount());
+    try std.testing.expectEqual(@as(usize, 1), prompter.write_prompts.load(.acquire));
+    const followup = (srv.lastRequest() orelse return error.NoRequestCaptured).body();
+    try std.testing.expect(std.mem.indexOf(u8, followup, "permission_denied") != null);
+    const created = if (std.Io.Dir.cwd().access(std.testing.io, target, .{})) |_| true else |_| false;
+    try std.testing.expect(!created);
 }
 
 test "L2 Explore 只读由工具白名单保证:bypass 父会话下猜 Write 也到不了磁盘" {

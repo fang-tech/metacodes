@@ -1508,7 +1508,11 @@ needed.
   export, another mutation, or a Provider cancel still draining after an
   abort. A poisoned Session returns `INVALID_STATE`, and a code that is not
   one of the five `METASK_AGENTCORE_PERMISSION_*` values returns
-  `INVALID_ARGUMENT` with a diagnostic. None of these changes anything.
+  `INVALID_ARGUMENT` with a diagnostic. A mode the Session's settings disable
+  (`disableBypassPermissionsMode`, `disableAutoMode`) would also return
+  `INVALID_ARGUMENT`, diagnostic `PermissionModeDisabled`; a Session's
+  settings are the Host-imported rules, which cannot disable a mode, so this
+  does not occur in revision 19. None of these changes anything.
 - **Effective point.** The first permission decision after the call returns
   `OK`, which is the first Tool call of the next Run.
 - **Grants.** A new mode is a new policy. The call starts a new policy
@@ -1684,7 +1688,9 @@ and `required`.
 Session permission modes are `default`, `accept_edits`, `auto`, `dont_ask`,
 and `full_access`, represented by the corresponding public constants. A
 Session starts with the mode in its Host configuration and changes it only
-through `update_permission_mode` (see "Permission mode updates").
+through `update_permission_mode` (see "Permission mode updates"). Which modes
+a Host offers is the Host's policy: a Session's only settings are the
+Host-imported allow/ask/deny rules, which cannot disable a mode.
 
 ABI v1 supports these built-in tools: `Read`, `Write`, `Edit`, `Glob`, `Grep`,
 `Bash`, `BashOutput`, `KillShell`, `WebSearch`, `WebFetch`, and

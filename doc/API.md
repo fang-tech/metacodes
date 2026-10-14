@@ -573,6 +573,37 @@ non-null value with `error.AgentEffortUnsupportedProvider`.
 writes. It is not named in the system prompt. These two are source-level only;
 AgentCore revision 19 does not carry them.
 
+### Permission modes the settings disable
+
+`disableBypassPermissionsMode` and `disableAutoMode`, in any settings layer,
+are hard constraints on the mode work runs under, not only on what `/mode`
+accepts:
+
+- **Mode switches are refused.** A session that starts in such a mode is
+  downgraded to `default` when the settings load. `/mode` on every surface
+  and the `--web`/`serve` message's `permission_mode` refuse it (see below).
+  `AgentSession.setPermissionMode` returns `error.PermissionModeDisabled` and
+  AgentCore `update_permission_mode` returns `INVALID_ARGUMENT` (diagnostic
+  `PermissionModeDisabled`); the mode, policy generation and grants stay as
+  they were.
+- **Spawns do not apply it.** An AgentDef's `permissionMode` (a Task
+  subagent, a background job, an in-process teammate) and a forked Skill
+  bound to that agent with `agent:` run as `default` instead, and log one
+  warning. The Task result carries `"permission_mode_notice": "permissionMode
+  bypassPermissions is disabled by settings; the subagent runs as default"`,
+  the forked Skill's result opens with the same sentence in brackets, and
+  `/agents` marks the mode `(disabled by settings; runs as default)`.
+- **Decisions never run under it.** Whatever puts such a mode on a permission
+  context, each decision is the one `default` makes
+  (`permission/decision.zig` `effectiveMode`), including the ApplyPatch path
+  gate and the AgentCore fallback for external Tools.
+
+An `AgentSession`'s settings are only the Host-imported rule layer
+(`permission_rules`, `updatePermissionRules`: allow/ask/deny), which has no
+way to disable a mode, so the refusal above cannot trigger for a Session today:
+the Host owns which modes it offers its users and must not pass one it
+forbids. The check is in place for a Session that does carry such settings.
+
 ### Wire lines for out-of-process Hosts
 
 A Host that carries a Session over SSE, a WebSocket or a queue serializes
