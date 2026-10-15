@@ -2,23 +2,28 @@
 //! (doc/SEALED_SKILL_PROTOCOL.md §9 "Activation").
 //!
 //! A forked Skill runs the ordinary subagent loop; this Provider replaces the
-//! model. Its first `sendStream` opens the run (`runs.start`) with the user's
-//! prompt and the tool definitions the pin allows; every later `sendStream`
-//! takes the `tool_result` blocks the loop appended and sends them
-//! (`runs.continue`). Each Step comes back as neutral stream events —
-//! `tool_use_start` per call, `text`, `usage`, `done` — so dispatch,
-//! permission, sandbox, artifact storage and observation are untouched.
+//! model. Its first `sendStream` opens the run (`runs.start`) with everything
+//! the fork's own model call would have carried — the system prompt, the tool
+//! definitions the pin allows, the model, the request parameters and the
+//! client's provider route — so the gateway's shadow of the fork makes the
+//! same request the client would have (§9.1 "Mirror"), over the client's own
+//! provider account (§8.1). Every later `sendStream` takes the `tool_result`
+//! blocks the loop appended and sends them (`runs.continue`). Each Step comes
+//! back as neutral stream events — `tool_use_start` per call, `usage`, `done`
+//! — so dispatch, permission, sandbox, artifact storage and observation are
+//! untouched. The brain's narration between calls never reaches the loop;
+//! only a `final` Step carries text.
 //!
 //! What this module enforces on its own, because the gateway is untrusted:
 //! the hash chain and `seq` of every Step (§8.3), the result size caps (§6.3),
 //! the policy-violation count that cancels a run (§6.2), the cost cap (§6.5),
 //! the ledger (§6.6), credential substitution and redaction (§6.4), and the
 //! `confirm: true` marks handed to the child's permission context through
-//! its confirm gate (§6.2). An `input_required` Step is put to the user over
-//! the session's UI requester and the answer goes back as the one result of
-//! the next `runs.continue` (§4.3). The tool allowlist itself is enforced by
-//! the Skill's policy frame before dispatch; this module only classifies the
-//! refusal.
+//! its confirm gate (§6.2). An `input_required` Step is put to the user with
+//! the client's own `AskUserQuestion` tool over the session's UI requester
+//! and the answer goes back as the one result of the next `runs.continue`
+//! (§4.3). The tool allowlist itself is enforced by the Skill's policy frame
+//! before dispatch; this module only classifies the refusal.
 
 const std = @import("std");
 const protocol = @import("protocol.zig");
@@ -33,10 +38,10 @@ const api_request = @import("../../api/request.zig");
 const types = @import("../../types.zig");
 const json_mod = @import("../../json.zig");
 const log = @import("../../util/log.zig");
-const rule_spec = @import("../../permission/rule_spec.zig");
 const confirm_gate = @import("../../permission/confirm_gate.zig");
 const ui_request = @import("../../core/protocol/ui_request.zig");
 const tool_context = @import("../../tools/context.zig");
+const ask_user = @import("../../tools/ask_user.zig");
 const SessionId = @import("../../core/session_id.zig").SessionId;
 const AbortSignal = @import("../../util/abort.zig").AbortSignal;
 
@@ -48,6 +53,13 @@ pub const MAX_POLICY_VIOLATIONS: u8 = 3;
 pub const MODEL_PREFIX = "sealed:";
 /// Longest answer accepted for an `input_required` question.
 pub const MAX_ANSWER_BYTES: usize = 64 * 1024;
+/// The client's question tool: always advertised to the gateway, outside the
+/// allowlist, because a question to the user is the user's to answer.
+pub const ASK_USER_TOOL = "AskUserQuestion";
+/// The context window the client's fork loop believes it has. The brain's
+/// conversation lives on the gateway, which compacts it; the client's copy
+/// is only a mirror for pairing results, so it must never compact.
+const NO_COMPACTION_INPUT_TOKENS: u32 = 8_000_000;
 
 pub const Error = error{
     OutOfMemory,
@@ -64,6 +76,9 @@ pub const Error = error{
     SealedNoPrompt,
     /// `<state root>/sealed-credentials.json` exists but cannot be read.
     SealedCredentialsUnreadable,
+    /// The client's provider cannot be delegated to a gateway (§8.1): it has
+    /// no route, or its authentication cannot be carried in a header.
+    SealedProviderRouteUnavailable,
 };
 
 pub const Options = struct {
@@ -84,6 +99,20 @@ pub const Options = struct {
     ui: ?ui_request.UiRequester = null,
     /// The session the question dialog is routed to.
     session: SessionId = .single,
+    /// The client's own provider: the fork's model, whose capabilities,
+    /// output cap and reasoning effort this provider answers for so the loop
+    /// advertises to the gateway exactly what it would have advertised to it.
+    /// Must outlive this provider.
+    origin: provider_mod.Provider,
+    /// The client's own provider route (§8.1); its slices must outlive the
+    /// provider. The gateway calls the model over it, with its credential.
+    route: provider_mod.ProviderRoute,
+    /// The pin directory: the Skill's base directory as the brain sees it,
+    /// where its public assets were installed.
+    base_dir: []const u8,
+    /// The user's positional arguments, rendered into the body on the gateway
+    /// exactly as a local fork would render them.
+    arguments: []const []const u8 = &.{},
 };
 
 const PreRefusal = struct {
@@ -129,6 +158,10 @@ pub const SealedSkillProvider = struct {
     model_name: []u8,
     ui: ?ui_request.UiRequester,
     session: SessionId,
+    origin: provider_mod.Provider,
+    route: provider_mod.ProviderRoute,
+    base_dir: []u8,
+    arguments: []const []u8,
     /// Everything the current run owns; reset per Step.
     run_arena: std.heap.ArenaAllocator,
     run: ?Run = null,
@@ -145,6 +178,8 @@ pub const SealedSkillProvider = struct {
         errdefer allocator.destroy(self);
         var pin = options.pin;
         errdefer pin.deinit();
+        if (options.route.auth_scheme) |scheme| if (scheme == .signed_adapter) return error.SealedProviderRouteUnavailable;
+        if (options.route.credential.len == 0) return error.SealedProviderRouteUnavailable;
         const model_name = try std.fmt.allocPrint(allocator, "{s}{s}", .{ MODEL_PREFIX, pin.pin.entry.skill_id });
         errdefer allocator.free(model_name);
         const session_id = try allocator.dupe(u8, options.session_id);
@@ -155,6 +190,16 @@ pub const SealedSkillProvider = struct {
         errdefer allocator.free(client_version);
         const client_platform = try allocator.dupe(u8, options.client_platform);
         errdefer allocator.free(client_platform);
+        const base_dir = try allocator.dupe(u8, options.base_dir);
+        errdefer allocator.free(base_dir);
+        const arguments = try allocator.alloc([]u8, options.arguments.len);
+        errdefer allocator.free(arguments);
+        var copied: usize = 0;
+        errdefer for (arguments[0..copied]) |argument| allocator.free(argument);
+        for (options.arguments, arguments) |source, *slot| {
+            slot.* = try allocator.dupe(u8, source);
+            copied += 1;
+        }
         var store = credentials.load(allocator, options.state_root) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => {
@@ -163,7 +208,8 @@ pub const SealedSkillProvider = struct {
             },
         };
         errdefer store.deinit();
-        const client = try transport.Client.init(allocator, io, pin.pin.gateway_url, options.token);
+        var client = try transport.Client.init(allocator, io, pin.pin.gateway_url, options.token);
+        client.provider_credential = options.route.credential;
         self.* = .{
             .allocator = allocator,
             .transport = client,
@@ -178,6 +224,10 @@ pub const SealedSkillProvider = struct {
             .model_name = model_name,
             .ui = options.ui,
             .session = options.session,
+            .origin = options.origin,
+            .route = options.route,
+            .base_dir = base_dir,
+            .arguments = arguments,
             .run_arena = std.heap.ArenaAllocator.init(allocator),
         };
         return self;
@@ -194,6 +244,9 @@ pub const SealedSkillProvider = struct {
         self.transport.deinit();
         self.credentials.deinit();
         self.pin.deinit();
+        for (self.arguments) |argument| self.allocator.free(argument);
+        self.allocator.free(self.arguments);
+        self.allocator.free(self.base_dir);
         self.allocator.free(self.model_name);
         self.allocator.free(self.client_platform);
         self.allocator.free(self.client_version);
@@ -215,6 +268,7 @@ pub const SealedSkillProvider = struct {
             .maxInputTokensFn = maxInputTokensFn,
             .reasoningEffortFn = reasoningEffortFn,
             .supportsFn = supportsFn,
+            .supportsForModelFn = supportsForModelFn,
             .endpointIdFn = endpointIdFn,
         };
     }
@@ -242,6 +296,13 @@ pub const SealedSkillProvider = struct {
         return @as(f64, @floatFromInt(self.max_cost_micros)) / 1_000_000.0;
     }
 
+    /// The loop's turn cap for a sealed fork: the protocol's step cap. The
+    /// brain's iteration belongs to the gateway; the client loop is its
+    /// executor and sets no shorter limit of its own.
+    pub fn maxTurns(self: *const SealedSkillProvider) u32 {
+        return @intCast(@min(self.max_steps, std.math.maxInt(u32)));
+    }
+
     pub fn cumulativeCostMicros(self: *const SealedSkillProvider) i64 {
         return if (self.run) |run| run.cumulative_cost_micros else 0;
     }
@@ -263,10 +324,10 @@ pub const SealedSkillProvider = struct {
     fn sendStreamFn(
         ctx: *anyopaque,
         messages: []const types.ApiMessage,
-        _: ?[]const u8,
+        system: ?[]const u8,
         tools: ?[]const json_mod.ToolDefinition,
         abort: ?*const AbortSignal,
-        _: ?[]const u8,
+        model_override: ?[]const u8,
         _: ?json_mod.ToolChoice,
         _: []const u8,
     ) anyerror!provider_mod.StreamHandle {
@@ -275,7 +336,7 @@ pub const SealedSkillProvider = struct {
             self.last_error = error.SealedRunFinished;
             return error.SealedRunFinished;
         };
-        const outcome = if (self.run != null) self.continueRun(messages, abort) else self.startRun(messages, tools, abort);
+        const outcome = if (self.run != null) self.continueRun(messages, abort) else self.startRun(messages, system, tools, model_override, abort);
         return outcome catch |err| {
             self.last_error = err;
             return err;
@@ -306,7 +367,8 @@ pub const SealedSkillProvider = struct {
 
     fn sendFn(_: *anyopaque, _: []const types.ApiMessage, _: ?[]const u8, _: ?[]const json_mod.ToolDefinition, _: ?[]const u8) anyerror!provider_mod.ApiResponse {
         // Compaction summaries would send the fork's conversation to the
-        // gateway as free text; a sealed run has no such request.
+        // gateway as free text; the brain's conversation is compacted on the
+        // gateway, the client's mirror never is.
         return error.SealedProviderNoSummaries;
     }
 
@@ -314,20 +376,27 @@ pub const SealedSkillProvider = struct {
         cast(ctx).transport.cancel(signal);
     }
 
-    fn maxTokensFn(_: *anyopaque) u32 {
-        return 8192;
+    // The fork's loop asks its provider what the model can do and how much
+    // it may emit; the answers are the client's own provider's, so the loop
+    // advertises and bounds exactly what a local fork would (§9.1).
+    fn maxTokensFn(ctx: *anyopaque) u32 {
+        return cast(ctx).origin.maxTokens();
     }
 
     fn maxInputTokensFn(_: *anyopaque) u32 {
-        return 200_000;
+        return NO_COMPACTION_INPUT_TOKENS;
     }
 
-    fn reasoningEffortFn(_: *anyopaque) ?types.ReasoningEffort {
-        return null;
+    fn reasoningEffortFn(ctx: *anyopaque) ?types.ReasoningEffort {
+        return cast(ctx).origin.reasoningEffort();
     }
 
-    fn supportsFn(_: *anyopaque, _: provider_mod.Capability) bool {
-        return false;
+    fn supportsFn(ctx: *anyopaque, cap: provider_mod.Capability) bool {
+        return cast(ctx).origin.supports(cap);
+    }
+
+    fn supportsForModelFn(ctx: *anyopaque, cap: provider_mod.Capability, model: []const u8) bool {
+        return cast(ctx).origin.supportsForModel(cap, model);
     }
 
     // ── Run lifecycle ─────────────────────────────────────────────────────
@@ -335,7 +404,9 @@ pub const SealedSkillProvider = struct {
     fn startRun(
         self: *SealedSkillProvider,
         messages: []const types.ApiMessage,
+        system: ?[]const u8,
         tools: ?[]const json_mod.ToolDefinition,
+        model_override: ?[]const u8,
         abort: ?*const AbortSignal,
     ) anyerror!provider_mod.StreamHandle {
         var scratch = std.heap.ArenaAllocator.init(self.allocator);
@@ -344,20 +415,32 @@ pub const SealedSkillProvider = struct {
 
         const prompt = try firstUserText(arena, messages);
         if (prompt.len == 0) return error.SealedNoPrompt;
-        const tools_json = try self.allowedToolsJson(arena, tools orelse &.{});
+        const split = try self.toolsJson(arena, tools orelse &.{});
+        const arguments = try arena.alloc([]const u8, self.arguments.len);
+        for (self.arguments, arguments) |argument, *slot| slot.* = argument;
         var params: std.Io.Writer.Allocating = .init(arena);
         try protocol.writeStartParams(&params.writer, .{
             .skill_id = self.pin.pin.entry.skill_id,
             .manifest_digest = self.pin.pin.entry.manifest_digest,
             .prompt = prompt,
-            .arguments = &.{},
-            .tools_json = tools_json,
+            .arguments = arguments,
+            .tools_json = split.client,
             .max_cost_micros = self.max_cost_micros,
             .max_steps = self.max_steps,
             .client_name = "metacodes",
             .client_version = self.client_version,
             .client_platform = self.client_platform,
             .run_ref = self.session_id,
+            .system = system orelse "",
+            .base_dir = self.base_dir,
+            .provider_kind = @tagName(self.route.kind),
+            .provider_base_url = self.route.base_url,
+            .provider_openai_protocol = if (self.route.kind == .openai) @tagName(self.route.openai_protocol) else "",
+            .provider_auth_json = try authJson(arena, self.route.auth_scheme),
+            .provider_tools_json = split.provider,
+            .model = model_override orelse self.route.model,
+            .max_tokens = self.origin.maxTokensFor(model_override),
+            .reasoning_effort = if (self.origin.reasoningEffort()) |effort| @tagName(effort) else "",
         });
         var response = self.transport.call(.runs_start, params.written(), abort) catch |err| return self.transportFailure(err);
         defer response.deinit();
@@ -600,9 +683,10 @@ pub const SealedSkillProvider = struct {
             });
             return self.sendResults(arena, results.items, abort);
         }
+        // The brain's text between calls (if a gateway sends any) is its own
+        // reasoning, not the Skill's result: it is not replayed.
         const stream = try StreamResponse.create(self.allocator, .tool_use);
         errdefer stream.destroy();
-        if (step.text.len != 0) try stream.pushText(step.text);
         for (step.calls, run.calls) |call, ref| {
             if (ref.pre_refusal != null) continue;
             if (ref.credential_refs.len == 0) {
@@ -654,9 +738,12 @@ pub const SealedSkillProvider = struct {
         return .{ .content = current, .refs = redacted.items };
     }
 
-    /// §4.3 `input_required`: put the question to the user over the UI
-    /// requester and send the answer as the Step's one result. Without a
-    /// channel the run is released and the question becomes the fork's text.
+    /// §4.3 `input_required`: put the question to the user and send the
+    /// answer as the Step's one result. A question that carries the brain's
+    /// `AskUserQuestion` input is answered by running that very tool here,
+    /// so the brain gets the result shape it asked for; a bare message gets
+    /// one dialog. Without a channel the run is released and the question
+    /// becomes the fork's text.
     fn answerQuestion(self: *SealedSkillProvider, step: *const protocol.Step, abort: ?*const AbortSignal) anyerror!provider_mod.StreamHandle {
         const question = step.question.?;
         var scratch = std.heap.ArenaAllocator.init(self.allocator);
@@ -664,7 +751,7 @@ pub const SealedSkillProvider = struct {
         const arena = scratch.allocator();
         const asked = self.askUser(arena, question) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
-            else => Asked{ .declined = {} },
+            else => Asked{ .declined = @errorName(err) },
         };
         switch (asked) {
             .unavailable => {
@@ -672,13 +759,18 @@ pub const SealedSkillProvider = struct {
                 self.cancelRun(.client_error, abort);
                 return self.finishWithText(text);
             },
-            .declined => {
+            .declined => |why| {
+                const content = try std.fmt.allocPrint(arena, "the user did not answer the question ({s})", .{why});
                 const result: protocol.ResultEntry = .{
                     .tool_use_id = question.id,
-                    .content = "the user did not answer the question",
+                    .content = content,
                     .is_error = true,
                     .refusal = .aborted,
                 };
+                return self.sendResults(arena, &.{result}, abort);
+            },
+            .tool_error => |content| {
+                const result: protocol.ResultEntry = .{ .tool_use_id = question.id, .content = content, .is_error = true };
                 return self.sendResults(arena, &.{result}, abort);
             },
             .answered => |answer| {
@@ -688,13 +780,24 @@ pub const SealedSkillProvider = struct {
         }
     }
 
-    const Asked = union(enum) { unavailable, declined, answered: []const u8 };
+    const Asked = union(enum) { unavailable, declined: []const u8, tool_error: []const u8, answered: []const u8 };
 
-    /// One `ask_question` dialog for the Step's question. Options come from a
-    /// single-property `enum` in the elicitation schema when there is one;
-    /// otherwise the dialog's free-text entry is the answer.
     fn askUser(self: *SealedSkillProvider, arena: std.mem.Allocator, question: protocol.Question) !Asked {
         const requester = self.ui orelse return .unavailable;
+        if (question.tool_input_json.len != 0) {
+            // The client's own AskUserQuestion, with the session's dialog.
+            var ctx = tool_context.ToolContext.simple(arena);
+            ctx.ui_requester = requester;
+            ctx.session = self.session;
+            const output = ask_user.execute(&ctx, question.tool_input_json) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.InputAborted, error.UiCancelled => return .{ .declined = @errorName(err) },
+                error.NotATty, error.UiPending => return .unavailable,
+                else => return .{ .tool_error = try std.fmt.allocPrint(arena, "AskUserQuestion failed: {s}", .{@errorName(err)}) },
+            };
+            if (output.len > MAX_ANSWER_BYTES) return .{ .answered = output[0..MAX_ANSWER_BYTES] };
+            return .{ .answered = output };
+        }
         const options = try enumOptions(arena, question.schema_json);
         const header = try std.fmt.allocPrint(arena, "/{s}", .{self.manifest().name});
         const questions = [_]tool_context.AskQuestion{.{
@@ -714,13 +817,13 @@ pub const SealedSkillProvider = struct {
         }
         switch (resp) {
             .answers => |answers| {
-                if (answers.len == 0) return .declined;
+                if (answers.len == 0) return .{ .declined = "no answer" };
                 const answer = answers[0];
-                if (answer.len == 0) return .declined;
+                if (answer.len == 0) return .{ .declined = "empty answer" };
                 if (answer.len > MAX_ANSWER_BYTES) return .{ .answered = answer[0..MAX_ANSWER_BYTES] };
                 return .{ .answered = answer };
             },
-            else => return .declined,
+            else => return .{ .declined = "no answer" },
         }
     }
 
@@ -817,36 +920,84 @@ pub const SealedSkillProvider = struct {
         }
     }
 
-    // ── Allowlist projection ──────────────────────────────────────────────
+    // ── Tool projection ───────────────────────────────────────────────────
 
-    /// The definitions the gateway may call: those in `tools` whose name the
-    /// pinned allowlist admits (§3.4 `tools`). Serialized as a JSON array in
-    /// the client's own schema dialect.
-    fn allowedToolsJson(self: *const SealedSkillProvider, arena: std.mem.Allocator, tools: []const json_mod.ToolDefinition) ![]const u8 {
-        var buf: std.ArrayList(u8) = .empty;
-        try buf.append(arena, '[');
-        var first = true;
+    const ToolsJson = struct { client: []const u8, provider: []const u8 };
+
+    /// The definitions the gateway's shadow may call, in the client's own
+    /// schema dialect: the client tools the pinned allowlist admits plus
+    /// `AskUserQuestion` (§3.4 `tools`), and the provider-side server tools
+    /// the fork's own request would carry (§3.4 `provider_tools`). The list
+    /// is exactly what the loop handed this provider — deferred tools
+    /// included, flagged `"deferred":true` so the shadow's loop treats them
+    /// as this loop would — because the shadow's request must be the fork's.
+    fn toolsJson(self: *const SealedSkillProvider, arena: std.mem.Allocator, tools: []const json_mod.ToolDefinition) !ToolsJson {
+        var client: std.ArrayList(u8) = .empty;
+        var provider_tools: std.ArrayList(u8) = .empty;
+        try client.append(arena, '[');
+        try provider_tools.append(arena, '[');
+        var client_first = true;
+        var provider_first = true;
         for (tools) |tool| {
-            if (tool.server_type != null or tool.deferred) continue;
+            if (tool.server_type != null) {
+                if (!provider_first) try provider_tools.append(arena, ',');
+                provider_first = false;
+                try api_request.serializeOneTool(tool, &provider_tools, arena);
+                continue;
+            }
             if (!self.toolAllowed(tool.name)) continue;
-            if (!first) try buf.append(arena, ',');
-            first = false;
-            try api_request.serializeOneTool(tool, &buf, arena);
+            if (!client_first) try client.append(arena, ',');
+            client_first = false;
+            try api_request.serializeOneTool(tool, &client, arena);
+            if (tool.deferred) {
+                // Inside the object just written: replace its closing brace.
+                client.items[client.items.len - 1] = ',';
+                try client.appendSlice(arena, "\"deferred\":true}");
+            }
         }
-        try buf.append(arena, ']');
-        return buf.items;
+        try client.append(arena, ']');
+        try provider_tools.append(arena, ']');
+        return .{ .client = client.items, .provider = provider_tools.items };
     }
 
     /// Name-level admission against the pinned manifest: a `deny` rule that
     /// names the whole tool wins, then any `allow` rule for the tool admits
     /// it (argument patterns are the policy frame's job at dispatch time).
+    /// `AskUserQuestion` is always admitted: it never dispatches through the
+    /// frame, it is the user answering their own Skill.
     pub fn toolAllowed(self: *const SealedSkillProvider, tool_name: []const u8) bool {
+        if (std.mem.eql(u8, tool_name, ASK_USER_TOOL)) return true;
         const m = self.manifest();
         for (m.tools_deny) |raw| if (ruleNamesWholeTool(raw, tool_name)) return false;
         for (m.tools_allow) |raw| if (ruleCoversTool(raw, tool_name)) return true;
         return false;
     }
 };
+
+/// The route's authentication as the `provider.auth` object (§3.4); "" for
+/// the kind's default header.
+fn authJson(arena: std.mem.Allocator, scheme: ?@import("../../api/auth_header.zig").AuthScheme) ![]const u8 {
+    const selected = scheme orelse return "";
+    var out: std.Io.Writer.Allocating = .init(arena);
+    const w = &out.writer;
+    switch (selected) {
+        .bearer => try w.writeAll("{\"scheme\":\"bearer\"}"),
+        .api_key_header => |name| {
+            try w.writeAll("{\"scheme\":\"api_key_header\",\"header\":");
+            try protocol.writeString(w, name);
+            try w.writeByte('}');
+        },
+        .custom_header => |custom| {
+            try w.writeAll("{\"scheme\":\"custom_header\",\"header\":");
+            try protocol.writeString(w, custom.name);
+            try w.writeAll(",\"value_prefix\":");
+            try protocol.writeString(w, custom.value_prefix);
+            try w.writeByte('}');
+        },
+        .signed_adapter => return error.SealedProviderRouteUnavailable,
+    }
+    return out.written();
+}
 
 /// `Tool`, `Tool(pattern)`, or `prefix*` (MCP wildcard) covers `tool_name`.
 fn ruleCoversTool(raw: []const u8, tool_name: []const u8) bool {
@@ -874,7 +1025,7 @@ fn isPermissionDenied(content: []const u8) bool {
     return std.mem.indexOf(u8, content, "\"code\":\"permission_denied\"") != null;
 }
 
-/// Options for an `input_required` dialog from an elicitation schema whose
+/// Options for a bare `input_required` dialog from an elicitation schema whose
 /// single property is an enum (`{"type":"object","properties":{"x":{"enum":
 /// ["a","b"]}}}`); anything else yields no options, and the dialog's own
 /// free-text entry takes the answer.
@@ -1065,7 +1216,17 @@ test "input_required options come from a single enum property only" {
     try std.testing.expectEqual(@as(usize, 0), (try enumOptions(arena.allocator(), "not json")).len);
 }
 
-test "stream replays text, calls, usage, then done" {
+test "the provider route's authentication travels as the auth object" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    try std.testing.expectEqualStrings("", try authJson(arena.allocator(), null));
+    try std.testing.expectEqualStrings("{\"scheme\":\"bearer\"}", try authJson(arena.allocator(), .bearer));
+    try std.testing.expectEqualStrings("{\"scheme\":\"api_key_header\",\"header\":\"x-api-key\"}", try authJson(arena.allocator(), .{ .api_key_header = "x-api-key" }));
+    try std.testing.expectError(error.SealedProviderRouteUnavailable, authJson(arena.allocator(), .{ .signed_adapter = "aws" }));
+}
+
+test "stream replays calls, usage, then done" {
     const a = std.testing.allocator;
     const stream = try StreamResponse.create(a, .tool_use);
     try stream.pushText("hi");

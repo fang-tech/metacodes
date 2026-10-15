@@ -630,6 +630,7 @@ pub fn handleSlash(
             &tool_context,
             record,
             activation,
+            values,
         ) catch |err| {
             std.debug.print(
                 "\x1b[31m/{s}: fork execution failed: {s}\x1b[0m\n",
@@ -773,7 +774,7 @@ fn executeModelTool(
         return error.SkillNotFound;
 
     if (record.definition.context == .fork) {
-        const fork = try executeFork(self, ctx, record, activation);
+        const fork = try executeFork(self, ctx, record, activation, invocation.values);
         defer ctx.allocator.free(fork.text);
         try self.finishActivation(ctx.agent_ident, activation);
         activation_live = false;
@@ -839,11 +840,13 @@ fn executeFork(
     ctx: *const ToolContext,
     record: *const runtime.catalog.SkillRecord,
     activation: *const runtime.activation.Activation,
+    values: []const []const u8,
 ) !ForkOutput {
     // A sealed Skill (doc/SEALED_SKILL_PROTOCOL.md §9) runs the same child
-    // loop with the gateway as its model; it needs no local model client.
+    // loop with the gateway as its model; the gateway's shadow of this fork
+    // calls the model over this client's own provider route.
     const sealed: ?*sealed_provider.SealedSkillProvider = if (record.definition.isSealed())
-        try openSealedProvider(self, ctx, record, activation)
+        try openSealedProvider(self, ctx, record, activation, values)
     else
         null;
     defer if (sealed) |remote| remote.destroy();
@@ -946,6 +949,9 @@ fn executeFork(
         task,
         .{
             .system_prompt = system_prompt,
+            // A sealed fork's iteration belongs to the gateway's loop; this
+            // loop is its executor and sets no shorter turn cap of its own.
+            .max_turns = if (sealed) |remote| remote.maxTurns() else 20,
             .agent_depth = ctx.agent_depth + 1,
             .state_root = ctx.state_root,
             .dyn_registry = ctx.dyn_registry,
@@ -986,13 +992,22 @@ fn executeFork(
 /// re-read and re-verified from the live directory, it must match the binding
 /// the catalog parsed, and the bearer token comes from the pin's environment
 /// variable. The cost cap is `METACODES_SEALED_MAX_COST_MICROS` (default
-/// USD 0.50 in micro-units).
+/// USD 0.50 in micro-units). The model is this session's own provider,
+/// whose route and credential the gateway's shadow uses (§8.1); a provider
+/// that cannot be delegated cannot run sealed Skills.
 fn openSealedProvider(
     self: *Runtime,
     ctx: *const ToolContext,
     record: *const runtime.catalog.SkillRecord,
     activation: *const runtime.activation.Activation,
+    values: []const []const u8,
 ) !*sealed_provider.SealedSkillProvider {
+    const own_provider: ?@import("../api/provider.zig").Provider = ctx.provider orelse
+        if (ctx.api_client) |client| client.provider() else null;
+    const route = (if (own_provider) |prov| prov.route() else null) orelse {
+        std.debug.print("\x1b[31m/{s}: a sealed Skill runs on this session's own model account, and the current provider cannot be delegated to a gateway\x1b[0m\n", .{record.invocation_name});
+        return error.SealedProviderRouteUnavailable;
+    };
     var pin = sealed_pin.read(ctx.allocator, activation.tree.path()) catch |err| {
         std.debug.print("\x1b[31m/{s}: sealed pin unreadable ({s})\x1b[0m\n", .{ record.invocation_name, @errorName(err) });
         return error.SealedPinInvalid;
@@ -1029,6 +1044,10 @@ fn openSealedProvider(
         // Skill tool, else the per-session one the permission context carries.
         .ui = ctx.ui_requester orelse if (ctx.permission_ctx) |permission| permission.ui_requester else null,
         .session = ctx.session,
+        .origin = own_provider.?,
+        .route = route,
+        .base_dir = activation.tree.path(),
+        .arguments = values,
     });
 }
 

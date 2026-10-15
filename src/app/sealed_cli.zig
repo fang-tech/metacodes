@@ -8,9 +8,9 @@
 //!   declared credential reference to a local secret (§6.4), read from stdin
 //!   or an environment variable, never from the command line;
 //! - `ledger` prints the sealed usage ledger (§6.6);
-//! - `serve --skills <dir> [--listen PORT] [--token T] [--provider KIND]
-//!   [--model M] [--base-url U] [--api-key-env NAME]` runs the reference
-//!   gateway on loopback with the server's own provider credentials.
+//! - `serve --skills <dir> [--listen PORT] [--token T]` runs the reference
+//!   gateway on loopback; it has no provider credentials of its own and calls
+//!   the model over each client's route (§8.1).
 
 const std = @import("std");
 const pfs = @import("platform").fs;
@@ -22,8 +22,6 @@ const pin_mod = @import("../skills/sealed/pin.zig");
 const ledger = @import("../skills/sealed/ledger.zig");
 const credentials = @import("../skills/sealed/credentials.zig");
 const gateway_mod = @import("../skills/sealed/gateway.zig");
-const provider_factory = @import("../api/provider_factory.zig");
-const types = @import("../types.zig");
 
 const USAGE =
     \\usage: metacodes sealed install <gateway-url> <skill_id> [--token-env NAME] [--yes]
@@ -32,8 +30,6 @@ const USAGE =
     \\       metacodes sealed unbind <name> <ref>
     \\       metacodes sealed ledger
     \\       metacodes sealed serve --skills <dir> [--listen PORT] [--token T]
-    \\                              [--provider anthropic|openai|gemini] [--model M]
-    \\                              [--base-url U] [--api-key-env NAME]
     \\
 ;
 
@@ -130,8 +126,34 @@ fn install(args: *std.process.Args.Iterator, allocator: std.mem.Allocator, io: s
         std.debug.print("error: could not write the pin ({s})\n", .{@errorName(err)});
         return 1;
     };
-    std.debug.print("Installed /{s} (sealed, {s}). Run it with /{s} <arguments>.\n", .{ entry.manifest.name, entry.manifest_digest, entry.manifest.name });
+    // Public assets (scripts, data) are installed where the Skill's brain
+    // believes they are; sealed files never come down.
+    for (entry.assets) |asset| {
+        installAsset(allocator, &client, state_root, entry, asset) catch |err| {
+            std.debug.print("error: asset {s} could not be installed ({s}); the pin is incomplete\n", .{ asset.path, @errorName(err) });
+            return 1;
+        };
+    }
+    std.debug.print("Installed /{s} (sealed, {s}, {d} public asset(s)). Run it with /{s} <arguments>.\n", .{ entry.manifest.name, entry.manifest_digest, entry.assets.len, entry.manifest.name });
     return 0;
+}
+
+/// Fetch one asset (`skills.asset`), verify its digest against the Entry
+/// and write it under the pin directory.
+pub fn installAsset(allocator: std.mem.Allocator, client: *transport.Client, state_root: []const u8, entry: *const protocol.Entry, asset: protocol.Asset) !void {
+    var params: std.Io.Writer.Allocating = .init(allocator);
+    defer params.deinit();
+    try protocol.writeSkillsAssetParams(&params.writer, entry.skill_id, asset.path);
+    var response = try client.call(.skills_asset, params.written(), null);
+    defer response.deinit();
+    const result = switch (response.response) {
+        .result => |result| result,
+        .err => return error.AssetRefused,
+    };
+    var parsed = try protocol.parseAsset(allocator, result);
+    defer parsed.deinit();
+    if (!std.mem.eql(u8, parsed.path, asset.path) or !std.mem.eql(u8, parsed.sha256, asset.sha256)) return error.AssetMismatch;
+    try pin_mod.writeAsset(allocator, state_root, entry.manifest.name, asset.path, parsed.content);
 }
 
 /// What the user consents to when pinning (§6.1): identity, allowlist,
@@ -331,10 +353,6 @@ fn serve(args: *std.process.Args.Iterator, allocator: std.mem.Allocator) u8 {
     var skills_dir: ?[]const u8 = null;
     var port: u16 = 8787;
     var token: []const u8 = "";
-    var kind: types.ProviderKind = .anthropic;
-    var model: []const u8 = "claude-sonnet-4-5";
-    var base_url: ?[]const u8 = null;
-    var api_key_env: ?[]const u8 = null;
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--skills")) {
             skills_dir = args.next() orelse return usageError("--skills needs a directory");
@@ -343,36 +361,15 @@ fn serve(args: *std.process.Args.Iterator, allocator: std.mem.Allocator) u8 {
             port = std.fmt.parseInt(u16, raw, 10) catch return usageError("--listen takes a loopback port number");
         } else if (std.mem.eql(u8, arg, "--token")) {
             token = args.next() orelse return usageError("--token needs a value");
-        } else if (std.mem.eql(u8, arg, "--provider")) {
-            const raw = args.next() orelse return usageError("--provider needs a kind");
-            kind = std.meta.stringToEnum(types.ProviderKind, raw) orelse return usageError("--provider is anthropic, openai or gemini");
-        } else if (std.mem.eql(u8, arg, "--model")) {
-            model = args.next() orelse return usageError("--model needs a name");
-        } else if (std.mem.eql(u8, arg, "--base-url")) {
-            base_url = args.next() orelse return usageError("--base-url needs a URL");
-        } else if (std.mem.eql(u8, arg, "--api-key-env")) {
-            api_key_env = args.next() orelse return usageError("--api-key-env needs a name");
         } else {
             std.debug.print("error: unknown serve argument '{s}'\n", .{arg});
             return 2;
         }
     }
     const dir = skills_dir orelse return usageError("--skills <dir> is required");
-    const key_env = api_key_env orelse switch (kind) {
-        .anthropic => "ANTHROPIC_API_KEY",
-        .openai => "OPENAI_API_KEY",
-        .gemini => "GEMINI_API_KEY",
-    };
-    const api_key = envValue(allocator, key_env) orelse {
-        std.debug.print("error: the gateway's provider key must be in ${s} (it is the operator's key, never a client's)\n", .{key_env});
-        return 1;
-    };
-    var owned = provider_factory.makeProvider(allocator, kind, api_key, model, base_url) catch |err| {
-        std.debug.print("error: provider setup failed ({s})\n", .{@errorName(err)});
-        return 1;
-    };
-    defer owned.deinit();
-    const gateway = gateway_mod.Gateway.init(allocator, owned.provider(), dir, .{ .token = token }) catch |err| {
+    // The gateway has no model provider of its own: every run calls the
+    // model over the client's route and credential (§8.1).
+    const gateway = gateway_mod.Gateway.init(allocator, dir, .{ .token = token }) catch |err| {
         std.debug.print("error: could not load Skill packages from {s} ({s})\n", .{ dir, @errorName(err) });
         return 1;
     };
@@ -383,8 +380,8 @@ fn serve(args: *std.process.Args.Iterator, allocator: std.mem.Allocator) u8 {
     };
     defer server.stop();
     std.debug.print("sealed gateway: {d} Skill package(s) from {s}\n", .{ gateway.packages.len, dir });
-    for (gateway.packages) |package| std.debug.print("  {s}  {s}  {s}\n", .{ package.entry.skill_id, package.name, package.entry.manifest_digest });
-    std.debug.print("listening on http://127.0.0.1:{d}/ssp (provider {s}, model {s}{s})\n", .{ server.port, @tagName(kind), model, if (token.len == 0) ", no token: open to every local caller" else "" });
+    for (gateway.packages) |package| std.debug.print("  {s}  {s}  {s}  ({d} public asset(s), {d} sealed file(s))\n", .{ package.entry.skill_id, package.name, package.entry.manifest_digest, package.assets.len, package.sealed_files.len });
+    std.debug.print("listening on http://127.0.0.1:{d}/ssp (model calls use each client's own provider{s})\n", .{ server.port, if (token.len == 0) "; no token: open to every local caller" else "" });
     while (true) util_time.sleepMs(1000);
 }
 

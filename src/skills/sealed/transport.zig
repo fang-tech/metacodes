@@ -40,6 +40,10 @@ pub const Client = struct {
     uri: std.Uri,
     /// `Authorization: Bearer <token>`; empty = no header (tests, public listing).
     token: []u8,
+    /// §8.1: the client's provider credential, sent as
+    /// `Sealed-Provider-Credential` on every request while non-empty. Borrowed
+    /// from the provider it belongs to; the caller sets it for the call.
+    provider_credential: []const u8 = "",
     registry: provider.RequestAbortRegistry = .{},
     next_id: u64 = 1,
     idle_limit_ms: u64 = DEFAULT_IDLE_LIMIT_MS,
@@ -103,7 +107,7 @@ pub const Client = struct {
     fn post(self: *Client, json: []const u8, abort: ?*const AbortSignal) Error!Raw {
         if (abort) |signal| if (signal.isAborted()) return error.Aborted;
         var auth_buf: [4096]u8 = undefined;
-        var extra: [3]std.http.Header = undefined;
+        var extra: [4]std.http.Header = undefined;
         var extra_len: usize = 0;
         extra[extra_len] = .{ .name = "Accept", .value = "application/json, text/event-stream" };
         extra_len += 1;
@@ -112,6 +116,10 @@ pub const Client = struct {
         if (self.token.len != 0) {
             const value = std.fmt.bufPrint(&auth_buf, "Bearer {s}", .{self.token}) catch return error.OutOfMemory;
             extra[extra_len] = .{ .name = "Authorization", .value = value };
+            extra_len += 1;
+        }
+        if (self.provider_credential.len != 0) {
+            extra[extra_len] = .{ .name = protocol.PROVIDER_CREDENTIAL_HEADER, .value = self.provider_credential };
             extra_len += 1;
         }
         var request = self.http.request(.POST, self.uri, .{

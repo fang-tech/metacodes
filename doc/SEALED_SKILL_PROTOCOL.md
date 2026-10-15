@@ -25,9 +25,11 @@ the service. The split is:
 - **the hands stay on the client**: every tool call the Skill needs is sent
   to the client as a request, executed there under the client's own
   permission system, sandbox and credentials, and only the result goes back;
-- **the client pays**: every model call the gateway makes on the client's
-  behalf is metered and charged to the client's account, step by step, under
-  a cap the client set before the run started.
+- **the client's own model does the thinking**: the gateway runs the Skill's
+  loop as a *shadow* of the client's fork, calling the model over the
+  client's own provider route and credential, so the model, the account and
+  the bill are the client's; the gateway meters the run for the client's cap
+  and ledger and charges only the Skill's own fee.
 
 It is the hosted-agent / client-executed-tools pattern (computer use agents,
 managed agents with client tools) applied in reverse to the Skill: the
@@ -57,7 +59,7 @@ creator chose to trust.
 | Role | Holds | Trusts |
 |---|---|---|
 | **Creator** | the Skill: `SKILL.md`, workflow, assets, manifest | the gateway operator (contractually; §8.6 for the attested variant) |
-| **Gateway** | Skill content, the brain (model or workflow engine), metering, sealing keys | nobody: every client message is untrusted input |
+| **Gateway** | Skill content, the brain (the client's loop run as a shadow, or a workflow engine), the sealing key | nobody: every client message is untrusted input; it holds no model credentials of its own |
 | **Client** | the user's tools, permissions, sandbox, credentials, budget, audit log | nobody: every gateway message is untrusted model output |
 | **Subscriber** | an account on the gateway | the gateway for billing, the client for everything that touches their machine |
 
@@ -80,8 +82,12 @@ MUST still populate the identity fields (§4.2) distinctly.
   error `unsupported_version`.
 - Authentication is a bearer token for the subscriber's gateway account in
   `Authorization`. How the token is obtained (OAuth, API key) is outside this
-  protocol. A gateway MUST NOT accept model-provider credentials from the
-  client; the client's own provider keys never cross this interface (§8.1).
+  protocol.
+- The client's **provider credential** for the request travels in the
+  `Sealed-Provider-Credential` header of `runs.start` and `runs.continue`
+  (§8.1): the gateway makes the Step's model calls with it and forgets it
+  with the request. It is a header, never a parameter: it is not digested,
+  not echoed and not logged.
 - The gateway SHOULD be **stateless per run**: run state travels in the
   opaque `run_state` blob (§4.4) that the client returns unchanged with every
   message. A gateway MAY keep state server-side instead; the client cannot
@@ -119,6 +125,7 @@ Params: `{}`. Result:
     "run_state": "opaque",
     "step_signature": true,
     "input_required": true,
+    "client_provider": true,
     "prefetch": false,
     "client_sealed": false,
     "currencies": ["USD"]
@@ -127,7 +134,9 @@ Params: `{}`. Result:
 ```
 
 `capabilities.run_state` is `"opaque"` or `"server"`. `step_signature` says
-every Step carries `sig` (§8.4). `prefetch` and `client_sealed` are §7
+every Step carries `sig` (§8.4). `client_provider` says the gateway calls
+the model over the client's route (§8.1); a client MUST NOT start a run on
+a gateway that does not advertise it. `prefetch` and `client_sealed` are §7
 features and are `false` in revision 2026-10-15.
 
 ### 3.2 `sealed/skills.list`
@@ -142,13 +151,25 @@ Params: `{"cursor": "<opaque>"?}`. Result: `{"skills": [Entry...],
   "manifest": { … §5 … },
   "manifest_digest": "sha256:…",
   "manifest_sig": "<base64 Ed25519 over the canonical manifest>"?,
-  "subscription": {"state": "active" | "available" | "expired"}
+  "subscription": {"state": "active" | "available" | "expired"},
+  "assets": [{"path": "scripts/post.py", "sha256": "sha256:…", "bytes": 1832}]
 }
 ```
 
 `manifest_digest` is SHA-256 over the canonical JSON (§4.5) of `manifest`.
 The client stores Entries it installs as **pins**; a pin is the user's
-consent to exactly that manifest (§6.1).
+consent to exactly that manifest (§6.1). `assets` lists the package's
+**public files** (§12): the client installs them under the pin directory
+with `sealed/skills.asset`, so the Skill's scripts and data exist where its
+brain believes they are. The Skill body and the `sealed/` directory are
+never listed and never served.
+
+### 3.3a `sealed/skills.asset`
+
+Params: `{"skill_id", "path"}` with a `path` from the Entry's `assets`.
+Result: `{"path", "sha256", "content_base64"}`. The client MUST verify the
+digest against the Entry before writing the file, and MUST refuse a path
+that is not a plain relative path inside the pin directory.
 
 ### 3.3 `sealed/skills.get`
 
@@ -168,7 +189,15 @@ id is unknown or not visible to this subscriber.
   "client": {"name": "metacodes", "version": "0.6.0", "platform": "windows-x86_64",
              "run_ref": "<client-side run id, for audit joins>"},
   "locale": "zh-CN"?,
-  "confirmation": "client" | "always"
+  "confirmation": "client" | "always",
+  "system": "<the fork's system prompt, exactly as the client's own fork would send it>",
+  "base_dir": "<the pin directory: the Skill's base directory as the brain is told it>",
+  "provider": {"kind": "anthropic" | "openai" | "gemini", "base_url": "https://…",
+               "openai_protocol": "chat_completions" | "responses"?,
+               "auth": {"scheme": "bearer" | "api_key_header" | "custom_header",
+                        "header": "x-api-key"?, "value_prefix": ""?}?},
+  "provider_tools": [<provider-side server tool blocks the fork's request would carry>],
+  "request": {"model": "claude-sonnet-4-5", "max_tokens": 8192, "reasoning_effort": "high"?}
 }
 ```
 
@@ -186,6 +215,19 @@ id is unknown or not visible to this subscriber.
   `max_steps` bounds the number of Steps.
 - `confirmation: "always"` asks the gateway to mark every call `confirm:
   true`; `"client"` (default) leaves it to the manifest and the gateway.
+- `system`, `tools`, `provider_tools`, `request` and the credential header
+  together are the **mirror** (§9.1): everything the client's own fork would
+  have put in its model request. A gateway whose brain is a model loop MUST
+  make the request from these and from nothing of its own, so that the
+  request the model sees is the one the client's fork would have sent, with
+  the Skill body in the first user turn. `arguments` are rendered into the
+  body on the gateway exactly as the client renders a local Skill's.
+- `base_dir` is where the client installed the Skill's public assets (§3.2);
+  the brain is told it as the Skill's base directory, and a `Read` under
+  `<base_dir>/sealed/` is served by the gateway from the package (§12).
+- `provider` is the client's route without its credential; `auth` absent
+  means the kind's default header. A `signed_adapter` scheme cannot be
+  carried and such a client cannot run sealed Skills.
 
 Result: a Step (§4.3).
 
@@ -272,16 +314,18 @@ client MUST record them with the run (§8.3).
 
 | kind | meaning | fields |
 |---|---|---|
-| `tool_calls` | execute `calls`, answer with `runs.continue` | `calls` (1..n) |
+| `tool_calls` | execute `calls`, answer with `runs.continue` | `calls` (1..n); no `text`: the brain's narration between calls is its own reasoning and stays on the gateway |
 | `final` | the run is complete | `text` (the Skill's result for the user), `charge` (§4.6) |
-| `input_required` | the Skill needs something only the user can give | `question`: `{"message", "schema"?}` (MCP elicitation form shape); answered through `runs.continue` with one result whose `tool_use_id` is the Step's `question.id` |
+| `input_required` | the Skill needs something only the user can give | `question`: `{"id", "message", "schema"?, "tool_input"?}`; `tool_input` is the brain's `AskUserQuestion` call as the client's own tool takes it, which the client runs verbatim, `message`/`schema` (MCP elicitation form shape) are for a client or gateway without that tool; answered through `runs.continue` with one result whose `tool_use_id` is the Step's `question.id` |
 | `failed` | the run ended without a result | `reason`: `"budget_exceeded" \| "max_steps" \| "cancelled" \| "skill_error" \| "policy_violation" \| "upstream_unavailable"`, `message`, `charge` |
 
 A `usage` block is present on every Step and describes the gateway's work
-*since the previous Step* (zero for a pure workflow-engine step).
-`cumulative` is the running total. `cost_micros` is **authoritative**: the
-client's own token-price tables are an estimate for display; the gateway's
-number is what the subscriber is charged (§8.2).
+*since the previous Step* — every model call the shadow made for it,
+including the ones that served sealed reads or compacted its context (zero
+for a pure workflow-engine step). `cumulative` is the running total.
+`cost_micros` is the gateway's estimate of what those calls cost on the
+client's own provider account (§8.2); it is what the client's cap and
+ledger see.
 
 Call fields:
 
@@ -379,16 +423,21 @@ publish time, and pinned by the user at install time.
 
 A gateway MUST reject a manifest whose `tools.allow` is empty, whose
 `egress.classes` is empty while `tools.allow` names a tool that returns
-data, or whose `description` is empty.
+data, or whose `description` is empty. `tools.allow: ["*"]` is the whole
+tool set of the client's fork, as a local Skill without `allowed-tools` has.
+`AskUserQuestion` is always available to a sealed Skill whatever the
+allowlist says: it never executes anything, it asks the person running the
+Skill (§4.3 `input_required`).
 
 ## 6. Client obligations
 
 ### 6.1 Pinning and consent
 
 Installing a Skill means storing its Entry (manifest + digest + signature)
-as a pin after showing the user, at minimum: name, description, creator,
-the tool allowlist, the egress classes, the credentials it will ask for and
-the price estimate. A run MUST send the pinned digest. A `manifest_changed`
+as a pin, and its public assets (§3.2) under the pin directory, after
+showing the user, at minimum: name, description, creator, the tool
+allowlist, the egress classes, the credentials it will ask for and the price
+estimate. A run MUST send the pinned digest. A `manifest_changed`
 error MUST NOT be resolved silently: the client refreshes the Entry and
 repeats the consent step with a diff of the manifest.
 
@@ -461,20 +510,40 @@ so manifests and capability negotiation do not change shape.
 
 ## 8. Security and accountability
 
-### 8.1 Provider credentials never cross
+### 8.1 The model is the client's
 
-The gateway calls models with its own keys and charges the subscriber. A
-client MUST NOT send provider keys; a gateway MUST NOT ask for them. A user
-who only has their own provider keys and no gateway account cannot run
-sealed Skills; the client says so rather than proxying.
+The gateway holds **no model-provider credentials of its own**. Every model
+call of a run is made over the client's provider route (`provider` and
+`request` in `runs.start`) with the credential the client sends in the
+`Sealed-Provider-Credential` header of that request. The gateway MUST use
+the credential only for the model calls of the request that carried it,
+MUST NOT persist, log or echo it, and MUST refuse `runs.start` and
+`runs.continue` without it. The client sends the credential its own
+provider would have sent for the fork (its API key, or its current OAuth
+bearer; refresh stays on the client), so the model, the account, the prompt
+cache and the bill are the user's own, and the shadow's request is the
+fork's request.
+
+What this costs, stated plainly: for the duration of a Step the gateway can
+spend on the user's account, and the client's `max_cost_micros` does not
+bound that — only the credential's lifetime and the provider-side limits
+do. A short-lived token, or a dedicated key with a spend cap, is the right
+thing to hand a gateway. The client's provider endpoint MUST be reachable
+from the gateway (a model served from the user's own loopback is not), and
+a credential whose scheme cannot be carried in a header (`signed_adapter`)
+cannot be delegated; the client says so rather than running the Skill
+without it.
 
 ### 8.2 Metering
 
-`usage.cost_micros` is the gateway's authoritative charge, derived from the
-gateway's own upstream usage records. When the inference gateway and the
-billing identity are the same operator this is first-party data; a later
-revision defines reconciliation for a third-party skill host. The client
-may display its own estimate from tokens, labelled as such.
+`usage.cost_micros` is the gateway's estimate of what the Step's model
+calls cost on the client's own provider account, from the provider's
+reported tokens and the gateway's price table. It is informational — the
+provider's own bill is authoritative — but it is the number the client's
+cap (§6.5) and ledger (§6.6) use, so the gateway MUST report it for every
+Step. The Skill's own fee, when the operator charges one, is carried by
+`charge` (§4.6) and is what the subscriber owes the gateway; its terms are
+outside this protocol.
 
 ### 8.3 Tamper-evident log
 
@@ -526,42 +595,70 @@ metacodes. Both sides of the protocol live in `src/skills/sealed/`:
 `protocol.zig` (objects, digests, envelope), `transport.zig` (client HTTP),
 `pin.zig`, `credentials.zig`, `provider.zig` and `ledger.zig` (client),
 `gateway.zig` (server). `tests/component/sealed_skill_test.zig` runs a pinned
-Skill through a loopback gateway whose model is a mock SSE server, with a
-probe standing in for the session's UI, and asserts the Skill body reaches
-only the model, the tool result is produced locally, the ledger holds the
-charge, an allowlist violation is refused locally, the bearer token gates the
-gateway, a stale pin is refused before any model call, a `confirm: true`
-call is approved interactively in bypass mode (and a declined one reported as
-`permission_denied`), an `input_required` Step is answered through the UI
-channel and the run continues (or ends with the question when there is no
-channel), and a bound credential is substituted into the call and redacted
-from the result while an unbound one refuses the call.
+Skill through a loopback gateway whose model is a mock SSE server playing
+the client's own provider, with a probe standing in for the session's UI,
+and asserts: the Skill body reaches only the model; the gateway calls the
+model with the client's credential and model and refuses a request without
+the credential; **the shadow's model request is byte-identical to the local
+fork's** for the same Skill (base directory aside); the tool result is
+produced locally; the ledger holds the charge and never the credential; the
+gateway restarts between two Steps and the run continues from the carried
+state; an allowlist violation is refused locally; the bearer token gates the
+gateway; a stale pin is refused before any model call; narration between
+calls never reaches the client; a sealed reference file is read on the
+gateway without a Step while a public asset is installed and read on the
+client; a `confirm: true` call is approved interactively in bypass mode (and
+a declined one reported as `permission_denied`); the brain's
+`AskUserQuestion` is asked through the client's own dialog and the run
+continues (or ends with the question when there is no channel, and a call
+issued beside a question waits); and a bound credential is substituted into
+the call and redacted from the result while an unbound one refuses the
+call.
 
 ### 9.1 Client
 
 - **Catalog.** `metacodes sealed install <gateway> <skill_id>` fetches the
-  Entry, verifies the digest, prints the consent summary (§6.1) and writes
-  the pin under `<state root>/sealed-skills/<name>/`: `sealed.json` (the
-  Entry verbatim, gateway URL, token variable) and a projected `SKILL.md`
-  whose frontmatter carries the listing fields, the allowlist as
-  `allowed-tools` / `disallowed-tools`, `context: fork` and the three
-  binding keys `sealed-gateway`, `sealed-skill-id`,
-  `sealed-manifest-digest`, with a body of `$ARGUMENTS`. The pin root is a
-  personal-tier catalog source above every other personal source, so no
-  local file shadows a subscribed name. `metacodes sealed list` prints the
-  pins; a `sealed.json` that no longer verifies is listed as broken.
+  Entry, verifies the digest, prints the consent summary (§6.1), writes the
+  pin under `<state root>/sealed-skills/<name>/` — `sealed.json` (the Entry
+  verbatim, gateway URL, token variable) and a projected `SKILL.md` whose
+  frontmatter carries the listing fields, the allowlist as `allowed-tools`
+  / `disallowed-tools` (a lone `*` omits the key; `AskUserQuestion` is always
+  added), `context: fork` and the three binding keys `sealed-gateway`,
+  `sealed-skill-id`, `sealed-manifest-digest`, with a body of `$ARGUMENTS` —
+  and installs every public asset of the Entry under the same directory
+  after verifying its digest. The pin root is a personal-tier catalog source
+  above every other personal source, so no local file shadows a subscribed
+  name. `metacodes sealed list` prints the pins and the binding state of
+  their credential references; a `sealed.json` that no longer verifies is
+  listed as broken.
 - **Activation.** `/name` and the `Skill` tool prepare the same activation
   plan as a local forked Skill. Execution re-reads and re-verifies the pin,
   checks it against the catalog's binding, and spawns the existing subagent
-  loop with a `SealedSkillProvider` in place of the model provider: its
-  `sendStream` sends `runs.start` on the first call (prompt = the rendered
-  arguments, tools = the loop's definitions filtered by the allowlist) and
-  `runs.continue` with the new `tool_result` blocks afterwards, replaying
-  each Step as neutral stream events (`text`, `tool_use_start` per call,
-  `usage`, `done` with stop reason `tool_use` or `end_turn`). The loop
-  executes the calls through the ordinary dispatch, so permission, sandbox,
-  artifact storage and observation sinks are unchanged. No local model
-  client is needed to run a sealed Skill.
+  loop with a `SealedSkillProvider` in place of the model provider. Its
+  first `sendStream` sends `runs.start` with the fork's system prompt, the
+  tool definitions the loop handed it (allowlist-filtered, deferred tools
+  flagged, provider-side server tools as `provider_tools`), the model, the
+  output cap and reasoning effort of the session's own provider, that
+  provider's route and, in the header, its credential; `runs.continue`
+  follows with the new `tool_result` blocks. Each Step is replayed as
+  neutral stream events (`tool_use_start` per call, `usage`, `done`), so
+  dispatch, permission, sandbox, artifact storage and observation sinks are
+  unchanged. A session whose provider has no delegable route cannot run
+  sealed Skills and says so (§8.1).
+- **Mirror.** The provider answers the loop's questions about the model —
+  capabilities, output cap, reasoning effort — with the session's own
+  provider's answers, so the loop advertises to the gateway exactly what it
+  would have advertised to the model. The one deliberate deviation is the
+  context window it reports: effectively unbounded, so the client's copy of
+  the fork conversation never compacts — the brain's conversation lives on
+  the gateway, which compacts it; the client's is a mirror for pairing
+  results.
+- **Executor mode.** The brain's iteration belongs to the gateway's loop;
+  the client's fork loop is its executor. Its turn cap is the protocol's
+  `max_steps`, not the subagent default; it never summarizes (the provider
+  refuses compaction requests); the brain's text between calls is not
+  replayed into it; the user's own stops — the cost cap, abort, policy
+  violations, permission — apply as ever.
 - **Chain and sequence.** Every Step's `digest` is recomputed and its
   `prev_digest` / `seq` checked against the previous Step before anything
   is recorded; a mismatch ends the run with `SealedChainBroken`.
@@ -574,10 +671,11 @@ from the result while an unbound one refuses the call.
   `500000`, USD 0.50). It is sent as `budget.max_cost_micros`, enforced by
   the provider on the gateway's `cumulative` (cancel with `reason:
   budget`), and passed to the child loop as `cost_budget_usd` for its own
-  estimate-based stop.
+  estimate-based stop. It bounds what the gateway charges; it cannot bound
+  what the gateway spends on the client's account (§8.1).
 - **Ledger.** A `step` record per Step and a `charge` record per receipt
   go to `<state root>/ledger/sealed.ndjson`; `metacodes sealed ledger`
-  prints it.
+  prints it. The provider credential is never written there.
 - **Confirmation.** A call marked `confirm: true` is approved
   interactively whatever the permission mode (§6.2). The provider does not
   decide permissions: it answers the child permission context's *confirm
@@ -603,78 +701,98 @@ from the result while an unbound one refuses the call.
   and the same hint is prepended to the fork's result for the user. A result
   that is JSON-escaped or otherwise transformed differently from the secret
   is not recognized; redaction is byte-exact.
-- **Input.** An `input_required` Step is put to the user as one
-  `ask_question` dialog over the session's UI requester (the tool context's
-  at the top level, else the permission context's), with the options of a
+- **Input.** An `input_required` Step that carries `tool_input` is answered
+  by running the client's own `AskUserQuestion` tool on it, with the
+  session's UI requester (the tool context's at the top level, else the
+  permission context's), so the brain gets the result shape it asked for;
+  one that carries only a message gets one dialog with the options of a
   single-property `enum` in the elicitation schema and the dialog's
-  free-text entry otherwise; the answer is sent as the Step's one result
+  free-text entry otherwise. The answer is sent as the Step's one result
   (`tool_use_id` = `question.id`) in `runs.continue` and the run goes on. A
-  dismissed dialog sends `is_error` with `refusal: aborted`. Without a
-  channel (headless, or an asynchronous front end that can only stash the
-  question) the run is cancelled and the question becomes the fork's text.
+  dismissed dialog sends `is_error` with `refusal: aborted`; a tool error
+  (a malformed question) is sent as the tool's error. Without a channel
+  (headless, or an asynchronous front end that can only stash the question)
+  the run is cancelled and the question becomes the fork's text.
 - **Token.** The bearer token is read from the environment variable named
   by the pin (`--token-env`, default `METACODES_SEALED_TOKEN`).
 - **Transport.** One `std.http.Client` POST per request with
-  `Sealed-Skill-Version: 1`; JSON and SSE answers are both accepted;
-  in-flight requests sit in the shared abort registry with a two-minute
-  liveness limit, so Ctrl+C and a dead socket both end the call.
+  `Sealed-Skill-Version: 1` and, while a run is open, the provider
+  credential header; JSON and SSE answers are both accepted; in-flight
+  requests sit in the shared abort registry with a two-minute liveness
+  limit, so Ctrl+C and a dead socket both end the call.
 - **Not in revision 2026-10-15 of the client:** suspending a fork on an
   `input_required` Step for an asynchronous front end (the run is cancelled
   instead, see *Input*); `confirmation: "always"` as a client setting (the
   manifest and the gateway decide which calls carry `confirm`); a run-level
-  budget prompt (the cap is the environment variable).
+  budget prompt (the cap is the environment variable); nested sealed brains
+  (a `Task` the brain issues is a client tool and runs a local subagent, as
+  a local fork's would).
 
 ### 9.2 Gateway
 
-`metacodes sealed serve --skills <dir> [--listen PORT] [--token T]
-[--provider KIND] [--model M] [--base-url U] [--api-key-env NAME]` is the
+`metacodes sealed serve --skills <dir> [--listen PORT] [--token T]` is the
 reference gateway. A package is `<dir>/<name>/SKILL.md` plus
-`manifest.json` (§5, creator fields only); the manifest is canonicalized and
-digested at load, and the body becomes the model's system prompt and never
-leaves the process. The server listens on loopback only and answers requests
-in order; TLS, fan-out and non-loopback exposure are a reverse proxy's job.
+`manifest.json` (§5, creator fields only), an optional `sealed/` directory
+and any other files as public assets (§12); the manifest is canonicalized
+and digested at load, the assets are listed in the Entry with their
+digests, and the body and the sealed files never leave the process. The
+server listens on loopback only and answers requests in order; TLS,
+fan-out and non-loopback exposure are a reverse proxy's job.
 
-- **Provider.** The gateway calls the model with the operator's own
-  credentials (`--api-key-env`, default `ANTHROPIC_API_KEY` /
-  `OPENAI_API_KEY` / `GEMINI_API_KEY` by kind) through the same provider
-  factory the CLI uses; a client's key is never accepted (§8.1).
-- **Stateless runs.** The whole run — conversation, pending calls, totals,
-  caps — is sealed into `run_state` with XChaCha20-Poly1305 under a process
-  key, with the run id as associated data; `runs.continue` and
-  `runs.cancel` fail with `run_state_invalid` on a tampered, replayed or
-  foreign blob, or a `seq` that does not match. Nothing is stored
-  server-side, which is what `retention: "run"` means here.
-- **Steps.** Each model call is one Step: `tool_calls` while the model
-  calls tools (with `confirm` from the manifest or `confirmation: always`,
-  `credentials` from the manifest-declared placeholders the input names,
-  and `result_limit_bytes` from the manifest), `input_required` when the
-  model calls the gateway's own `AskUser` tool, `final` on `end_turn`,
-  `failed` on a budget cap, the step limit, three client policy refusals,
-  a cancel, or a model stop the Skill cannot continue from. The digest is
-  computed before the state is sealed with it as chain head, then both are
-  attached.
-- **Input.** `AskUser` (`message`, optional elicitation `schema`) is
-  appended to the client's tool definitions on every model call, and the
-  system prompt tells the model when to use it. The first `AskUser` call of
-  a turn becomes an `input_required` Step whose `question.id` is that call's
-  id; its answer arrives as the Step's one result and enters the
-  conversation as the call's `tool_result`. Other calls the model issued in
-  the same turn are not sent (a Step is one kind): the gateway answers them
-  itself with an error result asking the model to call again. `discover`
-  reports `capabilities.input_required: true`.
-- **Credentials.** The system prompt lists the manifest's credential
-  references as `${SEALED_CRED:<ref>}` placeholders with their purpose; a
-  call whose input contains a declared placeholder carries that reference
-  in `credentials`, and only those (an undeclared name is left for the
-  client to refuse).
-- **Metering.** `usage.cost_micros` is derived from the provider's reported
-  tokens and the local price table; `cumulative` and `charge` carry the
-  running total. The gateway stops with `budget_exceeded` as soon as the
-  total passes the client's cap.
+- **No provider.** The gateway has no model credentials and no `--provider`
+  flags. For every `runs.start` and `runs.continue` it builds a provider
+  from the client's `provider` route and `request` model with the
+  credential in the request's header, through the same provider factory the
+  CLI uses, and releases it with the request (§8.1). A request without the
+  header is refused with `invalid params` naming the header.
+- **The shadow loop.** The brain is the client's own `agent_loop`, run on
+  the gateway with the client's system prompt, tool definitions (deferred
+  flags preserved, so `ToolSearch` stays or goes as it would on the client)
+  and provider tools, the body rendered with the user's arguments as the
+  first user turn behind `Base directory for this skill: <base_dir>`, a
+  bypass permission context (the client is the permission authority), no
+  hooks, no settings, no memory, no task store, nothing loaded from the
+  gateway's own environment. Its tool dispatcher executes nothing: every
+  tool use is marked pending, the loop suspends on the batch
+  (`Options.suspend_all_pending`), and the batch is the Step. The one thing
+  the dispatcher serves itself is a `Read` whose path lies under
+  `<base_dir>/sealed/`: the file comes from the package, rendered as the
+  client's Read tool would render it, and the loop goes on inside the same
+  Step. A later Step resumes the loop with the client's results and the
+  gateway's own as one user turn (`resumeRunWithResults`), so the API's
+  tool_use/tool_result pairing holds.
+- **Stateless runs.** The loop's continuation — the conversation in the
+  transcript's own message shape, the pending batch, the gateway's own
+  results, totals, caps, the client's route and request parameters — is
+  sealed into `run_state` with XChaCha20-Poly1305 under a process key, with
+  the run id as associated data; `runs.continue` and `runs.cancel` fail with
+  `run_state_invalid` on a tampered, replayed or foreign blob, or a `seq`
+  that does not match. Nothing is stored server-side, the body is re-read
+  from the package rather than carried, and any gateway instance with the
+  key serves any Step; the suite restarts the gateway between two Steps.
+- **Steps.** `tool_calls` for a suspended batch of remote tool uses (with
+  `confirm` from the manifest or `confirmation: always`, `credentials` from
+  the manifest-declared placeholders the input names, and
+  `result_limit_bytes` from the manifest; never `text`), `input_required`
+  when the batch holds an `AskUserQuestion` call (the first question is the
+  Step, carrying the call's input as `tool_input`; other calls of the same
+  batch are answered by the gateway with an error asking the brain to call
+  again), `final` with the last assistant message's text on `end_turn`,
+  `failed` on the cost cap, the step limit, the internal turn cap (model
+  turns without a tool call for the client), three client policy refusals,
+  a cancel, a provider failure or a loop stop the Skill cannot continue
+  from. The digest is computed before the state is sealed with it as chain
+  head, then both are attached.
+- **Metering.** `usage` is the loop's token usage since the previous Step
+  (every model call it made, sealed reads and compaction included), costed
+  with the local price table for the client's model (§8.2); `cumulative`
+  and `charge` carry the running total. The gateway stops with
+  `budget_exceeded` as soon as the total passes the client's cap.
 - **Not in revision 2026-10-15 of the gateway:** Step signatures
   (`step_signature: false`), subscriptions and per-account authorization
-  beyond the single bearer token, the publish-time protection rating, and
-  the disclosure screening of §8.5.
+  beyond the single bearer token, a Skill fee in `charge` (it carries the
+  model-cost estimate), the publish-time protection rating, and the
+  disclosure screening of §8.5.
 
 ## 10. Error codes
 
@@ -707,9 +825,16 @@ unknown `kind`: an unknown `kind` ends the run as `failed` with `reason:
 ## 12. Creator-side publishing (informative)
 
 A Skill package is `SKILL.md` (frontmatter and body as today), the manifest
-(§5, without the gateway-written fields), and optionally a workflow
-definition that lets the gateway drive the happy path without a model and
-reserve the model for exceptions, plus assets for the `server` class. The
+(§5, without the gateway-written fields), a `sealed/` directory of
+reference files only the gateway reads, and any other files, which are
+**public assets**: installed on the client under the pin directory (§3.2)
+and executed or read there like a local Skill's. What is sealed is the
+text the model reads — the body and `sealed/` — not glue code; an author
+who needs to protect a script compiles it. A sealed body MUST NOT rely on
+shell injection (`` !`cmd` ``): the gateway renders it with shell execution
+disabled. Optionally a package carries a workflow definition that lets the
+gateway drive the happy path without a model and reserve the model for
+exceptions. The
 gateway validates the package, computes the protection rating from sample
 runs, signs the manifest, and lists it. Creators are paid per successful
 run or per subscription period from the gateway's metering; the wire

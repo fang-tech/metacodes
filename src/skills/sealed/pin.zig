@@ -25,6 +25,8 @@ pub const PIN_SCHEMA = "metacodes.sealed-pin/v1";
 pub const PIN_DIR_NAME = "sealed-skills";
 pub const PIN_FILE_NAME = "sealed.json";
 pub const DEFAULT_TOKEN_ENV = "METACODES_SEALED_TOKEN";
+/// Always in a sealed Skill's frame: the user answering their own Skill.
+pub const ASK_USER_TOOL = "AskUserQuestion";
 pub const MAX_PIN_BYTES: usize = 1024 * 1024;
 
 pub const Error = error{
@@ -94,6 +96,25 @@ pub fn write(
     const md_path = std.fs.path.join(allocator, &.{ dir, "SKILL.md" }) catch return error.OutOfMemory;
     defer allocator.free(md_path);
     try writeFile(allocator, md_path, skill_md);
+}
+
+/// Write one public asset of the Skill (§5 `assets`) under the pin directory
+/// at its package-relative `/`-separated path. The caller verified the bytes
+/// against the Entry's digest; the path was validated by `protocol.validAssetPath`.
+pub fn writeAsset(allocator: std.mem.Allocator, state_root: []const u8, name: []const u8, relative: []const u8, bytes: []const u8) Error!void {
+    if (!protocol.validAssetPath(relative)) return error.InvalidPin;
+    const root = try pinRoot(allocator, state_root);
+    defer allocator.free(root);
+    var parts: std.ArrayList([]const u8) = .empty;
+    defer parts.deinit(allocator);
+    parts.append(allocator, root) catch return error.OutOfMemory;
+    parts.append(allocator, name) catch return error.OutOfMemory;
+    var segments = std.mem.splitScalar(u8, relative, '/');
+    while (segments.next()) |segment| parts.append(allocator, segment) catch return error.OutOfMemory;
+    const path = std.fs.path.join(allocator, parts.items) catch return error.OutOfMemory;
+    defer allocator.free(path);
+    fs_util.mkdirParentsOf(path) catch return error.WriteFailed;
+    try writeFile(allocator, path, bytes);
 }
 
 /// Read and verify the pin in `skill_dir` (a catalog record's `live_dir`).
@@ -249,7 +270,27 @@ fn render(w: *std.Io.Writer, m: *const protocol.Manifest, entry: *const protocol
     if (m.when_to_use.len != 0) try yamlScalar(w, "when_to_use", m.when_to_use);
     if (m.argument_hint.len != 0) try yamlScalar(w, "argument-hint", m.argument_hint);
     if (m.arguments.len != 0) try yamlList(w, "arguments", m.arguments);
-    try yamlList(w, "allowed-tools", m.tools_allow);
+    // The frame derived from `allowed-tools` also decides which definitions
+    // the fork advertises to its model — here, to the gateway's shadow. A lone
+    // `*` is the whole tool set (no key: an unrestricted frame, as a local
+    // Skill without the key has); otherwise the list plus `AskUserQuestion`,
+    // which every sealed Skill may ask through (§4.3) and which never
+    // dispatches through the frame.
+    const unrestricted = for (m.tools_allow) |rule| {
+        if (std.mem.eql(u8, rule, "*")) break true;
+    } else false;
+    if (!unrestricted) {
+        const asks = for (m.tools_allow) |rule| {
+            if (std.mem.eql(u8, rule, ASK_USER_TOOL)) break true;
+        } else false;
+        try w.writeAll("allowed-tools:\n");
+        for (m.tools_allow) |value| {
+            try w.writeAll("  - ");
+            try yamlQuoted(w, value);
+            try w.writeByte('\n');
+        }
+        if (!asks) try w.writeAll("  - \"" ++ ASK_USER_TOOL ++ "\"\n");
+    }
     if (m.tools_deny.len != 0) try yamlList(w, "disallowed-tools", m.tools_deny);
     try w.writeAll("context: fork\n");
     try yamlScalar(w, "sealed-gateway", gateway_url);
@@ -338,8 +379,11 @@ test "pin projection renders quoted frontmatter the definition parser accepts" {
     try std.testing.expectEqual(definition.ExecContext.fork, skill.context);
     try std.testing.expectEqualStrings("erp-post", skill.name);
     try std.testing.expectEqualStrings(parsed.entry.manifest.description, skill.description);
-    try std.testing.expectEqual(@as(usize, 3), skill.allowed_tools.len);
+    // The manifest's three rules plus AskUserQuestion, which every sealed
+    // Skill may ask through.
+    try std.testing.expectEqual(@as(usize, 4), skill.allowed_tools.len);
     try std.testing.expectEqualStrings("Bash(python3 *)", skill.allowed_tools[2]);
+    try std.testing.expectEqualStrings(ASK_USER_TOOL, skill.allowed_tools[3]);
     try std.testing.expectEqualStrings("Bash(rm *)", skill.disallowed_tools[0]);
     try std.testing.expectEqualStrings(parsed.entry.manifest_digest, skill.sealed_manifest_digest);
     try std.testing.expectEqualStrings("$ARGUMENTS\n", skill.body);

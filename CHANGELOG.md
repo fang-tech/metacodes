@@ -12,6 +12,22 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Added
 
+- Sealed Skills run as a shadow of the client's fork on the client's own
+  model account ([doc/SEALED_SKILL_PROTOCOL.md](doc/SEALED_SKILL_PROTOCOL.md)
+  §8.1, §9): the gateway has no provider of its own; `runs.start` carries
+  the fork's system prompt, tools, model and request parameters plus the
+  client's provider route, and the credential travels in the
+  `Sealed-Provider-Credential` header of each request. The gateway's brain
+  is the real agent loop with a capturing dispatcher — every tool use
+  suspends the loop and becomes a Step, the loop's continuation travels in
+  `run_state`, and the gateway keeps nothing between Steps. The shadow's
+  model request is byte-identical to a local fork's (an L2 asserts it);
+  narration between calls stays on the gateway. Packages gain `sealed/`
+  reference files read on the gateway and public assets installed under the
+  pin directory (`sealed/skills.asset`). `metacodes sealed serve` drops its
+  provider flags. Kernel seams: `Provider.route()`,
+  `agent_loop.Options.suspend_all_pending` with `resumeRunWithResults`, and
+  `transcript.Writer.renderMessageJson` / `parseMessageJson`.
 - Sealed Skills, client side of the three §9.1 gaps: a call marked
   `confirm: true` is approved interactively whatever the permission mode,
   through a tightening-only confirm gate on the child's permission context
@@ -21,9 +37,9 @@ status, compatibility boundaries, and entry points are defined by
   and redacted from its result before it leaves the machine, an unbound one
   refusing the call with `permission_denied` and the bind command; an
   `input_required` Step is asked through the session's dialog and the answer
-  continues the run. The reference gateway gains the `AskUser` tool behind
-  `input_required` and annotates calls with the credential references their
-  inputs name.
+  continues the run. The reference gateway maps the brain's
+  `AskUserQuestion` to `input_required` and annotates calls with the
+  credential references their inputs name.
 - Sealed Skill Protocol (SSP/1, [doc/SEALED_SKILL_PROTOCOL.md](doc/SEALED_SKILL_PROTOCOL.md)):
   a Skill whose body stays on a gateway while every tool call it needs is
   executed, approved and paid for on the client. `metacodes sealed install`
@@ -31,8 +47,7 @@ status, compatibility boundaries, and entry points are defined by
   price; the pinned Skill runs as a fork whose model is the gateway, with a
   per-run cost cap (`METACODES_SEALED_MAX_COST_MICROS`) and a usage ledger
   (`metacodes sealed ledger`). `metacodes sealed serve` is the reference
-  gateway: stateless, AEAD-sealed run state, the operator's own provider
-  credentials, first-party metering.
+  gateway: stateless, AEAD-sealed run state, metering per Step.
 - Skills and MCP servers configured for Claude Code and Codex now work in
   metacodes, next to its own `<state root>/skills` and `config.json`
   ([doc/SKILLS_AND_MCP.md](doc/SKILLS_AND_MCP.md)). Skills come from

@@ -20,12 +20,21 @@ pub const MANIFEST_SCHEMA = "metask.sealed-skill.manifest/v1";
 pub const GENESIS_DIGEST = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
 pub const DEFAULT_MAX_RESULT_BYTES: u64 = 65536;
 /// Hard cap on any single JSON document this client will parse from a gateway.
-pub const MAX_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
+/// A Step carries the run's whole conversation in `run_state` (§4.4), so this
+/// is sized like a model context, not like a control message.
+pub const MAX_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
+/// §8.1: the client's provider credential for this request, as the client's
+/// own provider would send it. A header, not a parameter: it is never part of
+/// a digested object, never echoed and never logged.
+pub const PROVIDER_CREDENTIAL_HEADER = "Sealed-Provider-Credential";
+/// Largest public asset (§5 `assets`) a client will install.
+pub const MAX_ASSET_BYTES: usize = 8 * 1024 * 1024;
 
 pub const Method = enum {
     discover,
     skills_list,
     skills_get,
+    skills_asset,
     runs_start,
     runs_continue,
     runs_cancel,
@@ -35,6 +44,7 @@ pub const Method = enum {
             .discover => "sealed/discover",
             .skills_list => "sealed/skills.list",
             .skills_get => "sealed/skills.get",
+            .skills_asset => "sealed/skills.asset",
             .runs_start => "sealed/runs.start",
             .runs_continue => "sealed/runs.continue",
             .runs_cancel => "sealed/runs.cancel",
@@ -123,6 +133,17 @@ pub const Manifest = struct {
     }
 };
 
+/// A public file of the Skill package (§5 `assets`): installed into the pin
+/// directory so the Skill's scripts and data exist where the brain believes
+/// they do. Anything under `sealed/` and the SKILL.md body are never listed.
+pub const Asset = struct {
+    /// Package-relative path with `/` separators.
+    path: []const u8,
+    /// `sha256:<hex>` of the file's bytes.
+    sha256: []const u8,
+    bytes: u64,
+};
+
 pub const Entry = struct {
     skill_id: []const u8,
     version: []const u8,
@@ -132,6 +153,7 @@ pub const Entry = struct {
     manifest_digest: []const u8,
     manifest_sig: []const u8 = "",
     subscription_state: []const u8 = "",
+    assets: []const Asset = &.{},
 };
 
 pub const ParsedEntry = struct {
@@ -209,6 +231,20 @@ pub fn entryFromValue(arena: std.mem.Allocator, value: std.json.Value) ParseErro
     if (value.object.get("subscription")) |subscription| {
         if (subscription == .object) subscription_state = try optionalString(subscription, "state") orelse "";
     }
+    var assets: []const Asset = &.{};
+    if (value.object.get("assets")) |list| {
+        if (list != .array) return error.InvalidShape;
+        const out = try arena.alloc(Asset, list.array.items.len);
+        for (list.array.items, out) |item, *slot| {
+            if (item != .object) return error.InvalidShape;
+            const path = try requiredString(item, "path");
+            if (!validAssetPath(path)) return error.InvalidShape;
+            const bytes = try requiredInteger(item, "bytes");
+            if (bytes < 0) return error.InvalidShape;
+            slot.* = .{ .path = path, .sha256 = try requiredString(item, "sha256"), .bytes = @intCast(bytes) };
+        }
+        assets = out;
+    }
     return .{
         .skill_id = skill_id,
         .version = try optionalString(value, "version") orelse manifest.version,
@@ -217,7 +253,23 @@ pub fn entryFromValue(arena: std.mem.Allocator, value: std.json.Value) ParseErro
         .manifest_digest = digest,
         .manifest_sig = try optionalString(value, "manifest_sig") orelse "",
         .subscription_state = subscription_state,
+        .assets = assets,
     };
+}
+
+/// A package-relative path a client will write under its pin directory:
+/// `/`-separated, no empty, `.` or `..` segments, no drive or root, and never
+/// the pin's own files or the sealed set.
+pub fn validAssetPath(path: []const u8) bool {
+    if (path.len == 0 or path.len > 512) return false;
+    if (path[0] == '/' or std.mem.indexOfScalar(u8, path, '\\') != null or std.mem.indexOfScalar(u8, path, ':') != null) return false;
+    var parts = std.mem.splitScalar(u8, path, '/');
+    while (parts.next()) |part| {
+        if (part.len == 0 or std.mem.eql(u8, part, ".") or std.mem.eql(u8, part, "..")) return false;
+    }
+    if (std.mem.eql(u8, path, "SKILL.md") or std.mem.eql(u8, path, "sealed.json")) return false;
+    if (std.mem.startsWith(u8, path, "sealed/")) return false;
+    return true;
 }
 
 pub fn manifestFromValue(arena: std.mem.Allocator, value: std.json.Value) ParseError!Manifest {
@@ -339,6 +391,10 @@ pub const Question = struct {
     message: []const u8,
     /// Raw JSON of `schema`, or "" when absent.
     schema_json: []const u8 = "",
+    /// Raw JSON of `tool_input`: the brain's `AskUserQuestion` call as the
+    /// client's own tool takes it, so the client can run that tool verbatim.
+    /// "" for a gateway that only has a message.
+    tool_input_json: []const u8 = "",
 };
 
 pub const Step = struct {
@@ -436,6 +492,7 @@ pub fn stepFromValue(arena: std.mem.Allocator, value: std.json.Value) ParseError
             .id = try requiredString(question, "id"),
             .message = try requiredString(question, "message"),
             .schema_json = if (question.object.get("schema")) |schema| try canonicalize(arena, schema) else "",
+            .tool_input_json = if (question.object.get("tool_input")) |input| try serializeValue(arena, input) else "",
         };
     }
     if (value.object.get("charge")) |charge| {
@@ -548,6 +605,27 @@ pub const StartParams = struct {
     run_ref: []const u8 = "",
     locale: []const u8 = "",
     confirmation: []const u8 = "client",
+    /// The fork's system prompt, exactly as the client's own fork would send
+    /// it (§9.1 "Mirror"). "" omits the field.
+    system: []const u8 = "",
+    /// The directory the Skill's public assets were installed to on the
+    /// client; the brain is told it as the Skill's base directory.
+    base_dir: []const u8 = "",
+    /// The client's provider route (§8.1); kind "" omits the block.
+    provider_kind: []const u8 = "",
+    provider_base_url: []const u8 = "",
+    provider_openai_protocol: []const u8 = "",
+    /// `{"scheme":"bearer"}`, `{"scheme":"api_key_header","header":"x-api-key"}`
+    /// or `{"scheme":"custom_header","header":"…","value_prefix":"…"}`; "" for
+    /// the kind's default.
+    provider_auth_json: []const u8 = "",
+    /// Provider-side server tools (web search …) the client's request would
+    /// carry, in the client's dialect; "[]" or "" for none.
+    provider_tools_json: []const u8 = "",
+    /// Request parameters of the client's fork: model "" omits the block.
+    model: []const u8 = "",
+    max_tokens: u32 = 0,
+    reasoning_effort: []const u8 = "",
 };
 
 pub fn writeStartParams(w: *std.Io.Writer, p: StartParams) !void {
@@ -578,6 +656,43 @@ pub fn writeStartParams(w: *std.Io.Writer, p: StartParams) !void {
     }
     try w.writeAll(",\"confirmation\":");
     try writeString(w, p.confirmation);
+    if (p.system.len != 0) {
+        try w.writeAll(",\"system\":");
+        try writeString(w, p.system);
+    }
+    if (p.base_dir.len != 0) {
+        try w.writeAll(",\"base_dir\":");
+        try writeString(w, p.base_dir);
+    }
+    if (p.provider_kind.len != 0) {
+        try w.writeAll(",\"provider\":{\"kind\":");
+        try writeString(w, p.provider_kind);
+        try w.writeAll(",\"base_url\":");
+        try writeString(w, p.provider_base_url);
+        if (p.provider_openai_protocol.len != 0) {
+            try w.writeAll(",\"openai_protocol\":");
+            try writeString(w, p.provider_openai_protocol);
+        }
+        if (p.provider_auth_json.len != 0) {
+            try w.writeAll(",\"auth\":");
+            try w.writeAll(p.provider_auth_json);
+        }
+        try w.writeByte('}');
+    }
+    if (p.provider_tools_json.len != 0 and !std.mem.eql(u8, p.provider_tools_json, "[]")) {
+        try w.writeAll(",\"provider_tools\":");
+        try w.writeAll(p.provider_tools_json);
+    }
+    if (p.model.len != 0) {
+        try w.writeAll(",\"request\":{\"model\":");
+        try writeString(w, p.model);
+        try w.print(",\"max_tokens\":{d}", .{p.max_tokens});
+        if (p.reasoning_effort.len != 0) {
+            try w.writeAll(",\"reasoning_effort\":");
+            try writeString(w, p.reasoning_effort);
+        }
+        try w.writeByte('}');
+    }
     try w.writeAll("}");
 }
 
@@ -644,6 +759,54 @@ pub fn writeSkillsGetParams(w: *std.Io.Writer, skill_id: []const u8) !void {
     try w.writeAll("{\"skill_id\":");
     try writeString(w, skill_id);
     try w.writeByte('}');
+}
+
+pub fn writeSkillsAssetParams(w: *std.Io.Writer, skill_id: []const u8, path: []const u8) !void {
+    try w.writeAll("{\"skill_id\":");
+    try writeString(w, skill_id);
+    try w.writeAll(",\"path\":");
+    try writeString(w, path);
+    try w.writeByte('}');
+}
+
+/// The result of `skills.asset`: `{"path","sha256","content_base64"}`.
+pub const ParsedAsset = struct {
+    arena: std.heap.ArenaAllocator,
+    path: []const u8,
+    sha256: []const u8,
+    /// Decoded bytes, verified against `sha256`.
+    content: []const u8,
+
+    pub fn deinit(self: *ParsedAsset) void {
+        self.arena.deinit();
+        self.* = undefined;
+    }
+};
+
+pub fn parseAsset(allocator: std.mem.Allocator, result_json: []const u8) ParseError!ParsedAsset {
+    if (result_json.len > MAX_MESSAGE_BYTES) return error.MessageTooLarge;
+    var result: ParsedAsset = .{ .arena = std.heap.ArenaAllocator.init(allocator), .path = "", .sha256 = "", .content = "" };
+    errdefer result.arena.deinit();
+    const arena = result.arena.allocator();
+    const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, result_json, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidJson,
+    };
+    const path = try requiredString(parsed, "path");
+    if (!validAssetPath(path)) return error.InvalidShape;
+    const encoded = try requiredString(parsed, "content_base64");
+    const decoder = std.base64.standard.Decoder;
+    const size = decoder.calcSizeForSlice(encoded) catch return error.InvalidShape;
+    if (size > MAX_ASSET_BYTES) return error.MessageTooLarge;
+    const content = try arena.alloc(u8, size);
+    decoder.decode(content, encoded) catch return error.InvalidShape;
+    const claimed = try requiredString(parsed, "sha256");
+    const actual = try digestHex(arena, content);
+    if (!std.mem.eql(u8, claimed, actual)) return error.InvalidShape;
+    result.path = path;
+    result.sha256 = claimed;
+    result.content = content;
+    return result;
 }
 
 // ── JSON-RPC envelope ─────────────────────────────────────────────────────
@@ -1065,6 +1228,64 @@ test "request writers produce the documented shapes" {
     defer req.deinit();
     try writeRequest(&req.writer, 7, .runs_cancel, "{\"run_id\":\"r\"}");
     try std.testing.expectEqualStrings("{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"sealed/runs.cancel\",\"params\":{\"run_id\":\"r\"}}", req.written());
+
+    // The mirror fields (§9.1): system prompt, base dir, provider route,
+    // provider tools and the request parameters of the client's fork.
+    var mirror: std.Io.Writer.Allocating = .init(a);
+    defer mirror.deinit();
+    try writeStartParams(&mirror.writer, .{
+        .skill_id = "ssk",
+        .manifest_digest = "sha256:ab",
+        .prompt = "go",
+        .max_cost_micros = 1,
+        .max_steps = 2,
+        .client_name = "metacodes",
+        .client_version = "0.6.0",
+        .client_platform = "p",
+        .system = "You are a subagent.",
+        .base_dir = "/home/u/.metacodes/sealed-skills/erp-post",
+        .provider_kind = "anthropic",
+        .provider_base_url = "https://api.anthropic.com",
+        .provider_auth_json = "{\"scheme\":\"api_key_header\",\"header\":\"x-api-key\"}",
+        .provider_tools_json = "[{\"type\":\"web_search_20250305\",\"name\":\"web_search\"}]",
+        .model = "claude-sonnet-4-5",
+        .max_tokens = 8192,
+        .reasoning_effort = "high",
+    });
+    try std.testing.expect(std.mem.endsWith(
+        u8,
+        mirror.written(),
+        "\"confirmation\":\"client\",\"system\":\"You are a subagent.\",\"base_dir\":\"/home/u/.metacodes/sealed-skills/erp-post\",\"provider\":{\"kind\":\"anthropic\",\"base_url\":\"https://api.anthropic.com\",\"auth\":{\"scheme\":\"api_key_header\",\"header\":\"x-api-key\"}},\"provider_tools\":[{\"type\":\"web_search_20250305\",\"name\":\"web_search\"}],\"request\":{\"model\":\"claude-sonnet-4-5\",\"max_tokens\":8192,\"reasoning_effort\":\"high\"}}",
+    ));
+}
+
+test "assets: paths are confined to the pin directory and the public set" {
+    try std.testing.expect(validAssetPath("scripts/post.py"));
+    try std.testing.expect(validAssetPath("references/public.md"));
+    try std.testing.expect(!validAssetPath("sealed/notes.md"));
+    try std.testing.expect(!validAssetPath("SKILL.md"));
+    try std.testing.expect(!validAssetPath("sealed.json"));
+    try std.testing.expect(!validAssetPath("../escape.txt"));
+    try std.testing.expect(!validAssetPath("/abs.txt"));
+    try std.testing.expect(!validAssetPath("a//b"));
+    try std.testing.expect(!validAssetPath("C:x"));
+}
+
+test "assets: the result is decoded and its digest verified" {
+    const a = std.testing.allocator;
+    const content = "print('hi')\n";
+    const digest = try digestHex(a, content);
+    defer a.free(digest);
+    var encoded_buf: [64]u8 = undefined;
+    const encoded = std.base64.standard.Encoder.encode(&encoded_buf, content);
+    const ok_json = try std.fmt.allocPrint(a, "{{\"path\":\"scripts/post.py\",\"sha256\":\"{s}\",\"content_base64\":\"{s}\"}}", .{ digest, encoded });
+    defer a.free(ok_json);
+    var parsed = try parseAsset(a, ok_json);
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings(content, parsed.content);
+    const bad_json = try std.fmt.allocPrint(a, "{{\"path\":\"scripts/post.py\",\"sha256\":\"sha256:00\",\"content_base64\":\"{s}\"}}", .{encoded});
+    defer a.free(bad_json);
+    try std.testing.expectError(error.InvalidShape, parseAsset(a, bad_json));
 }
 
 test "json-rpc responses: result, known error, foreign id" {

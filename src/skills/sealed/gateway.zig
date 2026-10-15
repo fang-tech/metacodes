@@ -1,59 +1,76 @@
 //! Reference SSP/1 gateway: the server side of doc/SEALED_SKILL_PROTOCOL.md.
 //!
 //! `metacodes sealed serve` loads Skill packages (`<dir>/<name>/SKILL.md` +
-//! `manifest.json`), answers the six protocol methods over a small HTTP/1.1
-//! loop, and drives each run with the server's own model provider — the
-//! provider's API key, never the client's. Every model call becomes one Step:
-//! the model's tool calls are returned to the client instead of being
-//! executed here, and the client's results come back as the next request.
+//! `manifest.json`, public assets, a `sealed/` directory of private reference
+//! files) and answers the protocol methods over a small HTTP/1.1 loop.
 //!
-//! The gateway is stateless per run: the whole run (conversation, pending
-//! calls, totals, caps) travels in `run_state`, sealed with XChaCha20-Poly1305
-//! under a process key, so a tampered or replayed blob fails closed. Nothing
-//! about a run is stored server-side, which is what `egress.retention: "run"`
-//! promises.
+//! The brain of a run is a *shadow* of the client's fork (§9.1 "Mirror"): the
+//! same `agent_loop` the client would have run, fed the system prompt, tool
+//! definitions, model and request parameters the client sends, calling the
+//! model over the **client's own provider route and credential** (§8.1). The
+//! gateway has no provider of its own. Every tool use the loop produces is
+//! captured instead of executed: the loop suspends on the batch, the batch
+//! becomes a `tool_calls` Step, and the client's results resume the loop. The
+//! only tool the gateway serves itself is a `Read` of the Skill's own sealed
+//! reference files, which exist nowhere else. An `AskUserQuestion` call
+//! becomes an `input_required` Step the client answers with its own dialog.
 //!
-//! Metering is first-party: `usage.cost_micros` is computed from the
-//! provider's reported tokens with the local price table, and is what the
-//! `charge` receipt carries.
-//!
-//! Two things the model sees that are not client tools: the gateway's own
-//! `AskUser` tool, whose call becomes an `input_required` Step (§4.3) and
-//! whose answer comes back as that Step's one result; and the credential
-//! placeholders `${SEALED_CRED:<ref>}` for the references the manifest
-//! declares (§6.4) — a call whose input names one is annotated with
-//! `credentials: [<ref>]` so the client substitutes and redacts it.
+//! The gateway is stateless per run: the loop's continuation — the whole
+//! conversation, the pending batch, totals, caps — travels in `run_state`,
+//! sealed with XChaCha20-Poly1305 under a process key, so a tampered or
+//! replayed blob fails closed and any gateway instance with the key can serve
+//! any Step. Nothing about a run is stored server-side, which is what
+//! `egress.retention: "run"` promises, and the client's credential lives only
+//! as long as the request that carried it.
 
 const std = @import("std");
 const protocol = @import("protocol.zig");
 const credentials = @import("credentials.zig");
 const definition = @import("../runtime/definition.zig");
+const render = @import("../render.zig");
 const provider_mod = @import("../../api/provider.zig");
-const api_stream = @import("../../api/stream.zig");
-const api_request = @import("../../api/request.zig");
+const provider_factory = @import("../../api/provider_factory.zig");
+const dialect_mod = @import("../../api/dialect.zig");
+const auth_header_mod = @import("../../api/auth_header.zig");
 const types = @import("../../types.zig");
 const json_mod = @import("../../json.zig");
 const pricing = @import("../../util/pricing.zig");
 const log = @import("../../util/log.zig");
+const agent_loop = @import("../../core/agent_loop.zig");
+const Conversation = @import("../../core/conversation.zig").Conversation;
+const transcript = @import("../../core/transcript.zig");
+const msg = @import("../../core/message.zig");
+const writer_backend = @import("../../core/writer_backend.zig");
+const usage_mod = @import("../../core/usage.zig");
+const permission_mod = @import("../../permission.zig");
+const category_mod = @import("../../permission/category.zig");
+const tool_context = @import("../../tools/context.zig");
+const tool_result = @import("../../core/tool_result.zig");
 const net = @import("platform").net;
 const pfs = @import("platform").fs;
 const pdir = @import("platform").dir;
-const psync = @import("platform").sync;
 
 const Aead = std.crypto.aead.chacha_poly.XChaCha20Poly1305;
 const Base64 = std.base64.url_safe_no_pad;
+const Sha256 = std.crypto.hash.sha2.Sha256;
 
 pub const DEFAULT_OPERATOR = "metacodes";
-pub const MAX_REQUEST_BYTES: usize = 4 * 1024 * 1024;
-pub const MAX_STATE_BYTES: usize = 256 * 1024;
+/// A request carries the run's whole conversation (§4.4): sized like a model
+/// context, matched by the client's `protocol.MAX_MESSAGE_BYTES`.
+pub const MAX_REQUEST_BYTES: usize = 16 * 1024 * 1024;
+pub const MAX_STATE_BYTES: usize = 12 * 1024 * 1024;
 /// Policy violations reported by the client before the gateway fails the run.
 pub const MAX_POLICY_VIOLATIONS: u32 = 3;
-/// The gateway's own tool: a call to it is an `input_required` Step (§4.3).
-pub const ASK_USER_TOOL = "AskUser";
-const ASK_USER_DESCRIPTION = "Ask the person running this Skill one question that only they can answer (a choice, a value, a confirmation of intent). Returns their answer as text. Prefer finishing with what you have over asking; never ask for secrets, use credential placeholders instead.";
-const ASK_USER_SCHEMA_JSON =
-    \\{"type":"object","properties":{"message":{"type":"string","description":"The question, in the user's language, with the context they need to answer it."},"schema":{"type":"object","description":"Optional elicitation form: a JSON Schema object whose single property may carry an enum of the choices."}},"required":["message"],"additionalProperties":false}
-;
+/// The package directory whose files only the gateway ever reads (§5, §12).
+pub const SEALED_DIR = "sealed";
+/// The client's question tool: a call becomes an `input_required` Step (§4.3).
+pub const ASK_USER_TOOL = "AskUserQuestion";
+/// Model turns the loop may take inside one Step (sealed reads, compaction,
+/// retries) before the gateway gives up on it.
+pub const INTERNAL_TURN_CAP: u32 = 16;
+pub const MAX_SEALED_READ_BYTES: usize = 1024 * 1024;
+const PENDING_REMOTE_KIND = "sealed_remote";
+const PENDING_QUESTION_KIND = "sealed_question";
 
 pub const Error = error{
     OutOfMemory,
@@ -61,13 +78,29 @@ pub const Error = error{
     InvalidPackage,
 };
 
-/// One published Skill: its manifest as served, and the body that becomes
-/// the model's system prompt. The body never leaves this struct.
+pub const Asset = struct {
+    path: []const u8,
+    sha256: []const u8,
+    bytes: u64,
+};
+
+/// One published Skill: its manifest as served, the body that becomes the
+/// fork's first user turn, its public assets and its sealed reference files.
+/// The body and the sealed files never leave this process.
 pub const Package = struct {
     name: []const u8,
+    dir: []const u8,
     body: []const u8,
     entry_json: []const u8,
     entry: protocol.Entry,
+    assets: []const Asset,
+    /// Paths relative to `<dir>/sealed/`.
+    sealed_files: []const []const u8,
+
+    pub fn findAsset(self: *const Package, path: []const u8) ?*const Asset {
+        for (self.assets) |*asset| if (std.mem.eql(u8, asset.path, path)) return asset;
+        return null;
+    }
 };
 
 pub const Options = struct {
@@ -83,24 +116,19 @@ pub const Options = struct {
 pub const Gateway = struct {
     allocator: std.mem.Allocator,
     arena: std.heap.ArenaAllocator,
-    provider: provider_mod.Provider,
     packages: []const Package,
     operator_id: []const u8,
     token: []const u8,
     currency: []const u8,
     state_key: [32]u8,
-    /// Model calls are serialized: provider implementations own transport
-    /// state that is not shared across threads.
-    model_mutex: psync.Mutex = .{},
     next_run: std.atomic.Value(u64) = std.atomic.Value(u64).init(1),
 
-    pub fn init(allocator: std.mem.Allocator, provider: provider_mod.Provider, skills_dir: []const u8, options: Options) Error!*Gateway {
+    pub fn init(allocator: std.mem.Allocator, skills_dir: []const u8, options: Options) Error!*Gateway {
         const self = allocator.create(Gateway) catch return error.OutOfMemory;
         errdefer allocator.destroy(self);
         self.* = .{
             .allocator = allocator,
             .arena = std.heap.ArenaAllocator.init(allocator),
-            .provider = provider,
             .packages = &.{},
             .operator_id = "",
             .token = "",
@@ -142,9 +170,10 @@ pub const Gateway = struct {
     }
 
     /// Handle one JSON-RPC request body; the response document is owned by
-    /// the caller. Transport-level problems (bad JSON) become JSON-RPC errors
-    /// with a null id, never a crash.
-    pub fn handle(self: *Gateway, allocator: std.mem.Allocator, body: []const u8) ![]u8 {
+    /// the caller. `credential` is the client's provider credential for this
+    /// request (the `Sealed-Provider-Credential` header, "" when absent); it
+    /// is used for the model calls of this request and nowhere else.
+    pub fn handle(self: *Gateway, allocator: std.mem.Allocator, body: []const u8, credential: []const u8) ![]u8 {
         var scratch = std.heap.ArenaAllocator.init(allocator);
         defer scratch.deinit();
         const arena = scratch.allocator();
@@ -161,8 +190,9 @@ pub const Gateway = struct {
             if (std.mem.eql(u8, method, protocol.Method.discover.wire())) break :blk try self.discover(arena);
             if (std.mem.eql(u8, method, protocol.Method.skills_list.wire())) break :blk try self.skillsList(arena);
             if (std.mem.eql(u8, method, protocol.Method.skills_get.wire())) break :blk self.skillsGet(arena, params) catch |err| return self.rpcFailure(allocator, id, err);
-            if (std.mem.eql(u8, method, protocol.Method.runs_start.wire())) break :blk self.runsStart(arena, params) catch |err| return self.rpcFailure(allocator, id, err);
-            if (std.mem.eql(u8, method, protocol.Method.runs_continue.wire())) break :blk self.runsContinue(arena, params) catch |err| return self.rpcFailure(allocator, id, err);
+            if (std.mem.eql(u8, method, protocol.Method.skills_asset.wire())) break :blk self.skillsAsset(arena, params) catch |err| return self.rpcFailure(allocator, id, err);
+            if (std.mem.eql(u8, method, protocol.Method.runs_start.wire())) break :blk self.runsStart(arena, params, credential) catch |err| return self.rpcFailure(allocator, id, err);
+            if (std.mem.eql(u8, method, protocol.Method.runs_continue.wire())) break :blk self.runsContinue(arena, params, credential) catch |err| return self.rpcFailure(allocator, id, err);
             if (std.mem.eql(u8, method, protocol.Method.runs_cancel.wire())) break :blk self.runsCancel(arena, params) catch |err| return self.rpcFailure(allocator, id, err);
             return rpcError(allocator, id, -32601, "method not found", null, null);
         };
@@ -183,6 +213,8 @@ pub const Gateway = struct {
         ManifestChanged,
         RunStateInvalid,
         UpstreamUnavailable,
+        /// `Sealed-Provider-Credential` is missing on a method that calls the model.
+        CredentialMissing,
     };
 
     fn rpcFailure(self: *Gateway, allocator: std.mem.Allocator, id: ?std.json.Value, err: MethodError) ![]u8 {
@@ -190,6 +222,7 @@ pub const Gateway = struct {
         return switch (err) {
             error.OutOfMemory => error.OutOfMemory,
             error.InvalidParams => rpcError(allocator, id, -32602, "invalid params", null, null),
+            error.CredentialMissing => rpcError(allocator, id, -32602, protocol.PROVIDER_CREDENTIAL_HEADER ++ " header required: the gateway calls the model with the client's provider", null, null),
             error.SkillNotFound => rpcError(allocator, id, @intFromEnum(protocol.ErrorCode.skill_not_found), "unknown skill", .skill_not_found, null),
             error.ManifestChanged => rpcError(allocator, id, @intFromEnum(protocol.ErrorCode.manifest_changed), "pinned manifest is not current", .manifest_changed, null),
             error.RunStateInvalid => rpcError(allocator, id, @intFromEnum(protocol.ErrorCode.run_state_invalid), "run state rejected", .run_state_invalid, null),
@@ -214,7 +247,7 @@ pub const Gateway = struct {
         try protocol.writeString(w, self.operator_id);
         try w.writeAll(",\"billing\":");
         try protocol.writeString(w, self.operator_id);
-        try w.writeAll("},\"capabilities\":{\"run_state\":\"opaque\",\"step_signature\":false,\"input_required\":true,\"prefetch\":false,\"client_sealed\":false,\"currencies\":[");
+        try w.writeAll("},\"capabilities\":{\"run_state\":\"opaque\",\"step_signature\":false,\"input_required\":true,\"client_provider\":true,\"prefetch\":false,\"client_sealed\":false,\"currencies\":[");
         try protocol.writeString(w, self.currency);
         try w.writeAll("]}}");
         return out.written();
@@ -239,15 +272,41 @@ pub const Gateway = struct {
         return package.entry_json;
     }
 
-    fn runsStart(self: *Gateway, arena: std.mem.Allocator, params: std.json.Value) MethodError![]const u8 {
+    /// One public asset of a package, base64 in JSON: the client installs it
+    /// into the pin directory and verifies the digest (§5 `assets`).
+    fn skillsAsset(self: *Gateway, arena: std.mem.Allocator, params: std.json.Value) MethodError![]const u8 {
+        const skill_id = paramString(params, "skill_id") orelse return error.InvalidParams;
+        const path = paramString(params, "path") orelse return error.InvalidParams;
+        const package = self.findPackage(skill_id) orelse return error.SkillNotFound;
+        const asset = package.findAsset(path) orelse return error.InvalidParams;
+        const full = joinRelative(arena, package.dir, asset.path) catch return error.OutOfMemory;
+        const bytes = readFile(arena, full, protocol.MAX_ASSET_BYTES) catch return error.InvalidParams;
+        const encoded = arena.alloc(u8, std.base64.standard.Encoder.calcSize(bytes.len)) catch return error.OutOfMemory;
+        _ = std.base64.standard.Encoder.encode(encoded, bytes);
+        var out: std.Io.Writer.Allocating = .init(arena);
+        const w = &out.writer;
+        w.writeAll("{\"path\":") catch return error.OutOfMemory;
+        protocol.writeString(w, asset.path) catch return error.OutOfMemory;
+        w.writeAll(",\"sha256\":") catch return error.OutOfMemory;
+        protocol.writeString(w, asset.sha256) catch return error.OutOfMemory;
+        w.writeAll(",\"content_base64\":") catch return error.OutOfMemory;
+        protocol.writeString(w, encoded) catch return error.OutOfMemory;
+        w.writeByte('}') catch return error.OutOfMemory;
+        return out.written();
+    }
+
+    fn runsStart(self: *Gateway, arena: std.mem.Allocator, params: std.json.Value, credential: []const u8) MethodError![]const u8 {
         const skill_id = paramString(params, "skill_id") orelse return error.InvalidParams;
         const digest = paramString(params, "manifest_digest") orelse return error.InvalidParams;
         const prompt = paramString(params, "prompt") orelse return error.InvalidParams;
         const package = self.findPackage(skill_id) orelse return error.SkillNotFound;
         if (!std.mem.eql(u8, digest, package.entry.manifest_digest)) return error.ManifestChanged;
         if (params != .object) return error.InvalidParams;
+        if (credential.len == 0) return error.CredentialMissing;
         const tools_value = params.object.get("tools") orelse std.json.Value{ .array = std.json.Array.init(arena) };
         if (tools_value != .array) return error.InvalidParams;
+        const provider_tools_value = params.object.get("provider_tools") orelse std.json.Value{ .array = std.json.Array.init(arena) };
+        if (provider_tools_value != .array) return error.InvalidParams;
         var max_cost: i64 = 0;
         var max_steps: u64 = protocol_default_max_steps;
         if (params.object.get("budget")) |budget| {
@@ -266,6 +325,16 @@ pub const Gateway = struct {
             if (c != .string) return error.InvalidParams;
             confirm_all = std.mem.eql(u8, c.string, "always");
         }
+        const provider_spec = try providerSpecFromParams(params.object.get("provider") orelse return error.InvalidParams);
+        const request_value = params.object.get("request") orelse return error.InvalidParams;
+        const model = valueString(request_value, "model") orelse return error.InvalidParams;
+        if (model.len == 0) return error.InvalidParams;
+        var max_tokens: u32 = 0;
+        if (valueUnsigned(request_value, "max_tokens")) |v| max_tokens = @intCast(@min(v, std.math.maxInt(u32)));
+        const reasoning_effort = valueString(request_value, "reasoning_effort") orelse "";
+        const base_dir = paramString(params, "base_dir") orelse package.name;
+        const arguments = try stringList(arena, params.object.get("arguments"));
+
         const run_number = self.next_run.fetchAdd(1, .monotonic);
         var nonce: [8]u8 = undefined;
         fillRandom(&nonce) catch return error.OutOfMemory;
@@ -279,18 +348,69 @@ pub const Gateway = struct {
             .max_cost_micros = max_cost,
             .max_steps = max_steps,
             .confirm_all = confirm_all,
+            .system = paramString(params, "system") orelse "",
+            .base_dir = base_dir,
+            .model = model,
+            .max_tokens = max_tokens,
+            .reasoning_effort = reasoning_effort,
+            .provider = provider_spec,
             .tools = tools_value,
+            .provider_tools = provider_tools_value,
             .messages = std.json.Array.init(arena),
             .pending = &.{},
+            .completed = &.{},
         };
+        // The first user turn is byte-for-byte what a local fork of this
+        // Skill would have sent (§9.1): the base directory line and the body
+        // rendered with the user's arguments, plus what only a sealed Skill
+        // needs to be told — its sealed reference files and the credential
+        // placeholders it may use.
+        const task = try self.firstUserTurn(arena, package, base_dir, if (arguments.len != 0) arguments else &.{prompt});
         var text_block = std.json.ObjectMap{};
         text_block.put(arena, "type", .{ .string = "text" }) catch return error.OutOfMemory;
-        text_block.put(arena, "text", .{ .string = prompt }) catch return error.OutOfMemory;
-        try appendMessage(arena, &state, "user", &.{.{ .object = text_block }});
-        return self.advance(arena, package, &state);
+        text_block.put(arena, "text", .{ .string = task }) catch return error.OutOfMemory;
+        var blocks = std.json.Array.init(arena);
+        blocks.append(.{ .object = text_block }) catch return error.OutOfMemory;
+        var message = std.json.ObjectMap{};
+        message.put(arena, "role", .{ .string = "user" }) catch return error.OutOfMemory;
+        message.put(arena, "delivered", .{ .bool = false }) catch return error.OutOfMemory;
+        message.put(arena, "blocks", .{ .array = blocks }) catch return error.OutOfMemory;
+        state.messages.append(.{ .object = message }) catch return error.OutOfMemory;
+        return self.advance(arena, package, &state, credential, null);
     }
 
-    fn runsContinue(self: *Gateway, arena: std.mem.Allocator, params: std.json.Value) MethodError![]const u8 {
+    fn firstUserTurn(self: *Gateway, arena: std.mem.Allocator, package: *const Package, base_dir: []const u8, arguments: []const []const u8) MethodError![]const u8 {
+        _ = self;
+        const manifest = &package.entry.manifest;
+        // Shell injection (`!cmd`) would run on the gateway; it is disabled, as
+        // §12 requires of a sealed body. `@file` includes resolve inside the
+        // package, which is where a sealed Skill keeps what it includes.
+        const rendered = render.renderBody(arena, package.body, .{
+            .arguments = arguments,
+            .arg_names = manifest.arguments,
+            .skill_dir = package.dir,
+            .disable_shell_execution = true,
+        }) catch return error.InvalidParams;
+        var out: std.ArrayList(u8) = .empty;
+        out.print(arena, "Base directory for this skill: {s}\n\n{s}", .{ base_dir, rendered }) catch return error.OutOfMemory;
+        if (package.sealed_files.len != 0) {
+            out.appendSlice(arena, "\n\nSealed reference files of this Skill, readable with Read:\n") catch return error.OutOfMemory;
+            for (package.sealed_files) |path| {
+                out.print(arena, "- {s}/" ++ SEALED_DIR ++ "/{s}\n", .{ base_dir, path }) catch return error.OutOfMemory;
+            }
+        }
+        if (manifest.credentials.len != 0) {
+            out.appendSlice(arena, "\n\nCredential references bound on this machine. Write the placeholder literally wherever a tool input needs the value; it is substituted before execution and redacted from the result, and you never see it:\n") catch return error.OutOfMemory;
+            for (manifest.credentials) |credential| {
+                out.print(arena, "- `{s}{s}{s}`", .{ credentials.PLACEHOLDER_PREFIX, credential.ref, credentials.PLACEHOLDER_SUFFIX }) catch return error.OutOfMemory;
+                if (credential.purpose.len != 0) out.print(arena, " — {s}", .{credential.purpose}) catch return error.OutOfMemory;
+                out.append(arena, '\n') catch return error.OutOfMemory;
+            }
+        }
+        return out.items;
+    }
+
+    fn runsContinue(self: *Gateway, arena: std.mem.Allocator, params: std.json.Value, credential: []const u8) MethodError![]const u8 {
         const run_id = paramString(params, "run_id") orelse return error.InvalidParams;
         const blob = paramString(params, "run_state") orelse return error.InvalidParams;
         if (params != .object) return error.InvalidParams;
@@ -298,6 +418,7 @@ pub const Gateway = struct {
         if (seq_value != .integer or seq_value.integer <= 0) return error.InvalidParams;
         const results = params.object.get("results") orelse return error.InvalidParams;
         if (results != .array) return error.InvalidParams;
+        if (credential.len == 0) return error.CredentialMissing;
 
         var state = try self.openState(arena, blob, run_id);
         if (!std.mem.eql(u8, state.run_id, run_id)) return error.RunStateInvalid;
@@ -305,10 +426,11 @@ pub const Gateway = struct {
         if (state.pending.len == 0) return error.RunStateInvalid;
         const package = self.findPackage(state.skill_id) orelse return error.SkillNotFound;
 
-        // One result per pending call or question, matched by id. A call the
-        // model issued beside a question was never sent (§4.3: a Step is one
-        // kind); it is answered here so the conversation stays well-formed.
-        var blocks: std.ArrayList(std.json.Value) = .empty;
+        // One result per pending call or question, matched by id, plus the
+        // results the gateway produced itself (sealed reads) and the calls it
+        // answers itself (a call issued beside a question, §4.3). Together
+        // they are the one user turn that resumes the loop.
+        var resume_results: std.ArrayList(agent_loop.SuspendInfo.CompletedResult) = .empty;
         var matched: usize = 0;
         for (state.pending) |pending| {
             var content: []const u8 = skippedResultText(pending.kind);
@@ -322,20 +444,18 @@ pub const Gateway = struct {
                     if (std.mem.eql(u8, refusal, "policy_violation")) state.violations += 1;
                 }
             }
-            var block = std.json.ObjectMap{};
-            block.put(arena, "type", .{ .string = "tool_result" }) catch return error.OutOfMemory;
-            block.put(arena, "tool_use_id", .{ .string = pending.id }) catch return error.OutOfMemory;
-            block.put(arena, "content", .{ .string = content }) catch return error.OutOfMemory;
-            block.put(arena, "is_error", .{ .bool = is_error }) catch return error.OutOfMemory;
-            blocks.append(arena, .{ .object = block }) catch return error.OutOfMemory;
+            resume_results.append(arena, .{ .tool_use_id = pending.id, .content = content, .is_error = is_error }) catch return error.OutOfMemory;
         }
         if (matched != results.array.items.len) return error.RunStateInvalid;
-        try appendMessage(arena, &state, "user", blocks.items);
+        for (state.completed) |completed| {
+            resume_results.append(arena, .{ .tool_use_id = completed.id, .content = completed.content, .is_error = completed.is_error }) catch return error.OutOfMemory;
+        }
         state.pending = &.{};
+        state.completed = &.{};
         if (state.violations >= MAX_POLICY_VIOLATIONS) {
             return self.finishRun(arena, &state, "policy_violation", "the client refused calls outside the pinned allowlist");
         }
-        return self.advance(arena, package, &state);
+        return self.advance(arena, package, &state, credential, resume_results.items);
     }
 
     fn runsCancel(self: *Gateway, arena: std.mem.Allocator, params: std.json.Value) MethodError![]const u8 {
@@ -350,18 +470,72 @@ pub const Gateway = struct {
 
     /// What a pending id waits for: a client result (`call`, `question`), or
     /// nothing — the gateway answers it itself on continue (`skipped`: a call
-    /// issued beside a question; `invalid_ask`: an `AskUser` without a message).
-    const PendingKind = enum { call, question, skipped, invalid_ask };
+    /// issued beside a question).
+    const PendingKind = enum { call, question, skipped };
     const Pending = struct { id: []const u8, name: []const u8, kind: PendingKind = .call };
+    /// A result the gateway produced itself in the suspended batch (a sealed
+    /// read); it joins the client's results in the resuming user turn.
+    const Completed = struct { id: []const u8, content: []const u8, is_error: bool };
 
     fn skippedResultText(kind: PendingKind) []const u8 {
         return switch (kind) {
             .call, .question => "",
             .skipped => "not executed: the Skill asked the user in the same turn; call it again now that the answer is in",
-            .invalid_ask => "AskUser needs a non-empty string `message`; nothing was asked",
         };
     }
 
+    const AuthSpec = struct {
+        scheme: []const u8 = "",
+        header: []const u8 = "",
+        value_prefix: []const u8 = "",
+
+        fn toScheme(self: AuthSpec) ?auth_header_mod.AuthScheme {
+            if (std.mem.eql(u8, self.scheme, "bearer")) return .bearer;
+            if (std.mem.eql(u8, self.scheme, "api_key_header")) return .{ .api_key_header = self.header };
+            if (std.mem.eql(u8, self.scheme, "custom_header")) return .{ .custom_header = .{ .name = self.header, .value_prefix = self.value_prefix } };
+            return null;
+        }
+    };
+
+    /// The client's provider route (§8.1), minus the credential, which never
+    /// enters the state.
+    const ProviderSpec = struct {
+        kind: types.ProviderKind,
+        base_url: []const u8,
+        openai_protocol: types.OpenAIProtocol,
+        auth: AuthSpec,
+    };
+
+    fn providerSpecFromParams(value: std.json.Value) MethodError!ProviderSpec {
+        if (value != .object) return error.InvalidParams;
+        const kind_text = valueString(value, "kind") orelse return error.InvalidParams;
+        const kind = std.meta.stringToEnum(types.ProviderKind, kind_text) orelse return error.InvalidParams;
+        var spec: ProviderSpec = .{
+            .kind = kind,
+            .base_url = valueString(value, "base_url") orelse "",
+            .openai_protocol = .chat_completions,
+            .auth = .{},
+        };
+        if (valueString(value, "openai_protocol")) |raw| {
+            spec.openai_protocol = types.OpenAIProtocol.parse(raw) orelse return error.InvalidParams;
+        }
+        if (value.object.get("auth")) |auth| {
+            if (auth != .object) return error.InvalidParams;
+            spec.auth = .{
+                .scheme = valueString(auth, "scheme") orelse "",
+                .header = valueString(auth, "header") orelse "",
+                .value_prefix = valueString(auth, "value_prefix") orelse "",
+            };
+            // An empty scheme is the kind's default; a named one must be known.
+            if (spec.auth.scheme.len != 0 and spec.auth.toScheme() == null) return error.InvalidParams;
+        }
+        return spec;
+    }
+
+    /// The loop's continuation between two Steps. Everything in here is the
+    /// client's own data (its prompt, its tools, its results, the model's
+    /// replies it has seen as Steps) except the model's text between calls
+    /// and the sealed reads; the body itself is re-read from the package.
     const RunState = struct {
         run_id: []const u8,
         skill_id: []const u8,
@@ -374,46 +548,27 @@ pub const Gateway = struct {
         input_tokens: u64 = 0,
         output_tokens: u64 = 0,
         violations: u32 = 0,
+        system: []const u8,
+        base_dir: []const u8,
+        model: []const u8,
+        max_tokens: u32,
+        reasoning_effort: []const u8,
+        provider: ProviderSpec,
         tools: std.json.Value,
+        provider_tools: std.json.Value,
+        compact_boundary: usize = 0,
+        compact_summary: ?[]const u8 = null,
+        /// Transcript-shaped message objects (`transcript.Writer.renderMessageJson`).
         messages: std.json.Array,
         pending: []const Pending,
+        completed: []const Completed,
     };
-
-    fn appendMessage(arena: std.mem.Allocator, state: *RunState, role: []const u8, blocks: []const std.json.Value) MethodError!void {
-        var message = std.json.ObjectMap{};
-        message.put(arena, "role", .{ .string = role }) catch return error.OutOfMemory;
-        var content = std.json.Array.init(arena);
-        content.appendSlice(blocks) catch return error.OutOfMemory;
-        message.put(arena, "content", .{ .array = content }) catch return error.OutOfMemory;
-        state.messages.append(.{ .object = message }) catch return error.OutOfMemory;
-    }
 
     /// Serialize, seal and encode a run state (§4.4).
     fn sealState(self: *Gateway, arena: std.mem.Allocator, state: *const RunState) MethodError![]const u8 {
         var out: std.Io.Writer.Allocating = .init(arena);
         const w = &out.writer;
-        w.writeAll("{\"v\":1,\"run_id\":") catch return error.OutOfMemory;
-        protocol.writeString(w, state.run_id) catch return error.OutOfMemory;
-        w.writeAll(",\"skill_id\":") catch return error.OutOfMemory;
-        protocol.writeString(w, state.skill_id) catch return error.OutOfMemory;
-        w.print(",\"seq\":{d},\"last_digest\":", .{state.seq}) catch return error.OutOfMemory;
-        protocol.writeString(w, state.last_digest) catch return error.OutOfMemory;
-        w.print(",\"max_cost_micros\":{d},\"max_steps\":{d},\"confirm_all\":{},\"cost_micros\":{d},\"input_tokens\":{d},\"output_tokens\":{d},\"violations\":{d},\"tools\":", .{
-            state.max_cost_micros, state.max_steps, state.confirm_all, state.cost_micros, state.input_tokens, state.output_tokens, state.violations,
-        }) catch return error.OutOfMemory;
-        std.json.Stringify.value(state.tools, .{}, w) catch return error.OutOfMemory;
-        w.writeAll(",\"messages\":") catch return error.OutOfMemory;
-        std.json.Stringify.value(std.json.Value{ .array = state.messages }, .{}, w) catch return error.OutOfMemory;
-        w.writeAll(",\"pending\":[") catch return error.OutOfMemory;
-        for (state.pending, 0..) |pending, index| {
-            if (index != 0) w.writeByte(',') catch return error.OutOfMemory;
-            w.writeAll("{\"id\":") catch return error.OutOfMemory;
-            protocol.writeString(w, pending.id) catch return error.OutOfMemory;
-            w.writeAll(",\"name\":") catch return error.OutOfMemory;
-            protocol.writeString(w, pending.name) catch return error.OutOfMemory;
-            w.print(",\"kind\":\"{s}\"}}", .{@tagName(pending.kind)}) catch return error.OutOfMemory;
-        }
-        w.writeAll("]}") catch return error.OutOfMemory;
+        writeState(w, state) catch return error.OutOfMemory;
         const plain = out.written();
         if (plain.len > MAX_STATE_BYTES) return error.RunStateInvalid;
 
@@ -425,6 +580,61 @@ pub const Gateway = struct {
         Aead.encrypt(ciphertext, tag, plain, state.run_id, nonce.*, self.state_key);
         const encoded = arena.alloc(u8, Base64.Encoder.calcSize(raw.len)) catch return error.OutOfMemory;
         return Base64.Encoder.encode(encoded, raw);
+    }
+
+    fn writeState(w: *std.Io.Writer, state: *const RunState) !void {
+        try w.writeAll("{\"v\":2,\"run_id\":");
+        try protocol.writeString(w, state.run_id);
+        try w.writeAll(",\"skill_id\":");
+        try protocol.writeString(w, state.skill_id);
+        try w.print(",\"seq\":{d},\"last_digest\":", .{state.seq});
+        try protocol.writeString(w, state.last_digest);
+        try w.print(",\"max_cost_micros\":{d},\"max_steps\":{d},\"confirm_all\":{},\"cost_micros\":{d},\"input_tokens\":{d},\"output_tokens\":{d},\"violations\":{d}", .{
+            state.max_cost_micros, state.max_steps, state.confirm_all, state.cost_micros, state.input_tokens, state.output_tokens, state.violations,
+        });
+        try w.writeAll(",\"system\":");
+        try protocol.writeString(w, state.system);
+        try w.writeAll(",\"base_dir\":");
+        try protocol.writeString(w, state.base_dir);
+        try w.writeAll(",\"model\":");
+        try protocol.writeString(w, state.model);
+        try w.print(",\"max_tokens\":{d},\"reasoning_effort\":", .{state.max_tokens});
+        try protocol.writeString(w, state.reasoning_effort);
+        try w.print(",\"provider\":{{\"kind\":\"{s}\",\"base_url\":", .{@tagName(state.provider.kind)});
+        try protocol.writeString(w, state.provider.base_url);
+        try w.print(",\"openai_protocol\":\"{s}\",\"auth\":{{\"scheme\":", .{@tagName(state.provider.openai_protocol)});
+        try protocol.writeString(w, state.provider.auth.scheme);
+        try w.writeAll(",\"header\":");
+        try protocol.writeString(w, state.provider.auth.header);
+        try w.writeAll(",\"value_prefix\":");
+        try protocol.writeString(w, state.provider.auth.value_prefix);
+        try w.writeAll("}},\"tools\":");
+        try std.json.Stringify.value(state.tools, .{}, w);
+        try w.writeAll(",\"provider_tools\":");
+        try std.json.Stringify.value(state.provider_tools, .{}, w);
+        try w.print(",\"compact_boundary\":{d},\"compact_summary\":", .{state.compact_boundary});
+        if (state.compact_summary) |summary| try protocol.writeString(w, summary) else try w.writeAll("null");
+        try w.writeAll(",\"messages\":");
+        try std.json.Stringify.value(std.json.Value{ .array = state.messages }, .{}, w);
+        try w.writeAll(",\"pending\":[");
+        for (state.pending, 0..) |pending, index| {
+            if (index != 0) try w.writeByte(',');
+            try w.writeAll("{\"id\":");
+            try protocol.writeString(w, pending.id);
+            try w.writeAll(",\"name\":");
+            try protocol.writeString(w, pending.name);
+            try w.print(",\"kind\":\"{s}\"}}", .{@tagName(pending.kind)});
+        }
+        try w.writeAll("],\"completed\":[");
+        for (state.completed, 0..) |completed, index| {
+            if (index != 0) try w.writeByte(',');
+            try w.writeAll("{\"id\":");
+            try protocol.writeString(w, completed.id);
+            try w.writeAll(",\"content\":");
+            try protocol.writeString(w, completed.content);
+            try w.print(",\"is_error\":{}}}", .{completed.is_error});
+        }
+        try w.writeAll("]}");
     }
 
     /// Decode, authenticate and parse a run state. The run id the request
@@ -443,6 +653,7 @@ pub const Gateway = struct {
         Aead.decrypt(plain, ciphertext, tag.*, claimed_run_id, nonce.*, self.state_key) catch return error.RunStateInvalid;
         const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, plain, .{}) catch return error.RunStateInvalid;
         if (parsed != .object) return error.RunStateInvalid;
+        if ((valueUnsigned(parsed, "v") orelse 0) != 2) return error.RunStateInvalid;
         const messages_value = parsed.object.get("messages") orelse return error.RunStateInvalid;
         if (messages_value != .array) return error.RunStateInvalid;
         const pending_value = parsed.object.get("pending") orelse return error.RunStateInvalid;
@@ -456,6 +667,19 @@ pub const Gateway = struct {
                 .kind = std.meta.stringToEnum(PendingKind, kind_text) orelse return error.RunStateInvalid,
             };
         }
+        const completed_value = parsed.object.get("completed") orelse return error.RunStateInvalid;
+        if (completed_value != .array) return error.RunStateInvalid;
+        const completed = arena.alloc(Completed, completed_value.array.items.len) catch return error.OutOfMemory;
+        for (completed_value.array.items, completed) |item, *slot| {
+            slot.* = .{
+                .id = valueString(item, "id") orelse return error.RunStateInvalid,
+                .content = valueString(item, "content") orelse "",
+                .is_error = valueBool(item, "is_error") orelse false,
+            };
+        }
+        const provider_value = parsed.object.get("provider") orelse return error.RunStateInvalid;
+        const provider_spec = providerSpecFromParams(provider_value) catch return error.RunStateInvalid;
+        const summary_value = parsed.object.get("compact_summary");
         return .{
             .run_id = valueString(parsed, "run_id") orelse return error.RunStateInvalid,
             .skill_id = valueString(parsed, "skill_id") orelse return error.RunStateInvalid,
@@ -468,189 +692,234 @@ pub const Gateway = struct {
             .input_tokens = valueUnsigned(parsed, "input_tokens") orelse 0,
             .output_tokens = valueUnsigned(parsed, "output_tokens") orelse 0,
             .violations = @intCast(valueUnsigned(parsed, "violations") orelse 0),
+            .system = valueString(parsed, "system") orelse "",
+            .base_dir = valueString(parsed, "base_dir") orelse "",
+            .model = valueString(parsed, "model") orelse return error.RunStateInvalid,
+            .max_tokens = @intCast(@min(valueUnsigned(parsed, "max_tokens") orelse 0, std.math.maxInt(u32))),
+            .reasoning_effort = valueString(parsed, "reasoning_effort") orelse "",
+            .provider = provider_spec,
             .tools = parsed.object.get("tools") orelse std.json.Value{ .array = std.json.Array.init(arena) },
+            .provider_tools = parsed.object.get("provider_tools") orelse std.json.Value{ .array = std.json.Array.init(arena) },
+            .compact_boundary = @intCast(valueUnsigned(parsed, "compact_boundary") orelse 0),
+            .compact_summary = if (summary_value != null and summary_value.? == .string) summary_value.?.string else null,
             .messages = messages_value.array,
             .pending = pending,
+            .completed = completed,
         };
     }
 
-    // ── Steps ─────────────────────────────────────────────────────────────
+    // ── The shadow loop ───────────────────────────────────────────────────
 
-    /// One model call: append the assistant turn to the state and return the
-    /// Step that carries its tool calls, or the final text.
-    fn advance(self: *Gateway, arena: std.mem.Allocator, package: *const Package, state: *RunState) MethodError![]const u8 {
+    /// Run the client's fork loop until it needs the client: rebuild the
+    /// conversation from the state, call the model over the client's route,
+    /// serve sealed reads in place, and stop at the first batch of remote
+    /// tool uses (a Step) or at the end of the run.
+    fn advance(
+        self: *Gateway,
+        arena: std.mem.Allocator,
+        package: *const Package,
+        state: *RunState,
+        credential: []const u8,
+        resume_results: ?[]const agent_loop.SuspendInfo.CompletedResult,
+    ) MethodError![]const u8 {
         if (state.seq + 1 > state.max_steps) return self.finishRun(arena, state, "max_steps", "step limit reached");
-        const messages = try apiMessages(arena, state.messages.items);
-        const tools = try toolDefinitions(arena, state.tools);
-        const system = try systemPrompt(arena, package);
 
-        var text: std.ArrayList(u8) = .empty;
-        var calls: std.ArrayList(protocol.Call) = .empty;
-        // `AskUser` calls never reach the client as calls: the first valid one
-        // is the Step's question, the rest are answered by the gateway.
-        var asks: std.ArrayList(Pending) = .empty;
-        var question: ?protocol.Question = null;
-        var usage: api_stream.UsageDelta = .{};
-        var stop: api_stream.StopReason = .unknown;
-        {
-            self.model_mutex.lock();
-            defer self.model_mutex.unlock();
-            const stream = self.provider.sendStream(messages, system, tools, null, null, null, "") catch |err| {
-                log.warn("sealed-gw", "model call failed: {s}", .{@errorName(err)});
-                return error.UpstreamUnavailable;
+        // The conversation, owned by the loop's allocator for the request.
+        var conversation = Conversation.init(self.allocator);
+        defer conversation.deinit();
+        for (state.messages.items) |value| {
+            const text = protocol.serializeValue(arena, value) catch return error.OutOfMemory;
+            const message = transcript.parseMessageJson(text, self.allocator) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return error.RunStateInvalid,
             };
-            defer stream.deinit();
-            while (stream.next() catch |err| {
-                log.warn("sealed-gw", "model stream failed: {s}", .{@errorName(err)});
-                return error.UpstreamUnavailable;
-            }) |event| switch (event) {
-                .text => |chunk| {
-                    defer self.allocator.free(chunk);
-                    text.appendSlice(arena, chunk) catch return error.OutOfMemory;
-                },
-                .thinking => |chunk| self.allocator.free(chunk),
-                .reasoning_item => |chunk| self.allocator.free(chunk),
-                .web_search_query => |chunk| self.allocator.free(chunk),
-                .tool_use_start => |call| {
-                    defer {
-                        self.allocator.free(call.id);
-                        self.allocator.free(call.name);
-                        self.allocator.free(call.input_json);
-                    }
-                    const confirm = state.confirm_all or listContains(package.entry.manifest.confirmation_required_for, call.name);
-                    const input_json = arena.dupe(u8, call.input_json) catch return error.OutOfMemory;
-                    const id = arena.dupe(u8, call.id) catch return error.OutOfMemory;
-                    if (std.mem.eql(u8, call.name, ASK_USER_TOOL)) {
-                        const parsed_question: ?protocol.Question = questionFromInput(arena, id, input_json) catch null;
-                        var kind: PendingKind = .skipped;
-                        if (parsed_question) |q| {
-                            if (question == null) {
-                                question = q;
-                                kind = .question;
-                            }
-                        } else kind = .invalid_ask;
-                        asks.append(arena, .{ .id = id, .name = ASK_USER_TOOL, .kind = kind }) catch return error.OutOfMemory;
-                        // The assistant turn still records the call (below).
-                        calls.append(arena, .{ .id = id, .name = ASK_USER_TOOL, .input_json = input_json }) catch return error.OutOfMemory;
-                        continue;
-                    }
-                    calls.append(arena, .{
-                        .id = id,
-                        .name = arena.dupe(u8, call.name) catch return error.OutOfMemory,
-                        .input_json = input_json,
-                        .confirm = confirm,
-                        .deadline_ms = 300_000,
-                        .credentials = try declaredCredentialRefs(arena, package, input_json),
-                        .result_limit_bytes = package.entry.manifest.egress_max_result_bytes,
-                    }) catch return error.OutOfMemory;
-                },
-                .usage => |delta| {
-                    usage.input_tokens += delta.input_tokens;
-                    usage.output_tokens += delta.output_tokens;
-                    usage.cache_read_input_tokens += delta.cache_read_input_tokens;
-                    usage.cache_creation_input_tokens += delta.cache_creation_input_tokens;
-                },
-                .web_search_result => {},
-                .done => {},
-            };
-            stop = stream.stopReason();
+            conversation.append(message) catch return error.OutOfMemory;
         }
-        const rates = pricing.rateFor(self.provider.model());
-        const cost_usd = pricing.computeCost(rates, usage.input_tokens, usage.output_tokens, usage.cache_read_input_tokens, usage.cache_creation_input_tokens);
+        conversation.compact_boundary = @min(state.compact_boundary, conversation.messages.items.len);
+        if (state.compact_summary) |summary| conversation.compact_summary = self.allocator.dupe(u8, summary) catch return error.OutOfMemory;
+
+        // The client's provider, for this request only (§8.1).
+        var owned = provider_factory.makeProviderWithOptions(
+            self.allocator,
+            state.provider.kind,
+            credential,
+            state.model,
+            if (state.provider.base_url.len != 0) state.provider.base_url else null,
+            state.provider.openai_protocol,
+            dialect_mod.Resolver.builtin(),
+            .{
+                .auth_scheme = state.provider.auth.toScheme(),
+                .limits = if (state.max_tokens != 0) .{ .max_tokens_override = state.max_tokens } else null,
+            },
+        ) catch |err| {
+            log.warn("sealed-gw", "provider setup failed: {s}", .{@errorName(err)});
+            return error.UpstreamUnavailable;
+        };
+        defer owned.deinit();
+        const prov = owned.provider();
+        if (state.reasoning_effort.len != 0) {
+            if (std.meta.stringToEnum(types.ReasoningEffort, state.reasoning_effort)) |effort| {
+                if (prov.setReasoningEffortFn) |set| set(prov.ctx, effort);
+            }
+        }
+
+        const defs = try toolDefinitions(arena, state.tools, state.provider_tools);
+        var dispatcher = RemoteDispatcher{ .package = package, .base_dir = state.base_dir, .defs = defs };
+        var totals: usage_mod.UsageTotals = .{};
+        var wb = writer_backend.WriterBackend.initNullWithUsage(&totals);
+        const backend = wb.backend();
+        // The client is the permission authority (§6.2); the shadow's own
+        // chain never prompts and never executes.
+        const permission = permission_mod.PermissionContext{ .mode = .init(.bypass_permissions), .allocator = self.allocator };
+        const opts: agent_loop.Options = .{
+            .max_turns = INTERNAL_TURN_CAP,
+            .system_prompt = if (state.system.len != 0) state.system else null,
+            .tool_defs = defs,
+            .tool_dispatcher = dispatcher.dispatcher(),
+            .suspend_all_pending = true,
+            .agent_depth = 1,
+            .colorize = false,
+            .session_id = state.run_id,
+        };
+        const outcome = (if (resume_results) |results|
+            agent_loop.resumeRunWithResults(&conversation, prov, defs, &permission, results, opts, &backend, self.allocator)
+        else
+            agent_loop.run(&conversation, prov, defs, &permission, opts, &backend, self.allocator)) catch |err| {
+            log.warn("sealed-gw", "shadow loop failed: {s}", .{@errorName(err)});
+            return error.UpstreamUnavailable;
+        };
+        defer if (outcome.suspend_info) |info| info.deinit();
+
+        // Metering: informational under the client's own account (§8.2), but
+        // still the number the client's cap and ledger see.
+        const rates = pricing.rateFor(state.model);
+        const cost_usd = pricing.computeCost(rates, totals.input_tokens, totals.output_tokens, totals.cache_read_input_tokens, totals.cache_creation_input_tokens);
         const step_cost: i64 = @intFromFloat(@round(cost_usd * 1_000_000.0));
         state.cost_micros += step_cost;
-        state.input_tokens += usage.input_tokens;
-        state.output_tokens += usage.output_tokens;
+        state.input_tokens += totals.input_tokens;
+        state.output_tokens += totals.output_tokens;
         state.seq += 1;
-
-        // The assistant turn enters the conversation whatever happens next.
-        var blocks: std.ArrayList(std.json.Value) = .empty;
-        if (text.items.len != 0) {
-            var block = std.json.ObjectMap{};
-            block.put(arena, "type", .{ .string = "text" }) catch return error.OutOfMemory;
-            block.put(arena, "text", .{ .string = text.items }) catch return error.OutOfMemory;
-            blocks.append(arena, .{ .object = block }) catch return error.OutOfMemory;
-        }
-        for (calls.items) |call| {
-            var block = std.json.ObjectMap{};
-            block.put(arena, "type", .{ .string = "tool_use" }) catch return error.OutOfMemory;
-            block.put(arena, "id", .{ .string = call.id }) catch return error.OutOfMemory;
-            block.put(arena, "name", .{ .string = call.name }) catch return error.OutOfMemory;
-            block.put(arena, "input", .{ .string = call.input_json }) catch return error.OutOfMemory;
-            blocks.append(arena, .{ .object = block }) catch return error.OutOfMemory;
-        }
-        if (blocks.items.len != 0) try appendMessage(arena, state, "assistant", blocks.items);
-
         const step_usage: protocol.Usage = .{
-            .model = self.provider.model(),
-            .input_tokens = usage.input_tokens,
-            .output_tokens = usage.output_tokens,
-            .cache_read_input_tokens = usage.cache_read_input_tokens,
-            .cache_creation_input_tokens = usage.cache_creation_input_tokens,
+            .model = state.model,
+            .input_tokens = totals.input_tokens,
+            .output_tokens = totals.output_tokens,
+            .cache_read_input_tokens = totals.cache_read_input_tokens,
+            .cache_creation_input_tokens = totals.cache_creation_input_tokens,
             .cost_micros = step_cost,
             .currency = self.currency,
         };
+
+        // The continuation: the conversation as the loop left it.
+        try self.storeConversation(arena, state, &conversation);
+
         if (state.max_cost_micros > 0 and state.cost_micros > state.max_cost_micros) {
             return self.emitStep(arena, state, .{ .kind = .failed, .reason = "budget_exceeded", .message = "the run's cost cap was reached", .usage = step_usage });
         }
-        if (calls.items.len != 0 and stop != .end_turn) {
-            const pending = arena.alloc(Pending, calls.items.len) catch return error.OutOfMemory;
-            var client_calls: std.ArrayList(protocol.Call) = .empty;
-            for (calls.items, pending) |call, *slot| {
-                const ask = findPending(asks.items, call.id);
-                slot.* = if (ask) |a|
-                    a
-                else if (question != null)
-                    // §4.3: an `input_required` Step carries the question
-                    // alone; a sibling call waits for the next turn.
-                    .{ .id = call.id, .name = call.name, .kind = .skipped }
-                else blk: {
-                    client_calls.append(arena, call) catch return error.OutOfMemory;
-                    break :blk .{ .id = call.id, .name = call.name, .kind = .call };
+        switch (outcome.stop_reason) {
+            .suspended => {
+                const info = outcome.suspend_info orelse return error.UpstreamUnavailable;
+                return self.emitSuspended(arena, package, state, &conversation, info, step_usage);
+            },
+            .end_turn => {
+                const text = lastAssistantText(arena, &conversation) catch return error.OutOfMemory;
+                return self.emitStep(arena, state, .{ .kind = .final, .text = text, .usage = step_usage });
+            },
+            .api_error => return self.emitStep(arena, state, .{ .kind = .failed, .reason = "upstream_unavailable", .message = "the model provider failed", .usage = step_usage }),
+            .max_turns => return self.emitStep(arena, state, .{ .kind = .failed, .reason = "skill_error", .message = "the Skill took too many model turns without a tool call for the client", .usage = step_usage }),
+            else => |reason| return self.emitStep(arena, state, .{ .kind = .failed, .reason = "skill_error", .message = @tagName(reason), .usage = step_usage }),
+        }
+    }
+
+    /// Turn a suspended batch into the Step the client answers: every remote
+    /// tool use as a call (with `confirm` and `credentials`), or — when the
+    /// brain asked the user — the first question alone, the rest answered by
+    /// the gateway on continue.
+    fn emitSuspended(
+        self: *Gateway,
+        arena: std.mem.Allocator,
+        package: *const Package,
+        state: *RunState,
+        conversation: *const Conversation,
+        info: agent_loop.SuspendInfo,
+        step_usage: protocol.Usage,
+    ) MethodError![]const u8 {
+        const PendingUse = struct { id: []const u8, kind: []const u8, payload: []const u8 };
+        var uses: std.ArrayList(PendingUse) = .empty;
+        uses.append(arena, .{ .id = info.tool_use_id, .kind = info.kind, .payload = info.payload_json }) catch return error.OutOfMemory;
+        for (info.pending_siblings) |sibling| uses.append(arena, .{ .id = sibling.tool_use_id, .kind = sibling.kind, .payload = sibling.payload_json }) catch return error.OutOfMemory;
+
+        var question: ?protocol.Question = null;
+        for (uses.items) |use| {
+            if (std.mem.eql(u8, use.kind, PENDING_QUESTION_KIND)) {
+                question = .{
+                    .id = use.id,
+                    .message = firstQuestionText(arena, use.payload) catch return error.OutOfMemory,
+                    .tool_input_json = use.payload,
                 };
+                break;
             }
-            state.pending = pending;
+        }
+        const pending = arena.alloc(Pending, uses.items.len) catch return error.OutOfMemory;
+        var calls: std.ArrayList(protocol.Call) = .empty;
+        for (uses.items, pending) |use, *slot| {
+            const tool_use = findToolUse(conversation, use.id) orelse return error.UpstreamUnavailable;
+            const name = arena.dupe(u8, tool_use.name) catch return error.OutOfMemory;
             if (question) |q| {
-                return self.emitStep(arena, state, .{ .kind = .input_required, .question = q, .text = text.items, .usage = step_usage });
+                slot.* = .{ .id = use.id, .name = name, .kind = if (std.mem.eql(u8, use.id, q.id)) .question else .skipped };
+                continue;
             }
-            if (client_calls.items.len != 0) {
-                return self.emitStep(arena, state, .{ .kind = .tool_calls, .calls = client_calls.items, .text = text.items, .usage = step_usage });
-            }
-            // Only malformed `AskUser` calls: nothing for the client. Answer
-            // them here and let the model try again (bounded by max_steps).
-            var blocks_now: std.ArrayList(std.json.Value) = .empty;
-            for (pending) |p| {
-                var block = std.json.ObjectMap{};
-                block.put(arena, "type", .{ .string = "tool_result" }) catch return error.OutOfMemory;
-                block.put(arena, "tool_use_id", .{ .string = p.id }) catch return error.OutOfMemory;
-                block.put(arena, "content", .{ .string = skippedResultText(p.kind) }) catch return error.OutOfMemory;
-                block.put(arena, "is_error", .{ .bool = true }) catch return error.OutOfMemory;
-                blocks_now.append(arena, .{ .object = block }) catch return error.OutOfMemory;
-            }
-            try appendMessage(arena, state, "user", blocks_now.items);
-            state.pending = &.{};
-            // No Step left the gateway for this model call, so it is not a
-            // sequence number: the retry is the same client-visible Step. Its
-            // cost is already in the cumulative totals.
-            state.seq -= 1;
-            return self.advance(arena, package, state);
+            slot.* = .{ .id = use.id, .name = name, .kind = .call };
+            calls.append(arena, .{
+                .id = use.id,
+                .name = name,
+                .input_json = arena.dupe(u8, tool_use.input) catch return error.OutOfMemory,
+                .confirm = state.confirm_all or listContains(package.entry.manifest.confirmation_required_for, name),
+                .deadline_ms = 300_000,
+                .credentials = try declaredCredentialRefs(arena, package, tool_use.input),
+                .result_limit_bytes = package.entry.manifest.egress_max_result_bytes,
+            }) catch return error.OutOfMemory;
         }
-        if (stop == .max_tokens or stop == .refusal) {
-            return self.emitStep(arena, state, .{ .kind = .failed, .reason = "skill_error", .message = @tagName(stop), .usage = step_usage });
+        const completed = arena.alloc(Completed, info.completed_results.len) catch return error.OutOfMemory;
+        for (info.completed_results, completed) |result, *slot| slot.* = .{
+            .id = arena.dupe(u8, result.tool_use_id) catch return error.OutOfMemory,
+            .content = arena.dupe(u8, result.content) catch return error.OutOfMemory,
+            .is_error = result.is_error,
+        };
+        state.pending = pending;
+        state.completed = completed;
+        if (question) |q| {
+            return self.emitStep(arena, state, .{ .kind = .input_required, .question = q, .usage = step_usage });
         }
-        return self.emitStep(arena, state, .{ .kind = .final, .text = text.items, .usage = step_usage });
+        return self.emitStep(arena, state, .{ .kind = .tool_calls, .calls = calls.items, .usage = step_usage });
+    }
+
+    fn storeConversation(self: *Gateway, arena: std.mem.Allocator, state: *RunState, conversation: *const Conversation) MethodError!void {
+        _ = self;
+        var messages = std.json.Array.init(arena);
+        for (conversation.messages.items) |*message| {
+            var out: std.Io.Writer.Allocating = .init(arena);
+            transcript.Writer.renderMessageJson(&out.writer, message) catch return error.OutOfMemory;
+            const value = std.json.parseFromSliceLeaky(std.json.Value, arena, out.written(), .{}) catch return error.OutOfMemory;
+            messages.append(value) catch return error.OutOfMemory;
+        }
+        state.messages = messages;
+        state.compact_boundary = conversation.compact_boundary;
+        state.compact_summary = if (conversation.compact_summary) |summary| (arena.dupe(u8, summary) catch return error.OutOfMemory) else null;
     }
 
     fn finishRun(self: *Gateway, arena: std.mem.Allocator, state: *RunState, reason: []const u8, message: []const u8) MethodError![]const u8 {
         state.seq += 1;
         state.pending = &.{};
-        return self.emitStep(arena, state, .{ .kind = .failed, .reason = reason, .message = message, .usage = .{ .currency = self.currency } });
+        state.completed = &.{};
+        return self.emitStep(arena, state, .{ .kind = .failed, .reason = reason, .message = message, .usage = .{ .model = state.model, .currency = self.currency } });
     }
 
     const Emit = struct {
         kind: protocol.StepKind,
         calls: []const protocol.Call = &.{},
         question: ?protocol.Question = null,
+        /// `final` only: the Skill's result. A `tool_calls` Step carries no
+        /// text — the brain's narration between calls stays on the gateway.
         text: []const u8 = "",
         reason: []const u8 = "",
         message: []const u8 = "",
@@ -704,13 +973,13 @@ pub const Gateway = struct {
             try protocol.writeString(w, q.id);
             try w.writeAll(",\"message\":");
             try protocol.writeString(w, q.message);
-            if (q.schema_json.len != 0) {
-                try w.writeAll(",\"schema\":");
-                try w.writeAll(q.schema_json);
+            if (q.tool_input_json.len != 0) {
+                try w.writeAll(",\"tool_input\":");
+                try w.writeAll(q.tool_input_json);
             }
             try w.writeByte('}');
         }
-        if (emit.text.len != 0) {
+        if (emit.kind == .final and emit.text.len != 0) {
             try w.writeAll(",\"text\":");
             try protocol.writeString(w, emit.text);
         }
@@ -747,50 +1016,152 @@ pub const Gateway = struct {
 
 const protocol_default_max_steps: u64 = 200;
 
-/// The system prompt of a run: the Skill body, then what the model needs to
-/// know about this gateway's own affordances (credential placeholders for the
-/// declared references, and `AskUser`). Never anything per client or per run,
-/// so the provider's prompt cache is not broken between Steps.
-fn systemPrompt(arena: std.mem.Allocator, package: *const Package) Gateway.MethodError![]const u8 {
-    var out: std.ArrayList(u8) = .empty;
-    out.appendSlice(arena, package.body) catch return error.OutOfMemory;
-    const manifest = &package.entry.manifest;
-    if (manifest.credentials.len != 0) {
-        out.appendSlice(arena, "\n\n## Credentials\n\nThe user has bound these credential references on their machine. Write the placeholder literally wherever a tool input needs the value; the client substitutes it before executing and redacts it from the result. You never see the value and must not ask for it.\n") catch return error.OutOfMemory;
-        for (manifest.credentials) |credential| {
-            out.print(arena, "- `{s}{s}{s}`", .{ credentials.PLACEHOLDER_PREFIX, credential.ref, credentials.PLACEHOLDER_SUFFIX }) catch return error.OutOfMemory;
-            if (credential.purpose.len != 0) out.print(arena, " — {s}", .{credential.purpose}) catch return error.OutOfMemory;
-            out.append(arena, '\n') catch return error.OutOfMemory;
+// ── The capturing dispatcher ──────────────────────────────────────────────
+
+/// The shadow loop's tool directory: every client tool is dispatchable by
+/// name, none executes here. A `Read` of a sealed reference file is served
+/// from the package; everything else is marked pending so the loop suspends
+/// and the batch becomes a Step.
+const RemoteDispatcher = struct {
+    package: *const Package,
+    base_dir: []const u8,
+    defs: []const json_mod.ToolDefinition,
+
+    fn dispatcher(self: *const RemoteDispatcher) tool_context.ToolDispatcher {
+        return .{ .ctx = @ptrCast(self), .dispatchFn = &dispatchFn, .metadataFn = &metadataFn, .nameAtFn = &nameAtFn };
+    }
+
+    fn cast(ctx: *const anyopaque) *const RemoteDispatcher {
+        return @ptrCast(@alignCast(ctx));
+    }
+
+    fn known(self: *const RemoteDispatcher, name: []const u8) bool {
+        for (self.defs) |def| if (def.server_type == null and std.mem.eql(u8, def.name, name)) return true;
+        return false;
+    }
+
+    fn metadataFn(ctx: *const anyopaque, name: []const u8) ?tool_context.ToolMeta {
+        const self = cast(ctx);
+        if (!self.known(name)) return null;
+        return .{ .kind = .external, .category = category_mod.getToolCategory(name), .replay = .never, .prefetch_safe = false };
+    }
+
+    fn nameAtFn(ctx: *const anyopaque, index: usize) ?[]const u8 {
+        const self = cast(ctx);
+        var seen: usize = 0;
+        for (self.defs) |def| {
+            if (def.server_type != null) continue;
+            if (seen == index) return def.name;
+            seen += 1;
         }
+        return null;
     }
-    out.appendSlice(arena, "\n\n## Asking the user\n\nWhen only the person running this Skill can supply what you need, call `" ++ ASK_USER_TOOL ++ "` with one clear question; the answer comes back as the tool result.\n") catch return error.OutOfMemory;
-    return out.items;
+
+    fn dispatchFn(ctx: *const anyopaque, tool_ctx: *const tool_context.ToolContext, name: []const u8, args: []const u8) anyerror!tool_context.ToolDispatchOutcome {
+        const self = cast(ctx);
+        if (std.mem.eql(u8, name, "Read")) {
+            if (try self.sealedRelativePath(tool_ctx.allocator, args)) |relative| {
+                return .{ .ok = tool_result.ToolResultBody.initInline(try self.readSealed(tool_ctx.allocator, relative)) };
+            }
+        }
+        const kind: []const u8 = if (std.mem.eql(u8, name, ASK_USER_TOOL)) PENDING_QUESTION_KIND else PENDING_REMOTE_KIND;
+        if (tool_ctx.pending_request) |slot| slot.* = .{
+            .kind = try tool_ctx.allocator.dupe(u8, kind),
+            .payload_json = try tool_ctx.allocator.dupe(u8, args),
+        };
+        return error.UiPending;
+    }
+
+    /// `file_path` of a Read, when it names a file under `<base_dir>/sealed/`:
+    /// the path relative to the package's sealed directory.
+    fn sealedRelativePath(self: *const RemoteDispatcher, allocator: std.mem.Allocator, args: []const u8) !?[]const u8 {
+        var parsed = std.json.parseFromSlice(std.json.Value, allocator, args, .{}) catch return null;
+        defer parsed.deinit();
+        if (parsed.value != .object) return null;
+        const path_value = parsed.value.object.get("file_path") orelse return null;
+        if (path_value != .string) return null;
+        const path = try normalizeSlashes(allocator, path_value.string);
+        const base = try normalizeSlashes(allocator, self.base_dir);
+        const prefix = try std.mem.concat(allocator, u8, &.{ base, "/" ++ SEALED_DIR ++ "/" });
+        if (!std.mem.startsWith(u8, path, prefix)) return null;
+        const relative = path[prefix.len..];
+        if (relative.len == 0) return null;
+        var parts = std.mem.splitScalar(u8, relative, '/');
+        while (parts.next()) |part| {
+            if (part.len == 0 or std.mem.eql(u8, part, ".") or std.mem.eql(u8, part, "..")) return null;
+        }
+        return relative;
+    }
+
+    /// The sealed file as the client's Read tool would render it: `cat -n`
+    /// numbering, so the brain sees what it would have seen locally.
+    fn readSealed(self: *const RemoteDispatcher, allocator: std.mem.Allocator, relative: []const u8) ![]u8 {
+        const listed = for (self.package.sealed_files) |path| {
+            if (std.mem.eql(u8, path, relative)) break true;
+        } else false;
+        if (!listed) return error.FileNotFound;
+        const full = try std.fs.path.join(allocator, &.{ self.package.dir, SEALED_DIR, relative });
+        const bytes = readFile(allocator, full, MAX_SEALED_READ_BYTES) catch return error.FileNotFound;
+        var out: std.ArrayList(u8) = .empty;
+        var line_no: usize = 1;
+        var lines = std.mem.splitScalar(u8, bytes, '\n');
+        while (lines.next()) |line| : (line_no += 1) {
+            if (line.len == 0 and lines.peek() == null) break;
+            try out.print(allocator, "{d: >6}\t{s}\n", .{ line_no, line });
+        }
+        return out.toOwnedSlice(allocator);
+    }
+};
+
+fn normalizeSlashes(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+    const out = try allocator.dupe(u8, path);
+    for (out) |*c| if (c.* == '\\') {
+        c.* = '/';
+    };
+    while (out.len > 1 and out[out.len - 1] == '/') return out[0 .. out.len - 1];
+    return out;
 }
 
-/// The gateway's `AskUser` definition (§4.3), appended to the client's tools.
-fn askUserDefinition(arena: std.mem.Allocator) Gateway.MethodError!json_mod.ToolDefinition {
-    const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, ASK_USER_SCHEMA_JSON, .{}) catch return error.OutOfMemory;
-    var schema: json_mod.InputSchema = .{};
-    schema.properties = parsed.object.get("properties").?.object;
-    const required = arena.alloc([]const u8, 1) catch return error.OutOfMemory;
-    required[0] = "message";
-    schema.required = required;
-    schema.additional_properties = false;
-    return .{ .name = ASK_USER_TOOL, .description = ASK_USER_DESCRIPTION, .input_schema = schema };
+/// The question text of an `AskUserQuestion` input: the first question, or a
+/// marker the client's tool will reject with a proper error.
+fn firstQuestionText(arena: std.mem.Allocator, input_json: []const u8) ![]const u8 {
+    const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, input_json, .{}) catch return "(malformed question)";
+    if (parsed != .object) return "(malformed question)";
+    const questions = parsed.object.get("questions") orelse return "(malformed question)";
+    if (questions != .array or questions.array.items.len == 0) return "(malformed question)";
+    return valueString(questions.array.items[0], "question") orelse "(malformed question)";
 }
 
-/// An `AskUser` call's input as the Step's question: `message` is required,
-/// `schema` is passed through canonicalized.
-fn questionFromInput(arena: std.mem.Allocator, id: []const u8, input_json: []const u8) !protocol.Question {
-    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, arena, input_json, .{});
-    if (parsed != .object) return error.InvalidParams;
-    const message = valueString(parsed, "message") orelse return error.InvalidParams;
-    if (message.len == 0) return error.InvalidParams;
-    var schema_json: []const u8 = "";
-    if (parsed.object.get("schema")) |schema| {
-        if (schema == .object) schema_json = try protocol.canonicalize(arena, schema);
+fn findToolUse(conversation: *const Conversation, id: []const u8) ?msg.ToolUse {
+    var index = conversation.messages.items.len;
+    while (index > 0) {
+        index -= 1;
+        const message = conversation.messages.items[index];
+        if (message.role != .assistant) continue;
+        for (message.blocks) |block| switch (block) {
+            .tool_use => |use| if (std.mem.eql(u8, use.id, id)) return use,
+            else => {},
+        };
+        return null;
     }
-    return .{ .id = id, .message = message, .schema_json = schema_json };
+    return null;
+}
+
+/// The text of the last assistant message: the Skill's result.
+fn lastAssistantText(arena: std.mem.Allocator, conversation: *const Conversation) ![]const u8 {
+    var index = conversation.messages.items.len;
+    while (index > 0) {
+        index -= 1;
+        const message = conversation.messages.items[index];
+        if (message.role != .assistant) continue;
+        var out: std.ArrayList(u8) = .empty;
+        for (message.blocks) |block| switch (block) {
+            .text => |text| try out.appendSlice(arena, text),
+            else => {},
+        };
+        return out.items;
+    }
+    return "";
 }
 
 /// §6.4: the manifest-declared references whose placeholder appears in the
@@ -834,29 +1205,103 @@ fn packageLessThan(_: void, lhs: Package, rhs: Package) bool {
 
 pub fn loadPackage(arena: std.mem.Allocator, package_dir: []const u8, name: []const u8) Error!Package {
     const md_path = std.fs.path.join(arena, &.{ package_dir, "SKILL.md" }) catch return error.OutOfMemory;
-    const md = readFile(arena, md_path) catch return error.InvalidPackage;
+    const md = readFile(arena, md_path, MAX_REQUEST_BYTES) catch return error.InvalidPackage;
     const skill = definition.parseSkillMdWithFallback(arena, md, md_path, name) catch return error.InvalidPackage;
     const manifest_path = std.fs.path.join(arena, &.{ package_dir, "manifest.json" }) catch return error.OutOfMemory;
-    const manifest_json = readFile(arena, manifest_path) catch return error.InvalidPackage;
+    const manifest_json = readFile(arena, manifest_path, MAX_REQUEST_BYTES) catch return error.InvalidPackage;
     const manifest_value = std.json.parseFromSliceLeaky(std.json.Value, arena, manifest_json, .{}) catch return error.InvalidPackage;
     const canonical = protocol.canonicalize(arena, manifest_value) catch return error.InvalidPackage;
     const digest = protocol.digestHex(arena, canonical) catch return error.OutOfMemory;
     const manifest = protocol.manifestFromValue(arena, manifest_value) catch return error.InvalidPackage;
     if (!std.mem.eql(u8, manifest.name, name)) return error.InvalidPackage;
+
+    // Public assets: every regular file except the Skill's own two documents
+    // and the sealed set, which is listed separately and never served.
+    var assets: std.ArrayList(Asset) = .empty;
+    var sealed_files: std.ArrayList([]const u8) = .empty;
+    try collectFiles(arena, package_dir, "", &assets, &sealed_files);
+    std.mem.sort(Asset, assets.items, {}, assetLessThan);
+    std.mem.sort([]const u8, sealed_files.items, {}, pathLessThan);
+
+    var assets_json: std.Io.Writer.Allocating = .init(arena);
+    const aw = &assets_json.writer;
+    aw.writeByte('[') catch return error.OutOfMemory;
+    for (assets.items, 0..) |asset, index| {
+        if (index != 0) aw.writeByte(',') catch return error.OutOfMemory;
+        aw.writeAll("{\"path\":") catch return error.OutOfMemory;
+        protocol.writeString(aw, asset.path) catch return error.OutOfMemory;
+        aw.writeAll(",\"sha256\":") catch return error.OutOfMemory;
+        protocol.writeString(aw, asset.sha256) catch return error.OutOfMemory;
+        aw.print(",\"bytes\":{d}}}", .{asset.bytes}) catch return error.OutOfMemory;
+    }
+    aw.writeByte(']') catch return error.OutOfMemory;
+
     const entry_json = std.fmt.allocPrint(
         arena,
-        "{{\"skill_id\":{s},\"version\":{s},\"manifest\":{s},\"manifest_digest\":\"{s}\",\"subscription\":{{\"state\":\"active\"}}}}",
-        .{ quoted(arena, manifest.skill_id) catch return error.OutOfMemory, quoted(arena, manifest.version) catch return error.OutOfMemory, canonical, digest },
+        "{{\"skill_id\":{s},\"version\":{s},\"manifest\":{s},\"manifest_digest\":\"{s}\",\"subscription\":{{\"state\":\"active\"}},\"assets\":{s}}}",
+        .{ quoted(arena, manifest.skill_id) catch return error.OutOfMemory, quoted(arena, manifest.version) catch return error.OutOfMemory, canonical, digest, assets_json.written() },
     ) catch return error.OutOfMemory;
     const parsed = protocol.parseEntry(arena, entry_json) catch return error.InvalidPackage;
     // The entry's arena is a child of ours; keep the parsed view alive by
     // never calling deinit (it is freed with `arena`).
     return .{
         .name = name,
+        .dir = package_dir,
         .body = std.mem.trim(u8, skill.body, " \r\n\t"),
         .entry_json = entry_json,
         .entry = parsed.entry,
+        .assets = assets.toOwnedSlice(arena) catch return error.OutOfMemory,
+        .sealed_files = sealed_files.toOwnedSlice(arena) catch return error.OutOfMemory,
     };
+}
+
+fn assetLessThan(_: void, lhs: Asset, rhs: Asset) bool {
+    return std.mem.order(u8, lhs.path, rhs.path) == .lt;
+}
+
+fn pathLessThan(_: void, lhs: []const u8, rhs: []const u8) bool {
+    return std.mem.order(u8, lhs, rhs) == .lt;
+}
+
+/// Walk `root/<prefix>` recursively. Top-level `SKILL.md` and `manifest.json`
+/// are the Skill's own documents; the top-level `sealed/` tree is listed as
+/// sealed; dotfiles are skipped; everything else is a public asset.
+fn collectFiles(arena: std.mem.Allocator, root: []const u8, prefix: []const u8, assets: *std.ArrayList(Asset), sealed_files: *std.ArrayList([]const u8)) Error!void {
+    const dir_path = if (prefix.len == 0) root else (joinRelative(arena, root, prefix) catch return error.OutOfMemory);
+    const dir_z = arena.dupeZ(u8, dir_path) catch return error.OutOfMemory;
+    var iterator = pdir.open(dir_z) orelse return error.InvalidPackage;
+    defer pdir.close(&iterator);
+    while (pdir.next(&iterator)) |entry| {
+        if (entry.name.len == 0 or entry.name[0] == '.') continue;
+        if (std.mem.eql(u8, entry.name, ".") or std.mem.eql(u8, entry.name, "..")) continue;
+        const relative = if (prefix.len == 0)
+            arena.dupe(u8, entry.name) catch return error.OutOfMemory
+        else
+            std.mem.concat(arena, u8, &.{ prefix, "/", entry.name }) catch return error.OutOfMemory;
+        if (entry.is_dir) {
+            try collectFiles(arena, root, relative, assets, sealed_files);
+            continue;
+        }
+        if (prefix.len == 0 and (std.mem.eql(u8, entry.name, "SKILL.md") or std.mem.eql(u8, entry.name, "manifest.json"))) continue;
+        if (std.mem.startsWith(u8, relative, SEALED_DIR ++ "/")) {
+            sealed_files.append(arena, relative[SEALED_DIR.len + 1 ..]) catch return error.OutOfMemory;
+            continue;
+        }
+        if (!protocol.validAssetPath(relative)) continue;
+        const full = joinRelative(arena, root, relative) catch return error.OutOfMemory;
+        const bytes = readFile(arena, full, protocol.MAX_ASSET_BYTES) catch return error.InvalidPackage;
+        const digest = protocol.digestHex(arena, bytes) catch return error.OutOfMemory;
+        assets.append(arena, .{ .path = relative, .sha256 = digest, .bytes = bytes.len }) catch return error.OutOfMemory;
+    }
+}
+
+/// `root/relative` with the package-relative `/` path on this platform.
+fn joinRelative(arena: std.mem.Allocator, root: []const u8, relative: []const u8) ![]const u8 {
+    var parts: std.ArrayList([]const u8) = .empty;
+    try parts.append(arena, root);
+    var segments = std.mem.splitScalar(u8, relative, '/');
+    while (segments.next()) |segment| try parts.append(arena, segment);
+    return std.fs.path.join(arena, parts.items);
 }
 
 fn quoted(arena: std.mem.Allocator, value: []const u8) ![]const u8 {
@@ -865,66 +1310,34 @@ fn quoted(arena: std.mem.Allocator, value: []const u8) ![]const u8 {
     return out.written();
 }
 
-fn readFile(arena: std.mem.Allocator, path: []const u8) ![]u8 {
-    const z = try arena.dupeZ(u8, path);
+fn readFile(allocator: std.mem.Allocator, path: []const u8, cap: usize) ![]u8 {
+    const z = try allocator.dupeZ(u8, path);
+    defer allocator.free(z);
     const fd = pfs.open(z.ptr, .{ .ACCMODE = .RDONLY }, 0);
     if (fd < 0) return error.NotFound;
     defer pfs.close(fd);
     var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
     var chunk: [8192]u8 = undefined;
     while (true) {
         const n = pfs.read(fd, &chunk);
         if (n < 0) return error.ReadFailed;
         if (n == 0) break;
-        try out.appendSlice(arena, chunk[0..@intCast(n)]);
-        if (out.items.len > MAX_REQUEST_BYTES) return error.TooLarge;
+        try out.appendSlice(allocator, chunk[0..@intCast(n)]);
+        if (out.items.len > cap) return error.TooLarge;
     }
-    return out.items;
+    return out.toOwnedSlice(allocator);
 }
 
 // ── Conversions ───────────────────────────────────────────────────────────
 
-fn apiMessages(arena: std.mem.Allocator, messages: []const std.json.Value) Gateway.MethodError![]const types.ApiMessage {
-    const out = arena.alloc(types.ApiMessage, messages.len) catch return error.OutOfMemory;
-    for (messages, out) |message, *slot| {
-        const role_text = valueString(message, "role") orelse return error.RunStateInvalid;
-        const role: types.MessageRole = if (std.mem.eql(u8, role_text, "user")) .user else .assistant;
-        const content = (if (message == .object) message.object.get("content") else null) orelse return error.RunStateInvalid;
-        if (content != .array) return error.RunStateInvalid;
-        const blocks = arena.alloc(types.ApiContent, content.array.items.len) catch return error.OutOfMemory;
-        for (content.array.items, blocks) |block, *target| {
-            const kind = valueString(block, "type") orelse return error.RunStateInvalid;
-            if (std.mem.eql(u8, kind, "text")) {
-                target.* = .{ .text = valueString(block, "text") orelse "" };
-            } else if (std.mem.eql(u8, kind, "tool_use")) {
-                target.* = .{ .tool_use = .{
-                    .id = valueString(block, "id") orelse return error.RunStateInvalid,
-                    .name = valueString(block, "name") orelse return error.RunStateInvalid,
-                    .input = valueString(block, "input") orelse "{}",
-                } };
-            } else if (std.mem.eql(u8, kind, "tool_result")) {
-                target.* = .{ .tool_result = .{
-                    .tool_use_id = valueString(block, "tool_use_id") orelse return error.RunStateInvalid,
-                    .content = valueString(block, "content") orelse "",
-                    .is_error = valueBool(block, "is_error") orelse false,
-                } };
-            } else return error.RunStateInvalid;
-        }
-        slot.* = .{ .role = role, .content = blocks };
-    }
-    return out;
-}
-
-/// The client's tool definitions (§4.1) in the neutral request type.
-fn toolDefinitions(arena: std.mem.Allocator, tools: std.json.Value) Gateway.MethodError![]const json_mod.ToolDefinition {
-    if (tools != .array) return error.InvalidParams;
-    const out = arena.alloc(json_mod.ToolDefinition, tools.array.items.len + 1) catch return error.OutOfMemory;
-    // The gateway's own tool comes last; a client tool of the same name is
-    // refused, since its call would never reach the client as a call.
-    out[tools.array.items.len] = try askUserDefinition(arena);
+/// The client's tool definitions (§4.1) plus its provider-side server tools,
+/// in the neutral request type.
+fn toolDefinitions(arena: std.mem.Allocator, tools: std.json.Value, provider_tools: std.json.Value) Gateway.MethodError![]const json_mod.ToolDefinition {
+    if (tools != .array or provider_tools != .array) return error.InvalidParams;
+    const out = arena.alloc(json_mod.ToolDefinition, tools.array.items.len + provider_tools.array.items.len) catch return error.OutOfMemory;
     for (tools.array.items, out[0..tools.array.items.len]) |tool, *slot| {
         const name = valueString(tool, "name") orelse return error.InvalidParams;
-        if (std.mem.eql(u8, name, ASK_USER_TOOL)) return error.InvalidParams;
         var schema: json_mod.InputSchema = .{};
         if (tool == .object) if (tool.object.get("input_schema")) |raw| {
             if (raw != .object) return error.InvalidParams;
@@ -949,14 +1362,33 @@ fn toolDefinitions(arena: std.mem.Allocator, tools: std.json.Value) Gateway.Meth
             .name = name,
             .description = valueString(tool, "description") orelse "",
             .input_schema = schema,
+            // The client's loop advertised this deferred tool as-is; so does
+            // the shadow's (and keeps ToolSearch for it, as the client does).
+            .deferred = valueBool(tool, "deferred") orelse false,
+        };
+    }
+    for (provider_tools.array.items, out[tools.array.items.len..]) |tool, *slot| {
+        const name = valueString(tool, "name") orelse return error.InvalidParams;
+        const server_type = valueString(tool, "type") orelse return error.InvalidParams;
+        slot.* = .{
+            .name = name,
+            .description = valueString(tool, "description") orelse "",
+            .input_schema = .{},
+            .server_type = server_type,
         };
     }
     return out;
 }
 
-fn findPending(list: []const Gateway.Pending, id: []const u8) ?Gateway.Pending {
-    for (list) |item| if (std.mem.eql(u8, item.id, id)) return item;
-    return null;
+fn stringList(arena: std.mem.Allocator, value: ?std.json.Value) Gateway.MethodError![]const []const u8 {
+    const list = value orelse return &.{};
+    if (list != .array) return error.InvalidParams;
+    const out = arena.alloc([]const u8, list.array.items.len) catch return error.OutOfMemory;
+    for (list.array.items, out) |item, *slot| {
+        if (item != .string) return error.InvalidParams;
+        slot.* = item.string;
+    }
+    return out;
 }
 
 fn listContains(list: []const []const u8, needle: []const u8) bool {
@@ -1090,6 +1522,9 @@ pub const Server = struct {
         const cap = MAX_REQUEST_BYTES;
         const buf = self.allocator.alloc(u8, cap) catch return;
         defer self.allocator.free(buf);
+        // The client's provider credential arrives in this buffer and lives
+        // nowhere else; it is zeroed before the buffer goes back.
+        defer @memset(buf, 0);
         var total: usize = 0;
         var headers_end: ?usize = null;
         var content_length: usize = 0;
@@ -1126,7 +1561,8 @@ pub const Server = struct {
             writeResponse(fd, "401 Unauthorized", "{\"error\":\"unauthorized\"}");
             return;
         }
-        const response = self.gateway.handle(self.allocator, body) catch |err| {
+        const credential = std.mem.trim(u8, headerValue(head, protocol.PROVIDER_CREDENTIAL_HEADER) orelse "", " ");
+        const response = self.gateway.handle(self.allocator, body, credential) catch |err| {
             log.warn("sealed-gw", "request failed: {s}", .{@errorName(err)});
             writeResponse(fd, "500 Internal Server Error", "{\"error\":\"internal\"}");
             return;
@@ -1174,4 +1610,26 @@ fn fillRandom(buf: []u8) error{OutOfMemory}!void {
     // The platform RNG is the OS CSPRNG; a failure to read it is fatal for a
     // key or nonce, so it surfaces as an error instead of a predictable value.
     if (!rng.randomBytes(buf)) return error.OutOfMemory;
+}
+
+test "sealed read paths are confined to <base_dir>/sealed/" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const package = Package{ .name = "x", .dir = "/pkg", .body = "", .entry_json = "", .entry = undefined, .assets = &.{}, .sealed_files = &.{"notes.md"} };
+    const dispatcher = RemoteDispatcher{ .package = &package, .base_dir = "C:\\Users\\u\\.metacodes\\sealed-skills\\x", .defs = &.{} };
+    const inside = try dispatcher.sealedRelativePath(arena.allocator(), "{\"file_path\":\"C:/Users/u/.metacodes/sealed-skills/x/sealed/notes.md\"}");
+    try std.testing.expectEqualStrings("notes.md", inside.?);
+    try std.testing.expect((try dispatcher.sealedRelativePath(arena.allocator(), "{\"file_path\":\"C:/Users/u/.metacodes/sealed-skills/x/scripts/post.py\"}")) == null);
+    try std.testing.expect((try dispatcher.sealedRelativePath(arena.allocator(), "{\"file_path\":\"C:/Users/u/.metacodes/sealed-skills/x/sealed/../manifest.json\"}")) == null);
+    try std.testing.expect((try dispatcher.sealedRelativePath(arena.allocator(), "{\"file_path\":\"/etc/passwd\"}")) == null);
+    try std.testing.expect((try dispatcher.sealedRelativePath(arena.allocator(), "not json")) == null);
+}
+
+test "the first question of an AskUserQuestion input is the Step's message" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    try std.testing.expectEqualStrings("Which ledger?", try firstQuestionText(arena.allocator(), "{\"questions\":[{\"question\":\"Which ledger?\",\"options\":[]}]}"));
+    try std.testing.expectEqualStrings("(malformed question)", try firstQuestionText(arena.allocator(), "{\"schema\":{}}"));
 }

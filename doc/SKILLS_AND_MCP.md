@@ -106,14 +106,21 @@ and `sealed-manifest-digest`, `context: fork`, and the allowlist as
 `Skill` tool run it as a fork whose model is the gateway. Usage is charged to
 the client's gateway account step by step under
 `METACODES_SEALED_MAX_COST_MICROS` and recorded in
-`<state root>/ledger/sealed.ndjson` (`metacodes sealed ledger`). A call the
-gateway marks `confirm: true` is approved interactively even in a mode that
-would auto-allow it; a question the Skill has for the user is asked through
-the session's dialog and answered in place. A credential reference the
-manifest declares is bound with `metacodes sealed bind <name> <ref>` (secret
-from stdin or `--from-env`), kept in `<state root>/sealed-credentials.json`,
-substituted into the call on this machine and redacted from the result
-before it leaves. `metacodes sealed serve` runs the reference gateway.
+`<state root>/ledger/sealed.ndjson` (`metacodes sealed ledger`). The model
+is this session's own: the gateway runs the Skill's loop as a shadow of the
+fork and calls the model over the session's provider route and credential,
+so the request the model sees is the one a local fork would have sent, on
+the user's account. A call the gateway marks `confirm: true` is approved
+interactively even in a mode that would auto-allow it; a question the
+Skill has for the user is asked through the session's own AskUserQuestion
+dialog and answered in place. A credential reference the manifest declares
+is bound with `metacodes sealed bind <name> <ref>` (secret from stdin or
+`--from-env`), kept in `<state root>/sealed-credentials.json`, substituted
+into the call on this machine and redacted from the result before it
+leaves. The Skill's public files (scripts, data) are installed under the
+pin directory; its `sealed/` reference files are read on the gateway.
+`metacodes sealed serve` runs the reference gateway; it has no provider
+credentials of its own.
 
 ## MCP servers
 

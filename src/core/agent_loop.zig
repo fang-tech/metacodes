@@ -248,14 +248,23 @@ pub const SuspendInfo = struct {
     payload_json: []const u8, // 渲染规格(owned)
     /// 同轮已完成工具的结果(owned)。resume 时与 pending 的迟来结果一起补成单条 user 消息。
     completed_results: []CompletedResult,
+    /// Every *other* pending tool use of the batch when
+    /// `Options.suspend_all_pending` is set: a batch whose tools all execute
+    /// elsewhere (a sealed Skill's client) is answered as a whole through
+    /// `resumeRunWithResults`. Empty under the default single-suspend rule,
+    /// where siblings become `ConcurrentSuspendUnsupported` placeholders.
+    pending_siblings: []PendingSibling = &.{},
     allocator: std.mem.Allocator,
-
     pub const CompletedResult = struct {
         tool_use_id: []const u8, // owned
         content: []const u8, // owned
         is_error: bool,
     };
-
+    pub const PendingSibling = struct {
+        tool_use_id: []const u8, // owned
+        kind: []const u8, // owned
+        payload_json: []const u8, // owned
+    };
     pub fn deinit(self: SuspendInfo) void {
         self.allocator.free(self.tool_use_id);
         self.allocator.free(self.kind);
@@ -265,6 +274,12 @@ pub const SuspendInfo = struct {
             self.allocator.free(cr.content);
         }
         self.allocator.free(self.completed_results);
+        for (self.pending_siblings) |sibling| {
+            self.allocator.free(sibling.tool_use_id);
+            self.allocator.free(sibling.kind);
+            self.allocator.free(sibling.payload_json);
+        }
+        self.allocator.free(self.pending_siblings);
     }
 };
 
@@ -415,6 +430,11 @@ pub const Options = struct {
     /// immutable selection that produced `tool_defs`. Null preserves the App's
     /// existing process registry behavior.
     tool_dispatcher: ?tools_mod.ToolDispatcher = null,
+    /// Suspend on a batch with several pending tool uses by carrying all of
+    /// them in `SuspendInfo.pending_siblings` instead of answering the extra
+    /// ones with `ConcurrentSuspendUnsupported`. For a dispatcher whose every
+    /// tool executes elsewhere and answers through `resumeRunWithResults`.
+    suspend_all_pending: bool = false,
     /// Host tool 执行身份(admission 处固定,AgentSession.runLoop 显式传值)。
     /// 可选 + null 默认:非 Host-tool 消费者零感知(共享基础设施扩展规则)。
     host_run: ?tools_mod.HostRunIdentity = null,
@@ -3377,8 +3397,33 @@ pub fn run(
             }
             var completed_names: std.ArrayList([]const u8) = .empty;
             defer completed_names.deinit(allocator);
+            var pending_siblings: std.ArrayList(SuspendInfo.PendingSibling) = .empty;
+            errdefer {
+                for (pending_siblings.items) |sibling| {
+                    allocator.free(sibling.tool_use_id);
+                    allocator.free(sibling.kind);
+                    allocator.free(sibling.payload_json);
+                }
+                pending_siblings.deinit(allocator);
+            }
             for (slots.items) |*o| {
                 if (o == s or o.decision != .run) continue;
+                if (o.pending and opts.suspend_all_pending) {
+                    // The whole batch waits elsewhere: hand the sibling over
+                    // with its request intact (ownership moves, no placeholder).
+                    try pending_siblings.append(allocator, .{
+                        .tool_use_id = try allocator.dupe(u8, o.id),
+                        .kind = if (o.pending_kind) |k| k else try allocator.dupe(u8, ""),
+                        .payload_json = if (o.pending_payload) |p| p else try allocator.dupe(u8, "{}"),
+                    });
+                    o.pending_kind = null;
+                    o.pending_payload = null;
+                    if (o.content) |c| {
+                        allocator.free(c);
+                        o.content = null;
+                    }
+                    continue;
+                }
                 const content: []const u8 = if (o.pending)
                     // 非首个 pending:MVP 不支持并发挂起 → 错误占位(模型 resume 后可重试)。
                     try tool_error.errorToJson("ConcurrentSuspendUnsupported", "tool {s} requested UI while another suspended; not supported in MVP", .{o.name}, allocator)
@@ -3433,6 +3478,7 @@ pub fn run(
                 .kind = if (s.pending_kind) |k| k else try allocator.dupe(u8, ""),
                 .payload_json = if (s.pending_payload) |p| p else try allocator.dupe(u8, "{}"),
                 .completed_results = try completed.toOwnedSlice(allocator),
+                .pending_siblings = try pending_siblings.toOwnedSlice(allocator),
                 .allocator = allocator,
             };
             s.pending_kind = null;
@@ -3798,6 +3844,42 @@ fn elapsedSinceNs(started_ns: util_time.Nanos) u64 {
 /// **为什么要 completed_results**:挂起的那条 assistant 消息可能有多个 tool_use(A=pending,
 /// B/C=done)。API 要求 A+B+C 的 tool_result 都在紧接的同一条 user 消息里。挂起时已完成的 B/C
 /// 结果没单独提交(那样会拆 turn 违规),而是 stash 在 SuspendInfo.completed_results,此刻一起补。
+/// Resume a run suspended with `suspend_all_pending`: every pending tool use of
+/// the batch (the suspend point and its `pending_siblings`) plus the completed
+/// siblings arrive as one list, and enter the conversation as one user message
+/// so the API's tool_use/tool_result pairing holds. `results` are borrowed.
+pub fn resumeRunWithResults(
+    conversation: *Conversation,
+    provider: provider_mod.Provider,
+    tool_defs: []const json_mod.ToolDefinition,
+    permission_ctx: *const permission_mod.PermissionContext,
+    results: []const SuspendInfo.CompletedResult,
+    opts: Options,
+    backend: *const UiBackend,
+    allocator: std.mem.Allocator,
+) !RunResult {
+    if (results.len == 0) return error.NoResultsToResume;
+    var blocks: std.ArrayList(msg.Block) = .empty;
+    errdefer {
+        for (blocks.items) |block| block.deinit(allocator);
+        blocks.deinit(allocator);
+    }
+    for (results) |result| {
+        const id = try allocator.dupe(u8, result.tool_use_id);
+        errdefer allocator.free(id);
+        const content = try allocator.dupe(u8, result.content);
+        errdefer allocator.free(content);
+        try blocks.append(allocator, .{ .tool_result = .{
+            .tool_use_id = id,
+            .content = content,
+            .is_error = result.is_error,
+        } });
+    }
+    try conversation.append(.{ .role = .user, .blocks = try blocks.toOwnedSlice(allocator) });
+    log.info("agent", "resume: injected {d} tool_result(s) for a remote batch, continuing run", .{results.len});
+    return run(conversation, provider, tool_defs, permission_ctx, opts, backend, allocator);
+}
+
 pub fn resumeRun(
     conversation: *Conversation,
     provider: provider_mod.Provider,

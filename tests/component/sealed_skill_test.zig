@@ -1,10 +1,12 @@
 //! L2: a sealed Skill (doc/SEALED_SKILL_PROTOCOL.md) runs end to end through
-//! real modules: the reference gateway with its own model provider (a mock
-//! Anthropic SSE server), the client's pin store and catalog, the forked
-//! subagent loop with the gateway as its Provider, local tool execution, the
-//! policy frame, and the usage ledger. Only the two process-external
-//! boundaries (the model's HTTP and the gateway's HTTP) are mocked or
-//! loopback-served.
+//! real modules: the reference gateway whose brain is the real agent loop, the
+//! client's pin store and catalog, the forked subagent loop with the gateway
+//! as its Provider, local tool execution, the policy frame, the confirm gate,
+//! the credential store and the usage ledger. The model is a mock Anthropic
+//! SSE server that plays the *client's* provider: the gateway reaches it over
+//! the route and credential the client sends (§8.1). Only the two
+//! process-external boundaries (the model's HTTP and the gateway's HTTP) are
+//! mocked or loopback-served.
 
 const std = @import("std");
 const harness = @import("harness");
@@ -20,6 +22,9 @@ const ui_request = cc.ui_request;
 
 const SECRET_BODY = "SECRET_SKILL_BODY: read the data file the user names and summarize it.";
 const SKILL_MD = "---\nname: erp-post\ndescription: Posts invoices. Use when asked to post an invoice.\n---\n" ++ SECRET_BODY ++ "\n";
+const CLIENT_KEY = "client-key-7f3a";
+const CLIENT_MODEL = "claude-sonnet-4-20250514";
+const STATE_KEY = [_]u8{7} ** 32;
 
 const FINAL_SSE =
     "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_f\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":40,\"output_tokens\":1}}}\n\n" ++
@@ -28,27 +33,6 @@ const FINAL_SSE =
     "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n" ++
     "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":5}}\n\n" ++
     "data: {\"type\":\"message_stop\"}\n\n";
-
-/// One assistant turn calling `tool` with `input_json` (already a JSON object).
-fn toolCallSse(allocator: std.mem.Allocator, tool: []const u8, input_json: []const u8) ![]u8 {
-    var escaped: std.ArrayList(u8) = .empty;
-    defer escaped.deinit(allocator);
-    for (input_json) |c| switch (c) {
-        '"' => try escaped.appendSlice(allocator, "\\\""),
-        '\\' => try escaped.appendSlice(allocator, "\\\\"),
-        else => try escaped.append(allocator, c),
-    };
-    return std.fmt.allocPrint(
-        allocator,
-        "data: {{\"type\":\"message_start\",\"message\":{{\"id\":\"msg_t\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{{\"input_tokens\":30,\"output_tokens\":1}}}}}}\n\n" ++
-            "data: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{{\"type\":\"tool_use\",\"id\":\"tu_1\",\"name\":\"{s}\",\"input\":{{}}}}}}\n\n" ++
-            "data: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"input_json_delta\",\"partial_json\":\"{s}\"}}}}\n\n" ++
-            "data: {{\"type\":\"content_block_stop\",\"index\":0}}\n\n" ++
-            "data: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"tool_use\"}},\"usage\":{{\"output_tokens\":9}}}}\n\n" ++
-            "data: {{\"type\":\"message_stop\"}}\n\n",
-        .{ tool, escaped.items },
-    );
-}
 
 fn escapeJson(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
     var escaped: std.ArrayList(u8) = .empty;
@@ -59,6 +43,32 @@ fn escapeJson(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
         else => try escaped.append(allocator, c),
     };
     return escaped.toOwnedSlice(allocator);
+}
+
+/// One assistant turn calling `tool` with `input_json` (already a JSON object).
+fn toolCallSse(allocator: std.mem.Allocator, tool: []const u8, input_json: []const u8) ![]u8 {
+    return toolCallSseWithText(allocator, "", tool, input_json);
+}
+
+/// One assistant turn: optional narration `text`, then a call of `tool`.
+fn toolCallSseWithText(allocator: std.mem.Allocator, text: []const u8, tool: []const u8, input_json: []const u8) ![]u8 {
+    const escaped = try escapeJson(allocator, input_json);
+    defer allocator.free(escaped);
+    const escaped_text = try escapeJson(allocator, text);
+    defer allocator.free(escaped_text);
+    return std.fmt.allocPrint(
+        allocator,
+        "data: {{\"type\":\"message_start\",\"message\":{{\"id\":\"msg_t\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{{\"input_tokens\":30,\"output_tokens\":1}}}}}}\n\n" ++
+            "data: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{{\"type\":\"text\",\"text\":\"\"}}}}\n\n" ++
+            "data: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":\"{s}\"}}}}\n\n" ++
+            "data: {{\"type\":\"content_block_stop\",\"index\":0}}\n\n" ++
+            "data: {{\"type\":\"content_block_start\",\"index\":1,\"content_block\":{{\"type\":\"tool_use\",\"id\":\"tu_1\",\"name\":\"{s}\",\"input\":{{}}}}}}\n\n" ++
+            "data: {{\"type\":\"content_block_delta\",\"index\":1,\"delta\":{{\"type\":\"input_json_delta\",\"partial_json\":\"{s}\"}}}}\n\n" ++
+            "data: {{\"type\":\"content_block_stop\",\"index\":1}}\n\n" ++
+            "data: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"tool_use\"}},\"usage\":{{\"output_tokens\":9}}}}\n\n" ++
+            "data: {{\"type\":\"message_stop\"}}\n\n",
+        .{ escaped_text, tool, escaped },
+    );
 }
 
 /// One assistant turn with two tool calls (`tu_a` then `tu_b`).
@@ -116,7 +126,7 @@ const Host = struct {
 };
 
 /// The session's UI channel, as the client sees it: it answers permission
-/// prompts with `permission_answer` and `input_required` questions with
+/// prompts with `permission_answer` and question dialogs with
 /// `question_answer`, and records what it was asked.
 const UiProbe = struct {
     permission_answer: ui_request.PermissionChoice = .allow_once,
@@ -155,8 +165,8 @@ const UiProbe = struct {
                     self.last_question_options = questions[0].options.len;
                 }
                 const answer = self.question_answer orelse return .unavailable;
-                const answers = try allocator.alloc([]const u8, 1);
-                answers[0] = try allocator.dupe(u8, answer);
+                const answers = try allocator.alloc([]const u8, questions.len);
+                for (answers) |*slot| slot.* = try allocator.dupe(u8, answer);
                 out.* = .{ .answers = answers };
                 return .answered;
             },
@@ -173,8 +183,10 @@ const UiProbe = struct {
     }
 };
 
-/// Everything one scenario needs: the mock model, the gateway over it, and a
-/// client whose catalog holds the pinned Skill.
+const PackageFile = struct { path: []const u8, bytes: []const u8 };
+
+/// Everything one scenario needs: the mock model (the client's provider), the
+/// gateway, and a client whose catalog holds the pinned Skill.
 const Lab = struct {
     allocator: std.mem.Allocator,
     root: []u8,
@@ -183,6 +195,7 @@ const Lab = struct {
     data_path: []u8,
     model: *harness.MockServer,
     model_url: []u8,
+    /// The client's own provider: the route the gateway is given.
     owned: cc.api_provider_factory.OwnedProvider,
     gateway: *gateway_mod.Gateway,
     server: *gateway_mod.Server,
@@ -198,6 +211,10 @@ const Lab = struct {
     host_token: u8 = 0,
 
     fn start(self: *Lab, allocator: std.mem.Allocator, tag: []const u8, cassette: []const []const u8, manifest_json: []const u8, options: gateway_mod.Options) !void {
+        return self.startWithFiles(allocator, tag, cassette, manifest_json, options, &.{});
+    }
+
+    fn startWithFiles(self: *Lab, allocator: std.mem.Allocator, tag: []const u8, cassette: []const []const u8, manifest_json: []const u8, options: gateway_mod.Options, files: []const PackageFile) !void {
         var root_buf: [512]u8 = undefined;
         const root_slice = cc.util_fs.testing.perPidDir(&root_buf, tag);
         const root = try allocator.dupe(u8, root_slice);
@@ -213,13 +230,20 @@ const Lab = struct {
         const manifest_path = try std.fmt.allocPrint(allocator, "{s}/erp-post/manifest.json", .{self.packages_dir});
         defer allocator.free(manifest_path);
         try writeFileAt(allocator, manifest_path, manifest_json);
+        for (files) |file| {
+            const path = try std.fmt.allocPrint(allocator, "{s}/erp-post/{s}", .{ self.packages_dir, file.path });
+            defer allocator.free(path);
+            try writeFileAt(allocator, path, file.bytes);
+        }
         try writeFileAt(allocator, self.data_path, "DATA_MARKER line one\n");
         try cc.util_fs.mkdirParents(self.state_dir);
 
         self.model = try harness.MockServer.startCassette(cassette, 0);
         self.model_url = try self.model.urlOwned(allocator);
-        self.owned = try cc.api_provider_factory.makeProvider(allocator, .anthropic, "gateway-key", "claude-sonnet-4-20250514", self.model_url);
-        self.gateway = try gateway_mod.Gateway.init(allocator, self.owned.provider(), self.packages_dir, options);
+        self.owned = try cc.api_provider_factory.makeProvider(allocator, .anthropic, CLIENT_KEY, CLIENT_MODEL, self.model_url);
+        var gateway_options = options;
+        if (gateway_options.state_key == null) gateway_options.state_key = STATE_KEY;
+        self.gateway = try gateway_mod.Gateway.init(allocator, self.packages_dir, gateway_options);
         self.server = try gateway_mod.Server.start(allocator, self.gateway, 0);
         self.gateway_url = try self.server.url(allocator);
 
@@ -236,7 +260,8 @@ const Lab = struct {
     }
 
     /// Install the Skill the way `metacodes sealed install` does: fetch the
-    /// Entry from the gateway, verify it, pin it under the client state root.
+    /// Entry from the gateway, verify it, pin it, and install its public
+    /// assets under the pin directory.
     fn install(self: *Lab, token: []const u8) !void {
         var client = try transport.Client.init(self.allocator, self.io_runtime.io(), self.gateway_url, token);
         defer client.deinit();
@@ -249,19 +274,38 @@ const Lab = struct {
         var parsed = try protocol.parseEntry(self.allocator, entry_json);
         defer parsed.deinit();
         try pin_mod.write(self.allocator, self.state_dir, self.gateway_url, "", entry_json, &parsed.entry);
+        for (parsed.entry.assets) |asset| {
+            var asset_params: std.Io.Writer.Allocating = .init(self.allocator);
+            defer asset_params.deinit();
+            try protocol.writeSkillsAssetParams(&asset_params.writer, parsed.entry.skill_id, asset.path);
+            var asset_response = try client.call(.skills_asset, asset_params.written(), null);
+            defer asset_response.deinit();
+            var fetched = try protocol.parseAsset(self.allocator, asset_response.response.result);
+            defer fetched.deinit();
+            try std.testing.expectEqualStrings(asset.sha256, fetched.sha256);
+            try pin_mod.writeAsset(self.allocator, self.state_dir, parsed.entry.manifest.name, asset.path, fetched.content);
+        }
     }
 
-    /// Load the client catalog from the pin root and register the Skill tool.
+    /// The pin directory: the Skill's base directory as the brain sees it.
+    fn pinDir(self: *Lab) ![]u8 {
+        return std.fmt.allocPrint(self.allocator, "{s}/sealed-skills/erp-post", .{self.state_dir});
+    }
+
+    /// Load the client catalog from the pin root (and, when given, a local
+    /// skills directory) and register the Skill tool.
     fn loadCatalog(self: *Lab) !void {
+        return self.loadCatalogWith(null);
+    }
+
+    fn loadCatalogWith(self: *Lab, local_root: ?[]const u8) !void {
         const pin_root = try pin_mod.pinRoot(self.allocator, self.state_dir);
         defer self.allocator.free(pin_root);
-        const sources = [_]cc.skills_runtime.catalog.Source{.{
-            .root = pin_root,
-            .scope = .personal,
-            .priority = 2005,
-            .profile = .compat,
-        }};
-        try self.runtime.loadSources(self.root, "", "", &sources, &self.projection);
+        var sources: std.ArrayList(cc.skills_runtime.catalog.Source) = .empty;
+        defer sources.deinit(self.allocator);
+        try sources.append(self.allocator, .{ .root = pin_root, .scope = .personal, .priority = 2005, .profile = .compat });
+        if (local_root) |root| try sources.append(self.allocator, .{ .root = root, .scope = .personal, .priority = 2000, .profile = .compat });
+        try self.runtime.loadSources(self.root, "", "", sources.items, &self.projection);
         try cc.skills_tool.registerSkillTool(&self.registry, &self.runtime);
         const model_defs = try cc.tools.toToolDefinitionsWithDyn(self.allocator, &self.registry);
         self.allocator.free(self.tool_defs);
@@ -271,7 +315,10 @@ const Lab = struct {
 
     fn context(self: *Lab) cc.tools.ToolContext {
         var ctx = cc.tools.ToolContext.withAbort(self.allocator, &self.abort);
-        ctx.api_client = null;
+        // The client's own provider: a local fork calls it directly; a sealed
+        // fork hands its route to the gateway.
+        ctx.api_client = self.owned.anthropicClient();
+        ctx.provider = self.owned.provider();
         ctx.tool_defs = self.tool_defs;
         ctx.permission_ctx = &self.permission;
         ctx.dyn_registry = &self.registry;
@@ -282,18 +329,6 @@ const Lab = struct {
         ctx.host_services = .{ .ctx = @ptrCast(&self.host_token), .activateSkillFn = &Host.activate };
         ctx.ui_requester = self.probe.requester();
         return ctx;
-    }
-
-    /// Every model request body, concatenated: what the gateway's model saw.
-    fn allModelBodies(self: *Lab, allocator: std.mem.Allocator) ![]u8 {
-        var out: std.ArrayList(u8) = .empty;
-        errdefer out.deinit(allocator);
-        var index: usize = 0;
-        while (self.model.requestAt(index)) |request| : (index += 1) {
-            try out.appendSlice(allocator, request.body());
-            try out.append(allocator, '\n');
-        }
-        return out.toOwnedSlice(allocator);
     }
 
     fn runSkill(self: *Lab, invocation: []const u8) ![]u8 {
@@ -308,6 +343,30 @@ const Lab = struct {
         const path = try std.fmt.allocPrint(self.allocator, "{s}/ledger/sealed.ndjson", .{self.state_dir});
         defer self.allocator.free(path);
         return readFileAt(self.allocator, path);
+    }
+
+    /// Every model request (headers and body), concatenated: what the
+    /// client's provider saw, and from whom.
+    fn allModelRequests(self: *Lab, allocator: std.mem.Allocator) ![]u8 {
+        var out: std.ArrayList(u8) = .empty;
+        errdefer out.deinit(allocator);
+        var index: usize = 0;
+        while (self.model.requestAt(index)) |request| : (index += 1) {
+            try out.appendSlice(allocator, request.raw);
+            try out.append(allocator, '\n');
+        }
+        return out.toOwnedSlice(allocator);
+    }
+
+    /// Restart the gateway process (same sealing key, same packages) and
+    /// point the pin at the new port: a run in flight must survive it.
+    fn restartGateway(self: *Lab) !void {
+        self.server.stop();
+        self.gateway.deinit();
+        self.gateway = try gateway_mod.Gateway.init(self.allocator, self.packages_dir, .{ .state_key = STATE_KEY });
+        self.server = try gateway_mod.Server.start(self.allocator, self.gateway, 0);
+        self.allocator.free(self.gateway_url);
+        self.gateway_url = try self.server.url(self.allocator);
     }
 
     fn stop(self: *Lab) void {
@@ -339,17 +398,20 @@ fn countOccurrences(haystack: []const u8, needle: []const u8) usize {
     return count;
 }
 
-test "L2 sealed: brain on the gateway, hands on the client, charge in the ledger" {
+fn readDataSse(a: std.mem.Allocator, tag: []const u8) ![]u8 {
+    var pre_buf: [512]u8 = undefined;
+    const pre_root = harness.normalizeSlashes(@constCast(cc.util_fs.testing.perPidDir(&pre_buf, tag)));
+    const read_input = try std.fmt.allocPrint(a, "{{\"file_path\":\"{s}/data.txt\"}}", .{pre_root});
+    defer a.free(read_input);
+    return toolCallSse(a, "Read", read_input);
+}
+
+// ── Brain on the gateway, hands and account on the client ─────────────────
+
+test "L2 sealed: brain on the gateway, hands on the client, model on the client's account, charge in the ledger" {
     const a = std.testing.allocator;
     var lab: Lab = undefined;
-    // The body is server-only; the client runs the Read the model asks for.
-    var pre_buf: [512]u8 = undefined;
-    const pre_root = harness.normalizeSlashes(@constCast(cc.util_fs.testing.perPidDir(&pre_buf, "cc-zig-sealed-e2e")));
-    const data_path = try std.fmt.allocPrint(a, "{s}/data.txt", .{pre_root});
-    defer a.free(data_path);
-    const read_input = try std.fmt.allocPrint(a, "{{\"file_path\":\"{s}\"}}", .{data_path});
-    defer a.free(read_input);
-    const read_sse = try toolCallSse(a, "Read", read_input);
+    const read_sse = try readDataSse(a, "cc-zig-sealed-e2e");
     defer a.free(read_sse);
     try lab.start(a, "cc-zig-sealed-e2e", &.{ read_sse, FINAL_SSE }, protocol.TEST_MANIFEST_JSON, .{});
     defer lab.stop();
@@ -370,14 +432,19 @@ test "L2 sealed: brain on the gateway, hands on the client, charge in the ledger
     try std.testing.expectEqual(@as(usize, 0), lab.probe.permission_requests);
     try std.testing.expectEqual(@as(usize, 0), lab.probe.question_requests);
 
-    // Model request 1: the Skill body as system prompt, the user's prompt,
-    // the client's tool definitions; request 2: the locally executed result.
+    // Model request 1, made by the gateway with the client's key and model:
+    // the fork's system prompt, the Skill body as the first user turn with
+    // the user's arguments, the client's tool definitions; request 2: the
+    // locally executed result.
     try std.testing.expectEqual(@as(usize, 2), lab.model.requestCount());
     const first = lab.model.requestAt(0) orelse return error.NoModelRequest;
+    try std.testing.expect(std.mem.indexOf(u8, first.raw, CLIENT_KEY) != null);
+    try std.testing.expect(std.mem.indexOf(u8, first.body(), "\"model\":\"" ++ CLIENT_MODEL ++ "\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first.body(), "You are a subagent") != null);
     try std.testing.expect(std.mem.indexOf(u8, first.body(), SECRET_BODY) != null);
     try std.testing.expect(std.mem.indexOf(u8, first.body(), "post the invoice in data.txt") != null);
     try std.testing.expect(std.mem.indexOf(u8, first.body(), "\"name\":\"Read\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, first.body(), "gateway-key") == null);
+    try std.testing.expect(std.mem.indexOf(u8, first.body(), "\"name\":\"AskUserQuestion\"") != null);
     const second = lab.model.requestAt(1) orelse return error.NoModelRequest;
     try std.testing.expect(std.mem.indexOf(u8, second.body(), "DATA_MARKER") != null);
     try std.testing.expect(std.mem.indexOf(u8, second.body(), "\"tool_use_id\":\"tu_1\"") != null);
@@ -390,6 +457,107 @@ test "L2 sealed: brain on the gateway, hands on the client, charge in the ledger
     try std.testing.expect(std.mem.indexOf(u8, ledger, "\"cost_micros\":0,") == null);
     try std.testing.expect(std.mem.indexOf(u8, ledger, "\"skill_id\":\"ssk_test\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, ledger, "\"inference_gateway\":\"metacodes\"") != null);
+    // The client's credential went to the model and nowhere else: not into
+    // the ledger, not into the fork's output.
+    try std.testing.expect(std.mem.indexOf(u8, ledger, CLIENT_KEY) == null);
+    try std.testing.expect(std.mem.indexOf(u8, output, CLIENT_KEY) == null);
+}
+
+test "L2 sealed: a request without the client's provider credential is refused before any model call" {
+    const a = std.testing.allocator;
+    var lab: Lab = undefined;
+    try lab.start(a, "cc-zig-sealed-nocred", &.{FINAL_SSE}, protocol.TEST_MANIFEST_JSON, .{});
+    defer lab.stop();
+    try lab.install("");
+
+    var client = try transport.Client.init(a, lab.io_runtime.io(), lab.gateway_url, "");
+    defer client.deinit();
+    var params: std.Io.Writer.Allocating = .init(a);
+    defer params.deinit();
+    try protocol.writeStartParams(&params.writer, .{
+        .skill_id = "ssk_test",
+        .manifest_digest = lab.gateway.packages[0].entry.manifest_digest,
+        .prompt = "go",
+        .max_cost_micros = 1000,
+        .max_steps = 10,
+        .client_name = "metacodes",
+        .client_version = "0",
+        .client_platform = "p",
+        .provider_kind = "anthropic",
+        .provider_base_url = lab.model_url,
+        .model = CLIENT_MODEL,
+        .max_tokens = 64,
+    });
+    var response = try client.call(.runs_start, params.written(), null);
+    defer response.deinit();
+    try std.testing.expect(response.response == .err);
+    try std.testing.expect(std.mem.indexOf(u8, response.response.err.message, protocol.PROVIDER_CREDENTIAL_HEADER) != null);
+    try std.testing.expectEqual(@as(usize, 0), lab.model.requestCount());
+}
+
+test "L2 sealed: the gateway holds no run state — it restarts between two Steps and the run continues" {
+    const a = std.testing.allocator;
+    var lab: Lab = undefined;
+    const read_sse = try readDataSse(a, "cc-zig-sealed-stateless");
+    defer a.free(read_sse);
+    try lab.start(a, "cc-zig-sealed-stateless", &.{ read_sse, FINAL_SSE }, protocol.TEST_MANIFEST_JSON, .{});
+    defer lab.stop();
+    try lab.install("");
+
+    // Drive the protocol by hand: start, restart the gateway, continue.
+    var client = try transport.Client.init(a, lab.io_runtime.io(), lab.gateway_url, "");
+    defer client.deinit();
+    client.provider_credential = CLIENT_KEY;
+    var params: std.Io.Writer.Allocating = .init(a);
+    defer params.deinit();
+    try protocol.writeStartParams(&params.writer, .{
+        .skill_id = "ssk_test",
+        .manifest_digest = lab.gateway.packages[0].entry.manifest_digest,
+        .prompt = "go",
+        .tools_json = "[{\"name\":\"Read\",\"description\":\"read\",\"input_schema\":{\"type\":\"object\",\"properties\":{\"file_path\":{\"type\":\"string\"}},\"required\":[\"file_path\"]}}]",
+        .max_cost_micros = 100_000,
+        .max_steps = 10,
+        .client_name = "metacodes",
+        .client_version = "0",
+        .client_platform = "p",
+        .system = "You are a subagent.",
+        .provider_kind = "anthropic",
+        .provider_base_url = lab.model_url,
+        .model = CLIENT_MODEL,
+        .max_tokens = 64,
+    });
+    var started = try client.call(.runs_start, params.written(), null);
+    defer started.deinit();
+    try std.testing.expect(started.response == .result);
+    var step1 = try protocol.parseStep(a, started.response.result);
+    defer step1.deinit();
+    try std.testing.expectEqual(protocol.StepKind.tool_calls, step1.step.kind);
+    try std.testing.expectEqualStrings("Read", step1.step.calls[0].name);
+
+    try lab.restartGateway();
+    var client2 = try transport.Client.init(a, lab.io_runtime.io(), lab.gateway_url, "");
+    defer client2.deinit();
+    client2.provider_credential = CLIENT_KEY;
+    var cont: std.Io.Writer.Allocating = .init(a);
+    defer cont.deinit();
+    try protocol.writeContinueParams(&cont.writer, step1.step.run_id, step1.step.run_state, step1.step.seq, &.{
+        .{ .tool_use_id = step1.step.calls[0].id, .content = "DATA_MARKER from the client" },
+    });
+    var continued = try client2.call(.runs_continue, cont.written(), null);
+    defer continued.deinit();
+    if (continued.response == .err) std.debug.print("runs.continue refused: {d} {s}\n", .{ continued.response.err.code, continued.response.err.message });
+    try std.testing.expect(continued.response == .result);
+    var step2 = try protocol.parseStep(a, continued.response.result);
+    defer step2.deinit();
+    try std.testing.expectEqual(protocol.StepKind.final, step2.step.kind);
+    try std.testing.expectEqualStrings("final-from-sealed", step2.step.text);
+    try std.testing.expectEqualStrings(step1.step.digest, step2.step.prev_digest);
+    try std.testing.expectEqual(@as(u64, 2), step2.step.seq);
+    // The new process made the second model call from the carried state.
+    try std.testing.expectEqual(@as(usize, 2), lab.model.requestCount());
+    const second = lab.model.requestAt(1) orelse return error.NoModelRequest;
+    try std.testing.expect(std.mem.indexOf(u8, second.body(), "DATA_MARKER from the client") != null);
+    try std.testing.expect(std.mem.indexOf(u8, second.body(), SECRET_BODY) != null);
 }
 
 test "L2 sealed: a call outside the pinned allowlist is refused locally and reported" {
@@ -439,6 +607,8 @@ test "L2 sealed: bearer token gates the gateway" {
     var response = try member.call(.discover, "{}", null);
     defer response.deinit();
     try std.testing.expect(std.mem.indexOf(u8, response.response.result, protocol.PROTOCOL_ID) != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.response.result, "\"client_provider\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.response.result, "\"input_required\":true") != null);
 }
 
 test "L2 sealed: a pin whose manifest changed on the gateway is refused, not run" {
@@ -454,12 +624,7 @@ test "L2 sealed: a pin whose manifest changed on the gateway is refused, not run
     const widened = try std.mem.replaceOwned(u8, a, protocol.TEST_MANIFEST_JSON, "\"allow\":[\"Read\"", "\"allow\":[\"Write\",\"Read\"");
     defer a.free(widened);
     try writeFileAt(a, manifest_path, widened);
-    lab.server.stop();
-    lab.gateway.deinit();
-    lab.gateway = try gateway_mod.Gateway.init(a, lab.owned.provider(), lab.packages_dir, .{});
-    lab.server = try gateway_mod.Server.start(a, lab.gateway, 0);
-    a.free(lab.gateway_url);
-    lab.gateway_url = try lab.server.url(a);
+    try lab.restartGateway();
     // The pin still names the old gateway port; rewrite its URL only, keeping
     // the old digest, as a client whose gateway moved would.
     const pin_path = try std.fmt.allocPrint(a, "{s}/sealed-skills/erp-post/sealed.json", .{lab.state_dir});
@@ -485,17 +650,142 @@ fn rewriteGatewayUrl(a: std.mem.Allocator, path: []const u8, new_url: []const u8
     try writeFileAt(a, path, rewritten);
 }
 
+// ── The mirror (§9.1) ─────────────────────────────────────────────────────
+
+const LOCAL_SKILL_MD = "---\nname: erp-local\ndescription: Posts invoices. Use when asked to post an invoice.\ncontext: fork\n---\n" ++ SECRET_BODY ++ "\n";
+const MIRROR_MANIFEST = "{\"schema\":\"metask.sealed-skill.manifest/v1\",\"skill_id\":\"ssk_test\",\"version\":\"1.0.0\",\"name\":\"erp-post\",\"description\":\"Posts invoices. Use when asked to post an invoice.\",\"tools\":{\"allow\":[\"*\"]},\"egress\":{\"classes\":[\"file_contents\",\"command_output\"]}}";
+
+/// The model request with the Skill's base directory (the value of the
+/// `Base directory for this skill:` line, as the request spells it) replaced
+/// by a marker: the one thing that legitimately differs between a local fork
+/// and its sealed shadow.
+fn normalizedRequest(a: std.mem.Allocator, body: []const u8) ![]u8 {
+    const marker = "Base directory for this skill: ";
+    const start = (std.mem.indexOf(u8, body, marker) orelse return error.BaseDirMissing) + marker.len;
+    const end = std.mem.indexOfPos(u8, body, start, "\\n") orelse return error.BaseDirMissing;
+    const base_dir = body[start..end];
+    if (base_dir.len == 0) return error.BaseDirMissing;
+    return std.mem.replaceOwned(u8, a, body, base_dir, "<BASE>");
+}
+
+test "L2 sealed: the shadow's model request is byte-identical to the local fork's" {
+    const a = std.testing.allocator;
+    var lab: Lab = undefined;
+    try lab.start(a, "cc-zig-sealed-mirror", &.{ FINAL_SSE, FINAL_SSE }, MIRROR_MANIFEST, .{});
+    defer lab.stop();
+    try lab.install("");
+    // The same Skill, as a plain local forked Skill.
+    const local_root = try std.fmt.allocPrint(a, "{s}/local-skills", .{lab.root});
+    defer a.free(local_root);
+    const local_md = try std.fmt.allocPrint(a, "{s}/erp-local/SKILL.md", .{local_root});
+    defer a.free(local_md);
+    try writeFileAt(a, local_md, LOCAL_SKILL_MD);
+    try lab.loadCatalogWith(local_root);
+
+    const local_output = try lab.runSkill("{\"name\":\"erp-local\",\"values\":[\"post the invoice in data.txt\"]}");
+    defer a.free(local_output);
+    try std.testing.expect(std.mem.indexOf(u8, local_output, "final-from-sealed") != null);
+    const sealed_output = try lab.runSkill("{\"name\":\"erp-post\",\"values\":[\"post the invoice in data.txt\"]}");
+    defer a.free(sealed_output);
+    try std.testing.expect(std.mem.indexOf(u8, sealed_output, "final-from-sealed") != null);
+    try std.testing.expectEqual(@as(usize, 2), lab.model.requestCount());
+
+    const local_request = lab.model.requestAt(0) orelse return error.NoModelRequest;
+    const sealed_request = lab.model.requestAt(1) orelse return error.NoModelRequest;
+    const local_normalized = try normalizedRequest(a, local_request.body());
+    defer a.free(local_normalized);
+    const sealed_normalized = try normalizedRequest(a, sealed_request.body());
+    defer a.free(sealed_normalized);
+    try std.testing.expect(std.mem.indexOf(u8, local_normalized, "<BASE>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sealed_normalized, "<BASE>") != null);
+    try std.testing.expectEqualStrings(local_normalized, sealed_normalized);
+    // Same account, same key, same header.
+    try std.testing.expect(std.mem.indexOf(u8, local_request.raw, CLIENT_KEY) != null);
+    try std.testing.expect(std.mem.indexOf(u8, sealed_request.raw, CLIENT_KEY) != null);
+}
+
+test "L2 sealed: narration between tool calls stays on the gateway; only the final text comes back" {
+    const a = std.testing.allocator;
+    var lab: Lab = undefined;
+    var pre_buf: [512]u8 = undefined;
+    const pre_root = harness.normalizeSlashes(@constCast(cc.util_fs.testing.perPidDir(&pre_buf, "cc-zig-sealed-silent")));
+    const read_input = try std.fmt.allocPrint(a, "{{\"file_path\":\"{s}/data.txt\"}}", .{pre_root});
+    defer a.free(read_input);
+    const narrated = try toolCallSseWithText(a, "THINKING_ALOUD: I will read the file now", "Read", read_input);
+    defer a.free(narrated);
+    try lab.start(a, "cc-zig-sealed-silent", &.{ narrated, FINAL_SSE }, protocol.TEST_MANIFEST_JSON, .{});
+    defer lab.stop();
+    try lab.install("");
+    try lab.loadCatalog();
+
+    const output = try lab.runSkill("{\"name\":\"erp-post\",\"values\":[\"go\"]}");
+    defer a.free(output);
+    try std.testing.expect(std.mem.indexOf(u8, output, "final-from-sealed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "THINKING_ALOUD") == null);
+    // The brain still sees its own narration in its conversation.
+    const second = lab.model.requestAt(1) orelse return error.NoModelRequest;
+    try std.testing.expect(std.mem.indexOf(u8, second.body(), "THINKING_ALOUD") != null);
+    try std.testing.expect(std.mem.indexOf(u8, second.body(), "DATA_MARKER") != null);
+}
+
+// ── Sealed reference files and public assets (§5, §12) ────────────────────
+
+test "L2 sealed: sealed files are read on the gateway without a Step; public assets are installed and read on the client" {
+    const a = std.testing.allocator;
+    var lab: Lab = undefined;
+    var pre_buf: [512]u8 = undefined;
+    const pre_root = harness.normalizeSlashes(@constCast(cc.util_fs.testing.perPidDir(&pre_buf, "cc-zig-sealed-files")));
+    const sealed_read = try std.fmt.allocPrint(a, "{{\"file_path\":\"{s}/state/sealed-skills/erp-post/sealed/notes.md\"}}", .{pre_root});
+    defer a.free(sealed_read);
+    const public_read = try std.fmt.allocPrint(a, "{{\"file_path\":\"{s}/state/sealed-skills/erp-post/scripts/post.py\"}}", .{pre_root});
+    defer a.free(public_read);
+    const sealed_sse = try toolCallSse(a, "Read", sealed_read);
+    defer a.free(sealed_sse);
+    const public_sse = try toolCallSse(a, "Read", public_read);
+    defer a.free(public_sse);
+    try lab.startWithFiles(a, "cc-zig-sealed-files", &.{ sealed_sse, public_sse, FINAL_SSE }, protocol.TEST_MANIFEST_JSON, .{}, &.{
+        .{ .path = "sealed/notes.md", .bytes = "SEALED_NOTE_MARKER: the rule nobody else reads\n" },
+        .{ .path = "scripts/post.py", .bytes = "print('PUBLIC_SCRIPT_MARKER')\n" },
+    });
+    defer lab.stop();
+    try lab.install("");
+    try lab.loadCatalog();
+
+    // Install put the public asset where the brain believes it is, and
+    // nothing of the sealed set.
+    const pin_dir = try lab.pinDir();
+    defer a.free(pin_dir);
+    const installed = try std.fmt.allocPrint(a, "{s}/scripts/post.py", .{pin_dir});
+    defer a.free(installed);
+    const installed_bytes = (try readFileAt(a, installed)) orelse return error.AssetNotInstalled;
+    defer a.free(installed_bytes);
+    try std.testing.expect(std.mem.indexOf(u8, installed_bytes, "PUBLIC_SCRIPT_MARKER") != null);
+    const leaked = try std.fmt.allocPrint(a, "{s}/sealed/notes.md", .{pin_dir});
+    defer a.free(leaked);
+    try std.testing.expect((try readFileAt(a, leaked)) == null);
+
+    const output = try lab.runSkill("{\"name\":\"erp-post\",\"values\":[\"go\"]}");
+    defer a.free(output);
+    try std.testing.expect(std.mem.indexOf(u8, output, "final-from-sealed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "SEALED_NOTE_MARKER") == null);
+    // Three model turns: the sealed read was served inside the first Step,
+    // the public read went to the client as the only tool_calls Step.
+    try std.testing.expectEqual(@as(usize, 3), lab.model.requestCount());
+    const first = lab.model.requestAt(0) orelse return error.NoModelRequest;
+    try std.testing.expect(std.mem.indexOf(u8, first.body(), "sealed/notes.md") != null);
+    const second = lab.model.requestAt(1) orelse return error.NoModelRequest;
+    try std.testing.expect(std.mem.indexOf(u8, second.body(), "SEALED_NOTE_MARKER") != null);
+    const third = lab.model.requestAt(2) orelse return error.NoModelRequest;
+    try std.testing.expect(std.mem.indexOf(u8, third.body(), "PUBLIC_SCRIPT_MARKER") != null);
+    const ledger = (try lab.ledger()) orelse return error.LedgerMissing;
+    defer a.free(ledger);
+    try std.testing.expectEqual(@as(usize, 2), countOccurrences(ledger, "\"kind\":\"step\""));
+    try std.testing.expect(std.mem.indexOf(u8, ledger, "SEALED_NOTE_MARKER") == null);
+}
+
 // ── confirm: true (§4.3, §6.2) ────────────────────────────────────────────
 
 const CONFIRM_READ_MANIFEST = "{\"schema\":\"metask.sealed-skill.manifest/v1\",\"skill_id\":\"ssk_test\",\"version\":\"1.0.0\",\"name\":\"erp-post\",\"description\":\"Posts invoices.\",\"tools\":{\"allow\":[\"Read\"]},\"confirmation\":{\"required_for\":[\"Read\"]},\"egress\":{\"classes\":[\"file_contents\"]}}";
-
-fn readDataSse(a: std.mem.Allocator, tag: []const u8) ![]u8 {
-    var pre_buf: [512]u8 = undefined;
-    const pre_root = harness.normalizeSlashes(@constCast(cc.util_fs.testing.perPidDir(&pre_buf, tag)));
-    const read_input = try std.fmt.allocPrint(a, "{{\"file_path\":\"{s}/data.txt\"}}", .{pre_root});
-    defer a.free(read_input);
-    return toolCallSse(a, "Read", read_input);
-}
 
 test "L2 sealed: confirm: true forces an interactive approval that bypass mode would skip" {
     const a = std.testing.allocator;
@@ -542,11 +832,11 @@ test "L2 sealed: a declined confirm is not executed and is reported as permissio
     try std.testing.expect(std.mem.indexOf(u8, second.body(), "permission_denied") != null);
 }
 
-// ── input_required (§4.3) ─────────────────────────────────────────────────
+// ── input_required (§4.3): the brain's AskUserQuestion, answered by the client ──
 
-const ASK_INPUT = "{\"message\":\"Which ledger should the invoice go to?\",\"schema\":{\"type\":\"object\",\"properties\":{\"ledger\":{\"type\":\"string\",\"enum\":[\"main\",\"test\"]}}}}";
+const ASK_INPUT = "{\"questions\":[{\"question\":\"Which ledger should the invoice go to?\",\"header\":\"Ledger\",\"options\":[{\"label\":\"main\",\"description\":\"the main ledger\"},{\"label\":\"test\",\"description\":\"the test ledger\"}]}]}";
 
-test "L2 sealed: an input_required Step is answered through the UI channel and the run continues" {
+test "L2 sealed: an AskUserQuestion of the brain is asked through the client's own dialog and the run continues" {
     const a = std.testing.allocator;
     var lab: Lab = undefined;
     const ask_sse = try toolCallSse(a, gateway_mod.ASK_USER_TOOL, ASK_INPUT);
@@ -558,30 +848,22 @@ test "L2 sealed: an input_required Step is answered through the UI channel and t
     try lab.install("");
     try lab.loadCatalog();
 
-    // The gateway advertises the capability.
-    var client = try transport.Client.init(a, lab.io_runtime.io(), lab.gateway_url, "");
-    defer client.deinit();
-    var discovered = try client.call(.discover, "{}", null);
-    defer discovered.deinit();
-    try std.testing.expect(std.mem.indexOf(u8, discovered.response.result, "\"input_required\":true") != null);
-
     const output = try lab.runSkill("{\"name\":\"erp-post\",\"values\":[\"post it\"]}");
     defer a.free(output);
     try std.testing.expect(std.mem.indexOf(u8, output, "final-from-sealed") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "needs input") == null);
-    // One question, with the enum as its options, asked over the session's UI.
+    // One dialog, with the brain's own options, over the session's UI.
     try std.testing.expectEqual(@as(usize, 1), lab.probe.question_requests);
     try std.testing.expectEqualStrings("Which ledger should the invoice go to?", lab.probe.lastQuestion());
     try std.testing.expectEqual(@as(usize, 2), lab.probe.last_question_options);
     try std.testing.expectEqual(@as(usize, 0), lab.probe.permission_requests);
-    // The model saw the AskUser tool, then the answer as that call's result,
-    // then the Read's content: the run was continued, not cancelled.
+    // The brain got the answer in the tool's own result shape, then the
+    // Read's content: the run was continued, not cancelled.
     try std.testing.expectEqual(@as(usize, 3), lab.model.requestCount());
-    const first = lab.model.requestAt(0) orelse return error.NoModelRequest;
-    try std.testing.expect(std.mem.indexOf(u8, first.body(), "\"name\":\"AskUser\"") != null);
     const second = lab.model.requestAt(1) orelse return error.NoModelRequest;
     try std.testing.expect(std.mem.indexOf(u8, second.body(), "\"tool_use_id\":\"tu_1\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, second.body(), "\"content\":\"main\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, second.body(), "answers") != null);
+    try std.testing.expect(std.mem.indexOf(u8, second.body(), "main") != null);
     const third = lab.model.requestAt(2) orelse return error.NoModelRequest;
     try std.testing.expect(std.mem.indexOf(u8, third.body(), "DATA_MARKER") != null);
     const ledger = (try lab.ledger()) orelse return error.LedgerMissing;
@@ -612,6 +894,55 @@ test "L2 sealed: without a UI channel an input_required Step ends the run with t
     try std.testing.expect(std.mem.indexOf(u8, ledger, "\"step_kind\":\"input_required\"") != null);
     // The run was released with runs.cancel: a failed/cancelled Step closed it.
     try std.testing.expect(std.mem.indexOf(u8, ledger, "\"step_kind\":\"failed\"") != null);
+}
+
+test "L2 sealed: a call issued beside a question waits; the gateway answers it and the brain calls again" {
+    const a = std.testing.allocator;
+    var lab: Lab = undefined;
+    var pre_buf: [512]u8 = undefined;
+    const pre_root = harness.normalizeSlashes(@constCast(cc.util_fs.testing.perPidDir(&pre_buf, "cc-zig-sealed-input-sibling")));
+    const read_input = try std.fmt.allocPrint(a, "{{\"file_path\":\"{s}/data.txt\"}}", .{pre_root});
+    defer a.free(read_input);
+    const both_sse = try twoCallSse(a, gateway_mod.ASK_USER_TOOL, ASK_INPUT, "Read", read_input);
+    defer a.free(both_sse);
+    try lab.start(a, "cc-zig-sealed-input-sibling", &.{ both_sse, FINAL_SSE }, protocol.TEST_MANIFEST_JSON, .{});
+    defer lab.stop();
+    try lab.install("");
+    try lab.loadCatalog();
+
+    const output = try lab.runSkill("{\"name\":\"erp-post\",\"values\":[\"post it\"]}");
+    defer a.free(output);
+    try std.testing.expect(std.mem.indexOf(u8, output, "final-from-sealed") != null);
+    try std.testing.expectEqual(@as(usize, 1), lab.probe.question_requests);
+    try std.testing.expectEqual(@as(usize, 2), lab.model.requestCount());
+    // The sibling Read was never sent to the client; the brain got the
+    // answer for tu_a and a "call again" error for tu_b in one user turn.
+    const second = lab.model.requestAt(1) orelse return error.NoModelRequest;
+    try std.testing.expect(std.mem.indexOf(u8, second.body(), "\"tool_use_id\":\"tu_a\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, second.body(), "answers") != null);
+    try std.testing.expect(std.mem.indexOf(u8, second.body(), "\"tool_use_id\":\"tu_b\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, second.body(), "call it again") != null);
+    try std.testing.expect(std.mem.indexOf(u8, second.body(), "DATA_MARKER") == null);
+}
+
+test "L2 sealed: a malformed AskUserQuestion is answered by the client's tool as an error, never asked" {
+    const a = std.testing.allocator;
+    var lab: Lab = undefined;
+    const bad_ask = try toolCallSse(a, gateway_mod.ASK_USER_TOOL, "{\"schema\":{}}");
+    defer a.free(bad_ask);
+    try lab.start(a, "cc-zig-sealed-input-invalid", &.{ bad_ask, FINAL_SSE }, protocol.TEST_MANIFEST_JSON, .{});
+    defer lab.stop();
+    try lab.install("");
+    try lab.loadCatalog();
+
+    const output = try lab.runSkill("{\"name\":\"erp-post\",\"values\":[\"post it\"]}");
+    defer a.free(output);
+    try std.testing.expect(std.mem.indexOf(u8, output, "final-from-sealed") != null);
+    try std.testing.expectEqual(@as(usize, 0), lab.probe.question_requests);
+    try std.testing.expectEqual(@as(usize, 2), lab.model.requestCount());
+    const second = lab.model.requestAt(1) orelse return error.NoModelRequest;
+    try std.testing.expect(std.mem.indexOf(u8, second.body(), "AskUserQuestion failed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, second.body(), "\"is_error\":true") != null);
 }
 
 // ── credentials (§6.4) ────────────────────────────────────────────────────
@@ -646,14 +977,14 @@ test "L2 sealed: a bound credential is substituted into the call and redacted fr
     defer a.free(output);
     try std.testing.expect(std.mem.indexOf(u8, output, "final-from-sealed") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "not bound") == null);
-    // The model was told the placeholder, never the value; the call's result
+    // The brain was told the placeholder, never the value; the call's result
     // reached it with the value redacted and the rest of the file intact.
     const first = lab.model.requestAt(0) orelse return error.NoModelRequest;
     try std.testing.expect(std.mem.indexOf(u8, first.body(), "${SEALED_CRED:erp-main}") != null);
     const second = lab.model.requestAt(1) orelse return error.NoModelRequest;
     try std.testing.expect(std.mem.indexOf(u8, second.body(), "VAULT_MARKER") != null);
     try std.testing.expect(std.mem.indexOf(u8, second.body(), "token=[redacted:erp-main]") != null);
-    const everything = try lab.allModelBodies(a);
+    const everything = try lab.allModelRequests(a);
     defer a.free(everything);
     try std.testing.expect(std.mem.indexOf(u8, everything, SECRET) == null);
     const ledger = (try lab.ledger()) orelse return error.LedgerMissing;
@@ -686,56 +1017,4 @@ test "L2 sealed: an unbound credential refuses the call with permission_denied a
     try std.testing.expect(std.mem.indexOf(u8, second.body(), "\"is_error\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, second.body(), "not bound on this client") != null);
     try std.testing.expectEqual(@as(usize, 0), lab.probe.permission_requests);
-}
-
-test "L2 sealed: a call issued beside a question waits; the gateway answers it and the model calls again" {
-    const a = std.testing.allocator;
-    var lab: Lab = undefined;
-    var pre_buf: [512]u8 = undefined;
-    const pre_root = harness.normalizeSlashes(@constCast(cc.util_fs.testing.perPidDir(&pre_buf, "cc-zig-sealed-input-sibling")));
-    const read_input = try std.fmt.allocPrint(a, "{{\"file_path\":\"{s}/data.txt\"}}", .{pre_root});
-    defer a.free(read_input);
-    const both_sse = try twoCallSse(a, gateway_mod.ASK_USER_TOOL, ASK_INPUT, "Read", read_input);
-    defer a.free(both_sse);
-    try lab.start(a, "cc-zig-sealed-input-sibling", &.{ both_sse, FINAL_SSE }, protocol.TEST_MANIFEST_JSON, .{});
-    defer lab.stop();
-    try lab.install("");
-    try lab.loadCatalog();
-
-    const output = try lab.runSkill("{\"name\":\"erp-post\",\"values\":[\"post it\"]}");
-    defer a.free(output);
-    try std.testing.expect(std.mem.indexOf(u8, output, "final-from-sealed") != null);
-    try std.testing.expectEqual(@as(usize, 1), lab.probe.question_requests);
-    try std.testing.expectEqual(@as(usize, 2), lab.model.requestCount());
-    // The sibling Read was never sent to the client; the model got the
-    // answer for tu_a and a "call again" error for tu_b in one user turn.
-    const second = lab.model.requestAt(1) orelse return error.NoModelRequest;
-    try std.testing.expect(std.mem.indexOf(u8, second.body(), "\"tool_use_id\":\"tu_a\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, second.body(), "\"content\":\"main\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, second.body(), "\"tool_use_id\":\"tu_b\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, second.body(), "call it again") != null);
-    try std.testing.expect(std.mem.indexOf(u8, second.body(), "DATA_MARKER") == null);
-}
-
-test "L2 sealed: an AskUser call without a message is answered by the gateway, never asked" {
-    const a = std.testing.allocator;
-    var lab: Lab = undefined;
-    const bad_ask = try toolCallSse(a, gateway_mod.ASK_USER_TOOL, "{\"schema\":{}}");
-    defer a.free(bad_ask);
-    try lab.start(a, "cc-zig-sealed-input-invalid", &.{ bad_ask, FINAL_SSE }, protocol.TEST_MANIFEST_JSON, .{});
-    defer lab.stop();
-    try lab.install("");
-    try lab.loadCatalog();
-
-    const output = try lab.runSkill("{\"name\":\"erp-post\",\"values\":[\"post it\"]}");
-    defer a.free(output);
-    try std.testing.expect(std.mem.indexOf(u8, output, "final-from-sealed") != null);
-    try std.testing.expectEqual(@as(usize, 0), lab.probe.question_requests);
-    try std.testing.expectEqual(@as(usize, 2), lab.model.requestCount());
-    const second = lab.model.requestAt(1) orelse return error.NoModelRequest;
-    try std.testing.expect(std.mem.indexOf(u8, second.body(), "needs a non-empty string") != null);
-    // One client-visible Step (the final), not an empty tool_calls Step.
-    const ledger = (try lab.ledger()) orelse return error.LedgerMissing;
-    defer a.free(ledger);
-    try std.testing.expectEqual(@as(usize, 1), countOccurrences(ledger, "\"kind\":\"step\""));
 }
