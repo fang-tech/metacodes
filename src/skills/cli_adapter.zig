@@ -911,6 +911,10 @@ fn executeFork(
         .{};
     var child_permission = permission.scopedDerive(mode_override.mode);
     child_permission.active_skill = null;
+    // A sealed call marked `confirm: true` must be approved interactively
+    // whatever the mode (§6.2). The provider does not decide permissions; it
+    // answers the kernel's gate, which can only turn an allow into an ask.
+    if (sealed) |remote| child_permission.confirm_gate = remote.confirmGate();
     const child_ident = session_id.gen();
     try self.registerChildContext(
         child_ident,
@@ -1020,6 +1024,11 @@ fn openSealedProvider(
         .state_root = ctx.state_root,
         .client_version = @import("../version.zig").semver,
         .client_platform = @tagName(builtin.cpu.arch) ++ "-" ++ @tagName(builtin.os.tag),
+        // An `input_required` question goes to the user over the session's
+        // UI channel: the tool-level requester when this is the top-level
+        // Skill tool, else the per-session one the permission context carries.
+        .ui = ctx.ui_requester orelse if (ctx.permission_ctx) |permission| permission.ui_requester else null,
+        .session = ctx.session,
     });
 }
 

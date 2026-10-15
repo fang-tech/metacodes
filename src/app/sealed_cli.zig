@@ -2,7 +2,11 @@
 //!
 //! - `install <gateway-url> <skill_id> [--token-env NAME] [--yes]` fetches the
 //!   Entry, shows what the user consents to (§6.1) and pins it;
-//! - `list` prints the pins under the state root;
+//! - `list` prints the pins under the state root, with the binding state of
+//!   every credential reference each one declares;
+//! - `bind <name> <ref> [--from-env VAR]` / `unbind <name> <ref>` bind a
+//!   declared credential reference to a local secret (§6.4), read from stdin
+//!   or an environment variable, never from the command line;
 //! - `ledger` prints the sealed usage ledger (§6.6);
 //! - `serve --skills <dir> [--listen PORT] [--token T] [--provider KIND]
 //!   [--model M] [--base-url U] [--api-key-env NAME]` runs the reference
@@ -16,6 +20,7 @@ const protocol = @import("../skills/sealed/protocol.zig");
 const transport = @import("../skills/sealed/transport.zig");
 const pin_mod = @import("../skills/sealed/pin.zig");
 const ledger = @import("../skills/sealed/ledger.zig");
+const credentials = @import("../skills/sealed/credentials.zig");
 const gateway_mod = @import("../skills/sealed/gateway.zig");
 const provider_factory = @import("../api/provider_factory.zig");
 const types = @import("../types.zig");
@@ -23,6 +28,8 @@ const types = @import("../types.zig");
 const USAGE =
     \\usage: metacodes sealed install <gateway-url> <skill_id> [--token-env NAME] [--yes]
     \\       metacodes sealed list
+    \\       metacodes sealed bind <name> <ref> [--from-env VAR]   (secret from stdin unless --from-env)
+    \\       metacodes sealed unbind <name> <ref>
     \\       metacodes sealed ledger
     \\       metacodes sealed serve --skills <dir> [--listen PORT] [--token T]
     \\                              [--provider anthropic|openai|gemini] [--model M]
@@ -37,6 +44,8 @@ pub fn run(args: *std.process.Args.Iterator, allocator: std.mem.Allocator, io: s
     };
     if (std.mem.eql(u8, sub, "install")) return install(args, allocator, io, state_root);
     if (std.mem.eql(u8, sub, "list")) return list(allocator, state_root);
+    if (std.mem.eql(u8, sub, "bind")) return bind(args, allocator, state_root);
+    if (std.mem.eql(u8, sub, "unbind")) return unbind(args, allocator, state_root);
     if (std.mem.eql(u8, sub, "ledger")) return printLedger(allocator, state_root);
     if (std.mem.eql(u8, sub, "serve")) return serve(args, allocator);
     std.debug.print("error: unknown sealed subcommand '{s}'\n{s}", .{ sub, USAGE });
@@ -186,13 +195,119 @@ fn list(allocator: std.mem.Allocator, state_root: []const u8) u8 {
         std.debug.print("No sealed Skills pinned.\n", .{});
         return 0;
     }
+    var store = credentials.load(allocator, state_root) catch |err| {
+        std.debug.print("error: could not read {s} ({s})\n", .{ credentials.FILE_NAME, @errorName(err) });
+        return 1;
+    };
+    defer store.deinit();
     for (listing.pins) |pin| {
         if (pin.broken) |err| {
             std.debug.print("/{s}  BROKEN ({s})\n", .{ pin.name, @errorName(err) });
             continue;
         }
         std.debug.print("/{s}  v{s}  {s}  {s}  {s}\n", .{ pin.name, pin.version, pin.gateway_url, pin.creator, pin.manifest_digest });
+        var parsed = readPin(allocator, state_root, pin.name) catch continue;
+        defer parsed.deinit();
+        for (parsed.pin.entry.manifest.credentials) |credential| {
+            if (store.isBound(parsed.pin.entry.skill_id, credential.ref)) {
+                std.debug.print("    credential {s}: bound\n", .{credential.ref});
+            } else {
+                std.debug.print("    credential {s}: NOT BOUND ({s}) — metacodes sealed bind {s} {s}\n", .{ credential.ref, credential.purpose, pin.name, credential.ref });
+            }
+        }
     }
+    return 0;
+}
+
+/// The verified pin of `/name` under the state root.
+fn readPin(allocator: std.mem.Allocator, state_root: []const u8, name: []const u8) !pin_mod.ParsedPin {
+    const pin_root = try pin_mod.pinRoot(allocator, state_root);
+    defer allocator.free(pin_root);
+    const dir = try std.fs.path.join(allocator, &.{ pin_root, name });
+    defer allocator.free(dir);
+    return pin_mod.read(allocator, dir);
+}
+
+/// `bind <name> <ref> [--from-env VAR]`: the secret comes from stdin (one
+/// line; pipe it or type it) or from an environment variable, never from
+/// argv, which every process on the machine can read.
+fn bind(args: *std.process.Args.Iterator, allocator: std.mem.Allocator, state_root: []const u8) u8 {
+    const name = args.next() orelse return usageError("bind needs <name> <ref>");
+    const ref = args.next() orelse return usageError("bind needs <name> <ref>");
+    var from_env: ?[]const u8 = null;
+    while (args.next()) |arg| {
+        if (std.mem.eql(u8, arg, "--from-env")) {
+            from_env = args.next() orelse return usageError("--from-env needs a variable name");
+        } else {
+            std.debug.print("error: unknown bind argument '{s}'\n", .{arg});
+            return 2;
+        }
+    }
+    if (state_root.len == 0) {
+        std.debug.print("error: no state root; pass --state-dir or set METACODES_HOME\n", .{});
+        return 1;
+    }
+    var parsed = readPin(allocator, state_root, name) catch |err| {
+        std.debug.print("error: no verified pin for /{s} ({s}); install it first\n", .{ name, @errorName(err) });
+        return 1;
+    };
+    defer parsed.deinit();
+    const manifest = &parsed.pin.entry.manifest;
+    const declared = for (manifest.credentials) |credential| {
+        if (std.mem.eql(u8, credential.ref, ref)) break true;
+    } else false;
+    if (!declared) {
+        std.debug.print("error: /{s} does not declare a credential reference '{s}'; it declares:", .{ name, ref });
+        for (manifest.credentials) |credential| std.debug.print(" {s}", .{credential.ref});
+        std.debug.print("\n", .{});
+        return 1;
+    }
+    var secret_buf: [credentials.MAX_SECRET_BYTES]u8 = undefined;
+    defer @memset(&secret_buf, 0);
+    const secret: []const u8 = if (from_env) |variable|
+        envValue(allocator, variable) orelse {
+            std.debug.print("error: ${s} is not set\n", .{variable});
+            return 1;
+        }
+    else blk: {
+        if (@import("platform").terminal.isatty(0)) std.debug.print("Secret for {s} ({s}), then Enter: ", .{ ref, manifest.name });
+        const n = pfs.read(0, &secret_buf);
+        if (n <= 0) {
+            std.debug.print("error: no secret on stdin\n", .{});
+            return 1;
+        }
+        break :blk secret_buf[0..@intCast(n)];
+    };
+    const trimmed = std.mem.trim(u8, secret, "\r\n");
+    credentials.bind(allocator, state_root, parsed.pin.entry.skill_id, ref, trimmed) catch |err| {
+        std.debug.print("error: could not bind ({s})\n", .{@errorName(err)});
+        return 1;
+    };
+    std.debug.print("Bound {s} for /{s} ({s}) in {s}/{s}.\n", .{ ref, name, parsed.pin.entry.skill_id, state_root, credentials.FILE_NAME });
+    return 0;
+}
+
+fn unbind(args: *std.process.Args.Iterator, allocator: std.mem.Allocator, state_root: []const u8) u8 {
+    const name = args.next() orelse return usageError("unbind needs <name> <ref>");
+    const ref = args.next() orelse return usageError("unbind needs <name> <ref>");
+    if (state_root.len == 0) {
+        std.debug.print("error: no state root; pass --state-dir or set METACODES_HOME\n", .{});
+        return 1;
+    }
+    var parsed = readPin(allocator, state_root, name) catch |err| {
+        std.debug.print("error: no verified pin for /{s} ({s})\n", .{ name, @errorName(err) });
+        return 1;
+    };
+    defer parsed.deinit();
+    const removed = credentials.unbind(allocator, state_root, parsed.pin.entry.skill_id, ref) catch |err| {
+        std.debug.print("error: could not unbind ({s})\n", .{@errorName(err)});
+        return 1;
+    };
+    if (!removed) {
+        std.debug.print("{s} was not bound for /{s}.\n", .{ ref, name });
+        return 1;
+    }
+    std.debug.print("Unbound {s} for /{s}.\n", .{ ref, name });
     return 0;
 }
 

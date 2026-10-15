@@ -12,6 +12,18 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Added
 
+- Sealed Skills, client side of the three §9.1 gaps: a call marked
+  `confirm: true` is approved interactively whatever the permission mode,
+  through a tightening-only confirm gate on the child's permission context
+  (a remembered "allow always" does not answer it); credential references
+  are bound per Skill with `metacodes sealed bind|unbind` in
+  `<state root>/sealed-credentials.json`, substituted into the call's input
+  and redacted from its result before it leaves the machine, an unbound one
+  refusing the call with `permission_denied` and the bind command; an
+  `input_required` Step is asked through the session's dialog and the answer
+  continues the run. The reference gateway gains the `AskUser` tool behind
+  `input_required` and annotates calls with the credential references their
+  inputs name.
 - Sealed Skill Protocol (SSP/1, [doc/SEALED_SKILL_PROTOCOL.md](doc/SEALED_SKILL_PROTOCOL.md)):
   a Skill whose body stays on a gateway while every tool call it needs is
   executed, approved and paid for on the client. `metacodes sealed install`

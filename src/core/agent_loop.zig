@@ -2153,7 +2153,10 @@ pub fn run(
                         const after_root_move = for (tool_uses.items[0 .. tool_uses.items.len - 1]) |previous| {
                             if (tools_mod.movesWorkingRoot(previous.name)) break true;
                         } else false;
-                        if (prefetch_enabled and not_aborted and activation_allows_prefetch and !after_root_move and sp.isStreamable(tu.name) and
+                        // A call the confirm gate marks must wait for its prompt;
+                        // started here it would run before the user answered.
+                        const needs_confirm = if (permission_ctx.confirm_gate) |gate| gate.requires(tu.id, tu.name) else false;
+                        if (prefetch_enabled and not_aborted and activation_allows_prefetch and !after_root_move and !needs_confirm and sp.isStreamable(tu.name) and
                             prefetch_ctx.isPrefetchSafe(tu.name) and
                             tools_mod.isConcurrencySafeInput(tu.name, tu.input_json) and
                             permission_mod.checkPermission(&pc_prefetch, tu.name, tu.input_json) == .allow)
@@ -3045,8 +3048,13 @@ pub fn run(
                 registry.category(canonical_name)
             else
                 null;
-            const perm_result = permission_mod.checkPermissionClassified(&pc_nohooks, canonical_name, eff_input, classified);
-            log.infoId("permission", rid, "tool={s} decision={s}", .{ tu.name, @tagName(perm_result) });
+            var perm_result = permission_mod.checkPermissionClassified(&pc_nohooks, canonical_name, eff_input, classified);
+            // A confirmation demanded from outside the chain (sealed `confirm:
+            // true`) only tightens: an allow becomes an ask whose prompt skips
+            // "allow always" memory; deny and ask are untouched.
+            const forced_confirm = if (permission_ctx.confirm_gate) |gate| gate.requires(tu.id, canonical_name) else false;
+            if (forced_confirm and perm_result == .allow) perm_result = .ask;
+            log.infoId("permission", rid, "tool={s} decision={s}{s}", .{ tu.name, @tagName(perm_result), if (forced_confirm) " (confirm required)" else "" });
             var slot = tool_exec.Slot{ .decision = .run, .name = tu.name, .id = tu.id, .input = eff_input };
             var policy_allowed = perm_result == .allow;
             switch (perm_result) {
@@ -3062,7 +3070,10 @@ pub fn run(
                     // R2-3:传 canonical_name——ask 记忆(rememberAllow/Deny)与决策链读取
                     // (decisionFor)必须同键,否则 "always deny" 存 "bash" 键、后续按 "Bash"
                     // 查不到,session deny 被 settings allow 越过。
-                    const allowed = permission_mod.promptUser(@constCast(permission_ctx), canonical_name, eff_input) catch false;
+                    const allowed = if (forced_confirm)
+                        permission_mod.promptUserForced(@constCast(permission_ctx), canonical_name, eff_input) catch false
+                    else
+                        permission_mod.promptUser(@constCast(permission_ctx), canonical_name, eff_input) catch false;
                     policy_allowed = allowed;
                     log.infoId("permission", rid, "prompt tool={s} user_allowed={}", .{ tu.name, allowed });
                     if (!allowed) {

@@ -16,9 +16,17 @@
 //! Metering is first-party: `usage.cost_micros` is computed from the
 //! provider's reported tokens with the local price table, and is what the
 //! `charge` receipt carries.
+//!
+//! Two things the model sees that are not client tools: the gateway's own
+//! `AskUser` tool, whose call becomes an `input_required` Step (§4.3) and
+//! whose answer comes back as that Step's one result; and the credential
+//! placeholders `${SEALED_CRED:<ref>}` for the references the manifest
+//! declares (§6.4) — a call whose input names one is annotated with
+//! `credentials: [<ref>]` so the client substitutes and redacts it.
 
 const std = @import("std");
 const protocol = @import("protocol.zig");
+const credentials = @import("credentials.zig");
 const definition = @import("../runtime/definition.zig");
 const provider_mod = @import("../../api/provider.zig");
 const api_stream = @import("../../api/stream.zig");
@@ -40,6 +48,12 @@ pub const MAX_REQUEST_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_STATE_BYTES: usize = 256 * 1024;
 /// Policy violations reported by the client before the gateway fails the run.
 pub const MAX_POLICY_VIOLATIONS: u32 = 3;
+/// The gateway's own tool: a call to it is an `input_required` Step (§4.3).
+pub const ASK_USER_TOOL = "AskUser";
+const ASK_USER_DESCRIPTION = "Ask the person running this Skill one question that only they can answer (a choice, a value, a confirmation of intent). Returns their answer as text. Prefer finishing with what you have over asking; never ask for secrets, use credential placeholders instead.";
+const ASK_USER_SCHEMA_JSON =
+    \\{"type":"object","properties":{"message":{"type":"string","description":"The question, in the user's language, with the context they need to answer it."},"schema":{"type":"object","description":"Optional elicitation form: a JSON Schema object whose single property may carry an enum of the choices."}},"required":["message"],"additionalProperties":false}
+;
 
 pub const Error = error{
     OutOfMemory,
@@ -200,7 +214,7 @@ pub const Gateway = struct {
         try protocol.writeString(w, self.operator_id);
         try w.writeAll(",\"billing\":");
         try protocol.writeString(w, self.operator_id);
-        try w.writeAll("},\"capabilities\":{\"run_state\":\"opaque\",\"step_signature\":false,\"input_required\":false,\"prefetch\":false,\"client_sealed\":false,\"currencies\":[");
+        try w.writeAll("},\"capabilities\":{\"run_state\":\"opaque\",\"step_signature\":false,\"input_required\":true,\"prefetch\":false,\"client_sealed\":false,\"currencies\":[");
         try protocol.writeString(w, self.currency);
         try w.writeAll("]}}");
         return out.written();
@@ -291,16 +305,22 @@ pub const Gateway = struct {
         if (state.pending.len == 0) return error.RunStateInvalid;
         const package = self.findPackage(state.skill_id) orelse return error.SkillNotFound;
 
-        // One result per pending call, matched by id.
+        // One result per pending call or question, matched by id. A call the
+        // model issued beside a question was never sent (§4.3: a Step is one
+        // kind); it is answered here so the conversation stays well-formed.
         var blocks: std.ArrayList(std.json.Value) = .empty;
         var matched: usize = 0;
         for (state.pending) |pending| {
-            const result = findResult(results.array.items, pending.id) orelse return error.RunStateInvalid;
-            matched += 1;
-            const content = valueString(result, "content") orelse "";
-            const is_error = valueBool(result, "is_error") orelse false;
-            if (valueString(result, "refusal")) |refusal| {
-                if (std.mem.eql(u8, refusal, "policy_violation")) state.violations += 1;
+            var content: []const u8 = skippedResultText(pending.kind);
+            var is_error = true;
+            if (pending.kind == .call or pending.kind == .question) {
+                const result = findResult(results.array.items, pending.id) orelse return error.RunStateInvalid;
+                matched += 1;
+                content = valueString(result, "content") orelse "";
+                is_error = valueBool(result, "is_error") orelse false;
+                if (valueString(result, "refusal")) |refusal| {
+                    if (std.mem.eql(u8, refusal, "policy_violation")) state.violations += 1;
+                }
             }
             var block = std.json.ObjectMap{};
             block.put(arena, "type", .{ .string = "tool_result" }) catch return error.OutOfMemory;
@@ -328,7 +348,19 @@ pub const Gateway = struct {
 
     // ── Run state ─────────────────────────────────────────────────────────
 
-    const Pending = struct { id: []const u8, name: []const u8 };
+    /// What a pending id waits for: a client result (`call`, `question`), or
+    /// nothing — the gateway answers it itself on continue (`skipped`: a call
+    /// issued beside a question; `invalid_ask`: an `AskUser` without a message).
+    const PendingKind = enum { call, question, skipped, invalid_ask };
+    const Pending = struct { id: []const u8, name: []const u8, kind: PendingKind = .call };
+
+    fn skippedResultText(kind: PendingKind) []const u8 {
+        return switch (kind) {
+            .call, .question => "",
+            .skipped => "not executed: the Skill asked the user in the same turn; call it again now that the answer is in",
+            .invalid_ask => "AskUser needs a non-empty string `message`; nothing was asked",
+        };
+    }
 
     const RunState = struct {
         run_id: []const u8,
@@ -379,7 +411,7 @@ pub const Gateway = struct {
             protocol.writeString(w, pending.id) catch return error.OutOfMemory;
             w.writeAll(",\"name\":") catch return error.OutOfMemory;
             protocol.writeString(w, pending.name) catch return error.OutOfMemory;
-            w.writeByte('}') catch return error.OutOfMemory;
+            w.print(",\"kind\":\"{s}\"}}", .{@tagName(pending.kind)}) catch return error.OutOfMemory;
         }
         w.writeAll("]}") catch return error.OutOfMemory;
         const plain = out.written();
@@ -417,9 +449,11 @@ pub const Gateway = struct {
         if (pending_value != .array) return error.RunStateInvalid;
         const pending = arena.alloc(Pending, pending_value.array.items.len) catch return error.OutOfMemory;
         for (pending_value.array.items, pending) |item, *slot| {
+            const kind_text = valueString(item, "kind") orelse "call";
             slot.* = .{
                 .id = valueString(item, "id") orelse return error.RunStateInvalid,
                 .name = valueString(item, "name") orelse return error.RunStateInvalid,
+                .kind = std.meta.stringToEnum(PendingKind, kind_text) orelse return error.RunStateInvalid,
             };
         }
         return .{
@@ -448,15 +482,20 @@ pub const Gateway = struct {
         if (state.seq + 1 > state.max_steps) return self.finishRun(arena, state, "max_steps", "step limit reached");
         const messages = try apiMessages(arena, state.messages.items);
         const tools = try toolDefinitions(arena, state.tools);
+        const system = try systemPrompt(arena, package);
 
         var text: std.ArrayList(u8) = .empty;
         var calls: std.ArrayList(protocol.Call) = .empty;
+        // `AskUser` calls never reach the client as calls: the first valid one
+        // is the Step's question, the rest are answered by the gateway.
+        var asks: std.ArrayList(Pending) = .empty;
+        var question: ?protocol.Question = null;
         var usage: api_stream.UsageDelta = .{};
         var stop: api_stream.StopReason = .unknown;
         {
             self.model_mutex.lock();
             defer self.model_mutex.unlock();
-            const stream = self.provider.sendStream(messages, package.body, if (tools.len == 0) null else tools, null, null, null, "") catch |err| {
+            const stream = self.provider.sendStream(messages, system, tools, null, null, null, "") catch |err| {
                 log.warn("sealed-gw", "model call failed: {s}", .{@errorName(err)});
                 return error.UpstreamUnavailable;
             };
@@ -479,12 +518,29 @@ pub const Gateway = struct {
                         self.allocator.free(call.input_json);
                     }
                     const confirm = state.confirm_all or listContains(package.entry.manifest.confirmation_required_for, call.name);
+                    const input_json = arena.dupe(u8, call.input_json) catch return error.OutOfMemory;
+                    const id = arena.dupe(u8, call.id) catch return error.OutOfMemory;
+                    if (std.mem.eql(u8, call.name, ASK_USER_TOOL)) {
+                        const parsed_question: ?protocol.Question = questionFromInput(arena, id, input_json) catch null;
+                        var kind: PendingKind = .skipped;
+                        if (parsed_question) |q| {
+                            if (question == null) {
+                                question = q;
+                                kind = .question;
+                            }
+                        } else kind = .invalid_ask;
+                        asks.append(arena, .{ .id = id, .name = ASK_USER_TOOL, .kind = kind }) catch return error.OutOfMemory;
+                        // The assistant turn still records the call (below).
+                        calls.append(arena, .{ .id = id, .name = ASK_USER_TOOL, .input_json = input_json }) catch return error.OutOfMemory;
+                        continue;
+                    }
                     calls.append(arena, .{
-                        .id = arena.dupe(u8, call.id) catch return error.OutOfMemory,
+                        .id = id,
                         .name = arena.dupe(u8, call.name) catch return error.OutOfMemory,
-                        .input_json = arena.dupe(u8, call.input_json) catch return error.OutOfMemory,
+                        .input_json = input_json,
                         .confirm = confirm,
                         .deadline_ms = 300_000,
+                        .credentials = try declaredCredentialRefs(arena, package, input_json),
                         .result_limit_bytes = package.entry.manifest.egress_max_result_bytes,
                     }) catch return error.OutOfMemory;
                 },
@@ -539,9 +595,45 @@ pub const Gateway = struct {
         }
         if (calls.items.len != 0 and stop != .end_turn) {
             const pending = arena.alloc(Pending, calls.items.len) catch return error.OutOfMemory;
-            for (calls.items, pending) |call, *slot| slot.* = .{ .id = call.id, .name = call.name };
+            var client_calls: std.ArrayList(protocol.Call) = .empty;
+            for (calls.items, pending) |call, *slot| {
+                const ask = findPending(asks.items, call.id);
+                slot.* = if (ask) |a|
+                    a
+                else if (question != null)
+                    // §4.3: an `input_required` Step carries the question
+                    // alone; a sibling call waits for the next turn.
+                    .{ .id = call.id, .name = call.name, .kind = .skipped }
+                else blk: {
+                    client_calls.append(arena, call) catch return error.OutOfMemory;
+                    break :blk .{ .id = call.id, .name = call.name, .kind = .call };
+                };
+            }
             state.pending = pending;
-            return self.emitStep(arena, state, .{ .kind = .tool_calls, .calls = calls.items, .text = text.items, .usage = step_usage });
+            if (question) |q| {
+                return self.emitStep(arena, state, .{ .kind = .input_required, .question = q, .text = text.items, .usage = step_usage });
+            }
+            if (client_calls.items.len != 0) {
+                return self.emitStep(arena, state, .{ .kind = .tool_calls, .calls = client_calls.items, .text = text.items, .usage = step_usage });
+            }
+            // Only malformed `AskUser` calls: nothing for the client. Answer
+            // them here and let the model try again (bounded by max_steps).
+            var blocks_now: std.ArrayList(std.json.Value) = .empty;
+            for (pending) |p| {
+                var block = std.json.ObjectMap{};
+                block.put(arena, "type", .{ .string = "tool_result" }) catch return error.OutOfMemory;
+                block.put(arena, "tool_use_id", .{ .string = p.id }) catch return error.OutOfMemory;
+                block.put(arena, "content", .{ .string = skippedResultText(p.kind) }) catch return error.OutOfMemory;
+                block.put(arena, "is_error", .{ .bool = true }) catch return error.OutOfMemory;
+                blocks_now.append(arena, .{ .object = block }) catch return error.OutOfMemory;
+            }
+            try appendMessage(arena, state, "user", blocks_now.items);
+            state.pending = &.{};
+            // No Step left the gateway for this model call, so it is not a
+            // sequence number: the retry is the same client-visible Step. Its
+            // cost is already in the cumulative totals.
+            state.seq -= 1;
+            return self.advance(arena, package, state);
         }
         if (stop == .max_tokens or stop == .refusal) {
             return self.emitStep(arena, state, .{ .kind = .failed, .reason = "skill_error", .message = @tagName(stop), .usage = step_usage });
@@ -558,6 +650,7 @@ pub const Gateway = struct {
     const Emit = struct {
         kind: protocol.StepKind,
         calls: []const protocol.Call = &.{},
+        question: ?protocol.Question = null,
         text: []const u8 = "",
         reason: []const u8 = "",
         message: []const u8 = "",
@@ -575,7 +668,7 @@ pub const Gateway = struct {
         const digest = protocol.stepDigest(arena, value) catch return error.OutOfMemory;
         state.last_digest = digest;
         value.object.put(arena, "digest", .{ .string = digest }) catch return error.OutOfMemory;
-        if (emit.kind == .tool_calls) {
+        if (emit.kind == .tool_calls or emit.kind == .input_required) {
             const blob = try self.sealState(arena, state);
             value.object.put(arena, "run_state", .{ .string = blob }) catch return error.OutOfMemory;
         }
@@ -596,9 +689,26 @@ pub const Gateway = struct {
                 try protocol.writeString(w, call.name);
                 try w.writeAll(",\"input\":");
                 try w.writeAll(call.input_json);
-                try w.print(",\"confirm\":{},\"deadline_ms\":{d},\"credentials\":[],\"result_limit_bytes\":{d}}}", .{ call.confirm, call.deadline_ms orelse 0, call.result_limit_bytes orelse protocol.DEFAULT_MAX_RESULT_BYTES });
+                try w.print(",\"confirm\":{},\"deadline_ms\":{d},\"credentials\":[", .{ call.confirm, call.deadline_ms orelse 0 });
+                for (call.credentials, 0..) |ref, ref_index| {
+                    if (ref_index != 0) try w.writeByte(',');
+                    try protocol.writeString(w, ref);
+                }
+                try w.print("],\"result_limit_bytes\":{d}}}", .{call.result_limit_bytes orelse protocol.DEFAULT_MAX_RESULT_BYTES});
             }
             try w.writeByte(']');
+        }
+        if (emit.kind == .input_required) {
+            const q = emit.question orelse return error.InvalidParams;
+            try w.writeAll(",\"question\":{\"id\":");
+            try protocol.writeString(w, q.id);
+            try w.writeAll(",\"message\":");
+            try protocol.writeString(w, q.message);
+            if (q.schema_json.len != 0) {
+                try w.writeAll(",\"schema\":");
+                try w.writeAll(q.schema_json);
+            }
+            try w.writeByte('}');
         }
         if (emit.text.len != 0) {
             try w.writeAll(",\"text\":");
@@ -636,6 +746,68 @@ pub const Gateway = struct {
 };
 
 const protocol_default_max_steps: u64 = 200;
+
+/// The system prompt of a run: the Skill body, then what the model needs to
+/// know about this gateway's own affordances (credential placeholders for the
+/// declared references, and `AskUser`). Never anything per client or per run,
+/// so the provider's prompt cache is not broken between Steps.
+fn systemPrompt(arena: std.mem.Allocator, package: *const Package) Gateway.MethodError![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    out.appendSlice(arena, package.body) catch return error.OutOfMemory;
+    const manifest = &package.entry.manifest;
+    if (manifest.credentials.len != 0) {
+        out.appendSlice(arena, "\n\n## Credentials\n\nThe user has bound these credential references on their machine. Write the placeholder literally wherever a tool input needs the value; the client substitutes it before executing and redacts it from the result. You never see the value and must not ask for it.\n") catch return error.OutOfMemory;
+        for (manifest.credentials) |credential| {
+            out.print(arena, "- `{s}{s}{s}`", .{ credentials.PLACEHOLDER_PREFIX, credential.ref, credentials.PLACEHOLDER_SUFFIX }) catch return error.OutOfMemory;
+            if (credential.purpose.len != 0) out.print(arena, " — {s}", .{credential.purpose}) catch return error.OutOfMemory;
+            out.append(arena, '\n') catch return error.OutOfMemory;
+        }
+    }
+    out.appendSlice(arena, "\n\n## Asking the user\n\nWhen only the person running this Skill can supply what you need, call `" ++ ASK_USER_TOOL ++ "` with one clear question; the answer comes back as the tool result.\n") catch return error.OutOfMemory;
+    return out.items;
+}
+
+/// The gateway's `AskUser` definition (§4.3), appended to the client's tools.
+fn askUserDefinition(arena: std.mem.Allocator) Gateway.MethodError!json_mod.ToolDefinition {
+    const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, ASK_USER_SCHEMA_JSON, .{}) catch return error.OutOfMemory;
+    var schema: json_mod.InputSchema = .{};
+    schema.properties = parsed.object.get("properties").?.object;
+    const required = arena.alloc([]const u8, 1) catch return error.OutOfMemory;
+    required[0] = "message";
+    schema.required = required;
+    schema.additional_properties = false;
+    return .{ .name = ASK_USER_TOOL, .description = ASK_USER_DESCRIPTION, .input_schema = schema };
+}
+
+/// An `AskUser` call's input as the Step's question: `message` is required,
+/// `schema` is passed through canonicalized.
+fn questionFromInput(arena: std.mem.Allocator, id: []const u8, input_json: []const u8) !protocol.Question {
+    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, arena, input_json, .{});
+    if (parsed != .object) return error.InvalidParams;
+    const message = valueString(parsed, "message") orelse return error.InvalidParams;
+    if (message.len == 0) return error.InvalidParams;
+    var schema_json: []const u8 = "";
+    if (parsed.object.get("schema")) |schema| {
+        if (schema == .object) schema_json = try protocol.canonicalize(arena, schema);
+    }
+    return .{ .id = id, .message = message, .schema_json = schema_json };
+}
+
+/// §6.4: the manifest-declared references whose placeholder appears in the
+/// call's input, so the client knows which secrets the call needs.
+fn declaredCredentialRefs(arena: std.mem.Allocator, package: *const Package, input_json: []const u8) Gateway.MethodError![]const []const u8 {
+    const found = credentials.placeholderRefs(arena, input_json) catch return error.OutOfMemory;
+    var declared: std.ArrayList([]const u8) = .empty;
+    for (found) |ref| {
+        for (package.entry.manifest.credentials) |credential| {
+            if (std.mem.eql(u8, credential.ref, ref)) {
+                declared.append(arena, ref) catch return error.OutOfMemory;
+                break;
+            }
+        }
+    }
+    return declared.items;
+}
 
 // ── Packages ──────────────────────────────────────────────────────────────
 
@@ -746,9 +918,13 @@ fn apiMessages(arena: std.mem.Allocator, messages: []const std.json.Value) Gatew
 /// The client's tool definitions (§4.1) in the neutral request type.
 fn toolDefinitions(arena: std.mem.Allocator, tools: std.json.Value) Gateway.MethodError![]const json_mod.ToolDefinition {
     if (tools != .array) return error.InvalidParams;
-    const out = arena.alloc(json_mod.ToolDefinition, tools.array.items.len) catch return error.OutOfMemory;
-    for (tools.array.items, out) |tool, *slot| {
+    const out = arena.alloc(json_mod.ToolDefinition, tools.array.items.len + 1) catch return error.OutOfMemory;
+    // The gateway's own tool comes last; a client tool of the same name is
+    // refused, since its call would never reach the client as a call.
+    out[tools.array.items.len] = try askUserDefinition(arena);
+    for (tools.array.items, out[0..tools.array.items.len]) |tool, *slot| {
         const name = valueString(tool, "name") orelse return error.InvalidParams;
+        if (std.mem.eql(u8, name, ASK_USER_TOOL)) return error.InvalidParams;
         var schema: json_mod.InputSchema = .{};
         if (tool == .object) if (tool.object.get("input_schema")) |raw| {
             if (raw != .object) return error.InvalidParams;
@@ -776,6 +952,11 @@ fn toolDefinitions(arena: std.mem.Allocator, tools: std.json.Value) Gateway.Meth
         };
     }
     return out;
+}
+
+fn findPending(list: []const Gateway.Pending, id: []const u8) ?Gateway.Pending {
+    for (list) |item| if (std.mem.eql(u8, item.id, id)) return item;
+    return null;
 }
 
 fn listContains(list: []const []const u8, needle: []const u8) bool {

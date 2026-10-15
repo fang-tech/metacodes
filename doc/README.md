@@ -17,7 +17,7 @@ Run `zig build gate:pr` to execute the single AGENTS.md pre-submit checklist.
   metacodes, Claude Code and Codex directories; MCP 2026-07-28 client.
 - [Sealed Skill Protocol](SEALED_SKILL_PROTOCOL.md) — SSP/1: a Skill that
   runs on a gateway with its tool calls executed, approved and paid for on
-  the client; `metacodes sealed install|list|ledger|serve`.
+  the client; `metacodes sealed install|list|bind|unbind|ledger|serve`.
 
 ## Kernel design
 

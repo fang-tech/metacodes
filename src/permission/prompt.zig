@@ -18,9 +18,22 @@ const PermissionContext = @import("../permission.zig").PermissionContext;
 /// **ctx 非 const**:本函数有副作用(写 session 记忆 rememberAllow/Deny、写 settings.local.json)。
 /// 线程契约:M6 前假设单线程调用(SessionRules 无锁);M6 多 session 多线程化时给 SessionRules 加锁。
 pub fn ask(ctx: *PermissionContext, tool_name: []const u8, args: []const u8) !bool {
+    return askWith(ctx, tool_name, args, false);
+}
+
+/// The prompt a `PermissionContext.confirm_gate` demands (sealed `confirm:
+/// true`, doc/SEALED_SKILL_PROTOCOL.md §6.2): identical to `ask`, except that a
+/// remembered "allow always" for the tool does not answer it. A remembered
+/// deny still does, since the gate may only tighten; an "allow always" the
+/// user gives here is still remembered for the tool's ordinary calls.
+pub fn askForced(ctx: *PermissionContext, tool_name: []const u8, args: []const u8) !bool {
+    return askWith(ctx, tool_name, args, true);
+}
+
+fn askWith(ctx: *PermissionContext, tool_name: []const u8, args: []const u8, forced: bool) !bool {
     // session 记忆优先(per-session,不串台)
     if (ctx.session_rules) |sr| {
-        if (sr.isAllowed(tool_name)) return true;
+        if (!forced and sr.isAllowed(tool_name)) return true;
         if (sr.isDenied(tool_name)) return false;
     }
 

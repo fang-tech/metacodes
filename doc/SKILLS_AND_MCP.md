@@ -106,8 +106,14 @@ and `sealed-manifest-digest`, `context: fork`, and the allowlist as
 `Skill` tool run it as a fork whose model is the gateway. Usage is charged to
 the client's gateway account step by step under
 `METACODES_SEALED_MAX_COST_MICROS` and recorded in
-`<state root>/ledger/sealed.ndjson` (`metacodes sealed ledger`).
-`metacodes sealed serve` runs the reference gateway.
+`<state root>/ledger/sealed.ndjson` (`metacodes sealed ledger`). A call the
+gateway marks `confirm: true` is approved interactively even in a mode that
+would auto-allow it; a question the Skill has for the user is asked through
+the session's dialog and answered in place. A credential reference the
+manifest declares is bound with `metacodes sealed bind <name> <ref>` (secret
+from stdin or `--from-env`), kept in `<state root>/sealed-credentials.json`,
+substituted into the call on this machine and redacted from the result
+before it leaves. `metacodes sealed serve` runs the reference gateway.
 
 ## MCP servers
 

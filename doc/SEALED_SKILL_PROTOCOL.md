@@ -524,12 +524,18 @@ not consent to.
 This section is informative for other implementations and binding for
 metacodes. Both sides of the protocol live in `src/skills/sealed/`:
 `protocol.zig` (objects, digests, envelope), `transport.zig` (client HTTP),
-`pin.zig`, `provider.zig` and `ledger.zig` (client), `gateway.zig` (server).
-`tests/component/sealed_skill_test.zig` runs a pinned Skill through a
-loopback gateway whose model is a mock SSE server, and asserts the Skill body
-reaches only the model, the tool result is produced locally, the ledger holds
-the charge, an allowlist violation is refused locally, the bearer token gates
-the gateway, and a stale pin is refused before any model call.
+`pin.zig`, `credentials.zig`, `provider.zig` and `ledger.zig` (client),
+`gateway.zig` (server). `tests/component/sealed_skill_test.zig` runs a pinned
+Skill through a loopback gateway whose model is a mock SSE server, with a
+probe standing in for the session's UI, and asserts the Skill body reaches
+only the model, the tool result is produced locally, the ledger holds the
+charge, an allowlist violation is refused locally, the bearer token gates the
+gateway, a stale pin is refused before any model call, a `confirm: true`
+call is approved interactively in bypass mode (and a declined one reported as
+`permission_denied`), an `input_required` Step is answered through the UI
+channel and the run continues (or ends with the question when there is no
+channel), and a bound credential is substituted into the call and redacted
+from the result while an unbound one refuses the call.
 
 ### 9.1 Client
 
@@ -572,18 +578,51 @@ the gateway, and a stale pin is refused before any model call.
 - **Ledger.** A `step` record per Step and a `charge` record per receipt
   go to `<state root>/ledger/sealed.ndjson`; `metacodes sealed ledger`
   prints it.
+- **Confirmation.** A call marked `confirm: true` is approved
+  interactively whatever the permission mode (§6.2). The provider does not
+  decide permissions: it answers the child permission context's *confirm
+  gate* (`permission/confirm_gate.zig`), which the loop consults after the
+  ordinary decision and which can only tighten — an `allow` becomes an `ask`
+  whose prompt ignores a remembered "allow always" for the tool (a
+  remembered deny still denies), and the stream prefetch never starts a
+  gated call. A declined prompt is reported as `refusal: permission_denied`.
+- **Credentials.** `metacodes sealed bind <name> <ref>` (secret from stdin
+  or `--from-env VAR`, never argv) binds a reference the pinned manifest
+  declares to a local secret, scoped to that Skill's `skill_id`, in
+  `<state root>/sealed-credentials.json` (mode 0600; a file of its own
+  rather than a section of `auth.json`, whose writers rebuild the whole
+  document from their own struct on every OAuth refresh). `metacodes sealed
+  unbind` removes it and `metacodes sealed list` shows each pin's references
+  as bound or not. For a call that lists references the provider replaces
+  `${SEALED_CRED:<ref>}` in the input JSON with the JSON-escaped secret
+  before streaming the call to the loop, and replaces every byte-exact
+  occurrence of the secret in the result with `[redacted:<ref>]` *before*
+  truncation, listing the reference in `redactions`. A reference the
+  manifest does not declare, or one not bound here, is never dispatched: the
+  call is answered with `refusal: permission_denied` and the bind command,
+  and the same hint is prepended to the fork's result for the user. A result
+  that is JSON-escaped or otherwise transformed differently from the secret
+  is not recognized; redaction is byte-exact.
+- **Input.** An `input_required` Step is put to the user as one
+  `ask_question` dialog over the session's UI requester (the tool context's
+  at the top level, else the permission context's), with the options of a
+  single-property `enum` in the elicitation schema and the dialog's
+  free-text entry otherwise; the answer is sent as the Step's one result
+  (`tool_use_id` = `question.id`) in `runs.continue` and the run goes on. A
+  dismissed dialog sends `is_error` with `refusal: aborted`. Without a
+  channel (headless, or an asynchronous front end that can only stash the
+  question) the run is cancelled and the question becomes the fork's text.
 - **Token.** The bearer token is read from the environment variable named
   by the pin (`--token-env`, default `METACODES_SEALED_TOKEN`).
 - **Transport.** One `std.http.Client` POST per request with
   `Sealed-Skill-Version: 1`; JSON and SSE answers are both accepted;
   in-flight requests sit in the shared abort registry with a two-minute
   liveness limit, so Ctrl+C and a dead socket both end the call.
-- **Not in revision 2026-10-15 of the client:** `confirm: true` is carried
-  but not yet forced onto the permission prompt (the ordinary permission
-  mode decides); credential references (§6.4) are not substituted, so a
-  Skill that declares `credentials` fails its first such call with
-  `permission_denied`; an `input_required` Step is returned to the parent
-  as the fork's text and the run is cancelled rather than resumed.
+- **Not in revision 2026-10-15 of the client:** suspending a fork on an
+  `input_required` Step for an asynchronous front end (the run is cancelled
+  instead, see *Input*); `confirmation: "always"` as a client setting (the
+  manifest and the gateway decide which calls carry `confirm`); a run-level
+  budget prompt (the cap is the environment variable).
 
 ### 9.2 Gateway
 
@@ -607,19 +646,35 @@ in order; TLS, fan-out and non-loopback exposure are a reverse proxy's job.
   server-side, which is what `retention: "run"` means here.
 - **Steps.** Each model call is one Step: `tool_calls` while the model
   calls tools (with `confirm` from the manifest or `confirmation: always`,
-  and `result_limit_bytes` from the manifest), `final` on `end_turn`,
+  `credentials` from the manifest-declared placeholders the input names,
+  and `result_limit_bytes` from the manifest), `input_required` when the
+  model calls the gateway's own `AskUser` tool, `final` on `end_turn`,
   `failed` on a budget cap, the step limit, three client policy refusals,
   a cancel, or a model stop the Skill cannot continue from. The digest is
   computed before the state is sealed with it as chain head, then both are
   attached.
+- **Input.** `AskUser` (`message`, optional elicitation `schema`) is
+  appended to the client's tool definitions on every model call, and the
+  system prompt tells the model when to use it. The first `AskUser` call of
+  a turn becomes an `input_required` Step whose `question.id` is that call's
+  id; its answer arrives as the Step's one result and enters the
+  conversation as the call's `tool_result`. Other calls the model issued in
+  the same turn are not sent (a Step is one kind): the gateway answers them
+  itself with an error result asking the model to call again. `discover`
+  reports `capabilities.input_required: true`.
+- **Credentials.** The system prompt lists the manifest's credential
+  references as `${SEALED_CRED:<ref>}` placeholders with their purpose; a
+  call whose input contains a declared placeholder carries that reference
+  in `credentials`, and only those (an undeclared name is left for the
+  client to refuse).
 - **Metering.** `usage.cost_micros` is derived from the provider's reported
   tokens and the local price table; `cumulative` and `charge` carry the
   running total. The gateway stops with `budget_exceeded` as soon as the
   total passes the client's cap.
 - **Not in revision 2026-10-15 of the gateway:** Step signatures
-  (`step_signature: false`), `input_required`, subscriptions and per-account
-  authorization beyond the single bearer token, the publish-time protection
-  rating, and the disclosure screening of §8.5.
+  (`step_signature: false`), subscriptions and per-account authorization
+  beyond the single bearer token, the publish-time protection rating, and
+  the disclosure screening of §8.5.
 
 ## 10. Error codes
 
