@@ -202,6 +202,12 @@ pub const mcp_session = @import("core/mcp_session.zig");
 pub const skills = @import("skills/skill.zig");
 pub const skills_runtime = @import("skills/runtime/root.zig");
 pub const skills_cli_adapter = @import("skills/cli_adapter.zig");
+pub const skills_sealed_protocol = @import("skills/sealed/protocol.zig");
+pub const skills_sealed_transport = @import("skills/sealed/transport.zig");
+pub const skills_sealed_pin = @import("skills/sealed/pin.zig");
+pub const skills_sealed_ledger = @import("skills/sealed/ledger.zig");
+pub const skills_sealed_provider = @import("skills/sealed/provider.zig");
+pub const skills_sealed_gateway = @import("skills/sealed/gateway.zig");
 pub const skills_tool = @import("skills/tool.zig");
 pub const skills_render = @import("skills/render.zig");
 pub const skills_discovery = @import("skills/discovery.zig");
@@ -1490,7 +1496,7 @@ fn maybeRunAuthCommand(init: std.process.Init, allocator: std.mem.Allocator, lea
     _ = args.next(); // 跳过 argv[0](程序名)
     for (0..leading) |_| _ = args.next(); // a leading --state-dir, already applied
     const cmd = args.next() orelse return null;
-    const subcommands = [_][]const u8{ "doctor", "install", "kgd", "kg", "ledger", "logout", "login" };
+    const subcommands = [_][]const u8{ "doctor", "install", "kgd", "kg", "ledger", "logout", "login", "sealed" };
     for (subcommands) |name| {
         if (std.mem.eql(u8, cmd, name)) break;
     } else return null;
@@ -1502,6 +1508,7 @@ fn maybeRunAuthCommand(init: std.process.Init, allocator: std.mem.Allocator, lea
     if (state_dir.len > 0) @import("core/context_caps.zig").configureStateRoot(state_dir);
     if (std.mem.eql(u8, cmd, "kgd")) return runKgd(&args, allocator);
     if (std.mem.eql(u8, cmd, "kg")) return runKg(&args, allocator);
+    if (std.mem.eql(u8, cmd, "sealed")) return @import("app/sealed_cli.zig").run(&args, allocator, init.io, state_dir);
     if (std.mem.eql(u8, cmd, "ledger")) {
         const provider = args.next() orelse {
             std.debug.print("usage: metacodes ledger metask\n", .{});

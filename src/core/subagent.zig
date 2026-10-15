@@ -43,6 +43,10 @@ pub const SubagentResult = struct {
 pub const SpawnOptions = struct {
     max_turns: u32 = 20,
     system_prompt: ?[]const u8 = null,
+    /// Per-run cost cap in USD (agent_loop `cost_budget_usd`): the child stops
+    /// with `.budget` once its own usage estimate reaches it. A sealed Skill
+    /// passes its pinned cap here as the secondary, estimate-based stop.
+    cost_budget_usd: ?f64 = null,
     /// UI/event routing identity. It is deliberately separate from
     /// `agent_ident`, which remains the child's coordination identity.
     /// Defaults only for standalone callers/tests. Production dispatchers must
@@ -224,6 +228,7 @@ pub fn spawnAgentSink(
         ctx_to_use,
         .{
             .max_turns = opts.max_turns,
+            .cost_budget_usd = opts.cost_budget_usd,
             .system_prompt = opts.system_prompt,
             .session = opts.session,
             .abort = abort,

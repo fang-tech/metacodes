@@ -31,6 +31,7 @@ test {
     _ = @import("component/wire_contract_test.zig");
     _ = @import("component/session_host_test.zig");
     _ = @import("component/skill_fork_test.zig");
+    _ = @import("component/sealed_skill_test.zig");
     _ = @import("component/prompt_tool_coupling_test.zig");
     _ = @import("component/http_error_test.zig");
     _ = @import("component/answer_queue_test.zig");

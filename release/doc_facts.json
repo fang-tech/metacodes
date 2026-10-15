@@ -54,7 +54,7 @@
         },
         {
           "file": "doc/LIB_API.md",
-          "regex": "^revision (\\d+) \u53ea\u6709\u4e00\u4e2a"
+          "regex": "^revision (\\d+) 只有一个"
         },
         {
           "file": "doc/PLUGIN_ARCHITECTURE.md",
@@ -70,7 +70,7 @@
         },
         {
           "file": "doc/PLUGIN_EVALUATION.md",
-          "regex": "AgentCore v1 revision (\\d+)\u3001CLI"
+          "regex": "AgentCore v1 revision (\\d+)、CLI"
         }
       ]
     },
@@ -187,6 +187,23 @@
         {
           "file": "doc/SKILLS_AND_MCP.md",
           "regex": "found up to (\\d+) directory levels"
+        }
+      ]
+    },
+    {
+      "id": "sealed_protocol_id",
+      "source": {
+        "file": "src/skills/sealed/protocol.zig",
+        "regex": "pub const PROTOCOL_ID = \"(metask\\.sealed-skill/v\\d+)\";"
+      },
+      "assert_in": [
+        {
+          "file": "doc/SEALED_SKILL_PROTOCOL.md",
+          "regex": "`(metask\\.sealed-skill/v\\d+)`"
+        },
+        {
+          "file": "doc/SKILLS_AND_MCP.md",
+          "regex": "`(metask\\.sealed-skill/v\\d+)`"
         }
       ]
     }

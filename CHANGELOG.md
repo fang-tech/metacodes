@@ -12,6 +12,15 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Added
 
+- Sealed Skill Protocol (SSP/1, [doc/SEALED_SKILL_PROTOCOL.md](doc/SEALED_SKILL_PROTOCOL.md)):
+  a Skill whose body stays on a gateway while every tool call it needs is
+  executed, approved and paid for on the client. `metacodes sealed install`
+  pins a gateway manifest after showing the allowlist, egress classes and
+  price; the pinned Skill runs as a fork whose model is the gateway, with a
+  per-run cost cap (`METACODES_SEALED_MAX_COST_MICROS`) and a usage ledger
+  (`metacodes sealed ledger`). `metacodes sealed serve` is the reference
+  gateway: stateless, AEAD-sealed run state, the operator's own provider
+  credentials, first-party metering.
 - Skills and MCP servers configured for Claude Code and Codex now work in
   metacodes, next to its own `<state root>/skills` and `config.json`
   ([doc/SKILLS_AND_MCP.md](doc/SKILLS_AND_MCP.md)). Skills come from
