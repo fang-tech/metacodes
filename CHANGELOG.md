@@ -120,7 +120,8 @@ status, compatibility boundaries, and entry points are defined by
 
 - `agent_loop.run` refuses provider server tools: a tool definition with
   `server_type` (in `tool_defs` or `Options.tool_defs`) returns
-  `error.ServerToolsUnsupported` before any request. The loop keeps no
+  `error.ServerToolsUnsupported` before any request (`resumeRun` before it
+  appends the resumed tool results). The loop keeps no
   server_tool_use or server result blocks, so a turn the server pauses
   (`pause_turn`) could only be truncated. `AgentSession`'s tool catalog
   already rejected them; only direct source-level callers of `run` are

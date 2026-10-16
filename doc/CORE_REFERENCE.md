@@ -359,7 +359,8 @@ pub const StopReason = enum {
 当 `stop_reason == .suspended` 时，`suspend_info` 由调用方拥有；写入持久状态或完成
 投递后调用其 `deinit()`。
 `tool_defs`(含 `Options.tool_defs`)里出现 provider server tool(`server_type` 非空,如
-Anthropic `web_search_20250305`)时 `run` 直接返回 `error.ServerToolsUnsupported`,不发任何请求:
+Anthropic `web_search_20250305`)时 `run` 直接返回 `error.ServerToolsUnsupported`,不发任何请求
+(`resumeRun` 在追加恢复的 tool_result 之前就拒绝,对话保持原样):
 本循环不保存 server_tool_use / 结果块,服务端暂停的回合(`pause_turn`)只能靠原样回送这些块续跑,
 放行只会静默截断。WebSearch 的 server tool 只出现在它自己的隔离子请求里。
 

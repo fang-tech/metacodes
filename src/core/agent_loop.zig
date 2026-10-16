@@ -943,6 +943,13 @@ fn hasServerTool(defs: []const json_mod.ToolDefinition) bool {
     return false;
 }
 
+/// Both entry points check before they change anything: `run` before any
+/// request, `resumeRun` before it appends the resumed tool results.
+fn refuseServerTools(tool_defs: []const json_mod.ToolDefinition, opts: Options) error{ServerToolsUnsupported}!void {
+    if (hasServerTool(tool_defs) or (if (opts.tool_defs) |defs| hasServerTool(defs) else false))
+        return error.ServerToolsUnsupported;
+}
+
 test "run refuses provider server tools it cannot represent" {
     const a = std.testing.allocator;
     var c = Conversation.init(a);
@@ -968,6 +975,10 @@ test "run refuses provider server tools it cannot represent" {
     // the Run on any request) and without touching the Conversation.
     try std.testing.expectError(error.ServerToolsUnsupported, run(&c, testProvider(&state), &server_tool, &perm, .{ .max_turns = 1, .colorize = false }, &backend, a));
     try std.testing.expectError(error.ServerToolsUnsupported, run(&c, testProvider(&state), &.{}, &perm, .{ .max_turns = 1, .colorize = false, .tool_defs = &server_tool }, &backend, a));
+    try std.testing.expectEqual(@as(usize, 1), c.len());
+    // resumeRun refuses before it appends the resumed tool result.
+    try std.testing.expectError(error.ServerToolsUnsupported, resumeRun(&c, testProvider(&state), &server_tool, &perm, "tu_1", "{}", &.{}, .{ .max_turns = 1, .colorize = false }, &backend, a));
+    try std.testing.expectError(error.ServerToolsUnsupported, resumeRun(&c, testProvider(&state), &.{}, &perm, "tu_1", "{}", &.{}, .{ .max_turns = 1, .colorize = false, .tool_defs = &server_tool }, &backend, a));
     try std.testing.expectEqual(@as(usize, 1), c.len());
 }
 
@@ -1048,8 +1059,7 @@ pub fn run(
     // here rather than truncate such turns silently. AgentSession's tool
     // catalog already rejects them; WebSearch keeps its server tool inside its
     // own isolated sub-request.
-    if (hasServerTool(tool_defs) or (if (opts.tool_defs) |defs| hasServerTool(defs) else false))
-        return error.ServerToolsUnsupported;
+    try refuseServerTools(tool_defs, opts);
     // 本次 run 归属的会话(emit/poll 路由用)。N=1/TUI 默认 .single;M6 由 SessionContext 传。
     const sess = opts.session;
     // 声明本 run 认领任务的身份,与工具 kgAgentIdent 同源(kg_agent_ident orelse agent_ident):
@@ -3841,6 +3851,9 @@ pub fn resumeRun(
     backend: *const UiBackend,
     allocator: std.mem.Allocator,
 ) !RunResult {
+    // Refused before the resumed results are appended: a refused resume must
+    // leave the Conversation exactly as it was.
+    try refuseServerTools(tool_defs, opts);
     // 一条 user 消息,内含挂起点的迟来结果 + 所有同轮已完成工具的结果(同 turn 配对)。
     var blocks: std.ArrayList(msg.Block) = .empty;
     errdefer blocks.deinit(allocator);
