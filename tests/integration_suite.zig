@@ -55,6 +55,7 @@ test {
     _ = @import("component/transcript_roundtrip_test.zig");
     _ = @import("component/headless_json_test.zig");
     _ = @import("component/output_semantics_test.zig");
+    _ = @import("component/stream_terminator_test.zig");
     _ = @import("component/file_change_test.zig");
     _ = @import("component/compound_perm_test.zig");
     _ = @import("component/bash_auto_allow_test.zig");

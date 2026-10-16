@@ -316,6 +316,39 @@ test "L2 输出语义:max_tokens 续写的多段合成一个 final" {
     defer assembled.deinit(a);
     try scenario.capture.assembledFinal(&assembled, a);
     try std.testing.expectEqualStrings("first half second half", assembled.items);
+
+    // issue #269: the seamless text is the only thing a result reader sees, so
+    // the continuation is counted on the RunResult and carried to `--json`.
+    try std.testing.expectEqual(@as(u32, 1), scenario.result.continuations);
+    const usage = cc.app_module.UsageTotals{};
+    const line = try cc.repl_headless.buildResultLine(a, scenario.ledger.finalText().?, "final", null, null, scenario.result, &usage, "m");
+    defer a.free(line);
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, std.mem.trimEnd(u8, line, "\n"), .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(i64, 1), parsed.value.object.get("continuations").?.integer);
+    try std.testing.expectEqualStrings("end_turn", parsed.value.object.get("stop_reason").?.string);
+}
+
+test "L2 输出语义:没有续写的 Run 结果行 continuations 为 0" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try tmpRoot(&tmp, &root_buf);
+
+    const whole = try textSseAlloc(a, "m1", "whole answer", "end_turn");
+    defer a.free(whole);
+    var scenario = try runCassette(a, &.{whole}, root, null, 0);
+    defer scenario.deinit();
+
+    try std.testing.expectEqual(cc.agent_loop.StopReason.end_turn, scenario.result.stop_reason);
+    try std.testing.expectEqual(@as(u32, 0), scenario.result.continuations);
+    const usage = cc.app_module.UsageTotals{};
+    const line = try cc.repl_headless.buildResultLine(a, "whole answer", "final", null, null, scenario.result, &usage, "m");
+    defer a.free(line);
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, std.mem.trimEnd(u8, line, "\n"), .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(i64, 0), parsed.value.object.get("continuations").?.integer);
 }
 
 test "L2 输出语义:中断产出的文本是 partial,永远不是 final" {

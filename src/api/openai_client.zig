@@ -519,6 +519,11 @@ const OpenAIStream = struct {
     /// flush 队列排空后补发一个 .done(Responses 无 [DONE] 哨兵行)。
     pending_done: bool = false,
     last_stop: StopReason = .unknown,
+    /// 流报告过"怎么停的":chat 的非 null `finish_reason`,或 Responses 的终止事件
+    /// (completed/incomplete)。与 last_stop 分开——`.unknown` 也可能是"报了个本端不认识
+    /// 的值"。没有它就结束的流(EOF 或只有 `[DONE]`)不是收尾:丢的可能正是
+    /// `finish_reason:"length"`(issue #269)。
+    stop_reported: bool = false,
     // 并行 tool_calls 增量累积(P0.1):OpenAI 流式把每个 tool_call 按 `index` 分槽分块发
     // (id/name 一次,arguments 跨 chunk 拼)。按 index 找槽累积,done 时把每个槽 flush 成一个
     // tool_use_start 事件排队,next() 逐个 drain → executeSlots 收到多 slot 真并发。
@@ -713,6 +718,9 @@ const OpenAIStream = struct {
                     client_mod.reportBodyStall("openai", self.id, stall);
                     return error.StreamStalled;
                 }
+                // 没报告过停止原因的 EOF:流在说完之前断了(chat 末块 / Responses 终止事件
+                // 没到)。报告过则只缺 `[DONE]` 帧尾(与可能跟在后面的 usage 块),回答完整。
+                if (!self.stop_reported) return self.incomplete();
                 return self.finishFlush();
             };
             // 进展记账:非保活行(含被 continue 掉的 usage/空 chunk)才续正文空闲时钟。
@@ -723,6 +731,9 @@ const OpenAIStream = struct {
             const data = std.mem.trim(u8, trimmed[5..], " ");
             if (std.mem.eql(u8, data, "[DONE]")) {
                 self.done = true;
+                // `[DONE]` 只是帧尾,不证明回答说完:携带 finish_reason 的末块(或 Responses
+                // 终止事件)丢了时,它照样到达(issue #269 的 chat 形状)。
+                if (!self.stop_reported) return self.incomplete();
                 if (self.finishFlush()) |ev| return ev;
                 return StreamEvent{ .done = {} };
             }
@@ -758,7 +769,11 @@ const OpenAIStream = struct {
     fn parseChatDelta(self: *OpenAIStream, data: []const u8) !?StreamEvent {
         // finish_reason → StopReason(末 chunk)。
         if (util_json.extractStringField(data, "finish_reason")) |fr| {
-            if (!std.mem.eql(u8, fr, "null")) self.last_stop = mapFinish(fr);
+            // 空串与 null 同义:部分兼容端在中间块里发 `"finish_reason":""`,它不是停止报告。
+            if (fr.len > 0 and !std.mem.eql(u8, fr, "null")) {
+                self.last_stop = mapFinish(fr);
+                self.stop_reported = true;
+            }
         }
         // delta.content → text。OpenAI: {"choices":[{"delta":{"content":"hi"},...}]}
         // SSE string 片段带一层 JSON 转义(\n/\"/\uXXXX):必须解除后再交对话/UI,
@@ -869,6 +884,7 @@ const OpenAIStream = struct {
         // 正常终止:usage + stop 归一 + flush tool_call 槽 + 排队 done(Responses 无 [DONE] 行)。
         if (std.mem.eql(u8, ev_type, "response.completed")) {
             self.last_stop = if (self.tc_active) .tool_use else .end_turn;
+            self.stop_reported = true;
             return self.finishResponsesTerminal(data);
         }
         // 截断终止:incomplete_details.reason=max_output_tokens → .max_tokens,其余 .unknown。
@@ -877,6 +893,7 @@ const OpenAIStream = struct {
                 (if (std.mem.eql(u8, reason, "max_output_tokens")) StopReason.max_tokens else .unknown)
             else
                 .unknown;
+            self.stop_reported = true;
             return self.finishResponsesTerminal(data);
         }
         // 失败终止(response.failed)/流级 error 事件:上抛给 agent_loop 的 stream_error 处理。
@@ -999,6 +1016,21 @@ const OpenAIStream = struct {
                 a.free(args);
             };
         }
+    }
+
+    /// 流在报告停止原因之前结束:置终态、留现场、上抛。累积中的 tool_call 槽不 flush——
+    /// 没收尾的参数可能残缺,调用方本来也要丢弃整段残片重发(deinit 释放这些槽)。
+    /// 取消与 stall 优先:被 cancel / 监视线程关掉的连接,缓冲里剩下的 `[DONE]` 或随后
+    /// 的 EOF 都只是它们的症状(issue #269 review)。
+    fn incomplete(self: *OpenAIStream) error{ StreamIncomplete, Aborted, StreamStalled } {
+        self.done = true;
+        if (self.abort) |ab| if (ab.isAborted()) return error.Aborted;
+        if (self.stalledVerdict()) |stall| {
+            client_mod.reportBodyStall("openai", self.id, stall);
+            return error.StreamStalled;
+        }
+        client_mod.reportStreamIncomplete("openai", self.id);
+        return error.StreamIncomplete;
     }
 
     /// 构建(一次)并返回队列里下一个 flush 事件;耗尽返 null。
@@ -2796,4 +2828,144 @@ test "issue #258 Responses: 终止事件 usage:null 不伪造全零 usage,flush 
     try std.testing.expectEqualStrings("call_r1", tool.tools.items[0].id);
     try std.testing.expectEqual(@as(usize, 0), tool.usages.items.len);
     try std.testing.expectEqual(StopReason.max_tokens, tool.stop);
+}
+
+// ── issue #269:流在报告停止原因之前结束,不是收尾 ─────────────────────────────
+
+/// 驱动 OpenAIStream 直到流结束或出错,把出错前收到的事件种类追加进 `kinds`;错误原样上抛。
+fn replayUntilError(a: std.mem.Allocator, protocol: types.OpenAIProtocol, sse: []const u8, kinds: *std.ArrayList(std.meta.Tag(StreamEvent))) !void {
+    var stream = OpenAIStream{
+        .allocator = a,
+        .model = "m",
+        .dialect = dialect_mod.dialectFor(.openai, "m"),
+        .protocol = protocol,
+        .request = undefined,
+        .response = undefined,
+        .id = .{ .bytes = .{0} ** 12 },
+    };
+    defer stream.releaseParseState();
+    var body = std.Io.Reader.fixed(sse);
+    stream.reader = &body;
+    while (stream.next() catch |err| {
+        // 失败即终态:之后不再读出任何东西(对齐 stream.zig 的 fail-terminal 契约)。
+        try std.testing.expect((try stream.next()) == null);
+        return err;
+    }) |ev| {
+        switch (ev) {
+            .text, .thinking, .reasoning_item, .web_search_query => |bytes| a.free(bytes),
+            .tool_use_start => |tu| {
+                a.free(tu.id);
+                a.free(tu.name);
+                a.free(tu.input_json);
+            },
+            .web_search_result => |w| {
+                a.free(w.ui_text);
+                a.free(w.content_json);
+            },
+            .usage, .done => {},
+        }
+        try kinds.append(a, std.meta.activeTag(ev));
+    }
+}
+
+test "issue #269 chat: [DONE] without any finish_reason is StreamIncomplete, not end_turn" {
+    const a = std.testing.allocator;
+    var kinds: std.ArrayList(std.meta.Tag(StreamEvent)) = .empty;
+    defer kinds.deinit(a);
+    // The final chunk carrying finish_reason never arrived; `[DONE]` did.
+    try std.testing.expectError(error.StreamIncomplete, replayUntilError(a, .chat_completions, "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"part one\"},\"finish_reason\":null}]}\n\n" ++
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\" part two\"},\"finish_reason\":null}]}\n\n" ++
+        "data: [DONE]\n\n", &kinds));
+    try std.testing.expectEqualSlices(std.meta.Tag(StreamEvent), &.{ .text, .text }, kinds.items);
+}
+
+test "issue #269 chat: clean EOF with neither finish_reason nor [DONE] is StreamIncomplete" {
+    const a = std.testing.allocator;
+    var kinds: std.ArrayList(std.meta.Tag(StreamEvent)) = .empty;
+    defer kinds.deinit(a);
+    try std.testing.expectError(error.StreamIncomplete, replayUntilError(a, .chat_completions, "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}\n\n", &kinds));
+}
+
+test "issue #269 chat: half-built tool_calls are not flushed from an unterminated stream" {
+    const a = std.testing.allocator;
+    var kinds: std.ArrayList(std.meta.Tag(StreamEvent)) = .empty;
+    defer kinds.deinit(a);
+    try std.testing.expectError(error.StreamIncomplete, replayUntilError(a, .chat_completions, "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"Read\",\"arguments\":\"{\\\"file_path\\\":\"}}]},\"finish_reason\":null}]}\n\n" ++
+        "data: [DONE]\n\n", &kinds));
+    // No tool_use_start: arguments that never finished must not reach a tool.
+    try std.testing.expectEqual(@as(usize, 0), kinds.items.len);
+}
+
+test "issue #269 chat: finish_reason then EOF without [DONE] keeps the answer and its stop" {
+    const a = std.testing.allocator;
+    // Only the frame tail (and any usage chunk after it) is missing; the stop
+    // status — here the `length` marker the continuation net needs — arrived.
+    var got = try replaySse(a, "m", .chat_completions, "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"cut\"},\"finish_reason\":null}]}\n\n" ++
+        "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"length\"}]}\n\n");
+    defer got.deinit(a);
+    try std.testing.expectEqualStrings("cut", got.text.items);
+    try std.testing.expectEqual(StopReason.max_tokens, got.stop);
+}
+
+test "issue #269 chat: an empty finish_reason on an intermediate chunk is not a stop report" {
+    const a = std.testing.allocator;
+    var kinds: std.ArrayList(std.meta.Tag(StreamEvent)) = .empty;
+    defer kinds.deinit(a);
+    try std.testing.expectError(error.StreamIncomplete, replayUntilError(a, .chat_completions, "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"x\"},\"finish_reason\":\"\"}]}\n\n" ++
+        "data: [DONE]\n\n", &kinds));
+}
+
+test "issue #269 chat: an unrecognized finish_reason still counts as reported" {
+    const a = std.testing.allocator;
+    var got = try replaySse(a, "m", .chat_completions, "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"x\"},\"finish_reason\":\"content_filter\"}]}\n\n" ++
+        "data: [DONE]\n\n");
+    defer got.deinit(a);
+    try std.testing.expectEqualSlices(std.meta.Tag(StreamEvent), &.{ .text, .done }, got.kinds.items);
+    try std.testing.expectEqual(StopReason.unknown, got.stop);
+}
+
+test "issue #269 Responses: EOF without response.completed/incomplete is StreamIncomplete" {
+    const a = std.testing.allocator;
+    var kinds: std.ArrayList(std.meta.Tag(StreamEvent)) = .empty;
+    defer kinds.deinit(a);
+    try std.testing.expectError(error.StreamIncomplete, replayUntilError(a, .responses, "event: response.output_text.delta\n" ++
+        "data: {\"type\":\"response.output_text.delta\",\"item_id\":\"msg_1\",\"output_index\":0,\"delta\":\"hi\"}\n\n" ++
+        "event: response.output_text.done\n" ++
+        "data: {\"type\":\"response.output_text.done\",\"item_id\":\"msg_1\",\"output_index\":0,\"text\":\"hi\"}\n\n", &kinds));
+    try std.testing.expectEqualSlices(std.meta.Tag(StreamEvent), &.{.text}, kinds.items);
+}
+
+test "issue #269 chat: a cancelled stream's leftover [DONE] is Aborted, not StreamIncomplete" {
+    // Cancellation closes the socket; a [DONE] already buffered is a symptom
+    // of the cancel, and the loop must see a cancel (no retry, partial kept).
+    const a = std.testing.allocator;
+    var signal = AbortSignal.init();
+    var stream = OpenAIStream{
+        .allocator = a,
+        .model = "m",
+        .dialect = dialect_mod.dialectFor(.openai, "m"),
+        .protocol = .chat_completions,
+        .request = undefined,
+        .response = undefined,
+        .id = .{ .bytes = .{0} ** 12 },
+        .abort = &signal,
+    };
+    defer stream.releaseParseState();
+    var body = std.Io.Reader.fixed("data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"part\"},\"finish_reason\":null}]}\n\n" ++
+        "data: [DONE]\n\n");
+    stream.reader = &body;
+    const first = (try stream.next()).?;
+    a.free(first.text);
+    signal.abort(.user_ctrl_c);
+    // The line loop checks abort before reading; reproduce the race where the
+    // flag lands after the [DONE] line was read by calling the terminal path.
+    try std.testing.expectError(error.Aborted, @as(anyerror!void, stream.incomplete()));
+}
+
+test "issue #269 Responses: a [DONE] sentinel does not stand in for the terminal event" {
+    const a = std.testing.allocator;
+    var kinds: std.ArrayList(std.meta.Tag(StreamEvent)) = .empty;
+    defer kinds.deinit(a);
+    try std.testing.expectError(error.StreamIncomplete, replayUntilError(a, .responses, "data: {\"type\":\"response.output_text.delta\",\"item_id\":\"msg_1\",\"output_index\":0,\"delta\":\"hi\"}\n\n" ++
+        "data: [DONE]\n\n", &kinds));
 }

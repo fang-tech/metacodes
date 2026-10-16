@@ -208,6 +208,13 @@ status, compatibility boundaries, and entry points are defined by
   create, check `GET /sessions`. Normative rules:
   [doc/API.md](doc/API.md#web-and-daemon-http-surface).
 
+- The `--json` result line carries `continuations`: how many times the Run
+  asked the model to continue an answer the provider cut at its output-token
+  limit (`max_tokens`). The continued text is one seamless concatenation and
+  the line still reads `end_turn`, so before this a headless consumer could not
+  tell the answer had been truncated. Source-level Hosts read the same count
+  from `RunResult.continuations` (issue #269).
+
 ### Changed
 
 - The Sealed Skill Protocol document says everywhere what the code does:
@@ -338,6 +345,26 @@ status, compatibility boundaries, and entry points are defined by
   (`platform/net.zig` binds with SO_EXCLUSIVEADDRUSE on Windows and
   SO_REUSEADDR elsewhere, neither of which admits a second listener); a
   platform test and an L2 now assert it.
+- A provider stream that ends before it reports how it stopped is no longer
+  taken for a finished answer (issue #269). A clean end of the connection, or a
+  bare `[DONE]`, without Anthropic's `message_delta.stop_reason`, OpenAI chat's
+  `finish_reason`, the Responses `response.completed`/`response.incomplete`
+  event or Gemini's `finishReason` used to come back as `end_turn`; when the
+  lost bytes were the ones carrying `max_tokens`/`length`, a truncated answer
+  read as complete and the continuation that should have followed never ran.
+  Such a stream is now a mid-stream failure: its text is discarded and the turn
+  re-issued within `max_stream_turn_retries` (two in headless mode), and with
+  none left the Run ends in `api_error`. A stream that reported its stop and
+  lost only the frame tail after it (`message_stop`, `[DONE]`, a trailing usage
+  chunk) still finishes normally, and its stop — `max_tokens` included — still
+  drives the continuation; a frame tail without a stop report before it is
+  incomplete. An Anthropic tool_use block still open when the stream ends was
+  silently dropped and now makes the stream incomplete. Gemini's stop report is
+  read from the candidate and `promptFeedback` themselves, so a `finishReason`
+  key inside a function call's arguments no longer passes for one. An empty
+  200 body is incomplete too, rather than an empty answer. Gemini
+  `CONTINUATION` (the answer reached the per-request limit but is not finished)
+  now drives the same continuation as `max_tokens`.
 - OpenAI Chat Completions streams no longer drop text (issue #258). metacodes
   always asks for `stream_options.include_usage`, under which every ordinary
   chunk carries `"usage": null`; the parser took any chunk containing the key

@@ -294,6 +294,12 @@ pub const RunResult = struct {
     /// (value type, nothing to free). Hosts render it with
     /// `stall_gate.renderStopNotice`.
     stall: ?stall_gate_mod.Report = null,
+    /// How many times this call to `run` asked the model to continue an answer
+    /// the provider cut at its output-token limit (`max_tokens`), at most
+    /// `MAX_CONTINUATIONS`. The visible text of a continued answer is one
+    /// seamless concatenation, so this is the only trace a host that reads
+    /// only the result has of it (issue #269).
+    continuations: u32 = 0,
 };
 
 /// Probe supplied by an interactive host so a queued user message can end the
@@ -1028,6 +1034,29 @@ pub fn run(
     backend: *const UiBackend,
     allocator: std.mem.Allocator,
 ) !RunResult {
+    // Run-wide counters that every return path reports. They live here rather
+    // than in each of the loop's many result literals, so no exit can forget one.
+    var counters: RunCounters = .{};
+    var result = try runCounted(conversation, provider, tool_defs, permission_ctx, opts, backend, allocator, &counters);
+    result.continuations = counters.continuations;
+    return result;
+}
+
+const RunCounters = struct {
+    /// max_tokens 续写次数(见 MAX_CONTINUATIONS);RunResult.continuations 的来源。
+    continuations: u32 = 0,
+};
+
+fn runCounted(
+    conversation: *Conversation,
+    provider: provider_mod.Provider,
+    tool_defs: []const json_mod.ToolDefinition,
+    permission_ctx: *const permission_mod.PermissionContext,
+    opts: Options,
+    backend: *const UiBackend,
+    allocator: std.mem.Allocator,
+    counters: *RunCounters,
+) !RunResult {
     // 本次 run 归属的会话(emit/poll 路由用)。N=1/TUI 默认 .single;M6 由 SessionContext 传。
     const sess = opts.session;
     // 声明本 run 认领任务的身份,与工具 kgAgentIdent 同源(kg_agent_ident orelse agent_ident):
@@ -1047,7 +1076,8 @@ pub fn run(
     // 环境故障计数(本 run 累计,不重置):见 MAX_ENVIRONMENT_FAULTS。
     var environment_faults: u32 = 0;
     // max_tokens 续写计数:防止模型一直撞上限导致无限续写。上限 3 次。
-    var continuations: u32 = 0;
+    // 计数放在 run() 持有的 counters 里,任何返回路径都会把它带进 RunResult。
+    const continuations = &counters.continuations;
     // 上一轮以 max_tokens 续写提示收尾 → 下一个 turn 边界不消费 UI 队列(见 drainUiEvents)。
     var continuation_pending = false;
     // 输出语义通道:每个 provider stream 一个可见输出段,定性在 loop **真正知道**时才发。
@@ -2561,7 +2591,7 @@ pub fn run(
 
         if (!has_tool_use) {
             if (turn_stop_reason == .max_tokens and
-                continuations >= MAX_CONTINUATIONS and
+                continuations.* >= MAX_CONTINUATIONS and
                 assistant_text.items.len == 0)
             {
                 // The provider exhausted the continuation budget without
@@ -2609,14 +2639,14 @@ pub fn run(
             }
             // max_tokens 续写:模型被 token 上限截断(非自然 end_turn),
             // 注入 continue 提示让它接着写,而不是当作完成。最多 MAX_CONTINUATIONS 次。
-            if (turn_stop_reason == .max_tokens and continuations < MAX_CONTINUATIONS) {
-                continuations += 1;
+            if (turn_stop_reason == .max_tokens and continuations.* < MAX_CONTINUATIONS) {
+                continuations.* += 1;
                 // 被 token 上限截断 → 本段与同 group 的下一段合成一个完整结果,单独任何一段
                 // 都不是 final(`stream_done` 更不是)。
                 output_channel.close(.continued, assistant_text.items);
-                log.infoId("agent", rid, "max_tokens truncation → continuation {d}/{d}", .{ continuations, MAX_CONTINUATIONS });
+                log.infoId("agent", rid, "max_tokens truncation → continuation {d}/{d}", .{ continuations.*, MAX_CONTINUATIONS });
                 // L4 诊断:续写。
-                backend.emitEvent(sess, .{ .diag_continuation = .{ .trace_id = trace_id, .depth = depth, .n = continuations, .max = MAX_CONTINUATIONS } });
+                backend.emitEvent(sess, .{ .diag_continuation = .{ .trace_id = trace_id, .depth = depth, .n = continuations.*, .max = MAX_CONTINUATIONS } });
                 try conversation.appendText(.user, "Your previous response was cut off by the token limit. Continue exactly where you left off, without repeating.");
                 continuation_pending = true;
                 continue;

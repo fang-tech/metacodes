@@ -344,6 +344,15 @@ pub fn reportBodyStall(comptime module: []const u8, rid: log.RequestId, stall: p
     last_error.recordNamed("正文空闲超时", detail);
 }
 
+/// 流在报告"怎么停的"之前就结束(干净 EOF / 只有 `[DONE]`,却没有 stop_reason、
+/// finish_reason、Responses 终止事件或 finishReason)的统一交代:日志 + last_error 现场。
+/// 这样的流不能当成完整回答——丢的可能正是 max_tokens(issue #269);调用方(agent_loop)
+/// 把它当流内失败,丢弃残片走同轮重试。取消/stall 判定在调用前已排除。四个流解析器共用。
+pub fn reportStreamIncomplete(comptime module: []const u8, rid: log.RequestId) void {
+    log.warnId(module, rid, "stream ended before reporting how it stopped (no terminal event): treated as a mid-stream failure", .{});
+    last_error.recordNamed("流未完整结束", "响应流在报告停止原因(stop_reason / finish_reason / 终止事件)之前就结束了,回答可能被截断");
+}
+
 /// 重试 UI 上报回调(agent_loop 注入,把 attempt/max/delay 渲染成 "Retrying in Ns…")。
 /// state 类型擦除(指向 stdout_writer 等);headless 传 null。
 pub const RetryReporter = api_stream.RetryReporter;
@@ -1480,6 +1489,16 @@ pub const StreamResponse = struct {
                 self.context_window_numbers = self.event_iter.context_window_numbers;
                 log.warnId("stream", self.id, "context-window-exceeded error event surfaced", .{});
                 return error.ContextWindowExceeded;
+            },
+            error.StreamIncomplete => {
+                // 同干净 EOF 的判定顺序:取消与 stall 关掉的连接也会以"没收尾的 EOF"醒来。
+                if (self.cancelled()) return error.Aborted;
+                if (self.stalledVerdict()) |stall| {
+                    reportBodyStall("stream", self.id, stall);
+                    return error.StreamStalled;
+                }
+                reportStreamIncomplete("stream", self.id);
+                return error.StreamIncomplete;
             },
             else => {
                 if (self.cancelled()) {
