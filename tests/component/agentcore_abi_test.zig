@@ -10439,6 +10439,11 @@ test "L2 Revision 20 input accepted by a Run that ends first reconciles as not a
     try std.testing.expectEqual(@as(u32, 1), result.input_accepted_count);
     try std.testing.expectEqual(@as(u32, 0), result.input_adopted_count);
     try std.testing.expectEqual(@as(usize, 0), probe.adopted_len);
+    // A later call that reuses the id is refused before admission and admits
+    // nothing: it reports zero, not Run 1's counts.
+    try std.testing.expectEqual(wire.STATUS_STALE_RUN, fixture.run(1, "same id again", &result));
+    try std.testing.expectEqual(@as(u32, 0), result.input_accepted_count);
+    try std.testing.expectEqual(@as(u32, 0), result.input_adopted_count);
     // It never entered the Conversation, so the next Run does not see it.
     try std.testing.expectEqual(wire.STATUS_OK, fixture.run(2, "next Run", &result));
     try std.testing.expect(std.mem.indexOf(u8, try requestBody(server, 1), "NEVER_ADOPTED") == null);
@@ -10633,7 +10638,10 @@ test "L2 Revision 20 a failed adoption callback poisons the Session but the coun
 
     var probe = RunInputProbe{
         .api = try runInputApi(),
-        .on_ui = &.{.{ .input_id = 40, .text = "ADOPTED_THEN_FAILED" }},
+        .on_ui = &.{
+            .{ .input_id = 40, .text = "ADOPTED_THEN_FAILED" },
+            .{ .input_id = 41, .text = "NEVER_AFTER_FAILURE" },
+        },
         .fatal_on_adoption = true,
     };
     var fixture: RunInputFixture = undefined;
@@ -10644,16 +10652,21 @@ test "L2 Revision 20 a failed adoption callback poisons the Session but the coun
     try std.testing.expectEqual(wire.STATUS_CALLBACK_FAILED, fixture.run(1, "invoke the Host echo", &result));
     try std.testing.expectEqual(@as(u32, 0), probe.mismatches);
     // The Host rejected the acknowledgement, yet the input was appended before
-    // it: the counts, defined on every status, say so.
+    // it: the counts, defined on every status, say so. The rejection aborted
+    // the Run: the second input is not adopted and no further request is sent.
     try std.testing.expectEqual(@as(usize, 1), probe.adopted_len);
-    try std.testing.expectEqual(@as(u32, 1), result.input_accepted_count);
+    try std.testing.expectEqual(@as(u32, 2), result.input_accepted_count);
     try std.testing.expectEqual(@as(u32, 1), result.input_adopted_count);
-    try std.testing.expectEqual(wire.STATUS_INVALID_STATE, fixture.submit(1, 41, "poisoned"));
+    try std.testing.expectEqual(@as(usize, 1), server.requestCount());
+    try std.testing.expectEqual(wire.STATUS_INVALID_STATE, fixture.submit(1, 42, "poisoned"));
 }
 
 const RunInputRacer = struct {
     api: sdk.Api,
     session: ?*wire.SessionHandle,
+    /// Set by the test once `session_run_input` returned: from then on every
+    /// submission must be too late, which ends the loop deterministically.
+    run_returned: std.atomic.Value(bool) = .init(false),
     accepted: u32 = 0,
     unexpected: u32 = 0,
     first_unexpected: u32 = 0,
@@ -10661,10 +10674,10 @@ const RunInputRacer = struct {
 
     fn race(self: *RunInputRacer) void {
         var id: u64 = 1;
-        var spins: u64 = 0;
         // Until the Run is over: stale before admission, then accepted (or the
         // count limit), then too late. Nothing else, and nothing after too late.
-        while (spins < 50_000_000) : (spins += 1) {
+        while (true) {
+            const returned = self.run_returned.load(.acquire);
             var receipt = std.mem.zeroes(wire.InputReceiptV1);
             var diagnostic = std.mem.zeroes(wire.OwnedBytesV1);
             const status = self.api.session().submitInput(self.session, 1, id, sdk.bytesView("RACED_INPUT"), &receipt, &diagnostic);
@@ -10684,6 +10697,10 @@ const RunInputRacer = struct {
                     self.unexpected += 1;
                 },
             }
+            // The Run had returned before this submission, yet it was not too
+            // late: record it (finished stays false) and stop.
+            if (returned) return;
+            std.Thread.yield() catch {};
         }
     }
 };
@@ -10709,6 +10726,7 @@ test "L2 Revision 20 submit_input racing Run completion is either counted or too
     const thread = try std.Thread.spawn(.{}, RunInputRacer.race, .{&racer});
     var result: wire.RunResultV1 = undefined;
     const status = fixture.run(1, "invoke the Host echo", &result);
+    racer.run_returned.store(true, .release);
     // The Host contract: no later call on the handle until submit returns.
     thread.join();
     try std.testing.expectEqual(wire.STATUS_OK, status);
@@ -10846,4 +10864,44 @@ test "L2 Revision 20 input submitted after the Run's abort was requested is too 
     try std.testing.expectEqual(wire.STOP_ABORTED, result.stop_reason_code);
     try std.testing.expectEqual(@as(u32, 0), result.input_accepted_count);
     try std.testing.expectEqual(@as(u32, 0), result.input_adopted_count);
+}
+
+fn submitAtStartHook(probe: *RunInputProbe, run_id: u64, event: sdk.CoreEvent) void {
+    switch (event) {
+        .run_state => |state| if (state.phase == .starting and probe.stage == 0) {
+            probe.stage = 1;
+            probe.submit(run_id, .{ .input_id = 70, .text = "BEFORE_FIRST_REQUEST", .expect_sequence = 1 });
+        },
+        else => {},
+    }
+}
+
+test "L2 Revision 20 input accepted before the first request rides that request (#270)" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try rootPath(&tmp, &root_buf);
+    const bodies = [_][]const u8{FINAL_SSE};
+    var server = try harness.MockServer.startCassette(&bodies, 0);
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+
+    var probe = RunInputProbe{ .api = try runInputApi(), .event_hook = submitAtStartHook };
+    var fixture: RunInputFixture = undefined;
+    try fixture.init(root, url, &probe, null);
+    defer fixture.deinit();
+
+    var result: wire.RunResultV1 = undefined;
+    try std.testing.expectEqual(wire.STATUS_OK, fixture.run(1, "ROOT_PROMPT", &result));
+    try std.testing.expectEqual(@as(u32, 0), probe.mismatches);
+    try std.testing.expectEqual(@as(u32, 1), probe.stage);
+    try std.testing.expectEqualSlices(RunInputAdoption, &.{.{ .input_id = 70, .sequence = 1, .turn = 1 }}, probe.adoptedSlice());
+    try std.testing.expectEqual(@as(u32, 1), result.input_accepted_count);
+    try std.testing.expectEqual(@as(u32, 1), result.input_adopted_count);
+    const first = try requestBody(server, 0);
+    const prompt = std.mem.indexOf(u8, first, "ROOT_PROMPT") orelse return error.MissingRootPrompt;
+    const input = std.mem.indexOf(u8, first, "BEFORE_FIRST_REQUEST") orelse return error.MissingAdoptedInput;
+    try std.testing.expect(prompt < input);
 }

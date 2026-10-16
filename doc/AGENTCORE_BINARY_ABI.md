@@ -833,6 +833,9 @@ acceptance order, and emits one `input_adopted {input_id, sequence, turn}` per
 input after appending it; `turn` is the 1-based turn whose request first
 carries it, and sequences arrive strictly increasing. So:
 
+- Input accepted before the Run's first request — from the starting
+  `run_state` event, say — joins that first request, after the root input
+  (`turn` 1).
 - Input submitted while a provider stream is open is queued; the request
   already sent is not changed.
 - Input submitted while a Permission or AskUserQuestion request waits is
@@ -847,7 +850,10 @@ carries it, and sequences arrive strictly increasing. So:
 - Adoption is not provider receipt: the request that carries it may still
   fail.
 - Input does not undo actions already performed and does not stop the Run;
-  `session_abort` stops it.
+  `session_abort` stops it. Once the Run is aborting — an abort was
+  requested, or a Host callback failed (an `input_adopted` the Host rejects
+  included) — nothing more is adopted, even input accepted earlier, and the
+  Run ends at that boundary without another request.
 - A forked Skill Run (`RUN_INPUT_SKILL` with `context: fork`) runs on a child
   Conversation that is discarded when it returns: input accepted before the
   fork claims the Run is never adopted, and later input is refused with
@@ -862,7 +868,8 @@ other poisoning status included — and are zero when no Run was admitted. The
 inputs whose receipt sequence is at most `input_adopted_count` are in the
 Conversation; the rest never will be. These counts are the authority: an
 `input_adopted` event the Host did not receive (its callback failed, or the
-event could not be delivered) proves nothing either way. A submission that
+event could not be delivered) proves nothing either way. A call that admitted
+no Run reports zero, also when it reused the last admitted `run_id`. A submission that
 overlaps the Run's completion either returns `OK` and is counted, or returns
 `TOO_LATE` and is not.
 
@@ -871,9 +878,10 @@ its Conversation position, is exported in checkpoints and restored with them,
 and is sent in later Runs' requests. Unadopted input leaves no trace. On
 acceptance the facade reserves the input's encoded checkpoint bytes: the Run's
 host input — the root input and every accepted input together — stays within
-`input_cap_bytes`, and what is left under `hard_bytes` must still hold one more
-provider turn; otherwise the input is refused with
-`CHECKPOINT_BUDGET_REQUIRED` and the Run continues. Adoption moves the
+`input_cap_bytes`, and what is left under `hard_bytes` must still hold one whole
+provider operation at its configured caps (request, result payload, audit and
+terminal reserve), so adopting it never makes the next request fail; otherwise
+the input is refused with `CHECKPOINT_BUDGET_REQUIRED` and the Run continues. Adoption moves the
 reservation into the Session's durable usage; the Run's end releases the
 rest. Input passes no permission, sandbox, cancellation, or budget decision:
 it only adds a user record.

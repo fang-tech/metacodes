@@ -29,9 +29,10 @@ status, compatibility boundaries, and entry points are defined by
   Conversation even when an event was lost. Limits: 64 inputs and 16 MiB of
   text per Run (`MAX_SUBMITTED_INPUTS_V1`, `MAX_SUBMITTED_INPUT_BYTES_V1`);
   each input reserves its checkpoint bytes against the durable budget, counts
-  with the root input toward `input_cap_bytes`, and is refused with
-  `CHECKPOINT_BUDGET_REQUIRED` — without ending the Run — when it does not
-  fit. A refused submission changes nothing; a stale id is `STALE_RUN`, a Run
+  with the root input toward `input_cap_bytes`, must leave room for one whole
+  provider operation, and is refused with `CHECKPOINT_BUDGET_REQUIRED` —
+  without ending the Run — when it does not fit. Once a Run is aborting (an
+  abort, or a callback the Host failed) it adopts nothing more. A refused submission changes nothing; a stale id is `STALE_RUN`, a Run
   that ended or is ending `TOO_LATE`, a forked Skill Run `INVALID_STATE`.
   Adopted input is ordinary Conversation state and survives checkpoint and
   restore. The Session table grows by one slot to 48 bytes and `RunResultV1`

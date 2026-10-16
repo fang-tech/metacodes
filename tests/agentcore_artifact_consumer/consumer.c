@@ -388,9 +388,11 @@ static uint64_t active_run_id = 0;
 static uint8_t bound_session_id[METASK_AGENTCORE_MAX_SESSION_ID_BYTES_V1];
 static size_t bound_session_id_len = 0;
 
-/* Revision 20: the first event of the armed Run submits more input from
- * inside the callback. The Run is a single turn, so it ends before another
- * boundary and the input must reconcile as accepted but not adopted. */
+/* Revision 20: the first text_chunk of the armed Run submits more input from
+ * inside the callback. The request is already out and the Run is a single
+ * turn, so it ends before another boundary and the input must reconcile as
+ * accepted but not adopted. (Input submitted before the first request — at
+ * the starting run_state — would ride that very request.) */
 static const metask_agentcore_api_v1 *callback_api = NULL;
 static int submit_on_event = 0;
 static uint32_t submit_status = UINT32_MAX;
@@ -419,7 +421,10 @@ static uint32_t on_event(void *ctx, const metask_agentcore_run_context_v1 *run,
     (void)ctx;
     if (accept_run_context(run) && event_json.ptr != NULL && event_json.len != 0) {
         event_calls++;
-        if (submit_on_event && callback_api != NULL) {
+        static const char text_chunk_tag[] = "{\"text_chunk\"";
+        if (submit_on_event && callback_api != NULL &&
+            event_json.len >= sizeof(text_chunk_tag) - 1 &&
+            memcmp(event_json.ptr, text_chunk_tag, sizeof(text_chunk_tag) - 1) == 0) {
             metask_agentcore_submitted_input_v1 input = {0};
             metask_agentcore_input_receipt_v1 receipt = {0};
             metask_agentcore_owned_bytes_v1 diagnostic = {0};

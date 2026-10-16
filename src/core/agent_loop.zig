@@ -1007,14 +1007,19 @@ fn drainUiEvents(
 /// queue's adopted count never claims a record the Conversation lacks; an
 /// append failure leaves the input unadopted and fails the Run. A Host that
 /// misses the event (callback failure) still reconciles from the counts.
+/// Nothing is adopted once the Run is aborting — a user abort, or a Host
+/// callback failure, which aborts the Run (possibly the very `input_adopted`
+/// just emitted): the rest stays pending and the caller ends the Run.
 fn adoptRunInputs(
     queue: *run_input_mod.Queue,
     conversation: *Conversation,
     backend: *const UiBackend,
     sess: @import("session_id.zig").SessionId,
     turn: u32,
+    abort: ?*const AbortSignal,
 ) !void {
     while (queue.next()) |pending| {
+        if (abort) |signal| if (signal.isAborted()) return;
         try conversation.appendText(.user, pending.text);
         queue.adopt(pending.sequence);
         log.info("agent", "host input adopted at turn {d} boundary sequence={d} bytes={d}", .{ turn, pending.sequence, pending.text.len });
@@ -1328,7 +1333,15 @@ pub fn run(
                 });
             }
             // Host input submitted through the Session (#270): same boundary, same skip.
-            if (opts.run_inputs) |queue| try adoptRunInputs(queue, conversation, backend, sess, turns + 1);
+            if (opts.run_inputs) |queue| {
+                try adoptRunInputs(queue, conversation, backend, sess, turns + 1, opts.abort);
+                // An adoption event the Host rejected aborts the Run: end it here
+                // rather than build and send another request.
+                if (opts.abort) |a| if (a.isAborted()) {
+                    log.warn("agent", "aborted while adopting host input before turn {d}", .{turns + 1});
+                    return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = stopReasonForAbort(opts.abort), .turns = turns, .tool_calls = total_tool_calls });
+                };
+            }
         }
 
         // 2026-09-19 polling incident: deliver metadata at the boundary so
@@ -7490,4 +7503,52 @@ test "估算随 model_override 变化,而不是只换个模型名" {
     // 模型换了,输出上限必须跟着换——同一个请求体不能描述两个模型。
     try std.testing.expect(std.mem.indexOf(u8, child.body, "\"model\":\"child\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, child.body, "\"max_tokens\":1024") != null);
+}
+
+test "run inputs: an adoption that aborts the Run adopts nothing more and builds no request (#270)" {
+    // A Host callback that rejects `input_adopted` aborts the Run. The loop
+    // must stop at that boundary: no further input adopted, and no provider
+    // request attempted (this provider fails the Run if one is).
+    const a = std.testing.allocator;
+    var c = Conversation.init(a);
+    defer c.deinit();
+    try c.appendText(.user, "root prompt");
+    var queue = run_input_mod.Queue.init(a, .{});
+    defer queue.deinit();
+    queue.open(1, null);
+    _ = try queue.submit(1, "first input");
+    _ = try queue.submit(2, "second input");
+
+    var signal = AbortSignal.init();
+    const Probe = struct {
+        signal: *AbortSignal,
+        adopted: u32 = 0,
+        fn emit(ctx: *anyopaque, _: @import("session_id.zig").SessionId, ev: CoreEvent) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (ev == .input_adopted) {
+                self.adopted += 1;
+                self.signal.abort(.host_failure);
+            }
+        }
+        fn poll(_: *anyopaque, _: @import("session_id.zig").SessionId) ?@import("protocol/ui_event.zig").UiEvent {
+            return null;
+        }
+    };
+    var probe = Probe{ .signal = &signal };
+    const backend = UiBackend{ .ctx = @ptrCast(&probe), .emit = Probe.emit, .poll = Probe.poll };
+    var state = TestProviderState{};
+    const perm = permission_mod.createContext(.bypass_permissions, a);
+    const result = try run(&c, testProvider(&state), &.{}, &perm, .{
+        .max_turns = 3,
+        .colorize = false,
+        .abort = &signal,
+        .run_inputs = &queue,
+    }, &backend, a);
+
+    try std.testing.expectEqual(StopReason.aborted, result.stop_reason);
+    try std.testing.expectEqual(@as(u32, 0), result.turns);
+    try std.testing.expectEqual(@as(u32, 1), probe.adopted);
+    try std.testing.expectEqual(run_input_mod.Reconciliation{ .accepted = 2, .adopted = 1 }, queue.close());
+    // Root prompt plus the one adopted input; the second stayed out.
+    try std.testing.expectEqual(@as(usize, 2), c.len());
 }

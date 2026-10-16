@@ -7250,8 +7250,12 @@ fn sessionRunInput(
     // Input reconciliation (#270) is defined on every return, OK or not, so a
     // Host can tell which submitted inputs reached the Conversation even after
     // a poisoning failure. Declared after the gate defer, so it runs before
-    // the gate is released. Zero when this call admitted no Run.
-    defer if (out_result) |out| writeInputReconciliation(self, run_id, out);
+    // the gate is released. Zero when this call admitted no Run — including a
+    // call that reuses the last admitted id and is refused before admission,
+    // which must not report that earlier Run's counts. The gate is held, so no
+    // other call can admit a Run in between.
+    const admitted_before = self.core_session.lastAdmittedRunId();
+    defer if (out_result) |out| writeInputReconciliation(self, run_id, admitted_before, out);
     if (self.facade_poisoned.load(.acquire))
         return fail(wire.STATUS_INVALID_STATE, "Session is poisoned by a previous admitted Run failure", out_error);
     const input = input_ptr orelse return fail(wire.STATUS_INVALID_ARGUMENT, "RunInputV1 is required", out_error);
@@ -7478,8 +7482,10 @@ fn sessionRunInput(
     return wire.STATUS_OK;
 }
 
-fn writeInputReconciliation(self: *AbiSession, run_id: u64, out: *wire.RunResultV1) void {
-    const counts = self.core_session.runInputReconciliation(run_id) orelse core.run_input.Reconciliation{};
+fn writeInputReconciliation(self: *AbiSession, run_id: u64, admitted_before: u64, out: *wire.RunResultV1) void {
+    const admitted_here = admitted_before != run_id and self.core_session.lastAdmittedRunId() == run_id;
+    const counts = (if (admitted_here) self.core_session.runInputReconciliation(run_id) else null) orelse
+        core.run_input.Reconciliation{};
     out.input_accepted_count = counts.accepted;
     out.input_adopted_count = counts.adopted;
 }

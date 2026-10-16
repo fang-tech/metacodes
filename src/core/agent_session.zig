@@ -2281,6 +2281,15 @@ pub const AgentSession = struct {
         }
     }
 
+    /// The most recently admitted Run ID (0 before the first). A facade that
+    /// holds the Session's call gate reads it before and after a Run call to
+    /// learn whether that call admitted its Run.
+    pub fn lastAdmittedRunId(self: *AgentSession) u64 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.last_run_id;
+    }
+
     /// The final input counts of `run_id` (#270) once that Run has ended:
     /// inputs with a sequence at most `adopted` are in the Conversation, the
     /// rest never will be. Null while the Run is active, or when `run_id` is
