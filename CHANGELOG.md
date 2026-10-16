@@ -12,6 +12,15 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Added
 
+- Sealed Skills: a `Glob` or `Grep` whose target lies under the Skill's
+  `sealed/` directory is answered on the gateway inside the Step, by the
+  client's own tool implementation run against the package with every path
+  it prints rewritten to the client's view; before, the call went to the
+  client, which has no such directory and answered with no matches. The
+  gateway serves `Read`, `Glob` and `Grep` on sealed files only for a tool
+  the manifest admits, forwarding the call otherwise so the client refuses
+  it; the manifest's tool rules are now one shared function
+  (`protocol.manifestAllowsTool`).
 - Sealed Skill chain and state: every Step derived from a `runs.continue`
   carries `results_digest`, the digest of the results array the gateway
   received, inside its digested body; the client computes the same digest

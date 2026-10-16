@@ -777,6 +777,32 @@ pub fn resultsDigestOfValue(allocator: std.mem.Allocator, results: std.json.Valu
     return digestHex(allocator, canonical);
 }
 
+/// Whether the manifest's tool rules admit `tool_name`: a `deny` rule that
+/// names the whole tool wins, then an `allow` rule that covers it. The same
+/// decision on both sides of the protocol — the client's policy frame
+/// (§6.1) and the gateway, which serves a sealed Read/Glob/Grep itself only
+/// for a tool the client would have admitted.
+pub fn manifestAllowsTool(manifest: *const Manifest, tool_name: []const u8) bool {
+    for (manifest.tools_deny) |raw| if (ruleNamesWholeTool(raw, tool_name)) return false;
+    for (manifest.tools_allow) |raw| if (ruleCoversTool(raw, tool_name)) return true;
+    return false;
+}
+
+/// `Tool`, `Tool(pattern)`, or `prefix*` (MCP wildcard) covers `tool_name`.
+pub fn ruleCoversTool(raw: []const u8, tool_name: []const u8) bool {
+    const paren = std.mem.indexOfScalar(u8, raw, '(') orelse raw.len;
+    const head = std.mem.trim(u8, raw[0..paren], " ");
+    if (head.len == 0) return false;
+    if (head[head.len - 1] == '*') return std.mem.startsWith(u8, tool_name, head[0 .. head.len - 1]);
+    return std.mem.eql(u8, head, tool_name);
+}
+
+/// A rule without an argument pattern that covers the tool.
+pub fn ruleNamesWholeTool(raw: []const u8, tool_name: []const u8) bool {
+    if (std.mem.indexOfScalar(u8, raw, '(') != null) return false;
+    return ruleCoversTool(raw, tool_name);
+}
+
 pub const CancelReason = enum { user_abort, budget, policy, client_error };
 
 pub fn writeCancelParams(w: *std.Io.Writer, run_id: []const u8, run_state: []const u8, reason: CancelReason) !void {
@@ -1320,6 +1346,29 @@ test "assets: the result is decoded and its digest verified" {
     const bad_json = try std.fmt.allocPrint(a, "{{\"path\":\"scripts/post.py\",\"sha256\":\"sha256:00\",\"content_base64\":\"{s}\"}}", .{encoded});
     defer a.free(bad_json);
     try std.testing.expectError(error.InvalidShape, parseAsset(a, bad_json));
+}
+
+test "manifest tool rules: plain names, argument patterns, MCP wildcards, deny first" {
+    try std.testing.expect(ruleCoversTool("Read", "Read"));
+    try std.testing.expect(!ruleCoversTool("Read", "Write"));
+    try std.testing.expect(ruleCoversTool("Bash(python3 *)", "Bash"));
+    try std.testing.expect(ruleCoversTool("mcp__playwright__*", "mcp__playwright__browser_click"));
+    try std.testing.expect(!ruleCoversTool("mcp__playwright__*", "mcp__github__issue"));
+    try std.testing.expect(ruleNamesWholeTool("Bash", "Bash"));
+    try std.testing.expect(!ruleNamesWholeTool("Bash(rm *)", "Bash"));
+
+    const a = std.testing.allocator;
+    const entry_json = try testEntryJson(a, TEST_MANIFEST_JSON);
+    defer a.free(entry_json);
+    var parsed = try parseEntry(a, entry_json);
+    defer parsed.deinit();
+    const m = &parsed.entry.manifest;
+    try std.testing.expect(manifestAllowsTool(m, "Read"));
+    try std.testing.expect(manifestAllowsTool(m, "Glob"));
+    // `Bash(rm *)` denies an argument pattern, not the tool: the frame checks it.
+    try std.testing.expect(manifestAllowsTool(m, "Bash"));
+    try std.testing.expect(!manifestAllowsTool(m, "Grep"));
+    try std.testing.expect(!manifestAllowsTool(m, "Write"));
 }
 
 test "results digest: client entries and the gateway's parsed array agree (§8.3)" {

@@ -223,8 +223,9 @@ id is unknown or not visible to this subscriber.
   the Skill body in the first user turn. `arguments` are rendered into the
   body on the gateway exactly as the client renders a local Skill's.
 - `base_dir` is where the client installed the Skill's public assets (§3.2);
-  the brain is told it as the Skill's base directory, and a `Read` under
-  `<base_dir>/sealed/` is served by the gateway from the package (§12).
+  the brain is told it as the Skill's base directory, and a `Read`, `Glob`
+  or `Grep` under `<base_dir>/sealed/` is served by the gateway from the
+  package (§12).
 - `provider` is the client's route without its credential; `auth` absent
   means the kind's default header. A `signed_adapter` scheme cannot be
   carried and such a client cannot run sealed Skills.
@@ -631,7 +632,9 @@ state; an allowlist violation is refused locally; the bearer token gates the
 gateway; a stale pin is refused before any model call; narration between
 calls never reaches the client; a sealed reference file is read on the
 gateway without a Step while a public asset is installed and read on the
-client; a `confirm: true` call is approved interactively in bypass mode (and
+client; a Glob and a Grep under `sealed/` are answered on the gateway
+without a Step while a Glob over the Skill directory goes to the client; a
+`confirm: true` call is approved interactively in bypass mode (and
 a declined one reported as `permission_denied`); the brain's
 `AskUserQuestion` is asked through the client's own dialog and the run
 continues (or ends with the question when there is no channel, and a call
@@ -796,12 +799,17 @@ fan-out and non-loopback exposure are a reverse proxy's job.
   gateway's own environment. Its tool dispatcher executes nothing: every
   tool use is marked pending, the loop suspends on the batch
   (`Options.suspend_all_pending`), and the batch is the Step. The one thing
-  the dispatcher serves itself is a `Read` whose path lies under
-  `<base_dir>/sealed/`: the file comes from the package, rendered as the
-  client's Read tool would render it, and the loop goes on inside the same
-  Step. A later Step resumes the loop with the client's results and the
-  gateway's own as one user turn (`resumeRunWithResults`), so the API's
-  tool_use/tool_result pairing holds.
+  the dispatcher serves itself is a `Read`, `Glob` or `Grep` whose target
+  lies under `<base_dir>/sealed/`, and only when the manifest admits the
+  tool: the client's own tool implementation runs against the package's
+  sealed directory — a Read rendered as the client's would be, a Glob or
+  Grep with every path it prints rewritten to the client's
+  `<base_dir>/sealed` — and the loop goes on inside the same Step. A search
+  over the Skill directory as a whole is forwarded unchanged and sees the
+  public assets only; a sealed tool the manifest does not admit is forwarded
+  too, so the client refuses it as it would any other. A later Step resumes
+  the loop with the client's results and the gateway's own as one user turn
+  (`resumeRunWithResults`), so the API's tool_use/tool_result pairing holds.
 - **Stateless runs.** The loop's continuation — the conversation's active
   window in the transcript's own message shape plus the compaction summary
   that stands for everything before it (the projected-away prefix is not

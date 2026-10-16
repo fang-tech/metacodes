@@ -1051,10 +1051,7 @@ pub const SealedSkillProvider = struct {
     /// frame, it is the user answering their own Skill.
     pub fn toolAllowed(self: *const SealedSkillProvider, tool_name: []const u8) bool {
         if (std.mem.eql(u8, tool_name, ASK_USER_TOOL)) return true;
-        const m = self.manifest();
-        for (m.tools_deny) |raw| if (ruleNamesWholeTool(raw, tool_name)) return false;
-        for (m.tools_allow) |raw| if (ruleCoversTool(raw, tool_name)) return true;
-        return false;
+        return protocol.manifestAllowsTool(self.manifest(), tool_name);
     }
 };
 
@@ -1090,21 +1087,6 @@ fn authJson(arena: std.mem.Allocator, scheme: ?@import("../../api/auth_header.zi
         .signed_adapter => return error.SealedProviderRouteUnavailable,
     }
     return out.written();
-}
-
-/// `Tool`, `Tool(pattern)`, or `prefix*` (MCP wildcard) covers `tool_name`.
-fn ruleCoversTool(raw: []const u8, tool_name: []const u8) bool {
-    const paren = std.mem.indexOfScalar(u8, raw, '(') orelse raw.len;
-    const head = std.mem.trim(u8, raw[0..paren], " ");
-    if (head.len == 0) return false;
-    if (head[head.len - 1] == '*') return std.mem.startsWith(u8, tool_name, head[0 .. head.len - 1]);
-    return std.mem.eql(u8, head, tool_name);
-}
-
-/// A rule without an argument pattern that covers the tool.
-fn ruleNamesWholeTool(raw: []const u8, tool_name: []const u8) bool {
-    if (std.mem.indexOfScalar(u8, raw, '(') != null) return false;
-    return ruleCoversTool(raw, tool_name);
 }
 
 fn findCall(calls: []const CallRef, id: []const u8) ?*const CallRef {
@@ -1268,16 +1250,6 @@ fn freeEvent(allocator: std.mem.Allocator, event: api_stream.StreamEvent) void {
         },
         else => {},
     }
-}
-
-test "allowlist rules cover plain names, patterns and MCP wildcards" {
-    try std.testing.expect(ruleCoversTool("Read", "Read"));
-    try std.testing.expect(!ruleCoversTool("Read", "Write"));
-    try std.testing.expect(ruleCoversTool("Bash(python3 *)", "Bash"));
-    try std.testing.expect(ruleCoversTool("mcp__playwright__*", "mcp__playwright__browser_click"));
-    try std.testing.expect(!ruleCoversTool("mcp__playwright__*", "mcp__github__issue"));
-    try std.testing.expect(ruleNamesWholeTool("Bash", "Bash"));
-    try std.testing.expect(!ruleNamesWholeTool("Bash(rm *)", "Bash"));
 }
 
 test "result truncation keeps a head, a marker and a tail within the cap" {

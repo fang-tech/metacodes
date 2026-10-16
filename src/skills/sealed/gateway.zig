@@ -24,6 +24,7 @@
 //! as long as the request that carried it.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const protocol = @import("protocol.zig");
 const credentials = @import("credentials.zig");
 const definition = @import("../runtime/definition.zig");
@@ -46,6 +47,10 @@ const permission_mod = @import("../../permission.zig");
 const category_mod = @import("../../permission/category.zig");
 const tool_context = @import("../../tools/context.zig");
 const tool_result = @import("../../core/tool_result.zig");
+const tool_common = @import("../../tools/common.zig");
+const glob_tool = @import("../../tools/glob.zig");
+const grep_tool = @import("../../tools/grep.zig");
+const read_state = @import("../../core/read_state.zig");
 const net = @import("platform").net;
 const pfs = @import("platform").fs;
 const pdir = @import("platform").dir;
@@ -394,7 +399,7 @@ pub const Gateway = struct {
         var out: std.ArrayList(u8) = .empty;
         out.print(arena, "Base directory for this skill: {s}\n\n{s}", .{ base_dir, rendered }) catch return error.OutOfMemory;
         if (package.sealed_files.len != 0) {
-            out.appendSlice(arena, "\n\nSealed reference files of this Skill, readable with Read:\n") catch return error.OutOfMemory;
+            out.appendSlice(arena, "\n\nSealed reference files of this Skill (Read, Glob and Grep work on them like on any other file):\n") catch return error.OutOfMemory;
             for (package.sealed_files) |path| {
                 out.print(arena, "- {s}/" ++ SEALED_DIR ++ "/{s}\n", .{ base_dir, path }) catch return error.OutOfMemory;
             }
@@ -1107,9 +1112,10 @@ test "run_state carries the active window and the summary, not the projected pre
 // ── The capturing dispatcher ──────────────────────────────────────────────
 
 /// The shadow loop's tool directory: every client tool is dispatchable by
-/// name, none executes here. A `Read` of a sealed reference file is served
-/// from the package; everything else is marked pending so the loop suspends
-/// and the batch becomes a Step.
+/// name, none executes here. A `Read`, `Glob` or `Grep` whose target lies
+/// under `<base_dir>/sealed/` is served from the package — the files that
+/// never leave this process — when the manifest admits the tool; everything
+/// else is marked pending so the loop suspends and the batch becomes a Step.
 const RemoteDispatcher = struct {
     package: *const Package,
     base_dir: []const u8,
@@ -1147,9 +1153,13 @@ const RemoteDispatcher = struct {
 
     fn dispatchFn(ctx: *const anyopaque, tool_ctx: *const tool_context.ToolContext, name: []const u8, args: []const u8) anyerror!tool_context.ToolDispatchOutcome {
         const self = cast(ctx);
-        if (std.mem.eql(u8, name, "Read")) {
-            if (try self.sealedRelativePath(tool_ctx.allocator, args)) |relative| {
-                return .{ .ok = tool_result.ToolResultBody.initInline(try self.readSealed(tool_ctx.allocator, relative)) };
+        if (self.servesHere(name)) {
+            if (std.mem.eql(u8, name, "Read")) {
+                if (try self.sealedRelativePath(tool_ctx.allocator, args)) |relative| {
+                    return .{ .ok = tool_result.ToolResultBody.initInline(try self.readSealed(tool_ctx.allocator, relative)) };
+                }
+            } else if (try self.searchSealed(tool_ctx, name, args)) |body| {
+                return .{ .ok = body };
             }
         }
         const kind: []const u8 = if (std.mem.eql(u8, name, ASK_USER_TOOL)) PENDING_QUESTION_KIND else PENDING_REMOTE_KIND;
@@ -1160,25 +1170,112 @@ const RemoteDispatcher = struct {
         return error.UiPending;
     }
 
+    /// The tools the gateway may answer itself when their target is sealed:
+    /// only ones the manifest admits. A call the client's policy frame would
+    /// refuse is forwarded instead, so that it is refused there and counted
+    /// (§6.1) like any other.
+    fn servesHere(self: *const RemoteDispatcher, name: []const u8) bool {
+        const local = std.mem.eql(u8, name, "Read") or std.mem.eql(u8, name, "Glob") or std.mem.eql(u8, name, "Grep");
+        return local and protocol.manifestAllowsTool(&self.package.entry.manifest, name);
+    }
+
     /// `file_path` of a Read, when it names a file under `<base_dir>/sealed/`:
     /// the path relative to the package's sealed directory.
     fn sealedRelativePath(self: *const RemoteDispatcher, allocator: std.mem.Allocator, args: []const u8) !?[]const u8 {
         var parsed = std.json.parseFromSlice(std.json.Value, allocator, args, .{}) catch return null;
         defer parsed.deinit();
-        if (parsed.value != .object) return null;
-        const path_value = parsed.value.object.get("file_path") orelse return null;
-        if (path_value != .string) return null;
-        const path = try normalizeSlashes(allocator, path_value.string);
-        const base = try normalizeSlashes(allocator, self.base_dir);
-        const prefix = try std.mem.concat(allocator, u8, &.{ base, "/" ++ SEALED_DIR ++ "/" });
-        if (!std.mem.startsWith(u8, path, prefix)) return null;
-        const relative = path[prefix.len..];
-        if (relative.len == 0) return null;
+        const path = valueString(parsed.value, "file_path") orelse return null;
+        const relative = (try self.sealedRelative(allocator, path)) orelse return null;
+        return if (relative.len == 0) null else relative;
+    }
+
+    /// A path under `<base_dir>/sealed`, in either separator style: its part
+    /// relative to that root ("" for the root itself), confined to it — no
+    /// empty, `.` or `..` segments. Null for any other path.
+    fn sealedRelative(self: *const RemoteDispatcher, allocator: std.mem.Allocator, raw: []const u8) !?[]const u8 {
+        const path = try normalizeSlashes(allocator, raw);
+        const root = try self.clientSealedRoot(allocator);
+        if (std.mem.eql(u8, path, root)) return "";
+        if (path.len <= root.len or !std.mem.startsWith(u8, path, root) or path[root.len] != '/') return null;
+        const relative = path[root.len + 1 ..];
         var parts = std.mem.splitScalar(u8, relative, '/');
         while (parts.next()) |part| {
             if (part.len == 0 or std.mem.eql(u8, part, ".") or std.mem.eql(u8, part, "..")) return null;
         }
         return relative;
+    }
+
+    /// `<base_dir>/sealed` as the brain names it, forward slashes.
+    fn clientSealedRoot(self: *const RemoteDispatcher, allocator: std.mem.Allocator) ![]u8 {
+        const base = try normalizeSlashes(allocator, self.base_dir);
+        return std.mem.concat(allocator, u8, &.{ base, "/" ++ SEALED_DIR });
+    }
+
+    /// The package's sealed directory on this host, forward slashes.
+    fn diskSealedRoot(self: *const RemoteDispatcher, allocator: std.mem.Allocator) ![]u8 {
+        const dir = try normalizeSlashes(allocator, self.package.dir);
+        return std.mem.concat(allocator, u8, &.{ dir, "/" ++ SEALED_DIR });
+    }
+
+    const SearchTarget = struct {
+        /// Relative to the sealed root; "" is the root itself.
+        relative: []const u8,
+        /// Glob only: the pattern made relative to the root, when the pattern
+        /// itself was an absolute path under it.
+        pattern: ?[]const u8 = null,
+    };
+
+    /// Where a Glob or Grep looks, when that is under `<base_dir>/sealed`. A
+    /// Glob whose `pattern` is itself an absolute path under the root is
+    /// searched from the root with the pattern made relative to it (ripgrep's
+    /// `--glob` matches relative to the search path); otherwise the `path`
+    /// argument decides, and without one the search is the client's.
+    fn sealedSearchTarget(self: *const RemoteDispatcher, allocator: std.mem.Allocator, is_glob: bool, args: std.json.Value) !?SearchTarget {
+        if (is_glob) {
+            if (valueString(args, "pattern")) |raw| {
+                if (try self.sealedRelative(allocator, raw)) |relative| {
+                    return if (relative.len == 0) null else .{ .relative = "", .pattern = relative };
+                }
+            }
+        }
+        const path = valueString(args, "path") orelse return null;
+        const relative = (try self.sealedRelative(allocator, path)) orelse return null;
+        return .{ .relative = relative };
+    }
+
+    /// A Glob or Grep over sealed files, answered here: the client's own tool
+    /// implementation runs against the package's sealed directory, and every
+    /// path in what it prints is rewritten to the client's `<base_dir>/sealed`,
+    /// so the brain sees what the client's tool would have shown and can hand
+    /// the paths straight back. A search over the Skill directory as a whole
+    /// is not ours: it goes to the client and sees the public assets only.
+    fn searchSealed(self: *const RemoteDispatcher, tool_ctx: *const tool_context.ToolContext, name: []const u8, args: []const u8) anyerror!?tool_result.ToolResultBody {
+        const allocator = tool_ctx.allocator;
+        const parsed = std.json.parseFromSliceLeaky(std.json.Value, allocator, args, .{}) catch return null;
+        if (parsed != .object) return null;
+        const is_glob = std.mem.eql(u8, name, "Glob");
+        const target = (try self.sealedSearchTarget(allocator, is_glob, parsed)) orelse return null;
+        const disk_root = try self.diskSealedRoot(allocator);
+        const client_root = try self.clientSealedRoot(allocator);
+        const disk_path = if (target.relative.len == 0) disk_root else try std.mem.concat(allocator, u8, &.{ disk_root, "/", target.relative });
+        _ = read_state.statPath(disk_path) catch {
+            // The client's tool reports a missing path the same way; the path
+            // it names is the client's, never this host's.
+            const client_path = if (target.relative.len == 0) client_root else try std.mem.concat(allocator, u8, &.{ client_root, "/", target.relative });
+            tool_common.setErrorDetail(tool_ctx.error_detail, allocator, "path not found: '{s}' (用绝对路径或 ~/...?)", .{client_path});
+            return error.PathNotFound;
+        };
+        var object = parsed.object;
+        try object.put(allocator, "path", .{ .string = disk_path });
+        if (target.pattern) |pattern| try object.put(allocator, "pattern", .{ .string = pattern });
+        const local_args = try protocol.serializeValue(allocator, .{ .object = object });
+        const printed = (if (is_glob) glob_tool.execute(tool_ctx, local_args) else grep_tool.execute(tool_ctx, local_args)) catch |err| {
+            if (tool_ctx.error_detail) |slot| {
+                if (slot.*) |detail| slot.* = rewriteSealedPaths(allocator, detail, disk_root, client_root, false) catch detail;
+            }
+            return err;
+        };
+        return tool_result.ToolResultBody.initInline(try rewriteSealedPaths(allocator, printed, disk_root, client_root, is_glob));
     }
 
     /// The sealed file as the client's Read tool would render it: `cat -n`
@@ -1200,6 +1297,38 @@ const RemoteDispatcher = struct {
         return out.toOwnedSlice(allocator);
     }
 };
+
+/// The gateway's sealed directory, as the client's tool would have printed
+/// it: every spelling of the on-disk root (forward or backslash separators)
+/// becomes the client's `<base_dir>/sealed`. The Glob tool's JSON gets a
+/// structural pass over its `filenames`, where on Windows the separators
+/// ripgrep appended are normalized too, so the brain gets paths it can hand
+/// straight back; Grep's text is rewritten by prefix only.
+fn rewriteSealedPaths(allocator: std.mem.Allocator, text: []const u8, disk_root: []const u8, client_root: []const u8, glob_json: bool) ![]u8 {
+    const disk_back = try std.mem.replaceOwned(u8, allocator, disk_root, "/", "\\");
+    defer allocator.free(disk_back);
+    if (glob_json) {
+        const parsed = std.json.parseFromSliceLeaky(std.json.Value, allocator, text, .{}) catch return allocator.dupe(u8, text);
+        if (parsed == .object) {
+            if (parsed.object.get("filenames")) |names| {
+                if (names == .array) {
+                    for (names.array.items) |*item| {
+                        if (item.* != .string) continue;
+                        var name = try std.mem.replaceOwned(u8, allocator, item.string, disk_back, client_root);
+                        name = try std.mem.replaceOwned(u8, allocator, name, disk_root, client_root);
+                        if (builtin.os.tag == .windows) name = try std.mem.replaceOwned(u8, allocator, name, "\\", "/");
+                        item.* = .{ .string = name };
+                    }
+                    return @constCast(try protocol.serializeValue(allocator, parsed));
+                }
+            }
+        }
+        return allocator.dupe(u8, text);
+    }
+    const once = try std.mem.replaceOwned(u8, allocator, text, disk_back, client_root);
+    defer allocator.free(once);
+    return std.mem.replaceOwned(u8, allocator, once, disk_root, client_root);
+}
 
 fn normalizeSlashes(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
     const out = try allocator.dupe(u8, path);
@@ -1712,6 +1841,61 @@ test "sealed read paths are confined to <base_dir>/sealed/" {
     try std.testing.expect((try dispatcher.sealedRelativePath(arena.allocator(), "{\"file_path\":\"C:/Users/u/.metacodes/sealed-skills/x/sealed/../manifest.json\"}")) == null);
     try std.testing.expect((try dispatcher.sealedRelativePath(arena.allocator(), "{\"file_path\":\"/etc/passwd\"}")) == null);
     try std.testing.expect((try dispatcher.sealedRelativePath(arena.allocator(), "not json")) == null);
+}
+
+test "sealed searches: Glob and Grep under <base_dir>/sealed are the gateway's, the Skill directory as a whole is not" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const al = arena.allocator();
+    const package = Package{ .name = "x", .dir = "/srv/packages/x", .body = "", .entry_json = "", .entry = undefined, .assets = &.{}, .sealed_files = &.{"notes.md"} };
+    const dispatcher = RemoteDispatcher{ .package = &package, .base_dir = "C:\\Users\\u\\.metacodes\\sealed-skills\\x", .defs = &.{} };
+    const Parse = struct {
+        fn value(arena_allocator: std.mem.Allocator, json: []const u8) !std.json.Value {
+            return std.json.parseFromSliceLeaky(std.json.Value, arena_allocator, json, .{});
+        }
+    };
+    // A Glob by an absolute pattern: searched from the root, pattern made relative.
+    const by_pattern = (try dispatcher.sealedSearchTarget(al, true, try Parse.value(al, "{\"pattern\":\"C:/Users/u/.metacodes/sealed-skills/x/sealed/**/*.md\"}"))).?;
+    try std.testing.expectEqualStrings("", by_pattern.relative);
+    try std.testing.expectEqualStrings("**/*.md", by_pattern.pattern.?);
+    // A Glob by path, in the client's own separators; the relative pattern stays.
+    const by_path = (try dispatcher.sealedSearchTarget(al, true, try Parse.value(al, "{\"pattern\":\"*.md\",\"path\":\"C:\\\\Users\\\\u\\\\.metacodes\\\\sealed-skills\\\\x\\\\sealed\\\\sub\"}"))).?;
+    try std.testing.expectEqualStrings("sub", by_path.relative);
+    try std.testing.expect(by_path.pattern == null);
+    // A Grep at the root itself.
+    const at_root = (try dispatcher.sealedSearchTarget(al, false, try Parse.value(al, "{\"pattern\":\"x\",\"path\":\"C:/Users/u/.metacodes/sealed-skills/x/sealed\"}"))).?;
+    try std.testing.expectEqualStrings("", at_root.relative);
+    // The Skill directory as a whole, a public subdirectory, a traversal, no path at all: the client's.
+    try std.testing.expect((try dispatcher.sealedSearchTarget(al, false, try Parse.value(al, "{\"pattern\":\"x\",\"path\":\"C:/Users/u/.metacodes/sealed-skills/x\"}"))) == null);
+    try std.testing.expect((try dispatcher.sealedSearchTarget(al, true, try Parse.value(al, "{\"pattern\":\"**/*\",\"path\":\"C:/Users/u/.metacodes/sealed-skills/x/scripts\"}"))) == null);
+    try std.testing.expect((try dispatcher.sealedSearchTarget(al, false, try Parse.value(al, "{\"pattern\":\"x\",\"path\":\"C:/Users/u/.metacodes/sealed-skills/x/sealed/../manifest.json\"}"))) == null);
+    try std.testing.expect((try dispatcher.sealedSearchTarget(al, false, try Parse.value(al, "{\"pattern\":\"x\"}"))) == null);
+    try std.testing.expect((try dispatcher.sealedSearchTarget(al, true, try Parse.value(al, "{\"pattern\":\"C:/Users/u/.metacodes/sealed-skills/x/sealed\"}"))) == null);
+}
+
+test "sealed search output names the client's sealed directory, never the gateway's" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const al = arena.allocator();
+    const disk = "D:/srv/packages/x/sealed";
+    const client = "C:/Users/u/.metacodes/sealed-skills/x/sealed";
+    // Grep text: the prefix in either spelling becomes the client's root.
+    const grep_out = try rewriteSealedPaths(al, "D:/srv/packages/x/sealed\\notes.md:1:RULE\nD:\\srv\\packages\\x\\sealed\\sub\\r.md:2:RULE\n", disk, client, false);
+    try std.testing.expectEqualStrings("C:/Users/u/.metacodes/sealed-skills/x/sealed\\notes.md:1:RULE\nC:/Users/u/.metacodes/sealed-skills/x/sealed\\sub\\r.md:2:RULE\n", grep_out);
+    // Glob JSON: each file name rewritten; on Windows its separators normalized as well.
+    const glob_out = try rewriteSealedPaths(al, "{\"filenames\":[\"D:/srv/packages/x/sealed\\\\notes.md\",\"D:\\\\srv\\\\packages\\\\x\\\\sealed\\\\sub\\\\r.md\"],\"numFiles\":2,\"truncated\":false,\"durationMs\":0}", disk, client, true);
+    try std.testing.expect(std.mem.indexOf(u8, glob_out, "D:") == null);
+    if (builtin.os.tag == .windows) {
+        try std.testing.expectEqualStrings("{\"filenames\":[\"C:/Users/u/.metacodes/sealed-skills/x/sealed/notes.md\",\"C:/Users/u/.metacodes/sealed-skills/x/sealed/sub/r.md\"],\"numFiles\":2,\"truncated\":false,\"durationMs\":0}", glob_out);
+    } else {
+        try std.testing.expect(std.mem.indexOf(u8, glob_out, "C:/Users/u/.metacodes/sealed-skills/x/sealed\\\\notes.md") != null);
+        try std.testing.expect(std.mem.indexOf(u8, glob_out, "\"numFiles\":2") != null);
+    }
+    // Text that is not the Glob JSON passes through untouched apart from the prefix.
+    const other = try rewriteSealedPaths(al, "no paths here", disk, client, true);
+    try std.testing.expectEqualStrings("no paths here", other);
 }
 
 test "the first question of an AskUserQuestion input is the Step's message" {

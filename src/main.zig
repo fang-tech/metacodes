@@ -111,6 +111,7 @@ pub const core_subagent = @import("core/subagent.zig");
 pub const agent_job_registry = @import("core/agent_job_registry.zig");
 pub const job_registry = @import("core/job_registry.zig");
 pub const util_time = @import("util/time.zig");
+pub const util_toolchain = @import("util/toolchain.zig");
 pub const tools = @import("tools.zig");
 pub const tool_prompt_ctx = @import("tools/prompt_context.zig");
 pub const task_tools = @import("tools/task_tools.zig");
