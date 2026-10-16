@@ -4,7 +4,7 @@ const wire = sdk.types;
 const Server = @import("mock_server.zig").Server;
 
 comptime {
-    if (wire.ABI_REVISION != 21 or
+    if (wire.ABI_REVISION != 22 or
         wire.MAX_SUBMITTED_INPUTS_V1 != 64 or
         wire.MAX_SUBMITTED_INPUT_BYTES_V1 != 16 * 1024 * 1024 or
         wire.PROMPT_OP_ADD != 1 or
@@ -19,6 +19,11 @@ comptime {
         wire.CAPABILITY_UNSUPPORTED != 2 or
         wire.MAX_MODEL_CAPABILITIES_V1 != 256 or
         wire.MAX_MODEL_CAPABILITY_MODEL_BYTES_V1 != 256 or
+        wire.TIME_CONTEXT_SYSTEM != 0 or
+        wire.TIME_CONTEXT_UTC_OFFSET != 1 or
+        wire.TIME_CONTEXT_OFF != 2 or
+        wire.MIN_UTC_OFFSET_MINUTES_V1 != -840 or
+        wire.MAX_UTC_OFFSET_MINUTES_V1 != 840 or
         wire.RUN_INPUT_MULTIMODAL != 3 or
         wire.RUN_INPUT_PART_TEXT != 1 or
         wire.RUN_INPUT_PART_IMAGE != 2 or
@@ -36,10 +41,10 @@ comptime {
         wire.MCP_APPLY_APPLIED != 1 or
         wire.MCP_APPLY_SUPERSEDED != 2 or
         wire.MCP_APPLY_REJECTED != 3)
-        @compileError("source-free Revision 21 codes must match the public contract");
+        @compileError("source-free Revision 22 codes must match the public contract");
     if (@hasDecl(wire, "SessionRefreshSkillCatalogFnV1") or
         @hasField(wire.ApiV1, "session_refresh_skill_catalog"))
-        @compileError("revision 21 must not expose the removed catalog refresh entry");
+        @compileError("revision 22 must not expose the removed catalog refresh entry");
     if (wire.MAX_SKILL_FILE_CONTENT_BYTES_V1 != 16 * 1024 * 1024 or
         wire.MAX_SKILL_CONTENT_BYTES_V1 != 32 * 1024 * 1024 or
         wire.MAX_SKILL_FILES_V1 != 1024 or
@@ -796,7 +801,7 @@ pub fn main(init: std.process.Init) !void {
         diagnostic,
     );
     api.bufferRelease()(&diagnostic);
-    var options = wire.RunOptionsV1{ .struct_size = @sizeOf(wire.RunOptionsV1), .max_turns = 7, .context_blocks = null, .context_block_count = 0, .reserved = [_]u64{0} ** 2 };
+    var options = wire.RunOptionsV1{ .struct_size = @sizeOf(wire.RunOptionsV1), .max_turns = 7, .context_blocks = null, .context_block_count = 0, .time_context_code = wire.TIME_CONTEXT_SYSTEM, .utc_offset_minutes = 0, .reserved = [_]u64{0} ** 1 };
     var result: wire.RunResultV1 = undefined;
     const encoded_arguments = try sdk.encodeSkillArguments(
         a,
@@ -997,12 +1002,16 @@ pub fn main(init: std.process.Init) !void {
         sdk.textPart("describe the attached icon"),
         sdk.imagePart("image/png", "aWNvbi1ieXRlcw=="),
     };
+    // Revision 22: a Host west of UTC gives its offset for this Run.
+    var west_options = options;
+    west_options.time_context_code = wire.TIME_CONTEXT_UTC_OFFSET;
+    west_options.utc_offset_minutes = -300;
     try probe.beginRun(4);
     try expectStatus(.ok, api.session().runMultimodal(
         session,
         4,
         &multimodal_parts,
-        &options,
+        &west_options,
         &result,
         &diagnostic,
     ), diagnostic);
@@ -1017,7 +1026,7 @@ pub fn main(init: std.process.Init) !void {
     try expectStatus(.ok, api.runtime().destroy()(runtime, &diagnostic), diagnostic);
     runtime = null;
 
-    std.debug.print("AgentCore source-free consumer: Revision 21 Agent Runtime, Host model capabilities, active-Run input, prompt profile, permission mode update, OpenAI Responses, multimodal input, active-Run journal, Host/MCP streaming, process-plugin configuration, Workspace Skill Catalog, tools, checkpoint, Runtime rebuild, restore and continued Run OK\n", .{});
+    std.debug.print("AgentCore source-free consumer: Revision 22 Agent Runtime, time context, Host model capabilities, active-Run input, prompt profile, permission mode update, OpenAI Responses, multimodal input, active-Run journal, Host/MCP streaming, process-plugin configuration, Workspace Skill Catalog, tools, checkpoint, Runtime rebuild, restore and continued Run OK\n", .{});
 }
 
 const CatalogIdentities = struct {

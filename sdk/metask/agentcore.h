@@ -5,7 +5,7 @@
 #include <stdint.h>
 
 #if !defined(UINTPTR_MAX) || !defined(UINT64_MAX) || UINTPTR_MAX != UINT64_MAX
-#error "AgentCore ABI v1 revision 21 requires a 64-bit pointer ABI"
+#error "AgentCore ABI v1 revision 22 requires a 64-bit pointer ABI"
 #endif
 
 #ifdef __cplusplus
@@ -13,11 +13,11 @@ extern "C" {
 #endif
 
 /* sdk/zig/types.zig is the normative fixed-layout schema. This header is its
- * Revision 21 C projection; sdk/rust/src/raw.rs is generated from this file.
+ * Revision 22 C projection; sdk/rust/src/raw.rs is generated from this file.
  * AgentCore ABI v1 remains experimental. Consumers pin an exact bundle and
  * must validate the exact root and mandatory child-table layouts together. */
 #define METASK_AGENTCORE_ABI_V1 1u
-#define METASK_AGENTCORE_ABI_REVISION 21u
+#define METASK_AGENTCORE_ABI_REVISION 22u
 
 #define METASK_AGENTCORE_STATUS_OK 0u
 #define METASK_AGENTCORE_STATUS_INVALID_ARGUMENT 1u
@@ -170,6 +170,16 @@ extern "C" {
  * leave a model out to make no statement. */
 #define METASK_AGENTCORE_CAPABILITY_SUPPORTED 1u
 #define METASK_AGENTCORE_CAPABILITY_UNSUPPORTED 2u
+/* Revision 22 run_options_v1.time_context_code: how the runtime tells the model
+ * today's date and time zone (a `currentDate` context block). SYSTEM, the zero
+ * default, uses the process's time zone; UTC_OFFSET uses utc_offset_minutes; OFF
+ * adds nothing. A Host block labeled `currentDate` suppresses the runtime's under
+ * SYSTEM and conflicts with UTC_OFFSET. */
+#define METASK_AGENTCORE_TIME_CONTEXT_SYSTEM 0u
+#define METASK_AGENTCORE_TIME_CONTEXT_UTC_OFFSET 1u
+#define METASK_AGENTCORE_TIME_CONTEXT_OFF 2u
+#define METASK_AGENTCORE_MIN_UTC_OFFSET_MINUTES_V1 (-840)
+#define METASK_AGENTCORE_MAX_UTC_OFFSET_MINUTES_V1 840
 #define METASK_AGENTCORE_PROMPT_OP_ADD 1u
 #define METASK_AGENTCORE_PROMPT_OP_REPLACE 2u
 #define METASK_AGENTCORE_PROMPT_OP_REMOVE 3u
@@ -714,7 +724,12 @@ typedef struct {
      * borrowed for the call. Null with zero count adds nothing. */
     const metask_agentcore_context_block_v1 *context_blocks;
     uint64_t context_block_count;
-    uint64_t reserved[2];
+    /* Revision 22: one METASK_AGENTCORE_TIME_CONTEXT_* value; zero is SYSTEM. */
+    uint32_t time_context_code;
+    /* Revision 22: minutes east of UTC under TIME_CONTEXT_UTC_OFFSET
+     * (METASK_AGENTCORE_MIN/MAX_UTC_OFFSET_MINUTES_V1); zero otherwise. */
+    int32_t utc_offset_minutes;
+    uint64_t reserved[1];
 } metask_agentcore_run_options_v1;
 
 /* The two input counts (Revision 20) are defined on every session_run_input
@@ -910,7 +925,7 @@ typedef uint32_t (*metask_agentcore_session_update_permission_mode_fn_v1)(
 typedef void (*metask_agentcore_buffer_release_fn_v1)(
     metask_agentcore_owned_bytes_v1 *);
 
-/* Function-table order is fixed within Revision 21. No earlier revision layout
+/* Function-table order is fixed within Revision 22. No earlier revision layout
  * is accepted, probed, aliased, or dispatched. */
 typedef struct metask_agentcore_runtime_api_v1 {
     uint32_t struct_size;
@@ -1096,8 +1111,8 @@ metask_agentcore_owned_bytes_v1_release(
 #define METASK_AGENTCORE_ASSERT_OFFSET(type, field, offset) \
     METASK_AGENTCORE_STATIC_ASSERT(offsetof(type, field) == (offset), #type "." #field " offset")
 
-METASK_AGENTCORE_STATIC_ASSERT(METASK_AGENTCORE_ABI_REVISION == 21u,
-                               "AgentCore revision 21");
+METASK_AGENTCORE_STATIC_ASSERT(METASK_AGENTCORE_ABI_REVISION == 22u,
+                               "AgentCore revision 22");
 METASK_AGENTCORE_STATIC_ASSERT(METASK_AGENTCORE_MCP_NEGOTIATION_AUTO == 1u,
                                "MCP auto code");
 METASK_AGENTCORE_STATIC_ASSERT(METASK_AGENTCORE_MCP_NEGOTIATION_MODERN_ONLY == 2u,
@@ -1224,6 +1239,9 @@ METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_run_input_v1, part_count, 80);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_run_input_v1, reserved, 88);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_run_options_v1, context_blocks, 8);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_run_options_v1, context_block_count, 16);
+METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_run_options_v1, time_context_code, 24);
+METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_run_options_v1, utc_offset_minutes, 28);
+METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_run_options_v1, reserved, 32);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_session_control_api_v1, set_prompt_profile, 64);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_session_control_api_v1, update_permission_mode, 72);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_run_result_v1, durable_usage_bytes, 24);

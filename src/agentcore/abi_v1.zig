@@ -4371,6 +4371,44 @@ fn parseContextBlocks(
     return blocks;
 }
 
+/// Revision 22 (#276): the runtime's `currentDate` block for this Run, or
+/// null when the Host turned it off, supplied its own, or the input is a Skill
+/// invocation (which carries no context). A Host `currentDate` block together
+/// with an explicit UTC offset is two answers to one question and is refused.
+fn timeContextBlock(
+    arena: std.mem.Allocator,
+    options: *const wire.RunOptionsV1,
+    host_blocks: []const core.context_blocks.Block,
+    kind_code: u32,
+    unix_seconds: i64,
+) !?core.context_blocks.Block {
+    const host_has_time = for (host_blocks) |block| {
+        if (std.mem.eql(u8, block.label, core.time_context.label)) break true;
+    } else false;
+    const zone: core.time_context.Zone = switch (options.time_context_code) {
+        wire.TIME_CONTEXT_SYSTEM => blk: {
+            if (options.utc_offset_minutes != 0) return error.InvalidTimeContext;
+            if (host_has_time or kind_code == wire.RUN_INPUT_SKILL) return null;
+            break :blk core.time_context.systemZone(unix_seconds);
+        },
+        wire.TIME_CONTEXT_UTC_OFFSET => blk: {
+            if (host_has_time) return error.ConflictingTimeContext;
+            if (kind_code == wire.RUN_INPUT_SKILL) return error.InvalidTimeContext;
+            break :blk core.time_context.Zone.fromHostOffset(options.utc_offset_minutes) catch
+                return error.InvalidTimeContext;
+        },
+        wire.TIME_CONTEXT_OFF => {
+            if (options.utc_offset_minutes != 0) return error.InvalidTimeContext;
+            return null;
+        },
+        else => return error.InvalidTimeContext,
+    };
+    return .{
+        .label = core.time_context.label,
+        .text = try core.time_context.today(arena, unix_seconds, &zone),
+    };
+}
+
 fn ownedSlice(v: wire.OwnedBytesV1) error{ InvalidArgument, Overflow }![]const u8 {
     return borrowed(.{ .ptr = v.ptr, .len = v.len });
 }
@@ -7347,7 +7385,23 @@ fn sessionRunInput(
             out_error,
         );
     }
-    const context_reminder = core.context_blocks.render(context_scratch.allocator(), context_blocks) catch
+    // Revision 22 (#276): today's date and time zone lead the Run's context
+    // unless the Host turned that off or said it itself.
+    const time_block = timeContextBlock(
+        context_scratch.allocator(),
+        options,
+        context_blocks,
+        input.kind_code,
+        core.time_context.currentUnixSeconds(),
+    ) catch |err| return failError(inputErrorStatus(err), err, out_error);
+    const run_blocks: []const core.context_blocks.Block = if (time_block) |block| blk: {
+        const all = context_scratch.allocator().alloc(core.context_blocks.Block, context_blocks.len + 1) catch
+            return fail(wire.STATUS_OUT_OF_MEMORY, "out of memory", out_error);
+        all[0] = block;
+        @memcpy(all[1..], context_blocks);
+        break :blk all;
+    } else context_blocks;
+    const context_reminder = core.context_blocks.render(context_scratch.allocator(), run_blocks) catch
         return fail(wire.STATUS_OUT_OF_MEMORY, "out of memory", out_error);
     if (context_reminder != null and input.kind_code == wire.RUN_INPUT_SKILL)
         return fail(wire.STATUS_INVALID_ARGUMENT, "context blocks are not accepted with SkillInvocation input", out_error);
@@ -8076,7 +8130,7 @@ test "ABI discovery is versioned" {
     try std.testing.expect(metask_agentcore_get_api(0) == null);
     const raw = metask_agentcore_get_api(wire.ABI_VERSION_V1) orelse return error.MissingApi;
     const api: *const wire.ApiV1 = @ptrCast(@alignCast(raw));
-    try std.testing.expectEqual(@as(u32, 21), api.abi_revision);
+    try std.testing.expectEqual(@as(u32, 22), api.abi_revision);
     try std.testing.expectEqual(@as(usize, 64), api.struct_size);
     try std.testing.expect(api.runtime != null);
     try std.testing.expect(api.session != null);

@@ -48,6 +48,11 @@ pub const Zone = struct {
 pub const min_offset_minutes: i32 = -14 * 60;
 pub const max_offset_minutes: i32 = 14 * 60;
 
+/// The current time, unix seconds.
+pub fn currentUnixSeconds() i64 {
+    return util_time.nowUnix();
+}
+
 /// The process's zone at `unix_seconds`, or UTC marked unknown.
 pub fn systemZone(unix_seconds: i64) Zone {
     const local = platform_tz.local(unix_seconds) orelse return Zone.utc_unknown;

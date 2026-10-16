@@ -1,6 +1,6 @@
 #include <metask/agentcore.h>
 
-_Static_assert(METASK_AGENTCORE_ABI_REVISION == 21,
+_Static_assert(METASK_AGENTCORE_ABI_REVISION == 22,
                "AgentCore revision changed");
 _Static_assert(sizeof(metask_agentcore_api_v1) == 64,
                "AgentCore root layout changed");

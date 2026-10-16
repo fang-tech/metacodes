@@ -4006,7 +4006,7 @@ test "L2 public MCP checkpoint restore facade preserves Conversation under narro
 
     var abi_revision_bytes: [4]u8 = undefined;
     @memcpy(&abi_revision_bytes, checkpoint.bytes.items[20..24]);
-    try std.testing.expectEqual(@as(u32, 21), wire.ABI_REVISION);
+    try std.testing.expectEqual(@as(u32, 22), wire.ABI_REVISION);
     // A Session without a prompt profile keeps the marker-8 envelope across
     // ABI revisions; the marker is independent of the table revision.
     try std.testing.expectEqual(
@@ -6768,7 +6768,7 @@ test "L2 opaque ABI routes Host callbacks and enforces Run admission identifiers
     try std.testing.expectEqual(wire.STATUS_BUSY, api.runtime().destroy()(runtime, &diagnostic));
     api.bufferRelease()(&diagnostic);
 
-    var options = wire.RunOptionsV1{ .struct_size = @sizeOf(wire.RunOptionsV1), .max_turns = 5, .context_blocks = null, .context_block_count = 0, .reserved = [_]u64{0} ** 2 };
+    var options = wire.RunOptionsV1{ .struct_size = @sizeOf(wire.RunOptionsV1), .max_turns = 5, .context_blocks = null, .context_block_count = 0, .time_context_code = wire.TIME_CONTEXT_SYSTEM, .utc_offset_minutes = 0, .reserved = [_]u64{0} ** 1 };
     var result: wire.RunResultV1 = undefined;
     try std.testing.expectEqual(wire.STATUS_INVALID_ARGUMENT, api.session().abort()(session, 0, wire.ABORT_USER_REQUEST, &diagnostic));
     api.bufferRelease()(&diagnostic);
@@ -6905,7 +6905,7 @@ test "L2 facade gate covers the core-idle epilogue until sessionRun returns" {
         diagnostic: wire.OwnedBytesV1 = .{ .ptr = null, .len = 0 },
 
         fn run(self: *@This()) void {
-            var options = wire.RunOptionsV1{ .struct_size = @sizeOf(wire.RunOptionsV1), .max_turns = 1, .context_blocks = null, .context_block_count = 0, .reserved = [_]u64{0} ** 2 };
+            var options = wire.RunOptionsV1{ .struct_size = @sizeOf(wire.RunOptionsV1), .max_turns = 1, .context_blocks = null, .context_block_count = 0, .time_context_code = wire.TIME_CONTEXT_SYSTEM, .utc_offset_minutes = 0, .reserved = [_]u64{0} ** 1 };
             self.status = self.api.session().runText(self.session, 1, sdk.bytesView("pause in facade epilogue"), &options, &self.result, &self.diagnostic);
         }
     };
@@ -6965,7 +6965,7 @@ test "L2 facade gate covers the core-idle epilogue until sessionRun returns" {
     try std.testing.expectEqual(@as(u64, 1), barrier.seen_run_id.load(.acquire));
 
     var competing_result: wire.RunResultV1 = undefined;
-    var options = wire.RunOptionsV1{ .struct_size = @sizeOf(wire.RunOptionsV1), .max_turns = 1, .context_blocks = null, .context_block_count = 0, .reserved = [_]u64{0} ** 2 };
+    var options = wire.RunOptionsV1{ .struct_size = @sizeOf(wire.RunOptionsV1), .max_turns = 1, .context_blocks = null, .context_block_count = 0, .time_context_code = wire.TIME_CONTEXT_SYSTEM, .utc_offset_minutes = 0, .reserved = [_]u64{0} ** 1 };
     try std.testing.expectEqual(
         wire.STATUS_BUSY,
         api.session().runText(session, 2, sdk.bytesView("must not enter during epilogue"), &options, &competing_result, &diagnostic),
@@ -7136,7 +7136,7 @@ test "L2 invalid UTF-8 Host tool result is released and does not poison Session"
         if (session) |handle| _ = api.session().destroy()(handle, &diagnostic);
     }
 
-    var options = wire.RunOptionsV1{ .struct_size = @sizeOf(wire.RunOptionsV1), .max_turns = 4, .context_blocks = null, .context_block_count = 0, .reserved = [_]u64{0} ** 2 };
+    var options = wire.RunOptionsV1{ .struct_size = @sizeOf(wire.RunOptionsV1), .max_turns = 4, .context_blocks = null, .context_block_count = 0, .time_context_code = wire.TIME_CONTEXT_SYSTEM, .utc_offset_minutes = 0, .reserved = [_]u64{0} ** 1 };
     var result: wire.RunResultV1 = undefined;
     try std.testing.expectEqual(wire.STATUS_OK, api.session().runText(session, 1, sdk.bytesView("invoke failing host"), &options, &result, &diagnostic));
     try std.testing.expectEqual(wire.STOP_END_TURN, result.stop_reason_code);
@@ -7276,7 +7276,7 @@ test "L2 Revision 12 public Host stream callback spools byte zero and returns a 
         .max_turns = 4,
         .context_blocks = null,
         .context_block_count = 0,
-        .reserved = [_]u64{0} ** 2,
+        .time_context_code = wire.TIME_CONTEXT_SYSTEM, .utc_offset_minutes = 0, .reserved = [_]u64{0} ** 1,
     };
     var result: wire.RunResultV1 = undefined;
     try std.testing.expectEqual(wire.STATUS_OK, api.session().runText(
@@ -7415,7 +7415,7 @@ test "L2 Revision 12 Host stream failure rolls back partial bytes and releases d
         .max_turns = 4,
         .context_blocks = null,
         .context_block_count = 0,
-        .reserved = [_]u64{0} ** 2,
+        .time_context_code = wire.TIME_CONTEXT_SYSTEM, .utc_offset_minutes = 0, .reserved = [_]u64{0} ** 1,
     };
     var result: wire.RunResultV1 = undefined;
     try std.testing.expectEqual(wire.STATUS_OK, api.session().runText(
@@ -7560,7 +7560,7 @@ test "L2 Event callback fatal aborts the Run and poisons the ABI Session" {
         if (session) |handle| _ = api.session().destroy()(handle, &diagnostic);
     }
 
-    var options = wire.RunOptionsV1{ .struct_size = @sizeOf(wire.RunOptionsV1), .max_turns = 2, .context_blocks = null, .context_block_count = 0, .reserved = [_]u64{0} ** 2 };
+    var options = wire.RunOptionsV1{ .struct_size = @sizeOf(wire.RunOptionsV1), .max_turns = 2, .context_blocks = null, .context_block_count = 0, .time_context_code = wire.TIME_CONTEXT_SYSTEM, .utc_offset_minutes = 0, .reserved = [_]u64{0} ** 1 };
     var result: wire.RunResultV1 = undefined;
     try std.testing.expectEqual(
         wire.STATUS_CALLBACK_FAILED,
@@ -7626,7 +7626,7 @@ test "L2 Event callback may cooperatively abort without poisoning the ABI Sessio
         if (session) |handle| _ = api.session().destroy()(handle, &diagnostic);
     }
 
-    var options = wire.RunOptionsV1{ .struct_size = @sizeOf(wire.RunOptionsV1), .max_turns = 2, .context_blocks = null, .context_block_count = 0, .reserved = [_]u64{0} ** 2 };
+    var options = wire.RunOptionsV1{ .struct_size = @sizeOf(wire.RunOptionsV1), .max_turns = 2, .context_blocks = null, .context_block_count = 0, .time_context_code = wire.TIME_CONTEXT_SYSTEM, .utc_offset_minutes = 0, .reserved = [_]u64{0} ** 1 };
     var result: wire.RunResultV1 = undefined;
     try std.testing.expectEqual(
         wire.STATUS_OK,
@@ -7705,7 +7705,7 @@ fn expectUiOutcome(mode: UiFailureMode, expected_releases: usize, expected_statu
         if (session) |handle| _ = api.session().destroy()(handle, &diagnostic);
     }
 
-    var options = wire.RunOptionsV1{ .struct_size = @sizeOf(wire.RunOptionsV1), .max_turns = 2, .context_blocks = null, .context_block_count = 0, .reserved = [_]u64{0} ** 2 };
+    var options = wire.RunOptionsV1{ .struct_size = @sizeOf(wire.RunOptionsV1), .max_turns = 2, .context_blocks = null, .context_block_count = 0, .time_context_code = wire.TIME_CONTEXT_SYSTEM, .utc_offset_minutes = 0, .reserved = [_]u64{0} ** 1 };
     var result: wire.RunResultV1 = undefined;
     try std.testing.expectEqual(expected_status, api.session().runText(session, 1, sdk.bytesView("ask through Host UI"), &options, &result, &diagnostic));
     try std.testing.expectEqual(@as(usize, 1), probe.calls);
@@ -9316,7 +9316,7 @@ test "L2 RunState: an abort accepted from the finalizing callback yields one ter
         if (session) |handle| _ = api.session().destroy()(handle, &diagnostic);
     }
 
-    var options = wire.RunOptionsV1{ .struct_size = @sizeOf(wire.RunOptionsV1), .max_turns = 2, .context_blocks = null, .context_block_count = 0, .reserved = [_]u64{0} ** 2 };
+    var options = wire.RunOptionsV1{ .struct_size = @sizeOf(wire.RunOptionsV1), .max_turns = 2, .context_blocks = null, .context_block_count = 0, .time_context_code = wire.TIME_CONTEXT_SYSTEM, .utc_offset_minutes = 0, .reserved = [_]u64{0} ** 1 };
     var result: wire.RunResultV1 = undefined;
     try std.testing.expectEqual(
         wire.STATUS_OK,
@@ -9367,7 +9367,7 @@ test "L2 RunState: a Host rejecting the terminal snapshot fails the Run with CAL
         if (session) |handle| _ = api.session().destroy()(handle, &diagnostic);
     }
 
-    var options = wire.RunOptionsV1{ .struct_size = @sizeOf(wire.RunOptionsV1), .max_turns = 2, .context_blocks = null, .context_block_count = 0, .reserved = [_]u64{0} ** 2 };
+    var options = wire.RunOptionsV1{ .struct_size = @sizeOf(wire.RunOptionsV1), .max_turns = 2, .context_blocks = null, .context_block_count = 0, .time_context_code = wire.TIME_CONTEXT_SYSTEM, .utc_offset_minutes = 0, .reserved = [_]u64{0} ** 1 };
     var result: wire.RunResultV1 = undefined;
     // 修复前:终态快照被拒绝的结果被丢弃,这里返回 STATUS_OK。
     try std.testing.expectEqual(
@@ -10072,13 +10072,188 @@ test "L2 public context blocks lead the Run's user record and stay in history" {
     try std.testing.expect(reminder_at < prompt_at);
 
     // The next Run without blocks still carries the first Run's context in
-    // its history: the cached prefix only grows.
+    // its history: the cached prefix only grows. (Time context off: the
+    // runtime would otherwise add this Run's own date, Revision 22.)
     var plain = options;
     plain.context_blocks = null;
     plain.context_block_count = 0;
+    plain.time_context_code = wire.TIME_CONTEXT_OFF;
     try std.testing.expectEqual(wire.STATUS_OK, fixture.api.session().runText(fixture.session, 2, sdk.bytesView("and the refunds"), &plain, &result, &fixture.diagnostic));
     const second = (server.requestAt(1) orelse return error.NoRequestCaptured).body();
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, second, "<system-reminder>\\nThe host application"));
+}
+
+/// `Today's date is YYYY-MM-DD (Weekday).` at `unix_seconds` in a zone
+/// `offset_minutes` east of UTC.
+fn expectedDate(buf: []u8, unix_seconds: i64, offset_minutes: i32) ![]const u8 {
+    const date = core.time_context.localDate(unix_seconds, offset_minutes);
+    return std.fmt.bufPrint(buf, "Today's date is {d}-{d:0>2}-{d:0>2} ({s}).", .{ date.year, date.month, date.day, @tagName(date.weekday) });
+}
+
+/// The request names the date at one of two instants (a Run straddling a
+/// midnight sees either).
+fn expectDateIn(body: []const u8, before: i64, after: i64, offset_minutes: i32) !void {
+    var a_buf: [64]u8 = undefined;
+    var b_buf: [64]u8 = undefined;
+    if (std.mem.indexOf(u8, body, try expectedDate(&a_buf, before, offset_minutes)) != null) return;
+    if (std.mem.indexOf(u8, body, try expectedDate(&b_buf, after, offset_minutes)) != null) return;
+    std.debug.print("request body: {s}\n", .{body});
+    return error.MissingTimeContext;
+}
+
+test "L2 Revision 22 each Run carries today's date and the process time zone by default, and history keeps each Run's own (issue #276)" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try rootPath(&tmp, &root_buffer);
+    var server = try harness.MockServer.startCassette(&.{ FINAL_SSE, FINAL_SSE }, 0);
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+    var fixture = try PublicSessionFixture.init(root, url, "test-model");
+    defer fixture.deinit();
+
+    // No context blocks, no time option: the Host supplies nothing.
+    var options = std.mem.zeroes(wire.RunOptionsV1);
+    options.struct_size = @sizeOf(wire.RunOptionsV1);
+    options.max_turns = 1;
+    var result = std.mem.zeroes(wire.RunResultV1);
+    const before = core.time_context.currentUnixSeconds();
+    try std.testing.expectEqual(wire.STATUS_OK, fixture.api.session().runText(fixture.session, 1, sdk.bytesView("what day is it"), &options, &result, &fixture.diagnostic));
+    const after = core.time_context.currentUnixSeconds();
+    const zone = core.time_context.systemZone(before);
+    const first = (server.requestAt(0) orelse return error.NoRequestCaptured).body();
+    try std.testing.expect(std.mem.indexOf(u8, first, "# currentDate\\nToday's date is ") != null);
+    try expectDateIn(first, before, after, zone.offset_minutes);
+    // The zone is named (or said to be unknown), never left implicit.
+    try std.testing.expect(std.mem.indexOf(u8, first, "Time zone: UTC") != null or
+        std.mem.indexOf(u8, first, "Time zone: ") != null or
+        std.mem.indexOf(u8, first, "the user's time zone is unknown") != null);
+    // The date rides the Run's user record, ahead of the prompt, not the system prompt.
+    try std.testing.expect(std.mem.indexOf(u8, first, "# currentDate").? < std.mem.indexOf(u8, first, "what day is it").?);
+
+    // The next Run gets its own date; the first Run's stays in history.
+    try std.testing.expectEqual(wire.STATUS_OK, fixture.api.session().runText(fixture.session, 2, sdk.bytesView("and tomorrow"), &options, &result, &fixture.diagnostic));
+    const second = (server.requestAt(1) orelse return error.NoRequestCaptured).body();
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, second, "# currentDate\\nToday's date is "));
+}
+
+test "L2 Revision 22 a Host UTC offset decides the date and names the zone (issue #276)" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try rootPath(&tmp, &root_buffer);
+    var server = try harness.MockServer.startCassette(&.{ FINAL_SSE, FINAL_SSE }, 0);
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+    var fixture = try PublicSessionFixture.init(root, url, "test-model");
+    defer fixture.deinit();
+
+    var options = std.mem.zeroes(wire.RunOptionsV1);
+    options.struct_size = @sizeOf(wire.RunOptionsV1);
+    options.max_turns = 1;
+    options.time_context_code = wire.TIME_CONTEXT_UTC_OFFSET;
+    var result = std.mem.zeroes(wire.RunResultV1);
+    // The two ends of the offset range are a day apart for most of every day.
+    for ([_]i32{ wire.MAX_UTC_OFFSET_MINUTES_V1, -12 * 60 }, [_][]const u8{ "Time zone: UTC+14:00.", "Time zone: UTC-12:00." }, 0..) |offset, label, i| {
+        options.utc_offset_minutes = offset;
+        const before = core.time_context.currentUnixSeconds();
+        try std.testing.expectEqual(wire.STATUS_OK, fixture.api.session().runText(fixture.session, i + 1, sdk.bytesView("what day is it"), &options, &result, &fixture.diagnostic));
+        const after = core.time_context.currentUnixSeconds();
+        const body = (server.requestAt(i) orelse return error.NoRequestCaptured).body();
+        try expectDateIn(body, before, after, offset);
+        try std.testing.expect(std.mem.indexOf(u8, body, label) != null);
+    }
+}
+
+test "L2 Revision 22 OFF adds no date, and a Host currentDate block is the Run's only one (issue #276)" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try rootPath(&tmp, &root_buffer);
+    var server = try harness.MockServer.startCassette(&.{ FINAL_SSE, FINAL_SSE }, 0);
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+    var fixture = try PublicSessionFixture.init(root, url, "test-model");
+    defer fixture.deinit();
+
+    var options = std.mem.zeroes(wire.RunOptionsV1);
+    options.struct_size = @sizeOf(wire.RunOptionsV1);
+    options.max_turns = 1;
+    options.time_context_code = wire.TIME_CONTEXT_OFF;
+    var result = std.mem.zeroes(wire.RunResultV1);
+    try std.testing.expectEqual(wire.STATUS_OK, fixture.api.session().runText(fixture.session, 1, sdk.bytesView("no clock please"), &options, &result, &fixture.diagnostic));
+    try std.testing.expect(std.mem.indexOf(u8, (server.requestAt(0) orelse return error.NoRequestCaptured).body(), "currentDate") == null);
+
+    // Under the default, the Host's own block wins and the runtime adds none.
+    const blocks = [_]wire.ContextBlockV1{.{ .struct_size = @sizeOf(wire.ContextBlockV1), .reserved0 = 0, .label = sdk.bytesView("currentDate"), .text = sdk.bytesView("It is the user's birthday, 1999-12-31."), .reserved = [_]u64{0} ** 2 }};
+    options.time_context_code = wire.TIME_CONTEXT_SYSTEM;
+    options.context_blocks = &blocks;
+    options.context_block_count = blocks.len;
+    try std.testing.expectEqual(wire.STATUS_OK, fixture.api.session().runText(fixture.session, 2, sdk.bytesView("what day is it"), &options, &result, &fixture.diagnostic));
+    const body = (server.requestAt(1) orelse return error.NoRequestCaptured).body();
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, "# currentDate"));
+    try std.testing.expect(std.mem.indexOf(u8, body, "It is the user's birthday, 1999-12-31.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "Today's date is ") == null);
+}
+
+test "Revision 22 time context is validated before a Run is admitted (issue #276)" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try rootPath(&tmp, &root_buffer);
+    var server = try harness.MockServer.startCassette(&.{FINAL_SSE}, 0);
+    defer server.stop();
+    const url = try server.urlOwned(std.testing.allocator);
+    defer std.testing.allocator.free(url);
+    var fixture = try PublicSessionFixture.init(root, url, "test-model");
+    defer fixture.deinit();
+    var result = std.mem.zeroes(wire.RunResultV1);
+    const host_date = [_]wire.ContextBlockV1{.{ .struct_size = @sizeOf(wire.ContextBlockV1), .reserved0 = 0, .label = sdk.bytesView("currentDate"), .text = sdk.bytesView("Today is Host day."), .reserved = [_]u64{0} ** 2 }};
+
+    const Case = struct { code: u32, offset: i32, host_block: bool = false };
+    for ([_]Case{
+        .{ .code = 3, .offset = 0 }, // unknown code
+        .{ .code = wire.TIME_CONTEXT_SYSTEM, .offset = 60 }, // an offset without UTC_OFFSET
+        .{ .code = wire.TIME_CONTEXT_OFF, .offset = -60 },
+        .{ .code = wire.TIME_CONTEXT_UTC_OFFSET, .offset = wire.MAX_UTC_OFFSET_MINUTES_V1 + 1 },
+        .{ .code = wire.TIME_CONTEXT_UTC_OFFSET, .offset = wire.MIN_UTC_OFFSET_MINUTES_V1 - 1 },
+        .{ .code = wire.TIME_CONTEXT_UTC_OFFSET, .offset = 480, .host_block = true }, // two answers
+    }) |case| {
+        var options = std.mem.zeroes(wire.RunOptionsV1);
+        options.struct_size = @sizeOf(wire.RunOptionsV1);
+        options.max_turns = 1;
+        options.time_context_code = case.code;
+        options.utc_offset_minutes = case.offset;
+        if (case.host_block) {
+            options.context_blocks = &host_date;
+            options.context_block_count = host_date.len;
+        }
+        try std.testing.expectEqual(wire.STATUS_INVALID_ARGUMENT, fixture.api.session().runText(fixture.session, 1, sdk.bytesView("x"), &options, &result, &fixture.diagnostic));
+        fixture.releaseDiagnostic();
+    }
+    // A Skill invocation carries no context, so it takes no offset either.
+    var skill_input = std.mem.zeroes(wire.RunInputV1);
+    skill_input.struct_size = @sizeOf(wire.RunInputV1);
+    skill_input.kind_code = wire.RUN_INPUT_SKILL;
+    var skill_options = std.mem.zeroes(wire.RunOptionsV1);
+    skill_options.struct_size = @sizeOf(wire.RunOptionsV1);
+    skill_options.max_turns = 1;
+    skill_options.time_context_code = wire.TIME_CONTEXT_UTC_OFFSET;
+    skill_options.utc_offset_minutes = 60;
+    try std.testing.expectEqual(wire.STATUS_INVALID_ARGUMENT, fixture.api.session().runInput()(fixture.session, 1, &skill_input, &skill_options, &result, &fixture.diagnostic));
+    fixture.releaseDiagnostic();
+    // Nothing was sent and Run 1 was never admitted.
+    try std.testing.expectEqual(@as(usize, 0), server.requestCount());
+    var ok_options = std.mem.zeroes(wire.RunOptionsV1);
+    ok_options.struct_size = @sizeOf(wire.RunOptionsV1);
+    ok_options.max_turns = 1;
+    try std.testing.expectEqual(wire.STATUS_OK, fixture.api.session().runText(fixture.session, 1, sdk.bytesView("x"), &ok_options, &result, &fixture.diagnostic));
 }
 
 /// Answers each Permission request with `allow_session` and, while the Run is
@@ -10584,6 +10759,9 @@ const RunInputFixture = struct {
         var options = std.mem.zeroes(wire.RunOptionsV1);
         options.struct_size = @sizeOf(wire.RunOptionsV1);
         options.max_turns = 4;
+        // These tests size budgets and requests to the byte; the Revision 22
+        // date block would move their arithmetic, not what they test.
+        options.time_context_code = wire.TIME_CONTEXT_OFF;
         result.* = std.mem.zeroes(wire.RunResultV1);
         self.api.bufferRelease()(&self.diagnostic);
         return self.api.session().runText(self.session, run_id, sdk.bytesView(prompt), &options, result, &self.diagnostic);

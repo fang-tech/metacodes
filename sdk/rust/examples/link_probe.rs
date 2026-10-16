@@ -1,6 +1,6 @@
 fn main() {
     let api = metask_agentcore_sys::Api::discover()
-        .expect("AgentCore Revision 21 exact discovery failed");
+        .expect("AgentCore Revision 22 exact discovery failed");
     let output = api.owned_buffer();
     assert!(output
         .as_bytes()
