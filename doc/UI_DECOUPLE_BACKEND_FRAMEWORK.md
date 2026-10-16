@@ -133,6 +133,7 @@ GUI/语音后端各自决定 tick(GUI=requestAnimationFrame,语音=无 tick)。
 | `usage: UsageDelta` | token 计数 | 累加 usage_acc(主路径 null,走 usage_sink) |
 | `auto_compact{dropped,kept}` | 历史压缩提示 | writeGenText(格式化行) |
 | `retry_notice{attempt,max,delay_ms}` | 建连重试提示 | 门控(show_retry/attempt≥3)+ writeGenText |
+| `input_adopted{input_id,sequence,turn}` | Session 活动 Run 的 Host 输入已追加进对话(#270) | no-op(只由 AgentSession 的 run_inputs 产生) |
 | `stream_done` | 一轮结束 | writeGenText(colorize ? "\x1b[0m\n" : "\n") |
 
 ### UiEvent(UI→core)

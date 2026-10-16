@@ -132,6 +132,7 @@ pub const CoreEvent = union(enum) {
     phase_change: Phase,                          // input ↔ generating
     auto_compact: struct { dropped, kept, before_tokens, after_tokens, cause }, // 自动压缩历史;cause 以 context_window_exceeded_ 开头的是恢复,不是压缩
     retry_notice: struct { attempt, max, delay_ms }, // 流式建连重试
+    input_adopted: struct { input_id, sequence, turn }, // Session 活动 Run 的 Host 输入已进对话(§3.3,#270)
     ui_request_pending: struct { tool_use_id, request_json }, // 可挂起 UI 请求(异步前端,见 §5.3)
 
     // 输出语义(见 §3.2.1)
