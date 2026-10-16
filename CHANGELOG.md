@@ -12,6 +12,11 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Added
 
+- Sealed Skill audit and trace: the ledger now records every call's id and
+  name per Step and a `results` record per `runs.continue` with the SHA-256,
+  size and flags of each result as sent (§6.6); the client logs every
+  gateway exchange and every Step at info level under `sealed`, and the
+  gateway logs each Step it emits with its number.
 - Sealed Skills run as a shadow of the client's fork on the client's own
   model account ([doc/SEALED_SKILL_PROTOCOL.md](doc/SEALED_SKILL_PROTOCOL.md)
   §8.1, §9): the gateway has no provider of its own; `runs.start` carries

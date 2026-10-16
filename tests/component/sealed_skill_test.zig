@@ -449,14 +449,26 @@ test "L2 sealed: brain on the gateway, hands on the client, model on the client'
     try std.testing.expect(std.mem.indexOf(u8, second.body(), "DATA_MARKER") != null);
     try std.testing.expect(std.mem.indexOf(u8, second.body(), "\"tool_use_id\":\"tu_1\"") != null);
 
-    // Ledger: two Steps and one charge, each carrying the gateway's cost.
+    // Ledger: two Steps and one charge, each carrying the gateway's cost;
+    // the Step names its call and the one continue digests what was sent (§6.6).
     const ledger = (try lab.ledger()) orelse return error.LedgerMissing;
     defer a.free(ledger);
     try std.testing.expectEqual(@as(usize, 2), countOccurrences(ledger, "\"kind\":\"step\""));
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(ledger, "\"kind\":\"results\""));
     try std.testing.expectEqual(@as(usize, 1), countOccurrences(ledger, "\"kind\":\"charge\""));
-    try std.testing.expect(std.mem.indexOf(u8, ledger, "\"cost_micros\":0,") == null);
+    // Every Step carries the gateway's cost (a results record has none).
+    var ledger_lines = std.mem.splitScalar(u8, ledger, '\n');
+    while (ledger_lines.next()) |line| {
+        if (std.mem.indexOf(u8, line, "\"kind\":\"step\"") == null) continue;
+        try std.testing.expect(std.mem.indexOf(u8, line, "\"cost_micros\":0,") == null);
+    }
     try std.testing.expect(std.mem.indexOf(u8, ledger, "\"skill_id\":\"ssk_test\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, ledger, "\"inference_gateway\":\"metacodes\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ledger, "\"tool_calls\":[{\"id\":\"tu_1\",\"name\":\"Read\"}]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ledger, "\"results\":[{\"tool_use_id\":\"tu_1\",\"sha256\":\"sha256:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ledger, "\"is_error\":false,\"truncated\":false,\"redactions\":[]}]") != null);
+    // Contents never enter the ledger, only their digests.
+    try std.testing.expect(std.mem.indexOf(u8, ledger, "DATA_MARKER") == null);
     // The client's credential went to the model and nowhere else: not into
     // the ledger, not into the fork's output.
     try std.testing.expect(std.mem.indexOf(u8, ledger, CLIENT_KEY) == null);
@@ -990,6 +1002,8 @@ test "L2 sealed: a bound credential is substituted into the call and redacted fr
     const ledger = (try lab.ledger()) orelse return error.LedgerMissing;
     defer a.free(ledger);
     try std.testing.expect(std.mem.indexOf(u8, ledger, SECRET) == null);
+    // The results record names the redaction that was applied.
+    try std.testing.expect(std.mem.indexOf(u8, ledger, "\"redactions\":[\"erp-main\"]") != null);
 }
 
 test "L2 sealed: an unbound credential refuses the call with permission_denied and tells the user how to bind it" {
@@ -1017,4 +1031,8 @@ test "L2 sealed: an unbound credential refuses the call with permission_denied a
     try std.testing.expect(std.mem.indexOf(u8, second.body(), "\"is_error\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, second.body(), "not bound on this client") != null);
     try std.testing.expectEqual(@as(usize, 0), lab.probe.permission_requests);
+    // The refusal is on the record for the Step it answered.
+    const ledger = (try lab.ledger()) orelse return error.LedgerMissing;
+    defer a.free(ledger);
+    try std.testing.expect(std.mem.indexOf(u8, ledger, "\"refusal\":\"permission_denied\"") != null);
 }

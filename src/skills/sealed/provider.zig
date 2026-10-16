@@ -418,6 +418,9 @@ pub const SealedSkillProvider = struct {
         const split = try self.toolsJson(arena, tools orelse &.{});
         const arguments = try arena.alloc([]const u8, self.arguments.len);
         for (self.arguments, arguments) |argument, *slot| slot.* = argument;
+        log.info("sealed", "runs.start skill={s} model={s} tools={d} provider_tools={d} max_steps={d} max_cost_micros={d} base_dir={s}", .{
+            self.pin.pin.entry.skill_id, model_override orelse self.route.model, split.client_count, split.provider_count, self.max_steps, self.max_cost_micros, self.base_dir,
+        });
         var params: std.Io.Writer.Allocating = .init(arena);
         try protocol.writeStartParams(&params.writer, .{
             .skill_id = self.pin.pin.entry.skill_id,
@@ -522,6 +525,14 @@ pub const SealedSkillProvider = struct {
         abort: ?*const AbortSignal,
     ) anyerror!provider_mod.StreamHandle {
         const run = &self.run.?;
+        var errors: usize = 0;
+        var refusals: usize = 0;
+        for (results) |result| {
+            if (result.is_error) errors += 1;
+            if (result.refusal != null) refusals += 1;
+        }
+        log.info("sealed", "runs.continue run={s} seq={d} results={d} errors={d} refusals={d}", .{ run.run_id, run.seq, results.len, errors, refusals });
+        try self.recordResults(arena, results);
         var params: std.Io.Writer.Allocating = .init(arena);
         try protocol.writeContinueParams(&params.writer, run.run_id, run.run_state, run.seq, results);
         var response = self.transport.call(.runs_continue, params.written(), abort) catch |err| return self.transportFailure(err);
@@ -589,6 +600,10 @@ pub const SealedSkillProvider = struct {
             .violations = previous_violations,
         };
         self.recordStep(step);
+        log.info("sealed", "step run={s} seq={d} kind={s} calls={d} cost_micros={d} cumulative={d} usage in={d} out={d} cache_r={d}", .{
+            step.run_id, step.seq, @tagName(step.kind), step.calls.len, step.usage.cost_micros, step.cumulative.cost_micros, step.usage.input_tokens, step.usage.output_tokens, step.usage.cache_read_input_tokens,
+        });
+        for (step.calls) |call| log.info("sealed", "  call id={s} name={s} confirm={} credentials={d} input_bytes={d}", .{ call.id, call.name, call.confirm, call.credentials.len, call.input_json.len });
 
         // §6.5: the client stops on its own as soon as the cap is passed.
         if (self.max_cost_micros > 0 and step.cumulative.cost_micros > self.max_cost_micros and continues) {
@@ -847,6 +862,7 @@ pub const SealedSkillProvider = struct {
         const run = &(self.run orelse return);
         if (run.finished) return;
         run.finished = true;
+        log.info("sealed", "runs.cancel run={s} seq={d} reason={s}", .{ run.run_id, run.seq, @tagName(reason) });
         var params: std.Io.Writer.Allocating = .init(self.allocator);
         defer params.deinit();
         protocol.writeCancelParams(&params.writer, run.run_id, run.run_state, reason) catch return;
@@ -876,6 +892,13 @@ pub const SealedSkillProvider = struct {
         if (self.state_root.len == 0) return;
         const entry = &self.pin.pin.entry;
         const now: i64 = @intCast(@divTrunc(util_time.nowWallNs(), std.time.ns_per_ms));
+        // §6.6: the call ids and names, so the audit shows what was asked.
+        const owned_calls: ?[]ledger.CallRef = self.allocator.alloc(ledger.CallRef, step.calls.len) catch null;
+        defer if (owned_calls) |owned| self.allocator.free(owned);
+        if (owned_calls) |owned| for (step.calls, owned) |call, *slot| {
+            slot.* = .{ .id = call.id, .name = call.name };
+        };
+        const tool_calls: []const ledger.CallRef = owned_calls orelse &.{};
         ledger.append(self.allocator, self.state_root, .{
             .kind = .step,
             .ts = now,
@@ -898,6 +921,7 @@ pub const SealedSkillProvider = struct {
             .issuer_skill_host = step.issuer_skill_host,
             .issuer_inference_gateway = step.issuer_inference_gateway,
             .calls = step.calls.len,
+            .tool_calls = tool_calls,
         }) catch |err| log.warn("sealed", "ledger append failed: {s}", .{@errorName(err)});
         if (step.charge) |charge| {
             ledger.append(self.allocator, self.state_root, .{
@@ -922,7 +946,36 @@ pub const SealedSkillProvider = struct {
 
     // ── Tool projection ───────────────────────────────────────────────────
 
-    const ToolsJson = struct { client: []const u8, provider: []const u8 };
+    /// §6.6: a digest of each result as sent (after redaction and truncation),
+    /// with its size and flags, keyed by the Step it answers.
+    fn recordResults(self: *SealedSkillProvider, arena: std.mem.Allocator, results: []const protocol.ResultEntry) !void {
+        if (self.state_root.len == 0) return;
+        const run = &self.run.?;
+        const entry = &self.pin.pin.entry;
+        const refs = try arena.alloc(ledger.ResultRef, results.len);
+        for (results, refs) |result, *slot| slot.* = .{
+            .tool_use_id = result.tool_use_id,
+            .sha256 = try protocol.digestHex(arena, result.content),
+            .bytes = result.content.len,
+            .is_error = result.is_error,
+            .truncated = result.truncated,
+            .refusal = if (result.refusal) |refusal| @tagName(refusal) else "",
+            .redactions = result.redactions,
+        };
+        ledger.append(self.allocator, self.state_root, .{
+            .kind = .results,
+            .ts = @intCast(@divTrunc(util_time.nowWallNs(), std.time.ns_per_ms)),
+            .session_id = self.session_id,
+            .gateway = self.pin.pin.gateway_url,
+            .skill_id = entry.skill_id,
+            .run_id = run.run_id,
+            .seq = run.seq,
+            .calls = results.len,
+            .results = refs,
+        }) catch |err| log.warn("sealed", "ledger append failed: {s}", .{@errorName(err)});
+    }
+
+    const ToolsJson = struct { client: []const u8, provider: []const u8, client_count: usize = 0, provider_count: usize = 0 };
 
     /// The definitions the gateway's shadow may call, in the client's own
     /// schema dialect: the client tools the pinned allowlist admits plus
@@ -936,18 +989,18 @@ pub const SealedSkillProvider = struct {
         var provider_tools: std.ArrayList(u8) = .empty;
         try client.append(arena, '[');
         try provider_tools.append(arena, '[');
-        var client_first = true;
-        var provider_first = true;
+        var client_count: usize = 0;
+        var provider_count: usize = 0;
         for (tools) |tool| {
             if (tool.server_type != null) {
-                if (!provider_first) try provider_tools.append(arena, ',');
-                provider_first = false;
+                if (provider_count != 0) try provider_tools.append(arena, ',');
+                provider_count += 1;
                 try api_request.serializeOneTool(tool, &provider_tools, arena);
                 continue;
             }
             if (!self.toolAllowed(tool.name)) continue;
-            if (!client_first) try client.append(arena, ',');
-            client_first = false;
+            if (client_count != 0) try client.append(arena, ',');
+            client_count += 1;
             try api_request.serializeOneTool(tool, &client, arena);
             if (tool.deferred) {
                 // Inside the object just written: replace its closing brace.
@@ -957,7 +1010,7 @@ pub const SealedSkillProvider = struct {
         }
         try client.append(arena, ']');
         try provider_tools.append(arena, ']');
-        return .{ .client = client.items, .provider = provider_tools.items };
+        return .{ .client = client.items, .provider = provider_tools.items, .client_count = client_count, .provider_count = provider_count };
     }
 
     /// Name-level admission against the pinned manifest: a `deny` rule that

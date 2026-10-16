@@ -1,11 +1,20 @@
-//! Durable per-Step usage and per-run charge ledger for sealed Skill runs
-//! (doc/SEALED_SKILL_PROTOCOL.md §6.6, §9 "Ledger").
+//! Durable audit ledger for sealed Skill runs (doc/SEALED_SKILL_PROTOCOL.md
+//! §6.6, §9 "Ledger").
 //!
-//! `<state root>/ledger/sealed.ndjson`, one JSON object per line. A `step`
-//! record is written for every Step the gateway returned (its own usage and
-//! the hash-chain link), a `charge` record for the receipt on `final` and
-//! `failed`. The gateway's `cost_micros` is recorded as served; the client
-//! never recomputes it.
+//! `<state root>/ledger/sealed.ndjson`, one JSON object per line:
+//!
+//! - `step`: every Step the gateway returned — its usage, the hash-chain
+//!   link (`digest`, `prev_digest`), the issuer, and the id and name of every
+//!   call it carried (`tool_calls`);
+//! - `results`: every `runs.continue` the client sent — for each result its
+//!   `tool_use_id`, the SHA-256 of the content as sent, its size and the
+//!   `is_error` / `truncated` / `refusal` / `redactions` it carried;
+//! - `charge`: the receipt on `final` and `failed`.
+//!
+//! Together they let the subscriber show, after the fact, what the gateway
+//! asked for and what this machine answered (§8.3), without keeping the
+//! contents themselves. The gateway's `cost_micros` is recorded as served;
+//! the client never recomputes it.
 
 const std = @import("std");
 const pfs = @import("platform").fs;
@@ -14,7 +23,27 @@ const protocol = @import("protocol.zig");
 
 pub const FILE_NAME = "sealed.ndjson";
 
-pub const Kind = enum { step, charge };
+pub const Kind = enum { step, results, charge };
+
+/// A call the Step carried (§6.6 "the call ids and names").
+pub const CallRef = struct {
+    id: []const u8,
+    name: []const u8,
+};
+
+/// What the client sent for one call (§6.6 "a digest of each result").
+pub const ResultRef = struct {
+    tool_use_id: []const u8,
+    /// `sha256:<hex>` over the content exactly as sent (after redaction and
+    /// truncation).
+    sha256: []const u8,
+    bytes: u64,
+    is_error: bool = false,
+    truncated: bool = false,
+    /// `@tagName` of the refusal, "" when none.
+    refusal: []const u8 = "",
+    redactions: []const []const u8 = &.{},
+};
 
 pub const Record = struct {
     kind: Kind,
@@ -37,8 +66,12 @@ pub const Record = struct {
     prev_digest: []const u8 = "",
     issuer_skill_host: []const u8 = "",
     issuer_inference_gateway: []const u8 = "",
-    /// Number of tool calls the Step carried.
+    /// Number of tool calls the Step carried (`charge`: the receipt's steps).
     calls: u64 = 0,
+    /// `step`: the calls, by id and name.
+    tool_calls: []const CallRef = &.{},
+    /// `results`: what was sent for each call of the answered Step.
+    results: []const ResultRef = &.{},
 };
 
 /// `METACODES_LEDGER_DIR/sealed.ndjson`, else `<state_root>/ledger/sealed.ndjson`.
@@ -80,7 +113,35 @@ pub fn render(allocator: std.mem.Allocator, record: Record) ![]u8 {
     try protocol.writeString(w, record.issuer_skill_host);
     try w.writeAll(",\"inference_gateway\":");
     try protocol.writeString(w, record.issuer_inference_gateway);
-    try w.print("}},\"calls\":{d}}}\n", .{record.calls});
+    try w.print("}},\"calls\":{d},\"tool_calls\":[", .{record.calls});
+    for (record.tool_calls, 0..) |call, index| {
+        if (index != 0) try w.writeByte(',');
+        try w.writeAll("{\"id\":");
+        try protocol.writeString(w, call.id);
+        try w.writeAll(",\"name\":");
+        try protocol.writeString(w, call.name);
+        try w.writeByte('}');
+    }
+    try w.writeAll("],\"results\":[");
+    for (record.results, 0..) |result, index| {
+        if (index != 0) try w.writeByte(',');
+        try w.writeAll("{\"tool_use_id\":");
+        try protocol.writeString(w, result.tool_use_id);
+        try w.writeAll(",\"sha256\":");
+        try protocol.writeString(w, result.sha256);
+        try w.print(",\"bytes\":{d},\"is_error\":{},\"truncated\":{}", .{ result.bytes, result.is_error, result.truncated });
+        if (result.refusal.len != 0) {
+            try w.writeAll(",\"refusal\":");
+            try protocol.writeString(w, result.refusal);
+        }
+        try w.writeAll(",\"redactions\":[");
+        for (result.redactions, 0..) |ref, ref_index| {
+            if (ref_index != 0) try w.writeByte(',');
+            try protocol.writeString(w, ref);
+        }
+        try w.writeAll("]}");
+    }
+    try w.writeAll("]}\n");
     return out.toOwnedSlice();
 }
 
@@ -144,5 +205,41 @@ test "ledger line carries the gateway's charge verbatim" {
     defer a.free(line);
     try std.testing.expect(std.mem.indexOf(u8, line, "\"kind\":\"charge\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, line, "\"cost_micros\":24400") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line, "\"tool_calls\":[],\"results\":[]") != null);
     try std.testing.expect(std.mem.endsWith(u8, line, "}\n"));
+}
+
+test "step and results records name the calls and digest what was sent (§6.6)" {
+    const a = std.testing.allocator;
+    const step = try render(a, .{
+        .kind = .step,
+        .ts = 1,
+        .session_id = "s",
+        .gateway = "http://g/ssp",
+        .skill_id = "ssk",
+        .run_id = "run_1",
+        .seq = 1,
+        .step_kind = "tool_calls",
+        .calls = 2,
+        .tool_calls = &.{ .{ .id = "c1", .name = "Read" }, .{ .id = "c2", .name = "Bash" } },
+    });
+    defer a.free(step);
+    try std.testing.expect(std.mem.indexOf(u8, step, "\"tool_calls\":[{\"id\":\"c1\",\"name\":\"Read\"},{\"id\":\"c2\",\"name\":\"Bash\"}]") != null);
+    const results = try render(a, .{
+        .kind = .results,
+        .ts = 2,
+        .session_id = "s",
+        .gateway = "http://g/ssp",
+        .skill_id = "ssk",
+        .run_id = "run_1",
+        .seq = 1,
+        .results = &.{
+            .{ .tool_use_id = "c1", .sha256 = "sha256:aa", .bytes = 12, .redactions = &.{"erp-main"} },
+            .{ .tool_use_id = "c2", .sha256 = "sha256:bb", .bytes = 0, .is_error = true, .refusal = "policy_violation" },
+        },
+    });
+    defer a.free(results);
+    try std.testing.expect(std.mem.indexOf(u8, results, "\"kind\":\"results\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, results, "{\"tool_use_id\":\"c1\",\"sha256\":\"sha256:aa\",\"bytes\":12,\"is_error\":false,\"truncated\":false,\"redactions\":[\"erp-main\"]}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, results, "{\"tool_use_id\":\"c2\",\"sha256\":\"sha256:bb\",\"bytes\":0,\"is_error\":true,\"truncated\":false,\"refusal\":\"policy_violation\",\"redactions\":[]}") != null);
 }

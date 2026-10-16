@@ -9,6 +9,8 @@
 
 const std = @import("std");
 const protocol = @import("protocol.zig");
+const log = @import("../../util/log.zig");
+const util_time = @import("../../util/time.zig");
 const provider = @import("../../api/provider.zig");
 const http_status = @import("../../api/http_status.zig");
 const AbortSignal = @import("../../util/abort.zig").AbortSignal;
@@ -91,8 +93,16 @@ pub const Client = struct {
         var body: std.Io.Writer.Allocating = .init(self.allocator);
         defer body.deinit();
         protocol.writeRequest(&body.writer, id, method, params_json) catch return error.OutOfMemory;
-        const raw = try self.post(body.written(), abort);
+        // The client's own trace of the protocol exchange (§9.1 "Transport"):
+        // method, request id, bytes each way, HTTP status and latency — never
+        // the parameters, which carry the user's prompt and results.
+        const started_ms = util_time.nowMs();
+        const raw = self.post(body.written(), abort) catch |err| {
+            log.warn("sealed", "{s} id={d} failed: {s} (http {d}, {d} B out, {d} ms)", .{ method.wire(), id, @errorName(err), self.last_http_status, body.written().len, util_time.nowMs() - started_ms });
+            return err;
+        };
         defer self.allocator.free(raw.bytes);
+        log.info("sealed", "{s} id={d} -> http {d} {s} ({d} B out, {d} B in, {d} ms)", .{ method.wire(), id, self.last_http_status, @tagName(raw.kind), body.written().len, raw.bytes.len, util_time.nowMs() - started_ms });
         return switch (raw.kind) {
             .json => parseOne(self.allocator, raw.bytes, id),
             .sse => parseStream(self.allocator, raw.bytes, id),

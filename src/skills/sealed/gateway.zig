@@ -935,6 +935,9 @@ pub const Gateway = struct {
         writeStepBody(w, self, state, emit) catch return error.OutOfMemory;
         var value = std.json.parseFromSliceLeaky(std.json.Value, arena, out.written(), .{}) catch return error.OutOfMemory;
         const digest = protocol.stepDigest(arena, value) catch return error.OutOfMemory;
+        log.info("sealed-gw", "run {s} step {d} {s}: calls={d} cost_micros={d} cumulative={d}{s}{s}", .{
+            state.run_id, state.seq, @tagName(emit.kind), emit.calls.len, emit.usage.cost_micros, state.cost_micros, if (emit.reason.len != 0) " reason=" else "", emit.reason,
+        });
         state.last_digest = digest;
         value.object.put(arena, "digest", .{ .string = digest }) catch return error.OutOfMemory;
         if (emit.kind == .tool_calls or emit.kind == .input_required) {

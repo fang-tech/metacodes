@@ -673,9 +673,14 @@ call.
   budget`), and passed to the child loop as `cost_budget_usd` for its own
   estimate-based stop. It bounds what the gateway charges; it cannot bound
   what the gateway spends on the client's account (§8.1).
-- **Ledger.** A `step` record per Step and a `charge` record per receipt
-  go to `<state root>/ledger/sealed.ndjson`; `metacodes sealed ledger`
-  prints it. The provider credential is never written there.
+- **Ledger.** `<state root>/ledger/sealed.ndjson` holds, per run, a
+  `step` record per Step (usage, chain link, issuer, and every call's id and
+  name as `tool_calls`), a `results` record per `runs.continue` (for each
+  result its `tool_use_id`, the SHA-256 of the content exactly as sent, its
+  size, `is_error`, `truncated`, `refusal`, `redactions`) and a `charge`
+  record per receipt — what §6.6 asks for, without the contents themselves.
+  `metacodes sealed ledger` prints it. The provider credential is never
+  written there.
 - **Confirmation.** A call marked `confirm: true` is approved
   interactively whatever the permission mode (§6.2). The provider does not
   decide permissions: it answers the child permission context's *confirm
@@ -719,7 +724,12 @@ call.
   `Sealed-Skill-Version: 1` and, while a run is open, the provider
   credential header; JSON and SSE answers are both accepted; in-flight
   requests sit in the shared abort registry with a two-minute liveness
-  limit, so Ctrl+C and a dead socket both end the call.
+  limit, so Ctrl+C and a dead socket both end the call. Every exchange is
+  logged at info level under the `sealed` module (method, request id, HTTP
+  status, bytes each way, latency), and the provider logs each Step it
+  adopts (seq, kind, calls) and each `runs.start` / `runs.continue` /
+  `runs.cancel` it sends — never parameters or results — so a client trace
+  (`METACODES_LOG=sealed:info`) shows the protocol conversation.
 - **Not in revision 2026-10-15 of the client:** suspending a fork on an
   `input_required` Step for an asynchronous front end (the run is cancelled
   instead, see *Input*); `confirmation: "always"` as a client setting (the
