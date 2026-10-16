@@ -32,6 +32,12 @@ pub const AgentSet = struct {
         self.agents.deinit(self.allocator);
     }
 
+    /// 只装内置三件(Explore / Plan / general-purpose),不碰任何目录:给需要
+    /// 真实 subagent prompt、又不能依赖宿主个人 agents 的测试与嵌入方用。
+    pub fn loadBuiltins(self: *AgentSet) !void {
+        return injectBuiltins(self);
+    }
+
     /// 标准加载入口。cwd 用于沿父级向上扫 project 级;"" 跳过。不读状态根下的
     /// personal agents(宿主经 loadFromStandardPathsWithPluginSources 传入状态根)。
     pub fn loadFromStandardPaths(self: *AgentSet, cwd: []const u8) !void {

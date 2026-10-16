@@ -19,6 +19,8 @@ const ToolDefinition = @import("../json.zig").ToolDefinition;
 const DynRegistry = @import("../tools/dynamic.zig").DynRegistry;
 const agent_tool = @import("../tools/agent.zig");
 const subagent = @import("../core/subagent.zig");
+const sealed_provider = @import("sealed/provider.zig");
+const sealed_pin = @import("sealed/pin.zig");
 const preload = @import("../agents/preload.zig");
 const agent_loop = @import("../core/agent_loop.zig");
 const project_activation = @import("../core/project_rule_activation.zig");
@@ -626,7 +628,9 @@ pub fn handleSlash(
         const fork = executeFork(
             &app.skill_runtime,
             &tool_context,
+            record,
             activation,
+            values,
         ) catch |err| {
             std.debug.print(
                 "\x1b[31m/{s}: fork execution failed: {s}\x1b[0m\n",
@@ -770,7 +774,7 @@ fn executeModelTool(
         return error.SkillNotFound;
 
     if (record.definition.context == .fork) {
-        const fork = try executeFork(self, ctx, activation);
+        const fork = try executeFork(self, ctx, record, activation, invocation.values);
         defer ctx.allocator.free(fork.text);
         try self.finishActivation(ctx.agent_ident, activation);
         activation_live = false;
@@ -834,9 +838,20 @@ const ForkOutput = struct {
 fn executeFork(
     self: *Runtime,
     ctx: *const ToolContext,
+    record: *const runtime.catalog.SkillRecord,
     activation: *const runtime.activation.Activation,
+    values: []const []const u8,
 ) !ForkOutput {
-    const api_client = ctx.api_client orelse return error.ForkUnavailable;
+    // A sealed Skill (doc/SEALED_SKILL_PROTOCOL.md §9) runs the same child
+    // loop with the gateway as its model; the gateway's shadow of this fork
+    // calls the model over this client's own provider route.
+    const sealed: ?*sealed_provider.SealedSkillProvider = if (record.definition.isSealed())
+        try openSealedProvider(self, ctx, record, activation, values)
+    else
+        null;
+    defer if (sealed) |remote| remote.destroy();
+    const api_client: ?*@import("../client.zig").Client = ctx.api_client orelse
+        if (sealed == null) return error.ForkUnavailable else null;
     const tool_defs = ctx.tool_defs orelse return error.ForkUnavailable;
     const permission = ctx.permission_ctx orelse return error.ForkUnavailable;
     if (ctx.agent_depth >= agent_tool.MAX_AGENT_DEPTH) return error.AgentDepthExceeded;
@@ -860,7 +875,11 @@ fn executeFork(
                 .parent_model = ctx.parent_model,
                 .session_id = ctx.session_id,
                 .skills = ctx.skills,
-                .skip_codebase_context = preload.shouldSkipCodebaseContext(definition.name),
+                // A sealed fork's prompt goes to the gateway: the codebase
+                // context (CLAUDE.md chain, git status) travels only under the
+                // egress class the user consented to (§5, §6.1).
+                .skip_codebase_context = preload.shouldSkipCodebaseContext(definition.name) or
+                    (sealed != null and !sealed.?.sendsCodebaseContext()),
                 .abort = ctx.abort,
                 .sandbox = ctx.sandbox,
                 .cwd_abs = ctx.cwd_abs,
@@ -899,32 +918,49 @@ fn executeFork(
         .{};
     var child_permission = permission.scopedDerive(mode_override.mode);
     child_permission.active_skill = null;
+    // A sealed call marked `confirm: true` must be approved interactively
+    // whatever the mode (§6.2). The provider does not decide permissions; it
+    // answers the kernel's gate, which can only turn an allow into an ask.
+    if (sealed) |remote| child_permission.confirm_gate = remote.confirmGate();
     const child_ident = session_id.gen();
     try self.registerChildContext(
         child_ident,
         activation.frame,
         &child_permission,
     );
-    const task = try std.fmt.allocPrint(
-        ctx.allocator,
-        "Base directory for this skill: {s}\n\n{s}",
-        .{ activation.tree.path(), activation.rendered_body },
-    );
+    // A sealed Skill's rendered body is `$ARGUMENTS` alone (pin.zig): the
+    // prompt the gateway receives is the user's request, never a local path.
+    const task = if (sealed != null)
+        try ctx.allocator.dupe(u8, activation.rendered_body)
+    else
+        try std.fmt.allocPrint(
+            ctx.allocator,
+            "Base directory for this skill: {s}\n\n{s}",
+            .{ activation.tree.path(), activation.rendered_body },
+        );
     defer ctx.allocator.free(task);
+    const child_provider = if (sealed) |remote|
+        remote.provider()
+    else
+        ctx.provider orelse api_client.?.provider();
     const result = subagent.spawnAgent(
         ctx.allocator,
-        ctx.provider orelse api_client.provider(),
-        api_client,
+        child_provider,
+        if (sealed != null) null else api_client,
         agent_tool_defs orelse tool_defs,
         &child_permission,
         ctx.abort,
         task,
         .{
             .system_prompt = system_prompt,
+            // A sealed fork's iteration belongs to the gateway's loop; this
+            // loop is its executor and sets no shorter turn cap of its own.
+            .max_turns = if (sealed) |remote| remote.maxTurns() else 20,
             .agent_depth = ctx.agent_depth + 1,
             .state_root = ctx.state_root,
             .dyn_registry = ctx.dyn_registry,
-            .model_override = model_override,
+            .model_override = if (sealed != null) null else model_override,
+            .cost_budget_usd = if (sealed) |remote| remote.costBudgetUsd() else null,
             .host_services = null,
             .session = ctx.session,
             .project_dir = ctx.project_dir,
@@ -937,6 +973,13 @@ fn executeFork(
         return run_error;
     };
     defer result.deinit();
+    // A sealed run the gateway refused (stale pin, unauthorized, broken
+    // chain) is an error of this invocation, not an empty summary.
+    if (sealed) |remote| if (remote.lastError()) |err| {
+        self.unregisterContextStrict(child_ident) catch
+            return error.CoreError;
+        return err;
+    };
     const output = ctx.allocator.dupe(u8, result.final_text) catch |copy_error| {
         self.unregisterContextStrict(child_ident) catch
             return error.CoreError;
@@ -947,6 +990,74 @@ fn executeFork(
         return error.CoreError;
     };
     return .{ .text = output, .refused_mode = mode_override.refused };
+}
+
+/// Open the gateway-backed provider for a pinned sealed Skill: the pin is
+/// re-read and re-verified from the live directory, it must match the binding
+/// the catalog parsed, and the bearer token comes from the pin's environment
+/// variable. The cost cap is `METACODES_SEALED_MAX_COST_MICROS` (default
+/// USD 0.50 in micro-units). The model is this session's own provider,
+/// whose route and credential the gateway's shadow uses (§8.1); a provider
+/// that cannot be delegated cannot run sealed Skills.
+fn openSealedProvider(
+    self: *Runtime,
+    ctx: *const ToolContext,
+    record: *const runtime.catalog.SkillRecord,
+    activation: *const runtime.activation.Activation,
+    values: []const []const u8,
+) !*sealed_provider.SealedSkillProvider {
+    const own_provider: ?@import("../api/provider.zig").Provider = ctx.provider orelse
+        if (ctx.api_client) |client| client.provider() else null;
+    if (own_provider == null or own_provider.?.route() == null) {
+        std.debug.print("\x1b[31m/{s}: a sealed Skill runs on this session's own model account, and the current provider cannot be delegated to a gateway\x1b[0m\n", .{record.invocation_name});
+        return error.SealedProviderRouteUnavailable;
+    }
+    var pin = sealed_pin.read(ctx.allocator, activation.tree.path()) catch |err| {
+        std.debug.print("\x1b[31m/{s}: sealed pin unreadable ({s})\x1b[0m\n", .{ record.invocation_name, @errorName(err) });
+        return error.SealedPinInvalid;
+    };
+    // `create` owns the pin from the call on, success or failure; only the
+    // checks before it release it here.
+    const binding = &record.definition;
+    if (!std.mem.eql(u8, pin.pin.entry.manifest_digest, binding.sealed_manifest_digest) or
+        !std.mem.eql(u8, pin.pin.entry.skill_id, binding.sealed_skill_id) or
+        !std.mem.eql(u8, pin.pin.gateway_url, binding.sealed_gateway))
+    {
+        pin.deinit();
+        return error.SealedPinMismatch;
+    }
+    if (!pin.pin.entry.manifest.executionSupported()) {
+        pin.deinit();
+        return error.SealedExecutionUnsupported;
+    }
+    const token_env = if (pin.pin.token_env.len != 0) pin.pin.token_env else sealed_pin.DEFAULT_TOKEN_ENV;
+    const token_z = try ctx.allocator.dupeZ(u8, token_env);
+    defer ctx.allocator.free(token_z);
+    const token: []const u8 = if (std.c.getenv(token_z.ptr)) |raw| std.mem.span(raw) else "";
+    const builtin = @import("builtin");
+    return sealed_provider.SealedSkillProvider.create(ctx.allocator, self.io, .{
+        .pin = pin,
+        .token = token,
+        .max_cost_micros = sealedCostCapFromEnv(),
+        .session_id = ctx.session_id,
+        .state_root = ctx.state_root,
+        .client_version = @import("../version.zig").semver,
+        .client_platform = @tagName(builtin.cpu.arch) ++ "-" ++ @tagName(builtin.os.tag),
+        // An `input_required` question goes to the user over the session's
+        // UI channel: the tool-level requester when this is the top-level
+        // Skill tool, else the per-session one the permission context carries.
+        .ui = ctx.ui_requester orelse if (ctx.permission_ctx) |permission| permission.ui_requester else null,
+        .session = ctx.session,
+        .origin = own_provider.?,
+        .base_dir = activation.tree.path(),
+        .arguments = values,
+    });
+}
+
+fn sealedCostCapFromEnv() i64 {
+    const raw = std.c.getenv("METACODES_SEALED_MAX_COST_MICROS") orelse return sealed_provider.DEFAULT_MAX_COST_MICROS;
+    const value = std.fmt.parseInt(i64, std.mem.span(raw), 10) catch return sealed_provider.DEFAULT_MAX_COST_MICROS;
+    return if (value >= 0) value else sealed_provider.DEFAULT_MAX_COST_MICROS;
 }
 
 fn shellPolicy(ctx: *const ToolContext) @import("../core/workspace_policy.zig").ShellPolicy {

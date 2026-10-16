@@ -501,6 +501,17 @@ pub const Client = struct {
             .retryAttemptFn = &pRetryAttempt,
             .lastContextWindowNumbersFn = &pLastContextWindowNumbers,
             .endpointIdFn = &pEndpointId,
+            .routeFn = &pRoute,
+        };
+    }
+    fn pRoute(ctx: *anyopaque) ?provider_mod.ProviderRoute {
+        const client = asClient(ctx);
+        return .{
+            .kind = .anthropic,
+            .base_url = client.base_url,
+            .model = client.modelSnapshot(),
+            .credential = client.api_key,
+            .auth_scheme = client.auth_scheme,
         };
     }
     fn pLastContextWindowNumbers(ctx: *anyopaque) error_class.ContextWindowNumbers {

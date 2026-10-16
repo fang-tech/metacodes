@@ -12,6 +12,85 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Added
 
+- Sealed Skills: the §8.5 disclosure screen. Before a Step leaves the
+  gateway, its `final` text, every call input of a `tool_calls` batch and
+  any question pass a screen built from the Skill's sealed material (the
+  body and the `sealed/` files): every run of eight consecutive tokens that
+  also occurs there is replaced by `[sealed]`, the Step carries
+  `disclosure.redactions`, and the client logs it, records it in the ledger
+  and tells the user once; the brain's own conversation keeps the original.
+  The manifest's new `egress.disclosure` chooses `redact` (default), `fail`
+  (the run ends as `failed` / `disclosure`) or `off`. Numbers, names, short
+  phrases and paraphrases pass; the document says so.
+- Sealed Skills: `egress.classes` is enforced at run time. A call whose
+  result class the client can tell from the tool (`Read`/`Grep`/`Edit`/
+  `NotebookEdit` → `file_contents`, `Glob` → `repository_structure`,
+  `Bash`/`BashOutput` → `command_output`, `WebFetch`/`WebSearch` →
+  `page_snapshot`) is refused unexecuted as a `policy_violation` when the
+  pinned manifest does not declare that class, and counted toward the
+  three-violation cancel like an allowlist refusal. The sealed fork's
+  system prompt carries the codebase context (the CLAUDE.md chain and git
+  status) only when the manifest declares `repository_structure`; the
+  install consent now says what travels with each run besides tool results.
+- Sealed Skills: a `Glob` or `Grep` whose target lies under the Skill's
+  `sealed/` directory is answered on the gateway inside the Step, by the
+  client's own tool implementation run against the package with every path
+  it prints rewritten to the client's view; before, the call went to the
+  client, which has no such directory and answered with no matches. The
+  gateway serves `Read`, `Glob` and `Grep` on sealed files only for a tool
+  the manifest admits, forwarding the call otherwise so the client refuses
+  it; the manifest's tool rules are now one shared function
+  (`protocol.manifestAllowsTool`).
+- Sealed Skill chain and state: every Step derived from a `runs.continue`
+  carries `results_digest`, the digest of the results array the gateway
+  received, inside its digested body; the client computes the same digest
+  before sending, checks the echo and ends the run on a mismatch (§8.3).
+  The provider route and credential are re-read from the session's provider
+  before every gateway request. `run_state` carries only the conversation's
+  active window plus the compaction summary, restored as the first
+  assistant turn, instead of every message ever exchanged. §8.4 now states
+  what a stateless gateway does and does not prevent about replay.
+- Sealed Skill audit and trace: the ledger now records every call's id and
+  name per Step and a `results` record per `runs.continue` with the SHA-256,
+  size and flags of each result as sent (§6.6); the client logs every
+  gateway exchange and every Step at info level under `sealed`, and the
+  gateway logs each Step it emits with its number.
+- Sealed Skills run as a shadow of the client's fork on the client's own
+  model account ([doc/SEALED_SKILL_PROTOCOL.md](doc/SEALED_SKILL_PROTOCOL.md)
+  §8.1, §9): the gateway has no provider of its own; `runs.start` carries
+  the fork's system prompt, tools, model and request parameters plus the
+  client's provider route, and the credential travels in the
+  `Sealed-Provider-Credential` header of each request. The gateway's brain
+  is the real agent loop with a capturing dispatcher — every tool use
+  suspends the loop and becomes a Step, the loop's continuation travels in
+  `run_state`, and the gateway keeps nothing between Steps. The shadow's
+  model request is byte-identical to a local fork's (an L2 asserts it);
+  narration between calls stays on the gateway. Packages gain `sealed/`
+  reference files read on the gateway and public assets installed under the
+  pin directory (`sealed/skills.asset`). `metacodes sealed serve` drops its
+  provider flags. Kernel seams: `Provider.route()`,
+  `agent_loop.Options.suspend_all_pending` with `resumeRunWithResults`, and
+  `transcript.Writer.renderMessageJson` / `parseMessageJson`.
+- Sealed Skills, client side of the three §9.1 gaps: a call marked
+  `confirm: true` is approved interactively whatever the permission mode,
+  through a tightening-only confirm gate on the child's permission context
+  (a remembered "allow always" does not answer it); credential references
+  are bound per Skill with `metacodes sealed bind|unbind` in
+  `<state root>/sealed-credentials.json`, substituted into the call's input
+  and redacted from its result before it leaves the machine, an unbound one
+  refusing the call with `permission_denied` and the bind command; an
+  `input_required` Step is asked through the session's dialog and the answer
+  continues the run. The reference gateway maps the brain's
+  `AskUserQuestion` to `input_required` and annotates calls with the
+  credential references their inputs name.
+- Sealed Skill Protocol (SSP/1, [doc/SEALED_SKILL_PROTOCOL.md](doc/SEALED_SKILL_PROTOCOL.md)):
+  a Skill whose body stays on a gateway while every tool call it needs is
+  executed, approved and paid for on the client. `metacodes sealed install`
+  pins a gateway manifest after showing the allowlist, egress classes and
+  price; the pinned Skill runs as a fork whose model is the gateway, with a
+  per-run cost cap (`METACODES_SEALED_MAX_COST_MICROS`) and a usage ledger
+  (`metacodes sealed ledger`). `metacodes sealed serve` is the reference
+  gateway: stateless, AEAD-sealed run state, metering per Step.
 - AgentCore ABI v1 revision 20 (#270): `session->submit_input` hands an active
   Run more user text. It may be called from any thread or from inside the
   Run's own callbacks, like `session_abort`, and never waits for the Run. Each
@@ -32,8 +111,9 @@ status, compatibility boundaries, and entry points are defined by
   with the root input toward `input_cap_bytes`, must leave room for one whole
   provider operation, and is refused with `CHECKPOINT_BUDGET_REQUIRED` —
   without ending the Run — when it does not fit. Once a Run is aborting (an
-  abort, or a callback the Host failed) it adopts nothing more. A refused submission changes nothing; a stale id is `STALE_RUN`, a Run
-  that ended or is ending `TOO_LATE`, a forked Skill Run `INVALID_STATE`.
+  abort, or a callback the Host failed) it adopts nothing more. A refused
+  submission changes nothing; a stale id is `STALE_RUN`, a Run that ended or
+  is ending `TOO_LATE`, a forked Skill Run `INVALID_STATE`.
   Adopted input is ordinary Conversation state and survives checkpoint and
   restore. The Session table grows by one slot to 48 bytes and `RunResultV1`
   turns its first reserved word into the two counts; the header, Zig and Rust
@@ -154,6 +234,17 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Changed
 
+- The Sealed Skill Protocol document says everywhere what the code does:
+  the gateway holds no inference account. Roles and identities (§1.2: the
+  subscriber's own provider account; the inference-gateway identity relays,
+  meters and signs, owns nothing), `discover` (§3.1: `client_provider` MUST
+  be `true`; `billing` bills the Skill fee, never the model), the budget as
+  a cap on the estimate (§3.4), Step usage (§4.3, §8.2: the provider's token
+  counts and the gateway's estimate both travel; model usage is billed on
+  the client's own account, the gateway account owes only the Skill fee),
+  the disclosure channel (§1.1, §8.5) and creator payment (§12).
+  `doc/SKILLS_AND_MCP.md` no longer says usage is charged to the gateway
+  account.
 - `--web`/`serve`: `user_message` is journaled by the session when the
   message's turn starts, no longer by the transport when the message is
   queued, so it always means "this turn started with this text". A message
@@ -259,6 +350,18 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- `metacodes sealed serve` stops cleanly. Ctrl+C (SIGINT; also SIGTERM and
+  SIGHUP, or the console closing on Windows) now only raises the process-wide
+  shutdown flag, and the main thread stops the HTTP server, joins its accept
+  loop, frees the Gateway and exits 0 within a 50 ms poll tick. Before,
+  `serve` slept forever and looked at no signal, so the console's default
+  handler was all that ended it; on Windows that handler runs on its own
+  thread while the accept loop is still running, and a gateway left behind
+  this way kept `zig-out/bin/metacodes.exe` and its port. A second `serve`
+  on a port in use is refused with `BindFailed` rather than sharing it
+  (`platform/net.zig` binds with SO_EXCLUSIVEADDRUSE on Windows and
+  SO_REUSEADDR elsewhere, neither of which admits a second listener); a
+  platform test and an L2 now assert it.
 - A provider stream that ends before it reports how it stopped is no longer
   taken for a finished answer (issue #269). A clean end of the connection, or a
   bare `[DONE]`, without Anthropic's `message_delta.stop_reason`, OpenAI chat's

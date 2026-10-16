@@ -154,6 +154,7 @@ pub const OpenAIClient = struct {
             .maxInputTokensForFn = &pMaxInputTokensFor,
             .reasoningEffortFn = &pReasoningEffort,
             .setReasoningEffortFn = &pSetReasoningEffort,
+            .routeFn = &pRoute,
             .requestOverridesFn = &pRequestOverrides,
             .setRequestOverridesFn = &pSetRequestOverrides,
             .supportsFn = &pSupports,
@@ -169,6 +170,17 @@ pub const OpenAIClient = struct {
     }
     fn pModel(ctx: *anyopaque) []const u8 {
         return cast(ctx).model;
+    }
+    fn pRoute(ctx: *anyopaque) ?provider_mod.ProviderRoute {
+        const self = cast(ctx);
+        return .{
+            .kind = .openai,
+            .base_url = self.base_url orelse "",
+            .model = self.model,
+            .credential = self.api_key,
+            .auth_scheme = self.auth_scheme,
+            .openai_protocol = self.protocol,
+        };
     }
     /// Provider.requestOverrides() 返回 Client.overrides;同步也镜像 reasoning_effort
     /// 进 overrides.reasoning_effort(若 overrides 未显式设,从 legacy 字段兜底),

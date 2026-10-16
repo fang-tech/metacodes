@@ -162,6 +162,16 @@ pub const agents_def = @import("agents/def.zig");
 pub const agents_set = @import("agents/set.zig");
 pub const skills = @import("skills/skill.zig");
 pub const skills_runtime = @import("skills/runtime/root.zig");
+// Sealed Skill Protocol (doc/SEALED_SKILL_PROTOCOL.md): wire objects, HTTP
+// transport, the client-side provider, pins, and the usage ledger.
+pub const skills_sealed_protocol = @import("skills/sealed/protocol.zig");
+pub const skills_sealed_transport = @import("skills/sealed/transport.zig");
+pub const skills_sealed_pin = @import("skills/sealed/pin.zig");
+pub const skills_sealed_ledger = @import("skills/sealed/ledger.zig");
+pub const skills_sealed_provider = @import("skills/sealed/provider.zig");
+pub const skills_sealed_gateway = @import("skills/sealed/gateway.zig");
+pub const skills_sealed_credentials = @import("skills/sealed/credentials.zig");
+pub const skills_sealed_disclosure = @import("skills/sealed/disclosure.zig");
 pub const skills_tool = @import("skills/tool.zig");
 pub const skills_render = @import("skills/render.zig");
 pub const mcp_client = @import("mcp/client.zig");
