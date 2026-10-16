@@ -654,7 +654,8 @@ test "extractToolUse preserves input JSON structure" {
 // EventIterator — 真流式 SSE 事件解析器（M1.3）
 //
 // 基于 std.Io.Reader.takeDelimiter('\n') 逐行消费，不需要手工 line buffer。
-// 每次 next() 检查 abort；遇到 message_stop 或 EOF 返回 null。
+// 每次 next() 检查 abort；message_stop 返回 .done，之后返回 null。EOF 只有在流已报告
+// stop_reason 时才算收尾(返回 null)，否则是 error.StreamIncomplete(见 next 的 EOF 分支)。
 //
 // 调用方负责 Event.deinit 释放 text_delta 之类的分配结果。
 // ============================================================================
@@ -932,6 +933,10 @@ pub const EventIterator = struct {
     /// 最后一次 message_delta 报告的 stop_reason(枚举化,避免 owned 字符串)。
     /// agent_loop drain 完后读它判断是否 max_tokens 续写。
     last_stop_reason: StopReason = .unknown,
+    /// 某个 message_delta 报告过 stop_reason(含本枚举不认识的值)。与 last_stop_reason
+    /// 分开:`.unknown` 既可能是"报了个新值",也可能是"根本没报",而流是否完整只看后者。
+    /// 没有它的 EOF 不是收尾——丢的那几个字节可能正是 `max_tokens`(issue #269)。
+    stop_reported: bool = false,
 
     /// 跨多个 SSE 事件累加的 tool_use 状态。
     /// `content_block_start`(tool_use) 时填入 id/name，input_buf 清空。
@@ -1096,10 +1101,19 @@ pub const EventIterator = struct {
                 return err;
             };
             const line = line_opt orelse {
-                self.logDebug("EOF reached (no message_stop before EOF)", .{});
                 @import("../core/recorder.zig").finishSse();
                 self.done_flag = true;
-                return null;
+                // message_stop 是 Anthropic 流的终止事件,但它不携带数据:stop_reason 在它之前
+                // 的 message_delta 里,之后协议上只剩 message_stop。所以"报告过 stop_reason 且
+                // 没有半截 tool_use 块"的 EOF 只丢了帧尾,回答本身完整。除此之外的 EOF 都是流
+                // 在说完之前断了——不能当收尾交上去:丢的那几个字节可能正是 max_tokens,续写
+                // 安全网就此失效(issue #269)。调用方据 StreamIncomplete 走流内失败的重试路径。
+                if (self.stop_reported and self.pending_tool == null) {
+                    self.logWarn("EOF after stop_reason={s} without message_stop; answer is complete", .{@tagName(self.last_stop_reason)});
+                    return null;
+                }
+                self.logWarn("EOF before the stream finished (stop_reason reported={}, tool_use block open={})", .{ self.stop_reported, self.pending_tool != null });
+                return error.StreamIncomplete;
             };
 
             // 进展记账:非保活行才续正文空闲时钟(包括下面会被 continue 掉的 input_json_delta /
@@ -1241,6 +1255,8 @@ pub const EventIterator = struct {
                     if (findTopLevelObjectField(data, "delta")) |delta_obj| {
                         if (findTopLevelStringField(delta_obj, "stop_reason")) |sr| {
                             self.last_stop_reason = StopReason.fromStr(sr);
+                            // 空串不是停止报告(同 OpenAI 兼容端的 `"finish_reason":""`)。
+                            if (sr.len > 0) self.stop_reported = true;
                             if (std.mem.eql(u8, sr, "max_tokens")) {
                                 self.logWarn("response hit max_tokens limit — increase max_tokens in request to get longer replies", .{});
                             } else {
@@ -1530,14 +1546,59 @@ test "EventIterator: after done returns null" {
     try std.testing.expect(try it.next(std.testing.allocator) == null);
 }
 
-test "EventIterator: EOF without message_stop returns null" {
+test "EventIterator: EOF before any stop_reason is StreamIncomplete, then terminal" {
+    // issue #269: content arrived, then the connection closed cleanly before
+    // message_delta. The answer may have been cut anywhere — including right
+    // where `max_tokens` would have been reported — so it is not a finish.
     const sse = "data: {\"type\":\"content_block_delta\",\"delta\":{\"text\":\"x\"}}\n";
     var reader = std.Io.Reader.fixed(sse);
     var it = EventIterator.init(&reader);
     const e1 = (try it.next(std.testing.allocator)).?;
     defer e1.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("x", e1.text_delta);
+    try std.testing.expectError(error.StreamIncomplete, it.next(std.testing.allocator));
+    // Fail-terminal: no later call reads past the failure.
     try std.testing.expect(try it.next(std.testing.allocator) == null);
+}
+
+test "EventIterator: EOF after message_delta.stop_reason but before message_stop is a complete answer" {
+    // message_stop carries no data and nothing but it may follow message_delta,
+    // so losing only the frame tail loses nothing the loop acts on.
+    const sse =
+        "data: {\"type\":\"content_block_delta\",\"delta\":{\"text\":\"x\"}}\n\n" ++
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"max_tokens\"},\"usage\":{\"output_tokens\":5}}\n\n";
+    var reader = std.Io.Reader.fixed(sse);
+    var it = EventIterator.init(&reader);
+    const e1 = (try it.next(std.testing.allocator)).?;
+    defer e1.deinit(std.testing.allocator);
+    const e2 = (try it.next(std.testing.allocator)).?;
+    defer e2.deinit(std.testing.allocator);
+    try std.testing.expect(@as(std.meta.Tag(Event), e2) == .usage);
+    try std.testing.expect(try it.next(std.testing.allocator) == null);
+    // The reported stop survives, so a max_tokens truncation still continues.
+    try std.testing.expect(it.last_stop_reason == .max_tokens);
+}
+
+test "EventIterator: an unrecognized stop_reason still counts as reported" {
+    const sse =
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"model_context_window_exceeded\"}}\n\n";
+    var reader = std.Io.Reader.fixed(sse);
+    var it = EventIterator.init(&reader);
+    try std.testing.expect(try it.next(std.testing.allocator) == null);
+    try std.testing.expect(it.last_stop_reason == .unknown);
+}
+
+test "EventIterator: EOF inside an open tool_use block is StreamIncomplete even after a stop_reason" {
+    // A non-conforming tail: the tool block never closed, so its arguments
+    // are partial and the call must not be dropped silently.
+    const sse =
+        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"t1\",\"name\":\"Read\",\"input\":{}}}\n\n" ++
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"file\"}}\n\n" ++
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"}}\n\n";
+    var reader = std.Io.Reader.fixed(sse);
+    var it = EventIterator.init(&reader);
+    defer it.deinit(std.testing.allocator);
+    try std.testing.expectError(error.StreamIncomplete, it.next(std.testing.allocator));
 }
 
 test "EventIterator: abort before first event" {
@@ -1562,10 +1623,13 @@ test "EventIterator: abort between events" {
     try std.testing.expectError(error.Aborted, it.next(std.testing.allocator));
 }
 
-test "EventIterator: empty stream returns null" {
+test "EventIterator: an empty 200 body is StreamIncomplete, not an empty answer" {
+    // No event at all (a proxy that answered 200 with nothing): the stream never
+    // said how it stopped, so it must not read as an empty end_turn.
     var reader = std.Io.Reader.fixed("");
     var it = EventIterator.init(&reader);
     defer it.deinit(std.testing.allocator);
+    try std.testing.expectError(error.StreamIncomplete, it.next(std.testing.allocator));
     try std.testing.expect(try it.next(std.testing.allocator) == null);
 }
 

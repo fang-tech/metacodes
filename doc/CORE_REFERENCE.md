@@ -345,6 +345,7 @@ pub const RunResult = struct {
     tool_calls: u32,
     suspend_info: ?SuspendInfo = null,
     stall: ?stall_gate.Report = null, // 非空 ⇔ stop_reason == .stalled
+    continuations: u32 = 0, // 本次 run 的 max_tokens 续写次数(≤ MAX_CONTINUATIONS)
 };
 pub const StopReason = enum {
     end_turn, max_turns, aborted, tool_error, api_error, tool_loop,
@@ -850,6 +851,19 @@ CoreEvent/UiEvent/UiRequest 全可序列化(无指针/闭包)。emit 内 `serial
   正文阶段的 stall 不自动重发(已流出的内容不能假装可回滚);TaskBatch 的 join 有界于空闲上限,
   不会 detach 卡死的 worker;TUI 每个 provider 回合结束就刷 transcript,但一个回合内的内容仍只在
   内存里。
+- **流必须报告它是怎么停的,否则不是收尾**(issue #269):四条 wire 各有一个停止报告——Anthropic
+  的 `message_delta.stop_reason`、OpenAI chat 的非 null `finish_reason`、Responses 的
+  `response.completed` / `response.incomplete`、Gemini 的 `finishReason`(或整条 prompt 被拒的
+  `promptFeedback.blockReason`)。干净 EOF 或只有 `[DONE]` 而没有它,解析器抛
+  `error.StreamIncomplete`(经 `client.reportStreamIncomplete` 写 last_error);agent_loop 把它当
+  流内失败:丢弃残片,按 `Options.max_stream_turn_retries` 同轮重发,额度用尽 `stop_reason=api_error`。
+  此前它被归一成 `end_turn`——丢的字节恰好是 `max_tokens` / `length` 时,截断的回答读起来是完整的,
+  续写安全网不开火。报告过停止原因、只丢了帧尾(`message_stop`、`[DONE]`、其后的 usage 块)的流
+  照常收尾:帧尾不携带回答的任何内容,停止原因(含 `max_tokens`)照样驱动续写。值不认识的停止
+  原因也算"报告过"(`StopReason.unknown` 只用于分支,不再兼任"没报")。Anthropic 流里仍开着的
+  tool_use 块在 EOF 时一律算未完成——参数可能残缺。`RunResult.continuations` 记本次 `run` 的
+  max_tokens 续写次数,headless `--json` 结果行同名字段携带它:续写后的正文是无缝拼接,只看结果
+  的消费者没有别的办法知道回答被截断过。
 - **permission 门不可挂起**:权限确认是 `executeSlots` 前的同步门,异步挂起暂不覆盖(out of scope)。
 - **文件修改契约只覆盖类型化文件工具**(Write/Edit/NotebookEdit/ApplyPatch,§3.2.2)。`Bash` 或
   任意终端命令改动文件系统**不会**产生 `file_changes`——要覆盖它需要文件系统级观测,不在本契约内。
