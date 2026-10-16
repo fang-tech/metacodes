@@ -242,8 +242,14 @@ status, compatibility boundaries, and entry points are defined by
   none left the Run ends in `api_error`. A stream that reported its stop and
   lost only the frame tail after it (`message_stop`, `[DONE]`, a trailing usage
   chunk) still finishes normally, and its stop — `max_tokens` included — still
-  drives the continuation. An empty 200 body is incomplete too, rather than an
-  empty answer.
+  drives the continuation; a frame tail without a stop report before it is
+  incomplete. An Anthropic tool_use block still open when the stream ends was
+  silently dropped and now makes the stream incomplete. Gemini's stop report is
+  read from the candidate and `promptFeedback` themselves, so a `finishReason`
+  key inside a function call's arguments no longer passes for one. An empty
+  200 body is incomplete too, rather than an empty answer. Gemini
+  `CONTINUATION` (the answer reached the per-request limit but is not finished)
+  now drives the same continuation as `max_tokens`.
 - OpenAI Chat Completions streams no longer drop text (issue #258). metacodes
   always asks for `stream_options.include_usage`, under which every ordinary
   chunk carries `"usage": null`; the parser took any chunk containing the key

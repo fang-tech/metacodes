@@ -1108,7 +1108,7 @@ pub const EventIterator = struct {
                 // 没有半截 tool_use 块"的 EOF 只丢了帧尾,回答本身完整。除此之外的 EOF 都是流
                 // 在说完之前断了——不能当收尾交上去:丢的那几个字节可能正是 max_tokens,续写
                 // 安全网就此失效(issue #269)。调用方据 StreamIncomplete 走流内失败的重试路径。
-                if (self.stop_reported and self.pending_tool == null) {
+                if (self.finished()) {
                     self.logWarn("EOF after stop_reason={s} without message_stop; answer is complete", .{@tagName(self.last_stop_reason)});
                     return null;
                 }
@@ -1237,16 +1237,16 @@ pub const EventIterator = struct {
                     continue;
                 },
                 .message_stop => {
-                    // 若还有未 emit 的 pending（异常情况），清理
-                    if (self.pending_tool) |*pt| {
-                        allocator.free(pt.id);
-                        allocator.free(pt.name);
-                        pt.input_buf.deinit(allocator);
-                        self.pending_tool = null;
-                    }
                     self.done_flag = true;
-                    self.logInfo("message_stop", .{});
                     @import("../core/recorder.zig").finishSse();
+                    // 帧尾到了,但流没报告怎么停的(没有 message_delta.stop_reason),或某个块
+                    // 还开着(半截 tool_use 以前在这里被静默丢弃):同 EOF,不是收尾。
+                    // 残留的 pending_tool 由 deinit 释放。
+                    if (!self.finished()) {
+                        self.logWarn("message_stop before the stream finished (stop_reason reported={}, tool_use block open={})", .{ self.stop_reported, self.pending_tool != null });
+                        return error.StreamIncomplete;
+                    }
+                    self.logInfo("message_stop", .{});
                     return Event{ .done = {} };
                 },
                 .message_delta => {
@@ -1298,6 +1298,14 @@ pub const EventIterator = struct {
                 else => continue,
             }
         }
+    }
+
+    /// 流已说完:报告过 stop_reason,且没有半截的 tool_use 块(它的参数可能残缺,而它是
+    /// 要在本地执行的)。其它没收到 content_block_stop 的块不拦:stop_reason 只在所有内容
+    /// 之后出现,文本已经完整;server_tool_use 在服务端执行,以它收尾而无结果块正是合法的
+    /// `pause_turn` 形态。部分翻译代理也不发 text 块的 content_block_stop。
+    fn finished(self: *const EventIterator) bool {
+        return self.stop_reported and self.pending_tool == null;
     }
 
     // --- 内部日志 helper：带 req_id 时用 *Id 变体，否则普通 ---
@@ -1422,6 +1430,7 @@ test "EventIterator: web_search 优先显示用户原始 query(对齐 mecode,pro
         "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"server_tool_use\",\"id\":\"x\",\"name\":\"web_search\",\"input\":{\"query\":\"web search\"}}}\n" ++
         "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"query\\\":\\\"searching the web\\\"}\"}}\n" ++
         "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"web_search_tool_result\",\"tool_use_id\":\"x\",\"content\":[]}}\n" ++
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n" ++
         "data: {\"type\":\"message_stop\"}\n";
     var reader = std.Io.Reader.fixed(sse);
     var it = EventIterator.init(&reader);
@@ -1453,6 +1462,7 @@ test "EventIterator: web_search per-search 组(对齐 cc:⏺ Web Search + ⎿ Di
         "data: {\"type\":\"content_block_stop\",\"index\":1}\n" ++
         "data: {\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n" ++
         "data: {\"type\":\"content_block_delta\",\"index\":2,\"delta\":{\"text\":\"Zig is 0.16.\"}}\n" ++
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n" ++
         "data: {\"type\":\"message_stop\"}\n";
     var reader = std.Io.Reader.fixed(sse);
     var it = EventIterator.init(&reader);
@@ -1484,6 +1494,7 @@ test "EventIterator: 两次搜索 → 两组各 Did 1 search(per-search 不累�
         "data: {\"type\":\"content_block_start\",\"index\":3,\"content_block\":{\"type\":\"web_search_tool_result\",\"tool_use_id\":\"b\",\"content\":[]}}\n" ++
         "data: {\"type\":\"content_block_start\",\"index\":4,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n" ++
         "data: {\"type\":\"content_block_delta\",\"index\":4,\"delta\":{\"text\":\"ans\"}}\n" ++
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n" ++
         "data: {\"type\":\"message_stop\"}\n";
     var reader = std.Io.Reader.fixed(sse);
     var it = EventIterator.init(&reader);
@@ -1522,6 +1533,7 @@ test "EventIterator: multiple events in sequence" {
     const sse =
         "data: {\"type\":\"content_block_delta\",\"delta\":{\"text\":\"a\"}}\n" ++
         "data: {\"type\":\"content_block_delta\",\"delta\":{\"text\":\"b\"}}\n" ++
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n" ++
         "data: {\"type\":\"message_stop\"}\n";
     var reader = std.Io.Reader.fixed(sse);
     var it = EventIterator.init(&reader);
@@ -1537,7 +1549,8 @@ test "EventIterator: multiple events in sequence" {
 }
 
 test "EventIterator: after done returns null" {
-    const sse = "data: {\"type\":\"message_stop\"}\n";
+    const sse = "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n" ++
+        "data: {\"type\":\"message_stop\"}\n";
     var reader = std.Io.Reader.fixed(sse);
     var it = EventIterator.init(&reader);
     const done = (try it.next(std.testing.allocator)).?;
@@ -1586,6 +1599,51 @@ test "EventIterator: an unrecognized stop_reason still counts as reported" {
     var it = EventIterator.init(&reader);
     try std.testing.expect(try it.next(std.testing.allocator) == null);
     try std.testing.expect(it.last_stop_reason == .unknown);
+}
+
+test "EventIterator: message_stop without any stop_reason is StreamIncomplete" {
+    // The frame tail arrived, but the stream never said how it stopped: the
+    // same hole as an EOF before message_delta (issue #269 review).
+    const sse =
+        "data: {\"type\":\"content_block_delta\",\"delta\":{\"text\":\"x\"}}\n\n" ++
+        "data: {\"type\":\"message_stop\"}\n\n";
+    var reader = std.Io.Reader.fixed(sse);
+    var it = EventIterator.init(&reader);
+    const e1 = (try it.next(std.testing.allocator)).?;
+    defer e1.deinit(std.testing.allocator);
+    try std.testing.expectError(error.StreamIncomplete, it.next(std.testing.allocator));
+    try std.testing.expect(try it.next(std.testing.allocator) == null);
+}
+
+test "EventIterator: message_stop with a tool_use block still open is StreamIncomplete, not a silent drop" {
+    const sse =
+        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"t1\",\"name\":\"Write\",\"input\":{}}}\n\n" ++
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"file_path\"}}\n\n" ++
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"}}\n\n" ++
+        "data: {\"type\":\"message_stop\"}\n\n";
+    var reader = std.Io.Reader.fixed(sse);
+    var it = EventIterator.init(&reader);
+    defer it.deinit(std.testing.allocator);
+    try std.testing.expectError(error.StreamIncomplete, it.next(std.testing.allocator));
+}
+
+test "EventIterator: a server tool call without its result is a complete pause_turn" {
+    // Anthropic pauses long server-tool turns: server_tool_use, then
+    // stop_reason pause_turn, and no web_search_tool_result yet. The tool runs
+    // server-side, so nothing the client must execute is half-delivered.
+    const sse =
+        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"server_tool_use\",\"id\":\"srv_1\",\"name\":\"web_search\",\"input\":{}}}\n\n" ++
+        "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n" ++
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"pause_turn\"}}\n\n" ++
+        "data: {\"type\":\"message_stop\"}\n\n";
+    var reader = std.Io.Reader.fixed(sse);
+    var it = EventIterator.init(&reader);
+    defer it.deinit(std.testing.allocator);
+    while (try it.next(std.testing.allocator)) |ev| {
+        defer ev.deinit(std.testing.allocator);
+        if (@as(std.meta.Tag(Event), ev) == .done) break;
+    }
+    try std.testing.expect(it.last_stop_reason == .pause_turn);
 }
 
 test "EventIterator: EOF inside an open tool_use block is StreamIncomplete even after a stop_reason" {
@@ -1645,6 +1703,7 @@ test "napi-style: content_block_start with nested-end type + input_json_delta ac
         "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"id\":\"toolu_abc\",\"input\":{},\"name\":\"Glob\",\"type\":\"tool_use\"}}\n" ++
         "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"path\\\":\\\"/tmp\\\"}\"}}\n" ++
         "data: {\"type\":\"content_block_stop\",\"index\":0}\n" ++
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n" ++
         "data: {\"type\":\"message_stop\"}\n";
     var reader = std.Io.Reader.fixed(sse);
     var it = EventIterator.init(&reader);
@@ -1688,6 +1747,7 @@ test "napi-style: text + tool_use in same stream" {
         "data: {\"type\":\"content_block_start\",\"content_block\":{\"id\":\"t1\",\"input\":{},\"name\":\"Read\",\"type\":\"tool_use\"}}\n" ++
         "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"path\\\":\\\"/x\\\"}\"}}\n" ++
         "data: {\"type\":\"content_block_stop\"}\n" ++
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n" ++
         "data: {\"type\":\"message_stop\"}\n";
     var reader = std.Io.Reader.fixed(sse);
     var it = EventIterator.init(&reader);
@@ -1817,6 +1877,7 @@ test "EventIterator: 真后端形态(空数组 + 占位 query)不打噪音" {
         "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"server_tool_use\",\"id\":\"srvtoolu_x\",\"name\":\"web_search\",\"input\":{\"query\":\"web search\"}}}\n" ++
         "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"web_search_tool_result\",\"tool_use_id\":\"srvtoolu_x\",\"content\":[]}}\n" ++
         "data: {\"type\":\"content_block_delta\",\"delta\":{\"text\":\"今天的 AI 新闻...\"}}\n" ++
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n" ++
         "data: {\"type\":\"message_stop\"}\n";
     var reader = std.Io.Reader.fixed(sse);
     var it = EventIterator.init(&reader);

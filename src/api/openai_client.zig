@@ -1008,8 +1008,15 @@ const OpenAIStream = struct {
 
     /// 流在报告停止原因之前结束:置终态、留现场、上抛。累积中的 tool_call 槽不 flush——
     /// 没收尾的参数可能残缺,调用方本来也要丢弃整段残片重发(deinit 释放这些槽)。
-    fn incomplete(self: *OpenAIStream) error{StreamIncomplete} {
+    /// 取消与 stall 优先:被 cancel / 监视线程关掉的连接,缓冲里剩下的 `[DONE]` 或随后
+    /// 的 EOF 都只是它们的症状(issue #269 review)。
+    fn incomplete(self: *OpenAIStream) error{ StreamIncomplete, Aborted, StreamStalled } {
         self.done = true;
+        if (self.abort) |ab| if (ab.isAborted()) return error.Aborted;
+        if (self.stalledVerdict()) |stall| {
+            client_mod.reportBodyStall("openai", self.id, stall);
+            return error.StreamStalled;
+        }
         client_mod.reportStreamIncomplete("openai", self.id);
         return error.StreamIncomplete;
     }
@@ -2914,6 +2921,33 @@ test "issue #269 Responses: EOF without response.completed/incomplete is StreamI
         "event: response.output_text.done\n" ++
         "data: {\"type\":\"response.output_text.done\",\"item_id\":\"msg_1\",\"output_index\":0,\"text\":\"hi\"}\n\n", &kinds));
     try std.testing.expectEqualSlices(std.meta.Tag(StreamEvent), &.{.text}, kinds.items);
+}
+
+test "issue #269 chat: a cancelled stream's leftover [DONE] is Aborted, not StreamIncomplete" {
+    // Cancellation closes the socket; a [DONE] already buffered is a symptom
+    // of the cancel, and the loop must see a cancel (no retry, partial kept).
+    const a = std.testing.allocator;
+    var signal = AbortSignal.init();
+    var stream = OpenAIStream{
+        .allocator = a,
+        .model = "m",
+        .dialect = dialect_mod.dialectFor(.openai, "m"),
+        .protocol = .chat_completions,
+        .request = undefined,
+        .response = undefined,
+        .id = .{ .bytes = .{0} ** 12 },
+        .abort = &signal,
+    };
+    defer stream.releaseParseState();
+    var body = std.Io.Reader.fixed("data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"part\"},\"finish_reason\":null}]}\n\n" ++
+        "data: [DONE]\n\n");
+    stream.reader = &body;
+    const first = (try stream.next()).?;
+    a.free(first.text);
+    signal.abort(.user_ctrl_c);
+    // The line loop checks abort before reading; reproduce the race where the
+    // flag lands after the [DONE] line was read by calling the terminal path.
+    try std.testing.expectError(error.Aborted, @as(anyerror!void, stream.incomplete()));
 }
 
 test "issue #269 Responses: a [DONE] sentinel does not stand in for the terminal event" {

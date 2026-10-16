@@ -859,9 +859,15 @@ CoreEvent/UiEvent/UiRequest 全可序列化(无指针/闭包)。emit 内 `serial
   流内失败:丢弃残片,按 `Options.max_stream_turn_retries` 同轮重发,额度用尽 `stop_reason=api_error`。
   此前它被归一成 `end_turn`——丢的字节恰好是 `max_tokens` / `length` 时,截断的回答读起来是完整的,
   续写安全网不开火。报告过停止原因、只丢了帧尾(`message_stop`、`[DONE]`、其后的 usage 块)的流
-  照常收尾:帧尾不携带回答的任何内容,停止原因(含 `max_tokens`)照样驱动续写。值不认识的停止
-  原因也算"报告过"(`StopReason.unknown` 只用于分支,不再兼任"没报")。Anthropic 流里仍开着的
-  tool_use 块在 EOF 时一律算未完成——参数可能残缺。`RunResult.continuations` 记本次 `run` 的
+  照常收尾:帧尾不携带回答的任何内容,停止原因(含 `max_tokens`)照样驱动续写。反过来,帧尾到了
+  而没有停止报告(只有 `message_stop`、只有 `[DONE]`)同样是未完成。值不认识的停止原因也算
+  "报告过"(`StopReason.unknown` 只用于分支,不再兼任"没报");空串、Gemini 的
+  `FINISH_REASON_UNSPECIFIED` 不算。Anthropic 流里仍开着的 tool_use 块(EOF 或 `message_stop`
+  时)一律算未完成——参数可能残缺,而它要在本地执行;其它没收到 `content_block_stop` 的块不拦
+  (stop_reason 之后文本已完整;server_tool_use 无结果块即收尾是合法的 `pause_turn`)。Gemini 的
+  停止报告按结构读(`candidates[i].finishReason`、`promptFeedback.blockReason`):`functionCall.args`
+  是未转义的 JSON 对象,子串扫描会把参数里的同名键当成停止报告。取消与 stall 先于"未完成"判定。
+  `RunResult.continuations` 记本次 `run` 的
   max_tokens 续写次数,headless `--json` 结果行同名字段携带它:续写后的正文是无缝拼接,只看结果
   的消费者没有别的办法知道回答被截断过。
 - **permission 门不可挂起**:权限确认是 `executeSlots` 前的同步门,异步挂起暂不覆盖(out of scope)。

@@ -490,16 +490,13 @@ const GeminiStream = struct {
 
     /// 解析一个 Gemini SSE chunk(完整 GenerateContentResponse JSON)→ 中立 StreamEvent。
     fn parseChunk(self: *GeminiStream, data: []const u8) !?StreamEvent {
-        if (util_json.extractStringField(data, "finishReason")) |fr| {
-            // 空值与 FINISH_REASON_UNSPECIFIED("Default value. This value is unused.")
-            // 都不是停止报告:规范写明 finishReason 为空即"模型还没停"。
-            if (fr.len > 0 and !std.mem.eql(u8, fr, "FINISH_REASON_UNSPECIFIED")) {
-                self.last_stop = mapGeminiFinish(fr);
-                self.stop_reported = true;
-            }
+        const report = stopReport(data);
+        if (report.finish_reason) |fr| {
+            self.last_stop = mapGeminiFinish(fr);
+            self.stop_reported = true;
         }
         // 整条 prompt 被拒:没有候选、也就没有 finishReason,但流确实说清了它为什么停。
-        if (util_json.extractStringField(data, "blockReason") != null) self.stop_reported = true;
+        if (report.blocked) self.stop_reported = true;
 
         // usageMetadata → 中立 UsageDelta(含 cachedContentTokenCount → cache_read,经 cache.zig)。
         // **关键(E 修复)**:Gemini 常把 usageMetadata 与末 content chunk(text+finishReason)合并。
@@ -609,6 +606,46 @@ fn freeToolUseStart(allocator: std.mem.Allocator, ev: StreamEvent) void {
         },
         else => {},
     }
+}
+
+/// 一个 chunk 里的停止报告,**按结构读**:候选级 `candidates[i].finishReason`(首个有值的
+/// 候选)与请求级 `promptFeedback.blockReason`。不能子串扫描整个 chunk——`functionCall.args`
+/// 是未转义的 JSON 对象,参数里同名的键会被当成停止报告,断流的 EOF 就被放行成完整回答
+/// (issue #269 review)。空值与 FINISH_REASON_UNSPECIFIED("Default value. This value is
+/// unused.")都不算:规范写明 finishReason 为空即"模型还没停"。
+const StopReport = struct {
+    finish_reason: ?[]const u8 = null,
+    blocked: bool = false,
+};
+
+fn stopReport(data: []const u8) StopReport {
+    var report = StopReport{};
+    if (util_json.topLevelField(data, "candidates")) |candidates| if (candidates[0] == '[') {
+        var pos: usize = 1;
+        while (pos < candidates.len) {
+            while (pos < candidates.len and (candidates[pos] == ',' or candidates[pos] == ' ' or
+                candidates[pos] == '\t' or candidates[pos] == '\n' or candidates[pos] == '\r')) : (pos += 1)
+            {}
+            const candidate = braceObject(candidates, pos) orelse break;
+            pos = candidate.end;
+            if (jsonString(util_json.topLevelField(candidate.obj, "finishReason"))) |fr| {
+                if (fr.len == 0 or std.mem.eql(u8, fr, "FINISH_REASON_UNSPECIFIED")) continue;
+                report.finish_reason = fr;
+                break;
+            }
+        }
+    };
+    if (util_json.topLevelObjectField(data, "promptFeedback")) |feedback| {
+        if (jsonString(util_json.topLevelField(feedback, "blockReason"))) |reason| report.blocked = reason.len != 0;
+    }
+    return report;
+}
+
+/// `topLevelField` 的原始值若是 JSON 字符串,返回去掉引号的内容(枚举值无转义);否则 null。
+fn jsonString(raw: ?[]const u8) ?[]const u8 {
+    const value = raw orelse return null;
+    if (value.len < 2 or value[0] != '"' or value[value.len - 1] != '"') return null;
+    return value[1 .. value.len - 1];
 }
 
 /// 从 `from` 起跳空白,取一个 {...} 对象(括号配平,跳字符串)。返回对象文本 + 结束偏移(供续找)。
@@ -1448,6 +1485,14 @@ test "issue #269 Gemini: CONTINUATION is a truncated answer, so it drives the co
 test "issue #269 Gemini: FINISH_REASON_UNSPECIFIED is not a stop report" {
     var stop: StopReason = .unknown;
     try std.testing.expectError(error.StreamIncomplete, replayGemini(std.testing.allocator, "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"half\"}],\"role\":\"model\"},\"finishReason\":\"FINISH_REASON_UNSPECIFIED\",\"index\":0}]}\n\n", &stop));
+}
+
+test "issue #269 Gemini: a finishReason key inside functionCall.args is not a stop report" {
+    // args is an unescaped JSON object, so a substring scan would read this
+    // tool argument as the candidate's terminal status and accept the EOF.
+    var stop: StopReason = .unknown;
+    try std.testing.expectError(error.StreamIncomplete, replayGemini(std.testing.allocator, "data: {\"candidates\":[{\"content\":{\"parts\":[{\"functionCall\":{\"name\":\"report\"," ++
+        "\"args\":{\"finishReason\":\"STOP\",\"promptFeedback\":{\"blockReason\":\"SAFETY\"}}}}],\"role\":\"model\"},\"index\":0}]}\n\n", &stop));
 }
 
 test "issue #269 Gemini: a blocked prompt reports why it stopped without any candidate" {
