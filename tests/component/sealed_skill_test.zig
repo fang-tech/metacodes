@@ -1571,3 +1571,47 @@ test "L2 sealed scale: consecutive Steps of a run reuse one built provider" {
     try std.testing.expectEqual(@as(u64, 1), pool.hits);
     try std.testing.expectEqual(@as(usize, 1), pool.size);
 }
+
+const DISCLOSURE_SPLIT_MANIFEST = "{\"schema\":\"metask.sealed-skill.manifest/v1\",\"skill_id\":\"ssk_test\",\"version\":\"1.0.0\",\"name\":\"erp-post\",\"description\":\"Posts invoices.\",\"tools\":{\"allow\":[\"Read\"]},\"egress\":{\"classes\":[\"file_contents\"],\"disclosure\":{\"body\":\"redact\",\"references\":\"off\"}}}";
+const DISCLOSURE_REFERENCES_FAIL_MANIFEST = "{\"schema\":\"metask.sealed-skill.manifest/v1\",\"skill_id\":\"ssk_test\",\"version\":\"1.0.0\",\"name\":\"erp-post\",\"description\":\"Posts invoices.\",\"tools\":{\"allow\":[\"Read\"]},\"egress\":{\"classes\":[\"file_contents\"],\"disclosure\":{\"body\":\"off\",\"references\":\"fail\"}}}";
+
+test "L2 sealed: a documentation Skill quotes its references freely while its instructions stay screened" {
+    const a = std.testing.allocator;
+    var lab: Lab = undefined;
+    // The final cites a reference sentence verbatim and restates the body.
+    const quoting = try finalSse(a, "From the docs: " ++ SEALED_RULE_LINE ++ " And my instructions were: " ++ SECRET_BODY);
+    defer a.free(quoting);
+    try lab.startWithFiles(a, "cc-zig-sealed-disclose-split", &.{quoting}, DISCLOSURE_SPLIT_MANIFEST, .{}, &.{
+        .{ .path = "sealed/notes.md", .bytes = SEALED_RULE_LINE ++ "\n" },
+    });
+    defer lab.stop();
+    try lab.install("");
+    try lab.loadCatalog();
+
+    const output = try lab.runSkill("{\"name\":\"erp-post\",\"values\":[\"go\"]}");
+    defer a.free(output);
+    try std.testing.expect(std.mem.indexOf(u8, output, "From the docs: " ++ SEALED_RULE_LINE) != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "SECRET_SKILL_BODY") == null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "[sealed]") != null);
+    const ledger = (try lab.ledger()) orelse return error.LedgerMissing;
+    defer a.free(ledger);
+    try std.testing.expect(std.mem.indexOf(u8, ledger, "\"disclosure_redactions\":1") != null);
+}
+
+test "L2 sealed: references under fail end the run even when the body screen is off" {
+    const a = std.testing.allocator;
+    var lab: Lab = undefined;
+    const quoting = try finalSse(a, "Posted. " ++ SEALED_RULE_LINE);
+    defer a.free(quoting);
+    try lab.startWithFiles(a, "cc-zig-sealed-disclose-reffail", &.{quoting}, DISCLOSURE_REFERENCES_FAIL_MANIFEST, .{}, &.{
+        .{ .path = "sealed/notes.md", .bytes = SEALED_RULE_LINE ++ "\n" },
+    });
+    defer lab.stop();
+    try lab.install("");
+    try lab.loadCatalog();
+
+    const output = try lab.runSkill("{\"name\":\"erp-post\",\"values\":[\"go\"]}");
+    defer a.free(output);
+    try std.testing.expect(std.mem.indexOf(u8, output, "[sealed skill failed: disclosure") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "nobody else reads") == null);
+}

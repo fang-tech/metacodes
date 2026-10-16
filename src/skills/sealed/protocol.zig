@@ -115,8 +115,14 @@ pub const Manifest = struct {
     egress_max_result_bytes: u64 = DEFAULT_MAX_RESULT_BYTES,
     egress_retention: []const u8 = "run",
     /// §5, §8.5: what the gateway does when the brain's output quotes the
-    /// Skill's sealed material — `redact` (default), `fail` or `off`.
+    /// Skill's **body** (its instructions) — `redact` (default), `fail` or
+    /// `off`. `egress.disclosure` as a string sets both policies; as an
+    /// object `{"body", "references"}` sets each.
     egress_disclosure: []const u8 = "redact",
+    /// The same for the `sealed/` **reference** files. A documentation Skill
+    /// whose purpose is to restate its references sets this to `off`; a
+    /// Skill whose references are its private rules keeps `redact`.
+    egress_disclosure_references: []const u8 = "redact",
     credentials: []const CredentialDecl = &.{},
     execution_classes: []const []const u8 = &.{},
     pricing_model: []const u8 = "",
@@ -314,10 +320,20 @@ pub fn manifestFromValue(arena: std.mem.Allocator, value: std.json.Value) ParseE
             manifest.egress_max_result_bytes = @intCast(bytes);
         }
         manifest.egress_retention = try optionalString(egress, "retention") orelse "run";
-        manifest.egress_disclosure = try optionalString(egress, "disclosure") orelse "redact";
-        if (!std.mem.eql(u8, manifest.egress_disclosure, "redact") and
-            !std.mem.eql(u8, manifest.egress_disclosure, "fail") and
-            !std.mem.eql(u8, manifest.egress_disclosure, "off")) return error.InvalidShape;
+        if (egress.object.get("disclosure")) |policy| switch (policy) {
+            .string => |both| {
+                manifest.egress_disclosure = both;
+                manifest.egress_disclosure_references = both;
+            },
+            .object => {
+                manifest.egress_disclosure = try optionalString(policy, "body") orelse "redact";
+                manifest.egress_disclosure_references = try optionalString(policy, "references") orelse "redact";
+            },
+            .null => {},
+            else => return error.InvalidShape,
+        };
+        if (!validDisclosurePolicy(manifest.egress_disclosure) or !validDisclosurePolicy(manifest.egress_disclosure_references))
+            return error.InvalidShape;
     }
     if (value.object.get("credentials")) |credentials| {
         if (credentials != .array) return error.InvalidShape;
@@ -1096,6 +1112,10 @@ fn writeStringArray(w: *std.Io.Writer, values: []const []const u8) !void {
     try w.writeByte(']');
 }
 
+fn validDisclosurePolicy(text: []const u8) bool {
+    return std.mem.eql(u8, text, "redact") or std.mem.eql(u8, text, "fail") or std.mem.eql(u8, text, "off");
+}
+
 fn requiredString(value: std.json.Value, key: []const u8) ParseError![]const u8 {
     return try optionalString(value, key) orelse error.InvalidShape;
 }
@@ -1520,4 +1540,31 @@ test "json-rpc responses: result, known error, foreign id" {
 
     try std.testing.expectError(error.NotOurResponse, parseResponse(a, "{\"jsonrpc\":\"2.0\",\"id\":4,\"result\":{}}", 3));
     try std.testing.expectError(error.NotOurResponse, parseResponse(a, "{\"jsonrpc\":\"2.0\",\"method\":\"notify\"}", 3));
+}
+
+test "disclosure: a string sets both policies, an object sets each, an unknown word is refused" {
+    const a = std.testing.allocator;
+    const both = try std.mem.replaceOwned(u8, a, TEST_MANIFEST_JSON, "\"retention\":\"run\"", "\"retention\":\"run\",\"disclosure\":\"fail\"");
+    defer a.free(both);
+    const both_entry = try testEntryJson(a, both);
+    defer a.free(both_entry);
+    var parsed_both = try parseEntry(a, both_entry);
+    defer parsed_both.deinit();
+    try std.testing.expectEqualStrings("fail", parsed_both.entry.manifest.egress_disclosure);
+    try std.testing.expectEqualStrings("fail", parsed_both.entry.manifest.egress_disclosure_references);
+
+    const split = try std.mem.replaceOwned(u8, a, TEST_MANIFEST_JSON, "\"retention\":\"run\"", "\"retention\":\"run\",\"disclosure\":{\"references\":\"off\"}");
+    defer a.free(split);
+    const split_entry = try testEntryJson(a, split);
+    defer a.free(split_entry);
+    var parsed_split = try parseEntry(a, split_entry);
+    defer parsed_split.deinit();
+    try std.testing.expectEqualStrings("redact", parsed_split.entry.manifest.egress_disclosure);
+    try std.testing.expectEqualStrings("off", parsed_split.entry.manifest.egress_disclosure_references);
+
+    const bad = try std.mem.replaceOwned(u8, a, TEST_MANIFEST_JSON, "\"retention\":\"run\"", "\"retention\":\"run\",\"disclosure\":{\"body\":\"loud\"}");
+    defer a.free(bad);
+    const bad_entry = try testEntryJson(a, bad);
+    defer a.free(bad_entry);
+    try std.testing.expectError(error.InvalidShape, parseEntry(a, bad_entry));
 }
