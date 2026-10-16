@@ -360,6 +360,13 @@ pub const Options = struct {
     /// after the Run's input so it enters history with this turn. Null (the
     /// default) adds nothing - AgentCore puts the date in each Run's context.
     time_announcer: ?*@import("time_context.zig").Announcer = null,
+    /// Issue #277: the Session's goal accounting. Each provider response's
+    /// non-cached input plus output tokens is charged to the goal the Run
+    /// began on (if it was active), and the Run's wall time when it ends -
+    /// however it ends. A budget used up mid-Run asks the model, once, at the
+    /// next turn boundary to wrap up; the Run is not cut off. Null charges
+    /// nothing.
+    goal_meter: ?*@import("goal.zig").Meter = null,
     /// One-shot user-role steering item appended to the first API request only.
     /// This is intentionally not written to Conversation/transcript; extensions such
     /// as /loop use it to continue work without fabricating a persisted user turn.
@@ -1139,6 +1146,8 @@ pub fn run(
     // Run-wide counters that every return path reports. They live here rather
     // than in each of the loop's many result literals, so no exit can forget one.
     var counters: RunCounters = .{};
+    if (opts.goal_meter) |meter| meter.beginRun();
+    defer if (opts.goal_meter) |meter| meter.endRun();
     var result = try runCounted(conversation, provider, tool_defs, permission_ctx, opts, backend, allocator, &counters);
     result.continuations = counters.continuations;
     return result;
@@ -1460,6 +1469,11 @@ fn runCounted(
                     return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = stopReasonForAbort(opts.abort), .turns = turns, .tool_calls = total_tool_calls });
                 };
             }
+            // Issue #277: the goal's budget ran out during the last turn.
+            if (opts.goal_meter) |meter| if (meter.takeBudgetNotice()) |notice| {
+                log.info("agent", "goal budget used up; wrap-up notice before turn {d}", .{turns + 1});
+                try conversation.appendText(.user, notice);
+            };
         }
 
         // 2026-09-19 polling incident: deliver metadata at the boundary so
@@ -1696,6 +1710,7 @@ fn runCounted(
                     &compact_summary_reserve_tokens,
                     opts.request_gate,
                     opts.abort,
+                    opts.goal_meter,
                 );
                 if (previous_model_compact_outcome == .api_error) {
                     return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .api_error, .turns = turns, .tool_calls = total_tool_calls });
@@ -1731,6 +1746,7 @@ fn runCounted(
                 &compact_summary_reserve_tokens,
                 opts.request_gate,
                 opts.abort,
+                opts.goal_meter,
             );
             if (pre_sampling_compact == .api_error) {
                 return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .api_error, .turns = turns, .tool_calls = total_tool_calls });
@@ -2135,6 +2151,7 @@ fn runCounted(
                             .summary_reserve_tokens = &compact_summary_reserve_tokens,
                             .request_gate = opts.request_gate,
                             .abort = opts.abort,
+                            .goal_meter = opts.goal_meter,
                         })) {
                             return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .api_error, .turns = turns, .tool_calls = total_tool_calls });
                         }
@@ -2371,6 +2388,7 @@ fn runCounted(
                         // 成本次闸累计(本 run):按模型单价把本响应 usage 折算成本。
                         run_cost_usd += @import("../util/pricing.zig").computeCost(cost_rates, u.input_tokens, u.output_tokens, u.cache_read_input_tokens, u.cache_creation_input_tokens);
                         response_usage.observe(u.input_tokens, u.output_tokens, u.cache_read_input_tokens, u.cache_creation_input_tokens);
+                        if (opts.goal_meter) |meter| meter.charge(u.input_tokens, u.output_tokens);
                         log.infoId("agent", rid, "usage in={d} out={d} cache_r={d} cache_w={d}", .{ u.input_tokens, u.output_tokens, u.cache_read_input_tokens, u.cache_creation_input_tokens });
                     },
                     .done => {},
@@ -2586,6 +2604,7 @@ fn runCounted(
                         .summary_reserve_tokens = &compact_summary_reserve_tokens,
                         .request_gate = opts.request_gate,
                         .abort = opts.abort,
+                        .goal_meter = opts.goal_meter,
                     })) {
                         return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .api_error, .turns = turns + 1, .tool_calls = total_tool_calls });
                     }
@@ -3893,6 +3912,7 @@ fn runCounted(
             &compact_summary_reserve_tokens,
             opts.request_gate,
             opts.abort,
+            opts.goal_meter,
         );
         if (post_tool_compact == .api_error) {
             return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .api_error, .turns = turns + 1, .tool_calls = total_tool_calls });
@@ -4497,6 +4517,7 @@ const RecoveryArgs = struct {
     summary_reserve_tokens: ?*usize,
     request_gate: ?request_gate_mod.Gate,
     abort: ?*const AbortSignal,
+    goal_meter: ?*@import("goal.zig").Meter,
 };
 
 /// The server rejected the pending request as too large. Turn that into a
@@ -4592,6 +4613,7 @@ fn recoverContextWindowExceeded(args: RecoveryArgs) bool {
             args.summary_reserve_tokens,
             args.request_gate,
             args.abort,
+            args.goal_meter,
         ) catch |err| {
             log.err("agent", "context-window recovery compaction failed turn={d}: {s}", .{ args.turn_number, @errorName(err) });
             return false;
@@ -4737,6 +4759,7 @@ fn runAutoCompactIfNeeded(
     summary_reserve_tokens: ?*usize,
     request_gate: ?request_gate_mod.Gate,
     abort: ?*const AbortSignal,
+    goal_meter: ?*@import("goal.zig").Meter,
 ) !AutoCompactOutcome {
     var outcome: AutoCompactOutcome = .not_needed;
 
@@ -4873,8 +4896,10 @@ fn runAutoCompactIfNeeded(
         // Persist metered usage before the diagnostic event. If the process is
         // hard-killed between the two complete NDJSON records, budget evidence
         // survives even if request-count telemetry is conservatively partial.
-        if (usageChanged(report.usage))
+        if (usageChanged(report.usage)) {
             backend.emitEvent(sess, .{ .usage = report.usage });
+            if (goal_meter) |meter| meter.charge(report.usage.input_tokens, report.usage.output_tokens);
+        }
         if (report.summary_request) |request| {
             backend.emitEvent(sess, .{ .diag_compact_request = .{
                 .trace_id = trace_id,
@@ -5558,6 +5583,7 @@ test "usage anchor suppresses false blocking-limit nuke (glm-5.2 并发工具风
         null,
         null,
         null,
+        null,
     );
 
     // est = 13522 + 20×(32768/4) + 信封 ≈ 178K < 229144 → 不触发;结果全部保留。
@@ -5652,6 +5678,7 @@ test "auto-compact preflight never rewrites an already committed tool_result" {
         0,
         null,
         a,
+        null,
         null,
         null,
         null,
@@ -5783,6 +5810,7 @@ test "auto-compact emits stale tool-result projection from the real microcompact
         null,
         null,
         null,
+        null,
     );
     try std.testing.expectEqual(AutoCompactOutcome.compacted, outcome);
     try std.testing.expectEqual(@as(u32, 1), cap.count);
@@ -5893,6 +5921,7 @@ test "mid-turn follow-up auto-compact emits post-tool cause and preserves tool s
         null,
         null,
         null,
+        null,
     );
 
     try std.testing.expectEqual(AutoCompactOutcome.compacted, outcome);
@@ -5960,6 +5989,7 @@ test "auto-compact does not buy a summary when fixed request overhead makes savi
         0,
         null,
         a,
+        null,
         null,
         null,
         null,
@@ -6033,6 +6063,7 @@ test "auto-compact checks runtime request gate before provider side effect" {
         null,
         .{ .ctx = @ptrCast(&gate_state), .allows_fn = GateState.allows },
         null,
+        null,
     );
     try std.testing.expectEqual(AutoCompactOutcome.aborted, outcome);
     try std.testing.expectEqual(@as(usize, 1), gate_state.checks);
@@ -6100,6 +6131,7 @@ test "auto-compact feeds realized summary overhead back into retry preview" {
         &summary_reserve_tokens,
         null,
         null,
+        null,
     );
     try std.testing.expectEqual(AutoCompactOutcome.skipped_no_savings, first);
     try std.testing.expectEqual(@as(u32, 1), provider_state.compact_request_count);
@@ -6128,6 +6160,7 @@ test "auto-compact feeds realized summary overhead back into retry preview" {
         null,
         null,
         &summary_reserve_tokens,
+        null,
         null,
         null,
     );
@@ -6196,6 +6229,7 @@ test "auto-compact summary carries in_progress task anchor through compaction" {
         null,
         null,
         null,
+        null,
     );
     try std.testing.expectEqual(AutoCompactOutcome.compacted, outcome);
 
@@ -6246,7 +6280,7 @@ test "auto-compact 触发 PreCompact + PostCompact hook(G-rest 接线,端到端)
     const post_entries = [_]hooks_mod.HookEntry{.{ .matcher = "*", .commands = &post_cmds }};
     const hs = hooks_mod.HookSet{ .pre_tool_use = &.{}, .pre_compact = &pre_entries, .post_compact = &post_entries, .allocator = a };
 
-    const outcome = try runAutoCompactIfNeeded(&c, provider, null, null, null, &.{}, null, null, 32_000, 2, "post_tool_follow_up_threshold", false, &backend, .single, [_]u8{0} ** 12, 0, 0, null, a, null, &hs, null, null, null);
+    const outcome = try runAutoCompactIfNeeded(&c, provider, null, null, null, &.{}, null, null, 32_000, 2, "post_tool_follow_up_threshold", false, &backend, .single, [_]u8{0} ** 12, 0, 0, null, a, null, &hs, null, null, null, null);
     try std.testing.expectEqual(AutoCompactOutcome.compacted, outcome);
 
     // PreCompact 真触发:marker 文件存在。
@@ -6357,6 +6391,7 @@ test "previous-model compact uses old model override before smaller-window sampl
         0,
         null,
         a,
+        null,
         null,
         null,
         null,

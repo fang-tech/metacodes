@@ -1,15 +1,29 @@
-//! Session-scoped goal state.
+//! Session-scoped goal state (issue #277).
 //!
-//! A goal is one persisted objective for the current session. This is deliberately
-//! smaller than Codex's app-server thread goal system, but keeps the same core
-//! invariants that matter for cc-zig: one goal per session, versioned updates,
-//! explicit status transitions, and secret-free JSON persistence.
+//! One objective per Session that its Runs work toward, with an optional
+//! token budget the runtime charges as provider responses arrive. The shape
+//! follows Codex's thread goals (codex-rs/ext/goal) where it matters: the six
+//! statuses, `(input - cached) + output` accounting, and a budget crossed
+//! mid-Run that tells the model to wrap up instead of cutting the Run off.
+//! It is smaller elsewhere: no model-facing goal tools, a continuation Run
+//! only when the user or Host asks for one, wall time counted per Run rather
+//! than while idle, and refused transitions are errors rather than silent
+//! coercions.
+//!
+//! `status` changes in two places only: `State.apply` (the user's or Host's
+//! actions) and `Meter` (the budget running out). Accounting needs nothing
+//! from the caller beyond `Meter.charge` per provider response, so every
+//! entry point that runs the agent loop with a Meter charges alike - a Run
+//! that ends in an error included.
 
 const std = @import("std");
 const pfs = @import("platform").fs;
 const session_id = @import("session_id.zig");
 const time = @import("../util/time.zig");
 const util_json = @import("../util/json.zig");
+
+/// Objectives longer than this many code points are refused (Codex's limit).
+pub const max_objective_codepoints: usize = 4000;
 
 pub const Status = enum {
     active,
@@ -25,14 +39,41 @@ pub const Status = enum {
         }
         return null;
     }
-
-    pub fn isTerminal(self: Status) bool {
-        return switch (self) {
-            .blocked, .usage_limited, .budget_limited, .complete => true,
-            .active, .paused => false,
-        };
-    }
 };
+
+/// What a user or Host may do to the goal. `usage_limited` and
+/// `budget_limited` are never requested: the runtime reaches them.
+pub const Action = enum {
+    /// active -> paused. A Run started while paused charges nothing.
+    pause,
+    /// Back to active from any other status (`resume` is a Zig keyword),
+    /// unless the budget is used up: raise or clear the budget first.
+    activate,
+    complete,
+    block,
+};
+
+pub const TransitionError = error{
+    NoGoal,
+    /// `pause` needs an active (or already paused) goal.
+    GoalNotActive,
+    /// `activate` with tokens_used >= token_budget.
+    BudgetExhausted,
+    /// `block` on a complete goal; `activate` reopens it instead.
+    GoalComplete,
+};
+
+pub const ObjectiveError = error{ EmptyObjective, ObjectiveTooLong, InvalidObjective };
+
+/// The objective as stored: trimmed, non-empty UTF-8 of at most
+/// `max_objective_codepoints` code points. Borrows from `raw`.
+pub fn normalizeObjective(raw: []const u8) ObjectiveError![]const u8 {
+    const objective = std.mem.trim(u8, raw, " \t\r\n");
+    if (objective.len == 0) return error.EmptyObjective;
+    const codepoints = std.unicode.utf8CountCodepoints(objective) catch return error.InvalidObjective;
+    if (codepoints > max_objective_codepoints) return error.ObjectiveTooLong;
+    return objective;
+}
 
 pub const Goal = struct {
     id: [24]u8,
@@ -47,6 +88,17 @@ pub const Goal = struct {
     pub fn deinit(self: *Goal, allocator: std.mem.Allocator) void {
         allocator.free(self.objective);
         self.* = undefined;
+    }
+
+    pub fn budgetExhausted(self: *const Goal) bool {
+        const budget = self.token_budget orelse return false;
+        return self.tokens_used >= budget;
+    }
+
+    pub fn clone(self: *const Goal, allocator: std.mem.Allocator) !Goal {
+        var copy = self.*;
+        copy.objective = try allocator.dupe(u8, self.objective);
+        return copy;
     }
 };
 
@@ -67,18 +119,19 @@ pub const State = struct {
         self.current = null;
     }
 
+    /// Replaces any goal with a new active one: a new id, usage from zero.
     pub fn setNew(self: *State, objective_raw: []const u8, token_budget: ?u64) !void {
-        const objective = std.mem.trim(u8, objective_raw, " \t\r\n");
-        if (objective.len == 0) return error.EmptyObjective;
+        const objective = try normalizeObjective(objective_raw);
         if (token_budget) |v| {
             if (v == 0) return error.InvalidBudget;
         }
+        const owned = try self.allocator.dupe(u8, objective);
         self.clearInMemory();
         const now = nowWallMs();
         const id = session_id.gen();
         self.current = .{
             .id = id.bytes,
-            .objective = try self.allocator.dupe(u8, objective),
+            .objective = owned,
             .status = .active,
             .token_budget = token_budget,
             .created_at_ms = now,
@@ -86,52 +139,54 @@ pub const State = struct {
         };
     }
 
+    /// Edits the objective in place: same id, usage and status.
     pub fn editObjective(self: *State, objective_raw: []const u8) !void {
-        const objective = std.mem.trim(u8, objective_raw, " \t\r\n");
-        if (objective.len == 0) return error.EmptyObjective;
+        const objective = try normalizeObjective(objective_raw);
         if (self.current == null) return error.NoGoal;
         const dup = try self.allocator.dupe(u8, objective);
-        errdefer self.allocator.free(dup);
         self.allocator.free(self.current.?.objective);
         self.current.?.objective = dup;
         self.touch();
     }
 
-    pub fn setStatus(self: *State, status: Status) !void {
-        if (self.current == null) return error.NoGoal;
-        self.current.?.status = status;
+    /// Applies a user or Host action, or refuses it and changes nothing.
+    pub fn apply(self: *State, action: Action) TransitionError!void {
+        const g = if (self.current) |*g| g else return error.NoGoal;
+        const next: Status = switch (action) {
+            .pause => switch (g.status) {
+                .active, .paused => .paused,
+                else => return error.GoalNotActive,
+            },
+            .activate => blk: {
+                if (g.status == .active) return;
+                if (g.budgetExhausted()) return error.BudgetExhausted;
+                break :blk .active;
+            },
+            .complete => .complete,
+            .block => switch (g.status) {
+                .complete => return error.GoalComplete,
+                else => .blocked,
+            },
+        };
+        if (next == g.status) return;
+        g.status = next;
         self.touch();
     }
 
+    /// Sets or clears (null) the budget. Room again on a `budget_limited`
+    /// goal makes it active; an active goal already past the new budget
+    /// becomes `budget_limited` at once.
     pub fn setBudget(self: *State, token_budget: ?u64) !void {
         if (self.current == null) return error.NoGoal;
         if (token_budget) |v| {
             if (v == 0) return error.InvalidBudget;
         }
-        self.current.?.token_budget = token_budget;
-        if (self.current.?.status == .budget_limited and
-            (token_budget == null or self.current.?.tokens_used < token_budget.?))
-        {
-            self.current.?.status = .active;
-        }
-        self.touch();
-    }
-
-    pub fn accountTokens(self: *State, delta: u64, expected_id: ?[]const u8) !void {
-        try self.accountProgress(delta, 0, expected_id);
-    }
-
-    pub fn accountProgress(self: *State, token_delta: u64, time_delta_ms: u64, expected_id: ?[]const u8) !void {
-        if (token_delta == 0 and time_delta_ms == 0) return;
-        if (self.current == null) return error.NoGoal;
-        if (expected_id) |id| {
-            if (!std.mem.eql(u8, self.current.?.id[0..], id)) return;
-        }
-        if (self.current.?.status != .active) return;
-        self.current.?.tokens_used +|= token_delta;
-        self.current.?.time_used_ms +|= time_delta_ms;
-        if (self.current.?.token_budget) |budget| {
-            if (self.current.?.tokens_used >= budget) self.current.?.status = .budget_limited;
+        const g = &self.current.?;
+        g.token_budget = token_budget;
+        if (g.status == .budget_limited and !g.budgetExhausted()) {
+            g.status = .active;
+        } else if (g.status == .active and g.budgetExhausted()) {
+            g.status = .budget_limited;
         }
         self.touch();
     }
@@ -141,9 +196,7 @@ pub const State = struct {
         defer self.allocator.free(path);
         const content = try readFileAlloc(self.allocator, path);
         defer self.allocator.free(content);
-        var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, content, .{});
-        defer parsed.deinit();
-        const g = try parseGoal(self.allocator, parsed.value);
+        const g = try decode(self.allocator, content);
         self.clearInMemory();
         self.current = g;
     }
@@ -164,7 +217,7 @@ pub const State = struct {
         const path_z = try self.allocator.dupeZ(u8, path);
         defer self.allocator.free(path_z);
 
-        const bytes = try serializeGoal(self.allocator, self.current.?);
+        const bytes = try encodeLine(self.allocator, self.current.?);
         defer self.allocator.free(bytes);
         const fd = pfs.open(tmp_z.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o600));
         if (fd < 0) return error.OpenFailed;
@@ -179,28 +232,176 @@ pub const State = struct {
     }
 };
 
-pub fn goalPath(allocator: std.mem.Allocator, session_dir: []const u8) ![]u8 {
-    return std.fmt.allocPrint(allocator, "{s}/goal.json", .{session_dir});
+/// Charges a Session's goal for the Runs that work toward it. One Meter per
+/// Session, handed to the agent loop through `Options.goal_meter`; the loop
+/// calls `beginRun`/`endRun` around a Run and `charge` per provider response.
+/// A Run charges the goal only if that goal was active when the Run began;
+/// once armed it is charged to the Run's end even after the budget runs out
+/// mid-Run (the model is asked to wrap up, the Run is not cut off). Not
+/// thread-safe: a Session runs one Run at a time, and goal mutations are
+/// idle-only.
+pub const Meter = struct {
+    state: *State,
+    observer: ?Observer = null,
+    /// Nested `run` calls on the same Meter (a Run inside a Run) charge the
+    /// outermost one; only depth 0 -> 1 arms and 1 -> 0 settles.
+    depth: u32 = 0,
+    armed: ?[24]u8 = null,
+    started_ns: time.Nanos = 0,
+    budget_notice_pending: bool = false,
+
+    pub const Change = enum {
+        /// The budget ran out during the Run: the goal is now `budget_limited`.
+        budget_reached,
+        /// The Run ended and its usage and time are on the goal.
+        run_settled,
+    };
+
+    pub const Observer = struct {
+        ctx: *anyopaque,
+        changed: *const fn (ctx: *anyopaque, state: *const State, change: Change) void,
+    };
+
+    pub fn init(state: *State) Meter {
+        return .{ .state = state };
+    }
+
+    pub fn beginRun(self: *Meter) void {
+        self.depth += 1;
+        if (self.depth != 1) return;
+        self.armed = if (self.state.current) |g| (if (g.status == .active) g.id else null) else null;
+        self.started_ns = time.nowNs();
+        self.budget_notice_pending = false;
+    }
+
+    /// Adds one provider response's billable tokens: non-cached input plus
+    /// output (the neutral UsageDelta's `input_tokens` already excludes cache
+    /// reads).
+    pub fn charge(self: *Meter, input_tokens: u64, output_tokens: u64) void {
+        if (self.depth == 0) return;
+        const tokens = input_tokens +| output_tokens;
+        if (tokens == 0) return;
+        const g = self.armedGoal() orelse return;
+        g.tokens_used +|= tokens;
+        g.updated_at_ms = nowWallMs();
+        if (g.status == .active and g.budgetExhausted()) {
+            g.status = .budget_limited;
+            self.budget_notice_pending = true;
+            self.notify(.budget_reached);
+        }
+    }
+
+    /// The wrap-up reminder, once per budget crossing, for the loop to append
+    /// at the next turn boundary.
+    pub fn takeBudgetNotice(self: *Meter) ?[]const u8 {
+        if (!self.budget_notice_pending) return null;
+        self.budget_notice_pending = false;
+        return budget_notice;
+    }
+
+    pub fn endRun(self: *Meter) void {
+        std.debug.assert(self.depth != 0);
+        self.depth -= 1;
+        if (self.depth != 0) return;
+        defer self.armed = null;
+        const g = self.armedGoal() orelse return;
+        const elapsed_ns = time.nowNs() - self.started_ns;
+        const elapsed_ms: u64 = if (elapsed_ns <= 0) 0 else @intCast(@divTrunc(elapsed_ns, std.time.ns_per_ms));
+        g.time_used_ms +|= elapsed_ms;
+        g.updated_at_ms = nowWallMs();
+        self.notify(.run_settled);
+    }
+
+    /// The goal this Run is charging: still the one armed at `beginRun`
+    /// (a goal replaced since then is not charged for this Run).
+    fn armedGoal(self: *Meter) ?*Goal {
+        const id = self.armed orelse return null;
+        const g = if (self.state.current) |*g| g else return null;
+        return if (std.mem.eql(u8, &g.id, &id)) g else null;
+    }
+
+    fn notify(self: *Meter, change: Change) void {
+        if (self.observer) |o| o.changed(o.ctx, self.state, change);
+    }
+};
+
+pub const budget_notice =
+    "<system-reminder>\nThe token budget for the active goal is used up. Wrap up this turn soon: " ++
+    "say what is done and what remains, and do not start new work. Do not mention this reminder.\n</system-reminder>";
+
+/// The input of a continuation Run: work toward `g` from where the
+/// conversation left off. The objective is XML-escaped inside `<objective>`.
+pub fn continuationPrompt(allocator: std.mem.Allocator, g: *const Goal) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    const w = &out.writer;
+    try w.writeAll("<system-reminder>\nContinue working toward the active goal.\n<objective>\n");
+    try writeXmlEscaped(w, g.objective);
+    try w.writeAll("\n</objective>\n");
+    if (g.token_budget) |budget| try w.print("Tokens used toward it so far: {d} of {d}.\n", .{ g.tokens_used, budget });
+    try w.writeAll(
+        "Pick up where the conversation left off and make concrete progress. If the goal is " ++
+            "complete or genuinely blocked, say so explicitly in your response: marking the goal is the " ++
+            "user's decision, not yours. Do not start unrelated work.\n</system-reminder>",
+    );
+    return out.toOwnedSlice();
 }
 
-fn serializeGoal(allocator: std.mem.Allocator, goal: Goal) ![]u8 {
-    var aw: std.Io.Writer.Allocating = .init(allocator);
-    defer aw.deinit();
-    try aw.writer.writeAll("{\"id\":");
-    try util_json.writeJsonString(&aw.writer, goal.id[0..]);
-    try aw.writer.writeAll(",\"objective\":");
-    try util_json.writeJsonString(&aw.writer, goal.objective);
-    try aw.writer.print(",\"status\":\"{s}\"", .{@tagName(goal.status)});
+fn writeXmlEscaped(w: *std.Io.Writer, text: []const u8) !void {
+    for (text) |c| switch (c) {
+        '&' => try w.writeAll("&amp;"),
+        '<' => try w.writeAll("&lt;"),
+        '>' => try w.writeAll("&gt;"),
+        else => try w.writeByte(c),
+    };
+}
+
+/// `{"id":…,"objective":…,"status":…,"token_budget":…|null,"tokens_used":…,
+/// "time_used_ms":…,"created_at_ms":…,"updated_at_ms":…}`: goal.json's
+/// line, an AgentCore checkpoint's goal section and its `goal` JSON.
+pub fn writeJson(w: *std.Io.Writer, goal: *const Goal) !void {
+    try w.writeAll("{\"id\":");
+    try util_json.writeJsonString(w, goal.id[0..]);
+    try w.writeAll(",\"objective\":");
+    try util_json.writeJsonString(w, goal.objective);
+    try w.print(",\"status\":\"{s}\"", .{@tagName(goal.status)});
     if (goal.token_budget) |b| {
-        try aw.writer.print(",\"token_budget\":{d}", .{b});
+        try w.print(",\"token_budget\":{d}", .{b});
     } else {
-        try aw.writer.writeAll(",\"token_budget\":null");
+        try w.writeAll(",\"token_budget\":null");
     }
-    try aw.writer.print(
-        ",\"tokens_used\":{d},\"time_used_ms\":{d},\"created_at_ms\":{d},\"updated_at_ms\":{d}}}\n",
+    try w.print(
+        ",\"tokens_used\":{d},\"time_used_ms\":{d},\"created_at_ms\":{d},\"updated_at_ms\":{d}}}",
         .{ goal.tokens_used, goal.time_used_ms, goal.created_at_ms, goal.updated_at_ms },
     );
+}
+
+pub fn encode(allocator: std.mem.Allocator, goal: Goal) ![]u8 {
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    defer aw.deinit();
+    try writeJson(&aw.writer, &goal);
     return try aw.toOwnedSlice();
+}
+
+fn encodeLine(allocator: std.mem.Allocator, goal: Goal) ![]u8 {
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    defer aw.deinit();
+    try writeJson(&aw.writer, &goal);
+    try aw.writer.writeByte('\n');
+    return try aw.toOwnedSlice();
+}
+
+/// Parses `encode`'s JSON (trailing whitespace allowed). The objective must
+/// satisfy `normalizeObjective` as stored, so a decoded goal is one this
+/// module could have written.
+pub fn decode(allocator: std.mem.Allocator, bytes: []const u8) !Goal {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, bytes, .{});
+    defer parsed.deinit();
+    return parseGoal(allocator, parsed.value);
+}
+
+pub fn goalPath(allocator: std.mem.Allocator, session_dir: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, "{s}/goal.json", .{session_dir});
 }
 
 fn parseGoal(allocator: std.mem.Allocator, value: std.json.Value) !Goal {
@@ -211,7 +412,10 @@ fn parseGoal(allocator: std.mem.Allocator, value: std.json.Value) !Goal {
     var id: [24]u8 = undefined;
     @memcpy(id[0..], id_s);
     const status = Status.parse(try getString(obj, "status")) orelse return error.InvalidGoal;
-    const objective = try allocator.dupe(u8, try getString(obj, "objective"));
+    const stored = try getString(obj, "objective");
+    const normalized = normalizeObjective(stored) catch return error.InvalidGoal;
+    if (normalized.len != stored.len) return error.InvalidGoal;
+    const objective = try allocator.dupe(u8, stored);
     errdefer allocator.free(objective);
     return .{
         .id = id,
@@ -274,26 +478,155 @@ fn nowWallMs() i64 {
     return @intCast(@divTrunc(time.nowWallNs(), std.time.ns_per_ms));
 }
 
-test "goal state set/edit/status/budget/account" {
+test "actions follow the transition table and a refusal changes nothing" {
+    const a = std.testing.allocator;
+    var st = State.init(a);
+    defer st.deinit();
+    try std.testing.expectError(error.NoGoal, st.apply(.pause));
+    try st.setNew("ship it", 10);
+
+    const Case = struct { from: Status, action: Action, to: ?Status, err: ?TransitionError = null };
+    for ([_]Case{
+        .{ .from = .active, .action = .pause, .to = .paused },
+        .{ .from = .paused, .action = .pause, .to = .paused },
+        .{ .from = .blocked, .action = .pause, .to = null, .err = error.GoalNotActive },
+        .{ .from = .budget_limited, .action = .pause, .to = null, .err = error.GoalNotActive },
+        .{ .from = .complete, .action = .pause, .to = null, .err = error.GoalNotActive },
+        .{ .from = .paused, .action = .activate, .to = .active },
+        .{ .from = .blocked, .action = .activate, .to = .active },
+        .{ .from = .usage_limited, .action = .activate, .to = .active },
+        .{ .from = .complete, .action = .activate, .to = .active },
+        .{ .from = .active, .action = .complete, .to = .complete },
+        .{ .from = .budget_limited, .action = .complete, .to = .complete },
+        .{ .from = .paused, .action = .block, .to = .blocked },
+        .{ .from = .complete, .action = .block, .to = null, .err = error.GoalComplete },
+    }) |case| {
+        st.current.?.status = case.from;
+        if (case.err) |expected| {
+            try std.testing.expectError(expected, st.apply(case.action));
+            try std.testing.expectEqual(case.from, st.current.?.status);
+        } else {
+            try st.apply(case.action);
+            try std.testing.expectEqual(case.to.?, st.current.?.status);
+        }
+    }
+
+    // A used-up budget cannot be resumed past; raising it can.
+    st.current.?.status = .paused;
+    st.current.?.tokens_used = 10;
+    try std.testing.expectError(error.BudgetExhausted, st.apply(.activate));
+    try std.testing.expectEqual(Status.paused, st.current.?.status);
+    st.current.?.status = .budget_limited;
+    try std.testing.expectError(error.BudgetExhausted, st.apply(.activate));
+    try st.setBudget(20);
+    try std.testing.expectEqual(Status.active, st.current.?.status);
+    // Lowering an active goal's budget below its usage limits it at once.
+    try st.setBudget(5);
+    try std.testing.expectEqual(Status.budget_limited, st.current.?.status);
+    try st.setBudget(null);
+    try std.testing.expectEqual(Status.active, st.current.?.status);
+    try std.testing.expectError(error.InvalidBudget, st.setBudget(0));
+}
+
+test "objectives are trimmed, non-empty UTF-8 of at most 4000 code points" {
     const a = std.testing.allocator;
     var st = State.init(a);
     defer st.deinit();
     try std.testing.expectError(error.InvalidBudget, st.setNew("bad budget", 0));
-    try st.setNew(" ship it ", 10);
-    try std.testing.expectEqual(Status.active, st.current.?.status);
-    try std.testing.expectEqualStrings("ship it", st.current.?.objective);
-    try st.accountProgress(11, 250, st.current.?.id[0..]);
-    try std.testing.expectEqual(@as(u64, 250), st.current.?.time_used_ms);
-    try std.testing.expectEqual(Status.budget_limited, st.current.?.status);
-    try st.setBudget(20);
-    try std.testing.expectEqual(Status.active, st.current.?.status);
+    try std.testing.expectError(error.EmptyObjective, st.setNew(" \t\n", null));
+    try std.testing.expectError(error.InvalidObjective, st.setNew("bad \xff byte", null));
+    // 4000 three-byte code points fit; one more does not.
+    const longest = "\u{4e2d}" ** max_objective_codepoints;
+    try st.setNew(" " ++ longest ++ " ", null);
+    try std.testing.expectEqualStrings(longest, st.current.?.objective);
+    try std.testing.expectError(error.ObjectiveTooLong, st.editObjective(longest ++ "x"));
+    try std.testing.expectEqualStrings(longest, st.current.?.objective);
     try st.editObjective("ship it safely");
     try std.testing.expectEqualStrings("ship it safely", st.current.?.objective);
-    try st.setStatus(.complete);
-    try std.testing.expect(st.current.?.status.isTerminal());
 }
 
-test "goal state persist/load roundtrip" {
+const ObserverProbe = struct {
+    budget_reached: u32 = 0,
+    run_settled: u32 = 0,
+
+    fn changed(raw: *anyopaque, _: *const State, change: Meter.Change) void {
+        const self: *ObserverProbe = @ptrCast(@alignCast(raw));
+        switch (change) {
+            .budget_reached => self.budget_reached += 1,
+            .run_settled => self.run_settled += 1,
+        }
+    }
+};
+
+test "the Meter charges a Run armed on an active goal, to its end, and asks once for a wrap-up" {
+    const a = std.testing.allocator;
+    var st = State.init(a);
+    defer st.deinit();
+    var probe = ObserverProbe{};
+    var meter = Meter.init(&st);
+    meter.observer = .{ .ctx = &probe, .changed = ObserverProbe.changed };
+
+    // No goal, or a paused one: nothing is charged.
+    meter.beginRun();
+    meter.charge(5, 5);
+    meter.endRun();
+    try st.setNew("ship it", 12);
+    try st.apply(.pause);
+    meter.beginRun();
+    meter.charge(5, 5);
+    meter.endRun();
+    try std.testing.expectEqual(@as(u64, 0), st.current.?.tokens_used);
+    try std.testing.expectEqual(@as(u32, 0), probe.run_settled);
+
+    // Active: charged per response; crossing the budget mid-Run limits the
+    // goal, asks once for a wrap-up, and keeps charging to the Run's end.
+    try st.apply(.activate);
+    meter.beginRun();
+    meter.charge(4, 3);
+    try std.testing.expect(meter.takeBudgetNotice() == null);
+    meter.beginRun(); // a nested Run charges the outer one
+    meter.charge(3, 2);
+    meter.endRun();
+    try std.testing.expectEqual(Status.budget_limited, st.current.?.status);
+    try std.testing.expectEqual(@as(u32, 1), probe.budget_reached);
+    try std.testing.expectEqualStrings(budget_notice, meter.takeBudgetNotice().?);
+    try std.testing.expect(meter.takeBudgetNotice() == null);
+    meter.charge(1, 1);
+    meter.endRun();
+    try std.testing.expectEqual(@as(u64, 14), st.current.?.tokens_used);
+    try std.testing.expectEqual(@as(u32, 1), probe.budget_reached);
+    try std.testing.expectEqual(@as(u32, 1), probe.run_settled);
+
+    // A Run that starts budget_limited charges nothing.
+    meter.beginRun();
+    meter.charge(9, 9);
+    meter.endRun();
+    try std.testing.expectEqual(@as(u64, 14), st.current.?.tokens_used);
+
+    // A goal replaced since the Run began is not charged for it.
+    try st.setNew("first", null);
+    meter.beginRun();
+    try st.setNew("replacement", null);
+    meter.charge(9, 9);
+    meter.endRun();
+    try std.testing.expectEqual(@as(u64, 0), st.current.?.tokens_used);
+    try std.testing.expectEqual(@as(u64, 0), st.current.?.time_used_ms);
+}
+
+test "the continuation prompt escapes the objective and reports the budget" {
+    const a = std.testing.allocator;
+    var st = State.init(a);
+    defer st.deinit();
+    try st.setNew("fix <a> & </objective>", 100);
+    st.current.?.tokens_used = 40;
+    const prompt = try continuationPrompt(a, &st.current.?);
+    defer a.free(prompt);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "<objective>\nfix &lt;a&gt; &amp; &lt;/objective&gt;\n</objective>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "Tokens used toward it so far: 40 of 100.") != null);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, prompt, "</objective>"));
+}
+
+test "goal state persist/load roundtrip, and decode refuses what encode never writes" {
     const a = std.testing.allocator;
     var _db: [512]u8 = undefined;
     const dir = @import("../tools/test_tmp.zig").path(&_db, "goal-roundtrip");
@@ -301,7 +634,10 @@ test "goal state persist/load roundtrip" {
     var st = State.init(a);
     defer st.deinit();
     try st.setNew("round trip", 123);
-    try st.accountTokens(7, null);
+    var meter = Meter.init(&st);
+    meter.beginRun();
+    meter.charge(4, 3);
+    meter.endRun();
     try st.persistToDir(dir);
 
     var loaded = State.init(a);
@@ -311,6 +647,15 @@ test "goal state persist/load roundtrip" {
     try std.testing.expectEqualStrings("round trip", loaded.current.?.objective);
     try std.testing.expectEqual(@as(u64, 123), loaded.current.?.token_budget.?);
     try std.testing.expectEqual(@as(u64, 7), loaded.current.?.tokens_used);
+
+    const encoded = try encode(a, st.current.?);
+    defer a.free(encoded);
+    var decoded = try decode(a, encoded);
+    defer decoded.deinit(a);
+    try std.testing.expectEqualStrings("round trip", decoded.objective);
+    const untrimmed = try std.mem.replaceOwned(u8, a, encoded, "\"round trip\"", "\" round trip\"");
+    defer a.free(untrimmed);
+    try std.testing.expectError(error.InvalidGoal, decode(a, untrimmed));
 
     loaded.clearInMemory();
     try loaded.persistToDir(dir);

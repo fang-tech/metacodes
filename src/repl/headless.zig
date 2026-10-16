@@ -569,6 +569,7 @@ fn buildOptions(
         .system_prompt = app.system_prompt,
         .inject_user_context = app.user_context,
         .time_announcer = if (app.time_announcer) |*announcer| announcer else null,
+        .goal_meter = if (app.goal_meter) |*meter| meter else null,
         .synthetic_user_input = scoped_recall,
         .dyn_registry = &app.dyn_registry,
         .host_services = app.hostServices(),
