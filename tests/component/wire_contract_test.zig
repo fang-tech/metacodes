@@ -43,7 +43,7 @@ const changes = [_]cc.file_change.Record{
     },
 };
 
-fn samples(manifest_entries: []cc.prompt_sections.ManifestEntry) [46]CoreEvent {
+fn samples(manifest_entries: []cc.prompt_sections.ManifestEntry) [47]CoreEvent {
     return .{
         .{ .text_chunk = "hello \"wire\"\n" },
         .{ .thinking_chunk = "considering" },
@@ -72,6 +72,7 @@ fn samples(manifest_entries: []cc.prompt_sections.ManifestEntry) [46]CoreEvent {
         .{ .auto_compact = .{ .dropped = 1, .kept = 2, .before_tokens = 3, .after_tokens = 4, .cause = "trigger" } },
         .{ .context_projection = .{ .kind = "large_tool_result_truncation", .changed_items = 1, .bytes_before = 10, .bytes_after = 5, .active_messages = 3, .cause = "pressure" } },
         .{ .retry_notice = .{ .attempt = 1, .max = 3, .delay_ms = 500 } },
+        .{ .input_adopted = .{ .input_id = 7, .sequence = 1, .turn = 2 } },
         .{ .environment_fault = .{ .tool = "Bash", .code = "working_directory_unavailable", .detail = "gone", .count = 1, .limit = 3 } },
         .stream_done,
         .{ .output_segment_begin = .{ .index = 0, .turn = 1, .group = 0 } },

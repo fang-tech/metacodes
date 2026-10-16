@@ -25,6 +25,7 @@
 {"v":1,"type":"auto_compact","data":{"dropped":1,"kept":2,"before_tokens":3,"after_tokens":4,"cause":"trigger"}}
 {"v":1,"type":"context_projection","data":{"kind":"large_tool_result_truncation","changed_items":1,"bytes_before":10,"bytes_after":5,"active_messages":3,"cause":"pressure"}}
 {"v":1,"type":"retry_notice","data":{"attempt":1,"max":3,"delay_ms":500}}
+{"v":1,"type":"input_adopted","data":{"input_id":7,"sequence":1,"turn":2}}
 {"v":1,"type":"environment_fault","data":{"tool":"Bash","code":"working_directory_unavailable","detail":"gone","count":1,"limit":3}}
 {"v":1,"type":"stream_done","data":null}
 {"v":1,"type":"output_segment_begin","data":{"index":0,"turn":1,"group":0}}

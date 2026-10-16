@@ -39,6 +39,7 @@ const tool_observation_journal = @import("tool_observation_journal.zig");
 const util_fs = @import("../util/fs.zig");
 const prompt_sections = @import("prompt_sections.zig");
 const system_prompt_mod = @import("system_prompt.zig");
+const run_input = @import("run_input.zig");
 
 pub const DEFAULT_BUILTIN_TOOLS = first_party_plugins.CODING_TOOLS ++ first_party_plugins.ARTIFACT_TOOLS;
 /// Built-ins whose complete execution dependencies are owned by AgentSession.
@@ -726,6 +727,18 @@ pub const LifecycleError = error{
     CallbackFailed,
 };
 
+/// `submitInput` outcomes besides the queue's own (`run_input.SubmitError`).
+/// `InputTooLate`: the Run named is the most recent one and it has ended, or is
+/// ending (abort requested, a callback failed) — no later boundary will adopt
+/// anything. `StaleRun`: no such Run is active or most recent.
+/// `InvalidSessionState`: the Session is poisoned or being destroyed, or its
+/// active Run never adopts input (a forked Skill Run).
+pub const SubmitInputError = error{
+    StaleRun,
+    InputTooLate,
+    InvalidSessionState,
+} || run_input.SubmitError;
+
 pub const ModelMutationError = error{
     SessionBusy,
     InvalidSessionState,
@@ -1120,6 +1133,9 @@ pub const AdmittedRun = struct {
         }
         try self.session.claimAdmittedRun(self.identity_value);
         self.completed = true;
+        // The executor runs on its own Conversation, discarded when it returns:
+        // no boundary of this Run can adopt Host input, so stop accepting it.
+        self.session.refuseRunInputs();
         for (root_records) |record| {
             self.session.conversation.appendText(.user, record) catch |err| {
                 _ = self.session.poisonRun();
@@ -1252,6 +1268,14 @@ pub const AgentSession = struct {
     /// finishes. Null is the ordinary path: the loop assembles and commits
     /// exactly as before, unobserved.
     response_observer: ?@import("response_candidate.zig").Observer = null,
+    /// Host input submitted to the active Run (#270). Opened at admission,
+    /// closed on every path that ends the Run; between Runs it keeps the
+    /// counts of the last one (`runInputReconciliation`).
+    run_inputs: run_input.Queue,
+    /// Durable-state admission the next Run's input window starts with.
+    /// Installed by the embedding facade around one Run, like
+    /// `response_observer`; null admits input without a budget.
+    run_input_admission: ?run_input.Admission = null,
 
     mutex: sync.Mutex = .{},
     callback_mutex: sync.Mutex = .{},
@@ -1438,6 +1462,7 @@ pub const AgentSession = struct {
             .prompt_profile = prompt_profile,
             .abort_signal = AbortSignal.init(),
             .compact_abort_signal = AbortSignal.init(),
+            .run_inputs = run_input.Queue.init(allocator, .{}),
             .last_run_id = if (hooks.restored) |restored|
                 restored.last_run_id
             else
@@ -1477,7 +1502,8 @@ pub const AgentSession = struct {
     }
 
     /// Destroy requires unique ownership of `self` and is valid only after the
-    /// synchronous activity and every matching abort call have returned. As
+    /// synchronous activity and every matching abort and `submitInput` call
+    /// have returned. As
     /// with allocator.destroy, using the pointer again after success is invalid.
     pub fn destroy(self: *AgentSession) LifecycleError!void {
         self.mutex.lock();
@@ -1503,6 +1529,7 @@ pub const AgentSession = struct {
         const sid = self.session_id;
         self.provider.deinit();
         self.conversation.deinit();
+        self.run_inputs.deinit();
         if (self.jobs) |*registry| registry.deinit();
         if (self.imported_permission_rules) |*rules| rules.deinit();
         self.read_state.deinit();
@@ -2194,6 +2221,86 @@ pub const AgentSession = struct {
         self.response_observer = observer;
     }
 
+    /// Install the durable-state admission for the input window of the Runs
+    /// admitted while it is set, or clear it with null. The facade installs
+    /// its budget controller here before admission and clears it after the
+    /// Run returns; the window itself drops the admission when it closes, so
+    /// no reservation outlives the Run that made it.
+    pub fn setRunInputAdmission(self: *AgentSession, admission: ?run_input.Admission) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.run_input_admission = admission;
+    }
+
+    /// Undo `setRunInputAdmission` after the Run that used it has returned,
+    /// and make sure that Run's input window is closed. Every lifecycle path
+    /// that ends a Run already closes it; doing it here as well guarantees no
+    /// reservation can outlive the facade's budget controller.
+    pub fn finishRunInputAdmission(self: *AgentSession) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.run_input_admission = null;
+        _ = self.run_inputs.close();
+    }
+
+    /// Hand the active Run more user text (#270). Safe from any thread while
+    /// that Run is active, including from inside its event and UI callbacks;
+    /// it never waits for the Run. Returns the input's 1-based acceptance
+    /// sequence. Acceptance only queues it: the agent loop appends it to the
+    /// Conversation at the next turn boundary that leads to another provider
+    /// request, and a Run that ends first leaves it unadopted — see
+    /// `runInputReconciliation`. It never answers a pending permission or
+    /// question request and never stops the Run (that is `abort`).
+    pub fn submitInput(self: *AgentSession, run_id: u64, input_id: u64, text: []const u8) SubmitInputError!u32 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.active_run_id != 0 and self.active_run_id != run_id) return error.StaleRun;
+        switch (self.state) {
+            .running => {
+                // `active_run_id == run_id` here, and it is never zero while running.
+                // A failed callback already aborted the Run; nothing is adopted after it.
+                if (self.callback_failed) return error.InputTooLate;
+                return self.run_inputs.submit(input_id, text) catch |err| switch (err) {
+                    error.InputClosed => error.InputTooLate,
+                    error.InputNotAccepted => error.InvalidSessionState,
+                    else => |e| e,
+                };
+            },
+            // The loop-top abort check precedes the input boundary.
+            .abort_requested => return error.InputTooLate,
+            // No Run is active. The answer is about the Run named, not about what
+            // the Session is doing now: the facade measures durable usage right
+            // before admission and right after a Run (`checkpointing`), and a
+            // submission racing either edge must read as not-yet-admitted or as
+            // too late — never as a third outcome.
+            .idle, .compacting, .compact_finishing, .mutating, .checkpointing => {
+                const too_late = run_id != 0 and self.last_run_id == run_id;
+                return if (too_late) error.InputTooLate else error.StaleRun;
+            },
+            .poisoned, .destroying => return error.InvalidSessionState,
+        }
+    }
+
+    /// The most recently admitted Run ID (0 before the first). A facade that
+    /// holds the Session's call gate reads it before and after a Run call to
+    /// learn whether that call admitted its Run.
+    pub fn lastAdmittedRunId(self: *AgentSession) u64 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.last_run_id;
+    }
+
+    /// The final input counts of `run_id` (#270) once that Run has ended:
+    /// inputs with a sequence at most `adopted` are in the Conversation, the
+    /// rest never will be. Null while the Run is active, or when `run_id` is
+    /// not the most recent Run (no input could be accepted for it, or its
+    /// record was replaced by a later admission).
+    pub fn runInputReconciliation(self: *AgentSession, run_id: u64) ?run_input.Reconciliation {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.run_inputs.reconciliation(run_id);
+    }
+
     pub fn admitRun(
         self: *AgentSession,
         run_id: u64,
@@ -2299,6 +2406,7 @@ pub const AgentSession = struct {
                 } else null,
                 .ui_requester = self.permission_ctx.ui_requester,
                 .response_observer = self.response_observer,
+                .run_inputs = &self.run_inputs,
                 .emit_tool_cards = true,
                 .project_dir = self.workspace.root,
                 .cwd_abs = self.workspace.root,
@@ -2362,6 +2470,7 @@ pub const AgentSession = struct {
         self.active_run_id = 0;
         self.active_run_started = false;
         self.active_sink = null;
+        _ = self.run_inputs.close();
         self.mutex.unlock();
         self.callback_mutex.unlock();
         return completion;
@@ -2438,9 +2547,16 @@ pub const AgentSession = struct {
         self.last_run_id = run_id;
         self.callback_failed = false;
         self.active_sink = sink;
+        self.run_inputs.open(run_id, self.run_input_admission);
         const identity = RunIdentity{ .session_id = self.session_id, .run_id = run_id };
         self.mutex.unlock();
         return identity;
+    }
+
+    fn refuseRunInputs(self: *AgentSession) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.run_inputs.refuse();
     }
 
     fn claimAdmittedRun(
@@ -2487,6 +2603,7 @@ pub const AgentSession = struct {
         self.active_run_id = 0;
         self.active_run_started = false;
         self.active_sink = null;
+        _ = self.run_inputs.close();
         if (self.callback_failed) return error.CallbackFailed;
         return .{ .aborted = aborted };
     }
@@ -2503,6 +2620,7 @@ pub const AgentSession = struct {
         self.active_run_id = 0;
         self.active_run_started = false;
         self.active_sink = null;
+        _ = self.run_inputs.close();
         self.mutex.unlock();
         return failed;
     }
@@ -2597,11 +2715,10 @@ pub const AgentSession = struct {
         };
     }
 
-    /// The AgentCore Session has no input operation for an active Run: the
-    /// binary ABI is one synchronous `session_run_input` at a time, so a Host
-    /// queues later input itself and submits it as the next Run (or aborts).
-    /// The in-process `UiEvent.queue_message` steering seam that `agent_loop`
-    /// drains at each turn boundary is therefore never fed here (#115).
+    /// A Session takes input for its active Run through `submitInput` and
+    /// the typed `run_inputs` queue (#270), which carries an id, an adoption
+    /// event and reconciliation counts. The untyped in-process
+    /// `UiEvent.queue_message` seam (#115) is therefore never fed here.
     fn backendPoll(_: *anyopaque, _: SessionId) ?UiEvent {
         return null;
     }

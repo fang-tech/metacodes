@@ -312,6 +312,31 @@ pub const SessionApi = struct {
     pub fn abort(self: SessionApi) types.SessionAbortFnV1 {
         return self.raw.abort.?;
     }
+    pub fn submitInputFn(self: SessionApi) types.SessionSubmitInputFnV1 {
+        return self.raw.submit_input.?;
+    }
+    /// Queue more user text for the active Run `run_id` (Revision 20). On
+    /// STATUS_OK `out_receipt.sequence` is the input's acceptance position;
+    /// `input_adopted` events and the Run's `RunResultV1` input counts report
+    /// whether it reached the Conversation.
+    pub fn submitInput(
+        self: SessionApi,
+        session: ?*types.SessionHandle,
+        run_id: u64,
+        input_id: u64,
+        text: types.BytesViewV1,
+        out_receipt: ?*types.InputReceiptV1,
+        out_diagnostic: ?*types.OwnedBytesV1,
+    ) u32 {
+        const input = types.SubmittedInputV1{
+            .struct_size = @sizeOf(types.SubmittedInputV1),
+            .reserved0 = 0,
+            .input_id = input_id,
+            .text = text,
+            .reserved = [_]u64{0} ** 2,
+        };
+        return self.submitInputFn()(session, run_id, &input, out_receipt, out_diagnostic);
+    }
 };
 
 pub const SessionControlApi = struct {
@@ -393,7 +418,8 @@ fn validateSessionApi(raw: ?*const types.SessionApiV1) bool {
     const api = raw orelse return false;
     if (@intFromPtr(api) % @alignOf(types.SessionApiV1) != 0) return false;
     return api.struct_size == @sizeOf(types.SessionApiV1) and api.reserved0 == 0 and
-        api.create != null and api.destroy != null and api.run_input != null and api.abort != null;
+        api.create != null and api.destroy != null and api.run_input != null and api.abort != null and
+        api.submit_input != null;
 }
 
 fn validateSessionControlApi(raw: ?*const types.SessionControlApiV1) bool {
@@ -450,7 +476,7 @@ test "RunContext validator bounds length before pointer slicing" {
     try std.testing.expectEqualStrings(id, valid.session_id);
 }
 
-test "Revision 19 SDK rejects Revision 13 through 18 and stale reference roots" {
+test "Revision 20 SDK rejects Revision 13 through 19 and stale reference roots" {
     const Revision13Api = extern struct {
         struct_size: u32,
         abi_version: u32,
@@ -466,9 +492,9 @@ test "Revision 19 SDK rejects Revision 13 through 18 and stale reference roots" 
     try std.testing.expectEqual(@as(usize, 280), @sizeOf(Revision13Api));
     try std.testing.expectError(error.UnsupportedAbi, Api.validate(&revision13));
 
-    // Revisions 14 through 18 (16 withdrawn) share the 64-byte root; only the
+    // Revisions 14 through 19 (16 withdrawn) share the 64-byte root; only the
     // revision check rejects them, so each must fail exactly there.
-    for ([_]u32{ 14, 15, 16, 17, 18 }) |older| {
+    for ([_]u32{ 14, 15, 16, 17, 18, 19 }) |older| {
         var root: types.ApiV1 align(@alignOf(types.ApiV1)) =
             std.mem.zeroes(types.ApiV1);
         root.struct_size = @sizeOf(types.ApiV1);

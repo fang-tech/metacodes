@@ -32,6 +32,7 @@ pub const tool_exec = @import("core/tool_exec.zig");
 pub const execution_effect = @import("core/execution_effect.zig");
 pub const response_candidate = @import("core/response_candidate.zig"); // candidate Provider response -> Conversation commit boundary
 pub const run_recovery = @import("core/run_recovery.zig");
+pub const run_input = @import("core/run_input.zig"); // Host input submitted to an active Run (#270)
 pub const file_reference = @import("core/file_reference.zig");
 pub const file_change = @import("core/file_change.zig"); // stable actual-file-modification contract
 pub const output_semantics = @import("core/output_semantics.zig"); // Run output classification (commentary/final/partial)

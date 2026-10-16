@@ -312,6 +312,10 @@ pub const Controller = struct {
     mutex: sync.Mutex = .{},
     estimated_usage_bytes: u64,
     root_input_delta_bytes: u64,
+    /// Encoded durable bytes of the Host inputs this Run accepted through
+    /// `submit_input` (#270) and has not released, adopted or pending. With
+    /// the root input it is bounded by `input_cap_bytes`.
+    submitted_input_delta_bytes: u64 = 0,
     reserved_bytes: u64 = 0,
     outcome_value: Outcome = .none,
     required_bytes_value: u64 = 0,
@@ -500,6 +504,58 @@ pub const Controller = struct {
         }
         self.estimated_usage_bytes = projected;
         self.root_input_delta_bytes = exact_delta;
+    }
+
+    /// Reserve the durable bytes of one Host input accepted while this Run
+    /// is active (#270): its exact encoded user record. The Run's host input
+    /// — root input plus every accepted input — stays within
+    /// `input_cap_bytes`, and what is left under `hard_bytes` must still hold
+    /// one whole provider operation at its configured caps (request bytes,
+    /// result payload, audit and terminal reserve — what `beginOperation`
+    /// demands), so adopting it can never be what makes the Run's next
+    /// provider request fail. Unlike every other reservation a refusal does
+    /// **not** record a Run outcome: it refuses that one submission and the
+    /// Run goes on. Returns the reserved bytes for `commitSubmittedInput` /
+    /// `releaseSubmittedInput`.
+    pub fn reserveSubmittedInput(self: *Controller, text: []const u8) Error!u64 {
+        const delta = checkpoint.encodedTextMessageBytes(text) catch return error.BudgetRequired;
+        if (text.len > self.profile.input_cap_bytes) return error.BudgetRequired;
+        const run_reserve = self.profile.minimumRunReserve() catch return error.BudgetRequired;
+        const next_operation = checkedAdd(run_reserve, self.profile.provider_request_cap_bytes) catch
+            return error.BudgetRequired;
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.outcome_value != .none) return error.BudgetRequired;
+        const host_input = checkedAdd(self.root_input_delta_bytes, self.submitted_input_delta_bytes) catch
+            return error.BudgetRequired;
+        if ((checkedAdd(host_input, delta) catch return error.BudgetRequired) > self.profile.input_cap_bytes)
+            return error.BudgetRequired;
+        var required = checkedAdd(self.estimated_usage_bytes, self.reserved_bytes) catch return error.BudgetRequired;
+        required = checkedAdd(required, delta) catch return error.BudgetRequired;
+        required = checkedAdd(required, next_operation) catch return error.BudgetRequired;
+        if (required > self.profile.hard_bytes) return error.BudgetRequired;
+        self.reserved_bytes += delta;
+        self.submitted_input_delta_bytes += delta;
+        return delta;
+    }
+
+    /// The input reserved by `reserveSubmittedInput` is now a Conversation
+    /// record: its bytes move from reserved to the durable estimate.
+    pub fn commitSubmittedInput(self: *Controller, reserved: u64) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        std.debug.assert(self.reserved_bytes >= reserved);
+        self.reserved_bytes -= reserved;
+        self.estimated_usage_bytes = checkedAdd(self.estimated_usage_bytes, reserved) catch unreachable;
+    }
+
+    /// The Run ended without adopting the input: give its bytes back.
+    pub fn releaseSubmittedInput(self: *Controller, reserved: u64) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        std.debug.assert(self.reserved_bytes >= reserved and self.submitted_input_delta_bytes >= reserved);
+        self.reserved_bytes -= reserved;
+        self.submitted_input_delta_bytes -= reserved;
     }
 
     pub fn outcome(self: *Controller) Outcome {
@@ -1574,6 +1630,39 @@ test "settle beyond its own reservation cannot consume a live sibling reservatio
     var only = try terminal_case.beginOperation(.tool, 32);
     try std.testing.expectError(error.ResourceLimit, only.settleSuccess(10, room + 64));
     try std.testing.expectEqual(profile.hard_bytes + 64, terminal_case.requiredBytes());
+}
+
+test "a submitted input is admitted only if the next provider operation still fits after it (#270)" {
+    const profile = Profile{
+        .hard_bytes = 4096,
+        .soft_bytes = 3072,
+        .input_cap_bytes = 2048,
+        .provider_request_cap_bytes = 1024,
+        .provider_result_cap_bytes = 512,
+        .tool_result_cap_bytes = 256,
+        .mcp_result_cap_bytes = 256,
+        .audit_reserve_bytes = 64,
+        .terminal_reserve_bytes = 128,
+    };
+    const admitted = try preflight(profile, 1000, &.{"run"});
+    var controller = Controller.init(std.testing.allocator, profile, admitted);
+    // Fits the input cap and the durable bytes plus a result turn, but not a
+    // request of the configured cap on top: refused, and the Run is untouched.
+    try std.testing.expectError(error.BudgetRequired, controller.reserveSubmittedInput(&([_]u8{'x'} ** 1486)));
+    try std.testing.expectEqual(Outcome.none, controller.outcome());
+    try std.testing.expectEqual(@as(u64, 0), controller.reserved_bytes);
+    // An input that leaves that room is reserved, and after adoption a
+    // maximal provider request is still admitted.
+    const reserved = try controller.reserveSubmittedInput(&([_]u8{'y'} ** 1000));
+    controller.commitSubmittedInput(reserved);
+    var request = try controller.beginOperation(.provider, profile.provider_request_cap_bytes);
+    request.release();
+    try std.testing.expectEqual(Outcome.none, controller.outcome());
+    // Releasing an unadopted input gives its bytes and its input-cap share back.
+    const pending = try controller.reserveSubmittedInput("z");
+    controller.releaseSubmittedInput(pending);
+    try std.testing.expectEqual(@as(u64, 0), controller.reserved_bytes);
+    try std.testing.expectEqual(reserved, controller.submitted_input_delta_bytes);
 }
 
 test "operation reservations are atomic and preserve terminal space" {

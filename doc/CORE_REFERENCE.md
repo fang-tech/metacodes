@@ -132,6 +132,7 @@ pub const CoreEvent = union(enum) {
     phase_change: Phase,                          // input ↔ generating
     auto_compact: struct { dropped, kept, before_tokens, after_tokens, cause }, // 自动压缩历史;cause 以 context_window_exceeded_ 开头的是恢复,不是压缩
     retry_notice: struct { attempt, max, delay_ms }, // 流式建连重试
+    input_adopted: struct { input_id, sequence, turn }, // Session 活动 Run 的 Host 输入已进对话(§3.3,#270)
     ui_request_pending: struct { tool_use_id, request_json }, // 可挂起 UI 请求(异步前端,见 §5.3)
 
     // 输出语义(见 §3.2.1)
@@ -287,8 +288,12 @@ pub const Phase = enum(u8) { input = 0, generating = 1 };
 `budget`),它补充而不取代 AbortSignal 的动中断;max_tokens 续写边界不 poll(续写段必须仍是同一个
 答案)。生产方决定什么可转向:TuiBackend 只交出普通 prompt,`/命令`、`!shell`、`exit` 留在队列由
 REPL 在 Run 结束后派发。REPL 里 Run 内的边界由 `run()` 消费,Run 结束时仍留在队列里的由 loop.zig
-合并成下一个 Run 的输入。AgentCore Session 的 backend.poll 恒返 null:二进制 ABI 没有活动 Run 的
-输入操作,宿主自己排队、Run 返回后再 run_input,或 abort。
+合并成下一个 Run 的输入。AgentCore Session 的 backend.poll 恒返 null:Session 的活动 Run 输入走
+带类型的第二条缝 `Options.run_inputs`(`core/run_input.zig` 的 `Queue`,#270)——同一个边界、同样
+跳过续写边界,但每条输入有 Host 给的 id、按接受序采纳(逐条追加原文、不 trim)、每条采纳发
+`CoreEvent.input_adopted{input_id, sequence, turn}`,Run 结束时关窗得 accepted/adopted 两个计数
+(采纳恒为接受序前缀,计数而非事件是对账依据)。`AgentSession.submitInput` / 二进制
+`session->submit_input` 是它的入口,见 AGENTCORE_BINARY_ABI.md "Active-Run input"。
 
 ### 3.4 UiRequest — core 向前端**请求一个回答**(交互式)
 

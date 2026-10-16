@@ -1,12 +1,12 @@
 #include <metask/agentcore.h>
 
-_Static_assert(METASK_AGENTCORE_ABI_REVISION == 19,
+_Static_assert(METASK_AGENTCORE_ABI_REVISION == 20,
                "AgentCore revision changed");
 _Static_assert(sizeof(metask_agentcore_api_v1) == 64,
                "AgentCore root layout changed");
 _Static_assert(sizeof(metask_agentcore_runtime_api_v1) == 24,
                "Runtime table layout changed");
-_Static_assert(sizeof(metask_agentcore_session_api_v1) == 40,
+_Static_assert(sizeof(metask_agentcore_session_api_v1) == 48,
                "Session table layout changed");
 _Static_assert(sizeof(metask_agentcore_session_control_api_v1) == 80,
                "Session Control table layout changed");
@@ -15,6 +15,10 @@ _Static_assert(sizeof(metask_agentcore_skill_api_v1) == 32,
 _Static_assert(sizeof(metask_agentcore_mcp_api_v1) == 40,
                "MCP table layout changed");
 
+_Static_assert(METASK_AGENTCORE_MAX_SUBMITTED_INPUTS_V1 == 64ULL,
+               "submitted input count limit changed");
+_Static_assert(METASK_AGENTCORE_MAX_SUBMITTED_INPUT_BYTES_V1 == 16777216ULL,
+               "submitted input byte limit changed");
 _Static_assert(METASK_AGENTCORE_MAX_SKILL_FILE_CONTENT_BYTES_V1 == 16777216ULL,
                "Skill file limit changed");
 _Static_assert(METASK_AGENTCORE_MAX_SKILL_CONTENT_BYTES_V1 == 33554432ULL,
@@ -145,6 +149,15 @@ void agentcore_revision_fifteen_call_shape_probe(
     (void)api->session->destroy;
     (void)api->session->run_input;
     (void)api->session->abort;
+    {
+        metask_agentcore_submitted_input_v1 input = {0};
+        metask_agentcore_input_receipt_v1 receipt = {0};
+        input.struct_size = (uint32_t)sizeof(input);
+        input.input_id = 1;
+        input.text = metask_agentcore_bytes_view_v1_from("more", 4);
+        (void)api->session->submit_input((metask_agentcore_session *)0, 1, &input,
+                                         &receipt, diagnostic);
+    }
     (void)api->session_control->restore;
     (void)api->session_control->describe;
     (void)api->session_control->set_model;
