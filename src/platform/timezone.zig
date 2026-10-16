@@ -197,6 +197,33 @@ test "local reports a plausible offset and a valid name where the platform can t
     try std.testing.expect(std.unicode.utf8ValidateSlice(zone.name()));
 }
 
+test "local follows TZ through daylight saving, and a rule string falls back to its abbreviation" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    // Without tzdata the libc answer is UTC, which would test nothing.
+    if (std.c.access("/usr/share/zoneinfo/America/New_York", 4) != 0) return error.SkipZigTest; // R_OK
+    const paths = @import("paths.zig");
+    var saved_buf: [256]u8 = undefined;
+    const saved: ?[:0]const u8 = if (std.c.getenv("TZ")) |raw|
+        std.fmt.bufPrintZ(&saved_buf, "{s}", .{std.mem.span(raw)}) catch return error.SkipZigTest
+    else
+        null;
+    defer if (saved) |value| paths.setEnv("TZ", value) else paths.unsetEnv("TZ");
+
+    const january: i64 = 1_768_478_400; // 2026-01-15T12:00:00Z
+    const july: i64 = 1_784_116_800; // 2026-07-15T12:00:00Z
+    paths.setEnv("TZ", "America/New_York");
+    const winter = local(january) orelse return error.TestExpectedLocalZone;
+    const summer = local(july) orelse return error.TestExpectedLocalZone;
+    try std.testing.expectEqual(@as(i32, -300), winter.offset_minutes);
+    try std.testing.expectEqual(@as(i32, -240), summer.offset_minutes);
+    try std.testing.expectEqualStrings("America/New_York", winter.name());
+
+    paths.setEnv("TZ", "CST-8");
+    const rule = local(january) orelse return error.TestExpectedLocalZone;
+    try std.testing.expectEqual(@as(i32, 480), rule.offset_minutes);
+    try std.testing.expectEqualStrings("CST", rule.name());
+}
+
 test "LocalZone keeps only short valid names" {
     var zone = LocalZone{ .offset_minutes = 0 };
     zone.setName("x" ** (LocalZone.max_name_bytes + 1));
