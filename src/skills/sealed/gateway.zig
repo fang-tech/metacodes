@@ -32,6 +32,10 @@ const definition = @import("../runtime/definition.zig");
 const render = @import("../render.zig");
 const provider_mod = @import("../../api/provider.zig");
 const provider_factory = @import("../../api/provider_factory.zig");
+const provider_pool = @import("provider_pool.zig");
+const connection_gate = @import("../../api/connection_gate.zig");
+const psync = @import("platform").sync;
+const util_time = @import("../../util/time.zig");
 const dialect_mod = @import("../../api/dialect.zig");
 const auth_header_mod = @import("../../api/auth_header.zig");
 const types = @import("../../types.zig");
@@ -65,6 +69,9 @@ pub const DEFAULT_OPERATOR = "metacodes";
 /// context, matched by the client's `protocol.MAX_MESSAGE_BYTES`.
 pub const MAX_REQUEST_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_STATE_BYTES: usize = 12 * 1024 * 1024;
+/// First allocation for a request; grown toward `MAX_REQUEST_BYTES` only as
+/// the declared body length demands.
+pub const INITIAL_REQUEST_BYTES: usize = 64 * 1024;
 /// Policy violations reported by the client before the gateway fails the run.
 pub const MAX_POLICY_VIOLATIONS: u32 = 3;
 /// The package directory whose files only the gateway ever reads (§5, §12).
@@ -120,6 +127,11 @@ pub const Options = struct {
     /// Process key for `run_state`; random when null.
     state_key: ?[32]u8 = null,
     currency: []const u8 = "USD",
+    /// Idle window a client's built provider (with its upstream connections)
+    /// stays cached for, keyed by route and credential (design §4). 0 builds
+    /// and discards one per request.
+    provider_cache_ms: u64 = provider_pool.DEFAULT_IDLE_TTL_MS,
+    provider_cache_max: usize = provider_pool.DEFAULT_MAX_ENTRIES,
 };
 
 pub const Gateway = struct {
@@ -130,7 +142,14 @@ pub const Gateway = struct {
     token: []const u8,
     currency: []const u8,
     state_key: [32]u8,
+    pool: provider_pool.Pool,
     next_run: std.atomic.Value(u64) = std.atomic.Value(u64).init(1),
+    /// Timing counters (milliseconds, summed) for `sealed:bench` and
+    /// diagnostics: whole `handle` calls, the shadow loop inside them (model
+    /// wait included), and how many Steps they cover.
+    timing_handle_ms: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    timing_loop_ms: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    timing_steps: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 
     pub fn init(allocator: std.mem.Allocator, skills_dir: []const u8, options: Options) Error!*Gateway {
         const self = allocator.create(Gateway) catch return error.OutOfMemory;
@@ -143,6 +162,7 @@ pub const Gateway = struct {
             .token = "",
             .currency = "",
             .state_key = undefined,
+            .pool = provider_pool.Pool.init(allocator, options.provider_cache_ms, options.provider_cache_max),
         };
         errdefer self.arena.deinit();
         const arena = self.arena.allocator();
@@ -155,9 +175,15 @@ pub const Gateway = struct {
     }
 
     pub fn deinit(self: *Gateway) void {
+        self.pool.deinit();
         self.arena.deinit();
         const allocator = self.allocator;
         allocator.destroy(self);
+    }
+
+    /// Route-cache counters (hits, misses, expiries, evictions, size).
+    pub fn poolStats(self: *Gateway) provider_pool.Stats {
+        return self.pool.snapshot();
     }
 
     pub fn findPackage(self: *const Gateway, skill_id: []const u8) ?*const Package {
@@ -183,6 +209,8 @@ pub const Gateway = struct {
     /// request (the `Sealed-Provider-Credential` header, "" when absent); it
     /// is used for the model calls of this request and nowhere else.
     pub fn handle(self: *Gateway, allocator: std.mem.Allocator, body: []const u8, credential: []const u8) ![]u8 {
+        const started = util_time.nowMs();
+        defer _ = self.timing_handle_ms.fetchAdd(@intCast(util_time.nowMs() - started), .monotonic);
         var scratch = std.heap.ArenaAllocator.init(allocator);
         defer scratch.deinit();
         const arena = scratch.allocator();
@@ -730,6 +758,48 @@ pub const Gateway = struct {
     /// conversation from the state, call the model over the client's route,
     /// serve sealed reads in place, and stop at the first batch of remote
     /// tool uses (a Step) or at the end of the run.
+    /// Everything `provider_pool.Pool.borrow` needs to build a client's
+    /// provider on a cache miss.
+    const ProviderBuild = struct {
+        allocator: std.mem.Allocator,
+        spec: ProviderSpec,
+        credential: []const u8,
+        model: []const u8,
+        max_tokens: u32,
+
+        /// Runs on a cache miss. The provider borrows the strings it is given
+        /// for as long as it lives, and the request they came from is gone by
+        /// the next lease, so every one is copied into the entry's allocator.
+        fn build(self: ProviderBuild, entry_allocator: std.mem.Allocator) anyerror!provider_pool.Built {
+            const secret = try entry_allocator.dupe(u8, self.credential);
+            const kept: ProviderSpec = .{
+                .kind = self.spec.kind,
+                .base_url = try entry_allocator.dupe(u8, self.spec.base_url),
+                .openai_protocol = self.spec.openai_protocol,
+                .auth = .{
+                    .scheme = try entry_allocator.dupe(u8, self.spec.auth.scheme),
+                    .header = try entry_allocator.dupe(u8, self.spec.auth.header),
+                    .value_prefix = try entry_allocator.dupe(u8, self.spec.auth.value_prefix),
+                },
+            };
+            const model = try entry_allocator.dupe(u8, self.model);
+            const owned = try provider_factory.makeProviderWithOptions(
+                self.allocator,
+                kept.kind,
+                secret,
+                model,
+                if (kept.base_url.len != 0) kept.base_url else null,
+                kept.openai_protocol,
+                dialect_mod.Resolver.builtin(),
+                .{
+                    .auth_scheme = kept.auth.toScheme(),
+                    .limits = if (self.max_tokens != 0) .{ .max_tokens_override = self.max_tokens } else null,
+                },
+            );
+            return .{ .owned = owned, .secret = secret };
+        }
+    };
+
     fn advance(
         self: *Gateway,
         arena: std.mem.Allocator,
@@ -748,29 +818,40 @@ pub const Gateway = struct {
             else => return error.RunStateInvalid,
         };
 
-        // The client's provider, for this request only (§8.1).
-        var owned = provider_factory.makeProviderWithOptions(
-            self.allocator,
-            state.provider.kind,
-            credential,
+        // The client's provider for this request (§8.1), lent from the route
+        // cache so consecutive Steps reuse the upstream connection (design
+        // §4). The key covers everything that shapes the route, the
+        // credential included; the lease is exclusive for the request.
+        const key = provider_pool.fingerprint(&.{
+            @tagName(state.provider.kind),
+            state.provider.base_url,
+            @tagName(state.provider.openai_protocol),
+            state.provider.auth.scheme,
+            state.provider.auth.header,
+            state.provider.auth.value_prefix,
             state.model,
-            if (state.provider.base_url.len != 0) state.provider.base_url else null,
-            state.provider.openai_protocol,
-            dialect_mod.Resolver.builtin(),
-            .{
-                .auth_scheme = state.provider.auth.toScheme(),
-                .limits = if (state.max_tokens != 0) .{ .max_tokens_override = state.max_tokens } else null,
-            },
-        ) catch |err| {
+            std.mem.asBytes(&state.max_tokens),
+            credential,
+        });
+        const lease = self.pool.borrow(key, ProviderBuild{
+            .allocator = self.allocator,
+            .spec = state.provider,
+            .credential = credential,
+            .model = state.model,
+            .max_tokens = state.max_tokens,
+        }, ProviderBuild.build) catch |err| {
             log.warn("sealed-gw", "provider setup failed: {s}", .{@errorName(err)});
             return error.UpstreamUnavailable;
         };
-        defer owned.deinit();
-        const prov = owned.provider();
-        if (state.reasoning_effort.len != 0) {
-            if (std.meta.stringToEnum(types.ReasoningEffort, state.reasoning_effort)) |effort| {
-                if (prov.setReasoningEffortFn) |set| set(prov.ctx, effort);
-            }
+        defer lease.release();
+        const prov = lease.provider();
+        // A cached provider keeps the last request's effort; set it every time.
+        if (prov.setReasoningEffortFn) |set| {
+            const effort: ?types.ReasoningEffort = if (state.reasoning_effort.len != 0)
+                std.meta.stringToEnum(types.ReasoningEffort, state.reasoning_effort)
+            else
+                null;
+            set(prov.ctx, effort);
         }
 
         const defs = try toolDefinitions(arena, state.tools, state.provider_tools);
@@ -791,6 +872,11 @@ pub const Gateway = struct {
             .colorize = false,
             .session_id = state.run_id,
         };
+        const loop_started = util_time.nowMs();
+        defer {
+            _ = self.timing_loop_ms.fetchAdd(@intCast(util_time.nowMs() - loop_started), .monotonic);
+            _ = self.timing_steps.fetchAdd(1, .monotonic);
+        }
         const outcome = (if (resume_results) |results|
             agent_loop.resumeRunWithResults(&conversation, prov, defs, &permission, results, opts, &backend, self.allocator)
         else
@@ -1783,6 +1869,26 @@ fn writeId(w: *std.Io.Writer, id: ?std.json.Value) !void {
     } else try w.writeAll("null");
 }
 
+/// A JSON-RPC error whose `data` is `extra_json` with `code` merged in.
+fn rpcErrorWithData(allocator: std.mem.Allocator, id: ?std.json.Value, code: i64, message: []const u8, known: protocol.ErrorCode, extra_json: []const u8) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    const w = &out.writer;
+    try w.writeAll("{\"jsonrpc\":\"2.0\",\"id\":");
+    try writeId(w, id);
+    try w.print(",\"error\":{{\"code\":{d},\"message\":", .{code});
+    try protocol.writeString(w, message);
+    try w.writeAll(",\"data\":{\"code\":");
+    try protocol.writeString(w, known.name());
+    const inner = std.mem.trim(u8, extra_json, " ");
+    if (inner.len > 2 and inner[0] == '{') {
+        try w.writeByte(',');
+        try w.writeAll(inner[1 .. inner.len - 1]);
+    }
+    try w.writeAll("}}}");
+    return out.toOwnedSlice();
+}
+
 fn rpcError(allocator: std.mem.Allocator, id: ?std.json.Value, code: i64, message: []const u8, known: ?protocol.ErrorCode, data_json: ?[]const u8) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();
@@ -1812,24 +1918,115 @@ fn rpcError(allocator: std.mem.Allocator, id: ?std.json.Value, code: i64, messag
 
 // ── HTTP server ───────────────────────────────────────────────────────────
 
-/// Loopback HTTP/1.1 front for a Gateway: one accept loop, requests handled
-/// in order. A reverse proxy terminates TLS and fans out in production; the
-/// reference server exists to run the protocol end to end.
+/// Loopback HTTP/1.1 front for a Gateway (design §3, §6): one accept
+/// thread, a bounded queue, a fixed set of worker threads, and a cap on
+/// Steps whose model call is in flight. Over-capacity requests are refused
+/// before any work is done on them — HTTP 503 with `Retry-After` when no
+/// worker can take the connection, the JSON-RPC `rate_limited` error with
+/// `retry_after_ms` when every model slot is busy — and both mean "not
+/// processed, resend unchanged" (§8.4). A Step is answered as an SSE stream
+/// whose only events are keepalive comments while the model works and the
+/// JSON-RPC response at the end, so proxies and the client's liveness
+/// monitor never see a silent connection. TLS, fan-out across processes and
+/// non-loopback exposure stay a reverse proxy's job.
+pub const ServerOptions = struct {
+    port: u16 = 0,
+    /// Worker threads; 0 = 4 × CPU count (a Step is mostly waiting on the
+    /// upstream model).
+    workers: usize = 0,
+    /// Accepted connections waiting for a worker; 0 = 4 × workers.
+    queue_depth: usize = 0,
+    /// Steps whose model call may be in flight at once; 0 = workers.
+    max_model_calls: usize = 0,
+    /// SSE keepalive interval while a Step is computed; 0 disables.
+    keepalive_ms: u64 = 15_000,
+};
+
+pub const ServerStats = struct {
+    accepted: u64,
+    served: u64,
+    rejected_queue: u64,
+    rejected_model: u64,
+    workers: usize,
+    queue_depth: usize,
+    max_model_calls: usize,
+    /// Summed queue wait (ms) over served connections.
+    queue_wait_ms: u64,
+};
+
+/// What an admission rejection tells the client to wait before resending.
+pub const QUEUE_RETRY_AFTER_MS: u64 = 1_000;
+pub const MODEL_RETRY_AFTER_MS: u64 = 200;
+
+/// A connection waiting for a worker, with when it was accepted.
+const Queued = struct { fd: net.Socket, accepted_ms: u64 };
+
 pub const Server = struct {
     allocator: std.mem.Allocator,
     gateway: *Gateway,
     listener: net.Socket,
     port: u16,
-    thread: std.Thread = undefined,
+    workers_wanted: usize,
+    queue_depth: usize,
+    max_model_calls: usize,
+    keepalive_ms: u64,
+    accept_thread: std.Thread = undefined,
+    workers: []std.Thread = &.{},
     closing: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    mutex: psync.Mutex = .{},
+    cond: psync.Condition = .{},
+    queue: std.ArrayList(Queued) = .empty,
+    model_in_flight: usize = 0,
+    /// Summed milliseconds connections spent between accept and a worker.
+    timing_queue_ms: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    accepted: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    served: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    rejected_queue: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    rejected_model: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 
     pub fn start(allocator: std.mem.Allocator, gateway: *Gateway, port: u16) !*Server {
-        const listener = try net.listenLoopback(port, 16);
+        return startWith(allocator, gateway, .{ .port = port });
+    }
+
+    pub fn startWith(allocator: std.mem.Allocator, gateway: *Gateway, options: ServerOptions) !*Server {
+        const cpus = std.Thread.getCpuCount() catch 1;
+        const workers_wanted = if (options.workers != 0) options.workers else @max(cpus * 4, 4);
+        const queue_depth = if (options.queue_depth != 0) options.queue_depth else workers_wanted * 4;
+        const max_model_calls = if (options.max_model_calls != 0) options.max_model_calls else workers_wanted;
+        // The process-wide request-setup gate counts the wait for a model's
+        // first byte; its CLI default of 8 would cap this server at 8
+        // concurrent model calls (design §3).
+        connection_gate.raiseProcessLimit(max_model_calls);
+        const listener = try net.listenLoopback(options.port, @intCast(@min(queue_depth + workers_wanted, 1024)));
         errdefer net.closeSocket(listener.sock);
         const self = try allocator.create(Server);
         errdefer allocator.destroy(self);
-        self.* = .{ .allocator = allocator, .gateway = gateway, .listener = listener.sock, .port = listener.port };
-        self.thread = try std.Thread.spawn(.{}, acceptLoop, .{self});
+        self.* = .{
+            .allocator = allocator,
+            .gateway = gateway,
+            .listener = listener.sock,
+            .port = listener.port,
+            .workers_wanted = workers_wanted,
+            .queue_depth = queue_depth,
+            .max_model_calls = max_model_calls,
+            .keepalive_ms = options.keepalive_ms,
+        };
+        const workers = try allocator.alloc(std.Thread, workers_wanted);
+        errdefer allocator.free(workers);
+        var spawned: usize = 0;
+        errdefer {
+            self.closing.store(true, .release);
+            self.mutex.lock();
+            self.cond.broadcast();
+            self.mutex.unlock();
+            for (workers[0..spawned]) |thread| thread.join();
+        }
+        for (workers) |*thread| {
+            thread.* = try std.Thread.spawn(.{}, workerLoop, .{self});
+            spawned += 1;
+        }
+        self.workers = workers;
+        self.accept_thread = try std.Thread.spawn(.{}, acceptLoop, .{self});
         return self;
     }
 
@@ -1837,7 +2034,15 @@ pub const Server = struct {
         self.closing.store(true, .release);
         // Wake a blocked accept deterministically on every platform.
         if (net.connectLoopback(self.port)) |wake| net.closeSocket(wake) else |_| {}
-        self.thread.join();
+        self.accept_thread.join();
+        self.mutex.lock();
+        self.cond.broadcast();
+        self.mutex.unlock();
+        for (self.workers) |thread| thread.join();
+        // Connections still queued were never answered; close them.
+        for (self.queue.items) |queued| net.closeSocket(queued.fd);
+        self.queue.deinit(self.allocator);
+        self.allocator.free(self.workers);
         net.closeSocket(self.listener);
         const allocator = self.allocator;
         allocator.destroy(self);
@@ -1845,6 +2050,19 @@ pub const Server = struct {
 
     pub fn url(self: *const Server, allocator: std.mem.Allocator) ![]u8 {
         return std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}/ssp", .{self.port});
+    }
+
+    pub fn stats(self: *Server) ServerStats {
+        return .{
+            .accepted = self.accepted.load(.monotonic),
+            .served = self.served.load(.monotonic),
+            .rejected_queue = self.rejected_queue.load(.monotonic),
+            .rejected_model = self.rejected_model.load(.monotonic),
+            .workers = self.workers_wanted,
+            .queue_depth = self.queue_depth,
+            .max_model_calls = self.max_model_calls,
+            .queue_wait_ms = self.timing_queue_ms.load(.monotonic),
+        };
     }
 
     fn acceptLoop(self: *Server) void {
@@ -1857,8 +2075,54 @@ pub const Server = struct {
                 net.closeSocket(conn);
                 return;
             }
-            self.handleConn(conn);
+            _ = self.accepted.fetchAdd(1, .monotonic);
+            self.mutex.lock();
+            if (self.queue.items.len >= self.queue_depth) {
+                self.mutex.unlock();
+                _ = self.rejected_queue.fetchAdd(1, .monotonic);
+                // Refused before a byte is read: the cheapest possible path.
+                rejectOverloaded(conn, QUEUE_RETRY_AFTER_MS);
+                net.closeSocket(conn);
+                continue;
+            }
+            self.queue.append(self.allocator, .{ .fd = conn, .accepted_ms = @intCast(util_time.nowMs()) }) catch {
+                self.mutex.unlock();
+                net.closeSocket(conn);
+                continue;
+            };
+            self.cond.signal();
+            self.mutex.unlock();
         }
+    }
+
+    fn workerLoop(self: *Server) void {
+        while (true) {
+            self.mutex.lock();
+            while (self.queue.items.len == 0 and !self.closing.load(.acquire)) self.cond.wait(&self.mutex);
+            if (self.queue.items.len == 0) {
+                self.mutex.unlock();
+                return;
+            }
+            const queued = self.queue.orderedRemove(0);
+            self.mutex.unlock();
+            _ = self.timing_queue_ms.fetchAdd(@as(u64, @intCast(util_time.nowMs())) -| queued.accepted_ms, .monotonic);
+            self.handleConn(queued.fd);
+            _ = self.served.fetchAdd(1, .monotonic);
+        }
+    }
+
+    fn tryAcquireModelSlot(self: *Server) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.model_in_flight >= self.max_model_calls) return false;
+        self.model_in_flight += 1;
+        return true;
+    }
+
+    fn releaseModelSlot(self: *Server) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.model_in_flight -= 1;
     }
 
     fn handleConn(self: *Server, fd: net.Socket) void {
@@ -1866,16 +2130,25 @@ pub const Server = struct {
         net.setRecvTimeoutMs(fd, 30_000);
         net.setSendTimeoutMs(fd, 30_000);
         const cap = MAX_REQUEST_BYTES;
-        const buf = self.allocator.alloc(u8, cap) catch return;
-        defer self.allocator.free(buf);
-        // The client's provider credential arrives in this buffer and lives
-        // nowhere else; it is zeroed before the buffer goes back.
-        defer @memset(buf, 0);
+        // The buffer starts small and grows to the declared length: a cap-sized
+        // (16 MiB) buffer allocated and zeroed per connection was the gateway's
+        // largest per-Step cost (design §7, found by `sealed:bench`).
+        var buf = self.allocator.alloc(u8, INITIAL_REQUEST_BYTES) catch return;
         var total: usize = 0;
+        defer {
+            // The client's provider credential arrives in this buffer and
+            // lives nowhere else; what was written is zeroed before it goes back.
+            @memset(buf[0..total], 0);
+            self.allocator.free(buf);
+        }
         var headers_end: ?usize = null;
         var content_length: usize = 0;
-        while (total < cap and headers_end == null) {
-            const n = net.recv(fd, buf[total..cap]);
+        while (headers_end == null) {
+            if (total == buf.len) {
+                if (buf.len >= cap) return;
+                buf = self.allocator.realloc(buf, @min(buf.len * 2, cap)) catch return;
+            }
+            const n = net.recv(fd, buf[total..]);
             if (n <= 0) return;
             total += @intCast(n);
             if (std.mem.indexOf(u8, buf[0..total], "\r\n\r\n")) |i| {
@@ -1884,16 +2157,17 @@ pub const Server = struct {
             }
         }
         const he = headers_end orelse return;
-        const head = buf[0..(he - 4)];
         if (content_length > cap - he) {
             writeResponse(fd, "413 Payload Too Large", "{\"error\":\"too large\"}");
             return;
         }
+        if (he + content_length > buf.len) buf = self.allocator.realloc(buf, he + content_length) catch return;
         while ((total - he) < content_length) {
             const n = net.recv(fd, buf[total .. he + content_length]);
             if (n <= 0) return;
             total += @intCast(n);
         }
+        const head = buf[0..(he - 4)];
         const body = buf[he..total];
 
         const version = headerValue(head, protocol.VERSION_HEADER);
@@ -1908,15 +2182,138 @@ pub const Server = struct {
             return;
         }
         const credential = std.mem.trim(u8, headerValue(head, protocol.PROVIDER_CREDENTIAL_HEADER) orelse "", " ");
+
+        // Admission for the two methods that call the model (design §6):
+        // judged on the request line of the body, before any state is
+        // decrypted, with the retry hint in the JSON-RPC error.
+        const calls_model = bodyCallsModel(body);
+        if (calls_model and !self.tryAcquireModelSlot()) {
+            _ = self.rejected_model.fetchAdd(1, .monotonic);
+            const id = requestId(self.allocator, body);
+            defer if (id) |parsed| parsed.deinit();
+            var data_buf: [64]u8 = undefined;
+            const data = std.fmt.bufPrint(&data_buf, "{{\"retry_after_ms\":{d}}}", .{MODEL_RETRY_AFTER_MS}) catch return;
+            const err = rpcErrorWithData(self.allocator, if (id) |parsed| parsed.value else null, @intFromEnum(protocol.ErrorCode.rate_limited), "every model slot is busy; resend after retry_after_ms", .rate_limited, data) catch return;
+            defer self.allocator.free(err);
+            writeResponse(fd, "200 OK", err);
+            return;
+        }
+        defer if (calls_model) self.releaseModelSlot();
+
+        if (!calls_model) {
+            const response = self.gateway.handle(self.allocator, body, credential) catch |err| {
+                log.warn("sealed-gw", "request failed: {s}", .{@errorName(err)});
+                writeResponse(fd, "500 Internal Server Error", "{\"error\":\"internal\"}");
+                return;
+            };
+            defer self.allocator.free(response);
+            writeResponse(fd, "200 OK", response);
+            return;
+        }
+
+        // A Step: SSE head now, keepalive comments while the model works,
+        // the response as the final event.
+        if (!writeAll(fd, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n")) return;
+        var pinger = Pinger{ .fd = fd, .interval_ms = self.keepalive_ms };
+        pinger.start();
         const response = self.gateway.handle(self.allocator, body, credential) catch |err| {
+            pinger.finish();
             log.warn("sealed-gw", "request failed: {s}", .{@errorName(err)});
-            writeResponse(fd, "500 Internal Server Error", "{\"error\":\"internal\"}");
+            _ = writeAll(fd, "data: {\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32603,\"message\":\"internal\"}}\n\n");
             return;
         };
         defer self.allocator.free(response);
-        writeResponse(fd, "200 OK", response);
+        pinger.finish();
+        if (pinger.failed.load(.acquire)) return;
+        if (!writeAll(fd, "data: ")) return;
+        if (!writeAll(fd, response)) return;
+        _ = writeAll(fd, "\n\n");
     }
 };
+
+/// Keepalive comments on an SSE stream while the worker computes the Step.
+/// `finish` joins the thread before the worker writes the final event, so
+/// the socket never sees two writers at once.
+const Pinger = struct {
+    fd: net.Socket,
+    interval_ms: u64,
+    stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    failed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    thread: ?std.Thread = null,
+
+    fn start(self: *Pinger) void {
+        if (self.interval_ms == 0) return;
+        self.thread = std.Thread.spawn(.{}, loop, .{self}) catch null;
+    }
+
+    fn loop(self: *Pinger) void {
+        while (!self.stop.load(.acquire)) {
+            var waited: u64 = 0;
+            while (waited < self.interval_ms and !self.stop.load(.acquire)) : (waited += 50) util_time.sleepMs(50);
+            if (self.stop.load(.acquire)) return;
+            if (!writeAll(self.fd, ": ping\n\n")) {
+                self.failed.store(true, .release);
+                return;
+            }
+        }
+    }
+
+    fn finish(self: *Pinger) void {
+        self.stop.store(true, .release);
+        if (self.thread) |thread| thread.join();
+        self.thread = null;
+    }
+};
+
+/// Whether the request body names `runs.start` or `runs.continue`, judged
+/// on the method string alone (a cheap scan, no JSON parse).
+fn bodyCallsModel(body: []const u8) bool {
+    return std.mem.indexOf(u8, body, "\"" ++ "sealed/runs.start" ++ "\"") != null or
+        std.mem.indexOf(u8, body, "\"" ++ "sealed/runs.continue" ++ "\"") != null;
+}
+
+/// The JSON-RPC id of a request body, for an error answered before `handle`.
+fn requestId(allocator: std.mem.Allocator, body: []const u8) ?std.json.Parsed(std.json.Value) {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch return null;
+    if (parsed.value != .object) {
+        parsed.deinit();
+        return null;
+    }
+    const id = parsed.value.object.get("id") orelse {
+        parsed.deinit();
+        return null;
+    };
+    parsed.value = id;
+    return parsed;
+}
+
+/// HTTP 503 with `Retry-After` and a JSON-RPC `rate_limited` body: nothing
+/// of the request is parsed, so the client resends it unchanged. The bytes
+/// the client is still sending are drained (bounded) after the answer and
+/// before the close: closing with unread input resets the connection on
+/// Windows and the client never sees the 503.
+fn rejectOverloaded(fd: net.Socket, retry_after_ms: u64) void {
+    defer drainBriefly(fd);
+    var body_buf: [256]u8 = undefined;
+    const body = std.fmt.bufPrint(&body_buf, "{{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{{\"code\":{d},\"message\":\"gateway at capacity; resend after retry_after_ms\",\"data\":{{\"code\":\"rate_limited\",\"retry_after_ms\":{d}}}}}}}", .{ @intFromEnum(protocol.ErrorCode.rate_limited), retry_after_ms }) catch return;
+    var head_buf: [256]u8 = undefined;
+    const retry_after_s = @max(retry_after_ms / 1000, 1);
+    const head = std.fmt.bufPrint(&head_buf, "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nRetry-After: {d}\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n", .{ retry_after_s, body.len }) catch return;
+    if (!writeAll(fd, head)) return;
+    _ = writeAll(fd, body);
+}
+
+/// Read and discard what the peer sends until it stops or a short timeout,
+/// after the response went out (the peer closes once it has read it).
+fn drainBriefly(fd: net.Socket) void {
+    net.setRecvTimeoutMs(fd, 250);
+    var sink: [4096]u8 = undefined;
+    var rounds: u8 = 0;
+    while (rounds < 64) : (rounds += 1) {
+        const n = net.recv(fd, &sink);
+        if (n <= 0) return;
+    }
+}
 
 fn headerValue(head: []const u8, name: []const u8) ?[]const u8 {
     var lines = std.mem.splitSequence(u8, head, "\r\n");

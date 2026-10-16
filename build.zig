@@ -2260,6 +2260,29 @@ pub fn build(b: *std.Build) void {
     );
     plugin_bench_step.dependOn(&b.addRunArtifact(plugin_bench_exe).step);
 
+    // Load benchmark for the sealed gateway (doc/SEALED_GATEWAY_SCALE_DESIGN.md
+    // §10): in-process mock model, N concurrent clients, Steps per second and
+    // gateway overhead percentiles. No provider is called.
+    const sealed_bench_mod = b.createModule(.{
+        .root_source_file = b.path("scripts/sealed_gateway_bench.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    sealed_bench_mod.addImport("metacodes-core", core_mod);
+    addPlatform(b, sealed_bench_mod);
+    const sealed_bench_exe = b.addExecutable(.{
+        .name = "sealed-gateway-bench",
+        .root_module = sealed_bench_mod,
+    });
+    const sealed_bench_run = b.addRunArtifact(sealed_bench_exe);
+    if (b.args) |args| sealed_bench_run.addArgs(args);
+    const sealed_bench_step = b.step(
+        "sealed:bench",
+        "Run the sealed gateway load benchmark (mock model; --concurrency/--runs/--steps/--latency-ms)",
+    );
+    sealed_bench_step.dependOn(&sealed_bench_run.step);
+
     const run_step = b.step("run", "Run the release app");
     const run_cmd = b.addRunArtifact(exe);
     run_step.dependOn(&run_cmd.step);

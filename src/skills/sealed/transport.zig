@@ -26,6 +26,9 @@ pub const Error = error{
     ConnectFailed,
     Aborted,
     Stalled,
+    /// HTTP 503: the gateway refused the request before reading it (§2
+    /// admission); `last_retry_after_ms` says when to resend it unchanged.
+    Overloaded,
     Unauthorized,
     /// A non-2xx status that carried no JSON-RPC body.
     HttpError,
@@ -51,6 +54,8 @@ pub const Client = struct {
     idle_limit_ms: u64 = DEFAULT_IDLE_LIMIT_MS,
     /// Last HTTP status seen, for diagnostics and the ledger.
     last_http_status: u16 = 0,
+    /// From the last 503's `Retry-After` (seconds on the wire), in ms.
+    last_retry_after_ms: u64 = 0,
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, url: []const u8, token: []const u8) Error!Client {
         const owned_url = allocator.dupe(u8, url) catch return error.OutOfMemory;
@@ -152,6 +157,16 @@ pub const Client = struct {
         self.last_http_status = status;
         const content_type = response.head.content_type orelse "";
         const is_sse = std.mem.startsWith(u8, content_type, "text/event-stream");
+        // Headers are read now, before the body reader reuses their buffer.
+        if (status == 503) {
+            self.last_retry_after_ms = 1000;
+            var headers = response.head.iterateHeaders();
+            while (headers.next()) |header| {
+                if (!std.ascii.eqlIgnoreCase(header.name, "retry-after")) continue;
+                const seconds = std.fmt.parseInt(u64, std.mem.trim(u8, header.value, " "), 10) catch continue;
+                self.last_retry_after_ms = seconds * 1000;
+            }
+        }
         var transfer: [16 * 1024]u8 = undefined;
         const reader = response.reader(&transfer);
         const bytes = reader.allocRemaining(self.allocator, .limited(protocol.MAX_MESSAGE_BYTES)) catch |err| switch (err) {
@@ -166,6 +181,7 @@ pub const Client = struct {
             // A JSON-RPC error body (e.g. unsupported_version on 400) is still
             // delivered to the caller as a parsed error response.
             400, 402, 404...499 => if (std.mem.trim(u8, bytes, " \t\r\n").len == 0) return error.HttpError,
+            503 => return error.Overloaded,
             else => return error.HttpError,
         }
         return .{ .kind = if (is_sse) .sse else .json, .bytes = bytes };

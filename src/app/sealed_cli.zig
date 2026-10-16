@@ -32,6 +32,8 @@ const USAGE =
     \\       metacodes sealed unbind <name> <ref>
     \\       metacodes sealed ledger
     \\       metacodes sealed serve --skills <dir> [--listen PORT] [--token T]
+    \\                              [--workers N] [--queue-depth N] [--max-model-calls N]
+    \\                              [--keepalive-ms MS] [--provider-cache-ms MS]
     \\
 ;
 
@@ -360,6 +362,8 @@ fn serve(args: *std.process.Args.Iterator, allocator: std.mem.Allocator) u8 {
     var skills_dir: ?[]const u8 = null;
     var port: u16 = 8787;
     var token: []const u8 = "";
+    var server_options: gateway_mod.ServerOptions = .{};
+    var provider_cache_ms: u64 = (gateway_mod.Options{}).provider_cache_ms;
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--skills")) {
             skills_dir = args.next() orelse return usageError("--skills needs a directory");
@@ -368,6 +372,16 @@ fn serve(args: *std.process.Args.Iterator, allocator: std.mem.Allocator) u8 {
             port = std.fmt.parseInt(u16, raw, 10) catch return usageError("--listen takes a loopback port number");
         } else if (std.mem.eql(u8, arg, "--token")) {
             token = args.next() orelse return usageError("--token needs a value");
+        } else if (std.mem.eql(u8, arg, "--workers")) {
+            server_options.workers = parseCount(args.next()) orelse return usageError("--workers takes a positive number");
+        } else if (std.mem.eql(u8, arg, "--queue-depth")) {
+            server_options.queue_depth = parseCount(args.next()) orelse return usageError("--queue-depth takes a positive number");
+        } else if (std.mem.eql(u8, arg, "--max-model-calls")) {
+            server_options.max_model_calls = parseCount(args.next()) orelse return usageError("--max-model-calls takes a positive number");
+        } else if (std.mem.eql(u8, arg, "--keepalive-ms")) {
+            server_options.keepalive_ms = parseMs(args.next()) orelse return usageError("--keepalive-ms takes a number of milliseconds (0 disables)");
+        } else if (std.mem.eql(u8, arg, "--provider-cache-ms")) {
+            provider_cache_ms = parseMs(args.next()) orelse return usageError("--provider-cache-ms takes a number of milliseconds (0 disables)");
         } else {
             std.debug.print("error: unknown serve argument '{s}'\n", .{arg});
             return 2;
@@ -383,7 +397,7 @@ fn serve(args: *std.process.Args.Iterator, allocator: std.mem.Allocator) u8 {
     platform_signal.installTerminate(onShutdownSignal);
     // The gateway has no model provider of its own: every run calls the
     // model over the client's route and credential (§8.1).
-    const gateway = gateway_mod.Gateway.init(allocator, dir, .{ .token = token }) catch |err| {
+    const gateway = gateway_mod.Gateway.init(allocator, dir, .{ .token = token, .provider_cache_ms = provider_cache_ms }) catch |err| {
         std.debug.print("error: could not load Skill packages from {s} ({s})\n", .{ dir, @errorName(err) });
         return 1;
     };
@@ -391,13 +405,16 @@ fn serve(args: *std.process.Args.Iterator, allocator: std.mem.Allocator) u8 {
     // A port another process holds fails here with BindFailed: the listener
     // binds exclusively (platform/net.zig), so two gateways never share one
     // port and a client never reaches a stale instance by chance.
-    const server = gateway_mod.Server.start(allocator, gateway, port) catch |err| {
+    server_options.port = port;
+    const server = gateway_mod.Server.startWith(allocator, gateway, server_options) catch |err| {
         std.debug.print("error: could not listen on 127.0.0.1:{d} ({s})\n", .{ port, @errorName(err) });
         return 1;
     };
     std.debug.print("sealed gateway: {d} Skill package(s) from {s}\n", .{ gateway.packages.len, dir });
     for (gateway.packages) |package| std.debug.print("  {s}  {s}  {s}  ({d} public asset(s), {d} sealed file(s))\n", .{ package.entry.skill_id, package.name, package.entry.manifest_digest, package.assets.len, package.sealed_files.len });
+    const resolved = server.stats();
     std.debug.print("listening on http://127.0.0.1:{d}/ssp (model calls use each client's own provider{s})\n", .{ server.port, if (token.len == 0) "; no token: open to every local caller" else "" });
+    std.debug.print("capacity: {d} workers, queue {d}, {d} model calls in flight, provider cache {d} ms\n", .{ resolved.workers, resolved.queue_depth, resolved.max_model_calls, provider_cache_ms });
     while (!shutdown.requested()) util_time.sleepMs(50);
     // Join the accept loop and close the listener before the Gateway it
     // serves goes away (the defer above); a request in flight finishes first.
@@ -409,6 +426,17 @@ fn serve(args: *std.process.Args.Iterator, allocator: std.mem.Allocator) u8 {
 /// Signal callback: async-signal-safe, an atomic store and nothing else.
 fn onShutdownSignal() void {
     shutdown.request();
+}
+
+fn parseCount(raw: ?[]const u8) ?usize {
+    const text = raw orelse return null;
+    const value = std.fmt.parseInt(usize, text, 10) catch return null;
+    return if (value == 0) null else value;
+}
+
+fn parseMs(raw: ?[]const u8) ?u64 {
+    const text = raw orelse return null;
+    return std.fmt.parseInt(u64, text, 10) catch null;
 }
 
 fn usageError(message: []const u8) u8 {

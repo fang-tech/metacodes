@@ -32,6 +32,7 @@ const pin_mod = @import("pin.zig");
 const ledger = @import("ledger.zig");
 const credentials = @import("credentials.zig");
 const util_time = @import("../../util/time.zig");
+const util_json = @import("../../util/json.zig");
 const provider_mod = @import("../../api/provider.zig");
 const api_stream = @import("../../api/stream.zig");
 const api_request = @import("../../api/request.zig");
@@ -46,6 +47,11 @@ const SessionId = @import("../../core/session_id.zig").SessionId;
 const AbortSignal = @import("../../util/abort.zig").AbortSignal;
 
 pub const DEFAULT_MAX_COST_MICROS: i64 = 500_000;
+/// Admission retries (§2): how often a refused Step is resent before the
+/// run fails, and the bounds on each wait the gateway may ask for.
+pub const MAX_ADMISSION_RETRIES: u32 = 8;
+pub const MIN_ADMISSION_WAIT_MS: u64 = 100;
+pub const MAX_ADMISSION_WAIT_MS: u64 = 30_000;
 pub const DEFAULT_MAX_STEPS: u64 = 200;
 const POLICY_CANCEL_TEXT = "[sealed skill cancelled: the gateway requested tools outside the pinned policy (allowlist or egress classes)]";
 
@@ -450,7 +456,7 @@ pub const SealedSkillProvider = struct {
             .max_tokens = self.origin.maxTokensFor(model_override),
             .reasoning_effort = if (self.origin.reasoningEffort()) |effort| @tagName(effort) else "",
         });
-        var response = self.transport.call(.runs_start, params.written(), abort) catch |err| return self.transportFailure(err);
+        var response = try self.callAdmitted(.runs_start, params.written(), abort);
         defer response.deinit();
         return self.consumeResponse(&response, null);
     }
@@ -546,7 +552,7 @@ pub const SealedSkillProvider = struct {
         try self.recordResults(arena, results, digest);
         var params: std.Io.Writer.Allocating = .init(arena);
         try protocol.writeContinueParams(&params.writer, run.run_id, run.run_state, run.seq, results);
-        var response = self.transport.call(.runs_continue, params.written(), abort) catch |err| return self.transportFailure(err);
+        var response = try self.callAdmitted(.runs_continue, params.written(), abort);
         defer response.deinit();
         return self.consumeResponse(&response, abort);
     }
@@ -925,6 +931,43 @@ pub const SealedSkillProvider = struct {
             var parsed = protocol.parseStep(self.allocator, response.response.result) catch return;
             defer parsed.deinit();
             self.recordStep(&parsed.step);
+        }
+    }
+
+    /// §2 and §8.4: an admission rejection — HTTP 503 with `Retry-After`, or
+    /// the JSON-RPC `rate_limited` error with `retry_after_ms` — means the
+    /// gateway did not process the request, so it is resent unchanged after
+    /// the wait it named. Bounded in attempts and per-wait, abortable.
+    fn callAdmitted(self: *SealedSkillProvider, method: protocol.Method, params_json: []const u8, abort: ?*const AbortSignal) anyerror!protocol.ParsedResponse {
+        var attempt: u32 = 0;
+        while (true) : (attempt += 1) {
+            var response = self.transport.call(method, params_json, abort) catch |err| switch (err) {
+                error.Overloaded => {
+                    if (attempt >= MAX_ADMISSION_RETRIES) return self.transportFailure(err);
+                    try self.waitAdmission(self.transport.last_retry_after_ms, abort, "at capacity");
+                    continue;
+                },
+                else => return self.transportFailure(err),
+            };
+            if (response.response == .err) {
+                if (response.response.err.known) |known| if (known == .rate_limited and attempt < MAX_ADMISSION_RETRIES) {
+                    const wait = util_json.extractIntField(response.response.err.data_json, "retry_after_ms");
+                    response.deinit();
+                    try self.waitAdmission(wait, abort, "model slots busy");
+                    continue;
+                };
+            }
+            return response;
+        }
+    }
+
+    fn waitAdmission(self: *SealedSkillProvider, requested_ms: u64, abort: ?*const AbortSignal, why: []const u8) anyerror!void {
+        const wait_ms = @min(@max(requested_ms, MIN_ADMISSION_WAIT_MS), MAX_ADMISSION_WAIT_MS);
+        log.info("sealed", "gateway {s} {s}; resending in {d} ms", .{ self.pin.pin.gateway_url, why, wait_ms });
+        var waited: u64 = 0;
+        while (waited < wait_ms) : (waited += 50) {
+            if (abort) |signal| if (signal.isAborted()) return error.Aborted;
+            util_time.sleepMs(@min(50, wait_ms - waited));
         }
     }
 

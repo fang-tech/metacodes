@@ -21,6 +21,9 @@ Run `zig build gate:pr` to execute the single AGENTS.md pre-submit checklist.
 
 ## Kernel design
 
+- [Sealed gateway at scale](SEALED_GATEWAY_SCALE_DESIGN.md) — worker pool,
+  admission, route-keyed provider cache, SSE keepalive, the load benchmark
+  and the numbers that are the claim.
 - [Core reference](CORE_REFERENCE.md)
 - [Stall gate](STALL_GATE_DESIGN.md) — the in-run breaker for tool rounds that
   keep returning nothing new.
