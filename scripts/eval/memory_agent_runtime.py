@@ -1568,6 +1568,10 @@ def _parse_result(stdout: str) -> Mapping[str, Any]:
     # every current build. Older receipts predate them, so replay fills the
     # defaults rather than rejecting the row -- same rule as cache telemetry.
     semantic_fields = {"text_kind", "file_changes"}
+    # max_tokens continuation count (issue #269). Every current build emits it;
+    # a receipt from before it was added had no way to report one, and replay
+    # reads that as 0 -- the same rule again, never a partially upgraded row.
+    continuation_fields = {"continuations"}
 
     def _semantic_defaults(row):
         # A pre-contract receipt carries text but no classification. Defaulting
@@ -1584,20 +1588,25 @@ def _parse_result(stdout: str) -> Mapping[str, Any]:
         }
 
     observed_fields = set(result)
+    current_fields = legacy_fields | cache_fields | semantic_fields | continuation_fields
     if observed_fields in (legacy_fields, legacy_fields | cache_fields):
         # Historical receipts predate public cache telemetry. Preserve replay
         # compatibility without accepting a partially upgraded schema.
         result = dict(result)
         result.update({key: 0 for key in cache_fields if key not in result})
         result.update(_semantic_defaults(result))
+        result.update({key: 0 for key in continuation_fields})
     elif observed_fields == legacy_fields | semantic_fields:
         result = dict(result)
         result.update({key: 0 for key in cache_fields})
-    elif observed_fields != legacy_fields | cache_fields | semantic_fields:
-        expected = legacy_fields | cache_fields | semantic_fields
+        result.update({key: 0 for key in continuation_fields})
+    elif observed_fields == legacy_fields | cache_fields | semantic_fields:
+        result = dict(result)
+        result.update({key: 0 for key in continuation_fields})
+    elif observed_fields != current_fields:
         _fail(
             "native metacodes result",
-            f"unexpected fields: {sorted(observed_fields ^ expected)}",
+            f"unexpected fields: {sorted(observed_fields ^ current_fields)}",
         )
     if not isinstance(result["text_kind"], str) or result["text_kind"] not in (
         "final",
@@ -1633,6 +1642,7 @@ def _parse_result(stdout: str) -> Mapping[str, Any]:
     for key in (
         "turns",
         "tool_calls",
+        "continuations",
         "input_tokens",
         "output_tokens",
         "cache_read_input_tokens",
