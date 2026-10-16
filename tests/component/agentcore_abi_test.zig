@@ -10206,6 +10206,15 @@ test "L2 Revision 22 OFF adds no date, and a Host currentDate block is the Run's
     try std.testing.expect(std.mem.indexOf(u8, body, "Today's date is ") == null);
 }
 
+fn expectTimeContextReason(fixture: *PublicSessionFixture, reason: []const u8) !void {
+    defer fixture.releaseDiagnostic();
+    const text = try sdk.borrowedBytes(.{ .ptr = fixture.diagnostic.ptr, .len = fixture.diagnostic.len });
+    if (std.mem.indexOf(u8, text, reason) == null) {
+        std.debug.print("expected {s} in diagnostic: {s}\n", .{ reason, text });
+        return error.TestUnexpectedDiagnostic;
+    }
+}
+
 test "Revision 22 time context is validated before a Run is admitted (issue #276)" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -10220,14 +10229,16 @@ test "Revision 22 time context is validated before a Run is admitted (issue #276
     var result = std.mem.zeroes(wire.RunResultV1);
     const host_date = [_]wire.ContextBlockV1{.{ .struct_size = @sizeOf(wire.ContextBlockV1), .reserved0 = 0, .label = sdk.bytesView("currentDate"), .text = sdk.bytesView("Today is Host day."), .reserved = [_]u64{0} ** 2 }};
 
-    const Case = struct { code: u32, offset: i32, host_block: bool = false };
+    // Each refusal names the time-context rule it broke, not a later check
+    // that happens to refuse the same input.
+    const Case = struct { code: u32, offset: i32, host_block: bool = false, reason: []const u8 = "InvalidTimeContext" };
     for ([_]Case{
         .{ .code = 3, .offset = 0 }, // unknown code
         .{ .code = wire.TIME_CONTEXT_SYSTEM, .offset = 60 }, // an offset without UTC_OFFSET
         .{ .code = wire.TIME_CONTEXT_OFF, .offset = -60 },
         .{ .code = wire.TIME_CONTEXT_UTC_OFFSET, .offset = wire.MAX_UTC_OFFSET_MINUTES_V1 + 1 },
         .{ .code = wire.TIME_CONTEXT_UTC_OFFSET, .offset = wire.MIN_UTC_OFFSET_MINUTES_V1 - 1 },
-        .{ .code = wire.TIME_CONTEXT_UTC_OFFSET, .offset = 480, .host_block = true }, // two answers
+        .{ .code = wire.TIME_CONTEXT_UTC_OFFSET, .offset = 480, .host_block = true, .reason = "ConflictingTimeContext" }, // two answers
     }) |case| {
         var options = std.mem.zeroes(wire.RunOptionsV1);
         options.struct_size = @sizeOf(wire.RunOptionsV1);
@@ -10239,7 +10250,7 @@ test "Revision 22 time context is validated before a Run is admitted (issue #276
             options.context_block_count = host_date.len;
         }
         try std.testing.expectEqual(wire.STATUS_INVALID_ARGUMENT, fixture.api.session().runText(fixture.session, 1, sdk.bytesView("x"), &options, &result, &fixture.diagnostic));
-        fixture.releaseDiagnostic();
+        try expectTimeContextReason(&fixture, case.reason);
     }
     // A Skill invocation carries no context, so it takes no offset either.
     var skill_input = std.mem.zeroes(wire.RunInputV1);
@@ -10251,7 +10262,7 @@ test "Revision 22 time context is validated before a Run is admitted (issue #276
     skill_options.time_context_code = wire.TIME_CONTEXT_UTC_OFFSET;
     skill_options.utc_offset_minutes = 60;
     try std.testing.expectEqual(wire.STATUS_INVALID_ARGUMENT, fixture.api.session().runInput()(fixture.session, 1, &skill_input, &skill_options, &result, &fixture.diagnostic));
-    fixture.releaseDiagnostic();
+    try expectTimeContextReason(&fixture, "InvalidTimeContext");
     // Nothing was sent and Run 1 was never admitted.
     try std.testing.expectEqual(@as(usize, 0), server.requestCount());
     var ok_options = std.mem.zeroes(wire.RunOptionsV1);
