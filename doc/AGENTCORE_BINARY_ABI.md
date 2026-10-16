@@ -47,7 +47,7 @@ table pointers. Every table is mandatory at discovery; consumers simply avoid
 calling domains they do not use. There is no `query_interface`, string ID,
 optional-capability negotiation, or compatibility shim:
 
-- `metask_agentcore_api_v1` is 64 bytes and requires `abi_revision == 21`;
+- `metask_agentcore_api_v1` is 64 bytes and requires `abi_revision == 22`;
 - Runtime, Session, Session Control, Skill, and MCP tables are respectively
   24, 48, 80, 32, and 40 bytes;
 - the root plus child tables expose 24 functions: root `buffer_release` and
