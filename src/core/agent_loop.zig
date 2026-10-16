@@ -969,6 +969,55 @@ pub fn drainFileChangesForTest(
 
 /// One mapping for every way a Run can be stopped from outside: only the
 /// evaluation budget is a `budget` stop, everything else is `aborted`.
+fn hasServerTool(defs: []const json_mod.ToolDefinition) bool {
+    for (defs) |def| if (def.server_type != null) return true;
+    return false;
+}
+
+/// Every entry point checks before it changes anything: `run` before any
+/// request, `resumeRun` and `resumeRunWithResults` before they append the
+/// resumed tool results.
+fn refuseServerTools(tool_defs: []const json_mod.ToolDefinition, opts: Options) error{ServerToolsUnsupported}!void {
+    if (hasServerTool(tool_defs) or (if (opts.tool_defs) |defs| hasServerTool(defs) else false))
+        return error.ServerToolsUnsupported;
+}
+
+test "run refuses provider server tools it cannot represent" {
+    const a = std.testing.allocator;
+    var c = Conversation.init(a);
+    defer c.deinit();
+    try c.appendText(.user, "search the web");
+    var state = TestProviderState{};
+    const perm = permission_mod.createContext(.bypass_permissions, a);
+    const Null = struct {
+        fn emit(_: *anyopaque, _: @import("session_id.zig").SessionId, _: CoreEvent) void {}
+        fn poll(_: *anyopaque, _: @import("session_id.zig").SessionId) ?@import("protocol/ui_event.zig").UiEvent {
+            return null;
+        }
+    };
+    var dummy: u8 = 0;
+    const backend = UiBackend{ .ctx = @ptrCast(&dummy), .emit = Null.emit, .poll = Null.poll };
+    const server_tool = [_]json_mod.ToolDefinition{.{
+        .name = "web_search",
+        .description = "",
+        .input_schema = .{ .type = "object", .properties = null, .required = &.{} },
+        .server_type = "web_search_20250305",
+    }};
+    // Through either seam, before any provider request (this provider fails
+    // the Run on any request) and without touching the Conversation.
+    try std.testing.expectError(error.ServerToolsUnsupported, run(&c, testProvider(&state), &server_tool, &perm, .{ .max_turns = 1, .colorize = false }, &backend, a));
+    try std.testing.expectError(error.ServerToolsUnsupported, run(&c, testProvider(&state), &.{}, &perm, .{ .max_turns = 1, .colorize = false, .tool_defs = &server_tool }, &backend, a));
+    try std.testing.expectEqual(@as(usize, 1), c.len());
+    // resumeRun refuses before it appends the resumed tool result.
+    try std.testing.expectError(error.ServerToolsUnsupported, resumeRun(&c, testProvider(&state), &server_tool, &perm, "tu_1", "{}", &.{}, .{ .max_turns = 1, .colorize = false }, &backend, a));
+    try std.testing.expectError(error.ServerToolsUnsupported, resumeRun(&c, testProvider(&state), &.{}, &perm, "tu_1", "{}", &.{}, .{ .max_turns = 1, .colorize = false, .tool_defs = &server_tool }, &backend, a));
+    // So does resumeRunWithResults (the sealed gateway's seam).
+    const results = [_]SuspendInfo.CompletedResult{.{ .tool_use_id = "tu_1", .content = "{}", .is_error = false }};
+    try std.testing.expectError(error.ServerToolsUnsupported, resumeRunWithResults(&c, testProvider(&state), &server_tool, &perm, &results, .{ .max_turns = 1, .colorize = false }, &backend, a));
+    try std.testing.expectError(error.ServerToolsUnsupported, resumeRunWithResults(&c, testProvider(&state), &.{}, &perm, &results, .{ .max_turns = 1, .colorize = false, .tool_defs = &server_tool }, &backend, a));
+    try std.testing.expectEqual(@as(usize, 1), c.len());
+}
+
 fn stopReasonForReason(reason: @import("../util/abort.zig").Reason) StopReason {
     return if (reason == .evaluation_budget) .budget else .aborted;
 }
@@ -1074,6 +1123,14 @@ pub fn run(
     backend: *const UiBackend,
     allocator: std.mem.Allocator,
 ) !RunResult {
+    // Provider server tools (`server_type`, e.g. Anthropic web_search) are not
+    // representable in this loop: their server_tool_use / result blocks are
+    // not kept in the Conversation, and a turn the server pauses (`pause_turn`)
+    // could only be resumed by sending those blocks back verbatim. Refuse them
+    // here rather than truncate such turns silently. AgentSession's tool
+    // catalog already rejects them; WebSearch keeps its server tool inside its
+    // own isolated sub-request.
+    try refuseServerTools(tool_defs, opts);
     // Run-wide counters that every return path reports. They live here rather
     // than in each of the loop's many result literals, so no exit can forget one.
     var counters: RunCounters = .{};
@@ -3941,6 +3998,8 @@ pub fn resumeRunWithResults(
     allocator: std.mem.Allocator,
 ) !RunResult {
     if (results.len == 0) return error.NoResultsToResume;
+    // Refused before the results are appended, as in `resumeRun`.
+    try refuseServerTools(tool_defs, opts);
     var blocks: std.ArrayList(msg.Block) = .empty;
     errdefer {
         for (blocks.items) |block| block.deinit(allocator);
@@ -3974,6 +4033,9 @@ pub fn resumeRun(
     backend: *const UiBackend,
     allocator: std.mem.Allocator,
 ) !RunResult {
+    // Refused before the resumed results are appended: a refused resume must
+    // leave the Conversation exactly as it was.
+    try refuseServerTools(tool_defs, opts);
     // 一条 user 消息,内含挂起点的迟来结果 + 所有同轮已完成工具的结果(同 turn 配对)。
     var blocks: std.ArrayList(msg.Block) = .empty;
     errdefer blocks.deinit(allocator);

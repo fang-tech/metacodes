@@ -258,6 +258,17 @@ status, compatibility boundaries, and entry points are defined by
   the disclosure channel (§1.1, §8.5) and creator payment (§12).
   `doc/SKILLS_AND_MCP.md` no longer says usage is charged to the gateway
   account.
+- `agent_loop.run` refuses provider server tools: a tool definition with
+  `server_type` (in `tool_defs` or `Options.tool_defs`) returns
+  `error.ServerToolsUnsupported` before any request (`resumeRun` and
+  `resumeRunWithResults` before they append the resumed tool results). The
+  loop keeps no server_tool_use or server result blocks, so a turn the
+  server pauses (`pause_turn`) could only be truncated. `AgentSession`'s
+  tool catalog already rejected them; only direct source-level callers of
+  `run` are affected. For the same reason a Sealed Skill gateway refuses a
+  `runs.start` whose `provider_tools` is not empty with `invalid params`
+  naming the field, before any model call; the client's fork never sends
+  one.
 - `--web`/`serve`: `user_message` is journaled by the session when the
   message's turn starts, no longer by the transport when the message is
   queued, so it always means "this turn started with this text". A message
@@ -395,6 +406,16 @@ status, compatibility boundaries, and entry points are defined by
   200 body is incomplete too, rather than an empty answer. Gemini
   `CONTINUATION` (the answer reached the per-request limit but is not finished)
   now drives the same continuation as `max_tokens`.
+- `WebSearch` no longer passes off a search the server paused as a complete
+  one. Its internal search request is the only one that carries a server tool,
+  and when Anthropic stops it with `pause_turn` (the server-side search loop
+  reached its iteration limit) the result now starts with a note that it may
+  be incomplete; with nothing returned yet it fails as `WebSearchIncomplete`
+  rather than saying "No search results found". The search is not resumed:
+  resuming means sending the paused response back verbatim, server blocks
+  included, which this request does not keep. The agent loop's own requests
+  carry no server tools (see the `agent_loop.run` change above), so they
+  never end in `pause_turn`.
 - OpenAI Chat Completions streams no longer drop text (issue #258). metacodes
   always asks for `stream_options.include_usage`, under which every ordinary
   chunk carries `"usage": null`; the parser took any chunk containing the key

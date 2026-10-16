@@ -215,7 +215,7 @@ id is unknown or not visible to this subscriber.
                "openai_protocol": "chat_completions" | "responses"?,
                "auth": {"scheme": "bearer" | "api_key_header" | "custom_header",
                         "header": "x-api-key"?, "value_prefix": ""?}?},
-  "provider_tools": [<provider-side server tool blocks the fork's request would carry>],
+  "provider_tools": []?,
   "request": {"model": "claude-sonnet-4-5", "max_tokens": 8192, "reasoning_effort": "high"?}
 }
 ```
@@ -228,6 +228,13 @@ id is unknown or not visible to this subscriber.
   `tools.deny`, in the client's own schema dialect. A gateway MUST request
   only tools listed here, by exactly these names and against these schemas;
   it MUST NOT assume a tool exists because the manifest allows it.
+- `provider_tools` is reserved for the provider-side server tools the
+  fork's request would carry, and in this revision it MUST be absent or
+  empty: the agent loop keeps no server-tool blocks, so a turn the provider
+  pauses (`pause_turn`) could only be truncated, and the client's own fork
+  refuses such tools before its first request. A gateway MUST refuse a
+  non-empty list with `invalid params` naming `provider_tools`, before any
+  model call.
 - `budget.max_cost_micros` is the cap for this run in micro-units of
   `currency` (USD 0.50 is `500000`): a cap on the gateway's estimate of
   what the run's model calls cost on the client's own account (§8.2). The
@@ -740,7 +747,8 @@ call.
   loop with a `SealedSkillProvider` in place of the model provider. Its
   first `sendStream` sends `runs.start` with the fork's system prompt, the
   tool definitions the loop handed it (allowlist-filtered, deferred tools
-  flagged, provider-side server tools as `provider_tools`), the model, the
+  flagged; `provider_tools` stays empty, since the loop refuses provider
+  server tools before its first request), the model, the
   output cap and reasoning effort of the session's own provider, that
   provider's route and, in the header, its credential; `runs.continue`
   follows with the new `tool_result` blocks. Each Step is replayed as
@@ -877,11 +885,13 @@ shared with the instance that holds it.
   from the client's `provider` route and `request` model with the
   credential in the request's header, through the same provider factory the
   CLI uses, and releases it with the request (§8.1). A request without the
-  header is refused with `invalid params` naming the header.
+  header is refused with `invalid params` naming the header, and a
+  `runs.start` with a non-empty `provider_tools` with `invalid params`
+  naming that field (§3.4).
 - **The shadow loop.** The brain is the client's own `agent_loop`, run on
   the gateway with the client's system prompt, tool definitions (deferred
-  flags preserved, so `ToolSearch` stays or goes as it would on the client)
-  and provider tools, the body rendered with the user's arguments as the
+  flags preserved, so `ToolSearch` stays or goes as it would on the client),
+  the body rendered with the user's arguments as the
   first user turn behind `Base directory for this skill: <base_dir>`, a
   bypass permission context (the client is the permission authority), no
   hooks, no settings, no memory, no task store, nothing loaded from the

@@ -1812,6 +1812,12 @@ built-in. `WebSearch` uses the Session's configured internal web
 service/provider; it is an ordinary function tool rather than a
 provider-specific server-tool descriptor. The Host may select `WebSearch` in
 `builtin_tools`, but does not provide or register an executor callback for it.
+Its internal search request is the only request that carries a server tool, so
+it is the only one that can end in Anthropic's `pause_turn` (the server-side
+search loop reached its iteration limit). `WebSearch` does not resume it: it
+puts a note that the results may be incomplete in front of whatever arrived,
+and when nothing arrived it fails as `WebSearchIncomplete` instead of reporting
+an empty search. The Run's own requests carry no server tools.
 `WebFetch` is also Session-available, but it currently uses the tool's direct
 HTTP/subprocess implementation rather than the Session provider; its network
 and redirect policy remains the owning tool's contract. Existing WebFetch
