@@ -817,7 +817,11 @@ and any other files as public assets (§12); the manifest is canonicalized
 and digested at load, the assets are listed in the Entry with their
 digests, and the body and the sealed files never leave the process. The
 server listens on loopback only and answers requests in order; TLS,
-fan-out and non-loopback exposure are a reverse proxy's job.
+fan-out and non-loopback exposure are a reverse proxy's job. It stops on
+Ctrl+C (SIGINT; also SIGTERM/SIGHUP, or the console closing on Windows):
+the accept loop is joined, the listener closed and the packages freed
+before the process exits. A port already in use is refused at start, never
+shared with the instance that holds it.
 
 - **No provider.** The gateway has no model credentials and no `--provider`
   flags. For every `runs.start` and `runs.continue` it builds a provider

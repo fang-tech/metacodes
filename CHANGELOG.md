@@ -303,6 +303,18 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- `metacodes sealed serve` stops cleanly. Ctrl+C (SIGINT; also SIGTERM and
+  SIGHUP, or the console closing on Windows) now only raises the process-wide
+  shutdown flag, and the main thread stops the HTTP server, joins its accept
+  loop, frees the Gateway and exits 0 within a 50 ms poll tick. Before,
+  `serve` slept forever and looked at no signal, so the console's default
+  handler was all that ended it; on Windows that handler runs on its own
+  thread while the accept loop is still running, and a gateway left behind
+  this way kept `zig-out/bin/metacodes.exe` and its port. A second `serve`
+  on a port in use is refused with `BindFailed` rather than sharing it
+  (`platform/net.zig` binds with SO_EXCLUSIVEADDRUSE on Windows and
+  SO_REUSEADDR elsewhere, neither of which admits a second listener); a
+  platform test and an L2 now assert it.
 - OpenAI Chat Completions streams no longer drop text (issue #258). metacodes
   always asks for `stream_options.include_usage`, under which every ordinary
   chunk carries `"usage": null`; the parser took any chunk containing the key
