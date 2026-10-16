@@ -12,6 +12,13 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Added
 
+- Sealed Skills: the §8.5 disclosure screen keeps two corpora under their
+  own policies — the Skill's instructions and its `sealed/` references —
+  so `egress.disclosure` is one word for both or
+  `{"body": "redact", "references": "off"}`. A documentation Skill whose
+  references were being replaced by `[sealed]` when cited (seen with the
+  Browser Use Cloud reference skill) sets `references` to `off` and keeps
+  its instructions screened; the install summary shows both policies.
 - Sealed gateway at scale ([doc/SEALED_GATEWAY_SCALE_DESIGN.md](doc/SEALED_GATEWAY_SCALE_DESIGN.md)):
   `metacodes sealed serve` runs a bounded worker pool with a queue and a cap
   on in-flight model calls, refuses over-capacity requests before reading
