@@ -11,7 +11,7 @@ artifact store, and TinyKG admission are not replaceable extensions.
 | CLI | `metacodes-<version>-<target-id>/bin/metacodes` (the release unit, `release/LAYOUT.md`; `zig-out/bin/metacodes` in a development tree) | pre-1.0 | flags may evolve with changelog notice; `manifest.json` records version, commit, target, contract numbers and every file's digest |
 | Provider control plane | `src/provider/` kernel API | experimental | schema-versioned documents and revisioned mutations |
 | Zig source API | `@import("metacodes-core")` | experimental | pin repository commit and Zig toolchain |
-| AgentCore C ABI | `metask_agentcore_get_api(1)` | experimental rev 20 | exact root/child layouts and bundle manifest |
+| AgentCore C ABI | `metask_agentcore_get_api(1)` | experimental rev 21 | exact root/child layouts and bundle manifest |
 | Process plugins | strict manifest + stdio protocol | versioned v1 | reject unknown fields and digest drift |
 | Plugin inventory | `--dump-plugins`, Zig, Web state | versioned v1 | additive observation fields only where specified |
 | TinyKG executable distribution | `vendor/tinykg/manifest.json` | bundle v1 | exact target, format, source commit, and SHA-256 pinning |

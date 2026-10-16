@@ -198,7 +198,7 @@ test "version json has the documented shape" {
     try std.testing.expectEqualStrings("x86_64-linux-gnu", root.get("target").?.string);
     const contract = root.get("contract").?.object;
     try std.testing.expectEqual(@as(i64, 1), contract.get("binary_abi_version").?.integer);
-    try std.testing.expectEqual(@as(i64, 20), contract.get("binary_abi_revision").?.integer);
+    try std.testing.expectEqual(@as(i64, 21), contract.get("binary_abi_revision").?.integer);
     try std.testing.expectEqual(@as(i64, config.SCHEMA_VERSION), contract.get("config_schema_version").?.integer);
     const assets = root.get("expected_runtime_assets").?.array.items;
     try std.testing.expectEqual(@as(usize, 2), assets.len);
