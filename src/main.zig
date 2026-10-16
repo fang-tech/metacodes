@@ -81,6 +81,7 @@ pub const api_dialect = @import("api/dialect.zig");
 pub const api_request = @import("api/request.zig");
 pub const api_request_overrides = @import("api/request_overrides.zig");
 pub const model_adapter = @import("api/model_adapter.zig");
+pub const image_capability = @import("api/image_capability.zig");
 pub const model_tiers = @import("api/model_tiers.zig");
 pub const client_mod = client; // alias for L2 component tests
 pub const api_last_error = @import("api/last_error.zig"); // L2 stream liveness tests read the TUI-facing error text

@@ -17,6 +17,7 @@
 
 const std = @import("std");
 const types = @import("../types.zig");
+const image_capability = @import("image_capability.zig");
 const json_mod = @import("../json.zig");
 const api_stream = @import("stream.zig");
 const request_overrides = @import("request_overrides.zig");
@@ -447,6 +448,12 @@ pub const Provider = struct {
     /// 不是按父模型答。可选:答不了的 provider 保持返回自己的答案,与 maxTokensForFn
     /// 同一约定。
     supportsForModelFn: ?*const fn (ctx: *anyopaque, cap: Capability, model: []const u8) bool = null,
+    /// Image input for `model` together with who said so (issue #273): the
+    /// Host, the provider catalog, the family table, or nobody. Optional; a
+    /// provider without it answers through `supportsForModel` with the
+    /// source `model_family` for yes and `unknown` for no - it never claims
+    /// a model is known not to take images.
+    imageInputFn: ?*const fn (ctx: *anyopaque, model: []const u8) image_capability.Resolution = null,
     /// 本路由目录里声明能收图的模型名(借用 provider 内存;调用方只释放外层 slice)。
     /// 可选:没有目录的 provider 不实现,调用方视为"不知道",不编造候选。
     visionModelsFn: ?*const fn (ctx: *anyopaque, allocator: std.mem.Allocator) anyerror![]const []const u8 = null,
@@ -539,6 +546,15 @@ pub const Provider = struct {
         const name = model_override orelse return self.supports(cap);
         const resolve = self.supportsForModelFn orelse return self.supports(cap);
         return resolve(self.ctx, cap, name);
+    }
+    /// Image input for the model a request will name, with its source. The
+    /// AgentCore preflight uses this to tell "known not to take images" from
+    /// "nothing says it does".
+    pub fn imageInput(self: Provider, model_override: ?[]const u8) image_capability.Resolution {
+        const name = model_override orelse self.model();
+        if (self.imageInputFn) |resolve| return resolve(self.ctx, name);
+        const supported = self.supportsForModel(.image_input, model_override);
+        return .{ .supported = supported, .source = if (supported) .model_family else .unknown };
     }
     /// 目录声明能收图的模型名;provider 没有目录 → 空 slice(不是错误)。
     pub inline fn visionModels(self: Provider, allocator: std.mem.Allocator) anyerror![]const []const u8 {

@@ -10,6 +10,7 @@ const ResponseStatus = @import("api/http_status.zig").ResponseStatus;
 const error_class = @import("api/error_class.zig");
 const last_error = @import("api/last_error.zig");
 const Catalog = @import("api/catalog.zig").Catalog;
+const image_capability = @import("api/image_capability.zig");
 const AbortSignal = @import("util/abort.zig").AbortSignal;
 const provider_mod = @import("api/provider.zig");
 const liveness_reader = @import("api/liveness_reader.zig");
@@ -387,6 +388,9 @@ pub const Client = struct {
     base_url: []const u8,
     /// 模型 catalog——启动时 `probeModels` 填充。构造后为空，调 probeModels 再生效。
     catalog: Catalog,
+    /// Host declarations about models' image input (issue #273). They outrank
+    /// the catalog: the Host knows its own route. Owned; empty by default.
+    host_capabilities: image_capability.Declarations = .{},
     /// 模型上下文窗口表(~/.metacode/models.toml)。precedence:命中此表 > catalog probe > 200K。
     /// App 持有,借用不拥有(null = 未挂,落 catalog)。
     model_context: ?*const @import("app/model_context.zig").ModelContext = null,
@@ -452,6 +456,7 @@ pub const Client = struct {
         client.abort_registry.deinit(client.allocator);
         client.http_client.deinit();
         client.catalog.deinit();
+        client.host_capabilities.deinit();
     }
 
     pub fn serverRequestId(client: *const Client) []const u8 {
@@ -494,6 +499,7 @@ pub const Client = struct {
             // requestOverridesFn 走 default(返全 null),setRequestOverridesFn 留 null(setter 调用返 error)
             .supportsFn = &pSupports,
             .supportsForModelFn = &pSupportsForModel,
+            .imageInputFn = &pImageInput,
             .visionModelsFn = &pVisionModels,
             .requestIdTextFn = &pRequestIdText,
             .serverRequestIdFn = &pServerRequestId,
@@ -578,16 +584,20 @@ pub const Client = struct {
     fn pSupportsForModel(ctx: *anyopaque, cap: provider_mod.Capability, model: []const u8) bool {
         return asClient(ctx).supportsForModel(cap, model);
     }
+    fn pImageInput(ctx: *anyopaque, model: []const u8) image_capability.Resolution {
+        const profile = asClient(ctx).dialectFor(model).profileFor(.anthropic, model);
+        return .{ .supported = profile.supports_image_input, .source = profile.image_input_source };
+    }
     fn pVisionModels(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror![]const []const u8 {
         return asClient(ctx).catalog.visionModels(allocator);
     }
 
-    /// 本 client 发往 `model` 时用的方言:注册表/插件解析出的 Dialect,再叠上目录对
-    /// image_input 的声明。**序列化守门与能力查询的唯一出口**——两条 send 路径和
-    /// `supportsForModel` 都从这里拿 profile,目录真相不可能只影响其中一边。
+    /// 本 client 发往 `model` 时用的方言:注册表/插件解析出的 Dialect,再叠上 Host 或目录对
+    /// image_input 的声明(Host 优先)。**序列化守门与能力查询的唯一出口**——两条 send 路径和
+    /// `supportsForModel` 都从这里拿 profile,声明不可能只影响其中一边。
     pub fn dialectFor(client: *const Client, model: []const u8) dialect_mod.Dialect {
         var dialect = client.dialect_resolver.resolve(.anthropic, model);
-        dialect.image_input_override = client.catalog.imageInputFor(model);
+        dialect.declareImageInput(client.host_capabilities.imageInputFor(model), client.catalog.imageInputFor(model));
         return dialect;
     }
 

@@ -1,6 +1,6 @@
 #include <metask/agentcore.h>
 
-_Static_assert(METASK_AGENTCORE_ABI_REVISION == 20,
+_Static_assert(METASK_AGENTCORE_ABI_REVISION == 21,
                "AgentCore revision changed");
 _Static_assert(sizeof(metask_agentcore_api_v1) == 64,
                "AgentCore root layout changed");
@@ -47,6 +47,16 @@ _Static_assert(METASK_AGENTCORE_MAX_RUN_INPUT_IMAGE_DATA_BYTES_V1 == 5000000ULL,
                "image part payload limit changed");
 _Static_assert(METASK_AGENTCORE_STATUS_IMAGE_INPUT_UNSUPPORTED == 28u,
                "image capability status changed");
+_Static_assert(METASK_AGENTCORE_STATUS_IMAGE_INPUT_CAPABILITY_UNKNOWN == 29u &&
+                   METASK_AGENTCORE_CAPABILITY_SUPPORTED == 1u &&
+                   METASK_AGENTCORE_CAPABILITY_UNSUPPORTED == 2u,
+               "model capability codes changed");
+_Static_assert(METASK_AGENTCORE_MAX_MODEL_CAPABILITIES_V1 == 256ULL &&
+                   METASK_AGENTCORE_MAX_MODEL_CAPABILITY_MODEL_BYTES_V1 == 256ULL,
+               "model capability limits changed");
+_Static_assert(sizeof(metask_agentcore_model_capability_v1) == 40 &&
+                   sizeof(metask_agentcore_session_host_config_v1) == 168,
+               "model capability layouts changed");
 _Static_assert(sizeof(metask_agentcore_prompt_section_v1) == 72 &&
                    sizeof(metask_agentcore_prompt_profile_v1) == 56 &&
                    sizeof(metask_agentcore_context_block_v1) == 56,

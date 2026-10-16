@@ -2665,6 +2665,7 @@ const AbiSession = struct {
             .permission_mode = self.core_session.permission_ctx.modeValue(),
             .catalog_generation = self.catalog_generation,
             .model = model,
+            .image_input = self.core_session.provider.provider().imageInput(null),
             .conversation_messages = @intCast(lease.conversation.messages.items.len),
             .compact_boundary = @intCast(lease.conversation.compact_boundary),
             .skill_revision = if (self.skill_binding) |*binding|
@@ -4241,6 +4242,45 @@ fn parseMultimodalParts(
 /// Wire validation of a prompt profile: layouts, codes and limits, every
 /// length bounded before its pointer is read. The profile's own rules are
 /// `refusePromptProfile`'s. Slices borrow the Host's memory for the call.
+/// Revision 21: the Host's model-capability declarations, validated and
+/// borrowed from the call (the Session copies them). Null with a zero count is
+/// no statement; every entry names a distinct model (ignoring case) and says
+/// SUPPORTED or UNSUPPORTED - zero is not a declaration.
+fn parseModelCapabilities(
+    arena: std.mem.Allocator,
+    host: *const wire.SessionHostConfigV1,
+    metadata: *u64,
+) ![]const core.image_capability.Declaration {
+    if (host.model_capability_count == 0) {
+        if (host.model_capabilities != null) return error.InvalidModelCapabilities;
+        return &.{};
+    }
+    if (host.model_capability_count > wire.MAX_MODEL_CAPABILITIES_V1) return error.ResourceLimit;
+    const count: usize = @intCast(host.model_capability_count);
+    const raw = (host.model_capabilities orelse return error.InvalidModelCapabilities)[0..count];
+    const out = try arena.alloc(core.image_capability.Declaration, count);
+    for (raw, out, 0..) |entry, *slot, i| {
+        if (entry.struct_size != @sizeOf(wire.ModelCapabilityV1) or !allZero(entry.reserved))
+            return error.InvalidModelCapabilities;
+        if (entry.model.len > wire.MAX_MODEL_CAPABILITY_MODEL_BYTES_V1) return error.ResourceLimit;
+        try addMetadata(metadata, entry.model.len, wire.MAX_SESSION_METADATA_BYTES_V1);
+        const model = try text(entry.model);
+        if (model.len == 0) return error.InvalidModelCapabilities;
+        for (out[0..i]) |earlier| {
+            if (std.ascii.eqlIgnoreCase(earlier.model, model)) return error.DuplicateModelCapability;
+        }
+        slot.* = .{
+            .model = model,
+            .image_input = switch (entry.image_input_code) {
+                wire.CAPABILITY_SUPPORTED => true,
+                wire.CAPABILITY_UNSUPPORTED => false,
+                else => return error.InvalidModelCapabilities,
+            },
+        };
+    }
+    return out;
+}
+
 fn parsePromptProfile(
     arena: std.mem.Allocator,
     raw_ptr: ?*const wire.PromptProfileV1,
@@ -5747,6 +5787,8 @@ const SessionBuildConfig = struct {
     run_journal: core.agent_session.RunJournalConfig = .ephemeral,
     /// Validated; borrowed for the call.
     prompt_profile: core.prompt_sections.Profile = .{},
+    /// Revision 21 Host declarations; validated, borrowed for the call.
+    model_capabilities: []const core.image_capability.Declaration = &.{},
 };
 
 const RestoreHostConfig = struct {
@@ -5763,6 +5805,8 @@ const RestoreHostConfig = struct {
     workspace_scope_id: [64]u8,
     budget_profile: session_budget.Profile = .{},
     run_journal: core.agent_session.RunJournalConfig = .ephemeral,
+    /// Revision 21: current Host declarations; checkpoints carry none.
+    model_capabilities: []const core.image_capability.Declaration = &.{},
 };
 
 const InternalRestoreResult = struct {
@@ -6022,6 +6066,7 @@ fn buildAbiSession(
         .run_ui_requester = .{ .ctx = self, .requestFn = AbiSession.requestUi },
         .host_identity_ctx = self,
         .prompt_profile = config.prompt_profile,
+        .model_capabilities = config.model_capabilities,
     };
     self.core_session = if (config.restored) |decoded|
         try runtime.core_runtime.createRestoredSession(core_config, .{
@@ -6342,6 +6387,7 @@ fn restoreCheckpoint(
         .budget_profile = config.budget_profile,
         .run_journal = config.run_journal,
         .prompt_profile = restored_prompt_profile.profile(),
+        .model_capabilities = config.model_capabilities,
     });
     keep_binding = true;
     return .{
@@ -6417,6 +6463,12 @@ const SessionDescriptionJson = struct {
     permission_mode: []const u8,
     catalog_generation: u64,
     model: []const u8,
+    /// Revision 21: whether `model` takes image input and who said so
+    /// (`host`, `catalog`, `model_family`, or `unknown`).
+    image_input: struct {
+        supported: bool,
+        source: []const u8,
+    },
     conversation: struct {
         message_count: u64,
         compact_boundary: u64,
@@ -6544,6 +6596,10 @@ fn encodeSessionDescription(
         .permission_mode = permissionModeName(description.permission_mode),
         .catalog_generation = description.catalog_generation,
         .model = description.model,
+        .image_input = .{
+            .supported = description.image_input.supported,
+            .source = description.image_input.source.name(),
+        },
         .conversation = .{
             .message_count = description.conversation_messages,
             .compact_boundary = description.compact_boundary,
@@ -6749,6 +6805,8 @@ fn sessionCreate(runtime_handle: ?*wire.RuntimeHandle, config_ptr: ?*const wire.
     const prompt_profile = parsePromptProfile(scratch.allocator(), config.prompt_profile) catch |err|
         return failError(inputErrorStatus(err), err, out_error);
     if (refusePromptProfile(prompt_profile, out_error)) |status| return status;
+    const model_capabilities = parseModelCapabilities(scratch.allocator(), host, &session_metadata) catch |err|
+        return failError(inputErrorStatus(err), err, out_error);
     if (shell == .sandboxed) {
         sandbox_admission.validate(allocator) catch |err| return failError(
             if (err == error.OutOfMemory) wire.STATUS_OUT_OF_MEMORY else wire.STATUS_INVALID_ARGUMENT,
@@ -6774,6 +6832,7 @@ fn sessionCreate(runtime_handle: ?*wire.RuntimeHandle, config_ptr: ?*const wire.
         .budget_profile = budget_profile,
         .run_journal = run_journal,
         .prompt_profile = prompt_profile,
+        .model_capabilities = model_capabilities,
     }) catch |err| {
         return failError(
             if (err == error.OutOfMemory)
@@ -6906,6 +6965,8 @@ fn sessionRestore(
     ) catch |err| return failError(inputErrorStatus(err), err, out_error);
     const budget_profile = parseDurableBudget(host.durable_budget) catch |err|
         return failError(inputErrorStatus(err), err, out_error);
+    const model_capabilities = parseModelCapabilities(scratch.allocator(), host, &session_metadata) catch |err|
+        return failError(inputErrorStatus(err), err, out_error);
     const limits = parseCheckpointLimits(limits_raw) catch |err|
         return failError(inputErrorStatus(err), err, out_error);
     if (shell == .sandboxed) sandbox_admission.validate(allocator) catch |err|
@@ -6948,6 +7009,7 @@ fn sessionRestore(
             .workspace_scope_id = workspace_scope_id,
             .budget_profile = budget_profile,
             .run_journal = run_journal,
+            .model_capabilities = model_capabilities,
         },
         &current_skill_binding,
         source.interface(),
@@ -7390,15 +7452,27 @@ fn sessionRunInput(
                 @memcpy(all[1..], parts);
                 break :with_context all;
             } else parts;
-            // Capability preflight (single truth: ModelProfile.supports_image_input).
-            // Rejection happens before admission and before any Provider request,
-            // so the Run ID stays reusable and Conversation is untouched.
-            if (has_image and !self.core_session.provider.provider().supports(.image_input))
-                return fail(
-                    wire.STATUS_IMAGE_INPUT_UNSUPPORTED,
-                    "session model does not support image input",
+            // Capability preflight (single truth: the profile `Dialect.profileFor`
+            // returns, with the Host's declarations applied). Rejection happens
+            // before admission and before any Provider request, so the Run ID stays
+            // reusable and Conversation is untouched. An unknown capability is its
+            // own status: a declaration fixes it, another model is not required.
+            if (has_image) {
+                const resolution = self.core_session.provider.provider().imageInput(null);
+                if (!resolution.supported) return fail(
+                    if (resolution.isUnknown())
+                        wire.STATUS_IMAGE_INPUT_CAPABILITY_UNKNOWN
+                    else
+                        wire.STATUS_IMAGE_INPUT_UNSUPPORTED,
+                    switch (resolution.source) {
+                        .unknown => "image input capability of the Session model is unknown: no Host declaration, provider catalog entry or built-in model family covers it; declare it in SessionHostConfigV1.model_capabilities",
+                        .host => "the Session model does not take image input (declared by the Host)",
+                        .catalog => "the Session model does not take image input (declared by the provider catalog)",
+                        .model_family => "the Session model does not take image input (built-in model family)",
+                    },
                     out_error,
                 );
+            }
             const multimodal_execution = self.runMultimodalWithBoundSkills(
                 &runtime.materializations,
                 run_id,
