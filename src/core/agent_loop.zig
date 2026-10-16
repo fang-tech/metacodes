@@ -355,6 +355,11 @@ pub const Options = struct {
     /// null → 不 prepend(headless/subagent/无记忆)。由 user_context.build 生成,owned-by-caller,
     /// 生命周期须覆盖整个 run。
     inject_user_context: ?[]const u8 = null,
+    /// Issue #276: the CLI session's date bookkeeping. The first turn of a Run
+    /// on a later local date than the model can see gets one notice, appended
+    /// after the Run's input so it enters history with this turn. Null (the
+    /// default) adds nothing - AgentCore puts the date in each Run's context.
+    time_announcer: ?*@import("time_context.zig").Announcer = null,
     /// One-shot user-role steering item appended to the first API request only.
     /// This is intentionally not written to Conversation/transcript; extensions such
     /// as /loop use it to continue work without fabricating a persisted user turn.
@@ -1161,6 +1166,12 @@ fn runCounted(
     if (opts.tasks) |store| {
         const claim_session = opts.agent_ident orelse sess;
         store.setClaimer(opts.kg_agent_ident orelse claim_session.asSlice()) catch {};
+    }
+    if (opts.time_announcer) |announcer| {
+        if (try announcer.noticeFor(allocator, conversation.activeMessages())) |notice| {
+            defer allocator.free(notice);
+            try conversation.appendText(.user, notice);
+        }
     }
     // L4:run 级 trace_id(整个 run 一个,跨所有 turn);诊断事件内联携带,DiagnosticsBackend
     // 据 trace_id+depth 重建 span 树。depth = agent 嵌套深度(父 0 子 1)。

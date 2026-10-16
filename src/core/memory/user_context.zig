@@ -12,8 +12,10 @@
 //!
 //!   <CLAUDE.md 链 + AutoMem>
 //!   # currentDate
-//!   Today's date is YYYY/MM/DD.
+//!   Today's date is YYYY-MM-DD (Weekday). Time zone: <zone> (UTC±hh:mm).
 //!
+//! The date is always there (issue #276), with or without CLAUDE.md, memory
+//! or KG content; without them the reminder carries the date alone.
 //!         IMPORTANT: this context may or may not be relevant to your tasks. ...
 //!   </system-reminder>
 
@@ -22,6 +24,7 @@ const ppaths = @import("platform").paths;
 const pfs = @import("platform").fs;
 const claudemd = @import("claudemd.zig");
 const time = @import("../../util/time.zig");
+const time_context = @import("../time_context.zig");
 
 // libc env(0.16 std.c 无 setenv/unsetenv 包装;项目范式见 prompt_override.zig)。
 
@@ -34,21 +37,6 @@ pub fn isDisabled() bool {
     return false;
 }
 
-/// 算今天日期 YYYY/MM/DD,UTC。cc 也按运行环境取日期,跨时区偏差最多一天,
-/// 对记忆上下文(相对/绝对日期换算的提示)无实质影响,故不引入时区库。
-fn formatToday(buf: []u8) []u8 {
-    const epoch_secs: u64 = @intCast(@max(0, time.nowUnix()));
-    const days = std.time.epoch.EpochDay{ .day = @intCast(epoch_secs / std.time.s_per_day) };
-    const year_day = days.calculateYearDay();
-    const month_day = year_day.calculateMonthDay();
-    // buf 至少 16:year 最大 u16=5 位 → "65535/12/31"=11 字节,定长足够,故 unreachable。
-    return std.fmt.bufPrint(buf, "{d}/{d:0>2}/{d:0>2}", .{
-        year_day.year,
-        month_day.month.numeric(),
-        month_day.day_index + 1,
-    }) catch unreachable;
-}
-
 pub const BuildOptions = struct {
     cwd: []const u8 = "",
     home: []const u8 = "",
@@ -59,20 +47,25 @@ pub const BuildOptions = struct {
     /// KG 注入段(持久任务图启动快照,kg/inject.zig 构建)。空则不加(空态零输出,
     /// 设计 KG_DESIGN v3-final §5)。owned-by-caller。
     kg_summary: []const u8 = "",
+    /// The instant the date is taken at (unix seconds); null = now.
+    now: ?i64 = null,
+    /// The zone the date is in; null = the process's zone (time_context.systemZone).
+    zone: ?time_context.Zone = null,
 };
 
-/// 构建 user-context 文本(owned)。无任何内容(CLAUDE.md 链空 + auto_mem 空)返回 null
-/// → 调用方不 prepend(对齐 cc:无 context 不发空 reminder)。
-pub fn build(allocator: std.mem.Allocator, opts: BuildOptions) !?[]u8 {
-    if (isDisabled()) return null;
-
-    const chain = try claudemd.load(allocator, .{ .cwd = opts.cwd, .home = opts.home, .state_root = opts.state_root });
+/// 构建 user-context 文本(owned)。日期段总在(issue #276);CLAUDE.md 链、AutoMem、KG 段
+/// 有内容才加,`CLAUDE_CODE_DISABLE_CLAUDE_MDS` 只关这三段(对齐 cc:claudeMd 可关,currentDate 恒在)。
+pub fn build(allocator: std.mem.Allocator, opts: BuildOptions) ![]u8 {
+    const disabled = isDisabled();
+    const chain = if (disabled)
+        try allocator.alloc(u8, 0)
+    else
+        try claudemd.load(allocator, .{ .cwd = opts.cwd, .home = opts.home, .state_root = opts.state_root });
     defer allocator.free(chain);
 
     const has_chain = chain.len > 0;
-    const has_mem = opts.auto_mem.len > 0;
-    const has_kg = opts.kg_summary.len > 0;
-    if (!has_chain and !has_mem and !has_kg) return null;
+    const has_mem = !disabled and opts.auto_mem.len > 0;
+    const has_kg = !disabled and opts.kg_summary.len > 0;
 
     var out = std.ArrayList(u8).empty;
     errdefer out.deinit(allocator);
@@ -80,11 +73,13 @@ pub fn build(allocator: std.mem.Allocator, opts: BuildOptions) !?[]u8 {
     try out.appendSlice(allocator,
         \\<system-reminder>
         \\As you answer the user's questions, you can use the following context:
-        \\# claudeMd
         \\
     );
-    try out.appendSlice(allocator, claudemd.MEMORY_INSTRUCTION_PROMPT);
-    try out.appendSlice(allocator, "\n\n");
+    if (has_chain or has_mem or has_kg) {
+        try out.appendSlice(allocator, "# claudeMd\n");
+        try out.appendSlice(allocator, claudemd.MEMORY_INSTRUCTION_PROMPT);
+        try out.appendSlice(allocator, "\n\n");
+    }
 
     if (has_chain) {
         try out.appendSlice(allocator, chain);
@@ -102,12 +97,16 @@ pub fn build(allocator: std.mem.Allocator, opts: BuildOptions) !?[]u8 {
         try out.appendSlice(allocator, opts.kg_summary);
     }
 
-    // currentDate
-    var date_buf: [16]u8 = undefined;
-    const today = formatToday(&date_buf);
-    const date_line = try std.fmt.allocPrint(allocator, "# currentDate\nToday's date is {s}.\n", .{today});
-    defer allocator.free(date_line);
-    try out.appendSlice(allocator, date_line);
+    // currentDate: the date this session started on, with its zone. A later
+    // date reaches the model as a notice in that turn (time_context.Announcer),
+    // so this first message - and the cache behind it - never moves.
+    const now = opts.now orelse time.nowUnix();
+    const zone = opts.zone orelse time_context.systemZone(now);
+    const today = try time_context.today(allocator, now, &zone);
+    defer allocator.free(today);
+    try out.appendSlice(allocator, "# " ++ time_context.label ++ "\n");
+    try out.appendSlice(allocator, today);
+    try out.appendSlice(allocator, "\n");
 
     try out.appendSlice(allocator,
         \\
@@ -162,7 +161,7 @@ test "build: wraps CLAUDE.md in system-reminder with instruction prompt" {
     defer a.free(dir);
     try writeFileAt(dir, "CLAUDE.md", "MY-PROJECT-RULE-XYZ");
 
-    const out = (try build(a, .{ .cwd = dir, .home = "" })).?;
+    const out = try build(a, .{ .cwd = dir, .home = "" });
     defer a.free(out);
 
     try testing.expect(std.mem.startsWith(u8, out, "<system-reminder>"));
@@ -182,11 +181,11 @@ test "build: auto_mem appended" {
     const dir = try tmpAbsPath(a, &tmp);
     defer a.free(dir);
 
-    const out = (try build(a, .{
+    const out = try build(a, .{
         .cwd = dir,
         .home = "",
         .auto_mem = "# Memory Index\n- [Foo](foo.md) — bar",
-    })).?;
+    });
     defer a.free(out);
     try testing.expect(std.mem.indexOf(u8, out, "# Memory Index") != null);
     try testing.expect(std.mem.indexOf(u8, out, "[Foo](foo.md)") != null);
@@ -195,11 +194,11 @@ test "build: auto_mem appended" {
 test "build: kg_summary 注入(DoD:KG 段端到端进首条 user message)" {
     const a = testing.allocator;
     // 仅 kg_summary,无 CLAUDE.md 无 auto_mem:也应产出(has_kg 触发)。
-    const out = (try build(a, .{
+    const out = try build(a, .{
         .cwd = "",
         .home = "",
         .kg_summary = "# Knowledge Graph — 持久任务图(root 7)\n开放任务:2 ready / 1 blocked(共 3)\n",
-    })).?;
+    });
     defer a.free(out);
     try testing.expect(std.mem.indexOf(u8, out, "Knowledge Graph — 持久任务图(root 7)") != null);
     try testing.expect(std.mem.indexOf(u8, out, "2 ready / 1 blocked") != null);
@@ -207,13 +206,21 @@ test "build: kg_summary 注入(DoD:KG 段端到端进首条 user message)" {
     try testing.expect(std.mem.indexOf(u8, out, "<system-reminder>") != null);
 }
 
-test "build: kg_summary 空 + 无其他内容 → null(空态零输出)" {
+test "build: with no other content the reminder still carries the date and zone (issue #276)" {
     const a = testing.allocator;
-    const out = try build(a, .{ .cwd = "", .home = "", .kg_summary = "" });
-    try testing.expect(out == null);
+    const zone = try time_context.Zone.fromHostOffset(8 * 60);
+    // 2026-10-16T16:30:00Z is already Saturday the 17th at UTC+08:00.
+    const out = try build(a, .{ .cwd = "", .home = "", .kg_summary = "", .now = 1_792_168_200, .zone = zone });
+    defer a.free(out);
+    try testing.expectEqualStrings(
+        "<system-reminder>\nAs you answer the user's questions, you can use the following context:\n" ++
+            "# currentDate\nToday's date is 2026-10-17 (Saturday). Time zone: UTC+08:00.\n" ++
+            "\n      IMPORTANT: this context may or may not be relevant to your tasks. You should not respond to this context unless it is highly relevant to your task.\n</system-reminder>",
+        out,
+    );
 }
 
-test "build: disabled via env CLAUDE_CODE_DISABLE_CLAUDE_MDS=1 returns null" {
+test "build: disabled via env CLAUDE_CODE_DISABLE_CLAUDE_MDS=1 drops CLAUDE.md and memory but keeps the date" {
     const a = testing.allocator;
     // Linus #4 修:之前此测试名说"disabled via env"却根本没 set env(测了反面)。
     // 0.16 std.c 无 setenv 包装,用 extern "c"(见文件顶 + prompt_override.zig)。真 set 验证返回 null。
@@ -234,12 +241,14 @@ test "build: disabled via env CLAUDE_CODE_DISABLE_CLAUDE_MDS=1 returns null" {
     defer _ = ppaths.unsetEnv("CLAUDE_CODE_DISABLE_CLAUDE_MDS");
     try testing.expect(isDisabled());
 
-    // 即便项目根有 CLAUDE.md(向上递归会命中),disabled 也必须返回 null。
+    // 即便项目根有 CLAUDE.md(向上递归会命中),disabled 也不带它与记忆;日期照旧(issue #276)。
+    try writeFileAt(dir, "CLAUDE.md", "DISABLED-RULE-XYZ");
     const out = try build(a, .{ .cwd = dir, .home = "", .auto_mem = "stuff" });
-    if (out) |o| {
-        a.free(o);
-        return error.ExpectedNullWhenDisabled;
-    }
+    defer a.free(out);
+    try testing.expect(std.mem.indexOf(u8, out, "DISABLED-RULE-XYZ") == null);
+    try testing.expect(std.mem.indexOf(u8, out, "stuff") == null);
+    try testing.expect(std.mem.indexOf(u8, out, "# claudeMd") == null);
+    try testing.expect(std.mem.indexOf(u8, out, "# currentDate\nToday's date is ") != null);
 }
 
 test "build: enabled (env unset) with content returns non-null" {
@@ -248,21 +257,7 @@ test "build: enabled (env unset) with content returns non-null" {
     _ = ppaths.unsetEnv("CLAUDE_CODE_DISABLE_CLAUDE_MDS");
     try testing.expect(!isDisabled());
     const out = try build(a, .{ .cwd = "", .home = "", .auto_mem = "MEMINDEX" });
-    try testing.expect(out != null);
-    if (out) |o| {
-        try testing.expect(std.mem.indexOf(u8, o, "MEMINDEX") != null);
-        a.free(o);
-    }
-}
-
-test "formatToday: produces YYYY/MM/DD shape" {
-    var buf: [16]u8 = undefined;
-    const s = formatToday(&buf);
-    // 形如 2026/06/08:含两个 '/'
-    var slashes: usize = 0;
-    for (s) |c| {
-        if (c == '/') slashes += 1;
-    }
-    try testing.expectEqual(@as(usize, 2), slashes);
-    try testing.expect(s.len >= 8); // 最短 yyyy/m/d → 但我们 0-pad,固定 10
+    defer a.free(out);
+    try testing.expect(std.mem.indexOf(u8, out, "MEMINDEX") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "# claudeMd") != null);
 }

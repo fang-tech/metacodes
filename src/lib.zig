@@ -79,6 +79,7 @@ pub const session_id = @import("core/session_id.zig"); // SessionId 值类型(�
 pub const system_prompt = @import("core/system_prompt.zig");
 pub const prompt_sections = @import("core/prompt_sections.zig");
 pub const context_blocks = @import("core/context_blocks.zig");
+pub const time_context = @import("core/time_context.zig"); // date + time zone for the model (#276)
 pub const answer_queue = @import("core/answer_queue.zig");
 pub const recorder = @import("core/recorder.zig");
 pub const context_pressure = @import("core/context_pressure.zig");
