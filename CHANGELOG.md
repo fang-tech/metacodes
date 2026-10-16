@@ -12,6 +12,32 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Added
 
+- Date and time zone for the model at every entry point (issue #276).
+  - **CLI.** The user-context message always states the date the session
+    started on, with its time zone - without CLAUDE.md, memory or KG, and
+    with `CLAUDE_CODE_DISABLE_CLAUDE_MDS` set - as
+    `Today's date is 2026-10-17 (Saturday). Time zone: Asia/Shanghai (UTC+08:00).`
+    The zone is the process's: libc `localtime_r` on POSIX (honours `TZ`,
+    `/etc/localtime` and daylight saving), the dynamic time-zone information
+    on Windows. When neither answers, the date is in UTC and the text says
+    the zone is unknown.
+  - **Crossing midnight.** The first Run on a later local date gets one
+    "The date has changed" notice after its input, in that turn's history.
+    The system prompt and the first message do not change, so the prompt
+    cache survives midnight. A notice that compaction, trimming or `/clear`
+    removed is given again.
+  - **AgentCore Revision 22.** `RunOptionsV1.time_context_code` and
+    `utc_offset_minutes` take the first remaining reserved word, so the
+    layout is unchanged at 40 bytes. By default each Run's context starts
+    with a `currentDate` block in the process's zone.
+    `TIME_CONTEXT_UTC_OFFSET` dates it in a Host-given offset (UTC±14:00)
+    instead, and `TIME_CONTEXT_OFF` drops it.
+  - **Host precedence.** A Host block labelled `currentDate` replaces the
+    runtime's. Combined with an explicit offset it is refused as
+    `INVALID_ARGUMENT`.
+  - **Source-level Hosts** build the same block with `core.time_context`.
+  - SDK 0.9.0-dev.
+
 - AgentCore Revision 21: Host model-capability declarations (issue #273).
   `SessionHostConfigV1.model_capabilities` / `model_capability_count` (two
   former reserved words; the struct stays 168 bytes) carry up to 256 40-byte
@@ -260,6 +286,12 @@ status, compatibility boundaries, and entry points are defined by
   from `RunResult.continuations` (issue #269).
 
 ### Changed
+
+- AgentCore provider requests now carry a `currentDate` context block in each
+  Run's user record unless the Host supplies one or sets `TIME_CONTEXT_OFF`
+  (Revision 22, issue #276). Hosts that byte-compare requests should set
+  `TIME_CONTEXT_OFF` or pass their own block. The CLI's date moved from a UTC
+  `YYYY/MM/DD` to a local `YYYY-MM-DD (Weekday)` with the zone named.
 
 - An image Run for a model that no Host declaration, provider catalog entry or
   built-in model family covers now returns AgentCore status 29

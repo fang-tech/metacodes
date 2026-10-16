@@ -7276,7 +7276,9 @@ test "L2 Revision 12 public Host stream callback spools byte zero and returns a 
         .max_turns = 4,
         .context_blocks = null,
         .context_block_count = 0,
-        .time_context_code = wire.TIME_CONTEXT_SYSTEM, .utc_offset_minutes = 0, .reserved = [_]u64{0} ** 1,
+        .time_context_code = wire.TIME_CONTEXT_SYSTEM,
+        .utc_offset_minutes = 0,
+        .reserved = [_]u64{0} ** 1,
     };
     var result: wire.RunResultV1 = undefined;
     try std.testing.expectEqual(wire.STATUS_OK, api.session().runText(
@@ -7415,7 +7417,9 @@ test "L2 Revision 12 Host stream failure rolls back partial bytes and releases d
         .max_turns = 4,
         .context_blocks = null,
         .context_block_count = 0,
-        .time_context_code = wire.TIME_CONTEXT_SYSTEM, .utc_offset_minutes = 0, .reserved = [_]u64{0} ** 1,
+        .time_context_code = wire.TIME_CONTEXT_SYSTEM,
+        .utc_offset_minutes = 0,
+        .reserved = [_]u64{0} ** 1,
     };
     var result: wire.RunResultV1 = undefined;
     try std.testing.expectEqual(wire.STATUS_OK, api.session().runText(

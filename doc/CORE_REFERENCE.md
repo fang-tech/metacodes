@@ -370,6 +370,11 @@ Anthropic `web_search_20250305`)时 `run` 直接返回 `error.ServerToolsUnsuppo
 本循环不保存 server_tool_use / 结果块,服务端暂停的回合(`pause_turn`)只能靠原样回送这些块续跑,
 放行只会静默截断。WebSearch 的 server tool 只出现在它自己的隔离子请求里;Sealed Skill 网关对
 非空 `provider_tools` 的 `runs.start` 回 `invalid params`(SEALED_SKILL_PROTOCOL §3.4)。
+日期与时区(issue #276):`Options.inject_user_context` 是 CLI 的首条 user-context 消息,总带会话
+开始那天的日期与时区(`core.time_context`,不再依赖 CLAUDE.md/记忆/KG 是否存在);
+`Options.time_announcer` 非 null 时,本地日期晚于模型能看到的日期的第一个 run 在本轮输入之后
+追加一条"The date has changed"提示,随这一轮进入历史,系统提示词与首条消息字节不动;提示被压缩、
+裁剪或清掉后会再给一次。AgentCore 不用它,而是把日期作为每个 Run 的 `currentDate` context block。
 
 **一回合做什么**:流式发当前 conversation → 收集 assistant 文本 + tool_use blocks(经 backend
 emit `text_chunk`/`tool_start`)→ 按权限决策 + 并发安全分批执行工具(`tool_exec.executeSlots`)→
