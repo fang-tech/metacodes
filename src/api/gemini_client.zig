@@ -171,6 +171,7 @@ pub const GeminiClient = struct {
             .setRequestOverridesFn = &pSetRequestOverrides,
             .supportsFn = &pSupports,
             .supportsForModelFn = &pSupportsForModel,
+            .routeFn = &pRoute,
         };
     }
     inline fn cast(ctx: *anyopaque) *GeminiClient {
@@ -178,6 +179,15 @@ pub const GeminiClient = struct {
     }
     fn pModel(ctx: *anyopaque) []const u8 {
         return cast(ctx).model;
+    }
+    fn pRoute(ctx: *anyopaque) ?provider_mod.ProviderRoute {
+        const self = cast(ctx);
+        return .{
+            .kind = .gemini,
+            .base_url = self.base_url,
+            .model = self.model,
+            .credential = self.api_key,
+        };
     }
     /// Provider.requestOverrides() 返回 Client.overrides;镜像 reasoning_effort 兜底。
     fn pRequestOverrides(ctx: *anyopaque) request_overrides.RequestOverrides {

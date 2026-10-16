@@ -35,6 +35,16 @@ pub const Skill = struct {
     model: []const u8,
     shell: []const u8,
     source_path: []const u8,
+    /// SSP/1 binding (doc/SEALED_SKILL_PROTOCOL.md §9): set only for a pinned
+    /// sealed Skill, whose body lives on that gateway. All three are present or
+    /// all three are empty; a sealed Skill always runs as a fork.
+    sealed_gateway: []const u8 = "",
+    sealed_skill_id: []const u8 = "",
+    sealed_manifest_digest: []const u8 = "",
+
+    pub fn isSealed(self: *const Skill) bool {
+        return self.sealed_skill_id.len != 0;
+    }
 
     pub fn deinit(self: Skill, allocator: std.mem.Allocator) void {
         allocator.free(self.name);
@@ -52,6 +62,9 @@ pub const Skill = struct {
         allocator.free(self.model);
         allocator.free(self.shell);
         allocator.free(self.source_path);
+        allocator.free(self.sealed_gateway);
+        allocator.free(self.sealed_skill_id);
+        allocator.free(self.sealed_manifest_digest);
     }
 };
 
@@ -64,6 +77,9 @@ pub const ParseError = error{
     InvalidShell,
     InvalidBoolean,
     InvalidFieldType,
+    /// `sealed-gateway`, `sealed-skill-id` and `sealed-manifest-digest` must
+    /// all be present (and non-empty) or all be absent.
+    InvalidSealedBinding,
 };
 
 pub const ParseOptions = struct {
@@ -120,11 +136,21 @@ pub fn parseSkillMdWithOptions(
         parseModelActivation(value) orelse return error.InvalidModelActivation
     else
         .advisory;
-    const context: ExecContext = if (try optionalText(root, &.{"context"})) |value| blk: {
+    var context: ExecContext = if (try optionalText(root, &.{"context"})) |value| blk: {
         if (value.len == 0 or std.mem.eql(u8, value, "inline")) break :blk .inline_ctx;
         if (std.mem.eql(u8, value, "fork")) break :blk .fork;
         return error.InvalidContext;
     } else .inline_ctx;
+    const sealed_gateway = try optionalText(root, &.{ "sealed-gateway", "sealed_gateway" }) orelse "";
+    const sealed_skill_id = try optionalText(root, &.{ "sealed-skill-id", "sealed_skill_id" }) orelse "";
+    const sealed_manifest_digest = try optionalText(root, &.{ "sealed-manifest-digest", "sealed_manifest_digest" }) orelse "";
+    const sealed_present: u8 = @as(u8, @intFromBool(sealed_gateway.len != 0)) +
+        @as(u8, @intFromBool(sealed_skill_id.len != 0)) +
+        @as(u8, @intFromBool(sealed_manifest_digest.len != 0));
+    if (sealed_present != 0 and sealed_present != 3) return error.InvalidSealedBinding;
+    // The body of a sealed Skill is on the gateway; it can only run as a fork
+    // whose model is the gateway. Never inline the (empty) local body.
+    if (sealed_present == 3) context = .fork;
     const agent_str = try optionalText(root, &.{"agent"}) orelse "";
     const model_str = try optionalText(root, &.{"model"}) orelse "";
     const shell_str = if (try optionalText(root, &.{"shell"})) |value| blk: {
@@ -163,6 +189,12 @@ pub fn parseSkillMdWithOptions(
     errdefer allocator.free(owned_shell);
     const owned_source_path = try allocator.dupe(u8, source_path);
     errdefer allocator.free(owned_source_path);
+    const owned_sealed_gateway = try allocator.dupe(u8, sealed_gateway);
+    errdefer allocator.free(owned_sealed_gateway);
+    const owned_sealed_skill_id = try allocator.dupe(u8, sealed_skill_id);
+    errdefer allocator.free(owned_sealed_skill_id);
+    const owned_sealed_manifest_digest = try allocator.dupe(u8, sealed_manifest_digest);
+    errdefer allocator.free(owned_sealed_manifest_digest);
 
     return .{
         .name = owned_name,
@@ -181,6 +213,9 @@ pub fn parseSkillMdWithOptions(
         .model = owned_model,
         .shell = owned_shell,
         .source_path = owned_source_path,
+        .sealed_gateway = owned_sealed_gateway,
+        .sealed_skill_id = owned_sealed_skill_id,
+        .sealed_manifest_digest = owned_sealed_manifest_digest,
     };
 }
 
@@ -605,4 +640,47 @@ test "Codex sidecar: implicit invocation policy, fail-open on malformed YAML" {
     const default = (try parseCodexSidecar(std.testing.allocator, "interface:\n  short_description: s\n")).?;
     try std.testing.expect(default.allow_implicit_invocation);
     try std.testing.expect((try parseCodexSidecar(std.testing.allocator, "policy: [unterminated")) == null);
+}
+
+test "sealed binding keys are all-or-nothing and force fork" {
+    const a = std.testing.allocator;
+    const md =
+        \\---
+        \\name: erp-post
+        \\description: posts
+        \\sealed-gateway: "https://g.example/ssp"
+        \\sealed-skill-id: ssk_1
+        \\sealed-manifest-digest: "sha256:ab"
+        \\---
+        \\$ARGUMENTS
+        \\
+    ;
+    const skill = try parseSkillMdWithFallback(a, md, "", "erp-post");
+    defer skill.deinit(a);
+    try std.testing.expect(skill.isSealed());
+    try std.testing.expectEqual(ExecContext.fork, skill.context);
+    try std.testing.expectEqualStrings("https://g.example/ssp", skill.sealed_gateway);
+
+    const partial =
+        \\---
+        \\name: x
+        \\description: d
+        \\sealed-skill-id: ssk_1
+        \\---
+        \\body
+        \\
+    ;
+    try std.testing.expectError(error.InvalidSealedBinding, parseSkillMdWithFallback(a, partial, "", "x"));
+
+    const plain_md =
+        \\---
+        \\name: x
+        \\description: d
+        \\---
+        \\body
+        \\
+    ;
+    const plain = try parseSkillMdWithFallback(a, plain_md, "", "x");
+    defer plain.deinit(a);
+    try std.testing.expect(!plain.isSealed());
 }

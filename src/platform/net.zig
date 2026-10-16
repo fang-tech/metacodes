@@ -909,6 +909,17 @@ test "a child spawned after listen and accept holds neither the port nor the con
     closeSocket(again.sock);
 }
 
+test "a second listener on a loopback port in use is refused" {
+    // A gateway or daemon that has not exited keeps its port to itself: the
+    // next instance fails at bind instead of splitting the traffic with it.
+    // POSIX SO_REUSEADDR admits no second listening socket on the address,
+    // and Windows binds with SO_EXCLUSIVEADDRUSE, which also refuses a
+    // socket that asks to reuse the address.
+    const held = try listenLoopback(0, 4);
+    defer closeSocket(held.sock);
+    try testing.expectError(error.BindFailed, listenLoopback(held.port, 4));
+}
+
 test "pollReadable tracks pending loopback connection" {
     const listener = try listenLoopback(0, 4);
     defer closeSocket(listener.sock);

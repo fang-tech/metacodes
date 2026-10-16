@@ -145,7 +145,11 @@ pub fn defaultSources(
         try appendSource(arena, &sources, "/etc/codex", &.{"skills"}, .enterprise, ENTERPRISE_PRIORITY + 1);
     }
 
-    // Personal: metacodes' own state root first.
+    // Personal: pinned sealed Skills (doc/SEALED_SKILL_PROTOCOL.md §9) sit
+    // above every other personal source: a pin is explicit consent, and no
+    // local file may shadow the name the user subscribed to. Then metacodes'
+    // own state root.
+    try appendSource(arena, &sources, inputs.state_root, &.{"sealed-skills"}, .personal, PERSONAL_PRIORITY + 5);
     try appendSource(arena, &sources, inputs.state_root, &.{"skills"}, .personal, PERSONAL_PRIORITY + 4);
     try appendSource(arena, &sources, inputs.home, &.{ ".agents", "skills" }, .personal, PERSONAL_PRIORITY + 3);
     try appendSource(arena, &sources, inputs.home, &.{ ".claude", "skills" }, .personal, PERSONAL_PRIORITY + 2);
@@ -1198,6 +1202,9 @@ fn cloneSkillRecord(arena: std.mem.Allocator, source: SkillRecord) error{OutOfMe
             .model = try arena.dupe(u8, source.definition.model),
             .shell = try arena.dupe(u8, source.definition.shell),
             .source_path = "",
+            .sealed_gateway = try arena.dupe(u8, source.definition.sealed_gateway),
+            .sealed_skill_id = try arena.dupe(u8, source.definition.sealed_skill_id),
+            .sealed_manifest_digest = try arena.dupe(u8, source.definition.sealed_manifest_digest),
         },
         .directories = directories,
         .files = files,
@@ -1837,6 +1844,7 @@ test "product default sources follow Claude Code tiers and read every compatible
         }
     }.f;
     const personal_and_project = [_]Expect{
+        .{ .root = join(a, &.{ state, "sealed-skills" }), .scope = .personal },
         .{ .root = join(a, &.{ state, "skills" }), .scope = .personal },
         .{ .root = join(a, &.{ home, ".agents", "skills" }), .scope = .personal },
         .{ .root = join(a, &.{ home, ".claude", "skills" }), .scope = .personal },
