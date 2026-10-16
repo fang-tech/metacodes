@@ -38,6 +38,30 @@ const WEB_SEARCH_EMPTY_CONTENT_SSE =
     "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":5}}\n\n" ++
     "data: {\"type\":\"message_stop\"}\n\n";
 
+// The server-side search loop hit its iteration limit: the response stops at
+// pause_turn. With a partial result and summary already streamed.
+const WEB_SEARCH_PAUSED_PARTIAL_SSE =
+    "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n" ++
+    "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"server_tool_use\",\"id\":\"srv_1\",\"name\":\"web_search\",\"input\":{}}}\n\n" ++
+    "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n" ++
+    "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"web_search_tool_result\",\"tool_use_id\":\"srv_1\",\"content\":[{\"type\":\"web_search_result\",\"title\":\"Zig Lang\",\"url\":\"https://ziglang.org\"}]}}\n\n" ++
+    "data: {\"type\":\"content_block_stop\",\"index\":1}\n\n" ++
+    "data: {\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n" ++
+    "data: {\"type\":\"content_block_delta\",\"index\":2,\"delta\":{\"type\":\"text_delta\",\"text\":\"Partial summary.\"}}\n\n" ++
+    "data: {\"type\":\"content_block_stop\",\"index\":2}\n\n" ++
+    "data: {\"type\":\"content_block_start\",\"index\":3,\"content_block\":{\"type\":\"server_tool_use\",\"id\":\"srv_2\",\"name\":\"web_search\",\"input\":{}}}\n\n" ++
+    "data: {\"type\":\"content_block_stop\",\"index\":3}\n\n" ++
+    "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"pause_turn\"},\"usage\":{\"output_tokens\":5}}\n\n" ++
+    "data: {\"type\":\"message_stop\"}\n\n";
+
+// Paused before any result or text arrived.
+const WEB_SEARCH_PAUSED_EMPTY_SSE =
+    "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n" ++
+    "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"server_tool_use\",\"id\":\"srv_1\",\"name\":\"web_search\",\"input\":{}}}\n\n" ++
+    "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n" ++
+    "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"pause_turn\"},\"usage\":{\"output_tokens\":1}}\n\n" ++
+    "data: {\"type\":\"message_stop\"}\n\n";
+
 fn makeClient(a: std.mem.Allocator, io: std.Io, url: []const u8) cc.client_mod.Client {
     return cc.client_mod.Client.initWithBaseUrl(a, io, "test-key", "claude-3-5-haiku-20241022", url);
 }
@@ -92,6 +116,52 @@ test "L2: WebSearch 子请求带 forced tool_choice + server tool" {
     try std.testing.expect(std.mem.indexOf(u8, out, "https://ziglang.org") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "Zig is a systems language.") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "REMINDER") != null);
+    // A search that finished carries no pause note.
+    try std.testing.expect(std.mem.indexOf(u8, out, "pause_turn") == null);
+}
+
+/// Run WebSearch through tool_exec, as the agent loop does, against one
+/// cassette body. The caller frees the slot.
+fn runPausedSearch(a: std.mem.Allocator, body: []const u8, slot: *cc.tool_exec.Slot) !void {
+    var srv = try harness.MockServer.start(body, 0);
+    defer srv.stop();
+    const url = try srv.urlOwned(a);
+    defer a.free(url);
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
+    defer io_runtime.deinit();
+    var client = makeClient(a, io_runtime.io(), url);
+    defer client.deinit();
+    const ctx = cc.tools.ToolContext{ .allocator = a, .api_client = &client };
+    var slots = [_]cc.tool_exec.Slot{slot.*};
+    try cc.tool_exec.executeSlots(&slots, &ctx, a, .{ .bytes = [_]u8{0} ** 12 });
+    slot.* = slots[0];
+}
+
+test "L2: WebSearch paused by the server says its partial results may be incomplete" {
+    const a = std.testing.allocator;
+    var slot = cc.tool_exec.Slot{ .decision = .run, .name = "WebSearch", .id = "ws-paused", .input = "{\"query\":\"zig\"}" };
+    defer slot.deinit(a);
+    try runPausedSearch(a, WEB_SEARCH_PAUSED_PARTIAL_SSE, &slot);
+
+    try std.testing.expect(!slot.is_error);
+    const out = slot.content orelse return error.MissingToolResult;
+    // The note leads the result, before what did arrive.
+    const note = std.mem.indexOf(u8, out, "The search service paused this search before it finished (stop_reason pause_turn)") orelse return error.MissingPauseNote;
+    const summary = std.mem.indexOf(u8, out, "Partial summary.") orelse return error.MissingSummary;
+    try std.testing.expect(note < summary);
+    try std.testing.expect(std.mem.indexOf(u8, out, "https://ziglang.org") != null);
+}
+
+test "L2: WebSearch paused before any result is an error, not an empty search" {
+    const a = std.testing.allocator;
+    var slot = cc.tool_exec.Slot{ .decision = .run, .name = "WebSearch", .id = "ws-paused-empty", .input = "{\"query\":\"zig\"}" };
+    defer slot.deinit(a);
+    try runPausedSearch(a, WEB_SEARCH_PAUSED_EMPTY_SSE, &slot);
+
+    try std.testing.expect(slot.is_error);
+    const out = slot.content orelse return error.MissingToolResult;
+    try std.testing.expect(std.mem.indexOf(u8, out, "was paused by the search service before it returned any result") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "No search results found") == null);
 }
 
 test "L2: provider factory returns distinct WebSearch clients" {

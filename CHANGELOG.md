@@ -223,6 +223,15 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- `WebSearch` no longer passes off a search the server paused as a complete
+  one. Its internal search request is the only one that carries a server tool,
+  and when Anthropic stops it with `pause_turn` (the server-side search loop
+  reached its iteration limit) the result now starts with a note that it may
+  be incomplete; with nothing returned yet it fails as `WebSearchIncomplete`
+  rather than saying "No search results found". The search is not resumed:
+  resuming means sending the paused response back verbatim, server blocks
+  included, which this request does not keep. The agent loop's own requests
+  never carry server tools, so they never end in `pause_turn`.
 - OpenAI Chat Completions streams no longer drop text (issue #258). metacodes
   always asks for `stream_options.include_usage`, under which every ordinary
   chunk carries `"usage": null`; the parser took any chunk containing the key

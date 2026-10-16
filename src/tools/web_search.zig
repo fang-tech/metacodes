@@ -127,8 +127,17 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
 
     const text = std.mem.trim(u8, model_text.items, " \t\r\n");
     const link_text = std.mem.trim(u8, links.items, " \t\r\n");
+    // pause_turn:服务端工具采样循环到了迭代上限,这次搜索没做完(响应可能停在一个没有
+    // 结果块的 server_tool_use 上)。协议的续跑方式是把原响应原样回送,而这个子请求不保留
+    // 原始 server 块,做不到原样——那就如实交代没做完,绝不把半截结果、更不能把空结果当成
+    // 一次完整的搜索交给模型。
+    const paused = stream.stopReason() == .pause_turn;
     // 空结果(模型既没续写摘要、后端也没透传结果)→ 对齐 cc/mecode no_results。
     if (text.len == 0 and link_text.len == 0) {
+        if (paused) {
+            setDetail(ctx, allocator, "web search for \"{s}\" was paused by the search service before it returned any result (stop_reason pause_turn); this is not an empty result. Retry the search or narrow the query.", .{query});
+            return error.WebSearchIncomplete;
+        }
         return try std.fmt.allocPrint(allocator, "No search results found for: {s}", .{query});
     }
 
@@ -140,11 +149,15 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     var out: std.Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
     try out.writer.print("Web search results for query: \"{s}\"\n\n", .{query});
+    if (paused) try out.writer.writeAll(PAUSED_NOTE ++ "\n\n");
     if (text.len > 0) try out.writer.print("{s}\n\n", .{text});
     if (link_text.len > 0) try out.writer.print("{s}\n\n", .{link_text});
     try out.writer.writeAll("REMINDER: You MUST include the sources above in your response to the user using markdown hyperlinks.");
     return try out.toOwnedSlice();
 }
+
+/// 搜索被服务端暂停(stop_reason pause_turn)但已有部分结果时,置于结果最前的说明。
+const PAUSED_NOTE = "NOTE: The search service paused this search before it finished (stop_reason pause_turn), so the results below may be incomplete. Search again, or narrow the query, if they do not cover the question.";
 
 fn setDetail(ctx: *const ToolContext, allocator: std.mem.Allocator, comptime fmt: []const u8, a: anytype) void {
     const slot = ctx.error_detail orelse return;
