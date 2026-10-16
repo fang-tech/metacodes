@@ -101,12 +101,11 @@ pub const Options = struct {
     session: SessionId = .single,
     /// The client's own provider: the fork's model, whose capabilities,
     /// output cap and reasoning effort this provider answers for so the loop
-    /// advertises to the gateway exactly what it would have advertised to it.
-    /// Must outlive this provider.
+    /// advertises to the gateway exactly what it would have advertised to it,
+    /// and whose route (§8.1) is read **before every request** — a refreshed
+    /// token or a switched key is picked up, never a stale copy. Must outlive
+    /// this provider.
     origin: provider_mod.Provider,
-    /// The client's own provider route (§8.1); its slices must outlive the
-    /// provider. The gateway calls the model over it, with its credential.
-    route: provider_mod.ProviderRoute,
     /// The pin directory: the Skill's base directory as the brain sees it,
     /// where its public assets were installed.
     base_dir: []const u8,
@@ -142,6 +141,9 @@ const Run = struct {
     cumulative_cost_micros: i64 = 0,
     finished: bool = false,
     violations: u8 = 0,
+    /// §8.3: the digest of the results sent for this Step, to be echoed by
+    /// the next one; "" until `runs.continue` is sent.
+    sent_results_digest: []const u8 = "",
 };
 
 pub const SealedSkillProvider = struct {
@@ -159,7 +161,6 @@ pub const SealedSkillProvider = struct {
     ui: ?ui_request.UiRequester,
     session: SessionId,
     origin: provider_mod.Provider,
-    route: provider_mod.ProviderRoute,
     base_dir: []u8,
     arguments: []const []u8,
     /// Everything the current run owns; reset per Step.
@@ -178,8 +179,10 @@ pub const SealedSkillProvider = struct {
         errdefer allocator.destroy(self);
         var pin = options.pin;
         errdefer pin.deinit();
-        if (options.route.auth_scheme) |scheme| if (scheme == .signed_adapter) return error.SealedProviderRouteUnavailable;
-        if (options.route.credential.len == 0) return error.SealedProviderRouteUnavailable;
+        // Fail at activation, not at the first Step, when the session's
+        // provider cannot be delegated at all; the route itself is re-read
+        // before every request.
+        _ = try routeOf(options.origin);
         const model_name = try std.fmt.allocPrint(allocator, "{s}{s}", .{ MODEL_PREFIX, pin.pin.entry.skill_id });
         errdefer allocator.free(model_name);
         const session_id = try allocator.dupe(u8, options.session_id);
@@ -208,8 +211,7 @@ pub const SealedSkillProvider = struct {
             },
         };
         errdefer store.deinit();
-        var client = try transport.Client.init(allocator, io, pin.pin.gateway_url, options.token);
-        client.provider_credential = options.route.credential;
+        const client = try transport.Client.init(allocator, io, pin.pin.gateway_url, options.token);
         self.* = .{
             .allocator = allocator,
             .transport = client,
@@ -225,7 +227,6 @@ pub const SealedSkillProvider = struct {
             .ui = options.ui,
             .session = options.session,
             .origin = options.origin,
-            .route = options.route,
             .base_dir = base_dir,
             .arguments = arguments,
             .run_arena = std.heap.ArenaAllocator.init(allocator),
@@ -415,11 +416,13 @@ pub const SealedSkillProvider = struct {
 
         const prompt = try firstUserText(arena, messages);
         if (prompt.len == 0) return error.SealedNoPrompt;
+        const route = try self.currentRoute();
+        defer self.transport.provider_credential = "";
         const split = try self.toolsJson(arena, tools orelse &.{});
         const arguments = try arena.alloc([]const u8, self.arguments.len);
         for (self.arguments, arguments) |argument, *slot| slot.* = argument;
         log.info("sealed", "runs.start skill={s} model={s} tools={d} provider_tools={d} max_steps={d} max_cost_micros={d} base_dir={s}", .{
-            self.pin.pin.entry.skill_id, model_override orelse self.route.model, split.client_count, split.provider_count, self.max_steps, self.max_cost_micros, self.base_dir,
+            self.pin.pin.entry.skill_id, model_override orelse route.model, split.client_count, split.provider_count, self.max_steps, self.max_cost_micros, self.base_dir,
         });
         var params: std.Io.Writer.Allocating = .init(arena);
         try protocol.writeStartParams(&params.writer, .{
@@ -436,12 +439,12 @@ pub const SealedSkillProvider = struct {
             .run_ref = self.session_id,
             .system = system orelse "",
             .base_dir = self.base_dir,
-            .provider_kind = @tagName(self.route.kind),
-            .provider_base_url = self.route.base_url,
-            .provider_openai_protocol = if (self.route.kind == .openai) @tagName(self.route.openai_protocol) else "",
-            .provider_auth_json = try authJson(arena, self.route.auth_scheme),
+            .provider_kind = @tagName(route.kind),
+            .provider_base_url = route.base_url,
+            .provider_openai_protocol = if (route.kind == .openai) @tagName(route.openai_protocol) else "",
+            .provider_auth_json = try authJson(arena, route.auth_scheme),
             .provider_tools_json = split.provider,
-            .model = model_override orelse self.route.model,
+            .model = model_override orelse route.model,
             .max_tokens = self.origin.maxTokensFor(model_override),
             .reasoning_effort = if (self.origin.reasoningEffort()) |effort| @tagName(effort) else "",
         });
@@ -532,7 +535,13 @@ pub const SealedSkillProvider = struct {
             if (result.refusal != null) refusals += 1;
         }
         log.info("sealed", "runs.continue run={s} seq={d} results={d} errors={d} refusals={d}", .{ run.run_id, run.seq, results.len, errors, refusals });
-        try self.recordResults(arena, results);
+        _ = try self.currentRoute();
+        defer self.transport.provider_credential = "";
+        // §8.3: what we are about to send, as the gateway will digest it; the
+        // next Step must echo it.
+        const digest = try protocol.resultsDigest(arena, results);
+        run.sent_results_digest = try self.run_arena.allocator().dupe(u8, digest);
+        try self.recordResults(arena, results, digest);
         var params: std.Io.Writer.Allocating = .init(arena);
         try protocol.writeContinueParams(&params.writer, run.run_id, run.run_state, run.seq, results);
         var response = self.transport.call(.runs_continue, params.written(), abort) catch |err| return self.transportFailure(err);
@@ -580,6 +589,13 @@ pub const SealedSkillProvider = struct {
             return error.SealedChainBroken;
         }
         if (self.run) |run| if (!std.mem.eql(u8, run.run_id, step.run_id)) return error.SealedChainBroken;
+        // §8.3: the Step answering our `runs.continue` must bind exactly the
+        // results we sent. A gateway that binds other results — or none — is
+        // not continuing the conversation we had; the run ends.
+        if (self.run) |run| if (run.sent_results_digest.len != 0 and !std.mem.eql(u8, run.sent_results_digest, step.results_digest)) {
+            log.warn("sealed", "step {d} binds results_digest {s}, we sent {s}", .{ step.seq, step.results_digest, run.sent_results_digest });
+            return error.SealedChainBroken;
+        };
         const continues = step.kind == .tool_calls or step.kind == .input_required;
         if (continues and step.run_state.len == 0) return error.SealedChainBroken;
 
@@ -863,6 +879,8 @@ pub const SealedSkillProvider = struct {
         if (run.finished) return;
         run.finished = true;
         log.info("sealed", "runs.cancel run={s} seq={d} reason={s}", .{ run.run_id, run.seq, @tagName(reason) });
+        // A cancel makes no model call (§3.6): no credential travels with it.
+        self.transport.provider_credential = "";
         var params: std.Io.Writer.Allocating = .init(self.allocator);
         defer params.deinit();
         protocol.writeCancelParams(&params.writer, run.run_id, run.run_state, reason) catch return;
@@ -922,6 +940,7 @@ pub const SealedSkillProvider = struct {
             .issuer_inference_gateway = step.issuer_inference_gateway,
             .calls = step.calls.len,
             .tool_calls = tool_calls,
+            .results_digest = step.results_digest,
         }) catch |err| log.warn("sealed", "ledger append failed: {s}", .{@errorName(err)});
         if (step.charge) |charge| {
             ledger.append(self.allocator, self.state_root, .{
@@ -948,7 +967,7 @@ pub const SealedSkillProvider = struct {
 
     /// §6.6: a digest of each result as sent (after redaction and truncation),
     /// with its size and flags, keyed by the Step it answers.
-    fn recordResults(self: *SealedSkillProvider, arena: std.mem.Allocator, results: []const protocol.ResultEntry) !void {
+    fn recordResults(self: *SealedSkillProvider, arena: std.mem.Allocator, results: []const protocol.ResultEntry, digest: []const u8) !void {
         if (self.state_root.len == 0) return;
         const run = &self.run.?;
         const entry = &self.pin.pin.entry;
@@ -972,7 +991,19 @@ pub const SealedSkillProvider = struct {
             .seq = run.seq,
             .calls = results.len,
             .results = refs,
+            .results_digest = digest,
         }) catch |err| log.warn("sealed", "ledger append failed: {s}", .{@errorName(err)});
+    }
+
+    /// The session provider's route as of now, with its credential set on
+    /// the transport for the request about to go out (§8.1), and cleared
+    /// again by the caller once it has. Read before every call, so a
+    /// refreshed OAuth token or a switched key is what the gateway gets and
+    /// the transport never holds a credential between requests.
+    fn currentRoute(self: *SealedSkillProvider) !provider_mod.ProviderRoute {
+        const route = try routeOf(self.origin);
+        self.transport.provider_credential = route.credential;
+        return route;
     }
 
     const ToolsJson = struct { client: []const u8, provider: []const u8, client_count: usize = 0, provider_count: usize = 0 };
@@ -1026,6 +1057,15 @@ pub const SealedSkillProvider = struct {
         return false;
     }
 };
+
+/// A provider's route, or the reason it cannot be delegated (§8.1): no route
+/// at all, no credential, or a signing scheme that cannot travel in a header.
+fn routeOf(origin: provider_mod.Provider) !provider_mod.ProviderRoute {
+    const route = origin.route() orelse return error.SealedProviderRouteUnavailable;
+    if (route.credential.len == 0) return error.SealedProviderRouteUnavailable;
+    if (route.auth_scheme) |scheme| if (scheme == .signed_adapter) return error.SealedProviderRouteUnavailable;
+    return route;
+}
 
 /// The route's authentication as the `provider.auth` object (§3.4); "" for
 /// the kind's default header.

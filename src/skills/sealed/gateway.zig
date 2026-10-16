@@ -452,6 +452,9 @@ pub const Gateway = struct {
         }
         state.pending = &.{};
         state.completed = &.{};
+        // §8.3: the next Step is derived from these results; bind them into
+        // the chain so the client can check the gateway saw what it sent.
+        state.results_digest = protocol.resultsDigestOfValue(arena, results) catch return error.OutOfMemory;
         if (state.violations >= MAX_POLICY_VIOLATIONS) {
             return self.finishRun(arena, &state, "policy_violation", "the client refused calls outside the pinned allowlist");
         }
@@ -556,12 +559,17 @@ pub const Gateway = struct {
         provider: ProviderSpec,
         tools: std.json.Value,
         provider_tools: std.json.Value,
-        compact_boundary: usize = 0,
+        /// The summary standing for everything the loop compacted away.
         compact_summary: ?[]const u8 = null,
-        /// Transcript-shaped message objects (`transcript.Writer.renderMessageJson`).
+        /// Transcript-shaped message objects (`transcript.Writer.renderMessageJson`)
+        /// of the **active window** only: everything before the compaction
+        /// boundary lives on as `compact_summary`.
         messages: std.json.Array,
         pending: []const Pending,
         completed: []const Completed,
+        /// Request-scoped, never sealed: the digest of the `results` the Step
+        /// being produced derives from (§8.3); "" for `runs.start`.
+        results_digest: []const u8 = "",
     };
 
     /// Serialize, seal and encode a run state (§4.4).
@@ -612,7 +620,7 @@ pub const Gateway = struct {
         try std.json.Stringify.value(state.tools, .{}, w);
         try w.writeAll(",\"provider_tools\":");
         try std.json.Stringify.value(state.provider_tools, .{}, w);
-        try w.print(",\"compact_boundary\":{d},\"compact_summary\":", .{state.compact_boundary});
+        try w.writeAll(",\"compact_summary\":");
         if (state.compact_summary) |summary| try protocol.writeString(w, summary) else try w.writeAll("null");
         try w.writeAll(",\"messages\":");
         try std.json.Stringify.value(std.json.Value{ .array = state.messages }, .{}, w);
@@ -700,7 +708,6 @@ pub const Gateway = struct {
             .provider = provider_spec,
             .tools = parsed.object.get("tools") orelse std.json.Value{ .array = std.json.Array.init(arena) },
             .provider_tools = parsed.object.get("provider_tools") orelse std.json.Value{ .array = std.json.Array.init(arena) },
-            .compact_boundary = @intCast(valueUnsigned(parsed, "compact_boundary") orelse 0),
             .compact_summary = if (summary_value != null and summary_value.? == .string) summary_value.?.string else null,
             .messages = messages_value.array,
             .pending = pending,
@@ -727,16 +734,10 @@ pub const Gateway = struct {
         // The conversation, owned by the loop's allocator for the request.
         var conversation = Conversation.init(self.allocator);
         defer conversation.deinit();
-        for (state.messages.items) |value| {
-            const text = protocol.serializeValue(arena, value) catch return error.OutOfMemory;
-            const message = transcript.parseMessageJson(text, self.allocator) catch |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                else => return error.RunStateInvalid,
-            };
-            conversation.append(message) catch return error.OutOfMemory;
-        }
-        conversation.compact_boundary = @min(state.compact_boundary, conversation.messages.items.len);
-        if (state.compact_summary) |summary| conversation.compact_summary = self.allocator.dupe(u8, summary) catch return error.OutOfMemory;
+        restoreConversation(arena, &conversation, state.messages, state.compact_summary) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.RunStateInvalid,
+        };
 
         // The client's provider, for this request only (§8.1).
         var owned = provider_factory.makeProviderWithOptions(
@@ -893,17 +894,12 @@ pub const Gateway = struct {
         return self.emitStep(arena, state, .{ .kind = .tool_calls, .calls = calls.items, .usage = step_usage });
     }
 
+    /// The continuation keeps only what the model would still see: the
+    /// active window plus the summary that stands for everything before it
+    /// (`activeWindowJson`).
     fn storeConversation(self: *Gateway, arena: std.mem.Allocator, state: *RunState, conversation: *const Conversation) MethodError!void {
         _ = self;
-        var messages = std.json.Array.init(arena);
-        for (conversation.messages.items) |*message| {
-            var out: std.Io.Writer.Allocating = .init(arena);
-            transcript.Writer.renderMessageJson(&out.writer, message) catch return error.OutOfMemory;
-            const value = std.json.parseFromSliceLeaky(std.json.Value, arena, out.written(), .{}) catch return error.OutOfMemory;
-            messages.append(value) catch return error.OutOfMemory;
-        }
-        state.messages = messages;
-        state.compact_boundary = conversation.compact_boundary;
+        state.messages = try activeWindowJson(arena, conversation);
         state.compact_summary = if (conversation.compact_summary) |summary| (arena.dupe(u8, summary) catch return error.OutOfMemory) else null;
     }
 
@@ -1006,6 +1002,10 @@ pub const Gateway = struct {
         try protocol.writeString(w, self.operator_id);
         try w.writeAll("},\"prev_digest\":");
         try protocol.writeString(w, state.last_digest);
+        if (state.results_digest.len != 0) {
+            try w.writeAll(",\"results_digest\":");
+            try protocol.writeString(w, state.results_digest);
+        }
         if (emit.kind == .final or emit.kind == .failed) {
             try w.writeAll(",\"charge\":{\"run_id\":");
             try protocol.writeString(w, state.run_id);
@@ -1018,6 +1018,91 @@ pub const Gateway = struct {
 };
 
 const protocol_default_max_steps: u64 = 200;
+
+/// The continuation's view of the conversation (§9.2): the messages from the
+/// compaction boundary on, in the transcript's own shape. The prefix the
+/// boundary projected away is not carried — compaction moves a boundary, it
+/// deletes nothing, so carrying it would grow `run_state` with every Step
+/// until the blob no longer fits (`MAX_STATE_BYTES`). The summary that
+/// stands for that prefix travels beside the window (`RunState.compact_summary`).
+fn activeWindowJson(arena: std.mem.Allocator, conversation: *const Conversation) error{OutOfMemory}!std.json.Array {
+    var messages = std.json.Array.init(arena);
+    for (conversation.messages.items[conversation.activeStart()..]) |*message| {
+        var out: std.Io.Writer.Allocating = .init(arena);
+        transcript.Writer.renderMessageJson(&out.writer, message) catch return error.OutOfMemory;
+        const value = std.json.parseFromSliceLeaky(std.json.Value, arena, out.written(), .{}) catch return error.OutOfMemory;
+        messages.append(value) catch return error.OutOfMemory;
+    }
+    return messages;
+}
+
+/// Rebuild the loop's conversation from a continuation. The summary, when
+/// there is one, leads as a synthetic assistant turn: that is the projection
+/// the loop makes of `compact_summary` anyway (one assistant text message
+/// before the active window), so the model sees the same conversation — and
+/// being an ordinary message now, it is part of what the next compaction
+/// summarizes, instead of being replaced and lost with the originals gone.
+fn restoreConversation(arena: std.mem.Allocator, conversation: *Conversation, messages: std.json.Array, summary: ?[]const u8) !void {
+    const allocator = conversation.allocator;
+    if (summary) |text| {
+        if (text.len != 0) {
+            const blocks = try allocator.alloc(msg.Block, 1);
+            errdefer allocator.free(blocks);
+            blocks[0] = .{ .text = try allocator.dupe(u8, text) };
+            errdefer allocator.free(blocks[0].text);
+            try conversation.append(.{ .role = .assistant, .blocks = blocks });
+        }
+    }
+    for (messages.items) |value| {
+        const json = try protocol.serializeValue(arena, value);
+        try conversation.append(try transcript.parseMessageJson(json, allocator));
+    }
+    conversation.compact_boundary = 0;
+}
+
+test "run_state carries the active window and the summary, not the projected prefix" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    // Four turns, compacted past the first two, with a summary standing in.
+    var conversation = Conversation.init(a);
+    defer conversation.deinit();
+    try conversation.appendText(.user, "first task");
+    try conversation.appendText(.assistant, "first answer");
+    try conversation.appendText(.user, "second task");
+    try conversation.appendText(.assistant, "second answer");
+    conversation.compact_boundary = 2;
+    conversation.compact_summary = try a.dupe(u8, "SUMMARY of the first exchange");
+
+    const window = try activeWindowJson(arena.allocator(), &conversation);
+    try std.testing.expectEqual(@as(usize, 2), window.items.len);
+    const rendered = try protocol.serializeValue(arena.allocator(), .{ .array = window });
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "first task") == null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "first answer") == null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "second task") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "second answer") != null);
+
+    // Restored: the summary leads as an assistant turn, then the window; the
+    // whole of it is active, so the next compaction summarizes the summary too.
+    var restored = Conversation.init(a);
+    defer restored.deinit();
+    try restoreConversation(arena.allocator(), &restored, window, conversation.compact_summary);
+    try std.testing.expectEqual(@as(usize, 3), restored.messages.items.len);
+    try std.testing.expectEqual(msg.Role.assistant, restored.messages.items[0].role);
+    try std.testing.expectEqualStrings("SUMMARY of the first exchange", restored.messages.items[0].blocks[0].text);
+    try std.testing.expectEqual(msg.Role.user, restored.messages.items[1].role);
+    try std.testing.expectEqualStrings("second task", restored.messages.items[1].blocks[0].text);
+    try std.testing.expectEqualStrings("second answer", restored.messages.items[2].blocks[0].text);
+    try std.testing.expectEqual(@as(usize, 3), restored.activeMessages().len);
+    try std.testing.expect(restored.compact_summary == null);
+
+    // No summary (never compacted): the window alone, nothing synthetic.
+    var plain = Conversation.init(a);
+    defer plain.deinit();
+    try restoreConversation(arena.allocator(), &plain, window, null);
+    try std.testing.expectEqual(@as(usize, 2), plain.messages.items.len);
+    try std.testing.expectEqual(msg.Role.user, plain.messages.items[0].role);
+}
 
 // ── The capturing dispatcher ──────────────────────────────────────────────
 

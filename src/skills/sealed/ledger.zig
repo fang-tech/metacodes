@@ -72,6 +72,9 @@ pub const Record = struct {
     tool_calls: []const CallRef = &.{},
     /// `results`: what was sent for each call of the answered Step.
     results: []const ResultRef = &.{},
+    /// `results`: the digest of the whole array as sent; `step`: the digest
+    /// the gateway bound into the Step (§8.3). Equal on a healthy chain.
+    results_digest: []const u8 = "",
 };
 
 /// `METACODES_LEDGER_DIR/sealed.ndjson`, else `<state_root>/ledger/sealed.ndjson`.
@@ -141,7 +144,9 @@ pub fn render(allocator: std.mem.Allocator, record: Record) ![]u8 {
         }
         try w.writeAll("]}");
     }
-    try w.writeAll("]}\n");
+    try w.writeAll("],\"results_digest\":");
+    try protocol.writeString(w, record.results_digest);
+    try w.writeAll("}\n");
     return out.toOwnedSlice();
 }
 
@@ -205,7 +210,7 @@ test "ledger line carries the gateway's charge verbatim" {
     defer a.free(line);
     try std.testing.expect(std.mem.indexOf(u8, line, "\"kind\":\"charge\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, line, "\"cost_micros\":24400") != null);
-    try std.testing.expect(std.mem.indexOf(u8, line, "\"tool_calls\":[],\"results\":[]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line, "\"tool_calls\":[],\"results\":[],\"results_digest\":\"\"") != null);
     try std.testing.expect(std.mem.endsWith(u8, line, "}\n"));
 }
 

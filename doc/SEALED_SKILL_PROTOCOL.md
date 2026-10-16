@@ -305,10 +305,18 @@ client MUST record them with the run (§8.3).
                  "input_tokens": 7300, "output_tokens": 410},
   "issuer": {"skill_host": "metask", "inference_gateway": "metask"},
   "prev_digest": "sha256:…",
+  "results_digest": "sha256:…"?,
   "digest": "sha256:…",
   "sig": "<base64 Ed25519 over digest>"?
 }
 ```
+
+`results_digest` is present on every Step derived from a `runs.continue`:
+the digest (§4.5) of that request's `results` array as the gateway parsed
+it. It is inside the digested body, so the chain binds what the client sent
+as well as what the gateway answered (§8.3). It is absent on the first Step;
+a client ends the run when the Step answering its `runs.continue` lacks it
+or carries another value.
 
 `kind` is one of:
 
@@ -343,8 +351,9 @@ Call fields:
 An opaque string. The client MUST return it unchanged on the next message
 and MUST NOT interpret it. A stateless gateway encodes the run's
 conversation and workflow position in it, encrypted and authenticated with
-a gateway key (AEAD, key id in the clear), so that a tampered or replayed
-blob fails with `run_state_invalid`. Size SHOULD stay under 256 KiB; a
+a gateway key (AEAD, key id in the clear), so that a tampered blob, or one
+presented under another run, fails with `run_state_invalid` (what this does
+and does not say about replay: §8.4). Size SHOULD stay under 256 KiB; a
 gateway that needs more SHOULD switch to server-side state for that run.
 
 ### 4.5 Canonical JSON
@@ -549,18 +558,33 @@ outside this protocol.
 
 Steps form a hash chain: `prev_digest` is the previous Step's `digest`
 (`sha256:` over 32 zero bytes for `seq: 1`), and the client's `results` are
-digested into the next Step by the gateway (the gateway includes
-`results_digest` in the Step it derives from them). Either side can show,
-after the fact, what the other sent. With `step_signature`, `sig` is an
+digested into the next Step by the gateway as `results_digest` — the digest
+of the canonical JSON of the `results` array it received. The client
+computes the same digest over the array it sent and MUST end the run as
+`failed` / `client_error` when the Step answering its `runs.continue` does
+not carry exactly that digest: a gateway that binds other results than the
+ones it was given — or none — is misreporting the conversation. Either side
+can therefore show, after the fact, what the other sent: the client keeps
+per-result digests and the array digest in its ledger, the gateway keeps
+the chain. With `step_signature`, `sig` is an
 Ed25519 signature by the inference gateway over `digest`; the key is
 published at `<gateway>/.well-known/sealed-skill.json`.
 
 ### 8.4 Replay and ordering
 
-`run_state` is authenticated; `seq` is checked; a `runs.continue` for a
-`seq` already answered is rejected. A client that crashes mid-run cannot
-resume it (there is no resume method in v1); it cancels or lets the
-gateway's run deadline expire, and is charged for the work done.
+`run_state` is authenticated with the run id as associated data and carries
+`seq`, so a tampered blob, a blob presented under another run's id, or a
+`seq` that does not match the blob is rejected with `run_state_invalid`.
+What a stateless gateway does **not** prevent, and this document does not
+promise: the holder of a blob replaying it. An old `run_state` with its own
+`seq` is self-consistent, so a client can continue a run again from any
+earlier Step and get a fresh continuation, at its own cost and on its own
+account; the hash chain makes such a fork visible (two Steps with the same
+`prev_digest`) and the client's ledger records both. A gateway that keeps
+server-side state MAY additionally reject a `seq` it has already answered.
+A client that crashes mid-run cannot resume it in any other way (there is
+no resume method in v1); it cancels or lets the gateway's run deadline
+expire, and is charged for the work done.
 
 ### 8.5 Disclosure through the model
 
@@ -648,11 +672,13 @@ call.
 - **Mirror.** The provider answers the loop's questions about the model —
   capabilities, output cap, reasoning effort — with the session's own
   provider's answers, so the loop advertises to the gateway exactly what it
-  would have advertised to the model. The one deliberate deviation is the
-  context window it reports: effectively unbounded, so the client's copy of
-  the fork conversation never compacts — the brain's conversation lives on
-  the gateway, which compacts it; the client's is a mirror for pairing
-  results.
+  would have advertised to the model. The provider's route and credential
+  are read from the session's provider **before every request**, so a
+  refreshed OAuth token or a switched key is what the gateway gets, never a
+  copy taken at activation. The one deliberate deviation is the context
+  window it reports: effectively unbounded, so the client's copy of the fork
+  conversation never compacts — the brain's conversation lives on the
+  gateway, which compacts it; the client's is a mirror for pairing results.
 - **Executor mode.** The brain's iteration belongs to the gateway's loop;
   the client's fork loop is its executor. Its turn cap is the protocol's
   `max_steps`, not the subagent default; it never summarizes (the provider
@@ -661,7 +687,10 @@ call.
   violations, permission — apply as ever.
 - **Chain and sequence.** Every Step's `digest` is recomputed and its
   `prev_digest` / `seq` checked against the previous Step before anything
-  is recorded; a mismatch ends the run with `SealedChainBroken`.
+  is recorded; a Step derived from a `runs.continue` must carry the digest
+  of the results the client sent (`results_digest`, §8.3), which the client
+  computed before sending and keeps in its ledger; any mismatch ends the
+  run with `SealedChainBroken`.
 - **Policy.** The policy frame derived from the pinned allowlist refuses a
   call outside it before dispatch; the provider reports the refusal as
   `policy_violation`, counts it, and cancels the run with `reason: policy`
@@ -674,11 +703,13 @@ call.
   estimate-based stop. It bounds what the gateway charges; it cannot bound
   what the gateway spends on the client's account (§8.1).
 - **Ledger.** `<state root>/ledger/sealed.ndjson` holds, per run, a
-  `step` record per Step (usage, chain link, issuer, and every call's id and
-  name as `tool_calls`), a `results` record per `runs.continue` (for each
-  result its `tool_use_id`, the SHA-256 of the content exactly as sent, its
-  size, `is_error`, `truncated`, `refusal`, `redactions`) and a `charge`
-  record per receipt — what §6.6 asks for, without the contents themselves.
+  `step` record per Step (usage, chain link, the `results_digest` the
+  gateway bound, issuer, and every call's id and name as `tool_calls`), a
+  `results` record per `runs.continue` (for each result its `tool_use_id`,
+  the SHA-256 of the content exactly as sent, its size, `is_error`,
+  `truncated`, `refusal`, `redactions`, and the digest of the whole array
+  as sent, §8.3) and a `charge` record per receipt — what §6.6 asks for,
+  without the contents themselves.
   `metacodes sealed ledger` prints it. The provider credential is never
   written there.
 - **Confirmation.** A call marked `confirm: true` is approved
@@ -771,15 +802,21 @@ fan-out and non-loopback exposure are a reverse proxy's job.
   Step. A later Step resumes the loop with the client's results and the
   gateway's own as one user turn (`resumeRunWithResults`), so the API's
   tool_use/tool_result pairing holds.
-- **Stateless runs.** The loop's continuation — the conversation in the
-  transcript's own message shape, the pending batch, the gateway's own
-  results, totals, caps, the client's route and request parameters — is
-  sealed into `run_state` with XChaCha20-Poly1305 under a process key, with
-  the run id as associated data; `runs.continue` and `runs.cancel` fail with
-  `run_state_invalid` on a tampered, replayed or foreign blob, or a `seq`
-  that does not match. Nothing is stored server-side, the body is re-read
-  from the package rather than carried, and any gateway instance with the
-  key serves any Step; the suite restarts the gateway between two Steps.
+- **Stateless runs.** The loop's continuation — the conversation's active
+  window in the transcript's own message shape plus the compaction summary
+  that stands for everything before it (the projected-away prefix is not
+  carried, so the state stays the size of a context window instead of
+  growing with every Step), the pending batch, the gateway's own results,
+  totals, caps, the client's route and request parameters — is sealed into
+  `run_state` with XChaCha20-Poly1305 under a process key, with the run id
+  as associated data; `runs.continue` and `runs.cancel` fail with
+  `run_state_invalid` on a tampered or foreign blob, or a `seq` that does
+  not match (replay by the blob's holder is not prevented, §8.4). On
+  restore the summary becomes the first assistant turn, which is the
+  projection the loop would have made of it and lets a later compaction
+  fold it in. Nothing is stored server-side, the body is re-read from the
+  package rather than carried, and any gateway instance with the key serves
+  any Step; the suite restarts the gateway between two Steps.
 - **Steps.** `tool_calls` for a suspended batch of remote tool uses (with
   `confirm` from the manifest or `confirmation: always`, `credentials` from
   the manifest-declared placeholders the input names, and
@@ -816,7 +853,7 @@ the symbolic name:
 | -32003 | `skill_not_found` | unknown or invisible `skill_id` |
 | -32004 | `manifest_changed` | pinned digest is not current; `data.current` holds the Entry |
 | -32005 | `run_not_found` | unknown `run_id` |
-| -32006 | `run_state_invalid` | tampered, replayed or stale `run_state`/`seq` |
+| -32006 | `run_state_invalid` | tampered or foreign `run_state`, or a `seq` that does not match it |
 | -32007 | `budget_exceeded` | the run would pass `max_cost_micros` |
 | -32008 | `policy_violation` | the client reported refusals the gateway cannot recover from |
 | -32009 | `rate_limited` | retry after `data.retry_after_ms` |

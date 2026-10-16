@@ -391,6 +391,18 @@ const Lab = struct {
     }
 };
 
+/// The value of `key` (`"name":"`) on the first ledger line containing `marker`.
+fn ledgerField(ledger: []const u8, marker: []const u8, key: []const u8) ?[]const u8 {
+    var lines = std.mem.splitScalar(u8, ledger, '\n');
+    while (lines.next()) |line| {
+        if (std.mem.indexOf(u8, line, marker) == null) continue;
+        const start = (std.mem.indexOf(u8, line, key) orelse return null) + key.len;
+        const end = std.mem.indexOfScalarPos(u8, line, start, '"') orelse return null;
+        return line[start..end];
+    }
+    return null;
+}
+
 fn countOccurrences(haystack: []const u8, needle: []const u8) usize {
     var count: usize = 0;
     var index: usize = 0;
@@ -469,6 +481,15 @@ test "L2 sealed: brain on the gateway, hands on the client, model on the client'
     try std.testing.expect(std.mem.indexOf(u8, ledger, "\"is_error\":false,\"truncated\":false,\"redactions\":[]}]") != null);
     // Contents never enter the ledger, only their digests.
     try std.testing.expect(std.mem.indexOf(u8, ledger, "DATA_MARKER") == null);
+    // §8.3: the digest of the results the client sent is bound into the Step
+    // the gateway derived from them — the `results` record and the `final`
+    // step record carry the same value, and it is not empty.
+    const sent_digest = ledgerField(ledger, "\"kind\":\"results\"", "\"results_digest\":\"") orelse return error.ResultsDigestMissing;
+    const bound_digest = ledgerField(ledger, "\"step_kind\":\"final\"", "\"results_digest\":\"") orelse return error.ResultsDigestMissing;
+    try std.testing.expect(std.mem.startsWith(u8, sent_digest, "sha256:"));
+    try std.testing.expectEqualStrings(sent_digest, bound_digest);
+    const first_step_digest = ledgerField(ledger, "\"seq\":1,\"step_kind\":\"tool_calls\"", "\"results_digest\":\"") orelse return error.ResultsDigestMissing;
+    try std.testing.expectEqualStrings("", first_step_digest);
     // The client's credential went to the model and nowhere else: not into
     // the ledger, not into the fork's output.
     try std.testing.expect(std.mem.indexOf(u8, ledger, CLIENT_KEY) == null);
@@ -565,6 +586,13 @@ test "L2 sealed: the gateway holds no run state — it restarts between two Step
     try std.testing.expectEqualStrings("final-from-sealed", step2.step.text);
     try std.testing.expectEqualStrings(step1.step.digest, step2.step.prev_digest);
     try std.testing.expectEqual(@as(u64, 2), step2.step.seq);
+    // §8.3: the Step derived from our results binds their digest.
+    const expected_digest = try protocol.resultsDigest(a, &.{
+        .{ .tool_use_id = step1.step.calls[0].id, .content = "DATA_MARKER from the client" },
+    });
+    defer a.free(expected_digest);
+    try std.testing.expectEqualStrings(expected_digest, step2.step.results_digest);
+    try std.testing.expectEqualStrings("", step1.step.results_digest);
     // The new process made the second model call from the carried state.
     try std.testing.expectEqual(@as(usize, 2), lab.model.requestCount());
     const second = lab.model.requestAt(1) orelse return error.NoModelRequest;

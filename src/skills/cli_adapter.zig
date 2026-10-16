@@ -1004,10 +1004,10 @@ fn openSealedProvider(
 ) !*sealed_provider.SealedSkillProvider {
     const own_provider: ?@import("../api/provider.zig").Provider = ctx.provider orelse
         if (ctx.api_client) |client| client.provider() else null;
-    const route = (if (own_provider) |prov| prov.route() else null) orelse {
+    if (own_provider == null or own_provider.?.route() == null) {
         std.debug.print("\x1b[31m/{s}: a sealed Skill runs on this session's own model account, and the current provider cannot be delegated to a gateway\x1b[0m\n", .{record.invocation_name});
         return error.SealedProviderRouteUnavailable;
-    };
+    }
     var pin = sealed_pin.read(ctx.allocator, activation.tree.path()) catch |err| {
         std.debug.print("\x1b[31m/{s}: sealed pin unreadable ({s})\x1b[0m\n", .{ record.invocation_name, @errorName(err) });
         return error.SealedPinInvalid;
@@ -1045,7 +1045,6 @@ fn openSealedProvider(
         .ui = ctx.ui_requester orelse if (ctx.permission_ctx) |permission| permission.ui_requester else null,
         .session = ctx.session,
         .origin = own_provider.?,
-        .route = route,
         .base_dir = activation.tree.path(),
         .arguments = values,
     });

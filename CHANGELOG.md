@@ -12,6 +12,15 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Added
 
+- Sealed Skill chain and state: every Step derived from a `runs.continue`
+  carries `results_digest`, the digest of the results array the gateway
+  received, inside its digested body; the client computes the same digest
+  before sending, checks the echo and ends the run on a mismatch (§8.3).
+  The provider route and credential are re-read from the session's provider
+  before every gateway request. `run_state` carries only the conversation's
+  active window plus the compaction summary, restored as the first
+  assistant turn, instead of every message ever exchanged. §8.4 now states
+  what a stateless gateway does and does not prevent about replay.
 - Sealed Skill audit and trace: the ledger now records every call's id and
   name per Step and a `results` record per `runs.continue` with the SHA-256,
   size and flags of each result as sent (§6.6); the client logs every

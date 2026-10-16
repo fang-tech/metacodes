@@ -411,6 +411,11 @@ pub const Step = struct {
     prev_digest: []const u8 = "",
     digest: []const u8 = "",
     sig: []const u8 = "",
+    /// §8.3: the digest of the `results` array this Step was derived from
+    /// (canonical JSON, §4.5); "" on a run's first Step. A client compares
+    /// it with the digest of what it sent and ends the run when the Step
+    /// answering its `runs.continue` carries anything else, including nothing.
+    results_digest: []const u8 = "",
     /// `failed` only.
     reason: []const u8 = "",
     message: []const u8 = "",
@@ -473,6 +478,7 @@ pub fn stepFromValue(arena: std.mem.Allocator, value: std.json.Value) ParseError
     step.message = try optionalString(value, "message") orelse "";
     step.prev_digest = try optionalString(value, "prev_digest") orelse "";
     step.sig = try optionalString(value, "sig") orelse "";
+    step.results_digest = try optionalString(value, "results_digest") orelse "";
     if (value.object.get("issuer")) |issuer| {
         if (issuer != .object) return error.InvalidShape;
         step.issuer_skill_host = try optionalString(issuer, "skill_host") orelse "";
@@ -724,7 +730,15 @@ pub fn writeContinueParams(
     try writeString(w, run_id);
     try w.writeAll(",\"run_state\":");
     try writeString(w, run_state);
-    try w.print(",\"seq\":{d},\"results\":[", .{seq});
+    try w.print(",\"seq\":{d},\"results\":", .{seq});
+    try writeResultsArray(w, results);
+    try w.writeByte('}');
+}
+
+/// The `results` array of `runs.continue` (§3.5), the one object both sides
+/// digest (§8.3).
+pub fn writeResultsArray(w: *std.Io.Writer, results: []const ResultEntry) !void {
+    try w.writeByte('[');
     for (results, 0..) |result, index| {
         if (index != 0) try w.writeByte(',');
         try w.writeAll("{\"tool_use_id\":");
@@ -740,7 +754,27 @@ pub fn writeContinueParams(
         try writeStringArray(w, result.redactions);
         try w.writeByte('}');
     }
-    try w.writeAll("]}");
+    try w.writeByte(']');
+}
+
+/// §8.3: `sha256:` over the canonical JSON (§4.5) of a `results` array. The
+/// client computes it from the entries it is about to send; the gateway from
+/// the array it parsed; the two agree by construction (same wire form, same
+/// canonicalization), so a Step's `results_digest` can be checked.
+pub fn resultsDigest(allocator: std.mem.Allocator, results: []const ResultEntry) ![]const u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    try writeResultsArray(&out.writer, results);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, out.written(), .{});
+    defer parsed.deinit();
+    return resultsDigestOfValue(allocator, parsed.value);
+}
+
+/// The gateway's side of `resultsDigest`: over the parsed `results` value.
+pub fn resultsDigestOfValue(allocator: std.mem.Allocator, results: std.json.Value) ![]const u8 {
+    const canonical = try canonicalize(allocator, results);
+    defer allocator.free(canonical);
+    return digestHex(allocator, canonical);
 }
 
 pub const CancelReason = enum { user_abort, budget, policy, client_error };
@@ -1286,6 +1320,32 @@ test "assets: the result is decoded and its digest verified" {
     const bad_json = try std.fmt.allocPrint(a, "{{\"path\":\"scripts/post.py\",\"sha256\":\"sha256:00\",\"content_base64\":\"{s}\"}}", .{encoded});
     defer a.free(bad_json);
     try std.testing.expectError(error.InvalidShape, parseAsset(a, bad_json));
+}
+
+test "results digest: client entries and the gateway's parsed array agree (§8.3)" {
+    const a = std.testing.allocator;
+    const entries = [_]ResultEntry{
+        .{ .tool_use_id = "call_1", .content = "line one\nline \"two\"", .truncated = true, .redactions = &.{"erp-main"} },
+        .{ .tool_use_id = "call_2", .content = "", .is_error = true, .refusal = .policy_violation },
+    };
+    const client_side = try resultsDigest(a, &entries);
+    defer a.free(client_side);
+    // What the gateway receives: the same array inside the continue params,
+    // possibly re-serialized with other spacing or key order by a proxy.
+    var params: std.Io.Writer.Allocating = .init(a);
+    defer params.deinit();
+    try writeContinueParams(&params.writer, "run_1", "blob", 1, &entries);
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, params.written(), .{});
+    defer parsed.deinit();
+    const gateway_side = try resultsDigestOfValue(a, parsed.value.object.get("results").?);
+    defer a.free(gateway_side);
+    try std.testing.expectEqualStrings(client_side, gateway_side);
+    try std.testing.expect(std.mem.startsWith(u8, client_side, "sha256:"));
+    // A changed result changes the digest.
+    const other = [_]ResultEntry{.{ .tool_use_id = "call_1", .content = "line one" }};
+    const other_digest = try resultsDigest(a, &other);
+    defer a.free(other_digest);
+    try std.testing.expect(!std.mem.eql(u8, client_side, other_digest));
 }
 
 test "json-rpc responses: result, known error, foreign id" {
