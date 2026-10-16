@@ -264,64 +264,70 @@ pub const Writer = struct {
     fn writeMessage(self: *Writer, m: *const msg_mod.Message) !void {
         var aw: std.Io.Writer.Allocating = .init(self.allocator);
         defer aw.deinit();
+        try renderMessageJson(&aw.writer, m);
+        try aw.writer.writeByte('\n');
+        try writeAllFd(self.fd, aw.written());
+    }
 
-        try aw.writer.writeAll("{\"role\":\"");
-        try aw.writer.writeAll(roleStr(m.role));
+    /// One message as the transcript's JSON object (no trailing newline): the
+    /// inverse of `parseMessageJson`. Also the shape a sealed gateway's run
+    /// state carries a conversation in, so both sides share one codec.
+    pub fn renderMessageJson(w: *std.Io.Writer, m: *const msg_mod.Message) !void {
+        try w.writeAll("{\"role\":\"");
+        try w.writeAll(roleStr(m.role));
         // 送达水位随消息持久化(消息级 + 每个 tool_result 块级):resume 后图片结果的
         // microcompact 保护与请求级裁剪都靠它,不再从消息位置推断。旧文件缺字段 → false(保守)。
-        try aw.writer.print("\",\"delivered\":{s},\"blocks\":[", .{if (m.delivered) "true" else "false"});
+        try w.print("\",\"delivered\":{s},\"blocks\":[", .{if (m.delivered) "true" else "false"});
         for (m.blocks, 0..) |b, i| {
-            if (i > 0) try aw.writer.writeAll(",");
+            if (i > 0) try w.writeAll(",");
             switch (b) {
                 .text => |t| {
-                    try aw.writer.writeAll("{\"type\":\"text\",\"text\":");
-                    try util_json.writeJsonString(&aw.writer, t);
-                    try aw.writer.writeAll("}");
+                    try w.writeAll("{\"type\":\"text\",\"text\":");
+                    try util_json.writeJsonString(w, t);
+                    try w.writeAll("}");
                 },
                 .tool_use => |tu| {
-                    try aw.writer.writeAll("{\"type\":\"tool_use\",\"id\":");
-                    try util_json.writeJsonString(&aw.writer, tu.id);
-                    try aw.writer.writeAll(",\"name\":");
-                    try util_json.writeJsonString(&aw.writer, tu.name);
-                    try aw.writer.writeAll(",\"input\":");
-                    try util_json.writeJsonString(&aw.writer, tu.input);
-                    try aw.writer.writeAll("}");
+                    try w.writeAll("{\"type\":\"tool_use\",\"id\":");
+                    try util_json.writeJsonString(w, tu.id);
+                    try w.writeAll(",\"name\":");
+                    try util_json.writeJsonString(w, tu.name);
+                    try w.writeAll(",\"input\":");
+                    try util_json.writeJsonString(w, tu.input);
+                    try w.writeAll("}");
                 },
                 .tool_result => |tr| {
-                    try aw.writer.writeAll("{\"type\":\"tool_result\",\"tool_use_id\":");
-                    try util_json.writeJsonString(&aw.writer, tr.tool_use_id);
-                    try aw.writer.writeAll(",\"content\":");
-                    try util_json.writeJsonString(&aw.writer, tr.content);
-                    try aw.writer.print(",\"is_error\":{s},\"delivered\":{s}", .{ if (tr.is_error) "true" else "false", if (tr.delivered) "true" else "false" });
-                    try aw.writer.writeAll("}");
+                    try w.writeAll("{\"type\":\"tool_result\",\"tool_use_id\":");
+                    try util_json.writeJsonString(w, tr.tool_use_id);
+                    try w.writeAll(",\"content\":");
+                    try util_json.writeJsonString(w, tr.content);
+                    try w.print(",\"is_error\":{s},\"delivered\":{s}", .{ if (tr.is_error) "true" else "false", if (tr.delivered) "true" else "false" });
+                    try w.writeAll("}");
                 },
                 .thinking => |t| {
-                    try aw.writer.writeAll("{\"type\":\"thinking\",\"thinking\":");
-                    try util_json.writeJsonString(&aw.writer, t);
-                    try aw.writer.writeAll("}");
+                    try w.writeAll("{\"type\":\"thinking\",\"thinking\":");
+                    try util_json.writeJsonString(w, t);
+                    try w.writeAll("}");
                 },
                 .image => |img| {
                     // base64 载荷 JSON 安全;resume 后图像语义原样恢复(issue #10)。
-                    try aw.writer.writeAll("{\"type\":\"image\",\"media_type\":");
-                    try util_json.writeJsonString(&aw.writer, img.media_type);
-                    try aw.writer.writeAll(",\"data\":");
-                    try util_json.writeJsonString(&aw.writer, img.data);
-                    try aw.writer.writeAll("}");
+                    try w.writeAll("{\"type\":\"image\",\"media_type\":");
+                    try util_json.writeJsonString(w, img.media_type);
+                    try w.writeAll(",\"data\":");
+                    try util_json.writeJsonString(w, img.data);
+                    try w.writeAll("}");
                 },
                 .reasoning_item => |item| {
                     // provider 私有的推理续传项:item JSON 作为**字符串**存(不内联
                     // 展开),resume 后逐字节还原后回传(issue #23)。
-                    try aw.writer.writeAll("{\"type\":\"reasoning_item\",\"model\":");
-                    try util_json.writeJsonString(&aw.writer, item.model);
-                    try aw.writer.writeAll(",\"item\":");
-                    try util_json.writeJsonString(&aw.writer, item.json);
-                    try aw.writer.writeAll("}");
+                    try w.writeAll("{\"type\":\"reasoning_item\",\"model\":");
+                    try util_json.writeJsonString(w, item.model);
+                    try w.writeAll(",\"item\":");
+                    try util_json.writeJsonString(w, item.json);
+                    try w.writeAll("}");
                 },
             }
         }
-        try aw.writer.writeAll("]}\n");
-
-        try writeAllFd(self.fd, aw.written());
+        try w.writeAll("]}");
     }
 
     fn writeMeta(self: *Writer, conversation: *const Conversation) !void {
@@ -648,6 +654,12 @@ fn loadCompactStateFromMeta(conversation: *Conversation, session_dir: []const u8
 /// 压默认值的"恢复"会在下次 rewriteAll 时把缺损永久写回盘。唯一例外:布尔字段
 /// (消息级 delivered、tool_result 的 is_error/delivered)键缺失取默认 false
 /// (旧文件兼容,保守方向);键在但非 bool 仍是损坏,硬错。
+/// Parse one message object written by `Writer.renderMessageJson`. Owned by
+/// `allocator`; the caller appends it to a Conversation of the same allocator.
+pub fn parseMessageJson(json: []const u8, allocator: std.mem.Allocator) !msg_mod.Message {
+    return parseMessageLine(json, allocator);
+}
+
 fn parseMessageLine(line: []const u8, allocator: std.mem.Allocator) !msg_mod.Message {
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
     defer parsed.deinit();

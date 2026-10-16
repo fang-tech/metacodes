@@ -82,6 +82,12 @@ pub const PermissionContext = struct {
     /// callback error 都直接 deny，**绝不**回落到 process answer queue / fd 0。用于
     /// UI-neutral library Session 和共享进程 stdin 的 swarm teammate。
     no_interactive_prompt: bool = false,
+    /// Per-call confirmation demanded by a principal outside the decision
+    /// chain (a sealed Skill's `confirm: true`, doc/SEALED_SKILL_PROTOCOL.md
+    /// §6.2). Consulted by agent_loop after the ordinary decision; it can only
+    /// turn an `.allow` into an `.ask` whose prompt skips "allow always"
+    /// memory. Copied into scoped children like every other field.
+    confirm_gate: ?@import("permission/confirm_gate.zig").ConfirmGate = null,
     /// 本 ctx 归属的会话(权限对话框路由到对应 session 视图)。默认 .single(N=1)。
     /// **M6 待办**:这与 ToolContext.session 是同一概念的两份拷贝(权限路径走 PermissionContext,
     /// 工具路径走 ToolContext)。M6 拆 SessionContext 后,两者都从 SessionContext.id 取,这俩
@@ -182,6 +188,15 @@ pub fn promptUser(ctx: *PermissionContext, tool_name: []const u8, args: []const 
     return prompt_mod.ask(ctx, tool_name, args);
 }
 
+/// A confirmation the `confirm_gate` demanded: the same prompt, but a
+/// remembered "allow always" for the tool does not answer it (a remembered
+/// deny still does). See permission/confirm_gate.zig.
+pub fn promptUserForced(ctx: *PermissionContext, tool_name: []const u8, args: []const u8) !bool {
+    return prompt_mod.askForced(ctx, tool_name, args);
+}
+
+pub const ConfirmGate = @import("permission/confirm_gate.zig").ConfirmGate;
+
 test {
     _ = &mode_mod;
     _ = &category_mod;
@@ -189,6 +204,7 @@ test {
     _ = &rule_mod;
     _ = &prompt_mod;
     _ = &@import("permission/bash_readonly.zig");
+    _ = &@import("permission/confirm_gate.zig");
 }
 
 test "shim checkPermission bypass" {

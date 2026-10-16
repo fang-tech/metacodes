@@ -24,6 +24,23 @@ const AbortSignal = @import("../util/abort.zig").AbortSignal;
 const sync = @import("platform").sync;
 const log = @import("../util/log.zig");
 const error_class = @import("error_class.zig");
+const auth_header_mod = @import("auth_header.zig");
+
+/// How this provider reaches its model: everything another process needs to
+/// make the same request against the same account. A sealed Skill's gateway
+/// (doc/SEALED_SKILL_PROTOCOL.md §8.1) runs the Skill's model calls with the
+/// client's own route, so the model, the endpoint and the account are the
+/// ones the user's fork would have used. Slices borrow the provider.
+pub const ProviderRoute = struct {
+    kind: types.ProviderKind,
+    base_url: []const u8,
+    model: []const u8,
+    /// The secret as the provider sends it (API key or bearer token).
+    credential: []const u8,
+    /// Null keeps the kind's default header.
+    auth_scheme: ?auth_header_mod.AuthScheme = null,
+    openai_protocol: types.OpenAIProtocol = .chat_completions,
+};
 
 pub const StreamHandle = api_stream.StreamHandle;
 pub const ApiResponse = api_stream.ApiResponse;
@@ -446,8 +463,15 @@ pub const Provider = struct {
     /// context caps are keyed by it together with the model: the same model
     /// behind two gateways is two different walls.
     endpointIdFn: ?*const fn (ctx: *anyopaque) []const u8 = null,
+    /// The route to this provider's model (see `ProviderRoute`). Null for a
+    /// provider that has no delegable route (synthetic, test, or sealed).
+    routeFn: ?*const fn (ctx: *anyopaque) ?ProviderRoute = null,
 
     // ── 便利转发 ──────────────────────────────────────────────────────────
+    pub inline fn route(self: Provider) ?ProviderRoute {
+        const f = self.routeFn orelse return null;
+        return f(self.ctx);
+    }
     pub inline fn model(self: Provider) []const u8 {
         return self.modelFn(self.ctx);
     }

@@ -20,7 +20,7 @@ checked-out repository cannot shadow a Skill the user installed.
 | Tier | Roots, highest first |
 |---|---|
 | Enterprise | `/etc/metacodes/skills`, Claude Code's managed `<dir>/.claude/skills` (`/Library/Application Support/ClaudeCode`, `/etc/claude-code`, `C:\Program Files\ClaudeCode`), `/etc/codex/skills` |
-| Personal | `<state root>/skills`, `~/.agents/skills`, `~/.claude/skills`, `$CODEX_HOME/skills` (default `~/.codex/skills`) |
+| Personal | `<state root>/sealed-skills` (pinned sealed Skills, see below), `<state root>/skills`, `~/.agents/skills`, `~/.claude/skills`, `$CODEX_HOME/skills` (default `~/.codex/skills`) |
 | Project | each directory from the repository root down to the working directory — a level closer to the working directory wins — and within a directory `.metacodes/skills`, `.agents/skills`, `.claude/skills`, `.codex/skills` |
 | `--add-dir` | `.metacodes/skills`, `.agents/skills`, `.claude/skills` under each added directory |
 
@@ -90,6 +90,39 @@ so Skills that carry a virtualenv, `node_modules` or large assets work.
   submitting.
 - `/skills` lists each Skill with its tier and directory, the Skills that did
   not load and why, and skipped roots.
+
+### Sealed Skills
+
+A sealed Skill is one whose body never reaches this machine: it runs on a
+gateway speaking the Sealed Skill Protocol (`metask.sealed-skill/v1`,
+[SEALED_SKILL_PROTOCOL.md](SEALED_SKILL_PROTOCOL.md)), and every tool call it
+needs is sent back here, executed under the ordinary permission system, and
+its result returned. `metacodes sealed install <gateway-url> <skill_id>`
+shows the manifest the user consents to (tool allowlist, data egress classes,
+credentials, price) and pins it under `<state root>/sealed-skills/<name>/`;
+the pin's projected `SKILL.md` carries `sealed-gateway`, `sealed-skill-id`
+and `sealed-manifest-digest`, `context: fork`, and the allowlist as
+`allowed-tools`. `/skills` lists it like any Skill; `/name args` and the
+`Skill` tool run it as a fork whose model is the gateway. The model is this
+session's own: the gateway runs the Skill's loop as a shadow of the fork and
+calls the model over the session's provider route and credential, so the
+request the model sees is the one a local fork would have sent, on the
+user's own account and bill. The gateway reports each Step's tokens and its
+estimate of their cost; the client stops the run at
+`METACODES_SEALED_MAX_COST_MICROS` and records every Step in
+`<state root>/ledger/sealed.ndjson` (`metacodes sealed ledger`). The gateway
+account owes only the Skill's own fee, when a gateway charges one. A call
+the gateway marks `confirm: true` is approved
+interactively even in a mode that would auto-allow it; a question the
+Skill has for the user is asked through the session's own AskUserQuestion
+dialog and answered in place. A credential reference the manifest declares
+is bound with `metacodes sealed bind <name> <ref>` (secret from stdin or
+`--from-env`), kept in `<state root>/sealed-credentials.json`, substituted
+into the call on this machine and redacted from the result before it
+leaves. The Skill's public files (scripts, data) are installed under the
+pin directory; its `sealed/` reference files are read on the gateway.
+`metacodes sealed serve` runs the reference gateway; it has no provider
+credentials of its own.
 
 ## MCP servers
 
