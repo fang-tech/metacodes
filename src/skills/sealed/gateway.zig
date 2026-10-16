@@ -224,6 +224,9 @@ pub const Gateway = struct {
         UpstreamUnavailable,
         /// `Sealed-Provider-Credential` is missing on a method that calls the model.
         CredentialMissing,
+        /// `provider_tools` is not empty: the shadow loop, like the client's
+        /// fork, cannot represent provider server tools (§3.4).
+        ProviderToolsUnsupported,
     };
 
     fn rpcFailure(self: *Gateway, allocator: std.mem.Allocator, id: ?std.json.Value, err: MethodError) ![]u8 {
@@ -232,6 +235,7 @@ pub const Gateway = struct {
             error.OutOfMemory => error.OutOfMemory,
             error.InvalidParams => rpcError(allocator, id, -32602, "invalid params", null, null),
             error.CredentialMissing => rpcError(allocator, id, -32602, protocol.PROVIDER_CREDENTIAL_HEADER ++ " header required: the gateway calls the model with the client's provider", null, null),
+            error.ProviderToolsUnsupported => rpcError(allocator, id, -32602, "provider_tools must be empty: the agent loop does not support provider server tools", null, null),
             error.SkillNotFound => rpcError(allocator, id, @intFromEnum(protocol.ErrorCode.skill_not_found), "unknown skill", .skill_not_found, null),
             error.ManifestChanged => rpcError(allocator, id, @intFromEnum(protocol.ErrorCode.manifest_changed), "pinned manifest is not current", .manifest_changed, null),
             error.RunStateInvalid => rpcError(allocator, id, @intFromEnum(protocol.ErrorCode.run_state_invalid), "run state rejected", .run_state_invalid, null),
@@ -316,6 +320,7 @@ pub const Gateway = struct {
         if (tools_value != .array) return error.InvalidParams;
         const provider_tools_value = params.object.get("provider_tools") orelse std.json.Value{ .array = std.json.Array.init(arena) };
         if (provider_tools_value != .array) return error.InvalidParams;
+        if (provider_tools_value.array.items.len != 0) return error.ProviderToolsUnsupported;
         var max_cost: i64 = 0;
         var max_steps: u64 = protocol_default_max_steps;
         if (params.object.get("budget")) |budget| {

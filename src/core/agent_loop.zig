@@ -974,8 +974,9 @@ fn hasServerTool(defs: []const json_mod.ToolDefinition) bool {
     return false;
 }
 
-/// Both entry points check before they change anything: `run` before any
-/// request, `resumeRun` before it appends the resumed tool results.
+/// Every entry point checks before it changes anything: `run` before any
+/// request, `resumeRun` and `resumeRunWithResults` before they append the
+/// resumed tool results.
 fn refuseServerTools(tool_defs: []const json_mod.ToolDefinition, opts: Options) error{ServerToolsUnsupported}!void {
     if (hasServerTool(tool_defs) or (if (opts.tool_defs) |defs| hasServerTool(defs) else false))
         return error.ServerToolsUnsupported;
@@ -1010,6 +1011,10 @@ test "run refuses provider server tools it cannot represent" {
     // resumeRun refuses before it appends the resumed tool result.
     try std.testing.expectError(error.ServerToolsUnsupported, resumeRun(&c, testProvider(&state), &server_tool, &perm, "tu_1", "{}", &.{}, .{ .max_turns = 1, .colorize = false }, &backend, a));
     try std.testing.expectError(error.ServerToolsUnsupported, resumeRun(&c, testProvider(&state), &.{}, &perm, "tu_1", "{}", &.{}, .{ .max_turns = 1, .colorize = false, .tool_defs = &server_tool }, &backend, a));
+    // So does resumeRunWithResults (the sealed gateway's seam).
+    const results = [_]SuspendInfo.CompletedResult{.{ .tool_use_id = "tu_1", .content = "{}", .is_error = false }};
+    try std.testing.expectError(error.ServerToolsUnsupported, resumeRunWithResults(&c, testProvider(&state), &server_tool, &perm, &results, .{ .max_turns = 1, .colorize = false }, &backend, a));
+    try std.testing.expectError(error.ServerToolsUnsupported, resumeRunWithResults(&c, testProvider(&state), &.{}, &perm, &results, .{ .max_turns = 1, .colorize = false, .tool_defs = &server_tool }, &backend, a));
     try std.testing.expectEqual(@as(usize, 1), c.len());
 }
 
@@ -3993,6 +3998,8 @@ pub fn resumeRunWithResults(
     allocator: std.mem.Allocator,
 ) !RunResult {
     if (results.len == 0) return error.NoResultsToResume;
+    // Refused before the results are appended, as in `resumeRun`.
+    try refuseServerTools(tool_defs, opts);
     var blocks: std.ArrayList(msg.Block) = .empty;
     errdefer {
         for (blocks.items) |block| block.deinit(allocator);
