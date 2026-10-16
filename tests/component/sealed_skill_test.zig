@@ -623,6 +623,16 @@ test "L2 sealed: bearer token gates the gateway" {
     try std.testing.expect(std.mem.indexOf(u8, response.response.result, "\"input_required\":true") != null);
 }
 
+test "L2 sealed: a second gateway on a port in use is refused, not shared" {
+    // `metacodes sealed serve` started twice on one port: the second start
+    // fails at bind, so a client never reaches a stale instance by chance.
+    const a = std.testing.allocator;
+    var lab: Lab = undefined;
+    try lab.start(a, "cc-zig-sealed-port", &.{FINAL_SSE}, protocol.TEST_MANIFEST_JSON, .{});
+    defer lab.stop();
+    try std.testing.expectError(error.BindFailed, gateway_mod.Server.start(a, lab.gateway, lab.server.port));
+}
+
 test "L2 sealed: a pin whose manifest changed on the gateway is refused, not run" {
     const a = std.testing.allocator;
     var lab: Lab = undefined;

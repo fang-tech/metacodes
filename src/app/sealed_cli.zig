@@ -9,13 +9,15 @@
 //!   or an environment variable, never from the command line;
 //! - `ledger` prints the sealed usage ledger (§6.6);
 //! - `serve --skills <dir> [--listen PORT] [--token T]` runs the reference
-//!   gateway on loopback; it has no provider credentials of its own and calls
-//!   the model over each client's route (§8.1).
+//!   gateway on loopback until Ctrl+C; it has no provider credentials of its
+//!   own and calls the model over each client's route (§8.1).
 
 const std = @import("std");
 const pfs = @import("platform").fs;
 const paths = @import("platform").paths;
+const platform_signal = @import("platform").signal;
 const util_time = @import("../util/time.zig");
+const shutdown = @import("../core/shutdown.zig");
 const protocol = @import("../skills/sealed/protocol.zig");
 const transport = @import("../skills/sealed/transport.zig");
 const pin_mod = @import("../skills/sealed/pin.zig");
@@ -367,6 +369,13 @@ fn serve(args: *std.process.Args.Iterator, allocator: std.mem.Allocator) u8 {
         }
     }
     const dir = skills_dir orelse return usageError("--skills <dir> is required");
+    // Ctrl+C, SIGTERM/SIGHUP and (on Windows) the console closing only raise
+    // the process-wide shutdown flag (core/shutdown.zig); this thread polls it
+    // and stops the server itself. Installed before any other thread exists,
+    // so no signal meets the console's default handler, which on Windows ends
+    // the process from its own thread while the accept loop still runs.
+    platform_signal.installInterrupt(onShutdownSignal);
+    platform_signal.installTerminate(onShutdownSignal);
     // The gateway has no model provider of its own: every run calls the
     // model over the client's route and credential (§8.1).
     const gateway = gateway_mod.Gateway.init(allocator, dir, .{ .token = token }) catch |err| {
@@ -374,15 +383,27 @@ fn serve(args: *std.process.Args.Iterator, allocator: std.mem.Allocator) u8 {
         return 1;
     };
     defer gateway.deinit();
+    // A port another process holds fails here with BindFailed: the listener
+    // binds exclusively (platform/net.zig), so two gateways never share one
+    // port and a client never reaches a stale instance by chance.
     const server = gateway_mod.Server.start(allocator, gateway, port) catch |err| {
         std.debug.print("error: could not listen on 127.0.0.1:{d} ({s})\n", .{ port, @errorName(err) });
         return 1;
     };
-    defer server.stop();
     std.debug.print("sealed gateway: {d} Skill package(s) from {s}\n", .{ gateway.packages.len, dir });
     for (gateway.packages) |package| std.debug.print("  {s}  {s}  {s}  ({d} public asset(s), {d} sealed file(s))\n", .{ package.entry.skill_id, package.name, package.entry.manifest_digest, package.assets.len, package.sealed_files.len });
     std.debug.print("listening on http://127.0.0.1:{d}/ssp (model calls use each client's own provider{s})\n", .{ server.port, if (token.len == 0) "; no token: open to every local caller" else "" });
-    while (true) util_time.sleepMs(1000);
+    while (!shutdown.requested()) util_time.sleepMs(50);
+    // Join the accept loop and close the listener before the Gateway it
+    // serves goes away (the defer above); a request in flight finishes first.
+    server.stop();
+    std.debug.print("\nsealed gateway closed.\n", .{});
+    return 0;
+}
+
+/// Signal callback: async-signal-safe, an atomic store and nothing else.
+fn onShutdownSignal() void {
+    shutdown.request();
 }
 
 fn usageError(message: []const u8) u8 {
