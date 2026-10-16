@@ -1173,7 +1173,7 @@ pub const SessionUpdatePermissionModeFnV1 = *const fn (
     permission_mode_code: u32,
     out_diagnostic: ?*OwnedBytesV1,
 ) callconv(.c) u32;
-/// Runs the canonical default best-effort compact policy. Revision 20 accepts
+/// Runs the canonical default best-effort compact policy. Revision 21 accepts
 /// no target token budget and does not guarantee fit for a model context.
 pub const SessionCompactFnV1 = *const fn (
     session: ?*SessionHandle,
@@ -1436,9 +1436,9 @@ test "typed provider kind validates every public code" {
     );
 }
 
-test "Revision 20 keeps MCP wire codes stable" {
+test "Revision 21 keeps MCP wire codes stable" {
     const std = @import("std");
-    try std.testing.expectEqual(@as(u32, 20), ABI_REVISION);
+    try std.testing.expectEqual(@as(u32, 21), ABI_REVISION);
     try std.testing.expectEqual(@as(u32, 1), MCP_NEGOTIATION_AUTO);
     try std.testing.expectEqual(@as(u32, 2), MCP_NEGOTIATION_MODERN_ONLY);
     try std.testing.expectEqual(@as(u32, 3), MCP_NEGOTIATION_LEGACY_ONLY);

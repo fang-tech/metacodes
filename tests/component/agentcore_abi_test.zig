@@ -4006,7 +4006,7 @@ test "L2 public MCP checkpoint restore facade preserves Conversation under narro
 
     var abi_revision_bytes: [4]u8 = undefined;
     @memcpy(&abi_revision_bytes, checkpoint.bytes.items[20..24]);
-    try std.testing.expectEqual(@as(u32, 20), wire.ABI_REVISION);
+    try std.testing.expectEqual(@as(u32, 21), wire.ABI_REVISION);
     // A Session without a prompt profile keeps the marker-8 envelope across
     // ABI revisions; the marker is independent of the table revision.
     try std.testing.expectEqual(

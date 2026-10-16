@@ -68,7 +68,7 @@ pub const PermissionCandidate = struct {
     target: ?[]const u8,
 };
 
-/// Exact Revision 20 Permission callback request. Unlike AskUserQuestion this
+/// Exact Revision 21 Permission callback request. Unlike AskUserQuestion this
 /// is a flat typed object, identified by `type == "permission"`.
 pub const PermissionRequest = struct {
     type: []const u8,
