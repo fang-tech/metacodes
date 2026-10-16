@@ -273,6 +273,8 @@ pub const Meter = struct {
     armed: ?[24]u8 = null,
     started_ns: time.Nanos = 0,
     budget_notice_pending: bool = false,
+    /// The monotonic clock a Run's time is measured with (tests replace it).
+    now_ns: *const fn () time.Nanos = time.nowNs,
 
     pub const Change = enum {
         /// The budget ran out during the Run: the goal is now `budget_limited`.
@@ -294,7 +296,7 @@ pub const Meter = struct {
         self.depth += 1;
         if (self.depth != 1) return;
         self.armed = if (self.state.current) |g| (if (g.status == .active) g.id else null) else null;
-        self.started_ns = time.nowNs();
+        self.started_ns = self.now_ns();
         self.budget_notice_pending = false;
     }
 
@@ -332,7 +334,7 @@ pub const Meter = struct {
         if (self.depth != 0) return null;
         defer self.armed = null;
         const g = self.armedGoal() orelse return null;
-        const elapsed_ns = time.nowNs() - self.started_ns;
+        const elapsed_ns = self.now_ns() - self.started_ns;
         const elapsed_ms: u64 = if (elapsed_ns <= 0) 0 else @intCast(@divTrunc(elapsed_ns, std.time.ns_per_ms));
         g.time_used_ms +|= elapsed_ms;
         g.updated_at_ms = nowWallMs();
@@ -601,6 +603,13 @@ test "objectives are trimmed, non-empty UTF-8 of at most 4000 code points" {
     try std.testing.expectEqualStrings("ship it safely", st.current.?.objective);
 }
 
+const FakeClock = struct {
+    var now: time.Nanos = 0;
+    fn read() time.Nanos {
+        return now;
+    }
+};
+
 const ObserverProbe = struct {
     budget_reached: u32 = 0,
     run_settled: u32 = 0,
@@ -621,6 +630,8 @@ test "the Meter charges a Run armed on an active goal, to its end, and asks once
     var probe = ObserverProbe{};
     var meter = Meter.init(&st);
     meter.observer = .{ .ctx = &probe, .changed = ObserverProbe.changed };
+    meter.now_ns = FakeClock.read;
+    FakeClock.now = 0;
 
     // No goal, or a paused one: nothing is charged.
     meter.beginRun();
@@ -637,6 +648,7 @@ test "the Meter charges a Run armed on an active goal, to its end, and asks once
     // Active: charged per response; crossing the budget mid-Run limits the
     // goal, asks once for a wrap-up, and keeps charging to the Run's end.
     try st.apply(.activate);
+    FakeClock.now = 10 * std.time.ns_per_s;
     meter.beginRun();
     _ = meter.charge(4, 3);
     try std.testing.expect(meter.takeBudgetNotice() == null);
@@ -648,8 +660,11 @@ test "the Meter charges a Run armed on an active goal, to its end, and asks once
     try std.testing.expectEqualStrings(budget_notice, meter.takeBudgetNotice().?);
     try std.testing.expect(meter.takeBudgetNotice() == null);
     _ = meter.charge(1, 1);
+    FakeClock.now += 2500 * std.time.ns_per_ms;
     _ = meter.endRun();
     try std.testing.expectEqual(@as(u64, 14), st.current.?.tokens_used);
+    // The Run's wall time, once, however many Runs nested inside it.
+    try std.testing.expectEqual(@as(u64, 2500), st.current.?.time_used_ms);
     try std.testing.expectEqual(@as(u32, 1), probe.budget_reached);
     try std.testing.expectEqual(@as(u32, 1), probe.run_settled);
 

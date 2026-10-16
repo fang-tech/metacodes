@@ -6245,6 +6245,45 @@ test "auto-compact summary carries in_progress task anchor through compaction" {
     try std.testing.expect(std.mem.indexOf(u8, summ, "kg-43") == null); // completed 不进锚
 }
 
+test "auto-compact charges its summary request to the Run's goal (issue #277)" {
+    const a = std.testing.allocator;
+    var c = Conversation.init(a);
+    defer c.deinit();
+    const chunk = try a.alloc(u8, 8192);
+    defer a.free(chunk);
+    @memset(chunk, 'x');
+    var i: usize = 0;
+    while (i < 30) : (i += 1) try c.appendText(.user, chunk);
+
+    var provider_state = TestProviderState{
+        .allocator = a,
+        .compact_summary_response = "small summary",
+        .max_input_tokens = 200_000,
+        .max_tokens = 32_000,
+    };
+    const provider = testProvider(&provider_state);
+    const Sink = struct {
+        fn emit(_: *anyopaque, _: @import("session_id.zig").SessionId, _: CoreEvent) void {}
+        fn poll(_: *anyopaque, _: @import("session_id.zig").SessionId) ?@import("protocol/ui_event.zig").UiEvent {
+            return null;
+        }
+    };
+    var dummy: u8 = 0;
+    const backend = UiBackend{ .ctx = @ptrCast(&dummy), .emit = Sink.emit, .poll = Sink.poll };
+
+    const goal = @import("goal.zig");
+    var state = goal.State.init(a);
+    defer state.deinit();
+    try state.setNew("ship it", null);
+    var meter = goal.Meter.init(&state);
+    meter.beginRun();
+    const outcome = try runAutoCompactIfNeeded(&c, provider, null, null, null, &.{}, null, null, 32_000, 2, "post_tool_follow_up_threshold", false, &backend, .single, [_]u8{0} ** 12, 0, 0, null, a, null, null, null, null, null, &meter);
+    _ = meter.endRun();
+    try std.testing.expectEqual(AutoCompactOutcome.compacted, outcome);
+    // The summary request's usage (11 in, 7 out) is goal work like any other.
+    try std.testing.expectEqual(@as(u64, 18), state.current.?.tokens_used);
+}
+
 test "auto-compact 触发 PreCompact + PostCompact hook(G-rest 接线,端到端)" {
     if (@import("builtin").os.tag == .windows) return error.SkipZigTest; // POSIX 专属测试脚手架(spawn 命令/shell hook/系统文件/Seatbelt)
     const a = std.testing.allocator;

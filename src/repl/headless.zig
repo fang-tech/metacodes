@@ -499,7 +499,8 @@ fn pendingRequestFn(
 }
 var pending_requester_dummy: u8 = 0;
 
-fn buildOptions(
+/// The headless Run's Options (pub for the App-level wiring tests).
+pub fn buildOptions(
     app: *app_mod.App,
     scoped_recall: ?[]const u8,
     request_gate: ?request_gate_mod.Gate,
