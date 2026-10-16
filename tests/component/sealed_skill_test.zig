@@ -1382,3 +1382,192 @@ test "L2 sealed: an unbound credential refuses the call with permission_denied a
     defer a.free(ledger);
     try std.testing.expect(std.mem.indexOf(u8, ledger, "\"refusal\":\"permission_denied\"") != null);
 }
+
+// ── Scale design (doc/SEALED_GATEWAY_SCALE_DESIGN.md): admission, route cache ──
+
+/// Restart only the server with explicit capacity options and point the pin
+/// at the new port; the gateway (packages, sealing key, route cache) stays.
+fn restartServerWith(lab: *Lab, options: gateway_mod.ServerOptions) !void {
+    const a = lab.allocator;
+    lab.server.stop();
+    lab.server = try gateway_mod.Server.startWith(a, lab.gateway, options);
+    a.free(lab.gateway_url);
+    lab.gateway_url = try lab.server.url(a);
+    const pin_path = try std.fmt.allocPrint(a, "{s}/sealed-skills/erp-post/sealed.json", .{lab.state_dir});
+    defer a.free(pin_path);
+    const md_path = try std.fmt.allocPrint(a, "{s}/sealed-skills/erp-post/SKILL.md", .{lab.state_dir});
+    defer a.free(md_path);
+    try rewriteGatewayUrl(a, pin_path, lab.gateway_url);
+    try rewriteGatewayUrl(a, md_path, lab.gateway_url);
+    try lab.loadCatalog();
+}
+
+/// A `runs.start` sent straight over the transport (no fork): it occupies a
+/// model slot for as long as the mock model's gate holds its answer.
+const DirectStart = struct {
+    lab: *Lab,
+    outcome: ?anyerror = null,
+    kind: ?protocol.StepKind = null,
+
+    fn run(self: *DirectStart) void {
+        self.go() catch |err| {
+            self.outcome = err;
+        };
+    }
+
+    fn go(self: *DirectStart) !void {
+        const a = self.lab.allocator;
+        var client = try transport.Client.init(a, self.lab.io_runtime.io(), self.lab.gateway_url, "");
+        defer client.deinit();
+        client.provider_credential = "direct-credential";
+        var params: std.Io.Writer.Allocating = .init(a);
+        defer params.deinit();
+        try protocol.writeStartParams(&params.writer, .{
+            .skill_id = "ssk_test",
+            .manifest_digest = self.lab.gateway.packages[0].entry.manifest_digest,
+            .prompt = "go",
+            .tools_json = "[]",
+            .max_cost_micros = 0,
+            .max_steps = 8,
+            .client_name = "test",
+            .client_version = "0",
+            .client_platform = "test",
+            .base_dir = "/t/skill",
+            .provider_kind = "anthropic",
+            .provider_base_url = self.lab.model_url,
+            .model = "claude-sonnet-4-20250514",
+        });
+        var response = try client.call(.runs_start, params.written(), null);
+        defer response.deinit();
+        switch (response.response) {
+            .result => |result| {
+                var step = try protocol.parseStep(a, result);
+                defer step.deinit();
+                self.kind = step.step.kind;
+            },
+            .err => return error.DirectStartRefused,
+        }
+    }
+};
+
+/// A `discover` over its own connection, for queue-pressure scenarios.
+const Discover = struct {
+    lab: *Lab,
+    outcome: ?anyerror = null,
+    retry_after_ms: u64 = 0,
+    ok: bool = false,
+
+    fn run(self: *Discover) void {
+        const a = self.lab.allocator;
+        var client = transport.Client.init(a, self.lab.io_runtime.io(), self.lab.gateway_url, "") catch |err| {
+            self.outcome = err;
+            return;
+        };
+        defer client.deinit();
+        var response = client.call(.discover, "{}", null) catch |err| {
+            self.outcome = err;
+            self.retry_after_ms = client.last_retry_after_ms;
+            return;
+        };
+        defer response.deinit();
+        self.ok = response.response == .result;
+    }
+};
+
+fn releaseAfter(model: *harness.MockServer, delay_ms: u64) void {
+    cc.util_time.sleepMs(delay_ms);
+    model.releaseGatedResponse();
+}
+
+test "L2 sealed scale: a Step refused for a busy model slot is resent by the client and completes" {
+    const a = std.testing.allocator;
+    var lab: Lab = undefined;
+    const read_sse = try toolCallSse(a, "Read", "{\"file_path\":\"does-not-exist.txt\"}");
+    defer a.free(read_sse);
+    // conn1: the direct run (gated); conn2/conn3: the client run's two Steps.
+    try lab.start(a, "cc-zig-sealed-scale-admit", &.{ read_sse, read_sse, FINAL_SSE }, protocol.TEST_MANIFEST_JSON, .{});
+    defer lab.stop();
+    try lab.install("");
+    try restartServerWith(&lab, .{ .max_model_calls = 1, .workers = 4, .queue_depth = 8, .keepalive_ms = 100 });
+
+    lab.model.gateNextResponse();
+    var holder = DirectStart{ .lab = &lab };
+    const holder_thread = try std.Thread.spawn(.{}, DirectStart.run, .{&holder});
+    try lab.model.waitUntilResponseGated();
+
+    // With the only slot busy, a Step is refused before any state is read.
+    var probe = try transport.Client.init(a, lab.io_runtime.io(), lab.gateway_url, "");
+    defer probe.deinit();
+    probe.provider_credential = "probe";
+    var refused = try probe.call(.runs_start, "{\"skill_id\":\"ssk_test\"}", null);
+    defer refused.deinit();
+    try std.testing.expect(refused.response == .err);
+    try std.testing.expectEqual(protocol.ErrorCode.rate_limited, refused.response.err.known.?);
+    try std.testing.expect(cc.util_json.extractIntField(refused.response.err.data_json, "retry_after_ms") > 0);
+    // Not a model method: served even now.
+    var open = try probe.call(.discover, "{}", null);
+    defer open.deinit();
+    try std.testing.expect(open.response == .result);
+
+    // The real client waits as told and gets through once the slot frees.
+    const releaser = try std.Thread.spawn(.{}, releaseAfter, .{ lab.model, @as(u64, 1500) });
+    const output = try lab.runSkill("{\"name\":\"erp-post\",\"values\":[\"go\"]}");
+    defer a.free(output);
+    releaser.join();
+    holder_thread.join();
+    try std.testing.expect(std.mem.indexOf(u8, output, "final-from-sealed") != null);
+    try std.testing.expect(holder.outcome == null);
+    try std.testing.expectEqual(protocol.StepKind.tool_calls, holder.kind.?);
+    const stats = lab.server.stats();
+    try std.testing.expect(stats.rejected_model >= 2);
+    try std.testing.expectEqual(@as(u64, 0), stats.rejected_queue);
+}
+
+test "L2 sealed scale: a full queue answers 503 with Retry-After before reading the request" {
+    const a = std.testing.allocator;
+    var lab: Lab = undefined;
+    const read_sse = try toolCallSse(a, "Read", "{\"file_path\":\"does-not-exist.txt\"}");
+    defer a.free(read_sse);
+    try lab.start(a, "cc-zig-sealed-scale-queue", &.{read_sse}, protocol.TEST_MANIFEST_JSON, .{});
+    defer lab.stop();
+    try lab.install("");
+    try restartServerWith(&lab, .{ .workers = 1, .queue_depth = 1, .max_model_calls = 1, .keepalive_ms = 0 });
+
+    lab.model.gateNextResponse();
+    var holder = DirectStart{ .lab = &lab };
+    const holder_thread = try std.Thread.spawn(.{}, DirectStart.run, .{&holder});
+    try lab.model.waitUntilResponseGated();
+    // The single worker is busy; the next connection waits in the queue…
+    var queued = Discover{ .lab = &lab };
+    const queued_thread = try std.Thread.spawn(.{}, Discover.run, .{&queued});
+    cc.util_time.sleepMs(300);
+    // …and the one after it is refused on arrival.
+    var refused = Discover{ .lab = &lab };
+    refused.run();
+    lab.model.releaseGatedResponse();
+    holder_thread.join();
+    queued_thread.join();
+    try std.testing.expect(queued.ok);
+    try std.testing.expectError(error.Overloaded, if (refused.outcome) |err| @as(anyerror!void, err) else {});
+    try std.testing.expectEqual(@as(u64, 1000), refused.retry_after_ms);
+    const stats = lab.server.stats();
+    try std.testing.expectEqual(@as(u64, 1), stats.rejected_queue);
+}
+
+test "L2 sealed scale: consecutive Steps of a run reuse one built provider" {
+    const a = std.testing.allocator;
+    var lab: Lab = undefined;
+    const read_sse = try toolCallSse(a, "Read", "{\"file_path\":\"does-not-exist.txt\"}");
+    defer a.free(read_sse);
+    try lab.start(a, "cc-zig-sealed-scale-pool", &.{ read_sse, FINAL_SSE }, protocol.TEST_MANIFEST_JSON, .{});
+    defer lab.stop();
+    try lab.install("");
+    try lab.loadCatalog();
+    const output = try lab.runSkill("{\"name\":\"erp-post\",\"values\":[\"go\"]}");
+    defer a.free(output);
+    try std.testing.expect(std.mem.indexOf(u8, output, "final-from-sealed") != null);
+    const pool = lab.gateway.poolStats();
+    try std.testing.expectEqual(@as(u64, 1), pool.misses);
+    try std.testing.expectEqual(@as(u64, 1), pool.hits);
+    try std.testing.expectEqual(@as(usize, 1), pool.size);
+}

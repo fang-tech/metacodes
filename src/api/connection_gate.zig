@@ -67,6 +67,36 @@ pub fn acquire(abort: ?*const AbortSignal) error{Aborted}!Lease {
     return process_gate.acquire(abort);
 }
 
+/// Raise the process-wide limit (never below `MAX_CONNECTING_REQUESTS`).
+///
+/// The lease covers the wait for the response head, which for a model
+/// request is its time to first token: a process that serves many clients'
+/// model calls at once — the sealed gateway — would otherwise be capped at
+/// eight concurrent calls whatever its worker count (`sealed:bench` found
+/// it: throughput flat at 8 ÷ latency). The CLI keeps the default.
+pub fn raiseProcessLimit(limit: usize) void {
+    process_gate.mutex.lock();
+    defer process_gate.mutex.unlock();
+    if (limit > process_gate.limit) {
+        process_gate.limit = limit;
+        process_gate.cond.broadcast();
+    }
+}
+
+pub fn processLimit() usize {
+    process_gate.mutex.lock();
+    defer process_gate.mutex.unlock();
+    return process_gate.limit;
+}
+
+test "raiseProcessLimit only ever raises, and wakes waiters" {
+    const before = processLimit();
+    raiseProcessLimit(1);
+    try std.testing.expectEqual(before, processLimit());
+    raiseProcessLimit(before + 3);
+    try std.testing.expectEqual(before + 3, processLimit());
+}
+
 test "Gate bounds concurrent setup and releases idempotently" {
     var gate = Gate.init(1);
     var first = try gate.acquire(null);

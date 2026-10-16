@@ -170,6 +170,7 @@ pub const skills_sealed_pin = @import("skills/sealed/pin.zig");
 pub const skills_sealed_ledger = @import("skills/sealed/ledger.zig");
 pub const skills_sealed_provider = @import("skills/sealed/provider.zig");
 pub const skills_sealed_gateway = @import("skills/sealed/gateway.zig");
+pub const skills_sealed_provider_pool = @import("skills/sealed/provider_pool.zig");
 pub const skills_sealed_credentials = @import("skills/sealed/credentials.zig");
 pub const skills_sealed_disclosure = @import("skills/sealed/disclosure.zig");
 pub const skills_tool = @import("skills/tool.zig");
@@ -205,6 +206,7 @@ pub const evaluation_backend = @import("core/evaluation_backend.zig"); // V1:稳
 pub const util_abort = @import("util/abort.zig"); // AbortSignal
 pub const util_log = @import("util/log.zig");
 pub const util_time = @import("util/time.zig");
+pub const util_json = @import("util/json.zig");
 pub const util_toolchain = @import("util/toolchain.zig"); // ripgrep 解析/可用性探测(Glob/Grep 依赖)
 pub const util_state_root = @import("util/state_root.zig"); // per-install state root (--state-dir / METACODES_HOME / install.json / ~/.metacodes)
 

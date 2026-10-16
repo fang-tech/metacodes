@@ -94,6 +94,19 @@ merge them and MUST still populate the identity fields (§4.2) distinctly.
   opaque `run_state` blob (§4.4) that the client returns unchanged with every
   message. A gateway MAY keep state server-side instead; the client cannot
   tell and MUST behave identically.
+- A gateway SHOULD answer `runs.start` and `runs.continue` as
+  `text/event-stream` and send a comment line (`: ping`) at intervals while
+  the Step is computed, so that no intermediary and no client liveness
+  monitor sees a silent connection during a long model call; the response
+  is the stream's final event. A client MUST ignore comment lines and any
+  event it does not understand.
+- **Admission.** A gateway at capacity refuses a request before processing
+  it: HTTP 503 with a `Retry-After` header (seconds) when no worker can take
+  the connection, or the JSON-RPC error `rate_limited` with
+  `data.retry_after_ms` when every model slot is busy. Either answer means
+  the request was **not processed** and changed no run state; the client
+  SHOULD wait the named interval and resend the identical request. This is
+  compatible with §8.4: a refused `seq` was never answered.
 - TLS is required outside loopback test deployments.
 
 ## 3. Methods
@@ -584,6 +597,14 @@ a credential whose scheme cannot be carried in a header (`signed_adapter`)
 cannot be delegated; the client says so rather than running the Skill
 without it.
 
+A gateway MAY keep a client's built provider — and, where its client allows
+it, the upstream connection — for a short idle window after a request,
+keyed by the route and the credential, so that consecutive Steps of a run do
+not each rebuild the client or pay an upstream handshake. Within that window the credential exists in process
+memory inside that client and nowhere else; it is never written or logged,
+and the window is bounded (the reference gateway: 60 s, `--provider-cache-ms
+0` restores strict per-request handling).
+
 ### 8.2 Metering
 
 Model usage is billed where the calls are made: on the client's own
@@ -950,7 +971,7 @@ the symbolic name:
 | -32006 | `run_state_invalid` | tampered or foreign `run_state`, or a `seq` that does not match it |
 | -32007 | `budget_exceeded` | the run would pass `max_cost_micros` |
 | -32008 | `policy_violation` | the client reported refusals the gateway cannot recover from |
-| -32009 | `rate_limited` | retry after `data.retry_after_ms` |
+| -32009 | `rate_limited` | not processed; resend the identical request after `data.retry_after_ms` (§2 Admission) |
 | -32010 | `unsupported_version` | `Sealed-Skill-Version` not implemented |
 | -32011 | `upstream_unavailable` | the gateway's model provider failed |
 

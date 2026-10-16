@@ -12,6 +12,19 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Added
 
+- Sealed gateway at scale ([doc/SEALED_GATEWAY_SCALE_DESIGN.md](doc/SEALED_GATEWAY_SCALE_DESIGN.md)):
+  `metacodes sealed serve` runs a bounded worker pool with a queue and a cap
+  on in-flight model calls, refuses over-capacity requests before reading
+  them (HTTP 503 + `Retry-After`, or JSON-RPC `rate_limited` with
+  `retry_after_ms`), answers Steps as SSE with keepalive comments, and lends
+  each client's provider from a route-keyed cache so consecutive Steps do
+  not rebuild it (`--workers`, `--queue-depth`, `--max-model-calls`,
+  `--keepalive-ms`, `--provider-cache-ms`). The client resends a refused Step
+  unchanged after the named wait. `zig build sealed:bench` measures Steps per
+  second and gateway overhead against a mock upstream; its first runs removed
+  a 16 MiB per-connection buffer and raised the process-wide request-setup
+  gate (`connection_gate.raiseProcessLimit`) for the server, taking 64
+  concurrent clients from 249 to 1 835 Steps/s.
 - Sealed Skills: the §8.5 disclosure screen. Before a Step leaves the
   gateway, its `final` text, every call input of a `tool_calls` batch and
   any question pass a screen built from the Skill's sealed material (the
