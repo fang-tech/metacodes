@@ -467,7 +467,13 @@ publish time, and pinned by the user at install time.
   is the creator's policy for the gateway's disclosure screen (§8.5):
   `"redact"` (the default) replaces a passage that quotes the Skill's sealed
   material with `[sealed]` and the Step counts it, `"fail"` ends the run as
-  `failed` / `disclosure`, `"off"` disables the screen.
+  `failed` / `disclosure`, `"off"` disables the screen. The screen has two
+  corpora with their own policies — the **body** (the Skill's instructions)
+  and the **references** (the `sealed/` files) — so the field is either one
+  word for both or `{"body": "redact", "references": "off"}`. A
+  documentation Skill, whose purpose is to restate its references, sets
+  `references` to `off` and keeps its instructions screened; a Skill whose
+  references are its private rules keeps both at `redact` or `fail`.
   `retention` is the gateway's promise for tool results: `"run"` (discarded
   when the run ends) or `"audit"` (kept for the audit window the operator
   publishes).
@@ -662,9 +668,14 @@ leaves. The reference gateway replaces every run of eight consecutive
 tokens (words compared without case or punctuation; CJK per character)
 that also occurs in the body or a `sealed/` file with `[sealed]`, the Step
 carries `disclosure.redactions`, and the brain's own conversation keeps the
-original: the output is edited, never the brain's memory. The manifest's
+original: the output is edited, never the brain's memory. The body and the
+`sealed/` references are separate corpora under separate policies, because
+they leak differently: restating the instructions is what the screen
+exists for, while citing a reference verbatim is a documentation Skill's
+job and a rule Skill's leak — only the creator knows which. The manifest's
 `egress.disclosure` (§5) chooses `redact`, `fail` (the Step becomes
-`failed` / `disclosure` and nothing of it reaches the client) or `off`.
+`failed` / `disclosure` and nothing of it reaches the client) or `off`, for
+both at once or for each.
 What the screen does not catch, stated plainly: a number, a name, a short
 phrase, a paraphrase — a threshold restated as "under 5000.00" passes; the
 rule it belongs to, quoted, does not. A gateway SHOULD add detection of its
