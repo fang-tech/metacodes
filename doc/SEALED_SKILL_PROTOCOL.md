@@ -46,10 +46,10 @@ remote side holds the instructions, the local side holds the environment.
 A run reveals one path through the Skill, never the Skill. A Skill whose
 value is a fixed procedure is reconstructible from enough runs; a Skill
 whose value is judgement and the long tail of exception handling is not.
-The gateway's language model is itself a disclosure channel (a tool result
-can carry an injection that asks the model to write its instructions into a
-file), so SSP specifies detection and accountability for that channel
-(§8.5), not impossibility. Nothing in this document is encryption of the
+The model the gateway's brain runs on — the client's own, §8.1 — is itself
+a disclosure channel (a tool result can carry an injection that asks the
+model to write its instructions into a file), so SSP specifies detection
+and accountability for that channel (§8.5), not impossibility. Nothing in this document is encryption of the
 Skill against the party that runs it; the Skill is confidential because it
 never leaves the gateway, and the gateway is operated by the party the
 creator chose to trust.
@@ -61,14 +61,16 @@ creator chose to trust.
 | **Creator** | the Skill: `SKILL.md`, workflow, assets, manifest | the gateway operator (contractually; §8.6 for the attested variant) |
 | **Gateway** | Skill content, the brain (the client's loop run as a shadow, or a workflow engine), the sealing key | nobody: every client message is untrusted input; it holds no model credentials of its own |
 | **Client** | the user's tools, permissions, sandbox, credentials, budget, audit log | nobody: every gateway message is untrusted model output |
-| **Subscriber** | an account on the gateway | the gateway for billing, the client for everything that touches their machine |
+| **Subscriber** | an account on the gateway, and their own model-provider account | the gateway for the Skill fee only (the model bill is their own provider's, §8.1), the client for everything that touches their machine |
 
 In the reference deployment one service implements the gateway's four
 internal identities — *skill host* (content and brain), *inference gateway*
-(model calls and metering), *sealing issuer* (§7) and *billing*. They are
-named separately so that a later revision can let a third party host Skills
-behind a Metask inference gateway; a v1 implementation MAY merge them and
-MUST still populate the identity fields (§4.2) distinctly.
+(the party that relays the brain's model calls over the client's own route
+and credential, meters them and signs Steps; it owns no inference account),
+*sealing issuer* (§7) and *billing* (the Skill fee, §8.2; never the model).
+They are named separately so that a later revision can let a third party
+host Skills behind a Metask inference gateway; a v1 implementation MAY
+merge them and MUST still populate the identity fields (§4.2) distinctly.
 
 ## 2. Transport
 
@@ -135,9 +137,13 @@ Params: `{}`. Result:
 
 `capabilities.run_state` is `"opaque"` or `"server"`. `step_signature` says
 every Step carries `sig` (§8.4). `client_provider` says the gateway calls
-the model over the client's route (§8.1); a client MUST NOT start a run on
-a gateway that does not advertise it. `prefetch` and `client_sealed` are §7
-features and are `false` in revision 2026-10-15.
+the model over the client's route and credential (§8.1); in revision
+2026-10-15 it MUST be `true` — the protocol defines no other account a
+run's model calls could be made on — and a client MUST NOT start a run on
+a gateway that does not advertise it. `identities.billing` names who
+charges the Skill fee (§8.2); no identity bills for the model. `prefetch`
+and `client_sealed` are §7 features and are `false` in revision
+2026-10-15.
 
 ### 3.2 `sealed/skills.list`
 
@@ -210,9 +216,10 @@ id is unknown or not visible to this subscriber.
   only tools listed here, by exactly these names and against these schemas;
   it MUST NOT assume a tool exists because the manifest allows it.
 - `budget.max_cost_micros` is the cap for this run in micro-units of
-  `currency` (USD 0.50 is `500000`). The gateway MUST stop with
-  `budget_exceeded` before the cumulative charge would pass it.
-  `max_steps` bounds the number of Steps.
+  `currency` (USD 0.50 is `500000`): a cap on the gateway's estimate of
+  what the run's model calls cost on the client's own account (§8.2). The
+  gateway MUST stop with `budget_exceeded` before `cumulative.cost_micros`
+  would pass it. `max_steps` bounds the number of Steps.
 - `confirmation: "always"` asks the gateway to mark every call `confirm:
   true`; `"client"` (default) leaves it to the manifest and the gateway.
 - `system`, `tools`, `provider_tools`, `request` and the credential header
@@ -331,10 +338,13 @@ or carries another value.
 A `usage` block is present on every Step and describes the gateway's work
 *since the previous Step* — every model call the shadow made for it,
 including the ones that served sealed reads or compacted its context (zero
-for a pure workflow-engine step). `cumulative` is the running total.
-`cost_micros` is the gateway's estimate of what those calls cost on the
-client's own provider account (§8.2); it is what the client's cap and
-ledger see.
+for a pure workflow-engine step). `cumulative` is the running total. The
+token counts are the provider's own numbers for calls made with the
+client's credential, so they are also on the client's provider bill;
+`cost_micros` is the gateway's estimate of what those calls cost there
+(§8.2). A Step carries both: the client's cap and ledger use the estimate
+in revision 2026-10-15, and a client that prices with its own table MAY
+use the counts instead.
 
 Call fields:
 
@@ -560,14 +570,17 @@ without it.
 
 ### 8.2 Metering
 
-`usage.cost_micros` is the gateway's estimate of what the Step's model
-calls cost on the client's own provider account, from the provider's
-reported tokens and the gateway's price table. It is informational — the
-provider's own bill is authoritative — but it is the number the client's
-cap (§6.5) and ledger (§6.6) use, so the gateway MUST report it for every
-Step. The Skill's own fee, when the operator charges one, is carried by
-`charge` (§4.6) and is what the subscriber owes the gateway; its terms are
-outside this protocol.
+Model usage is billed where the calls are made: on the client's own
+provider account (§8.1). The subscriber's gateway account is charged
+nothing for it. `usage` reports the provider's token counts for every call
+of the Step, and `usage.cost_micros` the gateway's estimate of what they
+cost there, from those counts and the gateway's price table. The estimate
+is informational — the provider's own bill is authoritative — but it is the
+number the client's cap (§6.5) and ledger (§6.6) use in revision
+2026-10-15, so the gateway MUST report both the counts and the estimate for
+every Step. The Skill's own fee, when the gateway's operator charges one,
+is carried by `charge` (§4.6) and is what the subscriber owes the gateway;
+its terms are outside this protocol.
 
 ### 8.3 Tamper-evident log
 
@@ -603,8 +616,9 @@ expire, and is charged for the work done.
 
 ### 8.5 Disclosure through the model
 
-Tool results are untrusted data to the gateway's model, exactly as they are
-to the client's. A gateway SHOULD screen outgoing call inputs and `text`
+Tool results are untrusted data to the model the gateway's brain runs on,
+exactly as they are to the client's own loop. A gateway SHOULD screen
+outgoing call inputs and `text`
 against the Skill's own content (n-gram and embedding similarity), SHOULD
 seed each creator's Skill with canary phrases, and MUST log and attribute
 an attempt to the subscriber account. Operators publish what they do here;
@@ -914,6 +928,7 @@ gateway drive the happy path without a model and reserve the model for
 exceptions. The
 gateway validates the package, computes the protection rating from sample
 runs, signs the manifest, and lists it. Creators are paid per successful
-run or per subscription period from the gateway's metering; the wire
-protocol carries nothing of that relationship except the identities in
-§4.2.
+run or per subscription period out of the Skill fee the gateway records
+(§8.2) — never out of model usage, which is each subscriber's own bill on
+their own provider account; the wire protocol carries nothing of that
+relationship except the identities in §4.2.

@@ -103,14 +103,16 @@ credentials, price) and pins it under `<state root>/sealed-skills/<name>/`;
 the pin's projected `SKILL.md` carries `sealed-gateway`, `sealed-skill-id`
 and `sealed-manifest-digest`, `context: fork`, and the allowlist as
 `allowed-tools`. `/skills` lists it like any Skill; `/name args` and the
-`Skill` tool run it as a fork whose model is the gateway. Usage is charged to
-the client's gateway account step by step under
-`METACODES_SEALED_MAX_COST_MICROS` and recorded in
-`<state root>/ledger/sealed.ndjson` (`metacodes sealed ledger`). The model
-is this session's own: the gateway runs the Skill's loop as a shadow of the
-fork and calls the model over the session's provider route and credential,
-so the request the model sees is the one a local fork would have sent, on
-the user's account. A call the gateway marks `confirm: true` is approved
+`Skill` tool run it as a fork whose model is the gateway. The model is this
+session's own: the gateway runs the Skill's loop as a shadow of the fork and
+calls the model over the session's provider route and credential, so the
+request the model sees is the one a local fork would have sent, on the
+user's own account and bill. The gateway reports each Step's tokens and its
+estimate of their cost; the client stops the run at
+`METACODES_SEALED_MAX_COST_MICROS` and records every Step in
+`<state root>/ledger/sealed.ndjson` (`metacodes sealed ledger`). The gateway
+account owes only the Skill's own fee, when a gateway charges one. A call
+the gateway marks `confirm: true` is approved
 interactively even in a mode that would auto-allow it; a question the
 Skill has for the user is asked through the session's own AskUserQuestion
 dialog and answered in place. A credential reference the manifest declares

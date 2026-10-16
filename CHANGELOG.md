@@ -187,6 +187,17 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Changed
 
+- The Sealed Skill Protocol document says everywhere what the code does:
+  the gateway holds no inference account. Roles and identities (§1.2: the
+  subscriber's own provider account; the inference-gateway identity relays,
+  meters and signs, owns nothing), `discover` (§3.1: `client_provider` MUST
+  be `true`; `billing` bills the Skill fee, never the model), the budget as
+  a cap on the estimate (§3.4), Step usage (§4.3, §8.2: the provider's token
+  counts and the gateway's estimate both travel; model usage is billed on
+  the client's own account, the gateway account owes only the Skill fee),
+  the disclosure channel (§1.1, §8.5) and creator payment (§12).
+  `doc/SKILLS_AND_MCP.md` no longer says usage is charged to the gateway
+  account.
 - `--web`/`serve`: `user_message` is journaled by the session when the
   message's turn starts, no longer by the transport when the message is
   queued, so it always means "this turn started with this text". A message
