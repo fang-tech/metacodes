@@ -156,6 +156,11 @@ pub fn event(arena: std.mem.Allocator, value: InternalEvent) error{OutOfMemory}!
             .max = v.max,
             .delay_ms = v.delay_ms,
         } },
+        .input_adopted => |v| .{ .input_adopted = .{
+            .input_id = v.input_id,
+            .sequence = v.sequence,
+            .turn = v.turn,
+        } },
         .output_segment_begin => |v| .{ .output_segment_begin = .{
             .index = v.index,
             .turn = v.turn,

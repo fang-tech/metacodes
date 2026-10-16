@@ -312,6 +312,10 @@ pub const Controller = struct {
     mutex: sync.Mutex = .{},
     estimated_usage_bytes: u64,
     root_input_delta_bytes: u64,
+    /// Encoded durable bytes of the Host inputs this Run accepted through
+    /// `submit_input` (#270) and has not released, adopted or pending. With
+    /// the root input it is bounded by `input_cap_bytes`.
+    submitted_input_delta_bytes: u64 = 0,
     reserved_bytes: u64 = 0,
     outcome_value: Outcome = .none,
     required_bytes_value: u64 = 0,
@@ -500,6 +504,54 @@ pub const Controller = struct {
         }
         self.estimated_usage_bytes = projected;
         self.root_input_delta_bytes = exact_delta;
+    }
+
+    /// Reserve the durable bytes of one Host input accepted while this Run
+    /// is active (#270): its exact encoded user record. The Run's host input
+    /// — root input plus every accepted input — stays within
+    /// `input_cap_bytes`, and the reservation must leave room for one more
+    /// provider turn (`minimumRunReserve`), so adopting it can never be what
+    /// exhausts the Run. Unlike every other reservation a refusal does **not**
+    /// record a Run outcome: it refuses that one submission and the Run goes
+    /// on. Returns the reserved bytes for `commitSubmittedInput` /
+    /// `releaseSubmittedInput`.
+    pub fn reserveSubmittedInput(self: *Controller, text: []const u8) Error!u64 {
+        const delta = checkpoint.encodedTextMessageBytes(text) catch return error.BudgetRequired;
+        if (text.len > self.profile.input_cap_bytes) return error.BudgetRequired;
+        const run_reserve = self.profile.minimumRunReserve() catch return error.BudgetRequired;
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.outcome_value != .none) return error.BudgetRequired;
+        const host_input = checkedAdd(self.root_input_delta_bytes, self.submitted_input_delta_bytes) catch
+            return error.BudgetRequired;
+        if ((checkedAdd(host_input, delta) catch return error.BudgetRequired) > self.profile.input_cap_bytes)
+            return error.BudgetRequired;
+        var required = checkedAdd(self.estimated_usage_bytes, self.reserved_bytes) catch return error.BudgetRequired;
+        required = checkedAdd(required, delta) catch return error.BudgetRequired;
+        required = checkedAdd(required, run_reserve) catch return error.BudgetRequired;
+        if (required > self.profile.hard_bytes) return error.BudgetRequired;
+        self.reserved_bytes += delta;
+        self.submitted_input_delta_bytes += delta;
+        return delta;
+    }
+
+    /// The input reserved by `reserveSubmittedInput` is now a Conversation
+    /// record: its bytes move from reserved to the durable estimate.
+    pub fn commitSubmittedInput(self: *Controller, reserved: u64) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        std.debug.assert(self.reserved_bytes >= reserved);
+        self.reserved_bytes -= reserved;
+        self.estimated_usage_bytes = checkedAdd(self.estimated_usage_bytes, reserved) catch unreachable;
+    }
+
+    /// The Run ended without adopting the input: give its bytes back.
+    pub fn releaseSubmittedInput(self: *Controller, reserved: u64) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        std.debug.assert(self.reserved_bytes >= reserved and self.submitted_input_delta_bytes >= reserved);
+        self.reserved_bytes -= reserved;
+        self.submitted_input_delta_bytes -= reserved;
     }
 
     pub fn outcome(self: *Controller) Outcome {

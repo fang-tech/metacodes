@@ -3978,7 +3978,7 @@ test "L2 public MCP checkpoint restore facade preserves Conversation under narro
 
     var abi_revision_bytes: [4]u8 = undefined;
     @memcpy(&abi_revision_bytes, checkpoint.bytes.items[20..24]);
-    try std.testing.expectEqual(@as(u32, 19), wire.ABI_REVISION);
+    try std.testing.expectEqual(@as(u32, 20), wire.ABI_REVISION);
     // A Session without a prompt profile keeps the marker-8 envelope across
     // ABI revisions; the marker is independent of the table revision.
     try std.testing.expectEqual(
@@ -10070,4 +10070,780 @@ test "L2 Revision 19 permission mode update governs the next Run in place and re
         try std.testing.expectEqual(@as(u32, 0), decoded.value.permission.invalidated_rules);
     }
     try expectDescribedPermission(api, session, .dont_ask, 3);
+}
+
+// ── Revision 20: Host input submitted to an active Run (#270) ───────────────
+
+const RunInputSubmission = struct {
+    input_id: u64,
+    text: []const u8,
+    /// Run to submit under; null means the callback's own Run.
+    run_id: ?u64 = null,
+    expect: u32 = wire.STATUS_OK,
+    /// Checked when non-zero.
+    expect_sequence: u32 = 0,
+};
+
+const RunInputAdoption = struct {
+    input_id: u64,
+    sequence: u32,
+    turn: u32,
+};
+
+/// Callbacks for the Revision 20 tests. `on_stream` is submitted from inside
+/// the first turn-1 `output_segment_begin` (the request is out, its response
+/// stream is open); `on_ui` from inside the first Host UI request, before it
+/// is answered; `hook` runs at the same stream point for custom checks.
+/// Wrong outcomes are counted in `mismatches` rather than returned as
+/// callback failures, so they fail the test instead of poisoning the Session.
+const RunInputProbe = struct {
+    api: sdk.Api,
+    session: ?*wire.SessionHandle = null,
+    on_stream: []const RunInputSubmission = &.{},
+    on_ui: []const RunInputSubmission = &.{},
+    hook: ?*const fn (*RunInputProbe, u64) void = null,
+    /// Sees every known event, for tests that submit at a specific edge.
+    event_hook: ?*const fn (*RunInputProbe, u64, sdk.CoreEvent) void = null,
+    stage: u32 = 0,
+    fatal_on_adoption: bool = false,
+    streamed: bool = false,
+    ui_submitted: bool = false,
+    mismatches: u32 = 0,
+    adopted: [80]RunInputAdoption = undefined,
+    adopted_len: usize = 0,
+    ui_calls: u32 = 0,
+    host_calls: u32 = 0,
+
+    fn mismatch(self: *RunInputProbe, comptime fmt: []const u8, args: anytype) void {
+        std.debug.print("run input probe: " ++ fmt ++ "\n", args);
+        self.mismatches += 1;
+    }
+
+    fn submit(self: *RunInputProbe, run_id: u64, submission: RunInputSubmission) void {
+        var receipt = std.mem.zeroes(wire.InputReceiptV1);
+        var diagnostic = std.mem.zeroes(wire.OwnedBytesV1);
+        const status = self.api.session().submitInput(
+            self.session,
+            submission.run_id orelse run_id,
+            submission.input_id,
+            sdk.bytesView(submission.text),
+            &receipt,
+            &diagnostic,
+        );
+        self.api.bufferRelease()(&diagnostic);
+        if (status != submission.expect)
+            self.mismatch("input {d}: status {d}, expected {d}", .{ submission.input_id, status, submission.expect });
+        if (status == wire.STATUS_OK and receipt.struct_size != @sizeOf(wire.InputReceiptV1))
+            self.mismatch("input {d}: receipt not written", .{submission.input_id});
+        if (status != wire.STATUS_OK and receipt.sequence != 0)
+            self.mismatch("input {d}: receipt written on failure", .{submission.input_id});
+        if (submission.expect_sequence != 0 and receipt.sequence != submission.expect_sequence)
+            self.mismatch("input {d}: sequence {d}, expected {d}", .{ submission.input_id, receipt.sequence, submission.expect_sequence });
+    }
+
+    fn event(raw: ?*anyopaque, run_ptr: ?*const wire.RunContextV1, event_json: wire.BytesViewV1) callconv(.c) u32 {
+        const self: *RunInputProbe = @ptrCast(@alignCast(raw orelse return wire.EVENT_FATAL));
+        const run = sdk.validateRunContext(run_ptr) catch return wire.EVENT_FATAL;
+        const encoded = sdk.borrowedBytes(event_json) catch return wire.EVENT_FATAL;
+        const parsed = sdk.decodeCoreEvent(std.heap.c_allocator, encoded) catch return wire.EVENT_FATAL;
+        defer parsed.deinit();
+        const value = switch (parsed.value) {
+            .known => |known| known,
+            .unknown => return wire.EVENT_CONTINUE,
+        };
+        if (self.event_hook) |hook| hook(self, run.run_id, value);
+        switch (value) {
+            .output_segment_begin => |segment| if (segment.turn == 1 and !self.streamed) {
+                self.streamed = true;
+                for (self.on_stream) |submission| self.submit(run.run_id, submission);
+                if (self.hook) |hook| hook(self, run.run_id);
+            },
+            .input_adopted => |adopted| {
+                if (self.adopted_len == self.adopted.len) return wire.EVENT_FATAL;
+                self.adopted[self.adopted_len] = .{ .input_id = adopted.input_id, .sequence = adopted.sequence, .turn = adopted.turn };
+                self.adopted_len += 1;
+                if (self.fatal_on_adoption) return wire.EVENT_FATAL;
+            },
+            else => {},
+        }
+        return wire.EVENT_CONTINUE;
+    }
+
+    fn ui(raw: ?*anyopaque, run_ptr: ?*const wire.RunContextV1, request_json: wire.BytesViewV1, out_response: ?*wire.OwnedBytesV1) callconv(.c) u32 {
+        const self: *RunInputProbe = @ptrCast(@alignCast(raw orelse return wire.UI_FATAL));
+        const run = sdk.validateRunContext(run_ptr) catch return wire.UI_FATAL;
+        const encoded = sdk.borrowedBytes(request_json) catch return wire.UI_FATAL;
+        const parsed = sdk.decodeUiRequest(std.heap.c_allocator, encoded) catch return wire.UI_FATAL;
+        defer parsed.deinit();
+        const request = switch (parsed.value) {
+            .permission => |value| value,
+            else => return wire.UI_FATAL,
+        };
+        // Input submitted while the approval waits is queued; it never stands
+        // in for the answer, which this callback still gives.
+        if (!self.ui_submitted) {
+            self.ui_submitted = true;
+            for (self.on_ui) |submission| self.submit(run.run_id, submission);
+        }
+        const response_json = sdk.encodeUiResponse(std.heap.c_allocator, parsed.value, .{ .permission = .{
+            .permission = .allow_once,
+            .request_id = request.request_id,
+            .policy_generation = request.policy_generation,
+        } }) catch return wire.UI_FATAL;
+        const out = out_response orelse {
+            std.heap.c_allocator.free(response_json);
+            return wire.UI_FATAL;
+        };
+        out.* = .{ .ptr = response_json.ptr, .len = response_json.len };
+        self.ui_calls += 1;
+        return wire.UI_ANSWERED;
+    }
+
+    fn releaseUi(_: ?*anyopaque, response: ?*wire.OwnedBytesV1) callconv(.c) void {
+        const out = response orelse return;
+        if (out.ptr) |ptr| {
+            const len = std.math.cast(usize, out.len) orelse return;
+            std.heap.c_allocator.free(ptr[0..len]);
+        }
+        out.* = .{ .ptr = null, .len = 0 };
+    }
+
+    fn host(raw: ?*anyopaque, _: ?*const wire.RunContextV1, _: wire.BytesViewV1, out_result: ?*wire.OwnedBytesV1) callconv(.c) u32 {
+        const self: *RunInputProbe = @ptrCast(@alignCast(raw orelse return wire.HOST_FATAL));
+        const result = "host-ok";
+        (out_result orelse return wire.HOST_FATAL).* = .{ .ptr = @constCast(result.ptr), .len = result.len };
+        self.host_calls += 1;
+        return wire.HOST_OK;
+    }
+
+    fn releaseHost(_: ?*anyopaque, result: ?*wire.OwnedBytesV1) callconv(.c) void {
+        if (result) |out| out.* = .{ .ptr = null, .len = 0 };
+    }
+
+    fn adoptedSlice(self: *const RunInputProbe) []const RunInputAdoption {
+        return self.adopted[0..self.adopted_len];
+    }
+};
+
+/// One AgentCore Session whose model may call the Host tool `HostEcho`, which
+/// asks for permission (PERMISSION_DEFAULT): a HOST_SSE turn is a tool turn
+/// with an approval wait, followed by a turn boundary.
+const RunInputFixture = struct {
+    api: sdk.Api,
+    runtime: ?*wire.RuntimeHandle = null,
+    session: ?*wire.SessionHandle = null,
+    diagnostic: wire.OwnedBytesV1 = .{ .ptr = null, .len = 0 },
+    host_tools: [1]wire.HostToolV1 = undefined,
+    allowed: [1]wire.BytesViewV1 = undefined,
+    host: wire.SessionHostConfigV1 = undefined,
+    callbacks: wire.SessionCallbacksV1 = undefined,
+
+    fn init(self: *RunInputFixture, root: []const u8, url: []const u8, probe: *RunInputProbe, budget: ?*const wire.DurableBudgetProfileV1) !void {
+        self.* = .{ .api = probe.api };
+        errdefer self.deinit();
+        var tool = std.mem.zeroes(wire.HostToolV1);
+        tool.struct_size = @sizeOf(wire.HostToolV1);
+        tool.ctx = probe;
+        tool.name = sdk.bytesView("HostEcho");
+        tool.description = sdk.bytesView("Echo a value through the Host");
+        tool.input_schema_json = sdk.bytesView("{\"type\":\"object\",\"properties\":{\"text\":{\"type\":\"string\"}},\"required\":[\"text\"]}");
+        tool.execute = RunInputProbe.host;
+        tool.release_result = RunInputProbe.releaseHost;
+        self.host_tools = .{tool};
+        var runtime_config = std.mem.zeroes(wire.RuntimeConfigV1);
+        runtime_config.struct_size = @sizeOf(wire.RuntimeConfigV1);
+        runtime_config.host_tools = &self.host_tools;
+        runtime_config.host_tool_count = self.host_tools.len;
+        try std.testing.expectEqual(wire.STATUS_OK, self.api.runtime().create()(&runtime_config, null, &self.runtime, &self.diagnostic));
+
+        self.allowed = .{sdk.bytesView("HostEcho")};
+        self.host = std.mem.zeroes(wire.SessionHostConfigV1);
+        self.host.struct_size = @sizeOf(wire.SessionHostConfigV1);
+        self.host.provider_kind_code = wire.PROVIDER_ANTHROPIC;
+        self.host.permission_mode_code = wire.PERMISSION_DEFAULT;
+        self.host.shell_policy_code = wire.SHELL_DISABLED;
+        self.host.api_key = sdk.bytesView("test-key");
+        self.host.base_url = sdk.bytesView(url);
+        self.host.workspace_root = sdk.bytesView(root);
+        self.host.workspace_home = sdk.bytesView(root);
+        self.host.allowed_tools = &self.allowed;
+        self.host.allowed_tool_count = self.allowed.len;
+        self.host.durable_budget = budget;
+        var create_config = sessionCreateConfig(&self.host, "test-model");
+        self.callbacks = std.mem.zeroes(wire.SessionCallbacksV1);
+        self.callbacks.struct_size = @sizeOf(wire.SessionCallbacksV1);
+        self.callbacks.ctx = probe;
+        self.callbacks.on_event = RunInputProbe.event;
+        self.callbacks.on_ui_request = RunInputProbe.ui;
+        self.callbacks.release_response = RunInputProbe.releaseUi;
+        try std.testing.expectEqual(wire.STATUS_OK, self.api.session().create()(self.runtime, &create_config, &self.callbacks, &self.session, &self.diagnostic));
+        probe.session = self.session;
+    }
+
+    fn run(self: *RunInputFixture, run_id: u64, prompt: []const u8, result: *wire.RunResultV1) u32 {
+        var options = std.mem.zeroes(wire.RunOptionsV1);
+        options.struct_size = @sizeOf(wire.RunOptionsV1);
+        options.max_turns = 4;
+        result.* = std.mem.zeroes(wire.RunResultV1);
+        self.api.bufferRelease()(&self.diagnostic);
+        return self.api.session().runText(self.session, run_id, sdk.bytesView(prompt), &options, result, &self.diagnostic);
+    }
+
+    fn submit(self: *RunInputFixture, run_id: u64, input_id: u64, text: []const u8) u32 {
+        var receipt = std.mem.zeroes(wire.InputReceiptV1);
+        self.api.bufferRelease()(&self.diagnostic);
+        return self.api.session().submitInput(self.session, run_id, input_id, sdk.bytesView(text), &receipt, &self.diagnostic);
+    }
+
+    fn deinit(self: *RunInputFixture) void {
+        if (self.session) |handle| _ = self.api.session().destroy()(handle, &self.diagnostic);
+        self.session = null;
+        self.api.bufferRelease()(&self.diagnostic);
+        if (self.runtime) |handle| _ = self.api.runtime().destroy()(handle, &self.diagnostic);
+        self.runtime = null;
+        self.api.bufferRelease()(&self.diagnostic);
+    }
+};
+
+fn runInputApi() !sdk.Api {
+    const raw_api = abi.metask_agentcore_get_api(wire.ABI_VERSION_V1) orelse return error.MissingApi;
+    return sdk.Api.validate(@ptrCast(@alignCast(raw_api)));
+}
+
+fn requestBody(server: *harness.MockServer, index: usize) ![]const u8 {
+    const captured = server.requestAt(index) orelse return error.MissingProviderRequest;
+    return captured.body();
+}
+
+test "L2 Revision 20 input submitted during the stream and during a Permission wait joins the next request in order (#270)" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try rootPath(&tmp, &root_buf);
+    const bodies = [_][]const u8{ HOST_SSE, FINAL_SSE, FINAL_SSE };
+    var server = try harness.MockServer.startCassette(&bodies, 0);
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+
+    var probe = RunInputProbe{
+        .api = try runInputApi(),
+        .on_stream = &.{
+            .{ .input_id = 10, .text = "STREAMED_STEERING", .expect_sequence = 1 },
+            // Another Run's id and the zero id are refused without effect.
+            .{ .input_id = 99, .text = "wrong run", .run_id = 2, .expect = wire.STATUS_STALE_RUN },
+            .{ .input_id = 98, .text = "zero run", .run_id = 0, .expect = wire.STATUS_INVALID_ARGUMENT },
+        },
+        .on_ui = &.{
+            .{ .input_id = 11, .text = "APPROVAL_STEERING", .expect_sequence = 2 },
+            // A duplicate id is refused for the rest of the Run.
+            .{ .input_id = 10, .text = "duplicate", .expect = wire.STATUS_INVALID_ARGUMENT },
+            .{ .input_id = 12, .text = "SECOND_APPROVAL_STEERING", .expect_sequence = 3 },
+        },
+    };
+    var fixture: RunInputFixture = undefined;
+    try fixture.init(root, url, &probe, null);
+    defer fixture.deinit();
+
+    var result: wire.RunResultV1 = undefined;
+    try std.testing.expectEqual(wire.STATUS_OK, fixture.run(1, "invoke the Host echo", &result));
+    try std.testing.expectEqual(@as(u32, 0), probe.mismatches);
+    try std.testing.expectEqual(wire.STOP_END_TURN, result.stop_reason_code);
+    // The approval was answered and the tool ran: input never answers it.
+    try std.testing.expectEqual(@as(u32, 1), probe.ui_calls);
+    try std.testing.expectEqual(@as(u32, 1), probe.host_calls);
+
+    // Adopted at the boundary before turn 2, in acceptance order.
+    try std.testing.expectEqualSlices(RunInputAdoption, &.{
+        .{ .input_id = 10, .sequence = 1, .turn = 2 },
+        .{ .input_id = 11, .sequence = 2, .turn = 2 },
+        .{ .input_id = 12, .sequence = 3, .turn = 2 },
+    }, probe.adoptedSlice());
+    try std.testing.expectEqual(@as(u32, 3), result.input_accepted_count);
+    try std.testing.expectEqual(@as(u32, 3), result.input_adopted_count);
+
+    // The request already sent when the input arrived is not changed; the next
+    // one carries every input as a user record after the tool result.
+    const first = try requestBody(server, 0);
+    try std.testing.expect(std.mem.indexOf(u8, first, "STREAMED_STEERING") == null);
+    const second = try requestBody(server, 1);
+    const tool_result = std.mem.indexOf(u8, second, "host-ok") orelse return error.MissingToolResult;
+    const streamed = std.mem.indexOf(u8, second, "STREAMED_STEERING") orelse return error.MissingAdoptedInput;
+    const approval = std.mem.indexOf(u8, second, "\"APPROVAL_STEERING") orelse return error.MissingAdoptedInput;
+    const later = std.mem.indexOf(u8, second, "SECOND_APPROVAL_STEERING") orelse return error.MissingAdoptedInput;
+    try std.testing.expect(tool_result < streamed and streamed < approval and approval < later);
+    try std.testing.expect(std.mem.indexOf(u8, second, "duplicate") == null);
+
+    // The Run is over: its id is too late, an unknown id stale.
+    try std.testing.expectEqual(wire.STATUS_TOO_LATE, fixture.submit(1, 50, "after the Run"));
+    try std.testing.expectEqual(wire.STATUS_STALE_RUN, fixture.submit(7, 50, "never admitted"));
+
+    // Adopted input is ordinary Conversation state: a checkpoint carries it to
+    // a restored Session, whose next request still holds it.
+    var checkpoint = PublicCheckpointBuffer{};
+    defer checkpoint.deinit();
+    var limits = publicCheckpointLimits();
+    var sink = checkpoint.sink();
+    var export_config = std.mem.zeroes(wire.CheckpointExportConfigV1);
+    export_config.struct_size = @sizeOf(wire.CheckpointExportConfigV1);
+    export_config.limits = &limits;
+    export_config.sink = &sink;
+    var export_result = std.mem.zeroes(wire.CheckpointExportResultV1);
+    try std.testing.expectEqual(wire.STATUS_OK, fixture.api.sessionControl().exportCheckpoint()(fixture.session, &export_config, &export_result, &fixture.diagnostic));
+    try std.testing.expectEqual(wire.STATUS_OK, fixture.api.session().destroy()(fixture.session, &fixture.diagnostic));
+    fixture.session = null;
+    var source = checkpoint.source();
+    var restore_config = std.mem.zeroes(wire.SessionRestoreConfigV1);
+    restore_config.struct_size = @sizeOf(wire.SessionRestoreConfigV1);
+    restore_config.host = &fixture.host;
+    restore_config.source = &source;
+    restore_config.limits = &limits;
+    var restore_report = std.mem.zeroes(wire.OwnedBytesV1);
+    defer fixture.api.bufferRelease()(&restore_report);
+    try std.testing.expectEqual(wire.STATUS_OK, fixture.api.sessionControl().restore()(fixture.runtime, &restore_config, &fixture.callbacks, &fixture.session, &restore_report, &fixture.diagnostic));
+    probe.session = fixture.session;
+    try std.testing.expectEqual(wire.STATUS_OK, fixture.run(2, "continue after restore", &result));
+    try std.testing.expectEqual(@as(u32, 0), result.input_accepted_count);
+    const restored = try requestBody(server, 2);
+    const restored_streamed = std.mem.indexOf(u8, restored, "STREAMED_STEERING") orelse return error.AdoptedInputLostByCheckpoint;
+    const restored_later = std.mem.indexOf(u8, restored, "SECOND_APPROVAL_STEERING") orelse return error.AdoptedInputLostByCheckpoint;
+    try std.testing.expect(restored_streamed < restored_later);
+}
+
+test "L2 Revision 20 input accepted by a Run that ends first reconciles as not adopted (#270)" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try rootPath(&tmp, &root_buf);
+    const bodies = [_][]const u8{ FINAL_SSE, FINAL_SSE };
+    var server = try harness.MockServer.startCassette(&bodies, 0);
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+
+    var probe = RunInputProbe{
+        .api = try runInputApi(),
+        .on_stream = &.{.{ .input_id = 20, .text = "NEVER_ADOPTED", .expect_sequence = 1 }},
+    };
+    var fixture: RunInputFixture = undefined;
+    try fixture.init(root, url, &probe, null);
+    defer fixture.deinit();
+
+    var result: wire.RunResultV1 = undefined;
+    try std.testing.expectEqual(wire.STATUS_OK, fixture.run(1, "single turn", &result));
+    try std.testing.expectEqual(@as(u32, 0), probe.mismatches);
+    try std.testing.expectEqual(wire.STOP_END_TURN, result.stop_reason_code);
+    // Accepted, but the Run ended at end_turn before another boundary.
+    try std.testing.expectEqual(@as(u32, 1), result.input_accepted_count);
+    try std.testing.expectEqual(@as(u32, 0), result.input_adopted_count);
+    try std.testing.expectEqual(@as(usize, 0), probe.adopted_len);
+    // It never entered the Conversation, so the next Run does not see it.
+    try std.testing.expectEqual(wire.STATUS_OK, fixture.run(2, "next Run", &result));
+    try std.testing.expect(std.mem.indexOf(u8, try requestBody(server, 1), "NEVER_ADOPTED") == null);
+}
+
+test "L2 Revision 20 a max_tokens continuation boundary does not adopt input (#270)" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try rootPath(&tmp, &root_buf);
+    const bodies = [_][]const u8{ CONTINUATION_HEAD_SSE, CONTINUATION_TAIL_SSE };
+    var server = try harness.MockServer.startCassette(&bodies, 0);
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+
+    var probe = RunInputProbe{
+        .api = try runInputApi(),
+        .on_stream = &.{.{ .input_id = 30, .text = "BETWEEN_THE_HALVES" }},
+    };
+    var fixture: RunInputFixture = undefined;
+    try fixture.init(root, url, &probe, null);
+    defer fixture.deinit();
+
+    var result: wire.RunResultV1 = undefined;
+    try std.testing.expectEqual(wire.STATUS_OK, fixture.run(1, "a long answer", &result));
+    try std.testing.expectEqual(@as(u32, 0), probe.mismatches);
+    try std.testing.expectEqual(wire.STOP_END_TURN, result.stop_reason_code);
+    // The continuation request keeps the truncated answer one answer: the
+    // input is not spliced between its halves, and the tail ended the Run.
+    try std.testing.expect(std.mem.indexOf(u8, try requestBody(server, 1), "BETWEEN_THE_HALVES") == null);
+    try std.testing.expectEqual(@as(u32, 1), result.input_accepted_count);
+    try std.testing.expectEqual(@as(u32, 0), result.input_adopted_count);
+}
+
+fn submitLimitsHook(probe: *RunInputProbe, run_id: u64) void {
+    const session = probe.api.session();
+    var receipt = std.mem.zeroes(wire.InputReceiptV1);
+    var diagnostic = std.mem.zeroes(wire.OwnedBytesV1);
+    defer probe.api.bufferRelease()(&diagnostic);
+    const expectStatus = struct {
+        fn check(p: *RunInputProbe, status: u32, expected: u32, what: []const u8) void {
+            if (status != expected) p.mismatch("{s}: status {d}, expected {d}", .{ what, status, expected });
+        }
+    }.check;
+
+    // Malformed submissions.
+    var input = wire.SubmittedInputV1{
+        .struct_size = @sizeOf(wire.SubmittedInputV1),
+        .reserved0 = 0,
+        .input_id = 1,
+        .text = sdk.bytesView("ok"),
+        .reserved = [_]u64{0} ** 2,
+    };
+    var bad = input;
+    bad.struct_size -= 8;
+    expectStatus(probe, session.submitInputFn()(probe.session, run_id, &bad, &receipt, &diagnostic), wire.STATUS_INVALID_ARGUMENT, "struct_size");
+    probe.api.bufferRelease()(&diagnostic);
+    bad = input;
+    bad.reserved[1] = 1;
+    expectStatus(probe, session.submitInputFn()(probe.session, run_id, &bad, &receipt, &diagnostic), wire.STATUS_INVALID_ARGUMENT, "reserved");
+    probe.api.bufferRelease()(&diagnostic);
+    bad = input;
+    bad.input_id = 0;
+    expectStatus(probe, session.submitInputFn()(probe.session, run_id, &bad, &receipt, &diagnostic), wire.STATUS_INVALID_ARGUMENT, "zero id");
+    probe.api.bufferRelease()(&diagnostic);
+    expectStatus(probe, session.submitInputFn()(probe.session, run_id, null, &receipt, &diagnostic), wire.STATUS_INVALID_ARGUMENT, "null input");
+    probe.api.bufferRelease()(&diagnostic);
+    expectStatus(probe, session.submitInputFn()(probe.session, run_id, &input, null, &diagnostic), wire.STATUS_INVALID_ARGUMENT, "null receipt");
+    probe.api.bufferRelease()(&diagnostic);
+    for ([_][]const u8{ "", " \t\r\n", "\xff\xfe" }) |text| {
+        expectStatus(probe, session.submitInput(probe.session, run_id, 2, sdk.bytesView(text), &receipt, &diagnostic), wire.STATUS_INVALID_ARGUMENT, "blank or invalid UTF-8");
+        probe.api.bufferRelease()(&diagnostic);
+    }
+    // A text above the published per-Run byte limit is a resource limit.
+    const oversized = std.heap.page_allocator.alloc(u8, wire.MAX_SUBMITTED_INPUT_BYTES_V1 + 1) catch {
+        probe.mismatch("oversized buffer allocation failed", .{});
+        return;
+    };
+    defer std.heap.page_allocator.free(oversized);
+    @memset(oversized, 'x');
+    expectStatus(probe, session.submitInput(probe.session, run_id, 3, sdk.bytesView(oversized), &receipt, &diagnostic), wire.STATUS_RESOURCE_LIMIT, "oversized");
+    probe.api.bufferRelease()(&diagnostic);
+
+    // Exactly MAX_SUBMITTED_INPUTS_V1 inputs fit; the next is a resource limit.
+    var id: u64 = 100;
+    while (id < 100 + wire.MAX_SUBMITTED_INPUTS_V1) : (id += 1) {
+        expectStatus(probe, session.submitInput(probe.session, run_id, id, sdk.bytesView("n"), &receipt, &diagnostic), wire.STATUS_OK, "within count");
+        probe.api.bufferRelease()(&diagnostic);
+    }
+    expectStatus(probe, session.submitInput(probe.session, run_id, id, sdk.bytesView("n"), &receipt, &diagnostic), wire.STATUS_RESOURCE_LIMIT, "over count");
+    if (receipt.sequence != 0) probe.mismatch("receipt written on a refused input", .{});
+}
+
+test "L2 Revision 20 submit_input validates arguments and per-Run limits without disturbing the Run (#270)" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try rootPath(&tmp, &root_buf);
+    const bodies = [_][]const u8{ HOST_SSE, FINAL_SSE };
+    var server = try harness.MockServer.startCassette(&bodies, 0);
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+
+    var probe = RunInputProbe{ .api = try runInputApi(), .hook = submitLimitsHook };
+    var fixture: RunInputFixture = undefined;
+    try fixture.init(root, url, &probe, null);
+    defer fixture.deinit();
+
+    var result: wire.RunResultV1 = undefined;
+    try std.testing.expectEqual(wire.STATUS_OK, fixture.run(1, "invoke the Host echo", &result));
+    try std.testing.expectEqual(@as(u32, 0), probe.mismatches);
+    try std.testing.expectEqual(wire.STOP_END_TURN, result.stop_reason_code);
+    // Only the accepted inputs count, and every one of them was adopted.
+    try std.testing.expectEqual(@as(u32, wire.MAX_SUBMITTED_INPUTS_V1), result.input_accepted_count);
+    try std.testing.expectEqual(@as(u32, wire.MAX_SUBMITTED_INPUTS_V1), result.input_adopted_count);
+    try std.testing.expectEqual(@as(usize, wire.MAX_SUBMITTED_INPUTS_V1), probe.adopted_len);
+    for (probe.adoptedSlice(), 0..) |adopted, index| {
+        try std.testing.expectEqual(@as(u64, 100 + index), adopted.input_id);
+        try std.testing.expectEqual(@as(u32, @intCast(index + 1)), adopted.sequence);
+    }
+}
+
+test "L2 Revision 20 submitted input counts toward the Run's input cap and is refused, not fatal, past it (#270)" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try rootPath(&tmp, &root_buf);
+    const bodies = [_][]const u8{ HOST_SSE, FINAL_SSE };
+    var server = try harness.MockServer.startCassette(&bodies, 0);
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+
+    // Root prompt (300 bytes) plus each input are one Run's host input,
+    // bounded together by input_cap_bytes: a 150-byte input still fits under
+    // 512, a further 50 bytes does not.
+    const budget = wire.DurableBudgetProfileV1{
+        .struct_size = @sizeOf(wire.DurableBudgetProfileV1),
+        .reserved0 = 0,
+        .hard_bytes = 4 * 1024 * 1024,
+        .soft_bytes = 3 * 1024 * 1024,
+        .input_cap_bytes = 512,
+        .provider_request_cap_bytes = 512 * 1024,
+        .provider_result_cap_bytes = 64 * 1024,
+        .tool_result_cap_bytes = 64 * 1024,
+        .mcp_result_cap_bytes = 64 * 1024,
+        .audit_reserve_bytes = 64 * 1024,
+        .terminal_reserve_bytes = 64 * 1024,
+        .reserved = [_]u64{0} ** 4,
+    };
+    const fits = "F" ** 150;
+    const over = "O" ** 50;
+    var probe = RunInputProbe{
+        .api = try runInputApi(),
+        .on_ui = &.{
+            .{ .input_id = 1, .text = fits, .expect_sequence = 1 },
+            .{ .input_id = 2, .text = over, .expect = wire.STATUS_CHECKPOINT_BUDGET_REQUIRED },
+        },
+    };
+    var fixture: RunInputFixture = undefined;
+    try fixture.init(root, url, &probe, &budget);
+    defer fixture.deinit();
+
+    var result: wire.RunResultV1 = undefined;
+    try std.testing.expectEqual(wire.STATUS_OK, fixture.run(1, "P" ** 300, &result));
+    try std.testing.expectEqual(@as(u32, 0), probe.mismatches);
+    // The refusal refused one submission; the Run went on and finished.
+    try std.testing.expectEqual(wire.STOP_END_TURN, result.stop_reason_code);
+    try std.testing.expectEqual(@as(u32, 1), result.input_accepted_count);
+    try std.testing.expectEqual(@as(u32, 1), result.input_adopted_count);
+    const second = try requestBody(server, 1);
+    try std.testing.expect(std.mem.indexOf(u8, second, fits) != null);
+    try std.testing.expect(std.mem.indexOf(u8, second, over) == null);
+}
+
+test "L2 Revision 20 a failed adoption callback poisons the Session but the counts still report the adoption (#270)" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try rootPath(&tmp, &root_buf);
+    const bodies = [_][]const u8{ HOST_SSE, FINAL_SSE };
+    var server = try harness.MockServer.startCassette(&bodies, 0);
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+
+    var probe = RunInputProbe{
+        .api = try runInputApi(),
+        .on_ui = &.{.{ .input_id = 40, .text = "ADOPTED_THEN_FAILED" }},
+        .fatal_on_adoption = true,
+    };
+    var fixture: RunInputFixture = undefined;
+    try fixture.init(root, url, &probe, null);
+    defer fixture.deinit();
+
+    var result: wire.RunResultV1 = undefined;
+    try std.testing.expectEqual(wire.STATUS_CALLBACK_FAILED, fixture.run(1, "invoke the Host echo", &result));
+    try std.testing.expectEqual(@as(u32, 0), probe.mismatches);
+    // The Host rejected the acknowledgement, yet the input was appended before
+    // it: the counts, defined on every status, say so.
+    try std.testing.expectEqual(@as(usize, 1), probe.adopted_len);
+    try std.testing.expectEqual(@as(u32, 1), result.input_accepted_count);
+    try std.testing.expectEqual(@as(u32, 1), result.input_adopted_count);
+    try std.testing.expectEqual(wire.STATUS_INVALID_STATE, fixture.submit(1, 41, "poisoned"));
+}
+
+const RunInputRacer = struct {
+    api: sdk.Api,
+    session: ?*wire.SessionHandle,
+    accepted: u32 = 0,
+    unexpected: u32 = 0,
+    first_unexpected: u32 = 0,
+    finished: bool = false,
+
+    fn race(self: *RunInputRacer) void {
+        var id: u64 = 1;
+        var spins: u64 = 0;
+        // Until the Run is over: stale before admission, then accepted (or the
+        // count limit), then too late. Nothing else, and nothing after too late.
+        while (spins < 50_000_000) : (spins += 1) {
+            var receipt = std.mem.zeroes(wire.InputReceiptV1);
+            var diagnostic = std.mem.zeroes(wire.OwnedBytesV1);
+            const status = self.api.session().submitInput(self.session, 1, id, sdk.bytesView("RACED_INPUT"), &receipt, &diagnostic);
+            self.api.bufferRelease()(&diagnostic);
+            switch (status) {
+                wire.STATUS_OK => {
+                    self.accepted += 1;
+                    id += 1;
+                },
+                wire.STATUS_STALE_RUN, wire.STATUS_RESOURCE_LIMIT => {},
+                wire.STATUS_TOO_LATE => {
+                    self.finished = true;
+                    return;
+                },
+                else => {
+                    if (self.unexpected == 0) self.first_unexpected = status;
+                    self.unexpected += 1;
+                },
+            }
+        }
+    }
+};
+
+test "L2 Revision 20 submit_input racing Run completion is either counted or too late (#270)" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try rootPath(&tmp, &root_buf);
+    const bodies = [_][]const u8{ HOST_SSE, FINAL_SSE };
+    var server = try harness.MockServer.startCassette(&bodies, 0);
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+
+    var probe = RunInputProbe{ .api = try runInputApi() };
+    var fixture: RunInputFixture = undefined;
+    try fixture.init(root, url, &probe, null);
+    defer fixture.deinit();
+
+    var racer = RunInputRacer{ .api = probe.api, .session = fixture.session };
+    const thread = try std.Thread.spawn(.{}, RunInputRacer.race, .{&racer});
+    var result: wire.RunResultV1 = undefined;
+    const status = fixture.run(1, "invoke the Host echo", &result);
+    // The Host contract: no later call on the handle until submit returns.
+    thread.join();
+    try std.testing.expectEqual(wire.STATUS_OK, status);
+    try std.testing.expect(racer.finished);
+    try std.testing.expectEqual(@as(u32, 0), racer.first_unexpected);
+    try std.testing.expectEqual(@as(u32, 0), racer.unexpected);
+    // Every OK is in the count; adoption is a prefix of acceptance.
+    try std.testing.expectEqual(racer.accepted, result.input_accepted_count);
+    try std.testing.expect(result.input_adopted_count <= result.input_accepted_count);
+    try std.testing.expectEqual(@as(usize, result.input_adopted_count), probe.adopted_len);
+    for (probe.adoptedSlice(), 0..) |adopted, index|
+        try std.testing.expectEqual(@as(u32, @intCast(index + 1)), adopted.sequence);
+}
+
+fn forkRefusalHook(probe: *RunInputProbe, run_id: u64, event: sdk.CoreEvent) void {
+    switch (event) {
+        // Admitted, not yet claimed by the fork: the window is still open.
+        .run_state => |state| if (state.phase == .starting and probe.stage == 0) {
+            probe.stage = 1;
+            probe.submit(run_id, .{ .input_id = 1, .text = "BEFORE_FORK_CLAIM", .expect_sequence = 1 });
+        },
+        // The fork announces its child prompt after claiming the Run: from
+        // here no boundary of this Run can adopt Host input.
+        .prompt_manifest => if (probe.stage == 1) {
+            probe.stage = 2;
+            probe.submit(run_id, .{ .input_id = 2, .text = "DURING_FORK", .expect = wire.STATUS_INVALID_STATE });
+        },
+        else => {},
+    }
+}
+
+test "L2 Revision 20 a forked Skill Run refuses input it could never adopt (#270)" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try rootPath(&tmp, &root_buf);
+    try writeSkillFixture(
+        a,
+        root,
+        "forked",
+        "---\nname: Forked\ndescription: Runs in a fresh child Conversation\ncontext: fork\n---\nFORKED_SKILL_SENTINEL",
+    );
+    const bodies = [_][]const u8{ FINAL_SSE, FINAL_SSE };
+    var server = try harness.MockServer.startCassette(&bodies, 0);
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+
+    var probe = RunInputProbe{ .api = try runInputApi(), .event_hook = forkRefusalHook };
+    var fixture: RunInputFixture = undefined;
+    try fixture.init(root, url, &probe, null);
+    defer fixture.deinit();
+
+    var query = wire.SkillCatalogQueryV1{
+        .struct_size = @sizeOf(wire.SkillCatalogQueryV1),
+        .reserved0 = 0,
+        .workspace_root = sdk.bytesView(root),
+        .workspace_home = sdk.bytesView(root),
+        .workspace_epoch = sdk.bytesView("run-input-fork-epoch"),
+        .additional_sources = null,
+        .additional_source_count = 0,
+        .reserved = [_]u64{0} ** 1,
+    };
+    var catalog: ?*wire.SkillCatalogHandle = null;
+    var descriptor = std.mem.zeroes(wire.OwnedBytesV1);
+    defer fixture.api.bufferRelease()(&descriptor);
+    try std.testing.expectEqual(wire.STATUS_OK, fixture.api.skill().resolveCatalog()(fixture.runtime, &query, &catalog, &descriptor, &fixture.diagnostic));
+    defer if (catalog) |handle| {
+        _ = fixture.api.skill().releaseCatalog()(handle, &fixture.diagnostic);
+    };
+    const descriptor_bytes = try sdk.borrowedBytes(.{ .ptr = descriptor.ptr, .len = descriptor.len });
+    var policy = try DecodedSkillPolicy.init(a, descriptor_bytes);
+    defer policy.deinit();
+    const ids = try extractCatalogIdentities(a, descriptor_bytes, "forked");
+    defer a.free(ids.revision);
+    defer a.free(ids.skill_id);
+    try std.testing.expectEqual(wire.STATUS_OK, fixture.api.skill().bindPolicy()(fixture.session, catalog, &policy.policy, &fixture.diagnostic));
+
+    var options = std.mem.zeroes(wire.RunOptionsV1);
+    options.struct_size = @sizeOf(wire.RunOptionsV1);
+    options.max_turns = 2;
+    var result = std.mem.zeroes(wire.RunResultV1);
+    try std.testing.expectEqual(wire.STATUS_OK, fixture.api.session().runSkill(
+        fixture.session,
+        1,
+        sdk.bytesView(ids.skill_id),
+        sdk.bytesView(ids.revision),
+        sdk.bytesView(""),
+        &options,
+        &result,
+        &fixture.diagnostic,
+    ));
+    try std.testing.expectEqual(@as(u32, 0), probe.mismatches);
+    try std.testing.expectEqual(@as(u32, 2), probe.stage);
+    try std.testing.expectEqual(wire.STOP_END_TURN, result.stop_reason_code);
+    // The input accepted before the fork claimed the Run never reached a
+    // Conversation; the one after was refused outright.
+    try std.testing.expectEqual(@as(u32, 1), result.input_accepted_count);
+    try std.testing.expectEqual(@as(u32, 0), result.input_adopted_count);
+    try std.testing.expectEqual(@as(usize, 0), probe.adopted_len);
+    try std.testing.expect(std.mem.indexOf(u8, try requestBody(server, 0), "BEFORE_FORK_CLAIM") == null);
+}
+
+fn abortThenSubmitHook(probe: *RunInputProbe, run_id: u64) void {
+    var diagnostic = std.mem.zeroes(wire.OwnedBytesV1);
+    const abort_status = probe.api.session().abort()(probe.session, run_id, wire.ABORT_USER_REQUEST, &diagnostic);
+    probe.api.bufferRelease()(&diagnostic);
+    if (abort_status != wire.STATUS_OK) probe.mismatch("abort status {d}", .{abort_status});
+    // The loop checks abort before the input boundary: nothing submitted now
+    // could ever be adopted, so it is refused as too late.
+    probe.submit(run_id, .{ .input_id = 60, .text = "after abort", .expect = wire.STATUS_TOO_LATE });
+}
+
+test "L2 Revision 20 input submitted after the Run's abort was requested is too late (#270)" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try rootPath(&tmp, &root_buf);
+    const bodies = [_][]const u8{ HOST_SSE, FINAL_SSE };
+    var server = try harness.MockServer.startCassette(&bodies, 0);
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+
+    var probe = RunInputProbe{ .api = try runInputApi(), .hook = abortThenSubmitHook };
+    var fixture: RunInputFixture = undefined;
+    try fixture.init(root, url, &probe, null);
+    defer fixture.deinit();
+
+    var result: wire.RunResultV1 = undefined;
+    try std.testing.expectEqual(wire.STATUS_OK, fixture.run(1, "invoke the Host echo", &result));
+    try std.testing.expectEqual(@as(u32, 0), probe.mismatches);
+    try std.testing.expectEqual(wire.STOP_ABORTED, result.stop_reason_code);
+    try std.testing.expectEqual(@as(u32, 0), result.input_accepted_count);
+    try std.testing.expectEqual(@as(u32, 0), result.input_adopted_count);
 }

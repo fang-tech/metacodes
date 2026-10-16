@@ -4,11 +4,11 @@
 /// doc/AGENTCORE_BINARY_ABI.md, Status). No stability promise: layouts and
 /// semantics may change incompatibly between commits. Pin an exact bundle.
 pub const ABI_VERSION_V1: u32 = 1;
-pub const ABI_REVISION: u32 = 19;
+pub const ABI_REVISION: u32 = 20;
 
 comptime {
     if (@sizeOf(usize) != 8)
-        @compileError("AgentCore ABI v1 revision 19 requires a 64-bit pointer ABI");
+        @compileError("AgentCore ABI v1 revision 20 requires a 64-bit pointer ABI");
 }
 
 pub const Status = enum(u32) {
@@ -196,6 +196,10 @@ pub const MAX_RUNTIME_METADATA_BYTES_V1: u64 = 16 * 1024 * 1024;
 pub const MAX_SESSION_METADATA_BYTES_V1: u64 = 4 * 1024 * 1024;
 pub const MAX_PROMPT_BYTES_V1: u64 = 16 * 1024 * 1024;
 pub const MAX_RUN_INPUT_PARTS_V1: u64 = 64;
+/// Revision 20: Host inputs one Run may accept through `submit_input`,
+/// adopted or not, and the text bytes of all of them together.
+pub const MAX_SUBMITTED_INPUTS_V1: u64 = 64;
+pub const MAX_SUBMITTED_INPUT_BYTES_V1: u64 = 16 * 1024 * 1024;
 /// Base64 payload cap for one image part. This is exactly the standard base64
 /// encoding of the Read tool's 3.75 MB raw-image limit, so an image that the
 /// built-in Read tool can attach is also submittable through the ABI.
@@ -874,7 +878,10 @@ pub const RunOptionsV1 = extern struct {
 /// STATUS_CHECKPOINT_BUDGET_REQUIRED, only struct_size,
 /// checkpoint_outcome_code, result_flags, durable_usage_bytes and
 /// required_checkpoint_bytes are defined; the Run was not admitted and its ID
-/// remains reusable. Fields are unspecified on every other status.
+/// remains reusable. The two input counts are defined on every status: they
+/// reconcile `submit_input` after any return, including a poisoning one, and
+/// are zero when the Run was not admitted. Every other field is unspecified
+/// on every other status.
 pub const RunResultV1 = extern struct {
     struct_size: u32,
     stop_reason_code: u32,
@@ -884,7 +891,34 @@ pub const RunResultV1 = extern struct {
     result_flags: u32,
     durable_usage_bytes: u64,
     required_checkpoint_bytes: u64,
-    reserved: [4]u64,
+    /// Inputs this Run accepted through `submit_input` (Revision 20).
+    input_accepted_count: u32,
+    /// The accepted inputs this Run appended to the Conversation. Adoption
+    /// follows acceptance order, so the inputs whose receipt sequence is at
+    /// most this count were adopted and the rest never will be.
+    input_adopted_count: u32,
+    reserved: [3]u64,
+};
+
+/// Host input for the active Run (`session.submit_input`, Revision 20).
+pub const SubmittedInputV1 = extern struct {
+    struct_size: u32,
+    reserved0: u32,
+    /// Host correlation id: non-zero and unique among the inputs this Run
+    /// has accepted. It names the input in `input_adopted`.
+    input_id: u64,
+    /// Non-empty UTF-8 with at least one non-whitespace byte, borrowed for
+    /// the call and appended to the Conversation verbatim.
+    text: BytesViewV1,
+    reserved: [2]u64,
+};
+
+/// Written only on STATUS_OK.
+pub const InputReceiptV1 = extern struct {
+    struct_size: u32,
+    /// 1-based acceptance position within the Run. Adoption follows it.
+    sequence: u32,
+    reserved: [2]u64,
 };
 
 /// Terminal manual-compact summary. Fields are defined only when
@@ -1071,6 +1105,21 @@ pub const SessionAbortFnV1 = *const fn (
     reason_code: u32,
     out_diagnostic: ?*OwnedBytesV1,
 ) callconv(.c) u32;
+
+/// Revision 20. Queues more user text for the active Run, which appends it
+/// to the Conversation at its next turn boundary. Like abort, it may overlap
+/// the matching Run, from any thread or from inside that Run's callbacks.
+/// OK writes the receipt. The matching active `run_id` accepts; another
+/// active ID is stale; the last admitted ID of an ended (or ending) Run is too
+/// late, whatever the Session does afterwards; any other ID is stale. A
+/// poisoned Session and a forked Skill Run return invalid state.
+pub const SessionSubmitInputFnV1 = *const fn (
+    session: ?*SessionHandle,
+    run_id: u64,
+    input: ?*const SubmittedInputV1,
+    out_receipt: ?*InputReceiptV1,
+    out_diagnostic: ?*OwnedBytesV1,
+) callconv(.c) u32;
 /// Replaces the prompt profile while the Session is idle (#184). Null clears
 /// it. The next Run renders its system prompt from the new profile: one
 /// prompt-cache boundary, announced by that Run's `prompt_manifest` event.
@@ -1092,7 +1141,7 @@ pub const SessionUpdatePermissionModeFnV1 = *const fn (
     permission_mode_code: u32,
     out_diagnostic: ?*OwnedBytesV1,
 ) callconv(.c) u32;
-/// Runs the canonical default best-effort compact policy. Revision 19 accepts
+/// Runs the canonical default best-effort compact policy. Revision 20 accepts
 /// no target token budget and does not guarantee fit for a model context.
 pub const SessionCompactFnV1 = *const fn (
     session: ?*SessionHandle,
@@ -1129,6 +1178,7 @@ pub const SessionApiV1 = extern struct {
     destroy: ?SessionDestroyFnV1,
     run_input: ?SessionRunInputFnV1,
     abort: ?SessionAbortFnV1,
+    submit_input: ?SessionSubmitInputFnV1,
 };
 
 pub const SessionControlApiV1 = extern struct {
@@ -1211,6 +1261,8 @@ test "ABI v1 public layouts are fixed on supported 64-bit targets" {
     try std.testing.expectEqual(@as(usize, 104), @sizeOf(RunInputV1));
     try std.testing.expectEqual(@as(usize, 40), @sizeOf(RunOptionsV1));
     try std.testing.expectEqual(@as(usize, 72), @sizeOf(RunResultV1));
+    try std.testing.expectEqual(@as(usize, 48), @sizeOf(SubmittedInputV1));
+    try std.testing.expectEqual(@as(usize, 24), @sizeOf(InputReceiptV1));
     try std.testing.expectEqual(@as(usize, 88), @sizeOf(CompactResultV1));
     try std.testing.expectEqual(@as(usize, 88), @sizeOf(CheckpointLimitsV1));
     try std.testing.expectEqual(@as(usize, 56), @sizeOf(CheckpointSinkV1));
@@ -1219,7 +1271,7 @@ test "ABI v1 public layouts are fixed on supported 64-bit targets" {
     try std.testing.expectEqual(@as(usize, 96), @sizeOf(CheckpointExportResultV1));
     try std.testing.expectEqual(@as(usize, 64), @sizeOf(SessionRestoreConfigV1));
     try std.testing.expectEqual(@as(usize, 24), @sizeOf(RuntimeApiV1));
-    try std.testing.expectEqual(@as(usize, 40), @sizeOf(SessionApiV1));
+    try std.testing.expectEqual(@as(usize, 48), @sizeOf(SessionApiV1));
     try std.testing.expectEqual(@as(usize, 80), @sizeOf(SessionControlApiV1));
     try std.testing.expectEqual(@as(usize, 32), @sizeOf(SkillApiV1));
     try std.testing.expectEqual(@as(usize, 40), @sizeOf(McpApiV1));
@@ -1277,6 +1329,14 @@ test "ABI v1 public layouts are fixed on supported 64-bit targets" {
     try std.testing.expectEqual(@as(usize, 24), @offsetOf(CompactResultV1, "input_tokens"));
     try std.testing.expectEqual(@as(usize, 24), @offsetOf(RunResultV1, "durable_usage_bytes"));
     try std.testing.expectEqual(@as(usize, 32), @offsetOf(RunResultV1, "required_checkpoint_bytes"));
+    try std.testing.expectEqual(@as(usize, 40), @offsetOf(RunResultV1, "input_accepted_count"));
+    try std.testing.expectEqual(@as(usize, 44), @offsetOf(RunResultV1, "input_adopted_count"));
+    try std.testing.expectEqual(@as(usize, 48), @offsetOf(RunResultV1, "reserved"));
+    try std.testing.expectEqual(@as(usize, 8), @offsetOf(SubmittedInputV1, "input_id"));
+    try std.testing.expectEqual(@as(usize, 16), @offsetOf(SubmittedInputV1, "text"));
+    try std.testing.expectEqual(@as(usize, 32), @offsetOf(SubmittedInputV1, "reserved"));
+    try std.testing.expectEqual(@as(usize, 4), @offsetOf(InputReceiptV1, "sequence"));
+    try std.testing.expectEqual(@as(usize, 40), @offsetOf(SessionApiV1, "submit_input"));
     try std.testing.expectEqual(@as(usize, 32), @offsetOf(CheckpointExportResultV1, "digest"));
     try std.testing.expectEqual(@as(usize, 40), @offsetOf(SkillCatalogQueryV1, "workspace_epoch"));
     try std.testing.expectEqual(@as(usize, 56), @offsetOf(SkillCatalogQueryV1, "additional_sources"));
@@ -1337,9 +1397,9 @@ test "typed provider kind validates every public code" {
     );
 }
 
-test "Revision 19 keeps MCP wire codes stable" {
+test "Revision 20 keeps MCP wire codes stable" {
     const std = @import("std");
-    try std.testing.expectEqual(@as(u32, 19), ABI_REVISION);
+    try std.testing.expectEqual(@as(u32, 20), ABI_REVISION);
     try std.testing.expectEqual(@as(u32, 1), MCP_NEGOTIATION_AUTO);
     try std.testing.expectEqual(@as(u32, 2), MCP_NEGOTIATION_MODERN_ONLY);
     try std.testing.expectEqual(@as(u32, 3), MCP_NEGOTIATION_LEGACY_ONLY);

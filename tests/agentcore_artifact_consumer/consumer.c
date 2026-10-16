@@ -6,10 +6,12 @@
 #include <string.h>
 
 #if defined(METASK_AGENTCORE_CALLBACK_CONTINUE) || defined(METASK_AGENTCORE_CALLBACK_FATAL)
-#error "revision 19 must not retain historical callback aliases"
+#error "revision 20 must not retain historical callback aliases"
 #endif
 
-#if METASK_AGENTCORE_ABI_REVISION != 19u || \
+#if METASK_AGENTCORE_ABI_REVISION != 20u || \
+    METASK_AGENTCORE_MAX_SUBMITTED_INPUTS_V1 != 64u || \
+    METASK_AGENTCORE_MAX_SUBMITTED_INPUT_BYTES_V1 != 16777216u || \
     METASK_AGENTCORE_PROMPT_OP_ADD != 1u || \
     METASK_AGENTCORE_PROMPT_OP_REPLACE != 2u || \
     METASK_AGENTCORE_PROMPT_OP_REMOVE != 3u || \
@@ -33,7 +35,7 @@
     METASK_AGENTCORE_MCP_APPLY_APPLIED != 1u || \
     METASK_AGENTCORE_MCP_APPLY_SUPERSEDED != 2u || \
     METASK_AGENTCORE_MCP_APPLY_REJECTED != 3u
-#error "source-free Revision 19 codes must match the public contract"
+#error "source-free Revision 20 codes must match the public contract"
 #endif
 
 #ifdef _WIN32
@@ -379,11 +381,20 @@ static void stop_server(struct test_server *server) {
 #endif
 }
 
+static metask_agentcore_bytes_view_v1 view(const char *text);
 static unsigned event_calls = 0;
 static metask_agentcore_session *registered_session = NULL;
 static uint64_t active_run_id = 0;
 static uint8_t bound_session_id[METASK_AGENTCORE_MAX_SESSION_ID_BYTES_V1];
 static size_t bound_session_id_len = 0;
+
+/* Revision 20: the first event of the armed Run submits more input from
+ * inside the callback. The Run is a single turn, so it ends before another
+ * boundary and the input must reconcile as accepted but not adopted. */
+static const metask_agentcore_api_v1 *callback_api = NULL;
+static int submit_on_event = 0;
+static uint32_t submit_status = UINT32_MAX;
+static uint32_t submit_sequence = 0;
 
 static int accept_run_context(const metask_agentcore_run_context_v1 *run) {
     if (run == NULL || run->struct_size != sizeof(*run) || run->reserved0 != 0 ||
@@ -408,6 +419,19 @@ static uint32_t on_event(void *ctx, const metask_agentcore_run_context_v1 *run,
     (void)ctx;
     if (accept_run_context(run) && event_json.ptr != NULL && event_json.len != 0) {
         event_calls++;
+        if (submit_on_event && callback_api != NULL) {
+            metask_agentcore_submitted_input_v1 input = {0};
+            metask_agentcore_input_receipt_v1 receipt = {0};
+            metask_agentcore_owned_bytes_v1 diagnostic = {0};
+            submit_on_event = 0;
+            input.struct_size = (uint32_t)sizeof(input);
+            input.input_id = 77;
+            input.text = view("one more thing");
+            submit_status = callback_api->session->submit_input(
+                registered_session, run->run_id, &input, &receipt, &diagnostic);
+            callback_api->buffer_release(&diagnostic);
+            submit_sequence = receipt.sequence;
+        }
         return METASK_AGENTCORE_EVENT_CONTINUE;
     }
     return METASK_AGENTCORE_EVENT_FATAL;
@@ -825,6 +849,8 @@ int main(int argc, char **argv) {
     context_options.context_blocks = &context_block;
     context_options.context_block_count = 1;
     active_run_id = 1;
+    callback_api = api;
+    submit_on_event = 1;
     uint32_t run_status = api->session->run_input(session, 1, &input,
                                                  &context_options, &result,
                                                  &diagnostic);
@@ -837,6 +863,31 @@ int main(int argc, char **argv) {
         api->buffer_release(&diagnostic);
         api->runtime->destroy(runtime, &diagnostic);
         return release_error(api, &diagnostic, 18);
+    }
+    /* Accepted from the callback, never adopted: the single turn ended the
+     * Run first. After the Run its id is too late and an unknown id stale. */
+    {
+        metask_agentcore_submitted_input_v1 late = {0};
+        metask_agentcore_input_receipt_v1 receipt = {0};
+        late.struct_size = (uint32_t)sizeof(late);
+        late.input_id = 78;
+        late.text = view("late");
+        if (submit_status != METASK_AGENTCORE_STATUS_OK || submit_sequence != 1 ||
+            result.input_accepted_count != 1 || result.input_adopted_count != 0 ||
+            api->session->submit_input(session, 1, &late, &receipt, &diagnostic) !=
+                METASK_AGENTCORE_STATUS_TOO_LATE ||
+            (api->buffer_release(&diagnostic),
+             api->session->submit_input(session, 99, &late, &receipt,
+                                        &diagnostic)) !=
+                METASK_AGENTCORE_STATUS_STALE_RUN) {
+            api->buffer_release(&diagnostic);
+            stop_server(&server);
+            api->session->destroy(session, &diagnostic);
+            api->buffer_release(&diagnostic);
+            api->runtime->destroy(runtime, &diagnostic);
+            return release_error(api, &diagnostic, 25);
+        }
+        api->buffer_release(&diagnostic);
     }
 
     /* End-to-end multimodal Run: the ordered text+image parts must reach the
@@ -865,6 +916,6 @@ int main(int argc, char **argv) {
         return release_error(api, &diagnostic, 20);
     }
     api->buffer_release(&diagnostic);
-    puts("AgentCore source-free C consumer: ABI table, callback, multimodal input and lifecycle OK");
+    puts("AgentCore source-free C consumer: ABI table, callback, active-Run input, multimodal input and lifecycle OK");
     return 0;
 }

@@ -4,7 +4,9 @@ const wire = sdk.types;
 const Server = @import("mock_server.zig").Server;
 
 comptime {
-    if (wire.ABI_REVISION != 19 or
+    if (wire.ABI_REVISION != 20 or
+        wire.MAX_SUBMITTED_INPUTS_V1 != 64 or
+        wire.MAX_SUBMITTED_INPUT_BYTES_V1 != 16 * 1024 * 1024 or
         wire.PROMPT_OP_ADD != 1 or
         wire.PROMPT_OP_REPLACE != 2 or
         wire.PROMPT_OP_REMOVE != 3 or
@@ -29,10 +31,10 @@ comptime {
         wire.MCP_APPLY_APPLIED != 1 or
         wire.MCP_APPLY_SUPERSEDED != 2 or
         wire.MCP_APPLY_REJECTED != 3)
-        @compileError("source-free Revision 19 codes must match the public contract");
+        @compileError("source-free Revision 20 codes must match the public contract");
     if (@hasDecl(wire, "SessionRefreshSkillCatalogFnV1") or
         @hasField(wire.ApiV1, "session_refresh_skill_catalog"))
-        @compileError("revision 19 must not expose the removed catalog refresh entry");
+        @compileError("revision 20 must not expose the removed catalog refresh entry");
     if (wire.MAX_SKILL_FILE_CONTENT_BYTES_V1 != 16 * 1024 * 1024 or
         wire.MAX_SKILL_CONTENT_BYTES_V1 != 32 * 1024 * 1024 or
         wire.MAX_SKILL_FILES_V1 != 1024 or
@@ -113,8 +115,17 @@ const SpinMutex = struct {
     }
 };
 
+/// Host input submitted to Run 1 from inside its AskUserQuestion callback.
+const STEERING_INPUT_ID: u64 = 0x5eed;
+const STEERING_TEXT = "Also mention the artifact steering note.";
+
 const Probe = struct {
     identity_mutex: SpinMutex = .{},
+    /// Set for the Run whose UI callback submits STEERING_TEXT (Revision 20).
+    api: ?sdk.Api = null,
+    submit_during_ui: bool = false,
+    submitted_sequence: u32 = 0,
+    saw_input_adopted: bool = false,
     session: ?*wire.SessionHandle = null,
     active_run_id: u64 = 0,
     bound_session_id_len: u8 = 0,
@@ -258,6 +269,14 @@ const Probe = struct {
                     if (segment.disposition == .final and segment.bytes == "artifact done".len)
                         self.saw_final_output_segment = true;
                 },
+                .input_adopted => |adopted| {
+                    // Submitted during the AskUserQuestion callback of turn 1,
+                    // adopted at the boundary before turn 2's request.
+                    if (adopted.input_id != STEERING_INPUT_ID or adopted.sequence != 1 or
+                        adopted.turn != 2 or self.saw_input_adopted)
+                        return wire.EVENT_FATAL;
+                    self.saw_input_adopted = true;
+                },
                 .prompt_manifest => |manifest| {
                     var host_section = false;
                     for (manifest.sections) |section| {
@@ -288,6 +307,33 @@ const Probe = struct {
             questions[0].options.len != 2 or !std.mem.eql(u8, questions[0].options[0].label, "Yes"))
             return wire.UI_FATAL;
         self.ui_calls += 1;
+        if (self.submit_during_ui) {
+            // Revision 20: more input while a UI request is pending. It is
+            // queued, never taken as the answer, and adopted at the next turn
+            // boundary; this callback still answers the question itself.
+            const api = self.api orelse return wire.UI_FATAL;
+            const run_id = (sdk.validateRunContext(run) catch return wire.UI_FATAL).run_id;
+            var receipt = std.mem.zeroes(wire.InputReceiptV1);
+            var diagnostic = std.mem.zeroes(wire.OwnedBytesV1);
+            const status = api.session().submitInput(
+                self.session,
+                run_id,
+                STEERING_INPUT_ID,
+                sdk.bytesView(STEERING_TEXT),
+                &receipt,
+                &diagnostic,
+            );
+            api.bufferRelease()(&diagnostic);
+            if (status != @intFromEnum(sdk.Status.ok) or receipt.struct_size != @sizeOf(wire.InputReceiptV1) or
+                receipt.sequence != 1)
+                return wire.UI_FATAL;
+            // The same id is refused for the rest of this Run.
+            const duplicate = api.session().submitInput(self.session, run_id, STEERING_INPUT_ID, sdk.bytesView("again"), &receipt, &diagnostic);
+            api.bufferRelease()(&diagnostic);
+            if (duplicate != @intFromEnum(sdk.Status.invalid_argument)) return wire.UI_FATAL;
+            self.submitted_sequence = 1;
+            self.submit_during_ui = false;
+        }
         const values = [_][]const u8{"Yes"};
         const answers = [_]sdk.protocol.Answer{.{ .values = &values }};
         const response = sdk.encodeUiResponse(std.heap.c_allocator, parsed.value, .{ .answers = &answers }) catch return wire.UI_FATAL;
@@ -749,6 +795,8 @@ pub fn main(init: std.process.Init) !void {
         a,
         &.{"artifact-target"},
     );
+    probe.api = api;
+    probe.submit_during_ui = true;
     try probe.beginRun(1);
     try expectStatus(.ok, api.session().runSkill(
         session,
@@ -769,6 +817,19 @@ pub fn main(init: std.process.Init) !void {
     if (!probe.saw_read_result or !probe.saw_file_change or !probe.saw_host_result or !probe.saw_stream_envelope or
         !probe.saw_artifact_recovery or !probe.saw_final_text or !probe.saw_final_output_segment)
         return error.MissingCoreEvent;
+    // Revision 20 reconciliation: the one input submitted mid-Run was accepted
+    // and adopted, and the Run that took it is over for further input.
+    if (probe.submitted_sequence != 1 or !probe.saw_input_adopted or
+        result.input_accepted_count != 1 or result.input_adopted_count != 1)
+        return error.SubmittedInputNotReconciled;
+    {
+        var receipt = std.mem.zeroes(wire.InputReceiptV1);
+        try expectStatus(.too_late, api.session().submitInput(session, 1, 7, sdk.bytesView("late"), &receipt, &diagnostic), diagnostic);
+        api.bufferRelease()(&diagnostic);
+        try expectStatus(.stale_run, api.session().submitInput(session, 99, 7, sdk.bytesView("stale"), &receipt, &diagnostic), diagnostic);
+        api.bufferRelease()(&diagnostic);
+        if (receipt.sequence != 0) return error.SubmittedInputNotReconciled;
+    }
     try probe.beginRun(2);
     try expectStatus(.ok, api.session().runSkill(
         session,
@@ -924,7 +985,7 @@ pub fn main(init: std.process.Init) !void {
     try expectStatus(.ok, api.runtime().destroy()(runtime, &diagnostic), diagnostic);
     runtime = null;
 
-    std.debug.print("AgentCore source-free consumer: Revision 19 Agent Runtime, prompt profile, permission mode update, OpenAI Responses, multimodal input, active-Run journal, Host/MCP streaming, process-plugin configuration, Workspace Skill Catalog, tools, checkpoint, Runtime rebuild, restore and continued Run OK\n", .{});
+    std.debug.print("AgentCore source-free consumer: Revision 20 Agent Runtime, active-Run input, prompt profile, permission mode update, OpenAI Responses, multimodal input, active-Run journal, Host/MCP streaming, process-plugin configuration, Workspace Skill Catalog, tools, checkpoint, Runtime rebuild, restore and continued Run OK\n", .{});
 }
 
 const CatalogIdentities = struct {

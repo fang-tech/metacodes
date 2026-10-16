@@ -292,6 +292,18 @@ pub const CoreEvent = union(enum) {
         cause: []const u8,
     },
 
+    /// Host input submitted to the active Run (#270) was appended to the
+    /// Conversation as a user record at the boundary before request `turn`
+    /// (1-based, the turn whose request first carries it). `sequence` is its
+    /// 1-based acceptance position in the Run; adoption follows acceptance
+    /// order, so sequences arrive strictly increasing. Adoption is not provider
+    /// receipt: that request may still fail.
+    input_adopted: struct {
+        input_id: u64,
+        sequence: u32,
+        turn: u32,
+    },
+
     /// 流式建连重试提示(第 attempt/max 次,退避 delay_ms)。
     retry_notice: struct {
         attempt: u32,
