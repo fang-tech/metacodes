@@ -21,6 +21,29 @@ for the full framework.
 | Binary/startup/RSS baseline | `scripts/perf_baseline.sh [--build]` | ReleaseSmall size, warm `--help` latency, peak RSS against the red lines in [PERF_MEMORY_PRINCIPLES.md](PERF_MEMORY_PRINCIPLES.md) |
 | Plugin snapshot regression | `zig build plugin:bench` | Zero-provider immutable plugin snapshot benchmark |
 | Test-throughput integrity | `python3 scripts/rule_control.py check` | Lean-pinned five-point coverage/failure semantics for the sharded test graph |
+| Sealed gateway load | `zig build sealed:bench -Doptimize=ReleaseFast -- --concurrency N --runs R --steps S --latency-ms L` | Steps per second, gateway overhead above the mock model's measured latency (p50/p95/p99), queue wait, admission counters, provider-cache hits; `--direct 1` measures host + mock alone ([SEALED_GATEWAY_SCALE_DESIGN.md](SEALED_GATEWAY_SCALE_DESIGN.md) §10) |
+
+**Sealed gateway, first recorded run** (2026-10-16, Windows 11, 28 logical
+CPUs, ReleaseFast, in-process mock model, `METACODES_LOG=error`; commit of
+this table's PR). The two defects the benchmark found before these numbers:
+a 16 MiB request buffer allocated and zeroed per connection (now 64 KiB,
+grown on demand), and the process-wide request-setup gate of 8 that counted
+the wait for a model's first byte (now raised to the server's model-slot
+cap). Mock latency is nominal; the mock reports its actual sleep.
+
+| Load | Steps/s | Step p50 / p99 (ms) | Overhead above mock p50 / p99 (ms) | Queue wait avg (ms) |
+|---|---|---|---|---|
+| 8 clients, mock 0 ms | 7 111 | 1 / 3 | 1 / 3 | 0 |
+| 64 clients, mock 20 ms (actual 30) | 1 835 | 33 / 39 | 3 / 9 | 0 |
+| 256 clients, mock 50 ms (actual 58), 112 workers | 1 676 | 136 / 196 | 76 / 136 | 72 |
+| direct to mock, 64 clients, mock 20 ms | 2 048 | 31 / 36 | 2 / 7 | — |
+
+Reading: the gateway's own cost per Step is 1–3 ms; at 64 in-flight Steps
+it keeps pace with the host (direct 2 048/s versus 1 835/s through the
+gateway); at 256 clients the fixed worker pool (112 threads) becomes the
+limit and queue wait appears, which is the trigger §3 names for the evented
+backend. Before the two fixes the same 64-client load ran at 249 Steps/s
+with a p50 of 141 ms.
 
 Build/test performance experiments follow the recording discipline normatively
 listed in [tests/README.md](../tests/README.md) — timings, resource ceilings,
