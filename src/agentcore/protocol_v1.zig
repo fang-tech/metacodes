@@ -181,6 +181,23 @@ pub fn event(arena: std.mem.Allocator, value: InternalEvent) error{OutOfMemory}!
         } },
         .stream_done => .stream_done,
         .prompt_manifest => |manifest| .{ .prompt_manifest = try promptManifest(arena, manifest) },
+        .goal_updated => |goal| .{ .goal_updated = .{
+            .id = &goal.id,
+            .objective = goal.objective,
+            .status = switch (goal.status) {
+                .active => .active,
+                .paused => .paused,
+                .blocked => .blocked,
+                .usage_limited => .usage_limited,
+                .budget_limited => .budget_limited,
+                .complete => .complete,
+            },
+            .token_budget = goal.token_budget,
+            .tokens_used = goal.tokens_used,
+            .time_used_ms = goal.time_used_ms,
+            .created_at_ms = goal.created_at_ms,
+            .updated_at_ms = goal.updated_at_ms,
+        } },
 
         // Presentation hints, diagnostics and App/daemon coordination remain
         // internal. Exporting them would freeze UI policy or implementation

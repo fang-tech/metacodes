@@ -1,6 +1,6 @@
 fn main() {
     let api = metask_agentcore_sys::Api::discover()
-        .expect("AgentCore Revision 22 exact discovery failed");
+        .expect("AgentCore Revision 23 exact discovery failed");
     let output = api.owned_buffer();
     assert!(output
         .as_bytes()
@@ -16,6 +16,7 @@ fn main() {
     let session_control = unsafe { &*raw.session_control };
     let skill = unsafe { &*raw.skill };
     let mcp = unsafe { &*raw.mcp };
+    let goal = unsafe { &*raw.goal };
 
     macro_rules! assert_slot {
         ($safe:expr, $raw:expr) => {
@@ -53,6 +54,10 @@ fn main() {
     assert_slot!(api.mcp().refresh(), mcp.refresh);
     assert_slot!(api.mcp().describe(), mcp.describe);
     assert_slot!(api.mcp().update_selection(), mcp.update_selection);
+    assert_slot!(api.goal().get(), goal.get);
+    assert_slot!(api.goal().set(), goal.set);
+    assert_slot!(api.goal().update(), goal.update);
+    assert_slot!(api.goal().clear(), goal.clear);
     assert!(unsafe {
         metask_agentcore_sys::metask_agentcore_get_api(
             metask_agentcore_sys::METASK_AGENTCORE_ABI_V1 + 1,

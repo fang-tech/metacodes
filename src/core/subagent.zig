@@ -47,6 +47,11 @@ pub const SpawnOptions = struct {
     /// with `.budget` once its own usage estimate reaches it. A sealed Skill
     /// passes its pinned cap here as the secondary, estimate-based stop.
     cost_budget_usd: ?f64 = null,
+    /// Issue #277: the parent Session's goal Meter, for a child that runs as
+    /// the Run itself on the Run's thread (an AgentCore Skill invocation in
+    /// its own context). Null - the default, and right for any child that may
+    /// run beside other tools - charges nothing.
+    goal_meter: ?*@import("goal.zig").Meter = null,
     /// UI/event routing identity. It is deliberately separate from
     /// `agent_ident`, which remains the child's coordination identity.
     /// Defaults only for standalone callers/tests. Production dispatchers must
@@ -229,6 +234,7 @@ pub fn spawnAgentSink(
         .{
             .max_turns = opts.max_turns,
             .cost_budget_usd = opts.cost_budget_usd,
+            .goal_meter = opts.goal_meter,
             .system_prompt = opts.system_prompt,
             .session = opts.session,
             .abort = abort,

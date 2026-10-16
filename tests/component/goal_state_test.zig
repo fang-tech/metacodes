@@ -34,10 +34,10 @@ test "L2 goal: set active goal, account tokens, cross budget, persist and reload
     const id = state.current.?.id;
     var meter = cc.core_goal.Meter.init(&state);
     meter.beginRun();
-    meter.charge(3, 2);
+    _ = meter.charge(3, 2);
     try std.testing.expectEqual(@as(u64, 5), state.current.?.tokens_used);
-    meter.charge(4, 4);
-    meter.endRun();
+    _ = meter.charge(4, 4);
+    _ = meter.endRun();
     try std.testing.expectEqual(cc.core_goal.Status.budget_limited, state.current.?.status);
     try state.persistToDir(dir);
 

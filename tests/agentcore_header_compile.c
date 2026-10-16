@@ -1,8 +1,8 @@
 #include <metask/agentcore.h>
 
-_Static_assert(METASK_AGENTCORE_ABI_REVISION == 22,
+_Static_assert(METASK_AGENTCORE_ABI_REVISION == 23,
                "AgentCore revision changed");
-_Static_assert(sizeof(metask_agentcore_api_v1) == 64,
+_Static_assert(sizeof(metask_agentcore_api_v1) == 72,
                "AgentCore root layout changed");
 _Static_assert(sizeof(metask_agentcore_runtime_api_v1) == 24,
                "Runtime table layout changed");
@@ -14,6 +14,12 @@ _Static_assert(sizeof(metask_agentcore_skill_api_v1) == 32,
                "Skill table layout changed");
 _Static_assert(sizeof(metask_agentcore_mcp_api_v1) == 40,
                "MCP table layout changed");
+_Static_assert(sizeof(metask_agentcore_goal_api_v1) == 40,
+               "Goal table layout changed");
+_Static_assert(METASK_AGENTCORE_STATUS_GOAL_CONFLICT == 30u,
+               "goal conflict status changed");
+_Static_assert(METASK_AGENTCORE_RUN_INPUT_GOAL_CONTINUATION == 4u,
+               "goal continuation input kind changed");
 
 _Static_assert(METASK_AGENTCORE_MAX_SUBMITTED_INPUTS_V1 == 64ULL,
                "submitted input count limit changed");

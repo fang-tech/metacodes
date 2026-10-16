@@ -32,6 +32,7 @@ const file_change = @import("../file_change.zig");
 const abort = @import("../../util/abort.zig");
 const types = @import("../../types.zig"); // UI-free 核心类型(PermissionMode/ReasoningEffort)
 const prompt_sections = @import("../prompt_sections.zig");
+const goal = @import("../goal.zig");
 
 /// **跨 UI session 配置变更**(U4)。多 UI 附着同一 session 时的状态广播源。
 /// 只含**跨 UI 关心的 session 级配置**——model/mode/dirs/reasoning;theme/vim 是
@@ -366,6 +367,11 @@ pub const CoreEvent = union(enum) {
     /// 变更、模型或工具面变化)——Run 开始时、首个 provider 请求之前发一次,
     /// 内容即 durable journal `run_started.prompt` 记下的同一份 manifest。借用,回调返回即失效。
     prompt_manifest: prompt_sections.Manifest,
+
+    /// Issue #277: the Session's goal changed during a Run - its budget ran
+    /// out (`budget_limited`), or the Run ended and its usage and time are
+    /// on the goal. Borrowed; invalid once the callback returns.
+    goal_updated: *const goal.Goal,
 
     // ── L4 诊断变体(可观测性)──────────────────────────────────────────────
     // agent_loop 在现有 log 点旁 emit;渲染 backend(TUI/Writer/JobEntry)一律 no-op,

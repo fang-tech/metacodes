@@ -375,6 +375,15 @@ Anthropic `web_search_20250305`)时 `run` 直接返回 `error.ServerToolsUnsuppo
 `Options.time_announcer` 非 null 时,本地日期晚于模型能看到的日期的第一个 run 在本轮输入之后
 追加一条"The date has changed"提示,随这一轮进入历史,系统提示词与首条消息字节不动;提示被压缩、
 裁剪或清掉后会再给一次。AgentCore 不用它,而是把日期作为每个 Run 的 `currentDate` context block。
+Session 目标(issue #277):`Options.goal_meter` 非 null 时,run 开始时目标为 active 才计账,
+每个 provider 响应(含自动压缩)累加非缓存输入 + 输出,run 结束(任何退出路径,含错误)累加
+耗时并发 `goal_updated`;中途用完预算则目标转 `budget_limited`、立即发 `goal_updated`,并在下一
+回合边界追加一次收尾提醒(不截断 run)。嵌套 run 共用同一 Meter 时只按最外层计一次。
+子 agent(`subagent.SpawnOptions.goal_meter` 默认 null)不计;只有作为 Run 本身、在 Run 线程上
+同步执行的子循环(AgentCore 自带上下文的 Skill 调用 Run)才传入 Meter——可能与其他工具并行的
+子循环共用 Meter 会产生数据竞争。规则在
+`core.goal`;CLI 的 App、`AgentSession` 各持一个 Meter,所以 REPL/web/daemon/headless/AgentCore
+同口径计账。
 
 **一回合做什么**:流式发当前 conversation → 收集 assistant 文本 + tool_use blocks(经 backend
 emit `text_chunk`/`tool_start`)→ 按权限决策 + 并发安全分批执行工具(`tool_exec.executeSlots`)→

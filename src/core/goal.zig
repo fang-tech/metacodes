@@ -141,54 +141,60 @@ pub const State = struct {
 
     /// Edits the objective in place: same id, usage and status.
     pub fn editObjective(self: *State, objective_raw: []const u8) !void {
-        const objective = try normalizeObjective(objective_raw);
-        if (self.current == null) return error.NoGoal;
-        const dup = try self.allocator.dupe(u8, objective);
-        self.allocator.free(self.current.?.objective);
-        self.current.?.objective = dup;
-        self.touch();
+        try self.update(.{ .objective = objective_raw });
     }
 
     /// Applies a user or Host action, or refuses it and changes nothing.
-    pub fn apply(self: *State, action: Action) TransitionError!void {
-        const g = if (self.current) |*g| g else return error.NoGoal;
-        const next: Status = switch (action) {
-            .pause => switch (g.status) {
-                .active, .paused => .paused,
-                else => return error.GoalNotActive,
-            },
-            .activate => blk: {
-                if (g.status == .active) return;
-                if (g.budgetExhausted()) return error.BudgetExhausted;
-                break :blk .active;
-            },
-            .complete => .complete,
-            .block => switch (g.status) {
-                .complete => return error.GoalComplete,
-                else => .blocked,
-            },
+    pub fn apply(self: *State, action: Action) (TransitionError || error{OutOfMemory})!void {
+        self.update(.{ .action = action }) catch |err| return switch (err) {
+            error.NoGoal, error.GoalNotActive, error.BudgetExhausted, error.GoalComplete, error.OutOfMemory => |e| e,
+            else => unreachable, // no objective or budget in this update
         };
-        if (next == g.status) return;
-        g.status = next;
-        self.touch();
     }
 
     /// Sets or clears (null) the budget. Room again on a `budget_limited`
     /// goal makes it active; an active goal already past the new budget
     /// becomes `budget_limited` at once.
     pub fn setBudget(self: *State, token_budget: ?u64) !void {
-        if (self.current == null) return error.NoGoal;
-        if (token_budget) |v| {
-            if (v == 0) return error.InvalidBudget;
+        try self.update(.{ .token_budget = token_budget });
+    }
+
+    /// Changes to the current goal, applied together or not at all: the
+    /// objective first, then the budget, then the action - so "raise the
+    /// budget and resume" is one update.
+    pub const Update = struct {
+        objective: ?[]const u8 = null,
+        /// Outer null keeps the budget; `.{ .token_budget = null }` clears it.
+        token_budget: ??u64 = null,
+        action: ?Action = null,
+    };
+
+    pub const UpdateError = TransitionError || ObjectiveError || error{ InvalidBudget, OutOfMemory };
+
+    pub fn update(self: *State, changes: Update) UpdateError!void {
+        const g = if (self.current) |*g| g else return error.NoGoal;
+        const objective = if (changes.objective) |raw| try normalizeObjective(raw) else null;
+        var next = g.*;
+        if (changes.token_budget) |budget| {
+            if (budget) |v| {
+                if (v == 0) return error.InvalidBudget;
+            }
+            next.token_budget = budget;
+            if (next.status == .budget_limited and !next.budgetExhausted()) {
+                next.status = .active;
+            } else if (next.status == .active and next.budgetExhausted()) {
+                next.status = .budget_limited;
+            }
         }
-        const g = &self.current.?;
-        g.token_budget = token_budget;
-        if (g.status == .budget_limited and !g.budgetExhausted()) {
-            g.status = .active;
-        } else if (g.status == .active and g.budgetExhausted()) {
-            g.status = .budget_limited;
-        }
-        self.touch();
+        if (changes.action) |action| next.status = try statusAfter(&next, action);
+        const unchanged = next.status == g.status and next.token_budget == g.token_budget and
+            (objective == null or std.mem.eql(u8, objective.?, g.objective));
+        if (unchanged) return;
+        // The only fallible step left; nothing has changed yet.
+        if (objective) |text| next.objective = try self.allocator.dupe(u8, text);
+        if (objective != null) self.allocator.free(g.objective);
+        next.updated_at_ms = nowWallMs();
+        g.* = next;
     }
 
     pub fn loadFromDir(self: *State, session_dir: []const u8) !void {
@@ -227,10 +233,28 @@ pub const State = struct {
         if (pfs.renameReplace(tmp_z.ptr, path_z.ptr) != 0) return error.RenameFailed;
     }
 
-    fn touch(self: *State) void {
-        self.current.?.updated_at_ms = nowWallMs();
-    }
 };
+
+/// The status `action` leads to from `g`, or why it is refused.
+fn statusAfter(g: *const Goal, action: Action) TransitionError!Status {
+    return switch (action) {
+        .pause => switch (g.status) {
+            .active, .paused => .paused,
+            else => error.GoalNotActive,
+        },
+        .activate => if (g.status == .active)
+            .active
+        else if (g.budgetExhausted())
+            error.BudgetExhausted
+        else
+            .active,
+        .complete => .complete,
+        .block => switch (g.status) {
+            .complete => error.GoalComplete,
+            else => .blocked,
+        },
+    };
+}
 
 /// Charges a Session's goal for the Runs that work toward it. One Meter per
 /// Session, handed to the agent loop through `Options.goal_meter`; the loop
@@ -277,18 +301,20 @@ pub const Meter = struct {
     /// Adds one provider response's billable tokens: non-cached input plus
     /// output (the neutral UsageDelta's `input_tokens` already excludes cache
     /// reads).
-    pub fn charge(self: *Meter, input_tokens: u64, output_tokens: u64) void {
-        if (self.depth == 0) return;
+    /// Returns the goal when this response used up its budget (it is now
+    /// `budget_limited`), for the loop to announce.
+    pub fn charge(self: *Meter, input_tokens: u64, output_tokens: u64) ?*const Goal {
+        if (self.depth == 0) return null;
         const tokens = input_tokens +| output_tokens;
-        if (tokens == 0) return;
-        const g = self.armedGoal() orelse return;
+        if (tokens == 0) return null;
+        const g = self.armedGoal() orelse return null;
         g.tokens_used +|= tokens;
         g.updated_at_ms = nowWallMs();
-        if (g.status == .active and g.budgetExhausted()) {
-            g.status = .budget_limited;
-            self.budget_notice_pending = true;
-            self.notify(.budget_reached);
-        }
+        if (g.status != .active or !g.budgetExhausted()) return null;
+        g.status = .budget_limited;
+        self.budget_notice_pending = true;
+        self.notify(.budget_reached);
+        return g;
     }
 
     /// The wrap-up reminder, once per budget crossing, for the loop to append
@@ -299,17 +325,19 @@ pub const Meter = struct {
         return budget_notice;
     }
 
-    pub fn endRun(self: *Meter) void {
+    /// Returns the goal the Run settled on, if it charged one.
+    pub fn endRun(self: *Meter) ?*const Goal {
         std.debug.assert(self.depth != 0);
         self.depth -= 1;
-        if (self.depth != 0) return;
+        if (self.depth != 0) return null;
         defer self.armed = null;
-        const g = self.armedGoal() orelse return;
+        const g = self.armedGoal() orelse return null;
         const elapsed_ns = time.nowNs() - self.started_ns;
         const elapsed_ms: u64 = if (elapsed_ns <= 0) 0 else @intCast(@divTrunc(elapsed_ns, std.time.ns_per_ms));
         g.time_used_ms +|= elapsed_ms;
         g.updated_at_ms = nowWallMs();
         self.notify(.run_settled);
+        return g;
     }
 
     /// The goal this Run is charging: still the one armed at `beginRun`
@@ -528,6 +556,34 @@ test "actions follow the transition table and a refusal changes nothing" {
     try std.testing.expectError(error.InvalidBudget, st.setBudget(0));
 }
 
+test "an update applies objective, budget and action together or not at all" {
+    const a = std.testing.allocator;
+    var st = State.init(a);
+    defer st.deinit();
+    try st.setNew("ship it", 10);
+    st.current.?.tokens_used = 10;
+    st.current.?.status = .complete;
+    const before = st.current.?.updated_at_ms;
+
+    // The action is refused, so the new objective and budget are not kept.
+    try std.testing.expectError(error.GoalNotActive, st.update(.{ .objective = "ship more", .token_budget = 50, .action = .pause }));
+    try std.testing.expectEqualStrings("ship it", st.current.?.objective);
+    try std.testing.expectEqual(@as(?u64, 10), st.current.?.token_budget);
+    try std.testing.expectEqual(Status.complete, st.current.?.status);
+    try std.testing.expectEqual(before, st.current.?.updated_at_ms);
+
+    // Raise the budget and complete in one update; the budget alone would
+    // have made the budget_limited goal active.
+    st.current.?.status = .budget_limited;
+    try st.update(.{ .objective = "ship more", .token_budget = 50, .action = .complete });
+    try std.testing.expectEqualStrings("ship more", st.current.?.objective);
+    try std.testing.expectEqual(@as(?u64, 50), st.current.?.token_budget);
+    try std.testing.expectEqual(Status.complete, st.current.?.status);
+    // Clearing the budget is a change of its own.
+    try st.update(.{ .token_budget = @as(?u64, null) });
+    try std.testing.expectEqual(@as(?u64, null), st.current.?.token_budget);
+}
+
 test "objectives are trimmed, non-empty UTF-8 of at most 4000 code points" {
     const a = std.testing.allocator;
     var st = State.init(a);
@@ -568,13 +624,13 @@ test "the Meter charges a Run armed on an active goal, to its end, and asks once
 
     // No goal, or a paused one: nothing is charged.
     meter.beginRun();
-    meter.charge(5, 5);
-    meter.endRun();
+    _ = meter.charge(5, 5);
+    _ = meter.endRun();
     try st.setNew("ship it", 12);
     try st.apply(.pause);
     meter.beginRun();
-    meter.charge(5, 5);
-    meter.endRun();
+    _ = meter.charge(5, 5);
+    _ = meter.endRun();
     try std.testing.expectEqual(@as(u64, 0), st.current.?.tokens_used);
     try std.testing.expectEqual(@as(u32, 0), probe.run_settled);
 
@@ -582,33 +638,33 @@ test "the Meter charges a Run armed on an active goal, to its end, and asks once
     // goal, asks once for a wrap-up, and keeps charging to the Run's end.
     try st.apply(.activate);
     meter.beginRun();
-    meter.charge(4, 3);
+    _ = meter.charge(4, 3);
     try std.testing.expect(meter.takeBudgetNotice() == null);
     meter.beginRun(); // a nested Run charges the outer one
-    meter.charge(3, 2);
-    meter.endRun();
+    _ = meter.charge(3, 2);
+    _ = meter.endRun();
     try std.testing.expectEqual(Status.budget_limited, st.current.?.status);
     try std.testing.expectEqual(@as(u32, 1), probe.budget_reached);
     try std.testing.expectEqualStrings(budget_notice, meter.takeBudgetNotice().?);
     try std.testing.expect(meter.takeBudgetNotice() == null);
-    meter.charge(1, 1);
-    meter.endRun();
+    _ = meter.charge(1, 1);
+    _ = meter.endRun();
     try std.testing.expectEqual(@as(u64, 14), st.current.?.tokens_used);
     try std.testing.expectEqual(@as(u32, 1), probe.budget_reached);
     try std.testing.expectEqual(@as(u32, 1), probe.run_settled);
 
     // A Run that starts budget_limited charges nothing.
     meter.beginRun();
-    meter.charge(9, 9);
-    meter.endRun();
+    _ = meter.charge(9, 9);
+    _ = meter.endRun();
     try std.testing.expectEqual(@as(u64, 14), st.current.?.tokens_used);
 
     // A goal replaced since the Run began is not charged for it.
     try st.setNew("first", null);
     meter.beginRun();
     try st.setNew("replacement", null);
-    meter.charge(9, 9);
-    meter.endRun();
+    _ = meter.charge(9, 9);
+    _ = meter.endRun();
     try std.testing.expectEqual(@as(u64, 0), st.current.?.tokens_used);
     try std.testing.expectEqual(@as(u64, 0), st.current.?.time_used_ms);
 }
@@ -636,8 +692,8 @@ test "goal state persist/load roundtrip, and decode refuses what encode never wr
     try st.setNew("round trip", 123);
     var meter = Meter.init(&st);
     meter.beginRun();
-    meter.charge(4, 3);
-    meter.endRun();
+    _ = meter.charge(4, 3);
+    _ = meter.endRun();
     try st.persistToDir(dir);
 
     var loaded = State.init(a);

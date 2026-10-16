@@ -3,8 +3,25 @@ const sdk = @import("metask_agentcore");
 const wire = sdk.types;
 const Server = @import("mock_server.zig").Server;
 
+/// Revision 23: the goal the consumer sets before its checkpoint.
+const CONSUMER_GOAL = "ship the source-free Zig consumer";
+
+/// `goal->get`, decoded and validated; the caller frees `arena`.
+fn readGoal(
+    api: sdk.Api,
+    arena: std.mem.Allocator,
+    session: ?*wire.SessionHandle,
+    diagnostic: *wire.OwnedBytesV1,
+) !?sdk.protocol.Goal {
+    var json = std.mem.zeroes(wire.OwnedBytesV1);
+    try expectStatus(.ok, api.goal().get()(session, &json, diagnostic), diagnostic.*);
+    defer api.bufferRelease()(&json);
+    const encoded = try sdk.borrowedBytes(.{ .ptr = json.ptr, .len = json.len });
+    return (try sdk.decodeGoalDocument(arena, encoded)).goal;
+}
+
 comptime {
-    if (wire.ABI_REVISION != 22 or
+    if (wire.ABI_REVISION != 23 or
         wire.MAX_SUBMITTED_INPUTS_V1 != 64 or
         wire.MAX_SUBMITTED_INPUT_BYTES_V1 != 16 * 1024 * 1024 or
         wire.PROMPT_OP_ADD != 1 or
@@ -40,11 +57,22 @@ comptime {
         wire.MCP_ERA_2025_06_18 != 3 or
         wire.MCP_APPLY_APPLIED != 1 or
         wire.MCP_APPLY_SUPERSEDED != 2 or
-        wire.MCP_APPLY_REJECTED != 3)
-        @compileError("source-free Revision 22 codes must match the public contract");
+        wire.MCP_APPLY_REJECTED != 3 or
+        @intFromEnum(wire.Status.goal_conflict) != 30 or
+        wire.RUN_INPUT_GOAL_CONTINUATION != 4 or
+        wire.GOAL_FIELD_OBJECTIVE != 1 or
+        wire.GOAL_FIELD_TOKEN_BUDGET != 2 or
+        wire.GOAL_FIELD_ACTION != 4 or
+        wire.GOAL_ACTION_PAUSE != 1 or
+        wire.GOAL_ACTION_ACTIVATE != 2 or
+        wire.GOAL_ACTION_COMPLETE != 3 or
+        wire.GOAL_ACTION_BLOCK != 4 or
+        wire.MAX_GOAL_OBJECTIVE_CODEPOINTS_V1 != 4000 or
+        wire.MAX_GOAL_OBJECTIVE_BYTES_V1 != 16_384)
+        @compileError("source-free Revision 23 codes must match the public contract");
     if (@hasDecl(wire, "SessionRefreshSkillCatalogFnV1") or
         @hasField(wire.ApiV1, "session_refresh_skill_catalog"))
-        @compileError("revision 22 must not expose the removed catalog refresh entry");
+        @compileError("revision 23 must not expose the removed catalog refresh entry");
     if (wire.MAX_SKILL_FILE_CONTENT_BYTES_V1 != 16 * 1024 * 1024 or
         wire.MAX_SKILL_CONTENT_BYTES_V1 != 32 * 1024 * 1024 or
         wire.MAX_SKILL_FILES_V1 != 1024 or
@@ -156,6 +184,8 @@ const Probe = struct {
     saw_final_output_segment: bool = false,
     /// A Run announced the manifest of the system prompt it sends.
     saw_prompt_manifest: bool = false,
+    /// Revision 23: `goal_updated` events for the consumer's goal.
+    goal_updates: u32 = 0,
     output_segment_open: bool = false,
     output_segment_index: u32 = 0,
     output_segment_turn: u32 = 0,
@@ -295,6 +325,11 @@ const Probe = struct {
                     }
                     if (!host_section or manifest.sha256.len != 64) return wire.EVENT_FATAL;
                     self.saw_prompt_manifest = true;
+                },
+                .goal_updated => |goal| {
+                    if (!std.mem.eql(u8, goal.objective, CONSUMER_GOAL) or goal.tokens_used == 0)
+                        return wire.EVENT_FATAL;
+                    self.goal_updates += 1;
                 },
                 else => {},
             },
@@ -858,6 +893,18 @@ pub fn main(init: std.process.Init) !void {
         result.tool_calls != 0)
         return error.UnexpectedRunResult;
 
+    // Revision 23: a goal set before the checkpoint travels with it.
+    var goal_arena = std.heap.ArenaAllocator.init(a);
+    defer goal_arena.deinit();
+    var consumer_goal = std.mem.zeroes(wire.GoalSetV1);
+    consumer_goal.struct_size = @sizeOf(wire.GoalSetV1);
+    consumer_goal.objective = sdk.bytesView(CONSUMER_GOAL);
+    try expectStatus(.ok, api.goal().set()(session, &consumer_goal, &diagnostic), diagnostic);
+    const goal_before = (try readGoal(api, goal_arena.allocator(), session, &diagnostic)) orelse
+        return error.MissingGoal;
+    if (goal_before.status != .active or goal_before.token_budget != null or goal_before.tokens_used != 0)
+        return error.UnexpectedGoal;
+
     var checkpoint = CheckpointBuffer{};
     defer checkpoint.deinit();
     var checkpoint_limits = checkpointLimits();
@@ -905,7 +952,7 @@ pub fn main(init: std.process.Init) !void {
         &diagnostic,
     ), diagnostic);
     api.bufferRelease()(&descriptor);
-    const responses_server = try Server.start(init.io, &.{ RESPONSES_FINAL_SSE, RESPONSES_FINAL_SSE });
+    const responses_server = try Server.start(init.io, &.{ RESPONSES_FINAL_SSE, RESPONSES_FINAL_SSE, RESPONSES_FINAL_SSE });
     defer responses_server.stop();
     const responses_url = try responses_server.url(a);
     session_host.provider_kind_code = wire.PROVIDER_OPENAI;
@@ -1020,13 +1067,37 @@ pub fn main(init: std.process.Init) !void {
         return error.UnexpectedRunResult;
     if (!probe.saw_prompt_manifest) return error.MissingPromptManifest;
 
+    // Revision 23: the restored Session has the checkpoint's goal, same id
+    // and objective. It was active, so the Runs since the restore were
+    // charged to it; a goal-continuation Run is charged too and reports it.
+    {
+        const restored_goal = (try readGoal(api, goal_arena.allocator(), session, &diagnostic)) orelse
+            return error.MissingGoal;
+        if (!std.mem.eql(u8, restored_goal.id, goal_before.id) or restored_goal.status != .active or
+            !std.mem.eql(u8, restored_goal.objective, CONSUMER_GOAL) or restored_goal.tokens_used == 0)
+            return error.UnexpectedGoal;
+        const updates_before = probe.goal_updates;
+        var continuation = std.mem.zeroes(wire.RunInputV1);
+        continuation.struct_size = @sizeOf(wire.RunInputV1);
+        continuation.kind_code = wire.RUN_INPUT_GOAL_CONTINUATION;
+        try probe.beginRun(5);
+        try expectStatus(.ok, api.session().runInput()(session, 5, &continuation, &options, &result, &diagnostic), diagnostic);
+        try probe.endRun(5);
+        if (try sdk.StopReason.fromCode(result.stop_reason_code) != .end_turn or
+            probe.goal_updates == updates_before)
+            return error.UnexpectedRunResult;
+        const charged_goal = (try readGoal(api, goal_arena.allocator(), session, &diagnostic)) orelse
+            return error.MissingGoal;
+        if (charged_goal.tokens_used <= restored_goal.tokens_used) return error.UnexpectedGoal;
+    }
+
     try probe.unregisterSession(session.?);
     try expectStatus(.ok, api.session().destroy()(session, &diagnostic), diagnostic);
     session = null;
     try expectStatus(.ok, api.runtime().destroy()(runtime, &diagnostic), diagnostic);
     runtime = null;
 
-    std.debug.print("AgentCore source-free consumer: Revision 22 Agent Runtime, time context, Host model capabilities, active-Run input, prompt profile, permission mode update, OpenAI Responses, multimodal input, active-Run journal, Host/MCP streaming, process-plugin configuration, Workspace Skill Catalog, tools, checkpoint, Runtime rebuild, restore and continued Run OK\n", .{});
+    std.debug.print("AgentCore source-free consumer: Revision 23 Agent Runtime, goals, time context, Host model capabilities, active-Run input, prompt profile, permission mode update, OpenAI Responses, multimodal input, active-Run journal, Host/MCP streaming, process-plugin configuration, Workspace Skill Catalog, tools, checkpoint, Runtime rebuild, restore and continued Run OK\n", .{});
 }
 
 const CatalogIdentities = struct {

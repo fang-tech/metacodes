@@ -1147,7 +1147,7 @@ pub fn run(
     // than in each of the loop's many result literals, so no exit can forget one.
     var counters: RunCounters = .{};
     if (opts.goal_meter) |meter| meter.beginRun();
-    defer if (opts.goal_meter) |meter| meter.endRun();
+    defer if (opts.goal_meter) |meter| if (meter.endRun()) |settled| backend.emitEvent(opts.session, .{ .goal_updated = settled });
     var result = try runCounted(conversation, provider, tool_defs, permission_ctx, opts, backend, allocator, &counters);
     result.continuations = counters.continuations;
     return result;
@@ -2388,7 +2388,8 @@ fn runCounted(
                         // 成本次闸累计(本 run):按模型单价把本响应 usage 折算成本。
                         run_cost_usd += @import("../util/pricing.zig").computeCost(cost_rates, u.input_tokens, u.output_tokens, u.cache_read_input_tokens, u.cache_creation_input_tokens);
                         response_usage.observe(u.input_tokens, u.output_tokens, u.cache_read_input_tokens, u.cache_creation_input_tokens);
-                        if (opts.goal_meter) |meter| meter.charge(u.input_tokens, u.output_tokens);
+                        if (opts.goal_meter) |meter| if (meter.charge(u.input_tokens, u.output_tokens)) |limited|
+                            backend.emitEvent(sess, .{ .goal_updated = limited });
                         log.infoId("agent", rid, "usage in={d} out={d} cache_r={d} cache_w={d}", .{ u.input_tokens, u.output_tokens, u.cache_read_input_tokens, u.cache_creation_input_tokens });
                     },
                     .done => {},
@@ -4898,7 +4899,8 @@ fn runAutoCompactIfNeeded(
         // survives even if request-count telemetry is conservatively partial.
         if (usageChanged(report.usage)) {
             backend.emitEvent(sess, .{ .usage = report.usage });
-            if (goal_meter) |meter| meter.charge(report.usage.input_tokens, report.usage.output_tokens);
+            if (goal_meter) |meter| if (meter.charge(report.usage.input_tokens, report.usage.output_tokens)) |limited|
+                backend.emitEvent(sess, .{ .goal_updated = limited });
         }
         if (report.summary_request) |request| {
             backend.emitEvent(sess, .{ .diag_compact_request = .{
