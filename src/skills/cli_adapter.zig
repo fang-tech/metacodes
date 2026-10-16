@@ -875,7 +875,11 @@ fn executeFork(
                 .parent_model = ctx.parent_model,
                 .session_id = ctx.session_id,
                 .skills = ctx.skills,
-                .skip_codebase_context = preload.shouldSkipCodebaseContext(definition.name),
+                // A sealed fork's prompt goes to the gateway: the codebase
+                // context (CLAUDE.md chain, git status) travels only under the
+                // egress class the user consented to (§5, §6.1).
+                .skip_codebase_context = preload.shouldSkipCodebaseContext(definition.name) or
+                    (sealed != null and !sealed.?.sendsCodebaseContext()),
                 .abort = ctx.abort,
                 .sandbox = ctx.sandbox,
                 .cwd_abs = ctx.cwd_abs,

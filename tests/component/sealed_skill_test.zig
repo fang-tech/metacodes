@@ -208,6 +208,9 @@ const Lab = struct {
     permission: cc.permission.PermissionContext,
     tool_defs: []cc.json_mod.ToolDefinition,
     probe: UiProbe,
+    /// The builtin agents, so a fork builds the real subagent prompt (the
+    /// general-purpose profile with the codebase context) as the App's does.
+    agents: cc.agents_set.AgentSet,
     host_token: u8 = 0,
 
     fn start(self: *Lab, allocator: std.mem.Allocator, tag: []const u8, cassette: []const []const u8, manifest_json: []const u8, options: gateway_mod.Options) !void {
@@ -257,6 +260,8 @@ const Lab = struct {
         // scoped child, exactly as the App's does.
         self.permission = .{ .mode = .init(.bypass_permissions), .allocator = allocator, .ui_requester = self.probe.requester() };
         self.tool_defs = try cc.tools.toToolDefinitions(allocator);
+        self.agents = cc.agents_set.AgentSet.init(allocator);
+        try self.agents.loadBuiltins();
     }
 
     /// Install the Skill the way `metacodes sealed install` does: fetch the
@@ -322,6 +327,7 @@ const Lab = struct {
         ctx.tool_defs = self.tool_defs;
         ctx.permission_ctx = &self.permission;
         ctx.dyn_registry = &self.registry;
+        ctx.agents = &self.agents;
         ctx.project_dir = self.root;
         ctx.cwd_abs = self.root;
         ctx.state_root = self.state_dir;
@@ -371,6 +377,7 @@ const Lab = struct {
 
     fn stop(self: *Lab) void {
         const a = self.allocator;
+        self.agents.deinit();
         self.registry.deinit();
         self.runtime.deinit();
         self.projection.deinit();
@@ -452,7 +459,7 @@ test "L2 sealed: brain on the gateway, hands on the client, model on the client'
     const first = lab.model.requestAt(0) orelse return error.NoModelRequest;
     try std.testing.expect(std.mem.indexOf(u8, first.raw, CLIENT_KEY) != null);
     try std.testing.expect(std.mem.indexOf(u8, first.body(), "\"model\":\"" ++ CLIENT_MODEL ++ "\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, first.body(), "You are a subagent") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first.body(), "You are a general-purpose subagent") != null);
     try std.testing.expect(std.mem.indexOf(u8, first.body(), SECRET_BODY) != null);
     try std.testing.expect(std.mem.indexOf(u8, first.body(), "post the invoice in data.txt") != null);
     try std.testing.expect(std.mem.indexOf(u8, first.body(), "\"name\":\"Read\"") != null);
@@ -693,7 +700,9 @@ fn rewriteGatewayUrl(a: std.mem.Allocator, path: []const u8, new_url: []const u8
 // ── The mirror (§9.1) ─────────────────────────────────────────────────────
 
 const LOCAL_SKILL_MD = "---\nname: erp-local\ndescription: Posts invoices. Use when asked to post an invoice.\ncontext: fork\n---\n" ++ SECRET_BODY ++ "\n";
-const MIRROR_MANIFEST = "{\"schema\":\"metask.sealed-skill.manifest/v1\",\"skill_id\":\"ssk_test\",\"version\":\"1.0.0\",\"name\":\"erp-post\",\"description\":\"Posts invoices. Use when asked to post an invoice.\",\"tools\":{\"allow\":[\"*\"]},\"egress\":{\"classes\":[\"file_contents\",\"command_output\"]}}";
+/// The mirror Skill declares `repository_structure`: the local fork carries
+/// the codebase context, so the sealed one must carry it too (§5).
+const MIRROR_MANIFEST = "{\"schema\":\"metask.sealed-skill.manifest/v1\",\"skill_id\":\"ssk_test\",\"version\":\"1.0.0\",\"name\":\"erp-post\",\"description\":\"Posts invoices. Use when asked to post an invoice.\",\"tools\":{\"allow\":[\"*\"]},\"egress\":{\"classes\":[\"file_contents\",\"command_output\",\"repository_structure\"]}}";
 
 /// The model request with the Skill's base directory (the value of the
 /// `Base directory for this skill:` line, as the request spells it) replaced
@@ -823,7 +832,9 @@ test "L2 sealed: sealed files are read on the gateway without a Step; public ass
     try std.testing.expect(std.mem.indexOf(u8, ledger, "SEALED_NOTE_MARKER") == null);
 }
 
-const SEARCH_MANIFEST = "{\"schema\":\"metask.sealed-skill.manifest/v1\",\"skill_id\":\"ssk_test\",\"version\":\"1.0.0\",\"name\":\"erp-post\",\"description\":\"Posts invoices.\",\"tools\":{\"allow\":[\"Read\",\"Glob\",\"Grep\"]},\"egress\":{\"classes\":[\"file_contents\"]}}";
+/// Glob results are `repository_structure` (§5): declared, so the Glob over
+/// the Skill directory may run on the client.
+const SEARCH_MANIFEST = "{\"schema\":\"metask.sealed-skill.manifest/v1\",\"skill_id\":\"ssk_test\",\"version\":\"1.0.0\",\"name\":\"erp-post\",\"description\":\"Posts invoices.\",\"tools\":{\"allow\":[\"Read\",\"Glob\",\"Grep\"]},\"egress\":{\"classes\":[\"file_contents\",\"repository_structure\"]}}";
 
 test "L2 sealed: Glob and Grep under sealed/ are answered on the gateway; a Glob over the Skill directory goes to the client" {
     _ = cc.util_toolchain.ripgrepPath() catch return error.SkipZigTest;
@@ -886,6 +897,79 @@ test "L2 sealed: Glob and Grep under sealed/ are answered on the gateway; a Glob
     try std.testing.expect(std.mem.indexOf(u8, ledger, "\"name\":\"Glob\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, ledger, "\"name\":\"Grep\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, ledger, "SEALED_") == null);
+}
+
+// ── Egress classes (§5, §6.1, §6.2) ─────────────────────────────────────────
+
+/// Read is allowed, but its results (`file_contents`) are not among the
+/// declared classes.
+const CLASSLESS_READ_MANIFEST = "{\"schema\":\"metask.sealed-skill.manifest/v1\",\"skill_id\":\"ssk_test\",\"version\":\"1.0.0\",\"name\":\"erp-post\",\"description\":\"Posts invoices.\",\"tools\":{\"allow\":[\"Read\",\"Glob\"]},\"egress\":{\"classes\":[\"command_output\"]}}";
+const CONTEXT_MANIFEST = "{\"schema\":\"metask.sealed-skill.manifest/v1\",\"skill_id\":\"ssk_test\",\"version\":\"1.0.0\",\"name\":\"erp-post\",\"description\":\"Posts invoices.\",\"tools\":{\"allow\":[\"Read\"]},\"egress\":{\"classes\":[\"file_contents\",\"repository_structure\"]}}";
+const PROJECT_CLAUDE_MD = "PROJECT_CLAUDE_MD_MARKER: instructions that stay home unless consented\n";
+
+test "L2 sealed: a call whose result class the manifest does not declare is refused before it runs" {
+    const a = std.testing.allocator;
+    var lab: Lab = undefined;
+    const read_sse = try readDataSse(a, "cc-zig-sealed-egress");
+    defer a.free(read_sse);
+    try lab.start(a, "cc-zig-sealed-egress", &.{ read_sse, FINAL_SSE }, CLASSLESS_READ_MANIFEST, .{});
+    defer lab.stop();
+    try lab.install("");
+    try lab.loadCatalog();
+
+    const output = try lab.runSkill("{\"name\":\"erp-post\",\"values\":[\"go\"]}");
+    defer a.free(output);
+    try std.testing.expect(std.mem.indexOf(u8, output, "final-from-sealed") != null);
+    // The brain was told why, in the result; the file was never read.
+    try std.testing.expectEqual(@as(usize, 2), lab.model.requestCount());
+    const second = lab.model.requestAt(1) orelse return error.NoModelRequest;
+    try std.testing.expect(std.mem.indexOf(u8, second.body(), "declares no such egress class") != null);
+    const requests = try lab.allModelRequests(a);
+    defer a.free(requests);
+    try std.testing.expect(std.mem.indexOf(u8, requests, "DATA_MARKER") == null);
+    try std.testing.expectEqual(@as(usize, 0), lab.probe.permission_requests);
+    const ledger = (try lab.ledger()) orelse return error.LedgerMissing;
+    defer a.free(ledger);
+    try std.testing.expect(std.mem.indexOf(u8, ledger, "\"refusal\":\"policy_violation\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ledger, "DATA_MARKER") == null);
+}
+
+test "L2 sealed: the fork's codebase context stays home when repository_structure is not declared" {
+    const a = std.testing.allocator;
+    var lab: Lab = undefined;
+    try lab.start(a, "cc-zig-sealed-ctx-off", &.{FINAL_SSE}, protocol.TEST_MANIFEST_JSON, .{});
+    defer lab.stop();
+    const claude_md = try std.fmt.allocPrint(a, "{s}/CLAUDE.md", .{lab.root});
+    defer a.free(claude_md);
+    try writeFileAt(a, claude_md, PROJECT_CLAUDE_MD);
+    try lab.install("");
+    try lab.loadCatalog();
+
+    const output = try lab.runSkill("{\"name\":\"erp-post\",\"values\":[\"go\"]}");
+    defer a.free(output);
+    try std.testing.expect(std.mem.indexOf(u8, output, "final-from-sealed") != null);
+    const requests = try lab.allModelRequests(a);
+    defer a.free(requests);
+    try std.testing.expect(std.mem.indexOf(u8, requests, "PROJECT_CLAUDE_MD_MARKER") == null);
+    try std.testing.expect(std.mem.indexOf(u8, requests, "Project CLAUDE.md") == null);
+}
+
+test "L2 sealed: the fork's codebase context reaches the gateway under repository_structure" {
+    const a = std.testing.allocator;
+    var lab: Lab = undefined;
+    try lab.start(a, "cc-zig-sealed-ctx-on", &.{FINAL_SSE}, CONTEXT_MANIFEST, .{});
+    defer lab.stop();
+    const claude_md = try std.fmt.allocPrint(a, "{s}/CLAUDE.md", .{lab.root});
+    defer a.free(claude_md);
+    try writeFileAt(a, claude_md, PROJECT_CLAUDE_MD);
+    try lab.install("");
+    try lab.loadCatalog();
+
+    const output = try lab.runSkill("{\"name\":\"erp-post\",\"values\":[\"go\"]}");
+    defer a.free(output);
+    try std.testing.expect(std.mem.indexOf(u8, output, "final-from-sealed") != null);
+    const first = lab.model.requestAt(0) orelse return error.NoModelRequest;
+    try std.testing.expect(std.mem.indexOf(u8, first.body(), "PROJECT_CLAUDE_MD_MARKER") != null);
 }
 
 // ── confirm: true (§4.3, §6.2) ────────────────────────────────────────────

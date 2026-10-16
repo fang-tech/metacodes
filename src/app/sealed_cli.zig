@@ -183,6 +183,11 @@ fn printConsent(entry: *const protocol.Entry, url: []const u8, token_env: []cons
     if (m.egress_classes.len == 0) std.debug.print(" (none declared)", .{});
     for (m.egress_classes) |class| std.debug.print(" {s}", .{class});
     std.debug.print(" (up to {d} bytes per result, retention: {s})\n", .{ m.egress_max_result_bytes, m.egress_retention });
+    if (protocol.manifestDeclaresEgress(m, protocol.EGRESS_CODEBASE_CONTEXT_CLASS)) {
+        std.debug.print("  context sent with each run: this project's CLAUDE.md chain and git status ({s})\n", .{protocol.EGRESS_CODEBASE_CONTEXT_CLASS});
+    } else {
+        std.debug.print("  context sent with each run: your request only, no CLAUDE.md or git status ({s} not declared)\n", .{protocol.EGRESS_CODEBASE_CONTEXT_CLASS});
+    }
     if (m.credentials.len != 0) {
         std.debug.print("  credentials it will ask for:", .{});
         for (m.credentials) |credential| std.debug.print(" {s} ({s})", .{ credential.ref, credential.purpose });

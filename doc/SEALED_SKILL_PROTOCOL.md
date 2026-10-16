@@ -418,8 +418,17 @@ publish time, and pinned by the user at install time.
 - `egress.classes` declares what kinds of data leave the machine as tool
   results: `file_contents`, `command_output`, `page_snapshot`, `images`,
   `repository_structure`, `environment`. A client MUST refuse a call whose
-  result would fall outside the declared classes when it can tell (a Read
-  under `command_output` only), and MUST show the classes at install time.
+  result would fall outside the declared classes when it can tell — before
+  running it, from the tool alone: `Read`, `Grep`, `Edit` and
+  `NotebookEdit` return `file_contents`, `Glob` `repository_structure`,
+  `Bash` and `BashOutput` `command_output`, `WebFetch` and `WebSearch`
+  `page_snapshot`; a tool whose result it cannot classify (a subagent, an
+  MCP tool, a write's confirmation) is not refused on class grounds — and
+  MUST show the classes at install time. `repository_structure` also
+  governs the one thing that leaves the machine other than as a tool
+  result: the codebase context the client's own forks carry in their system
+  prompt (the CLAUDE.md chain and git status). A sealed fork carries it
+  only under that class; otherwise it starts without it.
   `retention` is the gateway's promise for tool results: `"run"` (discarded
   when the run ends) or `"audit"` (kept for the audit window the operator
   publishes).
@@ -447,15 +456,20 @@ Installing a Skill means storing its Entry (manifest + digest + signature)
 as a pin, and its public assets (§3.2) under the pin directory, after
 showing the user, at minimum: name, description, creator, the tool
 allowlist, the egress classes, the credentials it will ask for and the price
-estimate. A run MUST send the pinned digest. A `manifest_changed`
+estimate — and what travels with every run besides tool results: the
+project's CLAUDE.md chain and git status when `repository_structure` is
+declared, nothing of the kind otherwise. A run MUST send the pinned digest.
+A `manifest_changed`
 error MUST NOT be resolved silently: the client refreshes the Entry and
 repeats the consent step with a diff of the manifest.
 
 ### 6.2 Policy enforcement
 
 The client evaluates every call in a Step against the pinned
-`tools.allow`/`tools.deny` **before** its ordinary permission system sees
-it. A call outside the allowlist is never executed; it is answered with
+`tools.allow`/`tools.deny`, and a call whose result class it knows (§5)
+against `egress.classes`, **before** its ordinary permission system sees
+it. A call outside the allowlist, or whose results fall outside the
+declared classes, is never executed; it is answered with
 `refusal: "policy_violation"`, logged, and counted. After three policy
 violations in one run the client MUST cancel the run with `reason:
 "policy"`. A call inside the allowlist then goes through the client's normal
@@ -625,7 +639,8 @@ the client's own provider, with a probe standing in for the session's UI,
 and asserts: the Skill body reaches only the model; the gateway calls the
 model with the client's credential and model and refuses a request without
 the credential; **the shadow's model request is byte-identical to the local
-fork's** for the same Skill (base directory aside); the tool result is
+fork's** for the same Skill (base directory aside, under a manifest that
+declares `repository_structure`); the tool result is
 produced locally; the ledger holds the charge and never the credential; the
 gateway restarts between two Steps and the run continues from the carried
 state; an allowlist violation is refused locally; the bearer token gates the
@@ -634,6 +649,8 @@ calls never reaches the client; a sealed reference file is read on the
 gateway without a Step while a public asset is installed and read on the
 client; a Glob and a Grep under `sealed/` are answered on the gateway
 without a Step while a Glob over the Skill directory goes to the client; a
+call whose result class is undeclared is refused before it runs; the fork's
+codebase context reaches the gateway only under `repository_structure`; a
 `confirm: true` call is approved interactively in bypass mode (and
 a declined one reported as `permission_denied`); the brain's
 `AskUserQuestion` is asked through the client's own dialog and the run
@@ -678,10 +695,14 @@ call.
   would have advertised to the model. The provider's route and credential
   are read from the session's provider **before every request**, so a
   refreshed OAuth token or a switched key is what the gateway gets, never a
-  copy taken at activation. The one deliberate deviation is the context
-  window it reports: effectively unbounded, so the client's copy of the fork
+  copy taken at activation. Two deliberate deviations: the context window
+  it reports is effectively unbounded, so the client's copy of the fork
   conversation never compacts — the brain's conversation lives on the
   gateway, which compacts it; the client's is a mirror for pairing results.
+  And the fork's system prompt carries the codebase context — the CLAUDE.md
+  chain and git status — only when the manifest declares
+  `repository_structure` (§5), the class under which that context leaves
+  the machine; the install consent says which it is.
 - **Executor mode.** The brain's iteration belongs to the gateway's loop;
   the client's fork loop is its executor. Its turn cap is the protocol's
   `max_steps`, not the subagent default; it never summarizes (the provider
@@ -695,10 +716,11 @@ call.
   computed before sending and keeps in its ledger; any mismatch ends the
   run with `SealedChainBroken`.
 - **Policy.** The policy frame derived from the pinned allowlist refuses a
-  call outside it before dispatch; the provider reports the refusal as
-  `policy_violation`, counts it, and cancels the run with `reason: policy`
-  at the third. Results are truncated to the smaller of the call's and the
-  manifest's byte cap.
+  call outside it before dispatch, and the provider refuses, before adopting
+  it, a call whose result class (§5) the manifest does not declare; either
+  refusal is reported as `policy_violation`, counted, and the run is
+  cancelled with `reason: policy` at the third. Results are truncated to
+  the smaller of the call's and the manifest's byte cap.
 - **Budget.** The cap is `METACODES_SEALED_MAX_COST_MICROS` (default
   `500000`, USD 0.50). It is sent as `budget.max_cost_micros`, enforced by
   the provider on the gateway's `cumulative` (cancel with `reason:

@@ -803,6 +803,38 @@ pub fn ruleNamesWholeTool(raw: []const u8, tool_name: []const u8) bool {
     return ruleCoversTool(raw, tool_name);
 }
 
+/// §5: the class under which the fork's codebase context — the CLAUDE.md
+/// chain and git status the client's own forks carry in their system
+/// prompt — leaves the machine. A sealed fork carries that context only when
+/// the manifest declares this class; otherwise it starts without it.
+pub const EGRESS_CODEBASE_CONTEXT_CLASS = "repository_structure";
+
+/// §5: the egress class a tool's results fall under, for the tools whose
+/// results the client can classify before running them. Null: the client
+/// cannot tell (a subagent's summary, an MCP tool, a write's confirmation)
+/// and does not refuse on class grounds.
+pub fn egressClassOfTool(tool_name: []const u8) ?[]const u8 {
+    const table = [_]struct { name: []const u8, class: []const u8 }{
+        .{ .name = "Read", .class = "file_contents" },
+        .{ .name = "Grep", .class = "file_contents" },
+        .{ .name = "Edit", .class = "file_contents" },
+        .{ .name = "NotebookEdit", .class = "file_contents" },
+        .{ .name = "Glob", .class = EGRESS_CODEBASE_CONTEXT_CLASS },
+        .{ .name = "Bash", .class = "command_output" },
+        .{ .name = "BashOutput", .class = "command_output" },
+        .{ .name = "WebFetch", .class = "page_snapshot" },
+        .{ .name = "WebSearch", .class = "page_snapshot" },
+    };
+    for (table) |row| if (std.mem.eql(u8, row.name, tool_name)) return row.class;
+    return null;
+}
+
+/// Whether the manifest declares `class` under `egress.classes`.
+pub fn manifestDeclaresEgress(manifest: *const Manifest, class: []const u8) bool {
+    for (manifest.egress_classes) |declared| if (std.mem.eql(u8, declared, class)) return true;
+    return false;
+}
+
 pub const CancelReason = enum { user_abort, budget, policy, client_error };
 
 pub fn writeCancelParams(w: *std.Io.Writer, run_id: []const u8, run_state: []const u8, reason: CancelReason) !void {
@@ -1369,6 +1401,29 @@ test "manifest tool rules: plain names, argument patterns, MCP wildcards, deny f
     try std.testing.expect(manifestAllowsTool(m, "Bash"));
     try std.testing.expect(!manifestAllowsTool(m, "Grep"));
     try std.testing.expect(!manifestAllowsTool(m, "Write"));
+}
+
+test "egress classes: the tools the client can classify, and what a manifest declares" {
+    try std.testing.expectEqualStrings("file_contents", egressClassOfTool("Read").?);
+    try std.testing.expectEqualStrings("file_contents", egressClassOfTool("Grep").?);
+    try std.testing.expectEqualStrings("repository_structure", egressClassOfTool("Glob").?);
+    try std.testing.expectEqualStrings("command_output", egressClassOfTool("Bash").?);
+    try std.testing.expectEqualStrings("page_snapshot", egressClassOfTool("WebFetch").?);
+    try std.testing.expect(egressClassOfTool("Write") == null);
+    try std.testing.expect(egressClassOfTool("Task") == null);
+    try std.testing.expect(egressClassOfTool("AskUserQuestion") == null);
+    try std.testing.expect(egressClassOfTool("mcp__github__issue") == null);
+
+    const a = std.testing.allocator;
+    const entry_json = try testEntryJson(a, TEST_MANIFEST_JSON);
+    defer a.free(entry_json);
+    var parsed = try parseEntry(a, entry_json);
+    defer parsed.deinit();
+    const m = &parsed.entry.manifest;
+    try std.testing.expect(manifestDeclaresEgress(m, "file_contents"));
+    try std.testing.expect(manifestDeclaresEgress(m, "command_output"));
+    try std.testing.expect(!manifestDeclaresEgress(m, "page_snapshot"));
+    try std.testing.expect(!manifestDeclaresEgress(m, EGRESS_CODEBASE_CONTEXT_CLASS));
 }
 
 test "results digest: client entries and the gateway's parsed array agree (§8.3)" {

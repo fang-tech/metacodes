@@ -12,6 +12,16 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Added
 
+- Sealed Skills: `egress.classes` is enforced at run time. A call whose
+  result class the client can tell from the tool (`Read`/`Grep`/`Edit`/
+  `NotebookEdit` → `file_contents`, `Glob` → `repository_structure`,
+  `Bash`/`BashOutput` → `command_output`, `WebFetch`/`WebSearch` →
+  `page_snapshot`) is refused unexecuted as a `policy_violation` when the
+  pinned manifest does not declare that class, and counted toward the
+  three-violation cancel like an allowlist refusal. The sealed fork's
+  system prompt carries the codebase context (the CLAUDE.md chain and git
+  status) only when the manifest declares `repository_structure`; the
+  install consent now says what travels with each run besides tool results.
 - Sealed Skills: a `Glob` or `Grep` whose target lies under the Skill's
   `sealed/` directory is answered on the gateway inside the Step, by the
   client's own tool implementation run against the package with every path

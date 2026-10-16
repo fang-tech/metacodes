@@ -47,6 +47,8 @@ const AbortSignal = @import("../../util/abort.zig").AbortSignal;
 
 pub const DEFAULT_MAX_COST_MICROS: i64 = 500_000;
 pub const DEFAULT_MAX_STEPS: u64 = 200;
+const POLICY_CANCEL_TEXT = "[sealed skill cancelled: the gateway requested tools outside the pinned policy (allowlist or egress classes)]";
+
 /// §6.2: policy violations in one run before the client cancels it.
 pub const MAX_POLICY_VIOLATIONS: u8 = 3;
 /// Model name the loop sees; its price table is only ever an estimate here.
@@ -515,7 +517,7 @@ pub const SealedSkillProvider = struct {
         }
         if (run.violations >= MAX_POLICY_VIOLATIONS) {
             self.cancelRun(.policy, abort);
-            return self.finishWithText("[sealed skill cancelled: the gateway requested tools outside the pinned allowlist]");
+            return self.finishWithText(POLICY_CANCEL_TEXT);
         }
         return self.sendResults(arena, results.items, abort);
     }
@@ -615,6 +617,13 @@ pub const SealedSkillProvider = struct {
             .finished = !continues,
             .violations = previous_violations,
         };
+        // A class refusal counts like an allowlist refusal (§6.2); the
+        // third ends the run, in `continueRun` or `streamCalls`.
+        for (calls) |call| {
+            if (call.pre_refusal) |refusal| {
+                if (refusal.refusal == .policy_violation) self.run.?.violations +|= 1;
+            }
+        }
         self.recordStep(step);
         log.info("sealed", "step run={s} seq={d} kind={s} calls={d} cost_micros={d} cumulative={d} usage in={d} out={d} cache_r={d}", .{
             step.run_id, step.seq, @tagName(step.kind), step.calls.len, step.usage.cost_micros, step.cumulative.cost_micros, step.usage.input_tokens, step.usage.output_tokens, step.usage.cache_read_input_tokens,
@@ -659,6 +668,19 @@ pub const SealedSkillProvider = struct {
             .credential_refs = &.{},
             .pre_refusal = null,
         };
+        // §5, §6.2: a result the client can classify from the tool alone must
+        // fall under a declared egress class; otherwise the call is refused
+        // unexecuted, a policy violation like a call outside the allowlist.
+        if (protocol.egressClassOfTool(call.name)) |class| {
+            if (!protocol.manifestDeclaresEgress(self.manifest(), class)) {
+                ref.pre_refusal = .{
+                    .refusal = .policy_violation,
+                    .message = try std.fmt.allocPrint(arena, "results of {s} ({s}) are not allowed to leave this machine: the pinned manifest declares no such egress class; the call was not executed", .{ call.name, class }),
+                };
+                log.warn("sealed", "call {s} ({s}) refused: egress class {s} is not declared", .{ call.id, call.name, class });
+                return ref;
+            }
+        }
         if (call.credentials.len == 0) return ref;
         const skill_id = self.pin.pin.entry.skill_id;
         const skill_name = self.manifest().name;
@@ -700,6 +722,10 @@ pub const SealedSkillProvider = struct {
             if (call.pre_refusal == null) dispatched += 1;
         }
         if (dispatched == 0) {
+            if (run.violations >= MAX_POLICY_VIOLATIONS) {
+                self.cancelRun(.policy, abort);
+                return self.finishWithText(POLICY_CANCEL_TEXT);
+            }
             // Nothing for the loop to run: answer the gateway now with the
             // refusals and go on to the next Step.
             var scratch = std.heap.ArenaAllocator.init(self.allocator);
@@ -1042,6 +1068,14 @@ pub const SealedSkillProvider = struct {
         try client.append(arena, ']');
         try provider_tools.append(arena, ']');
         return .{ .client = client.items, .provider = provider_tools.items, .client_count = client_count, .provider_count = provider_count };
+    }
+
+    /// §5: whether the fork's codebase context — the CLAUDE.md chain and git
+    /// status the client's own forks carry in their system prompt — may
+    /// travel to the gateway: only under the egress class the user consented
+    /// to at install (`repository_structure`).
+    pub fn sendsCodebaseContext(self: *const SealedSkillProvider) bool {
+        return protocol.manifestDeclaresEgress(self.manifest(), protocol.EGRESS_CODEBASE_CONTEXT_CLASS);
     }
 
     /// Name-level admission against the pinned manifest: a `deny` rule that
