@@ -311,13 +311,13 @@ Current delivery status is intentionally target-specific:
 
 | Target | Bundle/archive | Native source-free consumption |
 |---|---|---|
-| `aarch64-macos` | revision 22 ReleaseSafe bundle, schema-1 manifest, public-symbol, and source-free link gates passed locally (2026-10-16) | revision 22 native gate passed locally (2026-10-16): C and Zig source-free consumers (time context with a Host UTC offset, the C one finding the named offset in the provider request; Host model-capability declarations: unknown, Host-unsupported and Host-supported models, the Zig one across restore over OpenAI Responses; both submitting input to an active Run), C/C++ header compile, Rust SDK tests and link probe, including multimodal, fresh/restore and continued Runs |
-| `x86_64-windows-msvc` | revision 14 evidence retained; revision 22 not revalidated | native revision 22 gate pending |
-| `aarch64-windows-msvc` | revision 14 evidence retained; revision 22 not revalidated | native revision 22 gate pending |
-| `aarch64-windows-gnu` | revision 14 evidence retained; revision 22 not revalidated | native revision 22 gate pending |
-| `x86_64-windows-gnu` | revision 13 evidence retained; revision 22 not revalidated | native revision 22 gate pending |
-| `x86_64-linux-gnu` | revision 13 evidence retained; revision 22 not revalidated | native revision 22 gate pending |
-| `x86_64-macos` | revision 13 evidence retained; revision 22 not revalidated | native revision 22 gate pending |
+| `aarch64-macos` | revision 23 ReleaseSafe bundle, schema-1 manifest, public-symbol, and source-free link gates passed locally (2026-10-17) | revision 23 native gate passed locally (2026-10-17): C and Zig source-free consumers (Session goals: the C one sets a goal, runs a goal-continuation Run whose runtime-written input the mock finds, sees it charged and is refused once the goal is paused; the Zig one carries a goal across checkpoint and restore over OpenAI Responses and keeps charging it; time context with a Host UTC offset; Host model-capability declarations; both submitting input to an active Run), C/C++ header compile, Rust SDK tests and link probe, including multimodal, fresh/restore and continued Runs |
+| `x86_64-windows-msvc` | revision 14 evidence retained; revision 23 not revalidated | native revision 23 gate pending |
+| `aarch64-windows-msvc` | revision 14 evidence retained; revision 23 not revalidated | native revision 23 gate pending |
+| `aarch64-windows-gnu` | revision 14 evidence retained; revision 23 not revalidated | native revision 23 gate pending |
+| `x86_64-windows-gnu` | revision 13 evidence retained; revision 23 not revalidated | native revision 23 gate pending |
+| `x86_64-linux-gnu` | revision 13 evidence retained; revision 23 not revalidated | native revision 23 gate pending |
+| `x86_64-macos` | revision 13 evidence retained; revision 23 not revalidated | native revision 23 gate pending |
 
 Cross-build success is not a support claim. In particular, the empty macOS
 framework list remains provisional until the corresponding native gates pass.

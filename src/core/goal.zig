@@ -232,7 +232,6 @@ pub const State = struct {
         if (n < 0 or @as(usize, @intCast(n)) != bytes.len) return error.WriteFailed;
         if (pfs.renameReplace(tmp_z.ptr, path_z.ptr) != 0) return error.RenameFailed;
     }
-
 };
 
 /// The status `action` leads to from `g`, or why it is refused.

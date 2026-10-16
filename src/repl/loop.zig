@@ -4621,4 +4621,3 @@ test "L2 #16: /resume 切 app.session_id + permission_ctx.session(路由键随�
     try std.testing.expectEqualStrings(app.activeModel(), app.transcript_writer.?.model);
     try std.testing.expect(!app.agentJobScope().contains(old_id));
 }
-

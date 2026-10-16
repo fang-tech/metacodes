@@ -162,7 +162,7 @@ Freeze the surfaces hosts depend on. Preconditions are already written down:
       ([doc/AGENTCORE_BINARY_ABI.md](doc/AGENTCORE_BINARY_ABI.md)).
 - [ ] Re-verify the full supported-target matrix at the frozen revision
       (`aarch64-macos` passed the full native gate at revision 23 locally on
-      GATE_DATE; no other target is verified at revision 23 yet).
+      2026-10-17; no other target is verified at revision 23 yet).
 - [ ] Plugin manifest/process-protocol v1 freeze with negative-test coverage.
 - [ ] CLI: versioned `--version`/`--help` surface and changelog discipline for
       flag changes.

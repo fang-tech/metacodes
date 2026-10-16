@@ -43,7 +43,18 @@ const changes = [_]cc.file_change.Record{
     },
 };
 
-fn samples(manifest_entries: []cc.prompt_sections.ManifestEntry) [47]CoreEvent {
+const sample_goal = cc.core_goal.Goal{
+    .id = "0123456789abcdef01234567".*,
+    .objective = @constCast("ship \"wire\""),
+    .status = .budget_limited,
+    .token_budget = 100,
+    .tokens_used = 120,
+    .time_used_ms = 5,
+    .created_at_ms = 1,
+    .updated_at_ms = 2,
+};
+
+fn samples(manifest_entries: []cc.prompt_sections.ManifestEntry) [48]CoreEvent {
     return .{
         .{ .text_chunk = "hello \"wire\"\n" },
         .{ .thinking_chunk = "considering" },
@@ -80,6 +91,7 @@ fn samples(manifest_entries: []cc.prompt_sections.ManifestEntry) [47]CoreEvent {
         .{ .ui_request_pending = .{ .tool_use_id = "tu_3", .request_json = "{\"kind\":\"video_timeline\"}" } },
         .ui_request_resolved,
         .{ .prompt_manifest = .{ .entries = manifest_entries, .sha256 = [_]u8{0xcd} ** 32 } },
+        .{ .goal_updated = &sample_goal },
         .{ .diag_turn_begin = .{ .trace_id = trace, .depth = 0, .turn = 1 } },
         .{ .diag_turn_end = .{ .trace_id = trace, .depth = 0, .turn = 1, .tool_calls = 2 } },
         .{ .diag_model_request = .{ .trace_id = trace, .depth = 0, .turn = 1, .attempt = 1, .elapsed_ms = 30, .outcome = "ok" } },

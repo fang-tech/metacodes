@@ -1362,8 +1362,8 @@ test "a goal section rides marker 10, and the marker and the goal must agree (#2
         try std.testing.expectEqualStrings(case.goal, decoded.goal);
         try std.testing.expectEqualStrings("hello", decoded.conversation.messages.items[0].blocks[0].text);
 
-        // A header whose marker disagrees with its goal section is corrupt;
-        // an unknown marker is a newer library's.
+        // A header whose marker disagrees with its goal section is corrupt,
+        // even with a valid digest; an unknown marker is a newer library's.
         const Tamper = struct { marker: u32, expected: Error };
         const tampers: []const Tamper = if (case.goal.len != 0) &.{
             .{ .marker = PROMPT_PROFILE_COMPATIBILITY_MARKER, .expected = error.Corrupt },
@@ -1382,6 +1382,8 @@ test "a goal section rides marker 10, and the marker and the goal must agree (#2
                 std.mem.writeInt(u32, bytes[28..32], prompt_profile_section_count, .little);
             if (tamper.marker == CHECKPOINT_COMPATIBILITY_MARKER)
                 std.mem.writeInt(u32, bytes[28..32], section_count, .little);
+            // A valid digest, so only the header rule can refuse it.
+            rehashFixture(bytes);
             var tampered = TestSource{ .bytes = bytes };
             try std.testing.expectError(tamper.expected, decodeFromSource(allocator, .{ .ctx = &tampered, .read_fn = TestSource.read }, limits));
         }
