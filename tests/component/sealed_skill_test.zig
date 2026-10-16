@@ -870,9 +870,11 @@ test "L2 sealed: Glob and Grep under sealed/ are answered on the gateway; a Glob
     _ = cc.util_toolchain.ripgrepPath() catch return error.SkipZigTest;
     const a = std.testing.allocator;
     var lab: Lab = undefined;
-    var pre_buf: [512]u8 = undefined;
-    const pre_root = harness.normalizeSlashes(@constCast(cc.util_fs.testing.perPidDir(&pre_buf, "cc-zig-sealed-search")));
-    const base = try std.fmt.allocPrint(a, "{s}/state/sealed-skills/erp-post", .{pre_root});
+    // The brain names paths under the base directory it was told — the
+    // catalog's canonical spelling of the pin directory (brainVisibleRoot).
+    const brain_root = try brainVisibleRoot(a, "cc-zig-sealed-search");
+    defer a.free(brain_root);
+    const base = try std.fmt.allocPrint(a, "{s}/state/sealed-skills/erp-post", .{brain_root});
     defer a.free(base);
     const glob_sealed = try std.fmt.allocPrint(a, "{{\"pattern\":\"**/*.md\",\"path\":\"{s}/sealed\"}}", .{base});
     defer a.free(glob_sealed);
