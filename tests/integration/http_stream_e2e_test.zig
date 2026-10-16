@@ -8,6 +8,7 @@ test "MockServer + std.http.Client + EventIterator: text_delta event" {
 
     const sse_body =
         "data: {\"type\":\"content_block_delta\",\"delta\":{\"text\":\"hello\"}}\n\n" ++
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n" ++
         "data: {\"type\":\"message_stop\"}\n\n";
     var srv = try MockServer.start(sse_body, 0);
     defer srv.stop();

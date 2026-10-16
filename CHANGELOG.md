@@ -12,6 +12,35 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Added
 
+- AgentCore ABI v1 revision 20 (#270): `session->submit_input` hands an active
+  Run more user text. It may be called from any thread or from inside the
+  Run's own callbacks, like `session_abort`, and never waits for the Run. Each
+  input carries a non-zero Host `input_id` (unique within the Run) and gets a
+  1-based acceptance `sequence` in its receipt. The Run appends every pending
+  input verbatim, in acceptance order, as its own user record at its next turn
+  boundary — never into a request already sent, never at a `max_tokens`
+  continuation boundary — and emits `input_adopted {input_id, sequence, turn}`
+  for each. Input waits while a Permission or question request is pending and
+  never answers it. A Run that ends before another boundary leaves its pending
+  input unadopted. `RunResultV1.input_accepted_count` and
+  `input_adopted_count` are defined on every `session_run_input` return,
+  failures and poisoning ones included: adoption is always a prefix of
+  acceptance, so the counts tell the Host exactly which inputs reached the
+  Conversation even when an event was lost. Limits: 64 inputs and 16 MiB of
+  text per Run (`MAX_SUBMITTED_INPUTS_V1`, `MAX_SUBMITTED_INPUT_BYTES_V1`);
+  each input reserves its checkpoint bytes against the durable budget, counts
+  with the root input toward `input_cap_bytes`, must leave room for one whole
+  provider operation, and is refused with `CHECKPOINT_BUDGET_REQUIRED` —
+  without ending the Run — when it does not fit. Once a Run is aborting (an
+  abort, or a callback the Host failed) it adopts nothing more. A refused submission changes nothing; a stale id is `STALE_RUN`, a Run
+  that ended or is ending `TOO_LATE`, a forked Skill Run `INVALID_STATE`.
+  Adopted input is ordinary Conversation state and survives checkpoint and
+  restore. The Session table grows by one slot to 48 bytes and `RunResultV1`
+  turns its first reserved word into the two counts; the header, Zig and Rust
+  SDKs (`raw.rs` regenerated), both source-free consumers, the bundle manifest
+  and the docs move to revision 20, SDK package `0.7.0-dev`. Source-level
+  Hosts use `AgentSession.submitInput` / `runInputReconciliation`.
+
 - Skills and MCP servers configured for Claude Code and Codex now work in
   metacodes, next to its own `<state root>/skills` and `config.json`
   ([doc/SKILLS_AND_MCP.md](doc/SKILLS_AND_MCP.md)). Skills come from
@@ -115,6 +144,13 @@ status, compatibility boundaries, and entry points are defined by
   create holds its connection while the session starts; after a timed-out
   create, check `GET /sessions`. Normative rules:
   [doc/API.md](doc/API.md#web-and-daemon-http-surface).
+
+- The `--json` result line carries `continuations`: how many times the Run
+  asked the model to continue an answer the provider cut at its output-token
+  limit (`max_tokens`). The continued text is one seamless concatenation and
+  the line still reads `end_turn`, so before this a headless consumer could not
+  tell the answer had been truncated. Source-level Hosts read the same count
+  from `RunResult.continuations` (issue #269).
 
 ### Changed
 
@@ -231,6 +267,26 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- A provider stream that ends before it reports how it stopped is no longer
+  taken for a finished answer (issue #269). A clean end of the connection, or a
+  bare `[DONE]`, without Anthropic's `message_delta.stop_reason`, OpenAI chat's
+  `finish_reason`, the Responses `response.completed`/`response.incomplete`
+  event or Gemini's `finishReason` used to come back as `end_turn`; when the
+  lost bytes were the ones carrying `max_tokens`/`length`, a truncated answer
+  read as complete and the continuation that should have followed never ran.
+  Such a stream is now a mid-stream failure: its text is discarded and the turn
+  re-issued within `max_stream_turn_retries` (two in headless mode), and with
+  none left the Run ends in `api_error`. A stream that reported its stop and
+  lost only the frame tail after it (`message_stop`, `[DONE]`, a trailing usage
+  chunk) still finishes normally, and its stop — `max_tokens` included — still
+  drives the continuation; a frame tail without a stop report before it is
+  incomplete. An Anthropic tool_use block still open when the stream ends was
+  silently dropped and now makes the stream incomplete. Gemini's stop report is
+  read from the candidate and `promptFeedback` themselves, so a `finishReason`
+  key inside a function call's arguments no longer passes for one. An empty
+  200 body is incomplete too, rather than an empty answer. Gemini
+  `CONTINUATION` (the answer reached the per-request limit but is not finished)
+  now drives the same continuation as `max_tokens`.
 - `WebSearch` no longer passes off a search the server paused as a complete
   one. Its internal search request is the only one that carries a server tool,
   and when Anthropic stops it with `pause_turn` (the server-side search loop

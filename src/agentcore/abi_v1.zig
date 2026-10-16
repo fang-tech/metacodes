@@ -3217,6 +3217,9 @@ const AbiSession = struct {
         var run_admission = session_budget.RunAdmission{ .controller = &budget_controller };
         self.core_session.setResponseObserver(run_admission.observer());
         defer self.core_session.setResponseObserver(null);
+        // Host input submitted during the Run is budgeted by the same controller.
+        self.core_session.setRunInputAdmission(SubmittedInputBudget.admission(&budget_controller));
+        defer self.core_session.finishRunInputAdmission();
 
         const execution = switch (try self.admitMaterializedSkillBudgeted(
             materializations,
@@ -3312,6 +3315,9 @@ const AbiSession = struct {
         var run_admission = session_budget.RunAdmission{ .controller = &budget_controller };
         self.core_session.setResponseObserver(run_admission.observer());
         defer self.core_session.setResponseObserver(null);
+        // Host input submitted during the Run is budgeted by the same controller.
+        self.core_session.setRunInputAdmission(SubmittedInputBudget.admission(&budget_controller));
+        defer self.core_session.finishRunInputAdmission();
         const binding: ?*SkillBinding = if (self.skill_binding) |*value| value else null;
         const has_model_skill = if (binding) |value|
             materializations.supportsExactFileModes() and
@@ -7241,6 +7247,15 @@ fn sessionRunInput(
         self.clearStagedPermission();
         self.finishRun();
     }
+    // Input reconciliation (#270) is defined on every return, OK or not, so a
+    // Host can tell which submitted inputs reached the Conversation even after
+    // a poisoning failure. Declared after the gate defer, so it runs before
+    // the gate is released. Zero when this call admitted no Run — including a
+    // call that reuses the last admitted id and is refused before admission,
+    // which must not report that earlier Run's counts. The gate is held, so no
+    // other call can admit a Run in between.
+    const admitted_before = self.core_session.lastAdmittedRunId();
+    defer if (out_result) |out| writeInputReconciliation(self, run_id, admitted_before, out);
     if (self.facade_poisoned.load(.acquire))
         return fail(wire.STATUS_INVALID_STATE, "Session is poisoned by a previous admitted Run failure", out_error);
     const input = input_ptr orelse return fail(wire.STATUS_INVALID_ARGUMENT, "RunInputV1 is required", out_error);
@@ -7427,7 +7442,9 @@ fn sessionRunInput(
                 .result_flags = 0,
                 .durable_usage_bytes = 0,
                 .required_checkpoint_bytes = 0,
-                .reserved = [_]u64{0} ** 4,
+                .input_accepted_count = 0,
+                .input_adopted_count = 0,
+                .reserved = [_]u64{0} ** 3,
             };
             writeRunBudgetFields(self, out);
             invokeTestEpilogueHook(run_id);
@@ -7457,10 +7474,20 @@ fn sessionRunInput(
         .result_flags = 0,
         .durable_usage_bytes = 0,
         .required_checkpoint_bytes = 0,
-        .reserved = [_]u64{0} ** 4,
+        .input_accepted_count = 0,
+        .input_adopted_count = 0,
+        .reserved = [_]u64{0} ** 3,
     };
     writeRunBudgetFields(self, out);
     return wire.STATUS_OK;
+}
+
+fn writeInputReconciliation(self: *AbiSession, run_id: u64, admitted_before: u64, out: *wire.RunResultV1) void {
+    const admitted_here = admitted_before != run_id and self.core_session.lastAdmittedRunId() == run_id;
+    const counts = (if (admitted_here) self.core_session.runInputReconciliation(run_id) else null) orelse
+        core.run_input.Reconciliation{};
+    out.input_accepted_count = counts.accepted;
+    out.input_adopted_count = counts.adopted;
 }
 
 /// The terminal RunState phase for a Run's final stop reason. This is the only
@@ -7514,6 +7541,83 @@ fn sessionAbort(handle: ?*wire.SessionHandle, run_id: u64, reason_code: u32, out
     }, err, out_error);
     return wire.STATUS_OK;
 }
+
+/// Revision 20 (#270): queue more user text for the active Run. Like abort,
+/// it bypasses the facade Run gate and never takes the callback mutex, so a
+/// Host may call it from another thread or from inside the matching Run's
+/// own callbacks. It changes nothing but the Run's input queue: a refusal
+/// never ends, aborts or poisons the Run.
+fn sessionSubmitInput(
+    handle: ?*wire.SessionHandle,
+    run_id: u64,
+    input_ptr: ?*const wire.SubmittedInputV1,
+    out_receipt: ?*wire.InputReceiptV1,
+    out_error: ?*wire.OwnedBytesV1,
+) callconv(.c) u32 {
+    if (out_receipt) |out| out.* = std.mem.zeroes(wire.InputReceiptV1);
+    emptyError(out_error);
+    const self = sessionFrom(handle orelse return fail(wire.STATUS_INVALID_ARGUMENT, "session is required", out_error));
+    const runtime = self.runtime orelse
+        return fail(wire.STATUS_INVALID_STATE, "Session has no owning Runtime", out_error);
+    var runtime_call = runtime.catalogs.enterCall() catch |err|
+        return failError(catalogLifecycleStatus(err), err, out_error);
+    defer runtime_call.deinit();
+    if (self.facade_poisoned.load(.acquire))
+        return fail(wire.STATUS_INVALID_STATE, "Session is poisoned by a previous admitted Run failure", out_error);
+    const input = input_ptr orelse return fail(wire.STATUS_INVALID_ARGUMENT, "SubmittedInputV1 is required", out_error);
+    const out = out_receipt orelse return fail(wire.STATUS_INVALID_ARGUMENT, "out_receipt is required", out_error);
+    if (run_id == 0 or input.struct_size != @sizeOf(wire.SubmittedInputV1) or input.reserved0 != 0 or
+        !allZero(input.reserved) or input.input_id == 0)
+        return fail(wire.STATUS_INVALID_ARGUMENT, "invalid run id, input id, or SubmittedInputV1", out_error);
+    if (input.text.len > wire.MAX_SUBMITTED_INPUT_BYTES_V1)
+        return fail(wire.STATUS_RESOURCE_LIMIT, "input exceeds AgentCore ABI v1 limit", out_error);
+    const body = text(input.text) catch |err| return failError(wire.STATUS_INVALID_ARGUMENT, err, out_error);
+    const sequence = self.core_session.submitInput(run_id, input.input_id, body) catch |err| return failError(switch (err) {
+        error.StaleRun => wire.STATUS_STALE_RUN,
+        error.InputTooLate => wire.STATUS_TOO_LATE,
+        error.InvalidSessionState => wire.STATUS_INVALID_STATE,
+        error.InvalidInput, error.DuplicateInputId => wire.STATUS_INVALID_ARGUMENT,
+        error.InputLimitExceeded => wire.STATUS_RESOURCE_LIMIT,
+        error.BudgetRequired => wire.STATUS_CHECKPOINT_BUDGET_REQUIRED,
+        error.OutOfMemory => wire.STATUS_OUT_OF_MEMORY,
+        // The Session maps these to the outcomes above; reaching here is a Core bug.
+        error.InputClosed, error.InputNotAccepted => wire.STATUS_INTERNAL_ERROR,
+    }, err, out_error);
+    out.* = .{
+        .struct_size = @sizeOf(wire.InputReceiptV1),
+        .sequence = sequence,
+        .reserved = [_]u64{0} ** 2,
+    };
+    return wire.STATUS_OK;
+}
+
+comptime {
+    // The Core queue's defaults are the published per-Run limits; a drift
+    // would make the ABI enforce something other than what it documents.
+    const defaults = core.run_input.Limits{};
+    std.debug.assert(defaults.max_inputs == wire.MAX_SUBMITTED_INPUTS_V1);
+    std.debug.assert(defaults.max_total_bytes == wire.MAX_SUBMITTED_INPUT_BYTES_V1);
+}
+
+/// `run_input.Admission` over one Run's budget controller (#270): inputs are
+/// reserved at acceptance, committed at adoption, released at Run end.
+const SubmittedInputBudget = struct {
+    fn admission(controller: *session_budget.Controller) core.run_input.Admission {
+        return .{ .ctx = controller, .reserveFn = reserve, .commitFn = commit, .releaseFn = release };
+    }
+    fn reserve(ctx: *anyopaque, input_text: []const u8) error{BudgetRequired}!u64 {
+        const controller: *session_budget.Controller = @ptrCast(@alignCast(ctx));
+        return controller.reserveSubmittedInput(input_text) catch error.BudgetRequired;
+    }
+    fn commit(ctx: *anyopaque, reserved: u64) void {
+        const controller: *session_budget.Controller = @ptrCast(@alignCast(ctx));
+        controller.commitSubmittedInput(reserved);
+    }
+    fn release(ctx: *anyopaque, reserved: u64) void {
+        const controller: *session_budget.Controller = @ptrCast(@alignCast(ctx));
+        controller.releaseSubmittedInput(reserved);
+    }
+};
 
 fn sessionCompact(
     handle: ?*wire.SessionHandle,
@@ -7653,6 +7757,7 @@ const session_api_v1 = wire.SessionApiV1{
     .destroy = sessionDestroy,
     .run_input = sessionRunInput,
     .abort = sessionAbort,
+    .submit_input = sessionSubmitInput,
 };
 
 const session_control_api_v1 = wire.SessionControlApiV1{
@@ -7897,7 +8002,7 @@ test "ABI discovery is versioned" {
     try std.testing.expect(metask_agentcore_get_api(0) == null);
     const raw = metask_agentcore_get_api(wire.ABI_VERSION_V1) orelse return error.MissingApi;
     const api: *const wire.ApiV1 = @ptrCast(@alignCast(raw));
-    try std.testing.expectEqual(@as(u32, 19), api.abi_revision);
+    try std.testing.expectEqual(@as(u32, 20), api.abi_revision);
     try std.testing.expectEqual(@as(usize, 64), api.struct_size);
     try std.testing.expect(api.runtime != null);
     try std.testing.expect(api.session != null);

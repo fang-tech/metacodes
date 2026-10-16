@@ -16,7 +16,7 @@ pub enum AbiError {
     LengthOverflow,
 }
 
-/// Validated Revision 19 root plus mandatory domain tables. Discovery rejects
+/// Validated Revision 20 root plus mandatory domain tables. Discovery rejects
 /// every other layout; there is no legacy probe or alternate dispatch.
 #[derive(Clone, Copy)]
 pub struct Api {
@@ -155,6 +155,10 @@ impl SessionApi {
     pub fn abort(self) -> raw::metask_agentcore_session_abort_fn_v1 {
         self.table().abort
     }
+    /// Revision 20: queue more user text for the active Run.
+    pub fn submit_input(self) -> raw::metask_agentcore_session_submit_input_fn_v1 {
+        self.table().submit_input
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -276,6 +280,7 @@ unsafe fn validate_session_api(ptr: *const raw::metask_agentcore_session_api_v1)
         && table.destroy.is_some()
         && table.run_input.is_some()
         && table.abort.is_some()
+        && table.submit_input.is_some()
 }
 
 unsafe fn validate_session_control_api(
@@ -612,7 +617,12 @@ mod tests {
 
     #[test]
     fn revision_fifteen_layout_codes_and_host_buffer_helpers_are_exact() {
-        assert_eq!(raw::METASK_AGENTCORE_ABI_REVISION, 19);
+        assert_eq!(raw::METASK_AGENTCORE_ABI_REVISION, 20);
+        assert_eq!(raw::METASK_AGENTCORE_MAX_SUBMITTED_INPUTS_V1, 64);
+        assert_eq!(raw::METASK_AGENTCORE_MAX_SUBMITTED_INPUT_BYTES_V1, 16_777_216);
+        assert_eq!(size_of::<raw::metask_agentcore_submitted_input_v1>(), 48);
+        assert_eq!(size_of::<raw::metask_agentcore_input_receipt_v1>(), 24);
+        assert_eq!(size_of::<raw::metask_agentcore_run_result_v1>(), 72);
         assert_eq!(raw::METASK_AGENTCORE_PROMPT_OP_ADD, 1);
         assert_eq!(raw::METASK_AGENTCORE_PROMPT_OP_REPLACE, 2);
         assert_eq!(raw::METASK_AGENTCORE_PROMPT_OP_REMOVE, 3);
@@ -651,7 +661,7 @@ mod tests {
         assert_eq!(raw::METASK_AGENTCORE_MCP_APPLY_SUPERSEDED, 2);
         assert_eq!(raw::METASK_AGENTCORE_MCP_APPLY_REJECTED, 3);
         assert_eq!(size_of::<raw::metask_agentcore_runtime_api_v1>(), 24);
-        assert_eq!(size_of::<raw::metask_agentcore_session_api_v1>(), 40);
+        assert_eq!(size_of::<raw::metask_agentcore_session_api_v1>(), 48);
         assert_eq!(
             size_of::<raw::metask_agentcore_session_control_api_v1>(),
             80

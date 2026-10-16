@@ -132,6 +132,7 @@ pub const CoreEvent = union(enum) {
     phase_change: Phase,                          // input ↔ generating
     auto_compact: struct { dropped, kept, before_tokens, after_tokens, cause }, // 自动压缩历史;cause 以 context_window_exceeded_ 开头的是恢复,不是压缩
     retry_notice: struct { attempt, max, delay_ms }, // 流式建连重试
+    input_adopted: struct { input_id, sequence, turn }, // Session 活动 Run 的 Host 输入已进对话(§3.3,#270)
     ui_request_pending: struct { tool_use_id, request_json }, // 可挂起 UI 请求(异步前端,见 §5.3)
 
     // 输出语义(见 §3.2.1)
@@ -287,8 +288,12 @@ pub const Phase = enum(u8) { input = 0, generating = 1 };
 `budget`),它补充而不取代 AbortSignal 的动中断;max_tokens 续写边界不 poll(续写段必须仍是同一个
 答案)。生产方决定什么可转向:TuiBackend 只交出普通 prompt,`/命令`、`!shell`、`exit` 留在队列由
 REPL 在 Run 结束后派发。REPL 里 Run 内的边界由 `run()` 消费,Run 结束时仍留在队列里的由 loop.zig
-合并成下一个 Run 的输入。AgentCore Session 的 backend.poll 恒返 null:二进制 ABI 没有活动 Run 的
-输入操作,宿主自己排队、Run 返回后再 run_input,或 abort。
+合并成下一个 Run 的输入。AgentCore Session 的 backend.poll 恒返 null:Session 的活动 Run 输入走
+带类型的第二条缝 `Options.run_inputs`(`core/run_input.zig` 的 `Queue`,#270)——同一个边界、同样
+跳过续写边界,但每条输入有 Host 给的 id、按接受序采纳(逐条追加原文、不 trim)、每条采纳发
+`CoreEvent.input_adopted{input_id, sequence, turn}`,Run 结束时关窗得 accepted/adopted 两个计数
+(采纳恒为接受序前缀,计数而非事件是对账依据)。`AgentSession.submitInput` / 二进制
+`session->submit_input` 是它的入口,见 AGENTCORE_BINARY_ABI.md "Active-Run input"。
 
 ### 3.4 UiRequest — core 向前端**请求一个回答**(交互式)
 
@@ -345,6 +350,7 @@ pub const RunResult = struct {
     tool_calls: u32,
     suspend_info: ?SuspendInfo = null,
     stall: ?stall_gate.Report = null, // 非空 ⇔ stop_reason == .stalled
+    continuations: u32 = 0, // 本次 run 的 max_tokens 续写次数(≤ MAX_CONTINUATIONS)
 };
 pub const StopReason = enum {
     end_turn, max_turns, aborted, tool_error, api_error, tool_loop,
@@ -855,6 +861,25 @@ CoreEvent/UiEvent/UiRequest 全可序列化(无指针/闭包)。emit 内 `serial
   正文阶段的 stall 不自动重发(已流出的内容不能假装可回滚);TaskBatch 的 join 有界于空闲上限,
   不会 detach 卡死的 worker;TUI 每个 provider 回合结束就刷 transcript,但一个回合内的内容仍只在
   内存里。
+- **流必须报告它是怎么停的,否则不是收尾**(issue #269):四条 wire 各有一个停止报告——Anthropic
+  的 `message_delta.stop_reason`、OpenAI chat 的非 null `finish_reason`、Responses 的
+  `response.completed` / `response.incomplete`、Gemini 的 `finishReason`(或整条 prompt 被拒的
+  `promptFeedback.blockReason`)。干净 EOF 或只有 `[DONE]` 而没有它,解析器抛
+  `error.StreamIncomplete`(经 `client.reportStreamIncomplete` 写 last_error);agent_loop 把它当
+  流内失败:丢弃残片,按 `Options.max_stream_turn_retries` 同轮重发,额度用尽 `stop_reason=api_error`。
+  此前它被归一成 `end_turn`——丢的字节恰好是 `max_tokens` / `length` 时,截断的回答读起来是完整的,
+  续写安全网不开火。报告过停止原因、只丢了帧尾(`message_stop`、`[DONE]`、其后的 usage 块)的流
+  照常收尾:帧尾不携带回答的任何内容,停止原因(含 `max_tokens`)照样驱动续写。反过来,帧尾到了
+  而没有停止报告(只有 `message_stop`、只有 `[DONE]`)同样是未完成。值不认识的停止原因也算
+  "报告过"(`StopReason.unknown` 只用于分支,不再兼任"没报");空串、Gemini 的
+  `FINISH_REASON_UNSPECIFIED` 不算。Anthropic 流里仍开着的 tool_use 块(EOF 或 `message_stop`
+  时)一律算未完成——参数可能残缺,而它要在本地执行;其它没收到 `content_block_stop` 的块不拦
+  (stop_reason 之后文本已完整;server_tool_use 无结果块即收尾是合法的 `pause_turn`)。Gemini 的
+  停止报告按结构读(`candidates[i].finishReason`、`promptFeedback.blockReason`):`functionCall.args`
+  是未转义的 JSON 对象,子串扫描会把参数里的同名键当成停止报告。取消与 stall 先于"未完成"判定。
+  `RunResult.continuations` 记本次 `run` 的
+  max_tokens 续写次数,headless `--json` 结果行同名字段携带它:续写后的正文是无缝拼接,只看结果
+  的消费者没有别的办法知道回答被截断过。
 - **permission 门不可挂起**:权限确认是 `executeSlots` 前的同步门,异步挂起暂不覆盖(out of scope)。
 - **文件修改契约只覆盖类型化文件工具**(Write/Edit/NotebookEdit/ApplyPatch,§3.2.2)。`Bash` 或
   任意终端命令改动文件系统**不会**产生 `file_changes`——要覆盖它需要文件系统级观测,不在本契约内。

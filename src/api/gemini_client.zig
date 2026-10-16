@@ -365,6 +365,10 @@ const GeminiStream = struct {
     image_placeholder_ids: []const []const u8 = &.{},
     done: bool = false,
     last_stop: StopReason = .unknown,
+    /// 流报告过"怎么停的":候选的 `finishReason`(含本端不认识的值),或整条请求被拒的
+    /// `promptFeedback.blockReason`。Gemini 流没有 `[DONE]` 之类的帧尾——末块的
+    /// finishReason 就是终止标记;没有它的 EOF 是断流,丢的可能正是 MAX_TOKENS(issue #269)。
+    stop_reported: bool = false,
     fc_counter: u32 = 0, // functionCall 计数(Gemini 无 id,自生成 call_N)
     /// 并行 functionCall 队列(P0.1):一个 Gemini chunk 的 parts 可含多个 functionCall。
     /// 一次 next() 只能吐一个事件,故首个直接返回、其余排队,后续 next() 逐个 drain。
@@ -459,6 +463,12 @@ const GeminiStream = struct {
                     client_mod.reportBodyStall("gemini", self.id, stall);
                     return error.StreamStalled;
                 }
+                // 没报告停止原因就结束 = 断流,不是收尾。pending usage 一并作废:调用方把这次
+                // 尝试当流内失败,其 usage 本来也不计入(见 agent_loop report_usage)。
+                if (!self.stop_reported) {
+                    client_mod.reportStreamIncomplete("gemini", self.id);
+                    return error.StreamIncomplete;
+                }
                 // 流尽:若还有 pending usage(末 chunk 只含内容+usage,内容已 emit),吐它。
                 if (self.pending_usage) |u| {
                     self.pending_usage = null;
@@ -480,7 +490,13 @@ const GeminiStream = struct {
 
     /// 解析一个 Gemini SSE chunk(完整 GenerateContentResponse JSON)→ 中立 StreamEvent。
     fn parseChunk(self: *GeminiStream, data: []const u8) !?StreamEvent {
-        if (util_json.extractStringField(data, "finishReason")) |fr| self.last_stop = mapGeminiFinish(fr);
+        const report = stopReport(data);
+        if (report.finish_reason) |fr| {
+            self.last_stop = mapGeminiFinish(fr);
+            self.stop_reported = true;
+        }
+        // 整条 prompt 被拒:没有候选、也就没有 finishReason,但流确实说清了它为什么停。
+        if (report.blocked) self.stop_reported = true;
 
         // usageMetadata → 中立 UsageDelta(含 cachedContentTokenCount → cache_read,经 cache.zig)。
         // **关键(E 修复)**:Gemini 常把 usageMetadata 与末 content chunk(text+finishReason)合并。
@@ -569,9 +585,14 @@ fn shutdownRequest(raw: *anyopaque) void {
 }
 
 fn mapGeminiFinish(fr: []const u8) StopReason {
+    // 工具调用也以 STOP 收尾(没有单独的 "tool_calls" 值);上层据 tool_use 是否非空续轮。
     if (std.mem.eql(u8, fr, "STOP")) return .end_turn;
     if (std.mem.eql(u8, fr, "MAX_TOKENS")) return .max_tokens;
-    // Gemini 工具调用不单独给 finishReason(functionCall 在 parts 里),保守 unknown→上层据 tool_use 续轮。
+    // CONTINUATION:"reached the per-request token limit, but generation is not yet
+    // complete"——同样是被截断的回答。归 unknown 会把它当完成交上去(issue #269 同类);
+    // 归 max_tokens 让 agent_loop 的续写安全网接着要(不依赖 continuationToken)。
+    if (std.mem.eql(u8, fr, "CONTINUATION")) return .max_tokens;
+    // 其余(SAFETY/RECITATION/MALFORMED_FUNCTION_CALL/…)是报告过的终止,只是本端不细分。
     return .unknown;
 }
 
@@ -585,6 +606,46 @@ fn freeToolUseStart(allocator: std.mem.Allocator, ev: StreamEvent) void {
         },
         else => {},
     }
+}
+
+/// 一个 chunk 里的停止报告,**按结构读**:候选级 `candidates[i].finishReason`(首个有值的
+/// 候选)与请求级 `promptFeedback.blockReason`。不能子串扫描整个 chunk——`functionCall.args`
+/// 是未转义的 JSON 对象,参数里同名的键会被当成停止报告,断流的 EOF 就被放行成完整回答
+/// (issue #269 review)。空值与 FINISH_REASON_UNSPECIFIED("Default value. This value is
+/// unused.")都不算:规范写明 finishReason 为空即"模型还没停"。
+const StopReport = struct {
+    finish_reason: ?[]const u8 = null,
+    blocked: bool = false,
+};
+
+fn stopReport(data: []const u8) StopReport {
+    var report = StopReport{};
+    if (util_json.topLevelField(data, "candidates")) |candidates| if (candidates[0] == '[') {
+        var pos: usize = 1;
+        while (pos < candidates.len) {
+            while (pos < candidates.len and (candidates[pos] == ',' or candidates[pos] == ' ' or
+                candidates[pos] == '\t' or candidates[pos] == '\n' or candidates[pos] == '\r')) : (pos += 1)
+            {}
+            const candidate = braceObject(candidates, pos) orelse break;
+            pos = candidate.end;
+            if (jsonString(util_json.topLevelField(candidate.obj, "finishReason"))) |fr| {
+                if (fr.len == 0 or std.mem.eql(u8, fr, "FINISH_REASON_UNSPECIFIED")) continue;
+                report.finish_reason = fr;
+                break;
+            }
+        }
+    };
+    if (util_json.topLevelObjectField(data, "promptFeedback")) |feedback| {
+        if (jsonString(util_json.topLevelField(feedback, "blockReason"))) |reason| report.blocked = reason.len != 0;
+    }
+    return report;
+}
+
+/// `topLevelField` 的原始值若是 JSON 字符串,返回去掉引号的内容(枚举值无转义);否则 null。
+fn jsonString(raw: ?[]const u8) ?[]const u8 {
+    const value = raw orelse return null;
+    if (value.len < 2 or value[0] != '"' or value[value.len - 1] != '"') return null;
+    return value[1 .. value.len - 1];
 }
 
 /// 从 `from` 起跳空白,取一个 {...} 对象(括号配平,跳字符串)。返回对象文本 + 结束偏移(供续找)。
@@ -1358,4 +1419,86 @@ test "Gemini 防御分支: 方言不支持图像输入 → functionResponse 占�
     try std.testing.expect(std.mem.indexOf(u8, body, "\"result\":\"[image (image/png) was read successfully but omitted: this model does not support image input]\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "UE5HREFUQQ==") == null);
     try std.testing.expect(std.mem.indexOf(u8, body, "inline_data") == null);
+}
+
+// ── issue #269:Gemini 流没有帧尾,末块的 finishReason 就是终止标记 ───────────────
+
+/// 用固定 reader 直驱 GeminiStream(不建 HTTP 请求),逐个吐事件直到 null 或出错。
+/// 返回收到的文本(caller free)。
+fn replayGemini(a: std.mem.Allocator, sse: []const u8, stop: *StopReason) ![]u8 {
+    var stream = GeminiStream{
+        .allocator = a,
+        .request = undefined,
+        .response = undefined,
+        .id = .{ .bytes = .{0} ** 12 },
+    };
+    defer {
+        for (stream.fc_queue.items[stream.fc_pos..]) |ev| freeToolUseStart(a, ev);
+        stream.fc_queue.deinit(a);
+    }
+    var body = std.Io.Reader.fixed(sse);
+    stream.reader = &body;
+    var text: std.ArrayList(u8) = .empty;
+    errdefer text.deinit(a);
+    while (stream.next() catch |err| {
+        try std.testing.expect((try stream.next()) == null); // 失败即终态
+        return err;
+    }) |ev| switch (ev) {
+        .text => |t| {
+            defer a.free(t);
+            try text.appendSlice(a, t);
+        },
+        .thinking, .reasoning_item, .web_search_query => |bytes| a.free(bytes),
+        .tool_use_start => freeToolUseStart(a, ev),
+        .web_search_result => |w| {
+            a.free(w.ui_text);
+            a.free(w.content_json);
+        },
+        .usage, .done => {},
+    };
+    stop.* = stream.last_stop;
+    return text.toOwnedSlice(a);
+}
+
+test "issue #269 Gemini: EOF before any finishReason is StreamIncomplete" {
+    var stop: StopReason = .unknown;
+    try std.testing.expectError(error.StreamIncomplete, replayGemini(std.testing.allocator, "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"half\"}],\"role\":\"model\"},\"index\":0}]}\n\n", &stop));
+}
+
+test "issue #269 Gemini: the finishReason chunk ends the stream, MAX_TOKENS survives" {
+    var stop: StopReason = .unknown;
+    const text = try replayGemini(std.testing.allocator, "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"cut\"}],\"role\":\"model\"},\"index\":0}]}\n\n" ++
+        "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"\"}],\"role\":\"model\"},\"finishReason\":\"MAX_TOKENS\",\"index\":0}]," ++
+        "\"usageMetadata\":{\"promptTokenCount\":3,\"candidatesTokenCount\":2}}\n\n", &stop);
+    defer std.testing.allocator.free(text);
+    try std.testing.expectEqualStrings("cut", text);
+    try std.testing.expectEqual(StopReason.max_tokens, stop);
+}
+
+test "issue #269 Gemini: CONTINUATION is a truncated answer, so it drives the continuation" {
+    var stop: StopReason = .unknown;
+    const text = try replayGemini(std.testing.allocator, "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"cut\"}],\"role\":\"model\"},\"finishReason\":\"CONTINUATION\",\"index\":0}]}\n\n", &stop);
+    defer std.testing.allocator.free(text);
+    try std.testing.expectEqual(StopReason.max_tokens, stop);
+}
+
+test "issue #269 Gemini: FINISH_REASON_UNSPECIFIED is not a stop report" {
+    var stop: StopReason = .unknown;
+    try std.testing.expectError(error.StreamIncomplete, replayGemini(std.testing.allocator, "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"half\"}],\"role\":\"model\"},\"finishReason\":\"FINISH_REASON_UNSPECIFIED\",\"index\":0}]}\n\n", &stop));
+}
+
+test "issue #269 Gemini: a finishReason key inside functionCall.args is not a stop report" {
+    // args is an unescaped JSON object, so a substring scan would read this
+    // tool argument as the candidate's terminal status and accept the EOF.
+    var stop: StopReason = .unknown;
+    try std.testing.expectError(error.StreamIncomplete, replayGemini(std.testing.allocator, "data: {\"candidates\":[{\"content\":{\"parts\":[{\"functionCall\":{\"name\":\"report\"," ++
+        "\"args\":{\"finishReason\":\"STOP\",\"promptFeedback\":{\"blockReason\":\"SAFETY\"}}}}],\"role\":\"model\"},\"index\":0}]}\n\n", &stop));
+}
+
+test "issue #269 Gemini: a blocked prompt reports why it stopped without any candidate" {
+    var stop: StopReason = .unknown;
+    const text = try replayGemini(std.testing.allocator, "data: {\"promptFeedback\":{\"blockReason\":\"SAFETY\"},\"usageMetadata\":{\"promptTokenCount\":3}}\n\n", &stop);
+    defer std.testing.allocator.free(text);
+    try std.testing.expectEqualStrings("", text);
+    try std.testing.expectEqual(StopReason.unknown, stop);
 }

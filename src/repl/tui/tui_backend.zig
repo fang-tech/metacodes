@@ -331,6 +331,8 @@ pub const TuiBackend = struct {
             .output_segment_begin, .output_segment_end => {},
             // L4 诊断事件:DiagnosticsBackend 专属(经 TeeBackend 旁挂),TUI 不渲染,no-op。
             .diag_turn_begin, .diag_turn_end, .diag_model_request, .diag_compact_request, .diag_compact_begin, .diag_compact_end, .diag_tool_stage, .diag_breaker_tripped, .diag_cache_break, .diag_continuation, .context_projection, .policy_decision, .diag_run_end => {},
+            // Session-only (AgentSession run inputs); the REPL steers through queue_message.
+            .input_adopted => {},
         }
     }
 

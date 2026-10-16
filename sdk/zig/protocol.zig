@@ -68,7 +68,7 @@ pub const PermissionCandidate = struct {
     target: ?[]const u8,
 };
 
-/// Exact Revision 19 Permission callback request. Unlike AskUserQuestion this
+/// Exact Revision 20 Permission callback request. Unlike AskUserQuestion this
 /// is a flat typed object, identified by `type == "permission"`.
 pub const PermissionRequest = struct {
     type: []const u8,
@@ -338,6 +338,16 @@ pub const CoreEvent = union(enum) {
         attempt: u32,
         max: u32,
         delay_ms: u64,
+    },
+    /// Revision 20: an input accepted by `submit_input` was appended to the
+    /// Conversation as a user record before request `turn` (1-based).
+    /// `sequence` is its receipt sequence; within a Run they arrive strictly
+    /// increasing, in Conversation order. Adoption is not provider receipt.
+    /// A missed event proves nothing: reconcile with the RunResultV1 counts.
+    input_adopted: struct {
+        input_id: u64,
+        sequence: u32,
+        turn: u32,
     },
     run_state: RunState,
     permission_provenance: PermissionProvenance,
@@ -736,6 +746,8 @@ pub fn decodeCoreEvent(allocator: std.mem.Allocator, encoded: []const u8) Decode
             .prompt_manifest => |value| try validatePromptManifest(value),
             .tool_result => |value| try validateFileReferences(value.file_refs),
             .file_changes => |value| try validateFileChanges(value.changes),
+            .input_adopted => |value| if (value.input_id == 0 or value.sequence == 0 or value.turn == 0)
+                return error.InvalidPayload,
             else => {},
         }
         return .{ .arena = arena, .value = .{ .known = known } };
@@ -1458,6 +1470,7 @@ test "CoreEvent decoder covers every ABI v1 tag" {
         "{\"context_warning\":{\"current_tokens\":1,\"warning_threshold\":2,\"auto_compact_threshold\":3,\"blocking_limit\":4,\"level\":\"medium\"}}",
         "{\"auto_compact\":{\"dropped\":1,\"kept\":2,\"before_tokens\":3,\"after_tokens\":4,\"cause\":\"trigger\"}}",
         "{\"retry_notice\":{\"attempt\":1,\"max\":2,\"delay_ms\":3}}",
+        "{\"input_adopted\":{\"input_id\":18446744073709551615,\"sequence\":1,\"turn\":2}}",
         "{\"run_state\":{\"run_id\":9,\"transition_seq\":1,\"phase\":\"starting\",\"turn\":0,\"tool_calls\":0,\"in_flight_tools\":[]}}",
         "{\"permission_provenance\":{\"decision\":\"allow\",\"source\":\"explicit_allow\",\"matched_rule_id\":null,\"session_id\":\"000000000000000000000001\",\"run_id\":1,\"tool_call_id\":\"tool-1\",\"request_id\":null,\"tool\":{\"namespace\":\"builtin\",\"name\":\"Read\",\"binding\":\"0000000000000000000000000000000000000000000000000000000000000000\"},\"canonical_arguments_digest\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"policy_generation\":1,\"used_session_rule\":false,\"callback_outcome\":null,\"response\":null}}",
         "{\"prompt_manifest\":{\"sha256\":\"" ++ "a" ** 64 ++ "\",\"sections\":[{\"id\":\"metacodes:identity\",\"order\":-1000,\"origin\":\"host\",\"class\":\"replaceable\",\"sha256\":\"" ++ "b" ** 64 ++ "\"},{\"id\":\"metacodes:safety-policy\",\"order\":-900,\"origin\":\"kernel\",\"class\":\"locked\",\"sha256\":\"" ++ "c" ** 64 ++ "\"}]}}",
@@ -1645,6 +1658,11 @@ test "CoreEvent decoder normalizes malformed and invalid inputs" {
     try std.testing.expectError(error.InvalidPayload, decodeCoreEvent(a, "{\"retry_notice\":{\"attempt\":1,\"max\":2}}"));
     try std.testing.expectError(error.InvalidPayload, decodeCoreEvent(a, "{\"retry_notice\":{\"attempt\":-1,\"max\":2,\"delay_ms\":3}}"));
     try std.testing.expectError(error.InvalidPayload, decodeCoreEvent(a, "{\"retry_notice\":{\"attempt\":1,\"max\":2,\"delay_ms\":18446744073709551616}}"));
+    // input_adopted names an accepted input: id, sequence and turn are never zero.
+    try std.testing.expectError(error.InvalidPayload, decodeCoreEvent(a, "{\"input_adopted\":{\"input_id\":0,\"sequence\":1,\"turn\":1}}"));
+    try std.testing.expectError(error.InvalidPayload, decodeCoreEvent(a, "{\"input_adopted\":{\"input_id\":1,\"sequence\":0,\"turn\":1}}"));
+    try std.testing.expectError(error.InvalidPayload, decodeCoreEvent(a, "{\"input_adopted\":{\"input_id\":1,\"sequence\":1,\"turn\":0}}"));
+    try std.testing.expectError(error.InvalidPayload, decodeCoreEvent(a, "{\"input_adopted\":{\"input_id\":1,\"sequence\":1}}"));
 }
 
 test "UiRequest decoder covers every tag and response encoder enforces pairing" {

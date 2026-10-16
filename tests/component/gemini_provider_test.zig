@@ -109,9 +109,11 @@ test "P0.5: parent=Gemini → spawnAgentSink 继承 Gemini provider(子请求是
     try std.testing.expect(std.mem.indexOf(u8, body, "claude") == null);
 }
 
-// Gemini functionCall(工具循环跨协议)。
+// Gemini functionCall(工具循环跨协议)。函数调用块同样带 finishReason=STOP:Gemini 的
+// Candidate.finishReason "If empty, the model has not stopped generating tokens"
+// (ai.google.dev/api/generate-content),没有它就结束的流是断流(issue #269)。
 const GEMINI_TOOLCALL_SSE =
-    "data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"functionCall\":{\"name\":\"get_time\",\"args\":{}}}]}}]}\n\n";
+    "data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"functionCall\":{\"name\":\"get_time\",\"args\":{}}}]},\"finishReason\":\"STOP\"}]}\n\n";
 
 const GEMINI_FINAL_SSE =
     "data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"the time is now\"}]},\"finishReason\":\"STOP\"}]}\n\n";
@@ -174,7 +176,7 @@ const GEMINI_PARALLEL_SSE =
     "data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[" ++
     "{\"functionCall\":{\"name\":\"get_time\",\"args\":{}}}," ++
     "{\"functionCall\":{\"name\":\"get_date\",\"args\":{}}}" ++
-    "]}}]}\n\n";
+    "]},\"finishReason\":\"STOP\"}]}\n\n";
 
 test "C3/P0.1: 并行 functionCall 两个都执行 + name 干净 + 第二轮双 functionResponse" {
     const a = std.testing.allocator;
