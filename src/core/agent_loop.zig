@@ -1952,7 +1952,7 @@ fn runCounted(
             .host_services = opts.host_services,
             .host_run = opts.host_run,
             .explicit_invocation = opts.explicit_invocation,
-            .session_id = opts.session_id,
+            .session_id = sessionIdText(&opts),
             .project_dir = opts.project_dir,
             .disable_shell_execution = opts.disable_shell_execution,
             .sandbox = opts.sandbox,
@@ -3342,7 +3342,7 @@ fn runCounted(
             .host_services = opts.host_services,
             .host_run = opts.host_run,
             .explicit_invocation = opts.explicit_invocation,
-            .session_id = opts.session_id,
+            .session_id = sessionIdText(&opts),
             .project_dir = opts.project_dir,
             .disable_shell_execution = opts.disable_shell_execution,
             .sandbox = opts.sandbox,
@@ -7747,4 +7747,24 @@ test "run inputs: an adoption that aborts the Run adopts nothing more and builds
     try std.testing.expectEqual(run_input_mod.Reconciliation{ .accepted = 2, .adopted = 1 }, queue.close());
     // Root prompt plus the one adopted input; the second stayed out.
     try std.testing.expectEqual(@as(usize, 2), c.len());
+}
+
+/// The session id a ToolContext carries as text: `opts.session_id` when the
+/// caller set it, else the routing `opts.session` unless it is the `.single`
+/// sentinel. Headless and REPL runs set only `session`, and the sealed
+/// Skill ledger (and anything else keyed by session) read the text form, so
+/// without this fallback those records carried an empty session id.
+fn sessionIdText(opts: *const Options) []const u8 {
+    if (opts.session_id.len != 0) return opts.session_id;
+    if (std.mem.eql(u8, opts.session.asSlice(), @import("session_id.zig").SessionId.single.asSlice())) return "";
+    return opts.session.asSlice();
+}
+
+test "sessionIdText prefers the explicit id, then the routing session, never the sentinel" {
+    var opts: Options = .{};
+    try std.testing.expectEqualStrings("", sessionIdText(&opts));
+    opts.session = .{ .bytes = .{'a'} ** 24 };
+    try std.testing.expectEqualStrings("a" ** 24, sessionIdText(&opts));
+    opts.session_id = "explicit";
+    try std.testing.expectEqualStrings("explicit", sessionIdText(&opts));
 }

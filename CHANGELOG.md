@@ -37,7 +37,13 @@ status, compatibility boundaries, and entry points are defined by
     `INVALID_ARGUMENT`.
   - **Source-level Hosts** build the same block with `core.time_context`.
   - SDK 0.9.0-dev.
-
+- Sealed Skills: the §8.5 disclosure screen keeps two corpora under their
+  own policies — the Skill's instructions and its `sealed/` references —
+  so `egress.disclosure` is one word for both or
+  `{"body": "redact", "references": "off"}`. A documentation Skill whose
+  references were being replaced by `[sealed]` when cited (seen with the
+  Browser Use Cloud reference skill) sets `references` to `off` and keeps
+  its instructions screened; the install summary shows both policies.
 - AgentCore Revision 21: Host model-capability declarations (issue #273).
   `SessionHostConfigV1.model_capabilities` / `model_capability_count` (two
   former reserved words; the struct stays 168 bytes) carry up to 256 40-byte
@@ -51,7 +57,6 @@ status, compatibility boundaries, and entry points are defined by
   `Provider.imageInput` answers with the source. The OpenAI and Gemini clients
   now apply a catalog's `image_input` declaration too (only the Anthropic
   client did), and the CLI hands them the Metask catalog. SDK 0.8.0-dev.
-
 - Sealed gateway at scale ([doc/SEALED_GATEWAY_SCALE_DESIGN.md](doc/SEALED_GATEWAY_SCALE_DESIGN.md)):
   `metacodes sealed serve` runs a bounded worker pool with a queue and a cap
   on in-flight model calls, refuses over-capacity requests before reading
