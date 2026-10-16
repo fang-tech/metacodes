@@ -9,7 +9,7 @@ ABI v1 is an experimental in-process embedding contract for synchronous,
 stateful AgentSession execution. It does not expose or define a host product
 model.
 
-**Status: experimental.** Revision 19 is one exact hard-cut Agent Runtime wire
+**Status: experimental.** Revision 20 is one exact hard-cut Agent Runtime wire
 shape. It keeps the existing checkpoint/restore, durable budget, MCP
 Runtime/Session seams, Workspace Skill source/identity/policy binding,
 hash-pinned process-tool packages, Host/MCP byte-zero Tool Result streaming,
@@ -18,11 +18,14 @@ Revision 17's per-file `file_target` Session grants, and Revision 18's Host
 control of the system prompt (see "System prompt profiles and context
 blocks"): `SessionCreateConfigV1.prompt_profile`,
 `session_control->set_prompt_profile`, `RunOptionsV1.context_blocks`, and the
-`prompt_manifest` observation event. Over Revision 18 it adds
-`session_control->update_permission_mode`, which changes an existing Session's
-permission mode in place while idle, and `describe` reports the effective
-`permission_mode` (see "Permission mode updates"). The Session Control table
-grows by one slot to 80 bytes; no other layout changes. Revision 16 stays
+`prompt_manifest` observation event, and Revision 19's
+`session_control->update_permission_mode` (see "Permission mode updates").
+Over Revision 19 it adds `session->submit_input`, which hands an active Run
+more user text, the `input_adopted` observation event, and two input counts in
+`RunResultV1` that reconcile every submitted input after any return (see
+"Active-Run input"). The Session table grows by one slot to 48 bytes and
+`RunResultV1` turns its first reserved word into the two counts; no other
+layout changes. Revision 16 stays
 skipped: it named the withdrawn first-class PDF input on `main`, and a
 revision keeps a single meaning. The independent public Completion facade
 stays removed. This is not a general v1 stability promise.
@@ -32,7 +35,7 @@ and treat a different revision as incompatible. Layouts, numeric values,
 function-table order, and semantics may change only through another explicit
 revision cut while v1 remains experimental.
 
-The current experimental bundle is **ABI v1 revision 19**. Revision 19 is a
+The current experimental bundle is **ABI v1 revision 20**. Revision 20 is a
 hard-cut replacement for every earlier revision. The root is no longer a
 capability-tagged flat table. It is a 64-byte exact layout containing the
 stable 16-byte discovery prefix, `buffer_release`, and five non-null typed
@@ -40,17 +43,20 @@ table pointers. Every table is mandatory at discovery; consumers simply avoid
 calling domains they do not use. There is no `query_interface`, string ID,
 optional-capability negotiation, or compatibility shim:
 
-- `metask_agentcore_api_v1` is 64 bytes and requires `abi_revision == 19`;
+- `metask_agentcore_api_v1` is 64 bytes and requires `abi_revision == 20`;
 - Runtime, Session, Session Control, Skill, and MCP tables are respectively
-  24, 40, 80, 32, and 40 bytes;
-- the root plus child tables expose 23 functions: root `buffer_release` and
-  22 domain slots;
+  24, 48, 80, 32, and 40 bytes;
+- the root plus child tables expose 24 functions: root `buffer_release` and
+  23 domain slots;
 - `RuntimeConfigV1`, `SessionHostConfigV1`, `SessionCreateConfigV1`,
   `SessionRestoreConfigV1`, `RunInputV1`, and `RunResultV1` are respectively
   96, 168, 64, 64, 104, and 72 bytes on the required 64-bit ABI;
   `RunInputPartV1` is 72 bytes, and `RunInputV1` replaces two former reserved
   words with the `parts` pointer (offset 72) and `part_count` (offset 80) of
-  the multimodal input kind;
+  the multimodal input kind; `RunResultV1` replaces its first reserved word
+  with `input_accepted_count` (offset 40) and `input_adopted_count`
+  (offset 44);
+- `SubmittedInputV1` and `InputReceiptV1` are respectively 48 and 24 bytes;
 - `PromptSectionV1`, `PromptProfileV1`, and `ContextBlockV1` are respectively
   72, 56, and 56 bytes; `SessionCreateConfigV1` replaces one reserved word with
   the nullable `prompt_profile` pointer (offset 32), and the 40-byte
@@ -66,17 +72,18 @@ optional-capability negotiation, or compatibility shim:
   `request` remains the bounded control-frame operation and
   `request_tool_stream` is mandatory for `tools/call`;
 - checkpoint, restore, describe, MCP refresh/describe/apply/selection,
-  Permission rule and mode update, compact, and abort entries are mandatory;
+  Permission rule and mode update, compact, abort, and submit_input entries
+  are mandatory;
 - `SkillSourceV1`, `SkillPolicyV1`, and `SkillCatalogQueryV1` are respectively
   64, 56, and 80 bytes;
 - public status code 26 is a permanent tombstone; decoding it yields unknown,
   while `SKILL_CATALOG_INCOMPLETE` remains 27 and `IMAGE_INPUT_UNSUPPORTED`
   is 28;
-- `manifest.json` keeps schema version 1 and records revision 19 and root size
+- `manifest.json` keeps schema version 1 and records revision 20 and root size
   64. Child-table validation belongs to ABI discovery and is not duplicated in
   bundle metadata.
 
-Revision 19 provides no earlier AgentCore revision compatibility, shim, dual dispatch, or old
+Revision 20 provides no earlier AgentCore revision compatibility, shim, dual dispatch, or old
 table layout. Consumers update the header, SDK, manifest, and library
 atomically, validate the stable
 `struct_size`/`abi_version` prefix before reading later fields, then validate
@@ -85,16 +92,16 @@ per-Run callback validates and copies any retained `RunContext`
 fields during the callback, and Host registries bind/compare `session_id`
 atomically under their per-Session lock.
 
-Revision 19 deliberately exposes explicit process-package sources, their
+Revision 20 deliberately exposes explicit process-package sources, their
 namespaced `host_tool` contributions, and explicit Host stream-tool
 descriptors. It does not expose the generic
 data/static plugin grouping model or `metacodes.plugin-inventory/v1`; those
 remain available through the source-level Zig Runtime plus CLI/Web JSON Host
 interfaces. Projecting generic inventory into this binary table requires a
-later explicit ABI revision. A revision-19 consumer must not infer plugin
+later explicit ABI revision. A revision-20 consumer must not infer plugin
 identity from tool or Skill names, and every reserved field remains zero.
 
-### Revision 19 table topology
+### Revision 20 table topology
 
 The root layout is exact on the required 64-bit pointer ABI:
 
@@ -102,11 +109,11 @@ The root layout is exact on the required 64-bit pointer ABI:
 |---:|---|---|
 | 0 | `struct_size` | exactly 64 |
 | 4 | `abi_version` | exactly 1 |
-| 8 | `abi_revision` | exactly 19 |
+| 8 | `abi_revision` | exactly 20 |
 | 12 | `reserved0` | zero |
 | 16 | `buffer_release` | non-null function |
 | 24 | `runtime` | non-null 24-byte table |
-| 32 | `session` | non-null 40-byte table |
+| 32 | `session` | non-null 48-byte table |
 | 40 | `session_control` | non-null 80-byte table |
 | 48 | `skill` | non-null 32-byte table |
 | 56 | `mcp` | non-null 40-byte table |
@@ -117,7 +124,7 @@ these mandatory slots in this order:
 | Table | Ordered function slots |
 |---|---|
 | Runtime | `create`, `destroy` |
-| Session | `create`, `destroy`, `run_input`, `abort` |
+| Session | `create`, `destroy`, `run_input`, `abort`, `submit_input` |
 | Session Control | `restore`, `describe`, `set_model`, `update_permission_rules`, `compact`, `abort_compact`, `export_checkpoint`, `set_prompt_profile`, `update_permission_mode` |
 | Skill | `resolve_catalog`, `release_catalog`, `bind_policy` |
 | MCP | `apply_configuration`, `refresh`, `describe`, `update_selection` |
@@ -128,9 +135,9 @@ exact 64-byte/version check, and may dereference a child only after that child
 pointer is non-null and aligned. Wrong revision, reserved values, child sizes,
 or any null slot reject the entire discovery. The 280-byte Revision 13 root and
 the unreleased 72-byte reference layout therefore fail at root size without an
-out-of-bounds read, and stale 64-byte Revision 14, 15, 16, 17, and 18 roots
-fail at the revision check. A Revision 18 Session Control table is also 8
-bytes short of the Revision 19 size.
+out-of-bounds read, and stale 64-byte Revision 14, 15, 16, 17, 18, and 19
+roots fail at the revision check. A Revision 19 Session table is also 8 bytes
+short of the Revision 20 size.
 
 A future stability freeze first requires closure of the open items tracked in
 `doc/AGENTCORE_V1_EXPERIMENTAL_LEDGER.md` (every group A item closed; every
@@ -290,19 +297,19 @@ Current delivery status is intentionally target-specific:
 
 | Target | Bundle/archive | Native source-free consumption |
 |---|---|---|
-| `aarch64-macos` | revision 19 ReleaseSafe bundle, schema-1 manifest, public-symbol, and source-free link gates passed locally (2026-10-10) | revision 19 native gate passed locally (2026-10-10): C and Zig source-free consumers (both exercising the permission mode update), C/C++ header compile, Rust SDK tests and link probe, including multimodal, fresh/restore and continued Runs |
-| `x86_64-windows-msvc` | revision 14 evidence retained; revision 19 not revalidated | native revision 19 gate pending |
-| `aarch64-windows-msvc` | revision 14 evidence retained; revision 19 not revalidated | native revision 19 gate pending |
-| `aarch64-windows-gnu` | revision 14 evidence retained; revision 19 not revalidated | native revision 19 gate pending |
-| `x86_64-windows-gnu` | revision 13 evidence retained; revision 19 not revalidated | native revision 19 gate pending |
-| `x86_64-linux-gnu` | revision 13 evidence retained; revision 19 not revalidated | native revision 19 gate pending |
-| `x86_64-macos` | revision 13 evidence retained; revision 19 not revalidated | native revision 19 gate pending |
+| `aarch64-macos` | revision 20 ReleaseSafe bundle, schema-1 manifest, public-symbol, and source-free link gates passed locally (2026-10-16) | revision 20 native gate passed locally (2026-10-16): C and Zig source-free consumers (both submitting input to an active Run, the C one from an event callback, the Zig one while a UI request waits), C/C++ header compile, Rust SDK tests and link probe, including multimodal, fresh/restore and continued Runs |
+| `x86_64-windows-msvc` | revision 14 evidence retained; revision 20 not revalidated | native revision 20 gate pending |
+| `aarch64-windows-msvc` | revision 14 evidence retained; revision 20 not revalidated | native revision 20 gate pending |
+| `aarch64-windows-gnu` | revision 14 evidence retained; revision 20 not revalidated | native revision 20 gate pending |
+| `x86_64-windows-gnu` | revision 13 evidence retained; revision 20 not revalidated | native revision 20 gate pending |
+| `x86_64-linux-gnu` | revision 13 evidence retained; revision 20 not revalidated | native revision 20 gate pending |
+| `x86_64-macos` | revision 13 evidence retained; revision 20 not revalidated | native revision 20 gate pending |
 
 Cross-build success is not a support claim. In particular, the empty macOS
 framework list remains provisional until the corresponding native gates pass.
 This validation status is not an ABI restriction.
 
-Revision 19 hard-cuts the current schema-1 manifest contract in place. The
+Revision 20 hard-cuts the current schema-1 manifest contract in place. The
 manifest records the exact ABI version, revision, and root size, while runtime
 discovery validates all five mandatory child tables. There is no manifest
 migration, dual parser, capability negotiation, or duplicated child-table
@@ -336,7 +343,7 @@ both copies.
 
 `decodeSkillCatalog` returns an owned `ParsedSkillCatalog` for
 `metask.skill-catalog/v1`. Revision 15 hard-cut the current experimental shape
-of that schema, and Revision 19 keeps it: every earlier unreleased experimental
+of that schema, and Revision 20 keeps it: every earlier unreleased experimental
 shape bearing the same token is void, and consumers must interpret the
 descriptor only with the exact bundle they pin. The decoder validates the
 schema, the 1024-Skill limit, identity forms, duplicate concrete `skill_id` or
@@ -407,6 +414,7 @@ The v1 observation set is:
 | Context management and accounting | `auto_compact` | Conversation compaction summary |
 | Permission-decision evidence | `permission_provenance` | Final Permission decision, canonical source, request binding, generation, and typed callback outcome |
 | System prompt audit | `prompt_manifest` | The sections of the system prompt this Run sends (id, order, origin, class, SHA-256) and the prompt's SHA-256, when it differs from the previous Run's |
+| Host input adoption | `input_adopted` | An input accepted by `submit_input` was appended to the Conversation before request `turn`; carries its `input_id` and receipt `sequence` (see "Active-Run input") |
 
 Events describe observations, not commands. A Host may render, aggregate,
 persist, or ignore them; consuming an event never drives the core execution
@@ -420,7 +428,7 @@ ordering and may invoke their callbacks concurrently. The stream has no common
 event sequence number, cursor, replay, or exactly-once contract; only
 `run_state.transition_seq` orders RunState snapshots.
 
-`on_event` is mandatory in Revision 19. `run_state` is emitted for admitted-run
+`on_event` is mandatory in Revision 20. `run_state` is emitted for admitted-run
 start, phase/tool-set/turn/tool-call changes, and terminal closure; it is not a
 mirror of text or usage deltas. Its `transition_seq` starts at 1 for each Run
 and advances only for emitted RunState snapshots. While the observation
@@ -486,7 +494,7 @@ owned typed value. Older Hosts retain the event through the `unknown` path.
 decode it through the `unknown` observation path and ignore or retain it in
 accordance with the forward-compatibility rules above.
 
-`tool_result.file_refs` is an optional Revision 19 observation field. It is
+`tool_result.file_refs` is an optional Revision 20 observation field. It is
 present only for successful selected built-in file-tool executions and contains
 at most 32 entries. Each entry has one locator union (`workspace_path`,
 `absolute_path`, or `uri`), an open-ended bounded `kind` string, a bounded
@@ -513,7 +521,7 @@ their `ctx` and keeps it valid until Session destruction succeeds.
 
 ### Process-plugin Runtime configuration
 
-Revision 19 uses one `runtime->create(runtime_config, plugin_config,
+Revision 20 uses one `runtime->create(runtime_config, plugin_config,
 out_runtime, out_diagnostic)`. The Runtime config is required; the plugin
 config is nullable. Null and an empty, well-formed `RuntimePluginConfigV1`
 create equivalent no-extra-plugin generations. Descriptor arrays and path
@@ -572,7 +580,7 @@ version, pinned executable SHA-256, global tool name and validated reserialized
 input schema.
 The binding—not the display name alone—enters Permission provenance and
 checkpoint authority resolution. Process tools deliberately have no
-`allow_session`/`deny_session` candidate in revision 19, so a Host may answer
+`allow_session`/`deny_session` candidate in revision 20, so a Host may answer
 only the offered one-shot choices unless an independent native rule decides
 first. Changing executable/package/schema authority invalidates a restored
 binding instead of silently reauthorizing the new implementation.
@@ -669,7 +677,7 @@ not define status precedence when multiple other input or admission errors are
 present in the same call.
 
 ABI v1 provides no in-place recovery or mutation of a poisoned Session. The
-Host must destroy that physical handle. Revision 19 checkpoint/restore creates
+Host must destroy that physical handle. Revision 20 checkpoint/restore creates
 a new handle from a previously exported committed checkpoint; it does not
 reconstruct state that was never successfully exported or resume an active
 Run.
@@ -677,7 +685,7 @@ Run.
 When facade poison occurs after Core has returned to an inspectable idle state,
 `session_describe` succeeds and reports lifecycle `poisoned`; it must not report
 `idle`. An active ordinary Session activity makes `session_describe` return
-`METASK_AGENTCORE_STATUS_BUSY`, so a successful Revision 19 description does not
+`METASK_AGENTCORE_STATUS_BUSY`, so a successful Revision 20 description does not
 emit lifecycle `busy`.
 
 A checkpoint is resumable model state, not a raw transcript archive. Before
@@ -724,7 +732,7 @@ requests cooperative abort and any other value returns
 ### Manual compact
 
 `session_compact` runs the canonical default compact policy as a best-effort
-Conversation maintenance operation. Revision 19 has no Host-supplied target
+Conversation maintenance operation. Revision 20 has no Host-supplied target
 token budget and does not guarantee that the result fits the context window of
 the current or a future model. `session_set_model` and `session_compact` are
 independent primitives, not a compound model-migration transaction.
@@ -733,13 +741,16 @@ On `METASK_AGENTCORE_STATUS_OK`, `CompactResultV1.before_context_tokens` and
 `after_context_tokens` are context-size estimates for UI and policy decisions;
 they are not provider billing values. The four provider usage-delta fields are
 semantically separate. `METASK_AGENTCORE_COMPACT_DEGRADED` exposes no structured
-reason in Revision 19, and a Host must not infer one by parsing diagnostics.
+reason in Revision 20, and a Host must not infer one by parsing diagnostics.
 
 Assistant text and other execution output are delivered through `on_event`.
 `RunResultV1` is a terminal summary containing stop reason, turns, and tool
 calls; it is not an output buffer. Its fields are defined only when
 `session_run_input` returns `METASK_AGENTCORE_STATUS_OK`. On any non-OK status
-their contents are unspecified and the Host must not inspect them.
+their contents are unspecified and the Host must not inspect them — with two
+exceptions: the budget fields on `CHECKPOINT_BUDGET_REQUIRED` (see durable
+budget), and `input_accepted_count` / `input_adopted_count`, which are defined
+on every status (see "Active-Run input").
 
 Relative paths supplied to `Read`, `Write`, `Edit`, `Glob`, and `Grep` resolve
 against `workspace_root`; Bash also runs with that directory as its cwd.
@@ -759,7 +770,7 @@ fresh-create input or restored checkpoint. `protocol_kind_code` occupies byte
 offset 140 in the unchanged 168-byte Host config and accepts:
 
 - `METASK_AGENTCORE_PROTOCOL_DEFAULT` (`0`): use the selected provider's
-  existing default. In Revision 19 that means Anthropic Messages, OpenAI Chat
+  existing default. In Revision 20 that means Anthropic Messages, OpenAI Chat
   Completions, or Gemini GenerateContent;
 - `METASK_AGENTCORE_OPENAI_PROTOCOL_RESPONSES` (`1`): valid only with
   `METASK_AGENTCORE_PROVIDER_OPENAI`; serialize `POST /v1/responses` request
@@ -778,9 +789,110 @@ Provider and inherited by Skill child Providers. Restore uses the current Host
 protocol selection just as it uses the current Host provider, credential, and
 endpoint; the checkpoint does not persist or override connection authority.
 
+### Active-Run input
+
+Revision 20 adds `session->submit_input(session, run_id, input, out_receipt,
+out_error)`, which hands the active Run more user text (#270).
+
+`metask_agentcore_submitted_input_v1` is 48 bytes: `struct_size`, a zero
+`reserved0`, `input_id`, `text`, and two zero reserved words. `input_id` is the
+Host's correlation id: non-zero and unique among the inputs this Run has
+accepted (a later Run may use it again). `text` is non-empty UTF-8 with at
+least one non-whitespace byte, borrowed for the call and appended to the
+Conversation byte for byte. `out_receipt` is required and written only on
+`STATUS_OK`: `metask_agentcore_input_receipt_v1.sequence` is the input's
+1-based acceptance position in the Run.
+
+| Situation | Status |
+|---|---|
+| `run_id` names the active Run and it takes input | `OK`: the input is queued |
+| zero `run_id` or `input_id`, a malformed struct, a duplicate `input_id`, empty, all-whitespace, or invalid UTF-8 text | `INVALID_ARGUMENT` |
+| text above `MAX_SUBMITTED_INPUT_BYTES_V1`, or a Run that already accepted `MAX_SUBMITTED_INPUTS_V1` inputs or that many text bytes in total | `RESOURCE_LIMIT` |
+| the Run's durable budget cannot hold the input | `CHECKPOINT_BUDGET_REQUIRED` |
+| another Run is active, or no Run with this id is active or most recent | `STALE_RUN` |
+| the most recent Run has ended, or is ending (abort requested, a callback failed) — whatever the Session does after it, compact and checkpoint export included | `TOO_LATE` |
+| a forked Skill Run that has started its child; a Session being destroyed | `INVALID_STATE` |
+| a poisoned Session (checked before every argument) | `INVALID_STATE` |
+
+A refusal changes nothing — it never ends, aborts, or poisons the Run — and
+writes no receipt.
+
+**Concurrency.** Like abort, `submit_input` bypasses the facade call gate. It
+may overlap the matching synchronous Run from any thread, including from inside
+that Run's `on_event`, `on_ui_request`, and Host tool callbacks, and it may
+overlap abort and other `submit_input` calls. It never waits for the Run.
+Calls are linearized: concurrent accepted inputs get distinct consecutive
+sequences. The Host must let every call return before destroy or any later
+call on the handle.
+
+**Adoption.** An accepted input becomes its own user record, appended at the
+Run's next turn boundary: after the previous turn's tool results and before
+the next provider request is built — the boundary the source-level
+`UiEvent.queue_message` seam uses. A boundary adopts every pending input, in
+acceptance order, and emits one `input_adopted {input_id, sequence, turn}` per
+input after appending it; `turn` is the 1-based turn whose request first
+carries it, and sequences arrive strictly increasing. So:
+
+- Input accepted before the Run's first request — from the starting
+  `run_state` event, say — joins that first request, after the root input
+  (`turn` 1).
+- Input submitted while a provider stream is open is queued; the request
+  already sent is not changed.
+- Input submitted while a Permission or AskUserQuestion request waits is
+  queued and never taken as the answer: the callback still answers, and the
+  input follows that tool turn's results.
+- A `max_tokens` continuation boundary adopts nothing, so a truncated answer
+  stays one answer; pending input waits for the next ordinary boundary.
+- A boundary is only reached when the Run sends another request. A Run that
+  ends first — `end_turn`, `max_turns`, abort, a budget stop, an error —
+  leaves pending input unadopted; input submitted during the final answer's
+  stream is the common case. A Host submits it as the next Run's input.
+- Adoption is not provider receipt: the request that carries it may still
+  fail.
+- Input does not undo actions already performed and does not stop the Run;
+  `session_abort` stops it. Once the Run is aborting — an abort was
+  requested, or a Host callback failed (an `input_adopted` the Host rejects
+  included) — nothing more is adopted, even input accepted earlier, and the
+  Run ends at that boundary without another request.
+- A forked Skill Run (`RUN_INPUT_SKILL` with `context: fork`) runs on a child
+  Conversation that is discarded when it returns: input accepted before the
+  fork claims the Run is never adopted, and later input is refused with
+  `INVALID_STATE`. Child agents (Task, model-invoked forks) never adopt Host
+  input.
+
+**Reconciliation.** Adoption follows acceptance order and each boundary adopts
+everything pending, so the adopted inputs are always a prefix of the accepted
+ones. `RunResultV1.input_accepted_count` and `input_adopted_count` are written
+on every `session_run_input` return, `OK` or not — `CALLBACK_FAILED` and every
+other poisoning status included — and are zero when no Run was admitted. The
+inputs whose receipt sequence is at most `input_adopted_count` are in the
+Conversation; the rest never will be. These counts are the authority: an
+`input_adopted` event the Host did not receive (its callback failed, or the
+event could not be delivered) proves nothing either way. A call that admitted
+no Run reports zero, also when it reused the last admitted `run_id`. A submission that
+overlaps the Run's completion either returns `OK` and is counted, or returns
+`TOO_LATE` and is not.
+
+**State and budget.** Adopted input is an ordinary user text record: it keeps
+its Conversation position, is exported in checkpoints and restored with them,
+and is sent in later Runs' requests. Unadopted input leaves no trace. On
+acceptance the facade reserves the input's encoded checkpoint bytes: the Run's
+host input — the root input and every accepted input together — stays within
+`input_cap_bytes`, and what is left under `hard_bytes` must still hold one whole
+provider operation at its configured caps (request, result payload, audit and
+terminal reserve), so adopting it never makes the next request fail; otherwise
+the input is refused with `CHECKPOINT_BUDGET_REQUIRED` and the Run continues. Adoption moves the
+reservation into the Session's durable usage; the Run's end releases the
+rest. Input passes no permission, sandbox, cancellation, or budget decision:
+it only adds a user record.
+
+Support is discovered through Revision 20 itself (the slot is mandatory);
+`MAX_SUBMITTED_INPUTS_V1` (64) and `MAX_SUBMITTED_INPUT_BYTES_V1` (16 MiB) are
+published constants; `session_describe` is unchanged.
+
 ### Active-Run intent/result journal
 
-`SessionHostConfigV1.run_journal_mode_code` is part of the exact revision-19
+`SessionHostConfigV1.run_journal_mode_code` is part of the exact revision-20
 wire contract and accepts only:
 
 - `METASK_AGENTCORE_RUN_JOURNAL_EPHEMERAL` (`0`): the default, zero-journal-I/O
@@ -804,7 +916,7 @@ downgraded to never.
 The journal is outside Conversation and provider request projection. Enabling
 it therefore does not insert prompt bytes, reorder history, or invalidate a
 warm prompt-cache prefix. An unfinished pair or retained crash marker fails
-closed; revision 19 does **not** expose in-place active-Run resume, automatic
+closed; revision 20 does **not** expose in-place active-Run resume, automatic
 tool replay, or exactly-once external effects. It provides durable evidence
 and deterministic recovery classification for a later explicit recovery API,
 not authority to guess whether an external side effect occurred.
@@ -1002,14 +1114,14 @@ published once, not that the Host filesystem is transactional.
 AgentCore does not implicitly read `/etc/metacodes/skills`, `.claude/skills`,
 `.codex/skills`, or `.metacodes/skills`. A Host may explicitly register any
 local directory only when its contents already use the canonical Agent Skill
-format. Directory names do not select a parser; Revision 19 has no Claude/Codex
+format. Directory names do not select a parser; Revision 20 has no Claude/Codex
 format adapter or public Provider Registry. The projected provider id is
 `agents.directory`.
 
 Each valid `skills[]` entry exposes separate identities:
 
 - `skill_policy_key`: the logical invocation slot, equal to
-  `invocation_name` in Revision 19;
+  `invocation_name` in Revision 20;
 - `provider_id`, `source_scope`, `source_instance_id`, and `contribution_id`:
   source identity;
 - `content_revision`: body/resources identity;
@@ -1181,7 +1293,7 @@ synchronous within the same Host Run and projects its public text and usage
 through the ordinary event stream. The provider tool name `Skill` is reserved:
 Runtime creation rejects a Host tool with that name.
 
-Fork children cannot suspend for Host UI interaction in Revision 19. Their UI
+Fork children cannot suspend for Host UI interaction in Revision 20. Their UI
 requester is unavailable, so a child question or permission request fails
 closed as an ordinary fork/tool failure attributed to the outer Run. Inline
 execution may use the outer Run's synchronous UI callback.
@@ -1193,7 +1305,7 @@ product decision.
 
 ### MCP Runtime catalog and Session view
 
-Revision 19 supports exact MCP `2026-07-28`, `2025-11-25`, and `2025-06-18`
+Revision 20 supports exact MCP `2026-07-28`, `2025-11-25`, and `2025-06-18`
 connections. Public negotiation codes preserve Revision 6 meanings:
 `auto=1`, `modern_only=2`, and exact `legacy_only=3`; exact
 `legacy_2025_06_only=4` is appended. Runtime owns negotiation,
@@ -1244,7 +1356,7 @@ returns.
 | Reporting every completed HTTP response's final status and body | Host Connector |
 | Binding one connection context to `purpose_code` and `requested_era_code` | Host Connector |
 
-Revision 19 separates MCP control and result traffic in the type system.
+Revision 20 separates MCP control and result traffic in the type system.
 `McpConnectorV1.request` writes a 40-byte `McpResponseV1` only for bounded
 discovery/initialize/catalog control frames. Stdio responses use
 `http_status == 0`; Streamable HTTP completed responses use their final status
@@ -1355,12 +1467,12 @@ materializes a provider
 with the recorded envelope admission is an invariant violation. View
 destruction releases materialized tools before releasing the retained
 Snapshot. MCP Tasks, notification pumping, and automatic request replay remain
-outside Revision 19.
+outside Revision 20.
 
 The value-only MCP checkpoint section has one current `MCPSEL` format and no
 independent revision axis. Its decoder rejects every earlier `R6MCP`/`R7MCP`
 encoding. Era remains provenance rather than a selection fingerprint input.
-The outer AgentCore ABI Revision 19 remains the sole compatibility boundary.
+The outer AgentCore ABI Revision 20 remains the sole compatibility boundary.
 
 ### Model-visible MCP diagnostics
 
@@ -1512,7 +1624,7 @@ needed.
   (`disableBypassPermissionsMode`, `disableAutoMode`) would also return
   `INVALID_ARGUMENT`, diagnostic `PermissionModeDisabled`; a Session's
   settings are the Host-imported rules, which cannot disable a mode, so this
-  does not occur in revision 19. None of these changes anything.
+  does not occur in revision 20. None of these changes anything.
 - **Effective point.** The first permission decision after the call returns
   `OK`, which is the first Tool call of the next Run.
 - **Grants.** A new mode is a new policy. The call starts a new policy
@@ -1600,7 +1712,7 @@ prompt-outcome contract replaces that seam.
 
 ### Completion boundary
 
-Revision 19 exposes no Completion handle, DTO, status, or function slot.
+Revision 20 exposes no Completion handle, DTO, status, or function slot.
 Independent title, summary, classification, and other product-level model calls
 belong to the Host or a product plugin. If the Agent itself must invoke such a
 capability, the Host exposes a semantically bounded Tool; a generic Completion
@@ -1646,27 +1758,26 @@ not remain valid after the callback returns.
 | `on_ui_request` | Synchronous in the Run path | `METASK_AGENTCORE_UI_UNAVAILABLE` is an ordinary reusable outcome; fatal/unknown status or invalid, mismatched, or oversized response aborts and poisons |
 | release callbacks | Exactly once for every accepted Host-owned buffer; no thread affinity | Must not re-enter Run or destroy |
 | `session_abort` | May run concurrently with the matching synchronous Run, including from a callback | Cooperative; callback or provider code that blocks can delay completion |
+| `session_submit_input` | May run concurrently with the matching synchronous Run, with abort, and with other `submit_input` calls, including from a callback | Never blocks on the Run; a refusal changes nothing and never ends, aborts, or poisons the Run |
 | `session_abort_compact` | May run concurrently only with the matching synchronous compact | Cancellation propagates to in-flight provider I/O |
 | `set_prompt_profile` | An idle-Session mutation like `set_model`; never concurrent with a Run, compact, checkpoint, or another mutation | Busy Session returns `STATUS_BUSY`; refusal leaves the profile unchanged |
 | `update_permission_mode` | An idle-Session mutation like `update_permission_rules`; never concurrent with a Run (including from its callbacks), compact, checkpoint, or another mutation | Busy Session returns `STATUS_BUSY`; any refusal leaves mode, policy generation and grants unchanged |
 
-There is no input operation for an active Run. `session_run_input` is
-synchronous and a Session admits one Run at a time, so a Host that receives
-user input while a Run is active either queues it itself and submits it as the
-next `session_run_input` once the Run returns (the CLI does exactly this at its
-REPL layer), or calls `session_abort` and resubmits. The in-process steering
-seam — `UiBackend.poll` returning `UiEvent.queue_message`, which the shared
-agent loop appends to the Conversation at the next turn boundary — is a
-source-level `metacodes-core` facility and is not exposed through the binary
-ABI; the facade's backend poll always returns null.
+User input that arrives while a Run is active goes to that Run through
+`session_submit_input` (see "Active-Run input"); a Host that wants it to start
+a new Run instead still queues it and submits it once the Run returns, or
+aborts and resubmits. The untyped in-process steering seam —
+`UiBackend.poll` returning `UiEvent.queue_message` — remains a source-level
+`metacodes-core` facility; the facade's backend poll always returns null.
 
-Callbacks may request abort. A callback attempt to re-enter Run or destroy on
-the same handle returns `METASK_AGENTCORE_STATUS_BUSY`; callers must not spin or wait for that
-operation from inside the callback. Matching abort is the only concurrency
-exception to ordinary Session operations. The Host must wait for every
-`session_abort` and `session_abort_compact` call to return before issuing any
-subsequent call on the same handle, including a new Run, compact, mutation, or
-destroy. A successful destroy invalidates the handle; calling any API with that
+Callbacks may request abort and submit input. A callback attempt to re-enter
+Run or destroy on the same handle returns `METASK_AGENTCORE_STATUS_BUSY`;
+callers must not spin or wait for that operation from inside the callback.
+Matching abort and matching `submit_input` are the only concurrency exceptions
+to ordinary Session operations. The Host must wait for every `session_abort`,
+`session_submit_input`, and `session_abort_compact` call to return before
+issuing any subsequent call on the same handle, including a new Run, compact,
+mutation, or destroy. A successful destroy invalidates the handle; calling any API with that
 pointer afterward is invalid Host behavior. C++ exceptions,
 `longjmp`, and other non-local control transfers must never cross an AgentCore
 callback or release-callback boundary.
@@ -1750,6 +1861,7 @@ allocations or unbounded work:
 | total Session metadata | 4 MiB |
 | one TextInput prompt; total multimodal part payload | 16 MiB |
 | parts per multimodal input | 64 |
+| Host inputs accepted by one Run (`submit_input`) / their text bytes together | 64 / 16 MiB |
 | one image part base64 payload | 5,000,000 bytes |
 | Skill invocation slots per catalog | 1024 |
 | one Skill argument array / JSON | 64 values / 1 MiB |
@@ -1853,7 +1965,7 @@ reliable automatic classification.
 ### ABI evolution
 
 All v1 POD descriptors and the API table require their exact documented
-`struct_size`; every reserved field must be zero. While Revision 19 remains
+`struct_size`; every reserved field must be zero. While Revision 20 remains
 unreleased and experimental, an explicitly approved hard cut may replace its
 wire shape in place only when the library, headers, SDKs, consumers, tests, and
 documentation move atomically; the replaced bundle is void and no compatibility
@@ -1865,11 +1977,11 @@ or control-message extensions require `metask_agentcore_get_api(2)` and v2
 types. Assigning a meaning or non-zero value to a reserved field is always an
 explicit wire-contract decision, never an inferred compatible extension.
 
-Revision 19's published POD offsets and sizes require a 64-bit pointer ABI.
+Revision 20's published POD offsets and sizes require a 64-bit pointer ABI.
 The header rejects 32-bit consumers at compile time; a future 32-bit contract
 would need separately specified layouts and consumer gates.
 
-Revision 19 has no root capability mask. The five typed table pointers and
+Revision 20 has no root capability mask. The five typed table pointers and
 their exact layouts are the complete ABI surface and are all mandatory.
 Concrete Runtime and Session configuration still determines which tools and
 callbacks are active; that configuration is not ABI capability negotiation.

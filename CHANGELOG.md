@@ -91,6 +91,36 @@ status, compatibility boundaries, and entry points are defined by
   per-run cost cap (`METACODES_SEALED_MAX_COST_MICROS`) and a usage ledger
   (`metacodes sealed ledger`). `metacodes sealed serve` is the reference
   gateway: stateless, AEAD-sealed run state, metering per Step.
+- AgentCore ABI v1 revision 20 (#270): `session->submit_input` hands an active
+  Run more user text. It may be called from any thread or from inside the
+  Run's own callbacks, like `session_abort`, and never waits for the Run. Each
+  input carries a non-zero Host `input_id` (unique within the Run) and gets a
+  1-based acceptance `sequence` in its receipt. The Run appends every pending
+  input verbatim, in acceptance order, as its own user record at its next turn
+  boundary — never into a request already sent, never at a `max_tokens`
+  continuation boundary — and emits `input_adopted {input_id, sequence, turn}`
+  for each. Input waits while a Permission or question request is pending and
+  never answers it. A Run that ends before another boundary leaves its pending
+  input unadopted. `RunResultV1.input_accepted_count` and
+  `input_adopted_count` are defined on every `session_run_input` return,
+  failures and poisoning ones included: adoption is always a prefix of
+  acceptance, so the counts tell the Host exactly which inputs reached the
+  Conversation even when an event was lost. Limits: 64 inputs and 16 MiB of
+  text per Run (`MAX_SUBMITTED_INPUTS_V1`, `MAX_SUBMITTED_INPUT_BYTES_V1`);
+  each input reserves its checkpoint bytes against the durable budget, counts
+  with the root input toward `input_cap_bytes`, must leave room for one whole
+  provider operation, and is refused with `CHECKPOINT_BUDGET_REQUIRED` —
+  without ending the Run — when it does not fit. Once a Run is aborting (an
+  abort, or a callback the Host failed) it adopts nothing more. A refused
+  submission changes nothing; a stale id is `STALE_RUN`, a Run that ended or
+  is ending `TOO_LATE`, a forked Skill Run `INVALID_STATE`.
+  Adopted input is ordinary Conversation state and survives checkpoint and
+  restore. The Session table grows by one slot to 48 bytes and `RunResultV1`
+  turns its first reserved word into the two counts; the header, Zig and Rust
+  SDKs (`raw.rs` regenerated), both source-free consumers, the bundle manifest
+  and the docs move to revision 20, SDK package `0.7.0-dev`. Source-level
+  Hosts use `AgentSession.submitInput` / `runInputReconciliation`.
+
 - Skills and MCP servers configured for Claude Code and Codex now work in
   metacodes, next to its own `<state root>/skills` and `config.json`
   ([doc/SKILLS_AND_MCP.md](doc/SKILLS_AND_MCP.md)). Skills come from

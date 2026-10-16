@@ -91,8 +91,9 @@ stream.next 仍 throwIfAborted);backend 的输入端(watcher)收到 esc 时**也
 
 REPL 因此是两级语义:Run 内的 turn 边界由 agent_loop 消费;Run 结束时仍留在队列里的(最后一次
 流式期间入队的)由 loop.zig `popAllJoined` 合并成下一个 Run 的输入并回显。AgentCore Session
-(`agent_session.zig`)的 backend.poll 恒返 null:二进制 ABI 没有活动 Run 的输入操作,宿主自己
-排队、Run 返回后再 `session_run_input`,或 `session_abort`(见 AGENTCORE_BINARY_ABI.md)。
+(`agent_session.zig`)的 backend.poll 恒返 null:Session 的活动 Run 输入走带 id、采纳事件与对账
+计数的 `Options.run_inputs`(`AgentSession.submitInput`,二进制 `session->submit_input`,#270,见
+AGENTCORE_BINARY_ABI.md "Active-Run input"),在同一个 turn 边界、同样跳过续写边界被采纳。
 L2 证据:`tests/component/ui_queue_message_test.zig`(队列消息出现在同一 Run 的第二次请求里、
 interrupt 在边界停、空白消息丢弃、max_tokens 续写边界不 poll);`ui_backend_test.zig`(命令留队、
 取走进历史、中断时消息不丢)。
@@ -132,6 +133,7 @@ GUI/语音后端各自决定 tick(GUI=requestAnimationFrame,语音=无 tick)。
 | `usage: UsageDelta` | token 计数 | 累加 usage_acc(主路径 null,走 usage_sink) |
 | `auto_compact{dropped,kept}` | 历史压缩提示 | writeGenText(格式化行) |
 | `retry_notice{attempt,max,delay_ms}` | 建连重试提示 | 门控(show_retry/attempt≥3)+ writeGenText |
+| `input_adopted{input_id,sequence,turn}` | Session 活动 Run 的 Host 输入已追加进对话(#270) | no-op(只由 AgentSession 的 run_inputs 产生) |
 | `stream_done` | 一轮结束 | writeGenText(colorize ? "\x1b[0m\n" : "\n") |
 
 ### UiEvent(UI→core)

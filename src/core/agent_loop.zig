@@ -52,6 +52,7 @@ const ui_event = @import("protocol/ui_event.zig");
 const UiBackend = ui_backend.UiBackend;
 const CoreEvent = ui_event.CoreEvent;
 const job_notification_mod = @import("job_notification.zig");
+const run_input_mod = @import("run_input.zig");
 
 /// `stalled`: the stall gate stopped a run whose tool rounds kept returning
 /// nothing new (stall_gate.zig). A controlled stop like `tool_loop`, with its
@@ -396,6 +397,10 @@ pub const Options = struct {
     /// turn boundary; this prevents the 2026-09-19 polling incident from
     /// competing with a user's already queued message.
     pending_input: ?PendingInputProbe = null,
+    /// Host input submitted while this Run is active (#270). Adopted at the
+    /// same turn boundary as `UiEvent.queue_message` (see `adoptRunInputs`).
+    /// Only the root loop of a Session Run gets one; child agents never do.
+    run_inputs: ?*run_input_mod.Queue = null,
     job_wait: JobWaitOptions = .{},
     /// 后台 subagent 作业注册表（Task run_in_background + TaskOutput + TaskStop agent_ 分流用）
     agent_jobs: ?*@import("agent_job_registry.zig").AgentJobRegistry = null,
@@ -1017,6 +1022,41 @@ fn drainUiEvents(
     return null;
 }
 
+/// Host input → Conversation (#270). Appends every input pending in
+/// `queue` as its own user record, in acceptance order, and emits
+/// `input_adopted` after each append. Runs at the same boundary as
+/// `drainUiEvents` and is skipped with it at a max_tokens continuation
+/// boundary. The text is appended verbatim: the Host chose those bytes, and
+/// the queue already refused blank text.
+///
+/// The append comes before `adopt`, and `adopt` before the event, so the
+/// queue's adopted count never claims a record the Conversation lacks; an
+/// append failure leaves the input unadopted and fails the Run. A Host that
+/// misses the event (callback failure) still reconciles from the counts.
+/// Nothing is adopted once the Run is aborting — a user abort, or a Host
+/// callback failure, which aborts the Run (possibly the very `input_adopted`
+/// just emitted): the rest stays pending and the caller ends the Run.
+fn adoptRunInputs(
+    queue: *run_input_mod.Queue,
+    conversation: *Conversation,
+    backend: *const UiBackend,
+    sess: @import("session_id.zig").SessionId,
+    turn: u32,
+    abort: ?*const AbortSignal,
+) !void {
+    while (queue.next()) |pending| {
+        if (abort) |signal| if (signal.isAborted()) return;
+        try conversation.appendText(.user, pending.text);
+        queue.adopt(pending.sequence);
+        log.info("agent", "host input adopted at turn {d} boundary sequence={d} bytes={d}", .{ turn, pending.sequence, pending.text.len });
+        backend.emitEvent(sess, .{ .input_adopted = .{
+            .input_id = pending.input_id,
+            .sequence = pending.sequence,
+            .turn = turn,
+        } });
+    }
+}
+
 /// 一次用户请求的完整 agent 运行：发送当前 conversation 到 API，
 /// 收集事件到 assistant message 里（text 和 tool_use blocks），
 /// 如果有 tool_use 则执行、追加 tool_result 到 conversation，继续下一轮。
@@ -1333,13 +1373,25 @@ fn runCounted(
         // 刚追加的"接着写"提示与转向指令并排会让模型换题,而 Ledger 仍把下一段当同一答案的续写。
         if (continuation_pending) {
             continuation_pending = false;
-        } else if (try drainUiEvents(backend, sess, conversation, allocator, turns + 1)) |reason| {
-            log.warn("agent", "interrupt from UI backend before turn {d}: {s}", .{ turns + 1, @tagName(reason) });
-            return finishRun(backend, sess, trace_id, depth, .{
-                .stop_reason = stopReasonForReason(reason),
-                .turns = turns,
-                .tool_calls = total_tool_calls,
-            });
+        } else {
+            if (try drainUiEvents(backend, sess, conversation, allocator, turns + 1)) |reason| {
+                log.warn("agent", "interrupt from UI backend before turn {d}: {s}", .{ turns + 1, @tagName(reason) });
+                return finishRun(backend, sess, trace_id, depth, .{
+                    .stop_reason = stopReasonForReason(reason),
+                    .turns = turns,
+                    .tool_calls = total_tool_calls,
+                });
+            }
+            // Host input submitted through the Session (#270): same boundary, same skip.
+            if (opts.run_inputs) |queue| {
+                try adoptRunInputs(queue, conversation, backend, sess, turns + 1, opts.abort);
+                // An adoption event the Host rejected aborts the Run: end it here
+                // rather than build and send another request.
+                if (opts.abort) |a| if (a.isAborted()) {
+                    log.warn("agent", "aborted while adopting host input before turn {d}", .{turns + 1});
+                    return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = stopReasonForAbort(opts.abort), .turns = turns, .tool_calls = total_tool_calls });
+                };
+            }
         }
 
         // 2026-09-19 polling incident: deliver metadata at the boundary so
@@ -7574,4 +7626,52 @@ test "估算随 model_override 变化,而不是只换个模型名" {
     // 模型换了,输出上限必须跟着换——同一个请求体不能描述两个模型。
     try std.testing.expect(std.mem.indexOf(u8, child.body, "\"model\":\"child\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, child.body, "\"max_tokens\":1024") != null);
+}
+
+test "run inputs: an adoption that aborts the Run adopts nothing more and builds no request (#270)" {
+    // A Host callback that rejects `input_adopted` aborts the Run. The loop
+    // must stop at that boundary: no further input adopted, and no provider
+    // request attempted (this provider fails the Run if one is).
+    const a = std.testing.allocator;
+    var c = Conversation.init(a);
+    defer c.deinit();
+    try c.appendText(.user, "root prompt");
+    var queue = run_input_mod.Queue.init(a, .{});
+    defer queue.deinit();
+    queue.open(1, null);
+    _ = try queue.submit(1, "first input");
+    _ = try queue.submit(2, "second input");
+
+    var signal = AbortSignal.init();
+    const Probe = struct {
+        signal: *AbortSignal,
+        adopted: u32 = 0,
+        fn emit(ctx: *anyopaque, _: @import("session_id.zig").SessionId, ev: CoreEvent) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (ev == .input_adopted) {
+                self.adopted += 1;
+                self.signal.abort(.host_failure);
+            }
+        }
+        fn poll(_: *anyopaque, _: @import("session_id.zig").SessionId) ?@import("protocol/ui_event.zig").UiEvent {
+            return null;
+        }
+    };
+    var probe = Probe{ .signal = &signal };
+    const backend = UiBackend{ .ctx = @ptrCast(&probe), .emit = Probe.emit, .poll = Probe.poll };
+    var state = TestProviderState{};
+    const perm = permission_mod.createContext(.bypass_permissions, a);
+    const result = try run(&c, testProvider(&state), &.{}, &perm, .{
+        .max_turns = 3,
+        .colorize = false,
+        .abort = &signal,
+        .run_inputs = &queue,
+    }, &backend, a);
+
+    try std.testing.expectEqual(StopReason.aborted, result.stop_reason);
+    try std.testing.expectEqual(@as(u32, 0), result.turns);
+    try std.testing.expectEqual(@as(u32, 1), probe.adopted);
+    try std.testing.expectEqual(run_input_mod.Reconciliation{ .accepted = 2, .adopted = 1 }, queue.close());
+    // Root prompt plus the one adopted input; the second stayed out.
+    try std.testing.expectEqual(@as(usize, 2), c.len());
 }
