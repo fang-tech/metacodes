@@ -143,7 +143,7 @@ or any null slot reject the entire discovery. The 280-byte Revision 13 root and
 the unreleased 72-byte reference layout therefore fail at root size without an
 out-of-bounds read, and stale 64-byte Revision 14, 15, 16, 17, 18, 19, and 20
 roots fail at the revision check. A Revision 19 Session table is also 8 bytes
-short of the Revision 21 and 21 size.
+short of the Revision 20 and 21 size.
 
 A future stability freeze first requires closure of the open items tracked in
 `doc/AGENTCORE_V1_EXPERIMENTAL_LEDGER.md` (every group A item closed; every
