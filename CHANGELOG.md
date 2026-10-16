@@ -118,6 +118,13 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Changed
 
+- `agent_loop.run` refuses provider server tools: a tool definition with
+  `server_type` (in `tool_defs` or `Options.tool_defs`) returns
+  `error.ServerToolsUnsupported` before any request. The loop keeps no
+  server_tool_use or server result blocks, so a turn the server pauses
+  (`pause_turn`) could only be truncated. `AgentSession`'s tool catalog
+  already rejected them; only direct source-level callers of `run` are
+  affected.
 - `--web`/`serve`: `user_message` is journaled by the session when the
   message's turn starts, no longer by the transport when the message is
   queued, so it always means "this turn started with this text". A message
@@ -231,7 +238,8 @@ status, compatibility boundaries, and entry points are defined by
   rather than saying "No search results found". The search is not resumed:
   resuming means sending the paused response back verbatim, server blocks
   included, which this request does not keep. The agent loop's own requests
-  never carry server tools, so they never end in `pause_turn`.
+  carry no server tools (see the `agent_loop.run` change above), so they
+  never end in `pause_turn`.
 - OpenAI Chat Completions streams no longer drop text (issue #258). metacodes
   always asks for `stream_options.include_usage`, under which every ordinary
   chunk carries `"usage": null`; the parser took any chunk containing the key

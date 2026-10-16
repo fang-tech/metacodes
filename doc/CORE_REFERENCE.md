@@ -358,6 +358,10 @@ pub const StopReason = enum {
 直接驱动低层循环时，才从具体 client 取得 `client.provider()`。
 当 `stop_reason == .suspended` 时，`suspend_info` 由调用方拥有；写入持久状态或完成
 投递后调用其 `deinit()`。
+`tool_defs`(含 `Options.tool_defs`)里出现 provider server tool(`server_type` 非空,如
+Anthropic `web_search_20250305`)时 `run` 直接返回 `error.ServerToolsUnsupported`,不发任何请求:
+本循环不保存 server_tool_use / 结果块,服务端暂停的回合(`pause_turn`)只能靠原样回送这些块续跑,
+放行只会静默截断。WebSearch 的 server tool 只出现在它自己的隔离子请求里。
 
 **一回合做什么**:流式发当前 conversation → 收集 assistant 文本 + tool_use blocks(经 backend
 emit `text_chunk`/`tool_start`)→ 按权限决策 + 并发安全分批执行工具(`tool_exec.executeSlots`)→

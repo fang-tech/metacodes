@@ -938,6 +938,39 @@ pub fn drainFileChangesForTest(
 
 /// One mapping for every way a Run can be stopped from outside: only the
 /// evaluation budget is a `budget` stop, everything else is `aborted`.
+fn hasServerTool(defs: []const json_mod.ToolDefinition) bool {
+    for (defs) |def| if (def.server_type != null) return true;
+    return false;
+}
+
+test "run refuses provider server tools it cannot represent" {
+    const a = std.testing.allocator;
+    var c = Conversation.init(a);
+    defer c.deinit();
+    try c.appendText(.user, "search the web");
+    var state = TestProviderState{};
+    const perm = permission_mod.createContext(.bypass_permissions, a);
+    const Null = struct {
+        fn emit(_: *anyopaque, _: @import("session_id.zig").SessionId, _: CoreEvent) void {}
+        fn poll(_: *anyopaque, _: @import("session_id.zig").SessionId) ?@import("protocol/ui_event.zig").UiEvent {
+            return null;
+        }
+    };
+    var dummy: u8 = 0;
+    const backend = UiBackend{ .ctx = @ptrCast(&dummy), .emit = Null.emit, .poll = Null.poll };
+    const server_tool = [_]json_mod.ToolDefinition{.{
+        .name = "web_search",
+        .description = "",
+        .input_schema = .{ .type = "object", .properties = null, .required = &.{} },
+        .server_type = "web_search_20250305",
+    }};
+    // Through either seam, before any provider request (this provider fails
+    // the Run on any request) and without touching the Conversation.
+    try std.testing.expectError(error.ServerToolsUnsupported, run(&c, testProvider(&state), &server_tool, &perm, .{ .max_turns = 1, .colorize = false }, &backend, a));
+    try std.testing.expectError(error.ServerToolsUnsupported, run(&c, testProvider(&state), &.{}, &perm, .{ .max_turns = 1, .colorize = false, .tool_defs = &server_tool }, &backend, a));
+    try std.testing.expectEqual(@as(usize, 1), c.len());
+}
+
 fn stopReasonForReason(reason: @import("../util/abort.zig").Reason) StopReason {
     return if (reason == .evaluation_budget) .budget else .aborted;
 }
@@ -1008,6 +1041,15 @@ pub fn run(
     backend: *const UiBackend,
     allocator: std.mem.Allocator,
 ) !RunResult {
+    // Provider server tools (`server_type`, e.g. Anthropic web_search) are not
+    // representable in this loop: their server_tool_use / result blocks are
+    // not kept in the Conversation, and a turn the server pauses (`pause_turn`)
+    // could only be resumed by sending those blocks back verbatim. Refuse them
+    // here rather than truncate such turns silently. AgentSession's tool
+    // catalog already rejects them; WebSearch keeps its server tool inside its
+    // own isolated sub-request.
+    if (hasServerTool(tool_defs) or (if (opts.tool_defs) |defs| hasServerTool(defs) else false))
+        return error.ServerToolsUnsupported;
     // 本次 run 归属的会话(emit/poll 路由用)。N=1/TUI 默认 .single;M6 由 SessionContext 传。
     const sess = opts.session;
     // 声明本 run 认领任务的身份,与工具 kgAgentIdent 同源(kg_agent_ident orelse agent_ident):
