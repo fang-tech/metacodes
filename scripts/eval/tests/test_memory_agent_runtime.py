@@ -151,6 +151,45 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
         with self.assertRaises(ValidationError):
             _parse_result(stable_json(partial))
 
+    def test_headless_result_continuations_are_read_and_default_for_older_rows(self):
+        # issue #269: the result row counts max_tokens continuations. Rows from
+        # builds before it read as 0; a row that carries it must carry the rest
+        # of the current schema too, and the count must be a real count.
+        before = {
+            "type": "result",
+            "stop_reason": "end_turn",
+            "turns": 2,
+            "tool_calls": 0,
+            "input_tokens": 10,
+            "output_tokens": 2,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "cost_usd": 0.0,
+            "text": "done",
+            "text_kind": "final",
+            "file_changes": {
+                "schema_version": "metacodes-file-change-v1",
+                "truncated": False,
+                "changes": [],
+            },
+        }
+        self.assertEqual(_parse_result(stable_json(before))["continuations"], 0)
+
+        current = dict(before, continuations=1)
+        self.assertEqual(_parse_result(stable_json(current))["continuations"], 1)
+
+        partially_upgraded = {
+            key: value
+            for key, value in current.items()
+            if key not in ("text_kind", "file_changes")
+        }
+        with self.assertRaises(ValidationError):
+            _parse_result(stable_json(partially_upgraded))
+        for bad in (-1, True, "1", 1.5):
+            with self.subTest(continuations=bad):
+                with self.assertRaises(ValidationError):
+                    _parse_result(stable_json(dict(current, continuations=bad)))
+
     def test_context_cache_contract_binds_full_prefix_and_breaker_finalization(self):
         def normal(system="stable-system", tools=None):
             return {
