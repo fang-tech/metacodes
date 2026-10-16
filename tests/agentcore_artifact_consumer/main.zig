@@ -4,7 +4,7 @@ const wire = sdk.types;
 const Server = @import("mock_server.zig").Server;
 
 comptime {
-    if (wire.ABI_REVISION != 20 or
+    if (wire.ABI_REVISION != 21 or
         wire.MAX_SUBMITTED_INPUTS_V1 != 64 or
         wire.MAX_SUBMITTED_INPUT_BYTES_V1 != 16 * 1024 * 1024 or
         wire.PROMPT_OP_ADD != 1 or
