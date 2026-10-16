@@ -752,14 +752,34 @@ test "L2 sealed: narration between tool calls stays on the gateway; only the fin
 
 // ── Sealed reference files and public assets (§5, §12) ────────────────────
 
+/// `perPidDir(tag)` spelled the way the catalog records it and the brain is
+/// told it. The catalog canonicalizes every source root with
+/// `Dir.realPathFileAbsolute`, so on macOS `/tmp/...` becomes
+/// `/private/tmp/...`, and that spelling is the `base_dir` the client sends.
+/// A model fixture that names a file under `<base_dir>/sealed/` must use it:
+/// the gateway's prefix check is a string comparison, and with the raw
+/// `/tmp` spelling it sends the Read to the client instead of serving it.
+fn brainVisibleRoot(allocator: std.mem.Allocator, tag: []const u8) ![]u8 {
+    var dir_buf: [512]u8 = undefined;
+    const per_pid = harness.normalizeSlashes(@constCast(cc.util_fs.testing.perPidDir(&dir_buf, tag)));
+    var tmp_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const tmp_root = cc.util_fs.testing.tmpRoot(&tmp_buf);
+    var real_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const real_len = try std.Io.Dir.realPathFileAbsolute(std.testing.io, tmp_root, &real_buf);
+    const real_root = harness.normalizeSlashes(real_buf[0..real_len]);
+    return std.fmt.allocPrint(allocator, "{s}{s}", .{ real_root, per_pid[tmp_root.len..] });
+}
+
 test "L2 sealed: sealed files are read on the gateway without a Step; public assets are installed and read on the client" {
     const a = std.testing.allocator;
     var lab: Lab = undefined;
-    var pre_buf: [512]u8 = undefined;
-    const pre_root = harness.normalizeSlashes(@constCast(cc.util_fs.testing.perPidDir(&pre_buf, "cc-zig-sealed-files")));
-    const sealed_read = try std.fmt.allocPrint(a, "{{\"file_path\":\"{s}/state/sealed-skills/erp-post/sealed/notes.md\"}}", .{pre_root});
+    // The brain reads under the base directory it was told, which is the
+    // catalog's canonical spelling of the pin directory, not perPidDir's.
+    const brain_root = try brainVisibleRoot(a, "cc-zig-sealed-files");
+    defer a.free(brain_root);
+    const sealed_read = try std.fmt.allocPrint(a, "{{\"file_path\":\"{s}/state/sealed-skills/erp-post/sealed/notes.md\"}}", .{brain_root});
     defer a.free(sealed_read);
-    const public_read = try std.fmt.allocPrint(a, "{{\"file_path\":\"{s}/state/sealed-skills/erp-post/scripts/post.py\"}}", .{pre_root});
+    const public_read = try std.fmt.allocPrint(a, "{{\"file_path\":\"{s}/state/sealed-skills/erp-post/scripts/post.py\"}}", .{brain_root});
     defer a.free(public_read);
     const sealed_sse = try toolCallSse(a, "Read", sealed_read);
     defer a.free(sealed_sse);
