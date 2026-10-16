@@ -12,6 +12,16 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Added
 
+- Sealed Skills: the §8.5 disclosure screen. Before a Step leaves the
+  gateway, its `final` text, every call input of a `tool_calls` batch and
+  any question pass a screen built from the Skill's sealed material (the
+  body and the `sealed/` files): every run of eight consecutive tokens that
+  also occurs there is replaced by `[sealed]`, the Step carries
+  `disclosure.redactions`, and the client logs it, records it in the ledger
+  and tells the user once; the brain's own conversation keeps the original.
+  The manifest's new `egress.disclosure` chooses `redact` (default), `fail`
+  (the run ends as `failed` / `disclosure`) or `off`. Numbers, names, short
+  phrases and paraphrases pass; the document says so.
 - Sealed Skills: `egress.classes` is enforced at run time. A call whose
   result class the client can tell from the tool (`Read`/`Grep`/`Edit`/
   `NotebookEdit` → `file_contents`, `Glob` → `repository_structure`,

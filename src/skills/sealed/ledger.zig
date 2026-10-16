@@ -75,6 +75,9 @@ pub const Record = struct {
     /// `results`: the digest of the whole array as sent; `step`: the digest
     /// the gateway bound into the Step (§8.3). Equal on a healthy chain.
     results_digest: []const u8 = "",
+    /// `step`: passages of the Skill's sealed content the gateway replaced
+    /// with its marker in this Step (§8.5).
+    disclosure_redactions: u64 = 0,
 };
 
 /// `METACODES_LEDGER_DIR/sealed.ndjson`, else `<state_root>/ledger/sealed.ndjson`.
@@ -146,7 +149,7 @@ pub fn render(allocator: std.mem.Allocator, record: Record) ![]u8 {
     }
     try w.writeAll("],\"results_digest\":");
     try protocol.writeString(w, record.results_digest);
-    try w.writeAll("}\n");
+    try w.print(",\"disclosure_redactions\":{d}}}\n", .{record.disclosure_redactions});
     return out.toOwnedSlice();
 }
 

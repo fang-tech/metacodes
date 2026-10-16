@@ -170,6 +170,7 @@ pub const skills_sealed_ledger = @import("skills/sealed/ledger.zig");
 pub const skills_sealed_provider = @import("skills/sealed/provider.zig");
 pub const skills_sealed_gateway = @import("skills/sealed/gateway.zig");
 pub const skills_sealed_credentials = @import("skills/sealed/credentials.zig");
+pub const skills_sealed_disclosure = @import("skills/sealed/disclosure.zig");
 pub const skills_tool = @import("skills/tool.zig");
 pub const skills_render = @import("skills/render.zig");
 pub const mcp_client = @import("mcp/client.zig");

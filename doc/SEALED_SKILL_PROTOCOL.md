@@ -314,6 +314,7 @@ client MUST record them with the run (§8.3).
   "issuer": {"skill_host": "metask", "inference_gateway": "metask"},
   "prev_digest": "sha256:…",
   "results_digest": "sha256:…"?,
+  "disclosure": {"redactions": 1}?,
   "digest": "sha256:…",
   "sig": "<base64 Ed25519 over digest>"?
 }
@@ -326,6 +327,10 @@ as well as what the gateway answered (§8.3). It is absent on the first Step;
 a client ends the run when the Step answering its `runs.continue` lacks it
 or carries another value.
 
+`disclosure` is present when the gateway's screen (§8.5) replaced passages
+of the Skill's sealed material in this Step's `text`, call inputs or
+question: `redactions` counts them. The replaced passages read `[sealed]`.
+
 `kind` is one of:
 
 | kind | meaning | fields |
@@ -333,7 +338,7 @@ or carries another value.
 | `tool_calls` | execute `calls`, answer with `runs.continue` | `calls` (1..n); no `text`: the brain's narration between calls is its own reasoning and stays on the gateway |
 | `final` | the run is complete | `text` (the Skill's result for the user), `charge` (§4.6) |
 | `input_required` | the Skill needs something only the user can give | `question`: `{"id", "message", "schema"?, "tool_input"?}`; `tool_input` is the brain's `AskUserQuestion` call as the client's own tool takes it, which the client runs verbatim, `message`/`schema` (MCP elicitation form shape) are for a client or gateway without that tool; answered through `runs.continue` with one result whose `tool_use_id` is the Step's `question.id` |
-| `failed` | the run ended without a result | `reason`: `"budget_exceeded" \| "max_steps" \| "cancelled" \| "skill_error" \| "policy_violation" \| "upstream_unavailable"`, `message`, `charge` |
+| `failed` | the run ended without a result | `reason`: `"budget_exceeded" \| "max_steps" \| "cancelled" \| "skill_error" \| "policy_violation" \| "upstream_unavailable" \| "disclosure"`, `message`, `charge` |
 
 A `usage` block is present on every Step and describes the gateway's work
 *since the previous Step* — every model call the shadow made for it,
@@ -438,7 +443,11 @@ publish time, and pinned by the user at install time.
   governs the one thing that leaves the machine other than as a tool
   result: the codebase context the client's own forks carry in their system
   prompt (the CLAUDE.md chain and git status). A sealed fork carries it
-  only under that class; otherwise it starts without it.
+  only under that class; otherwise it starts without it. `egress.disclosure`
+  is the creator's policy for the gateway's disclosure screen (§8.5):
+  `"redact"` (the default) replaces a passage that quotes the Skill's sealed
+  material with `[sealed]` and the Step counts it, `"fail"` ends the run as
+  `failed` / `disclosure`, `"off"` disables the screen.
   `retention` is the gateway's promise for tool results: `"run"` (discarded
   when the run ends) or `"audit"` (kept for the audit window the operator
   publishes).
@@ -617,12 +626,23 @@ expire, and is charged for the work done.
 ### 8.5 Disclosure through the model
 
 Tool results are untrusted data to the model the gateway's brain runs on,
-exactly as they are to the client's own loop. A gateway SHOULD screen
-outgoing call inputs and `text`
-against the Skill's own content (n-gram and embedding similarity), SHOULD
-seed each creator's Skill with canary phrases, and MUST log and attribute
-an attempt to the subscriber account. Operators publish what they do here;
-the protocol does not promise that extraction is impossible.
+exactly as they are to the client's own loop, and the model can restate
+what it was told. A gateway MUST screen what the brain is about to show
+the client — a `final` text, every call's `input` in a `tool_calls` Step, a
+`question` — against the Skill's own sealed material before the Step
+leaves. The reference gateway replaces every run of eight consecutive
+tokens (words compared without case or punctuation; CJK per character)
+that also occurs in the body or a `sealed/` file with `[sealed]`, the Step
+carries `disclosure.redactions`, and the brain's own conversation keeps the
+original: the output is edited, never the brain's memory. The manifest's
+`egress.disclosure` (§5) chooses `redact`, `fail` (the Step becomes
+`failed` / `disclosure` and nothing of it reaches the client) or `off`.
+What the screen does not catch, stated plainly: a number, a name, a short
+phrase, a paraphrase — a threshold restated as "under 5000.00" passes; the
+rule it belongs to, quoted, does not. A gateway SHOULD add detection of its
+own (embedding similarity, canary phrases seeded per creator) and MUST log
+and attribute an attempt to the subscriber account. Operators publish what
+they do here; the protocol does not promise that extraction is impossible.
 
 ### 8.6 Attested gateway (reserved)
 
@@ -665,6 +685,10 @@ client; a Glob and a Grep under `sealed/` are answered on the gateway
 without a Step while a Glob over the Skill directory goes to the client; a
 call whose result class is undeclared is refused before it runs; the fork's
 codebase context reaches the gateway only under `repository_structure`; a
+final that quotes a sealed line comes back with the passage replaced and
+the Step counting it, a tool input that quotes one reaches the client's
+tool redacted, and under `disclosure: "fail"` the run ends with nothing of
+the Step shown; a
 `confirm: true` call is approved interactively in bypass mode (and
 a declined one reported as `permission_denied`); the brain's
 `AskUserQuestion` is asked through the client's own dialog and the run
@@ -751,6 +775,10 @@ call.
   without the contents themselves.
   `metacodes sealed ledger` prints it. The provider credential is never
   written there.
+- **Disclosure.** A Step whose `disclosure.redactions` is not zero is
+  logged at warn under `sealed`, recorded in the ledger
+  (`disclosure_redactions`) and announced once in the fork's output; the
+  `[sealed]` markers stay where the passages were.
 - **Confirmation.** A call marked `confirm: true` is approved
   interactively whatever the permission mode (§6.2). The provider does not
   decide permissions: it answers the child permission context's *confirm
@@ -883,11 +911,19 @@ shared with the instance that holds it.
   with the local price table for the client's model (§8.2); `cumulative`
   and `charge` carry the running total. The gateway stops with
   `budget_exceeded` as soon as the total passes the client's cap.
+- **Disclosure screen.** `disclosure.zig` builds, at package load, the set
+  of eight-token windows of the body and every sealed file; `emitStep`
+  passes a `final` text, each call input of a `tool_calls` batch and a
+  question through it before the Step is rendered (`screenEmit`), by the
+  manifest's `egress.disclosure`: `redact` replaces the passage with
+  `[sealed]` and counts it in the Step, `fail` turns the Step into
+  `failed` / `disclosure` with the pending batch dropped, `off` skips it.
+  The brain's conversation in `run_state` keeps the original.
 - **Not in revision 2026-10-15 of the gateway:** Step signatures
   (`step_signature: false`), subscriptions and per-account authorization
   beyond the single bearer token, a Skill fee in `charge` (it carries the
-  model-cost estimate), the publish-time protection rating, and the
-  disclosure screening of §8.5.
+  model-cost estimate), the publish-time protection rating, and any
+  disclosure detection beyond the eight-token screen of §8.5.
 
 ## 10. Error codes
 

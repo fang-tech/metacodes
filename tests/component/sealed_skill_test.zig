@@ -45,6 +45,22 @@ fn escapeJson(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
     return escaped.toOwnedSlice(allocator);
 }
 
+/// One assistant turn that ends with `text` and no tool call.
+fn finalSse(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
+    const escaped = try escapeJson(allocator, text);
+    defer allocator.free(escaped);
+    return std.fmt.allocPrint(
+        allocator,
+        "data: {{\"type\":\"message_start\",\"message\":{{\"id\":\"msg_f\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{{\"input_tokens\":40,\"output_tokens\":1}}}}}}\n\n" ++
+            "data: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{{\"type\":\"text\",\"text\":\"\"}}}}\n\n" ++
+            "data: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":\"{s}\"}}}}\n\n" ++
+            "data: {{\"type\":\"content_block_stop\",\"index\":0}}\n\n" ++
+            "data: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"end_turn\"}},\"usage\":{{\"output_tokens\":5}}}}\n\n" ++
+            "data: {{\"type\":\"message_stop\"}}\n\n",
+        .{escaped},
+    );
+}
+
 /// One assistant turn calling `tool` with `input_json` (already a JSON object).
 fn toolCallSse(allocator: std.mem.Allocator, tool: []const u8, input_json: []const u8) ![]u8 {
     return toolCallSseWithText(allocator, "", tool, input_json);
@@ -1002,6 +1018,92 @@ test "L2 sealed: the fork's codebase context reaches the gateway under repositor
     try std.testing.expect(std.mem.indexOf(u8, output, "final-from-sealed") != null);
     const first = lab.model.requestAt(0) orelse return error.NoModelRequest;
     try std.testing.expect(std.mem.indexOf(u8, first.body(), "PROJECT_CLAUDE_MD_MARKER") != null);
+}
+
+// ── Disclosure screen (§8.5) ───────────────────────────────────────────────
+
+const SEALED_RULE_LINE = "The rule nobody else reads applies to every invoice over the threshold.";
+const DISCLOSURE_MANIFEST = "{\"schema\":\"metask.sealed-skill.manifest/v1\",\"skill_id\":\"ssk_test\",\"version\":\"1.0.0\",\"name\":\"erp-post\",\"description\":\"Posts invoices.\",\"tools\":{\"allow\":[\"Read\",\"Write\"]},\"egress\":{\"classes\":[\"file_contents\"]}}";
+const DISCLOSURE_FAIL_MANIFEST = "{\"schema\":\"metask.sealed-skill.manifest/v1\",\"skill_id\":\"ssk_test\",\"version\":\"1.0.0\",\"name\":\"erp-post\",\"description\":\"Posts invoices.\",\"tools\":{\"allow\":[\"Read\"]},\"egress\":{\"classes\":[\"file_contents\"],\"disclosure\":\"fail\"}}";
+
+test "L2 sealed: a final that quotes a sealed line reaches the client with the passage replaced and counted" {
+    const a = std.testing.allocator;
+    var lab: Lab = undefined;
+    const quoting = try finalSse(a, "Posted. " ++ SEALED_RULE_LINE ++ " Nothing else to do.");
+    defer a.free(quoting);
+    try lab.startWithFiles(a, "cc-zig-sealed-disclose", &.{quoting}, DISCLOSURE_MANIFEST, .{}, &.{
+        .{ .path = "sealed/notes.md", .bytes = SEALED_RULE_LINE ++ "\n" },
+    });
+    defer lab.stop();
+    try lab.install("");
+    try lab.loadCatalog();
+
+    const output = try lab.runSkill("{\"name\":\"erp-post\",\"values\":[\"go\"]}");
+    defer a.free(output);
+    // The quoted sentence goes; its closing period, outside the last token, stays.
+    try std.testing.expect(std.mem.indexOf(u8, output, "Posted. [sealed]. Nothing else to do.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "nobody else reads") == null);
+    // The user is told, once, and the ledger keeps the count.
+    try std.testing.expect(std.mem.indexOf(u8, output, "[sealed skill] the gateway withheld passages") != null);
+    const ledger = (try lab.ledger()) orelse return error.LedgerMissing;
+    defer a.free(ledger);
+    try std.testing.expect(std.mem.indexOf(u8, ledger, "\"disclosure_redactions\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ledger, "nobody else reads") == null);
+}
+
+test "L2 sealed: a tool input that quotes a sealed line reaches the client's tool redacted" {
+    const a = std.testing.allocator;
+    var lab: Lab = undefined;
+    var pre_buf: [512]u8 = undefined;
+    const pre_root = harness.normalizeSlashes(@constCast(cc.util_fs.testing.perPidDir(&pre_buf, "cc-zig-sealed-disclose-input")));
+    const write_input = try std.fmt.allocPrint(a, "{{\"file_path\":\"{s}/leak.txt\",\"content\":\"Reminder: {s}\"}}", .{ pre_root, SEALED_RULE_LINE });
+    defer a.free(write_input);
+    const write_sse = try toolCallSse(a, "Write", write_input);
+    defer a.free(write_sse);
+    try lab.startWithFiles(a, "cc-zig-sealed-disclose-input", &.{ write_sse, FINAL_SSE }, DISCLOSURE_MANIFEST, .{}, &.{
+        .{ .path = "sealed/notes.md", .bytes = SEALED_RULE_LINE ++ "\n" },
+    });
+    defer lab.stop();
+    try lab.install("");
+    try lab.loadCatalog();
+
+    const output = try lab.runSkill("{\"name\":\"erp-post\",\"values\":[\"go\"]}");
+    defer a.free(output);
+    try std.testing.expect(std.mem.indexOf(u8, output, "final-from-sealed") != null);
+    const leak = try std.fmt.allocPrint(a, "{s}/leak.txt", .{lab.root});
+    defer a.free(leak);
+    const written = (try readFileAt(a, leak)) orelse return error.FileNotWritten;
+    defer a.free(written);
+    try std.testing.expectEqualStrings("Reminder: [sealed].", written);
+    const ledger = (try lab.ledger()) orelse return error.LedgerMissing;
+    defer a.free(ledger);
+    try std.testing.expect(std.mem.indexOf(u8, ledger, "\"step_kind\":\"tool_calls\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ledger, "\"disclosure_redactions\":1") != null);
+    // The brain itself still remembers what it asked for.
+    const second = lab.model.requestAt(1) orelse return error.NoModelRequest;
+    try std.testing.expect(std.mem.indexOf(u8, second.body(), "nobody else reads") != null);
+}
+
+test "L2 sealed: under disclosure: fail a quoting final ends the run and nothing of it reaches the client" {
+    const a = std.testing.allocator;
+    var lab: Lab = undefined;
+    const quoting = try finalSse(a, "Posted. " ++ SEALED_RULE_LINE);
+    defer a.free(quoting);
+    try lab.startWithFiles(a, "cc-zig-sealed-disclose-fail", &.{quoting}, DISCLOSURE_FAIL_MANIFEST, .{}, &.{
+        .{ .path = "sealed/notes.md", .bytes = SEALED_RULE_LINE ++ "\n" },
+    });
+    defer lab.stop();
+    try lab.install("");
+    try lab.loadCatalog();
+
+    const output = try lab.runSkill("{\"name\":\"erp-post\",\"values\":[\"go\"]}");
+    defer a.free(output);
+    try std.testing.expect(std.mem.indexOf(u8, output, "[sealed skill failed: disclosure") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "Posted.") == null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "nobody else reads") == null);
+    const ledger = (try lab.ledger()) orelse return error.LedgerMissing;
+    defer a.free(ledger);
+    try std.testing.expect(std.mem.indexOf(u8, ledger, "\"step_kind\":\"failed\"") != null);
 }
 
 // ── confirm: true (§4.3, §6.2) ────────────────────────────────────────────

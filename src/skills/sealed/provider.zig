@@ -625,6 +625,12 @@ pub const SealedSkillProvider = struct {
             }
         }
         self.recordStep(step);
+        if (step.disclosure_redactions != 0) {
+            // §8.5: the gateway withheld passages of the Skill's own sealed
+            // content; the user is told once, the ledger keeps the count.
+            log.warn("sealed", "step {d}: the gateway redacted {d} passage(s) of the Skill's sealed content", .{ step.seq, step.disclosure_redactions });
+            try self.addNotice("the gateway withheld passages of the Skill's own sealed content from this run's output; they read [sealed]");
+        }
         log.info("sealed", "step run={s} seq={d} kind={s} calls={d} cost_micros={d} cumulative={d} usage in={d} out={d} cache_r={d}", .{
             step.run_id, step.seq, @tagName(step.kind), step.calls.len, step.usage.cost_micros, step.cumulative.cost_micros, step.usage.input_tokens, step.usage.output_tokens, step.usage.cache_read_input_tokens,
         });
@@ -967,6 +973,7 @@ pub const SealedSkillProvider = struct {
             .calls = step.calls.len,
             .tool_calls = tool_calls,
             .results_digest = step.results_digest,
+            .disclosure_redactions = step.disclosure_redactions,
         }) catch |err| log.warn("sealed", "ledger append failed: {s}", .{@errorName(err)});
         if (step.charge) |charge| {
             ledger.append(self.allocator, self.state_root, .{

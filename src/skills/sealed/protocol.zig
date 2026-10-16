@@ -114,6 +114,9 @@ pub const Manifest = struct {
     egress_classes: []const []const u8 = &.{},
     egress_max_result_bytes: u64 = DEFAULT_MAX_RESULT_BYTES,
     egress_retention: []const u8 = "run",
+    /// §5, §8.5: what the gateway does when the brain's output quotes the
+    /// Skill's sealed material — `redact` (default), `fail` or `off`.
+    egress_disclosure: []const u8 = "redact",
     credentials: []const CredentialDecl = &.{},
     execution_classes: []const []const u8 = &.{},
     pricing_model: []const u8 = "",
@@ -311,6 +314,10 @@ pub fn manifestFromValue(arena: std.mem.Allocator, value: std.json.Value) ParseE
             manifest.egress_max_result_bytes = @intCast(bytes);
         }
         manifest.egress_retention = try optionalString(egress, "retention") orelse "run";
+        manifest.egress_disclosure = try optionalString(egress, "disclosure") orelse "redact";
+        if (!std.mem.eql(u8, manifest.egress_disclosure, "redact") and
+            !std.mem.eql(u8, manifest.egress_disclosure, "fail") and
+            !std.mem.eql(u8, manifest.egress_disclosure, "off")) return error.InvalidShape;
     }
     if (value.object.get("credentials")) |credentials| {
         if (credentials != .array) return error.InvalidShape;
@@ -416,6 +423,9 @@ pub const Step = struct {
     /// it with the digest of what it sent and ends the run when the Step
     /// answering its `runs.continue` carries anything else, including nothing.
     results_digest: []const u8 = "",
+    /// §8.5: how many passages of the Skill's sealed material the gateway
+    /// replaced with its marker in this Step's text, inputs or question.
+    disclosure_redactions: u64 = 0,
     /// `failed` only.
     reason: []const u8 = "",
     message: []const u8 = "",
@@ -479,6 +489,12 @@ pub fn stepFromValue(arena: std.mem.Allocator, value: std.json.Value) ParseError
     step.prev_digest = try optionalString(value, "prev_digest") orelse "";
     step.sig = try optionalString(value, "sig") orelse "";
     step.results_digest = try optionalString(value, "results_digest") orelse "";
+    if (value.object.get("disclosure")) |disclosure| {
+        if (disclosure != .object) return error.InvalidShape;
+        const redactions = try optionalInteger(disclosure, "redactions") orelse 0;
+        if (redactions < 0) return error.InvalidShape;
+        step.disclosure_redactions = @intCast(redactions);
+    }
     if (value.object.get("issuer")) |issuer| {
         if (issuer != .object) return error.InvalidShape;
         step.issuer_skill_host = try optionalString(issuer, "skill_host") orelse "";
@@ -1401,6 +1417,45 @@ test "manifest tool rules: plain names, argument patterns, MCP wildcards, deny f
     try std.testing.expect(manifestAllowsTool(m, "Bash"));
     try std.testing.expect(!manifestAllowsTool(m, "Grep"));
     try std.testing.expect(!manifestAllowsTool(m, "Write"));
+}
+
+test "disclosure: the Step's count parses; the manifest's policy is one of three words" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const al = arena.allocator();
+    // A Step is only accepted with its own digest: stamp the fixture.
+    const Stamped = struct {
+        fn step(allocator: std.mem.Allocator, body: []const u8) ![]const u8 {
+            const value = try std.json.parseFromSliceLeaky(std.json.Value, allocator, body, .{});
+            const digest = try stepDigest(allocator, value);
+            return std.fmt.allocPrint(allocator, "{s},\"digest\":\"{s}\"}}", .{ body[0 .. body.len - 1], digest });
+        }
+    };
+    var counted = try parseStep(a, try Stamped.step(al, "{\"run_id\":\"run_1\",\"seq\":2,\"run_state\":\"\",\"kind\":\"final\",\"text\":\"x [sealed] y\",\"disclosure\":{\"redactions\":2}}"));
+    defer counted.deinit();
+    try std.testing.expectEqual(@as(u64, 2), counted.step.disclosure_redactions);
+    var plain = try parseStep(a, try Stamped.step(al, "{\"run_id\":\"run_1\",\"seq\":1,\"run_state\":\"\",\"kind\":\"final\",\"text\":\"x\"}"));
+    defer plain.deinit();
+    try std.testing.expectEqual(@as(u64, 0), plain.step.disclosure_redactions);
+
+    const failing = try std.mem.replaceOwned(u8, a, TEST_MANIFEST_JSON, "\"retention\":\"run\"", "\"retention\":\"run\",\"disclosure\":\"fail\"");
+    defer a.free(failing);
+    const failing_entry = try testEntryJson(a, failing);
+    defer a.free(failing_entry);
+    var parsed = try parseEntry(a, failing_entry);
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("fail", parsed.entry.manifest.egress_disclosure);
+    const default_entry = try testEntryJson(a, TEST_MANIFEST_JSON);
+    defer a.free(default_entry);
+    var defaulted = try parseEntry(a, default_entry);
+    defer defaulted.deinit();
+    try std.testing.expectEqualStrings("redact", defaulted.entry.manifest.egress_disclosure);
+    const loud = try std.mem.replaceOwned(u8, a, TEST_MANIFEST_JSON, "\"retention\":\"run\"", "\"retention\":\"run\",\"disclosure\":\"loud\"");
+    defer a.free(loud);
+    const loud_entry = try testEntryJson(a, loud);
+    defer a.free(loud_entry);
+    try std.testing.expectError(error.InvalidShape, parseEntry(a, loud_entry));
 }
 
 test "egress classes: the tools the client can classify, and what a manifest declares" {

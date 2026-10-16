@@ -27,6 +27,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const protocol = @import("protocol.zig");
 const credentials = @import("credentials.zig");
+const disclosure = @import("disclosure.zig");
 const definition = @import("../runtime/definition.zig");
 const render = @import("../render.zig");
 const provider_mod = @import("../../api/provider.zig");
@@ -101,6 +102,9 @@ pub const Package = struct {
     assets: []const Asset,
     /// Paths relative to `<dir>/sealed/`.
     sealed_files: []const []const u8,
+    /// §8.5: the token windows of the sealed material (body and sealed
+    /// files), what the disclosure screen matches the brain's output against.
+    disclosure: disclosure.Corpus,
 
     pub fn findAsset(self: *const Package, path: []const u8) ?*const Asset {
         for (self.assets) |*asset| if (std.mem.eql(u8, asset.path, path)) return asset;
@@ -925,12 +929,16 @@ pub const Gateway = struct {
         reason: []const u8 = "",
         message: []const u8 = "",
         usage: protocol.Usage,
+        /// §8.5: set by the screen in `emitStep`; written as `disclosure`.
+        disclosure_redactions: usize = 0,
     };
 
     /// Render a Step: digest first (over everything but `run_state`, `digest`
     /// and `sig`), then seal the state with that digest as its chain head, and
     /// only then attach both.
-    fn emitStep(self: *Gateway, arena: std.mem.Allocator, state: *RunState, emit: Emit) MethodError![]const u8 {
+    fn emitStep(self: *Gateway, arena: std.mem.Allocator, state: *RunState, emit_in: Emit) MethodError![]const u8 {
+        var emit = emit_in;
+        if (self.findPackage(state.skill_id)) |package| try screenEmit(arena, package, state, &emit);
         var out: std.Io.Writer.Allocating = .init(arena);
         const w = &out.writer;
         writeStepBody(w, self, state, emit) catch return error.OutOfMemory;
@@ -1011,6 +1019,9 @@ pub const Gateway = struct {
             try w.writeAll(",\"results_digest\":");
             try protocol.writeString(w, state.results_digest);
         }
+        if (emit.disclosure_redactions != 0) {
+            try w.print(",\"disclosure\":{{\"redactions\":{d}}}", .{emit.disclosure_redactions});
+        }
         if (emit.kind == .final or emit.kind == .failed) {
             try w.writeAll(",\"charge\":{\"run_id\":");
             try protocol.writeString(w, state.run_id);
@@ -1023,6 +1034,114 @@ pub const Gateway = struct {
 };
 
 const protocol_default_max_steps: u64 = 200;
+
+/// §8.5: what the brain is about to show the client — a final text, the
+/// inputs of a tool_calls batch, a question — passes the disclosure screen
+/// before the Step is rendered. Under the manifest's `redact` policy a
+/// passage that quotes the sealed material becomes the marker and the Step
+/// counts it; under `fail` the Step becomes the run's failure and nothing of
+/// it reaches the client; `off` skips the screen. The brain's own
+/// conversation keeps the original: the screen edits what leaves, never
+/// what the brain remembers.
+fn screenEmit(arena: std.mem.Allocator, package: *const Package, state: *Gateway.RunState, emit: *Gateway.Emit) Gateway.MethodError!void {
+    const policy = disclosure.Policy.parse(package.entry.manifest.egress_disclosure) orelse .redact;
+    if (policy == .off or package.disclosure.isEmpty()) return;
+    var total: usize = 0;
+    switch (emit.kind) {
+        .final => {
+            const redacted = disclosure.redactText(arena, &package.disclosure, emit.text) catch return error.OutOfMemory;
+            emit.text = redacted.text;
+            total += redacted.spans;
+        },
+        .tool_calls => {
+            const calls = arena.dupe(protocol.Call, emit.calls) catch return error.OutOfMemory;
+            for (calls) |*call| {
+                const redacted = disclosure.redactJsonStrings(arena, &package.disclosure, call.input_json) catch return error.OutOfMemory;
+                call.input_json = redacted.text;
+                total += redacted.spans;
+            }
+            emit.calls = calls;
+        },
+        .input_required => {
+            if (emit.question) |*question| {
+                const message = disclosure.redactText(arena, &package.disclosure, question.message) catch return error.OutOfMemory;
+                question.message = message.text;
+                total += message.spans;
+                if (question.tool_input_json.len != 0) {
+                    const input = disclosure.redactJsonStrings(arena, &package.disclosure, question.tool_input_json) catch return error.OutOfMemory;
+                    question.tool_input_json = input.text;
+                    total += input.spans;
+                }
+            }
+        },
+        .failed => {},
+    }
+    if (total == 0) return;
+    log.warn("sealed-gw", "run {s} step {d}: {d} passage(s) quoting sealed content {s}", .{ state.run_id, state.seq, total, if (policy == .fail) "end the run" else "redacted" });
+    if (policy == .fail) {
+        const usage = emit.usage;
+        state.pending = &.{};
+        state.completed = &.{};
+        emit.* = .{ .kind = .failed, .reason = "disclosure", .message = "the Skill's output quoted its sealed content and its disclosure policy ends the run", .usage = usage };
+        return;
+    }
+    emit.disclosure_redactions = total;
+}
+
+test "the disclosure screen edits what leaves a Step, by the manifest's policy" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const al = arena.allocator();
+    const rule = "R5: every invoice above the threshold needs a second approver before posting.";
+    var corpus: disclosure.Corpus = .{};
+    try corpus.add(al, rule);
+    var manifest: protocol.Manifest = undefined;
+    const entry_json = try protocol.testEntryJson(al, protocol.TEST_MANIFEST_JSON);
+    const parsed = try protocol.parseEntry(al, entry_json);
+    manifest = parsed.entry.manifest;
+    var package = Package{ .name = "x", .dir = "/pkg", .body = rule, .entry_json = entry_json, .entry = parsed.entry, .assets = &.{}, .sealed_files = &.{}, .disclosure = corpus };
+    var state: Gateway.RunState = undefined;
+    state.run_id = "run_1";
+    state.seq = 1;
+    state.pending = &.{};
+    state.completed = &.{};
+
+    // redact (the default): the final text loses the passage, the Step counts it.
+    var final = Gateway.Emit{ .kind = .final, .text = "Done: every invoice above the threshold needs a second approver before posting, as the rule says.", .usage = .{} };
+    try screenEmit(al, &package, &state, &final);
+    try std.testing.expectEqual(protocol.StepKind.final, final.kind);
+    try std.testing.expectEqualStrings("Done: [sealed], as the rule says.", final.text);
+    try std.testing.expectEqual(@as(usize, 1), final.disclosure_redactions);
+    // A tool input: the quoting string value is replaced, the document stays valid.
+    const calls = [_]protocol.Call{.{ .id = "c1", .name = "Write", .input_json = "{\"file_path\":\"/tmp/x\",\"content\":\"every invoice above the threshold needs a second approver before posting\"}" }};
+    var batch = Gateway.Emit{ .kind = .tool_calls, .calls = &calls, .usage = .{} };
+    try screenEmit(al, &package, &state, &batch);
+    try std.testing.expectEqual(@as(usize, 1), batch.disclosure_redactions);
+    try std.testing.expectEqualStrings("{\"file_path\":\"/tmp/x\",\"content\":\"[sealed]\"}", batch.calls[0].input_json);
+    // Nothing quoting: untouched, uncounted.
+    var clean = Gateway.Emit{ .kind = .final, .text = "Posted the invoice; nothing to report.", .usage = .{} };
+    try screenEmit(al, &package, &state, &clean);
+    try std.testing.expectEqual(@as(usize, 0), clean.disclosure_redactions);
+    try std.testing.expectEqualStrings("Posted the invoice; nothing to report.", clean.text);
+
+    // fail: the Step becomes the run's failure.
+    manifest.egress_disclosure = "fail";
+    package.entry.manifest = manifest;
+    var failing = Gateway.Emit{ .kind = .final, .text = "Done: every invoice above the threshold needs a second approver before posting.", .usage = .{} };
+    try screenEmit(al, &package, &state, &failing);
+    try std.testing.expectEqual(protocol.StepKind.failed, failing.kind);
+    try std.testing.expectEqualStrings("disclosure", failing.reason);
+    try std.testing.expect(std.mem.indexOf(u8, failing.message, "threshold") == null);
+
+    // off: the passage passes.
+    manifest.egress_disclosure = "off";
+    package.entry.manifest = manifest;
+    var open = Gateway.Emit{ .kind = .final, .text = "Done: every invoice above the threshold needs a second approver before posting.", .usage = .{} };
+    try screenEmit(al, &package, &state, &open);
+    try std.testing.expectEqual(@as(usize, 0), open.disclosure_redactions);
+    try std.testing.expect(std.mem.indexOf(u8, open.text, "threshold") != null);
+}
 
 /// The continuation's view of the conversation (§9.2): the messages from the
 /// compaction boundary on, in the transcript's own shape. The prefix the
@@ -1459,6 +1578,15 @@ pub fn loadPackage(arena: std.mem.Allocator, package_dir: []const u8, name: []co
         .{ quoted(arena, manifest.skill_id) catch return error.OutOfMemory, quoted(arena, manifest.version) catch return error.OutOfMemory, canonical, digest, assets_json.written() },
     ) catch return error.OutOfMemory;
     const parsed = protocol.parseEntry(arena, entry_json) catch return error.InvalidPackage;
+    // §8.5: the sealed material the brain must not restate — the body and
+    // every sealed file — as the screen's corpus.
+    var corpus: disclosure.Corpus = .{};
+    corpus.add(arena, skill.body) catch return error.OutOfMemory;
+    for (sealed_files.items) |relative| {
+        const full = std.fs.path.join(arena, &.{ package_dir, SEALED_DIR, relative }) catch return error.OutOfMemory;
+        const bytes = readFile(arena, full, MAX_REQUEST_BYTES) catch return error.InvalidPackage;
+        corpus.add(arena, bytes) catch return error.OutOfMemory;
+    }
     // The entry's arena is a child of ours; keep the parsed view alive by
     // never calling deinit (it is freed with `arena`).
     return .{
@@ -1469,6 +1597,7 @@ pub fn loadPackage(arena: std.mem.Allocator, package_dir: []const u8, name: []co
         .entry = parsed.entry,
         .assets = assets.toOwnedSlice(arena) catch return error.OutOfMemory,
         .sealed_files = sealed_files.toOwnedSlice(arena) catch return error.OutOfMemory,
+        .disclosure = corpus,
     };
 }
 
@@ -1833,7 +1962,7 @@ test "sealed read paths are confined to <base_dir>/sealed/" {
     const a = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
-    const package = Package{ .name = "x", .dir = "/pkg", .body = "", .entry_json = "", .entry = undefined, .assets = &.{}, .sealed_files = &.{"notes.md"} };
+    const package = Package{ .name = "x", .dir = "/pkg", .body = "", .entry_json = "", .entry = undefined, .assets = &.{}, .sealed_files = &.{"notes.md"}, .disclosure = .{} };
     const dispatcher = RemoteDispatcher{ .package = &package, .base_dir = "C:\\Users\\u\\.metacodes\\sealed-skills\\x", .defs = &.{} };
     const inside = try dispatcher.sealedRelativePath(arena.allocator(), "{\"file_path\":\"C:/Users/u/.metacodes/sealed-skills/x/sealed/notes.md\"}");
     try std.testing.expectEqualStrings("notes.md", inside.?);
@@ -1848,7 +1977,7 @@ test "sealed searches: Glob and Grep under <base_dir>/sealed are the gateway's, 
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const al = arena.allocator();
-    const package = Package{ .name = "x", .dir = "/srv/packages/x", .body = "", .entry_json = "", .entry = undefined, .assets = &.{}, .sealed_files = &.{"notes.md"} };
+    const package = Package{ .name = "x", .dir = "/srv/packages/x", .body = "", .entry_json = "", .entry = undefined, .assets = &.{}, .sealed_files = &.{"notes.md"}, .disclosure = .{} };
     const dispatcher = RemoteDispatcher{ .package = &package, .base_dir = "C:\\Users\\u\\.metacodes\\sealed-skills\\x", .defs = &.{} };
     const Parse = struct {
         fn value(arena_allocator: std.mem.Allocator, json: []const u8) !std.json.Value {
