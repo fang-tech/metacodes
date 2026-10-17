@@ -837,6 +837,16 @@ N 个 session = N 个 `run()` 线程,共用一个 backend 实例;emit/poll 按 `
 CoreEvent/UiEvent/UiRequest 全可序列化(无指针/闭包)。emit 内 `serialize → 发送`、poll 内
 `接收 → parse`。`HeadlessBackend` 已示范 emit→NDJSON,可作进程外传输的起点。
 
+### 6.5 宿主调度 team(issue #277)
+
+`RuntimeConfig.enable_teams` 打开后,`SessionConfig.team`(`TeamConfig`,lead/member)把一个
+Session 加入宿主调度的 team。lead 的 `SpawnTeammate` 不起线程,只在
+`SwarmContext.pending_spawns` 记一条请求,由 Host 创建并运行对应 member Session
+(`SwarmContext.scheduler == .host`)。`swarm_tools.writeTeamDescription` 给名册与待处理请求,
+`swarm_tools.pollLeadInbox` 取 lead 收件箱的下一条输入。team 成员 Host 在 create/restore 时
+提供,不进 checkpoint。设计见 `SWARM_DESIGN.md` §7b,C ABI 封装见 `AGENTCORE_BINARY_ABI.md`
+"Teams"。
+
 ---
 
 ## 7. 已知约束与边界(诚实清单)

@@ -1,8 +1,8 @@
 #include <metask/agentcore.h>
 
-_Static_assert(METASK_AGENTCORE_ABI_REVISION == 23,
+_Static_assert(METASK_AGENTCORE_ABI_REVISION == 24,
                "AgentCore revision changed");
-_Static_assert(sizeof(metask_agentcore_api_v1) == 72,
+_Static_assert(sizeof(metask_agentcore_api_v1) == 80,
                "AgentCore root layout changed");
 _Static_assert(sizeof(metask_agentcore_runtime_api_v1) == 24,
                "Runtime table layout changed");
@@ -16,6 +16,16 @@ _Static_assert(sizeof(metask_agentcore_mcp_api_v1) == 40,
                "MCP table layout changed");
 _Static_assert(sizeof(metask_agentcore_goal_api_v1) == 40,
                "Goal table layout changed");
+_Static_assert(sizeof(metask_agentcore_team_api_v1) == 24,
+               "Team table layout changed");
+_Static_assert(sizeof(metask_agentcore_team_config_v1) == 88,
+               "Team config layout changed");
+_Static_assert(METASK_AGENTCORE_TEAM_ROLE_LEAD == 1u &&
+                   METASK_AGENTCORE_TEAM_ROLE_MEMBER == 2u,
+               "team role codes changed");
+_Static_assert(METASK_AGENTCORE_MAX_TEAM_NAME_BYTES_V1 == 64u &&
+                   METASK_AGENTCORE_MAX_TEAM_MEMBER_BYTES_V1 == 64u,
+               "team byte limits changed");
 _Static_assert(METASK_AGENTCORE_STATUS_GOAL_CONFLICT == 30u,
                "goal conflict status changed");
 _Static_assert(METASK_AGENTCORE_RUN_INPUT_GOAL_CONTINUATION == 4u,

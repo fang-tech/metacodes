@@ -6,10 +6,10 @@
 #include <string.h>
 
 #if defined(METASK_AGENTCORE_CALLBACK_CONTINUE) || defined(METASK_AGENTCORE_CALLBACK_FATAL)
-#error "revision 23 must not retain historical callback aliases"
+#error "revision 24 must not retain historical callback aliases"
 #endif
 
-#if METASK_AGENTCORE_ABI_REVISION != 23u || \
+#if METASK_AGENTCORE_ABI_REVISION != 24u || \
     METASK_AGENTCORE_MAX_SUBMITTED_INPUTS_V1 != 64u || \
     METASK_AGENTCORE_MAX_SUBMITTED_INPUT_BYTES_V1 != 16777216u || \
     METASK_AGENTCORE_PROMPT_OP_ADD != 1u || \
@@ -55,8 +55,12 @@
     METASK_AGENTCORE_GOAL_ACTION_COMPLETE != 3u || \
     METASK_AGENTCORE_GOAL_ACTION_BLOCK != 4u || \
     METASK_AGENTCORE_MAX_GOAL_OBJECTIVE_CODEPOINTS_V1 != 4000u || \
-    METASK_AGENTCORE_MAX_GOAL_OBJECTIVE_BYTES_V1 != 16384u
-#error "source-free Revision 23 codes must match the public contract"
+    METASK_AGENTCORE_MAX_GOAL_OBJECTIVE_BYTES_V1 != 16384u || \
+    METASK_AGENTCORE_TEAM_ROLE_LEAD != 1u || \
+    METASK_AGENTCORE_TEAM_ROLE_MEMBER != 2u || \
+    METASK_AGENTCORE_MAX_TEAM_NAME_BYTES_V1 != 64u || \
+    METASK_AGENTCORE_MAX_TEAM_MEMBER_BYTES_V1 != 64u
+#error "source-free Revision 23/24 codes must match the public contract"
 #endif
 
 #ifdef _WIN32
@@ -530,6 +534,15 @@ static int goal_contains(const metask_agentcore_api_v1 *api,
     return scan.found;
 }
 
+/* Revision 24: whether an owned-bytes buffer contains `needle`. */
+static int bytes_contains(const char *ptr, size_t len, const char *needle) {
+    struct needle_scan scan = {0};
+    scan.needle = needle;
+    scan.needle_len = strlen(needle);
+    scan_feed(&scan, ptr, len);
+    return scan.found;
+}
+
 static uint32_t host_stream(
     void *ctx, const metask_agentcore_run_context_v1 *run,
     metask_agentcore_bytes_view_v1 arguments,
@@ -622,6 +635,9 @@ int main(int argc, char **argv) {
     metask_agentcore_owned_bytes_v1 diagnostic = {0};
     metask_agentcore_runtime_config_v1 runtime_config = {0};
     runtime_config.struct_size = sizeof(runtime_config);
+    /* Revision 24 (issue #277): admit the team tools; the main Session below
+     * carries no team config, so only the dedicated team Session is affected. */
+    runtime_config.enable_teams = 1;
     metask_agentcore_host_stream_tool_v1 stream_tool = {0};
     stream_tool.struct_size = sizeof(stream_tool);
     stream_tool.name = view("HostStreamC");
@@ -1051,6 +1067,65 @@ int main(int argc, char **argv) {
         }
         api->buffer_release(&diagnostic);
     }
+    /* Revision 24 (issue #277): a member Session joins (creating) the team
+     * file at creation, so describe and poll are exercised against the real
+     * bundle with no Run. The full lead/member round-trip is the L2 test. */
+    {
+        metask_agentcore_team_config_v1 team_cfg = {0};
+        team_cfg.struct_size = (uint32_t)sizeof(team_cfg);
+        team_cfg.role_code = METASK_AGENTCORE_TEAM_ROLE_MEMBER;
+        team_cfg.team_name = view("c-consumer-team");
+        team_cfg.member_name = view("c-probe");
+        team_cfg.lead_session_id = view("000000000000000000000001");
+        team_cfg.member_lease = view("000000000000000000000002");
+
+        metask_agentcore_session_host_config_v1 team_host = session_host;
+        team_host.team = &team_cfg;
+        team_host.skill_catalog = NULL;
+        team_host.skill_policy = NULL;
+        metask_agentcore_bytes_view_v1 team_allowed[] = {view("HostStreamC")};
+        team_host.allowed_tools = team_allowed;
+        team_host.allowed_tool_count = 1;
+
+        metask_agentcore_session_create_config_v1 team_config = {0};
+        team_config.struct_size = (uint32_t)sizeof(team_config);
+        team_config.host = &team_host;
+        team_config.model = view("c-consumer-model");
+
+        metask_agentcore_session *team_session = NULL;
+        metask_agentcore_owned_bytes_v1 team_json = {0};
+        metask_agentcore_owned_bytes_v1 poll_json = {0};
+        int team_ok =
+            api->session->create(runtime, &team_config, &callbacks, &team_session,
+                                 &diagnostic) == METASK_AGENTCORE_STATUS_OK &&
+            team_session != NULL &&
+            api->team->describe(team_session, &team_json, &diagnostic) ==
+                METASK_AGENTCORE_STATUS_OK &&
+            bytes_contains((const char *)team_json.ptr, (size_t)team_json.len,
+                           "\"role\":\"member\"") &&
+            bytes_contains((const char *)team_json.ptr, (size_t)team_json.len,
+                           "\"name\":\"c-consumer-team\"") &&
+            bytes_contains((const char *)team_json.ptr, (size_t)team_json.len,
+                           "\"c-probe\"") &&
+            bytes_contains((const char *)team_json.ptr, (size_t)team_json.len,
+                           "\"pending_spawns\":[]") &&
+            api->team->poll(team_session, &poll_json, &diagnostic) ==
+                METASK_AGENTCORE_STATUS_OK &&
+            poll_json.len == 14 &&
+            memcmp(poll_json.ptr, "{\"input\":null}", 14) == 0;
+        api->buffer_release(&team_json);
+        api->buffer_release(&poll_json);
+        if (team_session != NULL)
+            api->session->destroy(team_session, &diagnostic);
+        if (!team_ok) {
+            api->buffer_release(&diagnostic);
+            api->session->destroy(session, &diagnostic);
+            api->buffer_release(&diagnostic);
+            api->runtime->destroy(runtime, &diagnostic);
+            return release_error(api, &diagnostic, 27);
+        }
+        api->buffer_release(&diagnostic);
+    }
     if (api->session->destroy(session, &diagnostic) != METASK_AGENTCORE_STATUS_OK) {
         api->buffer_release(&diagnostic);
         api->runtime->destroy(runtime, &diagnostic);
@@ -1060,6 +1135,6 @@ int main(int argc, char **argv) {
         return release_error(api, &diagnostic, 20);
     }
     api->buffer_release(&diagnostic);
-    puts("AgentCore source-free C consumer: ABI table, callback, active-Run input, multimodal input, goal and lifecycle OK");
+    puts("AgentCore source-free C consumer: ABI table, callback, active-Run input, multimodal input, goal, host-scheduled team and lifecycle OK");
     return 0;
 }

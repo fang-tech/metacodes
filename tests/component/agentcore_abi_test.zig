@@ -4056,7 +4056,7 @@ test "L2 public MCP checkpoint restore facade preserves Conversation under narro
 
     var abi_revision_bytes: [4]u8 = undefined;
     @memcpy(&abi_revision_bytes, checkpoint.bytes.items[20..24]);
-    try std.testing.expectEqual(@as(u32, 23), wire.ABI_REVISION);
+    try std.testing.expectEqual(@as(u32, 24), wire.ABI_REVISION);
     // A Session without a prompt profile keeps the marker-8 envelope across
     // ABI revisions; the marker is independent of the table revision.
     try std.testing.expectEqual(
@@ -6766,7 +6766,8 @@ test "L2 opaque ABI routes Host callbacks and enforces Run admission identifiers
         .mcp_servers = null,
         .mcp_server_count = 0,
         .mcp_catalog_limits = null,
-        .reserved = [_]u64{0} ** 4,
+        .enable_teams = 0,
+        .reserved = [_]u64{0} ** 3,
     };
     var diagnostic = wire.OwnedBytesV1{ .ptr = null, .len = 0 };
     defer api.bufferRelease()(&diagnostic);
@@ -6797,7 +6798,7 @@ test "L2 opaque ABI routes Host callbacks and enforces Run admission identifiers
         .protocol_kind_code = wire.PROTOCOL_DEFAULT,
         .model_capabilities = null,
         .model_capability_count = 0,
-        .reserved = [_]u64{0} ** 1,
+        .team = null,
     };
     var session_config = sessionCreateConfig(&host_config, "test-model");
     var callbacks = wire.SessionCallbacksV1{
@@ -8877,13 +8878,6 @@ test "Revision 21 Host capability declarations are validated before a Session ex
         try std.testing.expect(session == null);
         api.bufferRelease()(&diagnostic);
     }
-    // Reserved storage after the new fields still has to be zero.
-    host.model_capabilities = null;
-    host.model_capability_count = 0;
-    host.reserved[0] = 1;
-    var session: ?*wire.SessionHandle = null;
-    try std.testing.expectEqual(wire.STATUS_INVALID_ARGUMENT, api.session().create()(runtime, &config, &callbacks, &session, &diagnostic));
-    api.bufferRelease()(&diagnostic);
 }
 
 test "Revision 15 multimodal wire validation bounds every length before payload access" {
@@ -11912,4 +11906,194 @@ test "L2 Revision 23 a Skill invocation Run in its own context is charged to the
     defer reading.deinit();
     const goal = reading.goal orelse return error.MissingGoal;
     try std.testing.expect(goal.tokens_used > 0);
+}
+
+// ── Revision 24: host-scheduled teams (issue #277) ──────────────────────────
+
+fn teamTextSse(comptime text: []const u8) []const u8 {
+    return "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n" ++
+        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n" ++
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"" ++ text ++ "\"}}\n\n" ++
+        "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n" ++
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n" ++
+        "data: {\"type\":\"message_stop\"}\n\n";
+}
+
+fn teamToolSse(comptime id: []const u8, comptime name: []const u8, comptime input_json: []const u8) []const u8 {
+    return "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n" ++
+        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"" ++ id ++ "\",\"name\":\"" ++ name ++ "\",\"input\":{}}}\n\n" ++
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"" ++ input_json ++ "\"}}\n\n" ++
+        "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n" ++
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":1}}\n\n" ++
+        "data: {\"type\":\"message_stop\"}\n\n";
+}
+
+test "L2 Revision 24 a host-scheduled lead delegates through the public ABI, describe shows the pending spawn, and poll takes a member's reply (issue #277)" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try rootPath(&tmp, &root_buf);
+
+    const raw_api = abi.metask_agentcore_get_api(wire.ABI_VERSION_V1) orelse return error.MissingApi;
+    const api = try sdk.Api.validate(@ptrCast(@alignCast(raw_api)));
+
+    var diagnostic = wire.OwnedBytesV1{ .ptr = null, .len = 0 };
+    defer api.bufferRelease()(&diagnostic);
+
+    // A Runtime that admits the team tools.
+    var runtime_config = std.mem.zeroes(wire.RuntimeConfigV1);
+    runtime_config.struct_size = @sizeOf(wire.RuntimeConfigV1);
+    runtime_config.enable_teams = 1;
+    var runtime: ?*wire.RuntimeHandle = null;
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.runtime().create()(&runtime_config, null, &runtime, &diagnostic),
+    );
+    defer if (runtime) |h| {
+        _ = api.runtime().destroy()(h, &diagnostic);
+    };
+
+    // Lead: TeamCreate crew, SpawnTeammate solver, then end.
+    const lead_bodies = [_][]const u8{
+        teamToolSse("t1", "TeamCreate", "{\\\"name\\\":\\\"crew\\\"}"),
+        teamToolSse("t2", "SpawnTeammate", "{\\\"name\\\":\\\"solver\\\",\\\"prompt\\\":\\\"fix the parser\\\"}"),
+        teamTextSse("delegated"),
+    };
+    var lead_srv = try harness.MockServer.startCassette(&lead_bodies, 0);
+    defer lead_srv.stop();
+    const lead_url = try lead_srv.urlOwned(a);
+    defer a.free(lead_url);
+
+    var lead_team = std.mem.zeroes(wire.TeamConfigV1);
+    lead_team.struct_size = @sizeOf(wire.TeamConfigV1);
+    lead_team.role_code = wire.TEAM_ROLE_LEAD;
+    lead_team.team_name = sdk.bytesView("");
+
+    const lead_allowed = [_]wire.BytesViewV1{ sdk.bytesView("TeamCreate"), sdk.bytesView("SpawnTeammate"), sdk.bytesView("SendMessage") };
+    var lead_host = std.mem.zeroes(wire.SessionHostConfigV1);
+    lead_host.struct_size = @sizeOf(wire.SessionHostConfigV1);
+    lead_host.provider_kind_code = wire.PROVIDER_ANTHROPIC;
+    lead_host.permission_mode_code = wire.PERMISSION_FULL_ACCESS;
+    lead_host.shell_policy_code = wire.SHELL_DISABLED;
+    lead_host.api_key = sdk.bytesView("test-key");
+    lead_host.base_url = sdk.bytesView(lead_url);
+    lead_host.workspace_root = sdk.bytesView(root);
+    lead_host.workspace_home = sdk.bytesView(root);
+    lead_host.allowed_tools = &lead_allowed;
+    lead_host.allowed_tool_count = lead_allowed.len;
+    lead_host.run_journal_mode_code = wire.RUN_JOURNAL_EPHEMERAL;
+    lead_host.team = &lead_team;
+
+    var lead_create = sessionCreateConfig(&lead_host, "test-model");
+    var callbacks = std.mem.zeroes(wire.SessionCallbacksV1);
+    callbacks.struct_size = @sizeOf(wire.SessionCallbacksV1);
+    callbacks.on_event = acceptEvent;
+    var lead_session: ?*wire.SessionHandle = null;
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.session().create()(runtime, &lead_create, &callbacks, &lead_session, &diagnostic),
+    );
+    defer if (lead_session) |h| {
+        _ = api.session().destroy()(h, &diagnostic);
+    };
+
+    var options = std.mem.zeroes(wire.RunOptionsV1);
+    options.struct_size = @sizeOf(wire.RunOptionsV1);
+    options.max_turns = 4;
+    var result = std.mem.zeroes(wire.RunResultV1);
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.session().runText(lead_session, 1, sdk.bytesView("form a team and delegate"), &options, &result, &diagnostic),
+    );
+
+    // describe names the lead's team and the recorded spawn, which is pending —
+    // the lead keeps no running teammate.
+    var team_json = wire.OwnedBytesV1{ .ptr = null, .len = 0 };
+    defer api.bufferRelease()(&team_json);
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.team().describe()(lead_session, &team_json, &diagnostic),
+    );
+    const team_text = try sdk.borrowedBytes(.{ .ptr = team_json.ptr, .len = team_json.len });
+    try std.testing.expect(std.mem.indexOf(u8, team_text, "\"role\":\"lead\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, team_text, "\"name\":\"crew\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, team_text, "\"pending_spawns\":[{\"name\":\"solver\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, team_text, "fix the parser") != null);
+
+    // The member joins under the lead's logical session id and a fresh lease.
+    var lead_desc = wire.OwnedBytesV1{ .ptr = null, .len = 0 };
+    defer api.bufferRelease()(&lead_desc);
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.sessionControl().describe()(lead_session, &lead_desc, &diagnostic),
+    );
+    const lead_desc_text = try sdk.borrowedBytes(.{ .ptr = lead_desc.ptr, .len = lead_desc.len });
+    const decoded_lead = try sdk.decodeSessionDescription(a, lead_desc_text);
+    defer decoded_lead.deinit();
+
+    const lease = core.session_id.gen();
+    const member_bodies = [_][]const u8{
+        teamToolSse("s1", "SendMessage", "{\\\"to\\\":\\\"team-lead\\\",\\\"message\\\":\\\"done: 42\\\",\\\"summary\\\":\\\"done\\\"}"),
+        teamTextSse("idle"),
+    };
+    var member_srv = try harness.MockServer.startCassette(&member_bodies, 0);
+    defer member_srv.stop();
+    const member_url = try member_srv.urlOwned(a);
+    defer a.free(member_url);
+
+    var member_team = std.mem.zeroes(wire.TeamConfigV1);
+    member_team.struct_size = @sizeOf(wire.TeamConfigV1);
+    member_team.role_code = wire.TEAM_ROLE_MEMBER;
+    member_team.team_name = sdk.bytesView("crew");
+    member_team.member_name = sdk.bytesView("solver");
+    member_team.lead_session_id = sdk.bytesView(decoded_lead.value.session_id);
+    member_team.member_lease = sdk.bytesView(lease.asSlice());
+
+    const member_allowed = [_]wire.BytesViewV1{sdk.bytesView("SendMessage")};
+    var member_host = lead_host;
+    member_host.base_url = sdk.bytesView(member_url);
+    member_host.allowed_tools = &member_allowed;
+    member_host.allowed_tool_count = member_allowed.len;
+    member_host.team = &member_team;
+
+    var member_create = sessionCreateConfig(&member_host, "test-model");
+    var member_session: ?*wire.SessionHandle = null;
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.session().create()(runtime, &member_create, &callbacks, &member_session, &diagnostic),
+    );
+    defer if (member_session) |h| {
+        _ = api.session().destroy()(h, &diagnostic);
+    };
+
+    var member_options = std.mem.zeroes(wire.RunOptionsV1);
+    member_options.struct_size = @sizeOf(wire.RunOptionsV1);
+    member_options.max_turns = 3;
+    var member_result = std.mem.zeroes(wire.RunResultV1);
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.session().runText(member_session, 1, sdk.bytesView("work and report"), &member_options, &member_result, &diagnostic),
+    );
+
+    // The lead's poll takes the member's reply as its next model input, read.
+    var poll_json = wire.OwnedBytesV1{ .ptr = null, .len = 0 };
+    defer api.bufferRelease()(&poll_json);
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.team().poll()(lead_session, &poll_json, &diagnostic),
+    );
+    const poll_text = try sdk.borrowedBytes(.{ .ptr = poll_json.ptr, .len = poll_json.len });
+    try std.testing.expect(std.mem.indexOf(u8, poll_text, "done: 42") != null);
+    try std.testing.expect(std.mem.indexOf(u8, poll_text, "teammate_id=\\\"solver\\\"") != null);
+
+    // A second poll is empty: the first drained the inbox.
+    var poll_again = wire.OwnedBytesV1{ .ptr = null, .len = 0 };
+    defer api.bufferRelease()(&poll_again);
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.team().poll()(lead_session, &poll_again, &diagnostic),
+    );
+    const poll_again_text = try sdk.borrowedBytes(.{ .ptr = poll_again.ptr, .len = poll_again.len });
+    try std.testing.expectEqualStrings("{\"input\":null}", poll_again_text);
 }

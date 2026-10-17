@@ -5,7 +5,7 @@
 #include <stdint.h>
 
 #if !defined(UINTPTR_MAX) || !defined(UINT64_MAX) || UINTPTR_MAX != UINT64_MAX
-#error "AgentCore ABI v1 revision 23 requires a 64-bit pointer ABI"
+#error "AgentCore ABI v1 revision 24 requires a 64-bit pointer ABI"
 #endif
 
 #ifdef __cplusplus
@@ -13,11 +13,11 @@ extern "C" {
 #endif
 
 /* sdk/zig/types.zig is the normative fixed-layout schema. This header is its
- * Revision 22 C projection; sdk/rust/src/raw.rs is generated from this file.
+ * Revision 24 C projection; sdk/rust/src/raw.rs is generated from this file.
  * AgentCore ABI v1 remains experimental. Consumers pin an exact bundle and
  * must validate the exact root and mandatory child-table layouts together. */
 #define METASK_AGENTCORE_ABI_V1 1u
-#define METASK_AGENTCORE_ABI_REVISION 23u
+#define METASK_AGENTCORE_ABI_REVISION 24u
 
 #define METASK_AGENTCORE_STATUS_OK 0u
 #define METASK_AGENTCORE_STATUS_INVALID_ARGUMENT 1u
@@ -496,7 +496,11 @@ typedef struct {
     const metask_agentcore_mcp_server_v1 *mcp_servers;
     uint64_t mcp_server_count;
     const metask_agentcore_mcp_catalog_limits_v1 *mcp_catalog_limits;
-    uint64_t reserved[4];
+    /* Revision 24 (issue #277): nonzero admits the team tools (TeamCreate /
+     * TeamDelete / SendMessage / SpawnTeammate) into the catalog so a team
+     * Session can select them. Teams are opt-in; zero keeps them out. */
+    uint64_t enable_teams;
+    uint64_t reserved[3];
 } metask_agentcore_runtime_config_v1;
 
 /* Explicit executable authority. root is an absolute package directory with
@@ -607,6 +611,31 @@ typedef struct {
     uint64_t reserved[2];
 } metask_agentcore_model_capability_v1;
 
+/* Revision 24 (issue #277) team role codes for
+ * metask_agentcore_team_config_v1. */
+#define METASK_AGENTCORE_TEAM_ROLE_LEAD 1u
+#define METASK_AGENTCORE_TEAM_ROLE_MEMBER 2u
+#define METASK_AGENTCORE_MAX_TEAM_NAME_BYTES_V1 64u
+#define METASK_AGENTCORE_MAX_TEAM_MEMBER_BYTES_V1 64u
+
+/* Revision 24: a Session's team membership (issue #277). The lead's team_name
+ * may be empty — its TeamCreate names the team; a member names the team it
+ * joins and carries the lead's session id and a fresh lease. */
+typedef struct {
+    uint32_t struct_size;
+    /* METASK_AGENTCORE_TEAM_ROLE_LEAD or _MEMBER. */
+    uint32_t role_code;
+    /* Member: the team to join (required). Lead: empty, or the team name. */
+    metask_agentcore_bytes_view_v1 team_name;
+    /* Member only: this member's name (required). */
+    metask_agentcore_bytes_view_v1 member_name;
+    /* Member only: the lead's session id (24 lowercase hex) it joins under. */
+    metask_agentcore_bytes_view_v1 lead_session_id;
+    /* Member only: a fresh per-spawn lease (24 lowercase hex). */
+    metask_agentcore_bytes_view_v1 member_lease;
+    uint64_t reserved[2];
+} metask_agentcore_team_config_v1;
+
 /* Current Host authority is shared by fresh creation and restore. Restore
  * intersects this authority with checkpoint state; it never accepts a Host
  * supplied logical Session ID and never widens historical authority. */
@@ -639,7 +668,10 @@ typedef struct {
      * tool-scoped providers; restore uses the current Host's declarations. */
     const metask_agentcore_model_capability_v1 *model_capabilities;
     uint64_t model_capability_count;
-    uint64_t reserved[1];
+    /* Revision 24 (issue #277): this Session's place in a host-scheduled team,
+     * borrowed for the call. Null is no team. Requires the Runtime's
+     * enable_teams. */
+    const metask_agentcore_team_config_v1 *team;
 } metask_agentcore_session_host_config_v1;
 
 /* One edit of the kernel system-prompt sections. PROMPT_OP_ADD adds a
@@ -993,10 +1025,23 @@ typedef uint32_t (*metask_agentcore_goal_update_fn_v1)(
 /* Revision 23. Removes the goal while idle; without one it changes nothing. */
 typedef uint32_t (*metask_agentcore_goal_clear_fn_v1)(
     metask_agentcore_session *, metask_agentcore_owned_bytes_v1 *);
+/* Revision 24 (issue #277). Writes this Session's team as JSON: {"team":null}
+ * or {"team":{"name","role","members":[{name,session_id,lease_id,status}],
+ * "pending_spawns":[{name,prompt,agent_type,effort}]}}. BUSY like describe
+ * while a Run, compact, checkpoint or mutation runs. */
+typedef uint32_t (*metask_agentcore_team_describe_fn_v1)(
+    metask_agentcore_session *, metask_agentcore_owned_bytes_v1 *,
+    metask_agentcore_owned_bytes_v1 *);
+/* Revision 24. Takes the lead's pending inbox as the model input for its next
+ * Run, marked read: {"input":null} or {"input":"<text>"}. Idle-only; a
+ * non-lead or team-less Session writes {"input":null}. */
+typedef uint32_t (*metask_agentcore_team_poll_fn_v1)(
+    metask_agentcore_session *, metask_agentcore_owned_bytes_v1 *,
+    metask_agentcore_owned_bytes_v1 *);
 typedef void (*metask_agentcore_buffer_release_fn_v1)(
     metask_agentcore_owned_bytes_v1 *);
 
-/* Function-table order is fixed within Revision 23. No earlier revision layout
+/* Function-table order is fixed within Revision 24. No earlier revision layout
  * is accepted, probed, aliased, or dispatched. */
 typedef struct metask_agentcore_runtime_api_v1 {
     uint32_t struct_size;
@@ -1056,6 +1101,14 @@ typedef struct metask_agentcore_goal_api_v1 {
     metask_agentcore_goal_clear_fn_v1 clear;
 } metask_agentcore_goal_api_v1;
 
+/* Revision 24 (issue #277): the Session's host-scheduled team. */
+typedef struct metask_agentcore_team_api_v1 {
+    uint32_t struct_size;
+    uint32_t reserved0;
+    metask_agentcore_team_describe_fn_v1 describe;
+    metask_agentcore_team_poll_fn_v1 poll;
+} metask_agentcore_team_api_v1;
+
 typedef struct metask_agentcore_api_v1 {
     uint32_t struct_size;
     uint32_t abi_version;
@@ -1068,6 +1121,7 @@ typedef struct metask_agentcore_api_v1 {
     const metask_agentcore_skill_api_v1 *skill;
     const metask_agentcore_mcp_api_v1 *mcp;
     const metask_agentcore_goal_api_v1 *goal;
+    const metask_agentcore_team_api_v1 *team;
 } metask_agentcore_api_v1;
 
 /* The final owned-bytes output of AgentCore calls is optional and write-only.
@@ -1166,7 +1220,13 @@ metask_agentcore_api_v1_is_compatible(const metask_agentcore_api_v1 *api) {
            api->goal->get != (metask_agentcore_goal_get_fn_v1)0 &&
            api->goal->set != (metask_agentcore_goal_set_fn_v1)0 &&
            api->goal->update != (metask_agentcore_goal_update_fn_v1)0 &&
-           api->goal->clear != (metask_agentcore_goal_clear_fn_v1)0;
+           api->goal->clear != (metask_agentcore_goal_clear_fn_v1)0 &&
+           api->team != (const metask_agentcore_team_api_v1 *)0 &&
+           ((uintptr_t)api->team % sizeof(void *)) == 0 &&
+           api->team->struct_size == sizeof(*api->team) &&
+           api->team->reserved0 == 0 &&
+           api->team->describe != (metask_agentcore_team_describe_fn_v1)0 &&
+           api->team->poll != (metask_agentcore_team_poll_fn_v1)0;
 }
 
 static inline const metask_agentcore_api_v1 *
@@ -1201,8 +1261,8 @@ metask_agentcore_owned_bytes_v1_release(
 #define METASK_AGENTCORE_ASSERT_OFFSET(type, field, offset) \
     METASK_AGENTCORE_STATIC_ASSERT(offsetof(type, field) == (offset), #type "." #field " offset")
 
-METASK_AGENTCORE_STATIC_ASSERT(METASK_AGENTCORE_ABI_REVISION == 23u,
-                               "AgentCore revision 23");
+METASK_AGENTCORE_STATIC_ASSERT(METASK_AGENTCORE_ABI_REVISION == 24u,
+                               "AgentCore revision 24");
 METASK_AGENTCORE_STATIC_ASSERT(METASK_AGENTCORE_MCP_NEGOTIATION_AUTO == 1u,
                                "MCP auto code");
 METASK_AGENTCORE_STATIC_ASSERT(METASK_AGENTCORE_MCP_NEGOTIATION_MODERN_ONLY == 2u,
@@ -1270,9 +1330,11 @@ METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_session_control_api_v1, 80);
 METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_skill_api_v1, 32);
 METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_mcp_api_v1, 40);
 METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_goal_api_v1, 40);
+METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_team_api_v1, 24);
+METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_team_config_v1, 88);
 METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_goal_set_v1, 56);
 METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_goal_update_v1, 64);
-METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_api_v1, 72);
+METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_api_v1, 80);
 
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_run_context_v1, session, 8);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_run_context_v1, run_id, 16);
@@ -1288,6 +1350,7 @@ METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_mcp_server_v1, protocol_limits, 
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_mcp_server_v1, configuration_fingerprint, 200);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_runtime_config_v1, mcp_servers, 40);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_runtime_config_v1, mcp_catalog_limits, 56);
+METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_runtime_config_v1, enable_teams, 64);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_process_plugin_source_v1, root, 8);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_runtime_plugin_config_v1, process_plugins, 8);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_runtime_plugin_config_v1, host_stream_tools, 24);
@@ -1302,7 +1365,7 @@ METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_session_host_config_v1, run_jour
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_session_host_config_v1, protocol_kind_code, 140);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_session_host_config_v1, model_capabilities, 144);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_session_host_config_v1, model_capability_count, 152);
-METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_session_host_config_v1, reserved, 160);
+METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_session_host_config_v1, team, 160);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_model_capability_v1, image_input_code, 4);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_model_capability_v1, model, 8);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_model_capability_v1, reserved, 24);
@@ -1341,6 +1404,7 @@ METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_goal_update_v1, objective, 8);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_goal_update_v1, token_budget, 24);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_goal_update_v1, action_code, 32);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_api_v1, goal, 64);
+METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_api_v1, team, 72);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_session_control_api_v1, set_prompt_profile, 64);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_session_control_api_v1, update_permission_mode, 72);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_run_result_v1, durable_usage_bytes, 24);

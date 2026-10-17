@@ -294,6 +294,58 @@ pub fn executeSendMessage(ctx: *const ToolContext, args: []const u8) anyerror![]
     return out.toOwnedSlice();
 }
 
+/// Issue #277: the Session's team as JSON for AgentCore's `team->describe`:
+/// `{"team":null}` or `{"team":{"name","role","members":[{name,session_id,
+/// lease_id,status}],"pending_spawns":[{name,prompt,agent_type,effort}]}}`.
+/// `members` comes from the on-disk roster; `pending_spawns` from the lead's
+/// unfulfilled `SpawnTeammate` requests. Owned by `allocator`.
+pub fn writeTeamDescription(allocator: std.mem.Allocator, sw: *const SwarmContext) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    const w = &out.writer;
+    if (!sw.hasTeam()) {
+        try w.writeAll("{\"team\":null}");
+        return out.toOwnedSlice();
+    }
+    try w.writeAll("{\"team\":{\"name\":");
+    try util_json.writeJsonString(w, sw.team_sanitized);
+    try w.writeAll(",\"role\":");
+    try util_json.writeJsonString(w, if (sw.is_lead) "lead" else "member");
+    try w.writeAll(",\"members\":[");
+    var cfg_buf: [std.fs.max_path_bytes]u8 = undefined;
+    if (team_mod.load(allocator, sw.configPath(&cfg_buf))) |loaded| {
+        var tf = loaded;
+        defer tf.deinit();
+        for (tf.members.items, 0..) |*m, i| {
+            if (i != 0) try w.writeAll(",");
+            try w.writeAll("{\"name\":");
+            try util_json.writeJsonString(w, m.name);
+            try w.writeAll(",\"session_id\":");
+            try util_json.writeJsonString(w, m.session_id orelse "");
+            try w.writeAll(",\"lease_id\":");
+            try util_json.writeJsonString(w, m.lease_id orelse "");
+            try w.writeAll(",\"status\":");
+            try util_json.writeJsonString(w, if (m.is_active) "active" else "idle");
+            try w.writeAll("}");
+        }
+    }
+    try w.writeAll("],\"pending_spawns\":[");
+    for (sw.pending_spawns.items, 0..) |*req, i| {
+        if (i != 0) try w.writeAll(",");
+        try w.writeAll("{\"name\":");
+        try util_json.writeJsonString(w, req.name);
+        try w.writeAll(",\"prompt\":");
+        try util_json.writeJsonString(w, req.prompt);
+        try w.writeAll(",\"agent_type\":");
+        if (req.agent_type) |t| try util_json.writeJsonString(w, t) else try w.writeAll("null");
+        try w.writeAll(",\"effort\":");
+        if (req.effort) |e| try util_json.writeJsonString(w, e) else try w.writeAll("null");
+        try w.writeAll("}");
+    }
+    try w.writeAll("]}}");
+    return out.toOwnedSlice();
+}
+
 /// Issue #277: the host-scheduled spawn tool. The lead model names a teammate
 /// and its task; the runtime records a request and returns, leaving the
 /// embedding Host to create and run the teammate Session. The CLI uses

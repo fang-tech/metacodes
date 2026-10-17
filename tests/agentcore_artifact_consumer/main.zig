@@ -21,7 +21,7 @@ fn readGoal(
 }
 
 comptime {
-    if (wire.ABI_REVISION != 23 or
+    if (wire.ABI_REVISION != 24 or
         wire.MAX_SUBMITTED_INPUTS_V1 != 64 or
         wire.MAX_SUBMITTED_INPUT_BYTES_V1 != 16 * 1024 * 1024 or
         wire.PROMPT_OP_ADD != 1 or
@@ -68,11 +68,15 @@ comptime {
         wire.GOAL_ACTION_COMPLETE != 3 or
         wire.GOAL_ACTION_BLOCK != 4 or
         wire.MAX_GOAL_OBJECTIVE_CODEPOINTS_V1 != 4000 or
-        wire.MAX_GOAL_OBJECTIVE_BYTES_V1 != 16_384)
-        @compileError("source-free Revision 23 codes must match the public contract");
+        wire.MAX_GOAL_OBJECTIVE_BYTES_V1 != 16_384 or
+        wire.TEAM_ROLE_LEAD != 1 or
+        wire.TEAM_ROLE_MEMBER != 2 or
+        wire.MAX_TEAM_NAME_BYTES_V1 != 64 or
+        wire.MAX_TEAM_MEMBER_BYTES_V1 != 64)
+        @compileError("source-free Revision 23/24 codes must match the public contract");
     if (@hasDecl(wire, "SessionRefreshSkillCatalogFnV1") or
         @hasField(wire.ApiV1, "session_refresh_skill_catalog"))
-        @compileError("revision 23 must not expose the removed catalog refresh entry");
+        @compileError("revision 24 must not expose the removed catalog refresh entry");
     if (wire.MAX_SKILL_FILE_CONTENT_BYTES_V1 != 16 * 1024 * 1024 or
         wire.MAX_SKILL_CONTENT_BYTES_V1 != 32 * 1024 * 1024 or
         wire.MAX_SKILL_FILES_V1 != 1024 or
@@ -609,6 +613,9 @@ pub fn main(init: std.process.Init) !void {
     runtime_config.builtin_tool_count = builtins.len;
     runtime_config.host_tools = @ptrCast(&host);
     runtime_config.host_tool_count = 1;
+    // Revision 24 (issue #277): admit the team tools so a team Session can run
+    // them. The main Session below carries no team config, so it is unaffected.
+    runtime_config.enable_teams = 1;
     var diagnostic = wire.OwnedBytesV1{ .ptr = null, .len = 0 };
     defer api.bufferRelease()(&diagnostic);
     var runtime: ?*wire.RuntimeHandle = null;
@@ -727,7 +734,7 @@ pub fn main(init: std.process.Init) !void {
         .protocol_kind_code = wire.PROTOCOL_DEFAULT,
         .model_capabilities = null,
         .model_capability_count = 0,
-        .reserved = [_]u64{0} ** 1,
+        .team = null,
     };
     // A Host section the Session renders into every Run's system prompt and
     // carries through its checkpoint.
@@ -1097,7 +1104,58 @@ pub fn main(init: std.process.Init) !void {
     try expectStatus(.ok, api.runtime().destroy()(runtime, &diagnostic), diagnostic);
     runtime = null;
 
-    std.debug.print("AgentCore source-free consumer: Revision 23 Agent Runtime, goals, time context, Host model capabilities, active-Run input, prompt profile, permission mode update, OpenAI Responses, multimodal input, active-Run journal, Host/MCP streaming, process-plugin configuration, Workspace Skill Catalog, tools, checkpoint, Runtime rebuild, restore and continued Run OK\n", .{});
+    // ── Revision 24 (issue #277): host-scheduled team describe and poll ──────
+    // A member Session joins (creating) the team file at creation, so its team
+    // is observable through the public ABI with no Run. The full
+    // lead-delegates / member-replies / lead-polls round-trip is the AgentCore
+    // L2 team test; here the two new table entries are proven wired end to end.
+    {
+        var team_cfg = std.mem.zeroes(wire.TeamConfigV1);
+        team_cfg.struct_size = @sizeOf(wire.TeamConfigV1);
+        team_cfg.role_code = wire.TEAM_ROLE_MEMBER;
+        team_cfg.team_name = sdk.bytesView("consumer-team");
+        team_cfg.member_name = sdk.bytesView("probe");
+        team_cfg.lead_session_id = sdk.bytesView("000000000000000000000001");
+        team_cfg.member_lease = sdk.bytesView("000000000000000000000002");
+
+        var team_host = session_host;
+        team_host.team = &team_cfg;
+        team_host.skill_catalog = null;
+        team_host.skill_policy = null;
+        const team_allowed = [_]wire.BytesViewV1{sdk.bytesView("Read")};
+        team_host.allowed_tools = &team_allowed;
+        team_host.allowed_tool_count = team_allowed.len;
+
+        var team_create = std.mem.zeroes(wire.SessionCreateConfigV1);
+        team_create.struct_size = @sizeOf(wire.SessionCreateConfigV1);
+        team_create.host = &team_host;
+        team_create.model = sdk.bytesView("artifact-model");
+
+        var team_session: ?*wire.SessionHandle = null;
+        try expectStatus(.ok, api.session().create()(runtime, &team_create, &callbacks, &team_session, &diagnostic), diagnostic);
+        defer if (team_session) |handle| {
+            _ = api.session().destroy()(handle, &diagnostic);
+        };
+
+        var team_json = wire.OwnedBytesV1{ .ptr = null, .len = 0 };
+        defer api.bufferRelease()(&team_json);
+        try expectStatus(.ok, api.team().describe()(team_session, &team_json, &diagnostic), diagnostic);
+        const team_text = try sdk.borrowedBytes(.{ .ptr = team_json.ptr, .len = team_json.len });
+        if (std.mem.indexOf(u8, team_text, "\"role\":\"member\"") == null or
+            std.mem.indexOf(u8, team_text, "\"name\":\"consumer-team\"") == null or
+            std.mem.indexOf(u8, team_text, "\"probe\"") == null or
+            std.mem.indexOf(u8, team_text, "\"pending_spawns\":[]") == null)
+            return error.UnexpectedTeamDescription;
+
+        var poll_json = wire.OwnedBytesV1{ .ptr = null, .len = 0 };
+        defer api.bufferRelease()(&poll_json);
+        try expectStatus(.ok, api.team().poll()(team_session, &poll_json, &diagnostic), diagnostic);
+        const poll_text = try sdk.borrowedBytes(.{ .ptr = poll_json.ptr, .len = poll_json.len });
+        if (!std.mem.eql(u8, poll_text, "{\"input\":null}"))
+            return error.UnexpectedTeamPoll;
+    }
+
+    std.debug.print("AgentCore source-free consumer: Revision 24 Agent Runtime, goals, host-scheduled team, time context, Host model capabilities, active-Run input, prompt profile, permission mode update, OpenAI Responses, multimodal input, active-Run journal, Host/MCP streaming, process-plugin configuration, Workspace Skill Catalog, tools, checkpoint, Runtime rebuild, restore and continued Run OK\n", .{});
 }
 
 const CatalogIdentities = struct {
