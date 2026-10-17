@@ -10,7 +10,7 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from tty_driver import run  # noqa: E402
+from tty_driver import IDLE, READY, run, submit, wait_for  # noqa: E402
 from asserts import TTYAssert  # noqa: E402
 
 
@@ -168,16 +168,20 @@ def _screen_full(raw, rows=20, cols=90):
 def test_ctrl_o_markdown_render_equivalent(bin_path):
     # bug#1+#2 根治:对话含 markdown,Ctrl+O viewer 渲染等效主区(markdown 渲染、无 ▶/◀ 角色头),
     # 退出后主区不变源码、无残留。/md-test 注入 1 user + 1 assistant(含 **粗体**/`代码`/列表)。
-    base = ["sleep:0.8", "type:/md-test", "key:enter", "sleep:0.4"]
+    base = submit("/md-test", "[md-test]")
+    # viewer 开着时屏上是它自己的 footer(Showing detailed transcript),主屏 footer 不在;
+    # 关掉后主屏 footer 回来——两者就是开/关的屏幕标志。
+    opened = ["key:ctrl_x", "key:ctrl_o", wait_for("Showing detailed transcript")]
     # viewer 内:markdown 渲染(无源码 `**`)+ cc 风格前缀(❯/⏺,无 ▶ user/◀ assistant)。
-    inside = _screen_full(run(bin_path, base + ["key:ctrl_x", "key:ctrl_o", "sleep:0.5"], term_size=(20, 90)), rows=20)
+    inside = _screen_full(run(bin_path, base + opened, term_size=(20, 90)), rows=20)
     assert "⏺ 我是 MetaCode" in inside, f"viewer 未用 ⏺ 前缀渲染 assistant:\n{inside}"
     assert "❯ 你是谁" in inside, f"viewer 未用 ❯ 前缀渲染 user:\n{inside}"
     assert "**MetaCode**" not in inside, f"viewer 显示 markdown 源码 `**`(bug#1):\n{inside}"
     assert "▶ user" not in inside and "◀ assistant" not in inside, f"viewer 残留 ▶/◀ 角色头(bug#2):\n{inside}"
     assert "• 阅读代码" in inside, f"viewer 未渲染列表(- → •):\n{inside}"
     # 退出后:主区无源码 `**`、无 ▶/◀ 残留(进出渲染等效)。
-    after = _screen_full(run(bin_path, base + ["key:ctrl_x", "key:ctrl_o", "sleep:0.5", "key:ctrl_o", "sleep:0.5"], term_size=(20, 90)), rows=20)
+    after = _screen_full(run(bin_path, base + opened + ["key:ctrl_o", wait_for("bypass permissions on")],
+                             term_size=(20, 90)), rows=20)
     assert "**MetaCode**" not in after, f"退出后主区变 markdown 源码(bug#1):\n{after}"
     assert "▶ user" not in after and "◀ assistant" not in after, f"退出后 ▶/◀ 残留(bug#2):\n{after}"
 
@@ -255,9 +259,9 @@ def test_ctrl_o_idempotent_with_agent_panel(bin_path):
     # transcript_viewer 旧版硬编码 box_h=5 忽略 panel 行 → 退出锚定错位 → 残留 + TUI 乱。
     # 修:box_h = region.fixedRegionHeight()+1(含 panel)。本测试钉死:有 panel 时连续 Ctrl+O
     # 收敛到干净贴底态(框完整 + agent 树完整无残留 + 无重叠),且再按幂等(box_top 稳定)。
-    setup = ["type:/agent-test-multi", "key:enter", "sleep:0.4"]
+    setup = submit("/agent-test-multi", "Running 2 Explore agents")
     # 连按 4 次(2 个开关周期)后应稳定。
-    raw = run(bin_path, ["sleep:0.8"] + setup +
+    raw = run(bin_path, setup +
               ["key:ctrl_x", "key:ctrl_o", "sleep:0.5", "key:ctrl_o", "sleep:0.5",
                "key:ctrl_x", "key:ctrl_o", "sleep:0.5", "key:ctrl_o", "sleep:0.5"],
               term_size=(24, 100), per_key_drain=0.04, startup_drain=0.8)
@@ -280,14 +284,14 @@ def test_ctrl_o_agent_panel_box_top_idempotent(bin_path):
     # 不一致 → 整体下移~panel高度,banner 滚出。修(方案A):viewer DECSC 锚区顶、不覆盖 banner,退出
     # 回区顶相对重画 → 跟随内容、幂等。覆盖多终端高度(漂移量=rows-20,高终端漂得多,必须都幂等)。
     # (旧 test_ctrl_o_idempotent_with_agent_panel 只验框存在/树保留/边框计数,漏了 box_top 数值漂移。)
+    AGENTS = submit("/agent-test-multi", "Running 2 Explore agents")
+
     def box_top(rows):
-        raw = run(bin_path, ["sleep:0.8", "type:/agent-test-multi", "key:enter", "sleep:0.4"],
-                  term_size=(rows, 90), per_key_drain=0.05, startup_drain=0.8)
+        raw = run(bin_path, AGENTS, term_size=(rows, 90), per_key_drain=0.05, startup_drain=0.8)
         return TTYAssert(raw, rows=rows, cols=90).box_top_row()
 
     def box_top_after_toggle(rows):
-        raw = run(bin_path, ["sleep:0.8", "type:/agent-test-multi", "key:enter", "sleep:0.4",
-                             "key:ctrl_x", "key:ctrl_o", "sleep:0.5", "key:ctrl_o", "sleep:0.5"],
+        raw = run(bin_path, AGENTS + ["key:ctrl_x", "key:ctrl_o", "sleep:0.5", "key:ctrl_o", "sleep:0.5"],
                   term_size=(rows, 90), per_key_drain=0.05, startup_drain=0.8)
         return TTYAssert(raw, rows=rows, cols=90).box_top_row(), raw
 
@@ -323,7 +327,7 @@ def test_gen_region_agent_churn_no_spinner_residue(bin_path):
     # enterGenerating → 循环 tickSpinner + 增 agent(树长高) + emit,leaveGenerating。
     # (单线程几何不变式守护;真模型多线程时序的 spinner 遗留是另一类并发 bug,见 KG,offline tty 复现不了。)
     import re
-    raw = run(bin_path, ["sleep:0.8", "type:/agent-churn-test", "key:enter", "sleep:1.2"],
+    raw = run(bin_path, submit("/agent-churn-test", "[agent-churn-test] done"),
               term_size=(30, 100), per_key_drain=0.05, startup_drain=0.8)
     a = TTYAssert(raw, rows=30, cols=100)
     lines = [a.final.line_text(r) for r in range(30)]
@@ -358,7 +362,10 @@ def test_ctrlb_backgrounds_main_session_deterministic(bin_path):
     with SlowMockServer(turns) as srv:
         raw = run(
             bin_path,
-            ["type:do it", "key:enter", "sleep:2.5", "raw:\\x02", "sleep:6.5", "type:next", "sleep:0.5"],
+            # 等生成态再按 Ctrl+B,再等转后台提示本身(turn1 约 7.5s 文本后才到 tool_use 边界),
+            # 不睡固定秒数(同 test_kitty_csi_u_keys 的 Ctrl+B 用例)。
+            [READY, "type:do it", "key:enter", wait_for("esc to interrupt"), "raw:\\x02",
+             wait_for("已转后台续跑", 30), "type:next", "sleep:0.5"],
             base_url=srv.url, startup_drain=0.8, per_key_drain=0.15,
         )
     txt = re.compile(rb"\x1b\[[0-9;?>]*[A-Za-z]").sub(b"", raw).decode("utf-8", "replace")
@@ -387,8 +394,9 @@ def test_ctrl_o_multiagent_no_scroll_garbage(bin_path):
     with SlowMockServer(turns) as srv:
         raw = run(
             bin_path,
-            ["sleep:0.8", "type:/agent-test-multi", "key:enter", "sleep:0.4",
-             "type:go", "key:enter", "sleep:2.5", "key:ctrl_x", "key:ctrl_o", "sleep:1.2"],
+            submit("/agent-test-multi", "Running 2 Explore agents") +
+            ["type:go", "key:enter", wait_for("esc to interrupt"), "key:ctrl_x", "key:ctrl_o",
+             wait_for("Showing detailed transcript")],
             base_url=srv.url, startup_drain=0.8, per_key_drain=0.15, term_size=(24, 80),
         )
     a = TTYAssert(raw, rows=24, cols=80)
@@ -424,7 +432,7 @@ def test_ctrl_o_autorepeat_debounced_no_altscreen_churn(bin_path):
 
     def trial(events, rows=24, cols=80):
         with SlowMockServer([slow_text_then_end(n_chunks=14, delay=0.4)]) as srv:
-            raw = run(bin_path, ["sleep:0.8", "type:go", "key:enter"] + events,
+            raw = run(bin_path, [READY, "type:go", "key:enter"] + events,
                       base_url=srv.url, startup_drain=0.8, per_key_drain=0.06,
                       term_size=(rows, cols))
         return TTYAssert(raw, rows=rows, cols=cols), raw
@@ -433,8 +441,9 @@ def test_ctrl_o_autorepeat_debounced_no_altscreen_churn(bin_path):
     base_a, _ = trial(["sleep:8.0"])
     box0 = base_a.box_top_row()
 
-    # 复现:进生成 ~1.3s 按住 Ctrl+O(burst)→ 等生成结束 → 停止后再按住 Ctrl+O(burst)。
-    a, raw = trial(["sleep:1.3", BURST, "sleep:7.5", BURST, "sleep:0.8"])
+    # 复现:进入生成态后按住 Ctrl+O(burst)→ 等生成结束、空闲输入框起来 → 再按住 Ctrl+O(burst)。
+    # 第二个 burst 若落在生成结束到下次读输入之间,会被 TCSAFLUSH 丢掉,"停止后"那半就没测到。
+    a, raw = trial([wait_for("esc to interrupt"), BURST, "sleep:7.5", IDLE, BURST, "sleep:0.8"])
     full = "\n".join(a.final.line_text(r) for r in range(a.rows))
 
     # sanity:Ctrl+O 确实开过 alt-screen viewer(否则没走到目标路径)。
@@ -480,7 +489,7 @@ def test_gen_ctrl_o_exit_region_redraw_self_cleans(bin_path):
     with SlowMockServer([slow_text_then_end(n_chunks=18, delay=0.5)]) as srv:
         # 生成期开+关 transcript(Warp CSI-u 形式,间隔 >120ms 避免被去抖折叠 → 真 toggle)。
         raw = run(bin_path,
-                  ["sleep:0.8", "type:go", "key:enter", "sleep:1.5",
+                  [READY, "type:go", "key:enter", wait_for("esc to interrupt"),
                    "raw:\\x18\\x1b[111;5u", "sleep:0.6", "raw:\\x1b[111;5u", "sleep:4.0"],
                   base_url=srv.url, startup_drain=0.8, per_key_drain=0.06, term_size=(24, 80))
 
