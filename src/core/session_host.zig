@@ -29,6 +29,7 @@
 //! driver, journal readers and Host threads all allocate from it.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const sync = @import("platform").sync;
 const pfs = @import("platform").fs;
 const agent_session = @import("agent_session.zig");
@@ -105,6 +106,14 @@ pub const Command = union(enum) {
 
 pub const EnqueueError = error{ QueueFull, SessionClosed, SessionPoisoned, OutOfMemory };
 pub const RespondError = error{ NoSuchRequest, OutOfMemory };
+/// Test seam, read only in test builds: runs on the interrupting or closing
+/// thread once the cancellation is decided and before the kernel abort is
+/// requested - the window in which a released prompt used to let the Run take
+/// another turn.
+pub const testing_hooks = struct {
+    pub var before_abort: ?*const fn (*HostedSession) void = null;
+};
+
 pub const InterruptOutcome = enum {
     /// Nothing was running or about to run.
     no_run,
@@ -344,8 +353,15 @@ pub const HostedSession = struct {
     /// The admitted Run, 0 between Runs.
     current_run_id: u64 = 0,
     /// Set by `interrupt` for the Run being started or running; cleared when
-    /// the next submission is taken.
+    /// the next submission is taken. From then on no answer is accepted or
+    /// taken.
     run_interrupted: bool = false,
+    /// A pending UI request may stop waiting without an answer. Set only once
+    /// the cancellation is in force in the kernel - the Run's abort requested
+    /// - so the Run that resumes from the cancelled prompt sees the abort
+    /// rather than starting another turn first. Cleared with
+    /// `run_interrupted`.
+    ui_released: bool = false,
     /// The current submission's Run has returned; `finishRun` is reporting
     /// it. An interrupt now is too late.
     run_returned: bool = false,
@@ -426,13 +442,31 @@ pub const HostedSession = struct {
         const run_id = self.current_run_id;
         const starting = self.phase == .running;
         if (starting) self.run_interrupted = true;
-        self.ui_ready.broadcast();
-        if (run_id != 0) self.kernel_users += 1;
+        if (run_id == 0) {
+            // Not admitted yet, so no prompt is pending: runSubmission aborts
+            // the Run it admits and releases its prompts then.
+            self.mutex.unlock();
+            return if (starting) .requested else .no_run;
+        }
+        self.kernel_users += 1;
         self.mutex.unlock();
-        if (run_id == 0) return if (starting) .requested else .no_run;
         defer self.leaveKernel();
-        self.session.abort(run_id, .user_interrupt) catch return .too_late;
-        return .requested;
+        if (builtin.is_test) if (testing_hooks.before_abort) |hook| hook(self);
+        const outcome: InterruptOutcome = if (self.session.abort(run_id, .user_interrupt)) |_| .requested else |_| .too_late;
+        // Abort first, then release the prompt: woken earlier, the Run took
+        // the cancelled prompt as a denied tool, sent its next request, and
+        // could end normally before the abort arrived.
+        self.releaseUi();
+        return outcome;
+    }
+
+    /// Lets a pending UI request return cancelled; call once the abort (if
+    /// any) is in force.
+    fn releaseUi(self: *HostedSession) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.ui_released = true;
+        self.ui_ready.broadcast();
     }
 
     fn leaveKernel(self: *HostedSession) void {
@@ -501,6 +535,7 @@ pub const HostedSession = struct {
                 if (work.item == .submission) {
                     self.phase = .running;
                     self.run_interrupted = false;
+                    self.ui_released = false;
                     self.run_returned = false;
                 }
                 return work;
@@ -554,7 +589,10 @@ pub const HostedSession = struct {
         self.current_run_id = context.run_id;
         const stop_now = self.run_interrupted or self.closing;
         self.mutex.unlock();
-        if (stop_now) self.session.abort(context.run_id, .user_interrupt) catch {};
+        if (stop_now) {
+            self.session.abort(context.run_id, .user_interrupt) catch {};
+            self.releaseUi();
+        }
 
         const outcome = admitted.runText(submission.text, self.host.options.max_turns);
         self.mutex.lock();
@@ -681,7 +719,9 @@ pub const HostedSession = struct {
         defer self.ui_serial.unlock();
 
         self.mutex.lock();
-        if (self.closing or self.run_interrupted) {
+        // Released means the abort is in force. An interrupt still on its way
+        // to the kernel lets the prompt be announced and wait for it.
+        if (self.ui_released) {
             self.mutex.unlock();
             return wire.cancelResponse(req, out);
         }
@@ -704,7 +744,7 @@ pub const HostedSession = struct {
         else
             null;
         self.mutex.lock();
-        while (self.response == null and !self.run_interrupted and !self.closing) {
+        while (self.response == null and !self.ui_released) {
             if (deadline) |limit| {
                 const now = util_time.nowNs();
                 if (now >= limit) break;
@@ -755,9 +795,13 @@ pub const HostedSession = struct {
         self.final_permission_mode = self.session.permission_ctx.modeValue();
         const run_id = self.current_run_id;
         self.work_ready.broadcast();
-        self.ui_ready.broadcast();
         self.mutex.unlock();
-        if (run_id != 0) self.session.abort(run_id, .user_interrupt) catch {};
+        if (run_id != 0) {
+            if (builtin.is_test) if (testing_hooks.before_abort) |hook| hook(self);
+            self.session.abort(run_id, .user_interrupt) catch {};
+        }
+        // As in `interrupt`: the abort before the prompt's release.
+        self.releaseUi();
         self.driver.join();
     }
 
