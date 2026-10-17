@@ -90,6 +90,7 @@ pub const kg_client = @import("kg/client.zig"); // local daemon/exclusive-store 
 pub const scoped_recall = @import("kg/scoped_recall.zig"); // deterministic outcome-note + scored recall
 pub const kg_transport = @import("kg/transport.zig"); // authenticated tinykgd HTTP transport
 pub const kg_experience_packet = @import("kg/experience_packet.zig"); // prior execution feedback at claim boundary
+pub const kg_lesson = @import("kg/lesson.zig"); // learning-turn lesson envelope, binding and same-task note
 pub const kg_lexical_query_plan = @import("kg/lexical_query_plan.zig"); // governed vector-free query plans + host ledger
 pub const jev_question = @import("jev/question.zig"); // typed System-One questions (Jev-Mem control plane)
 pub const jev_client = @import("jev/client.zig"); // deadline-bounded System-One transport with breaker

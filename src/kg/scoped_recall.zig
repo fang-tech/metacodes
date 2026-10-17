@@ -15,6 +15,7 @@
 
 const std = @import("std");
 const client_mod = @import("client.zig");
+const lesson_mod = @import("lesson.zig");
 const conv_mod = @import("../core/conversation.zig");
 const AbortSignal = @import("../util/abort.zig").AbortSignal;
 const log = @import("../util/log.zig");
@@ -825,6 +826,19 @@ pub fn collectHistory(
     }
 }
 
+/// The same-task lessons note (doc/LEARNING_TURN_DESIGN.md §4): newest
+/// unsuperseded `lesson` nodes for the host-declared task, framed as
+/// hypotheses. Needs `METACODES_TASK_HINT`; project-wide lessons ride the
+/// ordinary BM25 recall instead. Best effort: any failure is no note. Owned.
+pub fn sameTaskLessonsNote(allocator: std.mem.Allocator, kg: *client_mod.KgClient) ?[]u8 {
+    const hint_c = std.c.getenv(TASK_HINT_ENV) orelse return null;
+    const task = lesson_mod.taskToken(std.mem.span(hint_c));
+    if (std.mem.eql(u8, task, lesson_mod.NO_TASK)) return null;
+    const stored = lesson_mod.collectForTask(allocator, kg, task, lesson_mod.MAX_SHOWN) catch return null;
+    defer lesson_mod.freeStored(allocator, stored);
+    return lesson_mod.renderNote(allocator, stored) catch null;
+}
+
 pub fn buildWithReceipt(
     allocator: std.mem.Allocator,
     kg: *client_mod.KgClient,
@@ -834,13 +848,20 @@ pub fn buildWithReceipt(
 ) !BuildResult {
     var scored = try buildScoredReceipt(allocator, kg, conversation, abort, options);
     if (disabled() or !kg.ready) return scored;
-    const note = sameTaskOutcomeNote(allocator, kg) orelse return scored;
-    defer allocator.free(note);
+    const note = sameTaskOutcomeNote(allocator, kg);
+    defer if (note) |text| allocator.free(text);
+    // Lessons the model wrote after earlier verdicts on this task
+    // (doc/LEARNING_TURN_DESIGN.md §4). Absent lessons leave the injection
+    // byte-identical to what it was before lessons existed.
+    const lessons_note = sameTaskLessonsNote(allocator, kg);
+    defer if (lessons_note) |text| allocator.free(text);
+    if (note == null and lessons_note == null) return scored;
     // 合并:确定性段在前,BM25 段在后;回执如实覆盖合并后全文(注入审计
     // 面不得旁路)。
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
-    try out.appendSlice(allocator, note);
+    if (note) |text| try out.appendSlice(allocator, text);
+    if (lessons_note) |text| try out.appendSlice(allocator, text);
     if (scored.text) |scored_text| {
         try out.appendSlice(allocator, scored_text);
         allocator.free(scored_text);
@@ -849,16 +870,25 @@ pub fn buildWithReceipt(
     const text = try out.toOwnedSlice(allocator);
     var receipt = scored.receipt;
     receipt.status = "injected";
-    receipt.injected_count += 1;
+    if (note != null) receipt.injected_count += 1;
+    if (lessons_note != null) receipt.injected_count += 1;
     receipt.injected_bytes = text.len;
     receipt.injection_sha256 = sha256Hex(text);
     // warn 级:host 定向注入是显著干预,必须在生产可审计(trial 的 stderr
     // 由 Harbor 收进 trial.log;p3 取证时无任何面能证明注入到达,只能靠
     // 行为侧写间接推断——不再允许这种盲区)。
-    const note_sha = sha256Hex(note);
-    log.warn("kg", "deterministic outcome note injected bytes={d} sha256={s}", .{
-        note.len, note_sha[0..16],
-    });
+    if (note) |text_note| {
+        const note_sha = sha256Hex(text_note);
+        log.warn("kg", "deterministic outcome note injected bytes={d} sha256={s}", .{
+            text_note.len, note_sha[0..16],
+        });
+    }
+    if (lessons_note) |text_lessons| {
+        const lessons_sha = sha256Hex(text_lessons);
+        log.warn("kg", "same-task lessons injected bytes={d} sha256={s}", .{
+            text_lessons.len, lessons_sha[0..16],
+        });
+    }
     return .{ .text = text, .receipt = receipt, .system_one = scored.system_one };
 }
 

@@ -30,6 +30,7 @@ pub const PROGRESS_UPDATES_SCHEMA_VERSION = "metacodes-progress-updates-v1";
 pub const STALL_GATE_SCHEMA_VERSION = "metacodes-stall-gate-v1";
 pub const CHECK_GATE_SCHEMA_VERSION = "metacodes-check-gate-v1";
 pub const TEST_INTEGRITY_SCHEMA_VERSION = "metacodes-test-integrity-v1";
+pub const LEARNING_TURN_SCHEMA_VERSION = "metacodes-learning-turn-v1";
 pub const REQUIREMENT_LEDGER_SCHEMA_VERSION = "metacodes-requirement-ledger-v1";
 pub const TEST_WEAKENING_SCHEMA_VERSION = "metacodes-test-weakening-candidate-v1";
 pub const SYSTEM_ONE_DECISION_SCHEMA_VERSION = "metacodes-system-one-decision-v1";
@@ -59,6 +60,10 @@ pub const SystemOneOutcome = enum {
 /// The last verdict the host check gate obtained in a run (`not_run` when
 /// the run never reached a dirty end-of-turn boundary).
 pub const CheckGateVerdict = enum { not_run, passed, failed, tainted, unavailable };
+/// What the learning turn saw at the run's terminal boundary.
+pub const LearningGrounding = enum { unchecked, passed, failed, tainted, unavailable };
+/// The learning turn's decision (core/learning_turn.zig `Decision`).
+pub const LearningDecision = enum { none_unfinished, none_unchecked, none_unavailable, none_tainted, none_spent, distill };
 /// Why the stall gate decided (`none`: it never did).
 pub const StallCause = enum { none, repeating, stale };
 pub const TestIntegrityCoverage = enum { git, no_git, git_failed };
@@ -370,6 +375,25 @@ pub const Event = union(enum) {
         final_total: u32,
         unchecked_changes: bool,
         stop_hook_blocks: u8,
+    },
+    /// Terminal record of the learning turn (doc/LEARNING_TURN_DESIGN.md §6):
+    /// one per run whenever it was armed. `decision` is the policy's answer at
+    /// the terminal boundary (`none_unfinished` when the run never reached
+    /// it); in observe mode a `distill` decision runs no pass (`passes` = 0).
+    /// Counts only; lesson text and node ids stay out.
+    learning_turn: struct {
+        schema_version: []const u8 = LEARNING_TURN_SCHEMA_VERSION,
+        /// Treatment-actuation witness: true when a pass could run.
+        enforced: bool,
+        grounding: LearningGrounding,
+        decision: LearningDecision,
+        passes: u8,
+        distill_turns: u32,
+        reconcile_turns: u32,
+        lessons_accepted: u8,
+        lessons_refused: u32,
+        reconciled: u32,
+        truncated: bool,
     },
     /// Terminal record of the test integrity obligation (TestIntegrity.lean):
     /// the suite as it was at run start compared with the end state. Counts

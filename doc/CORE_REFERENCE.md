@@ -220,6 +220,22 @@ web_search 显示 query、transcript 回放与 `/recap` 把它们与用户输入
   的轮次之后不决策、每轮都带回从未见过的键时永不决策,以及正向:足够长的 stale 段必然恰好决策一次
   (只依赖 propext)。
 
+**学习回合(learning turn,`core/learning_turn.zig` + `kg/lesson.zig`,设计说明
+[LEARNING_TURN_DESIGN.md](LEARNING_TURN_DESIGN.md))**:宿主检查门的判定让 Run 结束后,同一段对话把
+这次经验写成带条件的 lesson,供下一次同题尝试读取。
+- **触发**:根 Run(depth 0)的终局边界,检查门对当前工作区给出 passed / failed 判定时;tainted、
+  unavailable、没跑检查都不学。每 Run 至多一次,observe 只记录本该做的决定。
+- **两段**:distill 消息带判定、已存的同题 lesson 和宿主绑定的 lesson 头;模型用 `KgRemember`
+  kind `lesson` 写至多 4 条(`holds_when:` / `uncertain:` / `lesson:` / 可选 `supersedes:`)。
+  只有接受了 lesson 且已有同题 lesson 时才发 reconcile 消息。每段至多 6 个模型轮次。
+- **边界**:答案在学习回合开始前已定为 final,学习文本一律是 commentary;学习段里只有
+  Read / Grep / Glob / KgRecall / KgContext / KgRemember 能跑,过程传感器与环境故障熔断都不计这些
+  轮次。`KgRemember` 在学习回合之外、或 lesson 头与宿主所见不符时拒绝写入。
+- **宿主契约字段**:`Options.learning_turn: ?learning_turn.Options`(mode、task_hint、run_label),
+  canonical `buildRunOptions` 不带,CLI 尚未接线。武装时 Run 结束发一条 `learning_turn` 终局记录
+  (`metacodes-learning-turn-v1`)。下一次同题尝试(`METACODES_TASK_HINT`)经 scoped recall 看到最新
+  且未被取代的 lesson;没有 lesson 时注入逐字节不变。
+
 #### 3.2.1.1 候选响应边界:这条响应能不能进 Conversation(`core/response_candidate.zig`)
 
 段的定性回答"这段文本算什么";候选响应边界回答的是上一个问题——**这条 provider 响应最终
@@ -351,6 +367,7 @@ pub const RunResult = struct {
     suspend_info: ?SuspendInfo = null,
     stall: ?stall_gate.Report = null, // 非空 ⇔ stop_reason == .stalled
     continuations: u32 = 0, // 本次 run 的 max_tokens 续写次数(≤ MAX_CONTINUATIONS)
+    learning: ?learning_turn.Report = null, // 学习回合武装且 Run 走到终局边界时非空
 };
 pub const StopReason = enum {
     end_turn, max_turns, aborted, tool_error, api_error, tool_loop,

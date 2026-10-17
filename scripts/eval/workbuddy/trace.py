@@ -1728,6 +1728,73 @@ def _journal_control_metrics(rows: Iterable[Mapping[str, Any]]) -> Dict[str, Any
                     or formal["check_gate_stop_hook_blocks"] > 5  # CheckGate.lean maxStopBlocks
                 ):
                     raise TraceError("check gate record violates the gate policy")
+            elif observation_kind == "learning_turn":
+                # Terminal record of the learning turn (doc/LEARNING_TURN_DESIGN.md
+                # §6): after the check gate's verdict, at most two bounded passes
+                # write conditioned lessons. At most one record per run.
+                grounding = observation.get("grounding")
+                decision = observation.get("decision")
+                if (
+                    observation.get("schema_version") != "metacodes-learning-turn-v1"
+                    or not isinstance(observation.get("enforced"), bool)
+                    or not isinstance(observation.get("truncated"), bool)
+                    or grounding not in {"unchecked", "passed", "failed", "tainted", "unavailable"}
+                    or decision
+                    not in {
+                        "none_unfinished",
+                        "none_unchecked",
+                        "none_unavailable",
+                        "none_tainted",
+                        "none_spent",
+                        "distill",
+                    }
+                ):
+                    raise TraceError("learning turn record is invalid")
+                if formal.get("learning_turn_records"):
+                    raise TraceError("duplicate learning turn record")
+                formal["learning_turn_records"] = 1
+                counts = {}
+                for key in (
+                    "passes",
+                    "distill_turns",
+                    "reconcile_turns",
+                    "lessons_accepted",
+                    "lessons_refused",
+                    "reconciled",
+                ):
+                    value = observation.get(key)
+                    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                        raise TraceError(f"learning turn {key.replace('_', ' ')} is invalid")
+                    counts[key] = value
+                    formal["learning_turn_" + key] = value
+                formal["learning_turn_enforced"] = int(observation["enforced"])
+                formal["learning_turn_decision"] = decision
+                # Policy relationships learning_turn.zig proves (LearningTurn
+                # mirror): a pass only after a distill decision in enforce mode,
+                # a distill decision only on a passed or failed verdict, the
+                # none_* reasons matching the grounding, reconcile only after a
+                # distill pass that accepted a lesson, every bound respected.
+                ran = counts["passes"] > 0
+                # The grounding decides the decision unless the run never reached
+                # its terminal boundary or had already spent its learning turn.
+                decided_by_grounding = decision not in {"none_unfinished", "none_spent"}
+                if (
+                    counts["passes"] > 2
+                    or counts["distill_turns"] > 6  # learning_turn.PASS_MAX_TURNS
+                    or counts["reconcile_turns"] > 6
+                    or counts["lessons_accepted"] > 4  # lesson.MAX_PER_TURN
+                    or counts["reconciled"] > counts["lessons_accepted"]
+                    or (ran and (decision != "distill" or not observation["enforced"]))
+                    or (decision == "distill" and observation["enforced"] and not ran)
+                    or (decision == "distill" and grounding not in {"passed", "failed"})
+                    or (decided_by_grounding and (decision == "none_unchecked") != (grounding == "unchecked"))
+                    or (decided_by_grounding and (decision == "none_tainted") != (grounding == "tainted"))
+                    or (decided_by_grounding and (decision == "none_unavailable") != (grounding == "unavailable"))
+                    or (not ran and (counts["distill_turns"] or counts["reconcile_turns"] or counts["lessons_accepted"]))
+                    or (counts["passes"] < 2 and counts["reconcile_turns"] > 0)
+                    or (counts["passes"] == 2 and counts["lessons_accepted"] - counts["reconciled"] < 1)
+                ):
+                    raise TraceError("learning turn record violates the learning policy")
             elif observation_kind == "test_integrity":
                 # Terminal record of the test integrity obligation
                 # (TestIntegrity.lean): the tests that existed when the run
