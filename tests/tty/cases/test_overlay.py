@@ -408,6 +408,40 @@ def test_ctrl_o_multiagent_no_scroll_garbage(bin_path):
     assert b"\x1b[?1049h" in raw, "全屏 transcript 应进 alt-screen"
 
 
+# 按住 Ctrl+X Ctrl+O 的真实时序:第一下立刻到,隔一个系统连发延迟(≥250ms)后连发成批到。
+# 去抖若只看"距上次 Ctrl+O 的处理间隔",viewer 开着的这段延迟就把窗口耗完:第一个连发关掉
+# viewer,第二个被当成新的一下重开 → 两对 open/close。hosted Windows 上那个用例的 h/l=3/2
+# 是同一机制(连发里一处处理停顿,落在最后一个键前就悬挂一个 viewer)。修后看输入是否静默过:
+# 连发在缓冲里排着,不论处理多慢都算同一串 → 恰好一对,末态关闭。
+_HOLD_PRESS = "\\x18\\x1b[111;5u"
+_HOLD_H, _HOLD_L = b"\x1b[?1049h", b"\x1b[?1049l"
+
+
+def _hold_events(closed_marker):
+    return ["raw:" + _HOLD_PRESS, wait_for("Showing detailed transcript"), "strictsleep:0.3",
+            "raw:" + _HOLD_PRESS * 19, wait_for(closed_marker), "sleep:0.5"]
+
+
+def test_ctrl_o_hold_with_repeat_delay_is_one_pair_during_generation(bin_path):
+    from slow_mock_server import SlowMockServer, slow_text_then_end
+
+    with SlowMockServer([slow_text_then_end(n_chunks=20, delay=0.4)]) as srv:
+        # viewer 开着时屏上没有生成期 footer,关掉后回来:以 `esc to interrupt` 为关闭标志。
+        raw = run(bin_path, [READY, "type:go", "key:enter", wait_for("esc to interrupt")]
+                  + _hold_events("esc to interrupt"),
+                  base_url=srv.url, startup_drain=0.8, per_key_drain=0.05, term_size=(24, 80))
+    h, l = raw.count(_HOLD_H), raw.count(_HOLD_L)
+    assert (h, l) == (1, 1), f"按住一次应恰好一对 alt-screen 开/关,实得 h/l={h}/{l}"
+
+
+def test_ctrl_o_hold_with_repeat_delay_is_one_pair_at_the_prompt(bin_path):
+    # 输入期同一套去抖(loop.zig)。viewer 开着时主屏 footer 不在,关掉后回来。
+    raw = run(bin_path, [READY] + _hold_events("bypass permissions on"),
+              per_key_drain=0.05, term_size=(24, 80))
+    h, l = raw.count(_HOLD_H), raw.count(_HOLD_L)
+    assert (h, l) == (1, 1), f"按住一次应恰好一对 alt-screen 开/关,实得 h/l={h}/{l}"
+
+
 def test_ctrl_o_autorepeat_debounced_no_altscreen_churn(bin_path):
     # 用户实测 bug(Warp):问题正在回答中(生成期)"不断 Ctrl+O" →
     #   症状1:footer 出现重复的多行文字;症状2:停止下来之后再 Ctrl+O,终端界面丧失幂等性。
@@ -517,6 +551,8 @@ def test_ctrl_o_during_websearch_card_no_card_pileup(bin_path):
     #   (离线 Screen 模型如实模拟 alt-screen 存/复原 + 固定区原地重画 → committed scrollback 里卡数恒 0,
     #   复现不出真机堆叠;但"卡有进度卡时 alt-screen churn 是否有界"这一机制离线确定可测。)
     # 修法:render_region.noteCtrloAndShouldSuppressReopen 去抖,按住一次只一对 open/close。
+    # (hosted Windows 上本用例两次 h/l=3/2:去抖只看处理间隔,连发里一处处理停顿落在最后一个键
+    #  前就悬挂一个 viewer。现按输入是否静默过判定,见上方 _hold_events 处的说明。)
     #
     # 本测试钉死:复刻用户输入 + 3-turn mock(主 turn 发 WebSearch tool_use → 慢子请求让 `⏺ Web Search`
     #   卡常驻 → 续写),期间按住 Ctrl+O。断言 ① alt-screen 开关有界(去抖生效,修前每 burst≈卡长度/2 对);
@@ -539,8 +575,10 @@ def test_ctrl_o_during_websearch_card_no_card_pileup(bin_path):
     ]
     with SlowMockServer(turns) as srv:
         # 复刻用户:输入提示词 → 回车 → 进生成 + WebSearch 卡出现后,按住 Ctrl+O(burst)。
-        ev = ["sleep:0.8", "type:调研一下今天的ai新闻", "key:enter", "sleep:2.6",
-              BURST, "sleep:0.6", BURST, "sleep:5.5"]
+        # 等卡本身出现再按(原 sleep:2.6 赌它已出现);两次按住之间的 0.6s 是有意的(两次独立
+        # 的按住)。末了等续写的正文和空闲输入框,断言看的是生成结束后的末态。
+        ev = [READY, "type:调研一下今天的ai新闻", "key:enter", wait_for("Web Search"),
+              BURST, "sleep:0.6", BURST, wait_for("新闻摘要", 30), IDLE]
         raw = run(bin_path, ev, base_url=srv.url, startup_drain=0.8,
                   per_key_drain=0.05, term_size=(24, 80))
 

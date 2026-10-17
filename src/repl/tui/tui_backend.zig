@@ -591,6 +591,8 @@ pub const TuiBackend = struct {
             // ESC 待决时用短超时(40ms)→ 孤立 ESC 快速兑现为中断;否则常规 100ms tick。
             const timeout_ms: i32 = if (parser.pendingEsc()) 40 else 100;
             const rc = platform_term.waitReadable(fd, timeout_ms); // 可移植 poll
+            // 一个周期没有输入 = 输入静默过:此后的 Ctrl+O 不再算上一串的连发(Ctrl+O 去抖)。
+            if (rc == 0) self.region.noteInputIdle();
             if (rc <= 0) {
                 // 超时:孤立 ESC 兑现 → 处理(可能中断);否则推进 spinner。
                 if (parser.flushEsc()) |k| {
@@ -726,6 +728,7 @@ pub const TuiBackend = struct {
                 // 整条链路现为死代码,保留仅为遵守"其他保持不变"scope;后续清理时一并删。
                 const anchor_hint = self.region.overlayAnchorHint(rows);
                 transcript_viewer.runWithThemeAnchor(snap.fd, a, &app.conversation, rows, anchor_hint, th) catch {};
+                self.region.noteOverlayClosed();
                 self.region.exitExclusiveOverlay(app);
                 return;
             },

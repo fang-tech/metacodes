@@ -1261,6 +1261,9 @@ fn readLineRaw(fd: c_int, allocator: std.mem.Allocator, history: *history_mod.Hi
             const rows0: usize = if (sz0) |sz| sz.rows else 24;
             region.clear();
             transcript_viewer.runWithTheme(fd, allocator, &app.conversation, rows0, region.theme) catch {};
+            // 用 Ctrl+X Ctrl+O 关掉时,同一串连发的后续键会落到下面的读循环:记为一次 Ctrl+O 活动,
+            // 否则新 region 的时戳是 0,第一个连发就会重开。
+            region.noteOverlayClosed();
         },
     }
 
@@ -1291,6 +1294,8 @@ fn readLineRaw(fd: c_int, allocator: std.mem.Allocator, history: *history_mod.Hi
                 redraw(&region, &editor, app); // resize → 重测宽度重画
             }
             const rc = platform_term.waitReadable(fd, 200); // 可移植:200ms 超时等可读
+            // 一个周期没有输入 = 输入静默过:此后的 Ctrl+O 不再算上一串的连发(Ctrl+O 去抖)。
+            if (rc == 0) region.noteInputIdle();
             if (rc <= 0) {
                 // 超时/EINTR:若 parser 卡在 esc_seen(收到孤立 ESC 等后续字节),
                 // 此时无后续字节到来 → 兑现为 .esc(否则 Esc 永远到不了 dispatch/editor)。
@@ -1609,6 +1614,7 @@ fn readLineRaw(fd: c_int, allocator: std.mem.Allocator, history: *history_mod.Hi
                     const rows: usize = if (sz) |s| s.rows else 24;
                     region.clear();
                     transcript_viewer.runWithTheme(fd, allocator, &app.conversation, rows, region.theme) catch {};
+                    region.noteOverlayClosed();
                     redraw(&region, &editor, app);
                     continue;
                 },
