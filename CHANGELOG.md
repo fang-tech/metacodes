@@ -12,6 +12,53 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Added
 
+- Session goals at every entry point, and in AgentCore (issue #277).
+  - **One set of rules.** `core.goal` owns the status table: pause needs an
+    active goal, resuming a goal whose budget is used up is refused until the
+    budget is raised (in the same update if wanted), a complete goal cannot be
+    blocked. Refusals change nothing; objectives are 1-4000 code points.
+  - **Accounting by the agent loop.** Each provider response's non-cached
+    input plus output (automatic compaction included) is charged to the goal
+    a Run began on while active, and the Run's time when it ends - a Run that
+    ends in an error included. A budget used up mid-Run makes the goal
+    `budget_limited` and asks the model once, at the next turn, to wrap up;
+    the Run is not cut off.
+  - **CLI.** REPL, web, daemon, forked Skills and headless all charge the
+    session's goal (web, daemon and headless never did, though a resumed
+    daemon session loaded it), and goal.json is written whenever it changes.
+    `/goal resume` past a used-up budget now says so instead of reactivating.
+  - **AgentCore Revision 23.** A sixth root table, `goal`, with `get` (JSON),
+    `set`, `update` (objective, budget and action together or not at all)
+    and `clear`; the root grows from 64 to 72 bytes. A
+    `RUN_INPUT_GOAL_CONTINUATION` Run's input is written by the runtime from
+    the goal. Status 30 `GOAL_CONFLICT`; the `goal_updated` event; a goal
+    section in checkpoints (marker 10), admitted against the durable budget.
+  - SDK 0.10.0-dev.
+- Date and time zone for the model at every entry point (issue #276).
+  - **CLI.** The user-context message always states the date the session
+    started on, with its time zone - without CLAUDE.md, memory or KG, and
+    with `CLAUDE_CODE_DISABLE_CLAUDE_MDS` set - as
+    `Today's date is 2026-10-17 (Saturday). Time zone: Asia/Shanghai (UTC+08:00).`
+    The zone is the process's: libc `localtime_r` on POSIX (honours `TZ`,
+    `/etc/localtime` and daylight saving), the dynamic time-zone information
+    on Windows. When neither answers, the date is in UTC and the text says
+    the zone is unknown.
+  - **Crossing midnight.** The first Run on a later local date gets one
+    "The date has changed" notice after its input, in that turn's history.
+    The system prompt and the first message do not change, so the prompt
+    cache survives midnight. A notice that compaction, trimming or `/clear`
+    removed is given again.
+  - **AgentCore Revision 22.** `RunOptionsV1.time_context_code` and
+    `utc_offset_minutes` take the first remaining reserved word, so the
+    layout is unchanged at 40 bytes. By default each Run's context starts
+    with a `currentDate` block in the process's zone.
+    `TIME_CONTEXT_UTC_OFFSET` dates it in a Host-given offset (UTC±14:00)
+    instead, and `TIME_CONTEXT_OFF` drops it.
+  - **Host precedence.** A Host block labelled `currentDate` replaces the
+    runtime's. Combined with an explicit offset it is refused as
+    `INVALID_ARGUMENT`.
+  - **Source-level Hosts** build the same block with `core.time_context`.
+  - SDK 0.9.0-dev.
 - Sealed Skills: the §8.5 disclosure screen keeps two corpora under their
   own policies — the Skill's instructions and its `sealed/` references —
   so `egress.disclosure` is one word for both or
@@ -19,6 +66,19 @@ status, compatibility boundaries, and entry points are defined by
   references were being replaced by `[sealed]` when cited (seen with the
   Browser Use Cloud reference skill) sets `references` to `off` and keeps
   its instructions screened; the install summary shows both policies.
+- AgentCore Revision 21: Host model-capability declarations (issue #273).
+  `SessionHostConfigV1.model_capabilities` / `model_capability_count` (two
+  former reserved words; the struct stays 168 bytes) carry up to 256 40-byte
+  `ModelCapabilityV1` entries, each saying whether one model takes image input
+  (`CAPABILITY_SUPPORTED` / `CAPABILITY_UNSUPPORTED`). A declaration outranks
+  the provider catalog and the built-in model-family table for the Session's
+  model, every `set_model` target and its tool-scoped providers, and a restore
+  uses the current Host's declarations. `describe` reports
+  `"image_input":{"supported":…,"source":"host"|"catalog"|"model_family"|"unknown"}`.
+  Source-level hosts pass the same through `SessionConfig.model_capabilities`;
+  `Provider.imageInput` answers with the source. The OpenAI and Gemini clients
+  now apply a catalog's `image_input` declaration too (only the Anthropic
+  client did), and the CLI hands them the Metask catalog. SDK 0.8.0-dev.
 - Sealed gateway at scale ([doc/SEALED_GATEWAY_SCALE_DESIGN.md](doc/SEALED_GATEWAY_SCALE_DESIGN.md)):
   `metacodes sealed serve` runs a bounded worker pool with a queue and a cap
   on in-flight model calls, refuses over-capacity requests before reading
@@ -254,6 +314,20 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Changed
 
+- AgentCore provider requests now carry a `currentDate` context block in each
+  Run's user record unless the Host supplies one or sets `TIME_CONTEXT_OFF`
+  (Revision 22, issue #276). Hosts that byte-compare requests should set
+  `TIME_CONTEXT_OFF` or pass their own block. The CLI's date moved from a UTC
+  `YYYY/MM/DD` to a local `YYYY-MM-DD (Weekday)` with the zone named.
+
+- An image Run for a model that no Host declaration, provider catalog entry or
+  built-in model family covers now returns AgentCore status 29
+  `IMAGE_INPUT_CAPABILITY_UNKNOWN` instead of 28 `IMAGE_INPUT_UNSUPPORTED`; 28
+  now means a source says the model does not take images. Both still refuse
+  before any provider request: an unknown route can drop an image without an
+  error, so it is not sent on a guess (issue #273). Hosts that treated 28 as
+  "pick another model" should treat 29 as "declare the model, or pick another".
+
 - The Sealed Skill Protocol document says everywhere what the code does:
   the gateway holds no inference account. Roles and identities (§1.2: the
   subscriber's own provider account; the inference-gateway identity relays,
@@ -380,6 +454,23 @@ status, compatibility boundaries, and entry points are defined by
   `kg_root` pointers are still read.
 
 ### Fixed
+
+- `SessionHost`: an interrupt or close of a Run waiting on a UI prompt could
+  fail to stop it. The prompt was released before the kernel abort was
+  requested, so the Run took the cancelled prompt as a denied tool, sent its
+  next request, and - against a fast provider - ended normally first; the
+  interrupt then reported `too_late` (seen once on Windows CI). The abort is
+  now in force before the prompt is released; an answer racing the
+  interrupt is still discarded.
+- MiniMax-M3 takes image input: the model table now says so (MiniMax's
+  OpenAI-compatible Chat Completions documentation lists image understanding
+  for M3), so AgentCore and the CLI no longer refuse its images (issue #273).
+- `AgentSession.setModel` rebuilt the provider without the Session's
+  `auth_scheme`, so a route authenticated with `x-api-key` or a custom header
+  fell back to `authorization: Bearer` after a model switch.
+- doc/API.md said images are never replaced with placeholder text while a
+  later paragraph documents the placeholder for image tool results; the first
+  statement now covers images in user input only.
 
 - `metacodes sealed serve` stops cleanly. Ctrl+C (SIGINT; also SIGTERM and
   SIGHUP, or the console closing on Windows) now only raises the process-wide

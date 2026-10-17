@@ -4,11 +4,11 @@
 /// doc/AGENTCORE_BINARY_ABI.md, Status). No stability promise: layouts and
 /// semantics may change incompatibly between commits. Pin an exact bundle.
 pub const ABI_VERSION_V1: u32 = 1;
-pub const ABI_REVISION: u32 = 20;
+pub const ABI_REVISION: u32 = 23;
 
 comptime {
     if (@sizeOf(usize) != 8)
-        @compileError("AgentCore ABI v1 revision 20 requires a 64-bit pointer ABI");
+        @compileError("AgentCore ABI v1 revision 23 requires a 64-bit pointer ABI");
 }
 
 pub const Status = enum(u32) {
@@ -40,6 +40,17 @@ pub const Status = enum(u32) {
     invalid_mcp_selection = 25,
     skill_catalog_incomplete = 27,
     image_input_unsupported = 28,
+    /// Revision 21: a Run with an image was refused because nothing - the
+    /// Host's declarations, a provider catalog, or the built-in model-family
+    /// table - says the model takes images. A declaration fixes it; another
+    /// model is not required.
+    image_input_capability_unknown = 29,
+    /// Revision 23: the goal operation needs a goal, or an active one, that
+    /// the Session does not have: no goal, a refused transition (pausing a
+    /// goal that is not active, resuming one whose budget is used up,
+    /// blocking a complete one), or a goal-continuation Run without an
+    /// active goal. Nothing changed; the diagnostic names the reason.
+    goal_conflict = 30,
 
     pub fn fromCode(code: u32) error{UnknownStatus}!Status {
         return switch (code) {
@@ -71,6 +82,8 @@ pub const Status = enum(u32) {
             @intFromEnum(Status.invalid_mcp_selection) => .invalid_mcp_selection,
             @intFromEnum(Status.skill_catalog_incomplete) => .skill_catalog_incomplete,
             @intFromEnum(Status.image_input_unsupported) => .image_input_unsupported,
+            @intFromEnum(Status.image_input_capability_unknown) => .image_input_capability_unknown,
+            @intFromEnum(Status.goal_conflict) => .goal_conflict,
             else => error.UnknownStatus,
         };
     }
@@ -104,6 +117,8 @@ pub const STATUS_MCP_NOT_REFRESHED: u32 = @intFromEnum(Status.mcp_not_refreshed)
 pub const STATUS_INVALID_MCP_SELECTION: u32 = @intFromEnum(Status.invalid_mcp_selection);
 pub const STATUS_SKILL_CATALOG_INCOMPLETE: u32 = @intFromEnum(Status.skill_catalog_incomplete);
 pub const STATUS_IMAGE_INPUT_UNSUPPORTED: u32 = @intFromEnum(Status.image_input_unsupported);
+pub const STATUS_IMAGE_INPUT_CAPABILITY_UNKNOWN: u32 = @intFromEnum(Status.image_input_capability_unknown);
+pub const STATUS_GOAL_CONFLICT: u32 = @intFromEnum(Status.goal_conflict);
 
 pub const ProviderKind = enum(u32) {
     anthropic = 1,
@@ -204,6 +219,10 @@ pub const MAX_SUBMITTED_INPUT_BYTES_V1: u64 = 16 * 1024 * 1024;
 /// encoding of the Read tool's 3.75 MB raw-image limit, so an image that the
 /// built-in Read tool can attach is also submittable through the ABI.
 pub const MAX_RUN_INPUT_IMAGE_DATA_BYTES_V1: u64 = 5_000_000;
+/// Revision 21: Host model-capability declarations per Session host config,
+/// and the bytes of one declared model name.
+pub const MAX_MODEL_CAPABILITIES_V1: u64 = 256;
+pub const MAX_MODEL_CAPABILITY_MODEL_BYTES_V1: u64 = 256;
 pub const MAX_SKILL_CATALOG_SKILLS_V1: u64 = 1024;
 pub const MAX_SKILL_CATALOG_DESCRIPTOR_BYTES_V1: u64 = 4 * 1024 * 1024;
 pub const MAX_SKILL_FILE_CONTENT_BYTES_V1: u64 = 16 * 1024 * 1024;
@@ -265,9 +284,42 @@ pub const PLUGIN_LAYER_MANAGED: u32 = 5;
 pub const RUN_INPUT_TEXT: u32 = 1;
 pub const RUN_INPUT_SKILL: u32 = 2;
 pub const RUN_INPUT_MULTIMODAL: u32 = 3;
+/// Revision 23: continue toward the Session's active goal. Every input field
+/// is empty; the runtime writes the Run's input from the goal.
+pub const RUN_INPUT_GOAL_CONTINUATION: u32 = 4;
 
 pub const RUN_INPUT_PART_TEXT: u32 = 1;
 pub const RUN_INPUT_PART_IMAGE: u32 = 2;
+/// Revision 21 `ModelCapabilityV1.image_input_code` values. Zero is not a
+/// declaration and is refused; leave a model out to make no statement.
+pub const CAPABILITY_SUPPORTED: u32 = 1;
+pub const CAPABILITY_UNSUPPORTED: u32 = 2;
+/// Revision 22 `RunOptionsV1.time_context_code`: how the runtime tells the
+/// model today's date and time zone for a Run (a `currentDate` context block).
+/// SYSTEM (zero, the default) uses the process's time zone; UTC_OFFSET uses
+/// `utc_offset_minutes`; OFF adds nothing. A Host block labeled `currentDate`
+/// is the Run's time context and suppresses the runtime's under SYSTEM.
+pub const TIME_CONTEXT_SYSTEM: u32 = 0;
+pub const TIME_CONTEXT_UTC_OFFSET: u32 = 1;
+pub const TIME_CONTEXT_OFF: u32 = 2;
+/// Revision 22: `utc_offset_minutes` bounds (UTC-14:00 .. UTC+14:00).
+pub const MIN_UTC_OFFSET_MINUTES_V1: i32 = -14 * 60;
+pub const MAX_UTC_OFFSET_MINUTES_V1: i32 = 14 * 60;
+/// Revision 23 `GoalUpdateV1.fields` bits: which of its fields apply.
+pub const GOAL_FIELD_OBJECTIVE: u32 = 1 << 0;
+pub const GOAL_FIELD_TOKEN_BUDGET: u32 = 1 << 1;
+pub const GOAL_FIELD_ACTION: u32 = 1 << 2;
+/// Revision 23 `GoalUpdateV1.action_code` values. PAUSE needs an active (or
+/// paused) goal; ACTIVATE resumes any other status unless the budget is used
+/// up; BLOCK refuses a complete goal.
+pub const GOAL_ACTION_PAUSE: u32 = 1;
+pub const GOAL_ACTION_ACTIVATE: u32 = 2;
+pub const GOAL_ACTION_COMPLETE: u32 = 3;
+pub const GOAL_ACTION_BLOCK: u32 = 4;
+/// Revision 23: an objective is trimmed, then 1..4000 code points of UTF-8;
+/// views longer than MAX_GOAL_OBJECTIVE_BYTES_V1 are refused undecoded.
+pub const MAX_GOAL_OBJECTIVE_CODEPOINTS_V1: u64 = 4000;
+pub const MAX_GOAL_OBJECTIVE_BYTES_V1: u64 = 16_384;
 
 pub const SKILL_SOURCE_USER: u32 = 1;
 pub const SKILL_SOURCE_WORKSPACE: u32 = 2;
@@ -754,7 +806,24 @@ pub const SessionHostConfigV1 = extern struct {
     run_journal_mode_code: u32,
     /// PROTOCOL_DEFAULT, or a protocol code defined for provider_kind_code.
     protocol_kind_code: u32,
-    reserved: [3]u64,
+    /// Revision 21: what the Host knows about its models' image input,
+    /// borrowed for the call. Null with a zero count makes no statement.
+    /// Each entry names one model (matched ignoring case, at most once) and
+    /// outranks the built-in model-family table for the Session's model,
+    /// every `set_model` target, and its tool-scoped providers.
+    model_capabilities: ?[*]const ModelCapabilityV1,
+    model_capability_count: u64,
+    reserved: [1]u64,
+};
+
+/// Revision 21: one Host statement about one model.
+pub const ModelCapabilityV1 = extern struct {
+    struct_size: u32,
+    /// CAPABILITY_SUPPORTED or CAPABILITY_UNSUPPORTED.
+    image_input_code: u32,
+    /// Non-empty UTF-8, at most MAX_MODEL_CAPABILITY_MODEL_BYTES_V1.
+    model: BytesViewV1,
+    reserved: [2]u64,
 };
 
 /// One edit of the kernel system-prompt sections (#184).
@@ -786,6 +855,34 @@ pub const PromptProfileV1 = extern struct {
     sections: ?[*]const PromptSectionV1,
     section_count: u64,
     reserved: [4]u64,
+};
+
+/// Revision 23: a new goal for `goal->set`, borrowed for the call. It
+/// replaces any goal: a new id, usage from zero, status active.
+pub const GoalSetV1 = extern struct {
+    struct_size: u32,
+    reserved0: u32,
+    /// Trimmed, then 1..MAX_GOAL_OBJECTIVE_CODEPOINTS_V1 code points of UTF-8.
+    objective: BytesViewV1,
+    /// Tokens the goal may use (non-cached input plus output); 0 = no budget.
+    token_budget: u64,
+    reserved: [3]u64,
+};
+
+/// Revision 23: changes for `goal->update`, borrowed for the call and
+/// applied together or not at all - objective, then budget, then action.
+pub const GoalUpdateV1 = extern struct {
+    struct_size: u32,
+    /// A non-empty set of GOAL_FIELD_* bits. A field without its bit is zero.
+    fields: u32,
+    /// With GOAL_FIELD_OBJECTIVE: the new objective (same rules as set).
+    objective: BytesViewV1,
+    /// With GOAL_FIELD_TOKEN_BUDGET: the new budget; 0 clears it.
+    token_budget: u64,
+    /// With GOAL_FIELD_ACTION: one GOAL_ACTION_* value.
+    action_code: u32,
+    reserved0: u32,
+    reserved: [3]u64,
 };
 
 /// One Host fact for a single Run (#184): rendered with the Run's other blocks
@@ -871,7 +968,12 @@ pub const RunOptionsV1 = extern struct {
     /// zero count adds nothing.
     context_blocks: ?[*]const ContextBlockV1,
     context_block_count: u64,
-    reserved: [2]u64,
+    /// Revision 22: one TIME_CONTEXT_* value; zero is TIME_CONTEXT_SYSTEM.
+    time_context_code: u32,
+    /// Revision 22: minutes east of UTC under TIME_CONTEXT_UTC_OFFSET; zero
+    /// under any other code.
+    utc_offset_minutes: i32,
+    reserved: [1]u64,
 };
 
 /// Terminal Run summary. All fields are defined on STATUS_OK. On
@@ -1141,7 +1243,7 @@ pub const SessionUpdatePermissionModeFnV1 = *const fn (
     permission_mode_code: u32,
     out_diagnostic: ?*OwnedBytesV1,
 ) callconv(.c) u32;
-/// Runs the canonical default best-effort compact policy. Revision 20 accepts
+/// Runs the canonical default best-effort compact policy. Revision 22 accepts
 /// no target token budget and does not guarantee fit for a model context.
 pub const SessionCompactFnV1 = *const fn (
     session: ?*SessionHandle,
@@ -1158,6 +1260,34 @@ pub const SessionExportCheckpointFnV1 = *const fn (
     session: ?*SessionHandle,
     config: ?*const CheckpointExportConfigV1,
     out_result: ?*CheckpointExportResultV1,
+    out_diagnostic: ?*OwnedBytesV1,
+) callconv(.c) u32;
+/// Revision 23. Writes the Session's goal as JSON, `{"goal":null}` or
+/// `{"goal":{...}}` (see doc/AGENTCORE_BINARY_ABI.md, "Goals"). Like
+/// describe it is BUSY while a Run, compact, checkpoint or mutation is in
+/// progress; a Run reports goal changes through `goal_updated` events.
+pub const GoalGetFnV1 = *const fn (
+    session: ?*SessionHandle,
+    out_goal_json: ?*OwnedBytesV1,
+    out_diagnostic: ?*OwnedBytesV1,
+) callconv(.c) u32;
+/// Revision 23. Replaces any goal with a new active one while idle. Every
+/// refusal leaves the goal unchanged; `get` reads the result.
+pub const GoalSetFnV1 = *const fn (
+    session: ?*SessionHandle,
+    goal: ?*const GoalSetV1,
+    out_diagnostic: ?*OwnedBytesV1,
+) callconv(.c) u32;
+/// Revision 23. Applies an update while idle, all of it or none.
+/// GOAL_CONFLICT for no goal or a refused action; nothing changes.
+pub const GoalUpdateFnV1 = *const fn (
+    session: ?*SessionHandle,
+    update: ?*const GoalUpdateV1,
+    out_diagnostic: ?*OwnedBytesV1,
+) callconv(.c) u32;
+/// Revision 23. Removes the goal while idle; without one it changes nothing.
+pub const GoalClearFnV1 = *const fn (
+    session: ?*SessionHandle,
     out_diagnostic: ?*OwnedBytesV1,
 ) callconv(.c) u32;
 /// Releases only library-owned diagnostics, never Host-owned tool or UI
@@ -1212,6 +1342,16 @@ pub const McpApiV1 = extern struct {
     update_selection: ?SessionUpdateMcpFnV1,
 };
 
+/// Revision 23: the Session's goal (see doc/AGENTCORE_BINARY_ABI.md, "Goals").
+pub const GoalApiV1 = extern struct {
+    struct_size: u32,
+    reserved0: u32,
+    get: ?GoalGetFnV1,
+    set: ?GoalSetFnV1,
+    update: ?GoalUpdateFnV1,
+    clear: ?GoalClearFnV1,
+};
+
 pub const ApiV1 = extern struct {
     struct_size: u32,
     abi_version: u32,
@@ -1223,6 +1363,7 @@ pub const ApiV1 = extern struct {
     session_control: ?*const SessionControlApiV1,
     skill: ?*const SkillApiV1,
     mcp: ?*const McpApiV1,
+    goal: ?*const GoalApiV1,
 };
 
 test "ABI v1 public layouts are fixed on supported 64-bit targets" {
@@ -1275,7 +1416,16 @@ test "ABI v1 public layouts are fixed on supported 64-bit targets" {
     try std.testing.expectEqual(@as(usize, 80), @sizeOf(SessionControlApiV1));
     try std.testing.expectEqual(@as(usize, 32), @sizeOf(SkillApiV1));
     try std.testing.expectEqual(@as(usize, 40), @sizeOf(McpApiV1));
-    try std.testing.expectEqual(@as(usize, 64), @sizeOf(ApiV1));
+    try std.testing.expectEqual(@as(usize, 40), @sizeOf(GoalApiV1));
+    try std.testing.expectEqual(@as(usize, 56), @sizeOf(GoalSetV1));
+    try std.testing.expectEqual(@as(usize, 64), @sizeOf(GoalUpdateV1));
+    try std.testing.expectEqual(@as(usize, 8), @offsetOf(GoalSetV1, "objective"));
+    try std.testing.expectEqual(@as(usize, 24), @offsetOf(GoalSetV1, "token_budget"));
+    try std.testing.expectEqual(@as(usize, 8), @offsetOf(GoalUpdateV1, "objective"));
+    try std.testing.expectEqual(@as(usize, 24), @offsetOf(GoalUpdateV1, "token_budget"));
+    try std.testing.expectEqual(@as(usize, 32), @offsetOf(GoalUpdateV1, "action_code"));
+    try std.testing.expectEqual(@as(usize, 72), @sizeOf(ApiV1));
+    try std.testing.expectEqual(@as(usize, 64), @offsetOf(ApiV1, "goal"));
     try std.testing.expectEqual(@as(usize, 8), @offsetOf(RunContextV1, "session"));
     try std.testing.expectEqual(@as(usize, 16), @offsetOf(RunContextV1, "run_id"));
     try std.testing.expectEqual(@as(usize, 24), @offsetOf(RunContextV1, "session_id"));
@@ -1302,7 +1452,13 @@ test "ABI v1 public layouts are fixed on supported 64-bit targets" {
     try std.testing.expectEqual(@as(usize, 128), @offsetOf(SessionHostConfigV1, "durable_budget"));
     try std.testing.expectEqual(@as(usize, 136), @offsetOf(SessionHostConfigV1, "run_journal_mode_code"));
     try std.testing.expectEqual(@as(usize, 140), @offsetOf(SessionHostConfigV1, "protocol_kind_code"));
-    try std.testing.expectEqual(@as(usize, 144), @offsetOf(SessionHostConfigV1, "reserved"));
+    try std.testing.expectEqual(@as(usize, 144), @offsetOf(SessionHostConfigV1, "model_capabilities"));
+    try std.testing.expectEqual(@as(usize, 152), @offsetOf(SessionHostConfigV1, "model_capability_count"));
+    try std.testing.expectEqual(@as(usize, 160), @offsetOf(SessionHostConfigV1, "reserved"));
+    try std.testing.expectEqual(@as(usize, 40), @sizeOf(ModelCapabilityV1));
+    try std.testing.expectEqual(@as(usize, 4), @offsetOf(ModelCapabilityV1, "image_input_code"));
+    try std.testing.expectEqual(@as(usize, 8), @offsetOf(ModelCapabilityV1, "model"));
+    try std.testing.expectEqual(@as(usize, 24), @offsetOf(ModelCapabilityV1, "reserved"));
     try std.testing.expectEqual(@as(usize, 8), @offsetOf(SessionCreateConfigV1, "host"));
     try std.testing.expectEqual(@as(usize, 16), @offsetOf(SessionCreateConfigV1, "model"));
     try std.testing.expectEqual(@as(usize, 32), @offsetOf(SessionCreateConfigV1, "prompt_profile"));
@@ -1318,6 +1474,9 @@ test "ABI v1 public layouts are fixed on supported 64-bit targets" {
     try std.testing.expectEqual(@as(usize, 24), @offsetOf(ContextBlockV1, "text"));
     try std.testing.expectEqual(@as(usize, 8), @offsetOf(RunOptionsV1, "context_blocks"));
     try std.testing.expectEqual(@as(usize, 16), @offsetOf(RunOptionsV1, "context_block_count"));
+    try std.testing.expectEqual(@as(usize, 24), @offsetOf(RunOptionsV1, "time_context_code"));
+    try std.testing.expectEqual(@as(usize, 28), @offsetOf(RunOptionsV1, "utc_offset_minutes"));
+    try std.testing.expectEqual(@as(usize, 32), @offsetOf(RunOptionsV1, "reserved"));
     try std.testing.expectEqual(@as(usize, 64), @offsetOf(SessionControlApiV1, "set_prompt_profile"));
     try std.testing.expectEqual(@as(usize, 72), @offsetOf(SessionControlApiV1, "update_permission_mode"));
     try std.testing.expectEqual(@as(usize, 8), @offsetOf(SkillPolicyV1, "granted_skill_ids"));
@@ -1375,7 +1534,9 @@ test "typed status and stop reason validate every public code" {
     try std.testing.expectError(error.UnknownStatus, Status.fromCode(26));
     try std.testing.expectEqual(Status.skill_catalog_incomplete, try Status.fromCode(27));
     try std.testing.expectEqual(Status.image_input_unsupported, try Status.fromCode(28));
-    try std.testing.expectError(error.UnknownStatus, Status.fromCode(29));
+    try std.testing.expectEqual(Status.image_input_capability_unknown, try Status.fromCode(29));
+    try std.testing.expectEqual(Status.goal_conflict, try Status.fromCode(30));
+    try std.testing.expectError(error.UnknownStatus, Status.fromCode(31));
     try std.testing.expectError(error.UnknownStatus, Status.fromCode(std.math.maxInt(u32)));
     try std.testing.expectError(error.UnknownStopReason, StopReason.fromCode(0));
     try std.testing.expectEqual(StopReason.checkpoint_resource_limit, try StopReason.fromCode(8));
@@ -1397,9 +1558,9 @@ test "typed provider kind validates every public code" {
     );
 }
 
-test "Revision 20 keeps MCP wire codes stable" {
+test "Revision 23 keeps MCP wire codes stable" {
     const std = @import("std");
-    try std.testing.expectEqual(@as(u32, 20), ABI_REVISION);
+    try std.testing.expectEqual(@as(u32, 23), ABI_REVISION);
     try std.testing.expectEqual(@as(u32, 1), MCP_NEGOTIATION_AUTO);
     try std.testing.expectEqual(@as(u32, 2), MCP_NEGOTIATION_MODERN_ONLY);
     try std.testing.expectEqual(@as(u32, 3), MCP_NEGOTIATION_LEGACY_ONLY);

@@ -5,7 +5,7 @@
 #include <stdint.h>
 
 #if !defined(UINTPTR_MAX) || !defined(UINT64_MAX) || UINTPTR_MAX != UINT64_MAX
-#error "AgentCore ABI v1 revision 20 requires a 64-bit pointer ABI"
+#error "AgentCore ABI v1 revision 23 requires a 64-bit pointer ABI"
 #endif
 
 #ifdef __cplusplus
@@ -13,11 +13,11 @@ extern "C" {
 #endif
 
 /* sdk/zig/types.zig is the normative fixed-layout schema. This header is its
- * Revision 20 C projection; sdk/rust/src/raw.rs is generated from this file.
+ * Revision 22 C projection; sdk/rust/src/raw.rs is generated from this file.
  * AgentCore ABI v1 remains experimental. Consumers pin an exact bundle and
  * must validate the exact root and mandatory child-table layouts together. */
 #define METASK_AGENTCORE_ABI_V1 1u
-#define METASK_AGENTCORE_ABI_REVISION 20u
+#define METASK_AGENTCORE_ABI_REVISION 23u
 
 #define METASK_AGENTCORE_STATUS_OK 0u
 #define METASK_AGENTCORE_STATUS_INVALID_ARGUMENT 1u
@@ -47,6 +47,15 @@ extern "C" {
 #define METASK_AGENTCORE_STATUS_INVALID_MCP_SELECTION 25u
 #define METASK_AGENTCORE_STATUS_SKILL_CATALOG_INCOMPLETE 27u
 #define METASK_AGENTCORE_STATUS_IMAGE_INPUT_UNSUPPORTED 28u
+/* Revision 21: nothing (Host declaration, provider catalog, built-in model
+ * family) says the model takes images; a declaration fixes it. */
+#define METASK_AGENTCORE_STATUS_IMAGE_INPUT_CAPABILITY_UNKNOWN 29u
+/* Revision 23: the goal operation needs a goal, or an active one, that the
+ * Session does not have: no goal, a refused transition (pausing a goal that is
+ * not active, resuming one whose budget is used up, blocking a complete one),
+ * or a goal-continuation Run without an active goal. Nothing changed; the
+ * diagnostic names the reason. */
+#define METASK_AGENTCORE_STATUS_GOAL_CONFLICT 30u
 
 #define METASK_AGENTCORE_PROVIDER_ANTHROPIC 1u
 #define METASK_AGENTCORE_PROVIDER_OPENAI 2u
@@ -101,6 +110,10 @@ extern "C" {
 /* Base64 payload cap for one image part: exactly the standard base64 encoding
  * of the built-in Read tool's 3.75 MB raw-image limit. */
 #define METASK_AGENTCORE_MAX_RUN_INPUT_IMAGE_DATA_BYTES_V1 5000000ULL
+/* Revision 21: model-capability declarations per Session Host config, and the
+ * bytes of one declared model name. */
+#define METASK_AGENTCORE_MAX_MODEL_CAPABILITIES_V1 256ULL
+#define METASK_AGENTCORE_MAX_MODEL_CAPABILITY_MODEL_BYTES_V1 256ULL
 #define METASK_AGENTCORE_MAX_SKILL_CATALOG_SKILLS_V1 1024ULL
 #define METASK_AGENTCORE_MAX_SKILL_CATALOG_DESCRIPTOR_BYTES_V1 4194304ULL
 #define METASK_AGENTCORE_MAX_SKILL_FILE_CONTENT_BYTES_V1 16777216ULL
@@ -157,8 +170,40 @@ extern "C" {
 #define METASK_AGENTCORE_RUN_INPUT_TEXT 1u
 #define METASK_AGENTCORE_RUN_INPUT_SKILL 2u
 #define METASK_AGENTCORE_RUN_INPUT_MULTIMODAL 3u
+/* Revision 23: continue toward the Session's active goal. Every input field is
+ * empty; the runtime writes the Run's input from the goal. */
+#define METASK_AGENTCORE_RUN_INPUT_GOAL_CONTINUATION 4u
 #define METASK_AGENTCORE_RUN_INPUT_PART_TEXT 1u
 #define METASK_AGENTCORE_RUN_INPUT_PART_IMAGE 2u
+/* Revision 21 model_capability_v1.image_input_code. Zero is not a declaration;
+ * leave a model out to make no statement. */
+#define METASK_AGENTCORE_CAPABILITY_SUPPORTED 1u
+#define METASK_AGENTCORE_CAPABILITY_UNSUPPORTED 2u
+/* Revision 22 run_options_v1.time_context_code: how the runtime tells the model
+ * today's date and time zone (a `currentDate` context block). SYSTEM, the zero
+ * default, uses the process's time zone; UTC_OFFSET uses utc_offset_minutes; OFF
+ * adds nothing. A Host block labeled `currentDate` suppresses the runtime's under
+ * SYSTEM and conflicts with UTC_OFFSET. */
+#define METASK_AGENTCORE_TIME_CONTEXT_SYSTEM 0u
+#define METASK_AGENTCORE_TIME_CONTEXT_UTC_OFFSET 1u
+#define METASK_AGENTCORE_TIME_CONTEXT_OFF 2u
+#define METASK_AGENTCORE_MIN_UTC_OFFSET_MINUTES_V1 (-840)
+#define METASK_AGENTCORE_MAX_UTC_OFFSET_MINUTES_V1 840
+/* Revision 23 goal_update_v1.fields bits: which of its fields apply. */
+#define METASK_AGENTCORE_GOAL_FIELD_OBJECTIVE 1u
+#define METASK_AGENTCORE_GOAL_FIELD_TOKEN_BUDGET 2u
+#define METASK_AGENTCORE_GOAL_FIELD_ACTION 4u
+/* Revision 23 goal_update_v1.action_code. PAUSE needs an active (or paused)
+ * goal; ACTIVATE resumes any other status unless the budget is used up; BLOCK
+ * refuses a complete goal. */
+#define METASK_AGENTCORE_GOAL_ACTION_PAUSE 1u
+#define METASK_AGENTCORE_GOAL_ACTION_ACTIVATE 2u
+#define METASK_AGENTCORE_GOAL_ACTION_COMPLETE 3u
+#define METASK_AGENTCORE_GOAL_ACTION_BLOCK 4u
+/* Revision 23: an objective is trimmed, then 1..4000 code points of UTF-8;
+ * views longer than MAX_GOAL_OBJECTIVE_BYTES_V1 are refused undecoded. */
+#define METASK_AGENTCORE_MAX_GOAL_OBJECTIVE_CODEPOINTS_V1 4000u
+#define METASK_AGENTCORE_MAX_GOAL_OBJECTIVE_BYTES_V1 16384u
 #define METASK_AGENTCORE_PROMPT_OP_ADD 1u
 #define METASK_AGENTCORE_PROMPT_OP_REPLACE 2u
 #define METASK_AGENTCORE_PROMPT_OP_REMOVE 3u
@@ -551,6 +596,17 @@ typedef struct {
     uint64_t reserved[4];
 } metask_agentcore_durable_budget_profile_v1;
 
+/* Revision 21: one Host statement about one model's image input. `model` is
+ * non-empty UTF-8 of at most METASK_AGENTCORE_MAX_MODEL_CAPABILITY_MODEL_BYTES_V1
+ * bytes, matched against the model a request names ignoring case. */
+typedef struct {
+    uint32_t struct_size;
+    /* METASK_AGENTCORE_CAPABILITY_SUPPORTED or _UNSUPPORTED. */
+    uint32_t image_input_code;
+    metask_agentcore_bytes_view_v1 model;
+    uint64_t reserved[2];
+} metask_agentcore_model_capability_v1;
+
 /* Current Host authority is shared by fresh creation and restore. Restore
  * intersects this authority with checkpoint state; it never accepts a Host
  * supplied logical Session ID and never widens historical authority. */
@@ -576,7 +632,14 @@ typedef struct {
     /* METASK_AGENTCORE_PROTOCOL_DEFAULT, or a protocol code defined for
      * provider_kind_code. No URL or model-name inference is performed. */
     uint32_t protocol_kind_code;
-    uint64_t reserved[3];
+    /* Revision 21: borrowed for the call; null with a zero count makes no
+     * statement. At most METASK_AGENTCORE_MAX_MODEL_CAPABILITIES_V1 entries,
+     * each naming a distinct model. A declaration outranks the built-in model
+     * family table for the Session's model, every set_model target, and its
+     * tool-scoped providers; restore uses the current Host's declarations. */
+    const metask_agentcore_model_capability_v1 *model_capabilities;
+    uint64_t model_capability_count;
+    uint64_t reserved[1];
 } metask_agentcore_session_host_config_v1;
 
 /* One edit of the kernel system-prompt sections. PROMPT_OP_ADD adds a
@@ -606,6 +669,34 @@ typedef struct {
     uint64_t section_count;
     uint64_t reserved[4];
 } metask_agentcore_prompt_profile_v1;
+
+/* Revision 23: a new goal for goal->set, borrowed for the call. It replaces any
+ * goal: a new id, usage from zero, status active. */
+typedef struct metask_agentcore_goal_set_v1 {
+    uint32_t struct_size;
+    uint32_t reserved0;
+    /* Trimmed, then 1..MAX_GOAL_OBJECTIVE_CODEPOINTS_V1 code points of UTF-8. */
+    metask_agentcore_bytes_view_v1 objective;
+    /* Tokens the goal may use (non-cached input plus output); 0 = no budget. */
+    uint64_t token_budget;
+    uint64_t reserved[3];
+} metask_agentcore_goal_set_v1;
+
+/* Revision 23: changes for goal->update, borrowed for the call and applied
+ * together or not at all - objective, then budget, then action. */
+typedef struct metask_agentcore_goal_update_v1 {
+    uint32_t struct_size;
+    /* A non-empty set of GOAL_FIELD_* bits. A field without its bit is zero. */
+    uint32_t fields;
+    /* With GOAL_FIELD_OBJECTIVE: the new objective (same rules as set). */
+    metask_agentcore_bytes_view_v1 objective;
+    /* With GOAL_FIELD_TOKEN_BUDGET: the new budget; 0 clears it. */
+    uint64_t token_budget;
+    /* With GOAL_FIELD_ACTION: one GOAL_ACTION_* value. */
+    uint32_t action_code;
+    uint32_t reserved0;
+    uint64_t reserved[3];
+} metask_agentcore_goal_update_v1;
 
 /* One Host fact for a single Run, rendered with the Run's other blocks into one
  * <system-reminder> text that leads the Run's user record. */
@@ -685,7 +776,12 @@ typedef struct {
      * borrowed for the call. Null with zero count adds nothing. */
     const metask_agentcore_context_block_v1 *context_blocks;
     uint64_t context_block_count;
-    uint64_t reserved[2];
+    /* Revision 22: one METASK_AGENTCORE_TIME_CONTEXT_* value; zero is SYSTEM. */
+    uint32_t time_context_code;
+    /* Revision 22: minutes east of UTC under TIME_CONTEXT_UTC_OFFSET
+     * (METASK_AGENTCORE_MIN/MAX_UTC_OFFSET_MINUTES_V1); zero otherwise. */
+    int32_t utc_offset_minutes;
+    uint64_t reserved[1];
 } metask_agentcore_run_options_v1;
 
 /* The two input counts (Revision 20) are defined on every session_run_input
@@ -878,10 +974,29 @@ typedef uint32_t (*metask_agentcore_session_set_prompt_profile_fn_v1)(
  * a no-op. Any failure leaves mode, generation and grants unchanged. */
 typedef uint32_t (*metask_agentcore_session_update_permission_mode_fn_v1)(
     metask_agentcore_session *, uint32_t, metask_agentcore_owned_bytes_v1 *);
+/* Revision 23. Writes the Session's goal as JSON, {"goal":null} or
+ * {"goal":{...}}. Like describe it is BUSY while a Run, compact, checkpoint or
+ * mutation is in progress; a Run reports goal changes as goal_updated events. */
+typedef uint32_t (*metask_agentcore_goal_get_fn_v1)(
+    metask_agentcore_session *, metask_agentcore_owned_bytes_v1 *,
+    metask_agentcore_owned_bytes_v1 *);
+/* Revision 23. Replaces any goal with a new active one while idle. Every
+ * refusal leaves the goal unchanged; goal->get reads the result. */
+typedef uint32_t (*metask_agentcore_goal_set_fn_v1)(
+    metask_agentcore_session *, const metask_agentcore_goal_set_v1 *,
+    metask_agentcore_owned_bytes_v1 *);
+/* Revision 23. Applies an update while idle, all of it or none. GOAL_CONFLICT
+ * for no goal or a refused action; nothing changes. */
+typedef uint32_t (*metask_agentcore_goal_update_fn_v1)(
+    metask_agentcore_session *, const metask_agentcore_goal_update_v1 *,
+    metask_agentcore_owned_bytes_v1 *);
+/* Revision 23. Removes the goal while idle; without one it changes nothing. */
+typedef uint32_t (*metask_agentcore_goal_clear_fn_v1)(
+    metask_agentcore_session *, metask_agentcore_owned_bytes_v1 *);
 typedef void (*metask_agentcore_buffer_release_fn_v1)(
     metask_agentcore_owned_bytes_v1 *);
 
-/* Function-table order is fixed within Revision 20. No earlier revision layout
+/* Function-table order is fixed within Revision 23. No earlier revision layout
  * is accepted, probed, aliased, or dispatched. */
 typedef struct metask_agentcore_runtime_api_v1 {
     uint32_t struct_size;
@@ -931,6 +1046,16 @@ typedef struct metask_agentcore_mcp_api_v1 {
     metask_agentcore_session_update_mcp_fn_v1 update_selection;
 } metask_agentcore_mcp_api_v1;
 
+/* Revision 23: the Session's goal. */
+typedef struct metask_agentcore_goal_api_v1 {
+    uint32_t struct_size;
+    uint32_t reserved0;
+    metask_agentcore_goal_get_fn_v1 get;
+    metask_agentcore_goal_set_fn_v1 set;
+    metask_agentcore_goal_update_fn_v1 update;
+    metask_agentcore_goal_clear_fn_v1 clear;
+} metask_agentcore_goal_api_v1;
+
 typedef struct metask_agentcore_api_v1 {
     uint32_t struct_size;
     uint32_t abi_version;
@@ -942,6 +1067,7 @@ typedef struct metask_agentcore_api_v1 {
     const metask_agentcore_session_control_api_v1 *session_control;
     const metask_agentcore_skill_api_v1 *skill;
     const metask_agentcore_mcp_api_v1 *mcp;
+    const metask_agentcore_goal_api_v1 *goal;
 } metask_agentcore_api_v1;
 
 /* The final owned-bytes output of AgentCore calls is optional and write-only.
@@ -1032,7 +1158,15 @@ metask_agentcore_api_v1_is_compatible(const metask_agentcore_api_v1 *api) {
            api->mcp->refresh != (metask_agentcore_runtime_refresh_mcp_fn_v1)0 &&
            api->mcp->describe != (metask_agentcore_runtime_describe_mcp_fn_v1)0 &&
            api->mcp->update_selection !=
-               (metask_agentcore_session_update_mcp_fn_v1)0;
+               (metask_agentcore_session_update_mcp_fn_v1)0 &&
+           api->goal != (const metask_agentcore_goal_api_v1 *)0 &&
+           ((uintptr_t)api->goal % sizeof(void *)) == 0 &&
+           api->goal->struct_size == sizeof(*api->goal) &&
+           api->goal->reserved0 == 0 &&
+           api->goal->get != (metask_agentcore_goal_get_fn_v1)0 &&
+           api->goal->set != (metask_agentcore_goal_set_fn_v1)0 &&
+           api->goal->update != (metask_agentcore_goal_update_fn_v1)0 &&
+           api->goal->clear != (metask_agentcore_goal_clear_fn_v1)0;
 }
 
 static inline const metask_agentcore_api_v1 *
@@ -1067,8 +1201,8 @@ metask_agentcore_owned_bytes_v1_release(
 #define METASK_AGENTCORE_ASSERT_OFFSET(type, field, offset) \
     METASK_AGENTCORE_STATIC_ASSERT(offsetof(type, field) == (offset), #type "." #field " offset")
 
-METASK_AGENTCORE_STATIC_ASSERT(METASK_AGENTCORE_ABI_REVISION == 20u,
-                               "AgentCore revision 20");
+METASK_AGENTCORE_STATIC_ASSERT(METASK_AGENTCORE_ABI_REVISION == 23u,
+                               "AgentCore revision 23");
 METASK_AGENTCORE_STATIC_ASSERT(METASK_AGENTCORE_MCP_NEGOTIATION_AUTO == 1u,
                                "MCP auto code");
 METASK_AGENTCORE_STATIC_ASSERT(METASK_AGENTCORE_MCP_NEGOTIATION_MODERN_ONLY == 2u,
@@ -1110,6 +1244,7 @@ METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_mcp_selector_v1, 80);
 METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_mcp_selection_v1, 56);
 METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_durable_budget_profile_v1, 112);
 METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_session_host_config_v1, 168);
+METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_model_capability_v1, 40);
 METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_prompt_section_v1, 72);
 METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_prompt_profile_v1, 56);
 METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_context_block_v1, 56);
@@ -1134,7 +1269,10 @@ METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_session_api_v1, 48);
 METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_session_control_api_v1, 80);
 METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_skill_api_v1, 32);
 METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_mcp_api_v1, 40);
-METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_api_v1, 64);
+METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_goal_api_v1, 40);
+METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_goal_set_v1, 56);
+METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_goal_update_v1, 64);
+METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_api_v1, 72);
 
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_run_context_v1, session, 8);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_run_context_v1, run_id, 16);
@@ -1162,7 +1300,12 @@ METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_session_host_config_v1, mcp_sele
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_session_host_config_v1, durable_budget, 128);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_session_host_config_v1, run_journal_mode_code, 136);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_session_host_config_v1, protocol_kind_code, 140);
-METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_session_host_config_v1, reserved, 144);
+METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_session_host_config_v1, model_capabilities, 144);
+METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_session_host_config_v1, model_capability_count, 152);
+METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_session_host_config_v1, reserved, 160);
+METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_model_capability_v1, image_input_code, 4);
+METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_model_capability_v1, model, 8);
+METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_model_capability_v1, reserved, 24);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_session_create_config_v1, host, 8);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_session_create_config_v1, model, 16);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_session_create_config_v1, prompt_profile, 32);
@@ -1189,6 +1332,15 @@ METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_run_input_v1, part_count, 80);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_run_input_v1, reserved, 88);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_run_options_v1, context_blocks, 8);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_run_options_v1, context_block_count, 16);
+METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_run_options_v1, time_context_code, 24);
+METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_run_options_v1, utc_offset_minutes, 28);
+METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_run_options_v1, reserved, 32);
+METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_goal_set_v1, objective, 8);
+METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_goal_set_v1, token_budget, 24);
+METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_goal_update_v1, objective, 8);
+METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_goal_update_v1, token_budget, 24);
+METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_goal_update_v1, action_code, 32);
+METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_api_v1, goal, 64);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_session_control_api_v1, set_prompt_profile, 64);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_session_control_api_v1, update_permission_mode, 72);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_run_result_v1, durable_usage_bytes, 24);

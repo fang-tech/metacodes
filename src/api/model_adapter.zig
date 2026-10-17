@@ -21,6 +21,7 @@
 //! 调研来源:各厂商 chat_template.jinja / OpenAPI spec / 官方文档(2025-08 快照)。
 
 const std = @import("std");
+const image_capability = @import("image_capability.zig");
 const model_name = @import("model_name.zig");
 
 /// thinking 控制模式:决定 reasoning_effort 如何翻译到 wire 格式。
@@ -127,6 +128,11 @@ pub const ModelProfile = struct {
     /// 请求含 image block 时必须报显式能力错误(error.ImageInputUnsupported),
     /// 绝不静默丢图/OCR/文本占位。保守默认 false;仅对已验证 vision 家族开 true。
     supports_image_input: bool = false,
+    /// Who answered `supports_image_input`. `.model_family` when the built-in
+    /// table knows the name either way; `.unknown` when it does not (the
+    /// answer is then the fail-closed `false`). A catalog or Host declaration
+    /// applied by `Dialect.profileFor` replaces both fields (issue #273).
+    image_input_source: image_capability.Source = .unknown,
     /// 支持 multimodal functionResponse(图像嵌在 functionResponse.parts 里,官方形态)。
     /// 仅 Gemini 3 系起支持(ai.google.dev function-calling#multimodal + v1beta discovery
     /// doc,2025-12-17 changelog);旧世代 Gemini 走同级 inline_data part 形态。
@@ -157,10 +163,10 @@ fn anthropicProfile(model: []const u8) ModelProfile {
         .returns_reasoning_content = false, // Claude 用 content[] 里的 thinking block,非平级字段
         // Vision 按**模型家族**判,与 wire 格式无关(issue #112):Anthropic 兼容网关
         // 后面挂的可以是 gpt-5.x / gemini / qwen-vl,名字认得出的家族照常放行;
-        // 认不出的(glm-5.x 之类)保守 false——真相由 /v1/models 目录的 image_input
-        // 声明覆盖(Dialect.image_input_override),不在这里赌远端 400。
-        .supports_image_input = knownVisionFamily(model),
+        // 认不出的保守 false(来源 unknown)——真相由 /v1/models 目录或 Host 的
+        // image_input 声明覆盖(Dialect.image_input_override),不在这里赌远端 400。
     };
+    withFamilyImageInput(&p, familyImageInput(model));
     // Claude 4.x 保留 thinking(preserved thinking)
     if (hasSubstr(model, "claude-opus-4") or hasSubstr(model, "claude-sonnet-4") or hasSubstr(model, "claude-haiku-4")) {
         p.preserved_thinking_default = false; // 保留(对齐 Claude Opus 4.5+)
@@ -187,6 +193,7 @@ fn openaiProfile(model: []const u8) ModelProfile {
             // GLM 文本系(glm-5.x/glm-4-plus)无 vision;视觉变体是 glm-4v / glm-4.1v / glm-4.5v
             // 这种"版本号以 v 收尾"的名字。glm-5.3-flash 这类新号名字看不出来,靠目录声明。
             .supports_image_input = glmVisionVariant(model),
+            .image_input_source = .model_family,
         };
     }
     // Kimi K3(总是开 thinking,顶层 reasoning_effort,不发 thinking body,省略 temp/top_p/n)
@@ -224,8 +231,10 @@ fn openaiProfile(model: []const u8) ModelProfile {
             .thinking_mode = .qwen_template,
             .effort_levels = .none_, // Qwen3 无 effort 档位,只开关
             .returns_reasoning_content = true,
-            // Qwen3 文本模型无 vision;VL 变体(qwen3-vl-*)走 OpenAI image_url 格式。
+            // VL 变体(qwen3-vl-*)走 OpenAI image_url 格式;其余 Qwen3 名字(含 omni 一类)
+            // 表里不下结论,来源 unknown,由目录或 Host 声明。
             .supports_image_input = hasSubstr(model, "vl"),
+            .image_input_source = if (hasSubstr(model, "vl")) .model_family else .unknown,
         };
     }
     // MiniMax M3(三态 thinking;可关)
@@ -234,6 +243,11 @@ fn openaiProfile(model: []const u8) ModelProfile {
             .thinking_mode = .minimax_m3_thinking,
             .effort_levels = .minimax_3state,
             .returns_reasoning_content = true,
+            // 原生多模态:官方 OpenAI 兼容 Chat Completions 文档把图像理解列为 M3 新能力,
+            // 走标准 image_url part(platform.minimax.io text-chat-openai,2026-10 核对;
+            // issue #273)。
+            .supports_image_input = true,
+            .image_input_source = .model_family,
         };
     }
     // MiniMax M2.x(常开不可关;reasoning_split 平级返回思考)
@@ -256,20 +270,28 @@ fn openaiProfile(model: []const u8) ModelProfile {
     }
     // OpenAI 原生(GPT-4o/o1/o3/GPT-5)。注意本分支同时是**所有未匹配模型名的
     // catch-all**(vLLM/自部署/新厂商)——vision 只对已验证 OpenAI 家族开 true,
-    // 未知模型保持保守 false(fail-closed:本地显式能力错误优于远端 400/静默忽略)。
-    return .{
+    // 未知模型保持保守 false(fail-closed:本地显式能力错误优于远端 400/静默忽略),
+    // 来源记为 unknown,与"已知纯文本"区分开(issue #273)。
+    var p = ModelProfile{
         .thinking_mode = .openai_effort,
         .effort_levels = .full,
         .returns_reasoning_content = false, // OpenAI 不暴露 reasoning content
-        .supports_image_input = knownVisionFamily(model),
     };
+    withFamilyImageInput(&p, familyImageInput(model));
+    return p;
 }
 
-/// 已验证的 vision **家族**——与调用它的 wire 格式无关(同一个模型经 Anthropic 兼容
-/// 网关或 OpenAI 兼容端点,能不能看图是模型的事,不是协议的事;issue #112)。
-/// 认不出的名字一律 false(fail-closed):本地显式能力错误优于远端 400 / 静默忽略。
-/// 目录(`/v1/models` 的 image_input 声明)有话说时覆盖本表,见 dialect.Dialect.image_input_override。
-pub fn knownVisionFamily(model: []const u8) bool {
+fn withFamilyImageInput(p: *ModelProfile, family: ?bool) void {
+    p.supports_image_input = family orelse false;
+    p.image_input_source = if (family != null) .model_family else .unknown;
+}
+
+/// 模型**家族**表对 image input 的看法——与调用它的 wire 格式无关(同一个模型经 Anthropic
+/// 兼容网关或 OpenAI 兼容端点,能不能看图是模型的事,不是协议的事;issue #112)。
+/// true = 已验证的 vision 家族;false = 已验证的纯文本家族;null = 表里不认识这个名字
+/// (调用方 fail-closed 按 false 处理,但来源是 unknown,不是"不支持";issue #273)。
+/// 目录或 Host 有声明时覆盖本表,见 dialect.Dialect.image_input_override。
+pub fn familyImageInput(model: []const u8) ?bool {
     // Claude 3 起原生多模态;claude-1/2/instant 是纯文本代。
     if (hasSubstr(model, "claude")) {
         return !hasSubstr(model, "claude-instant") and
@@ -277,11 +299,29 @@ pub fn knownVisionFamily(model: []const u8) bool {
             !hasSubstr(model, "claude-2");
     }
     if (openaiNativeVision(model)) return true;
+    if (openaiKnownTextOnly(model)) return false;
     // Gemini 全系原生多模态。
     if (hasSubstr(model, "gemini")) return true;
     // Qwen VL 变体(qwen2.5-vl / qwen3-vl)。
     if (hasSubstr(model, "qwen") and hasSubstr(model, "vl")) return true;
-    return glmVisionVariant(model);
+    // MiniMax-M3:原生多模态(见 openaiProfile 的 M3 分支)。
+    if (hasSubstr(model, "minimax-m3") or hasSubstr(model, "minimax_m3")) return true;
+    // GLM:版本段以 v 收尾是视觉变体,其余是文本系——命名约定两头都确定。
+    if (std.ascii.indexOfIgnoreCase(model, "glm-") != null) return glmVisionVariant(model);
+    return null;
+}
+
+/// `familyImageInput` 的 fail-closed 布尔视图:不认识的名字按不支持。
+pub fn knownVisionFamily(model: []const u8) bool {
+    return familyImageInput(model) orelse false;
+}
+
+/// OpenAI 已知的纯文本型号:o1-mini/o1-preview/o3-mini、GPT-3.5、0613 代的裸 gpt-4。
+fn openaiKnownTextOnly(model: []const u8) bool {
+    if (hasSubstr(model, "o1-mini") or hasSubstr(model, "o1-preview") or
+        hasSubstr(model, "o3-mini") or hasSubstr(model, "gpt-3.5")) return true;
+    if (model_name.eqlIgnoreCase(model, "gpt-4")) return true;
+    return model_name.startsWithIgnoreCase(model, "gpt-4-0") or model_name.startsWithIgnoreCase(model, "gpt-4-32k");
 }
 
 /// GLM 视觉变体:`glm-` 后的版本段以 `v` 收尾——glm-4v、glm-4.1v-thinking、glm-4.5v、
@@ -326,6 +366,7 @@ fn geminiProfile(model: []const u8) ModelProfile {
     return .{
         .thinking_mode = .gemini_level,
         .supports_image_input = true, // Gemini 全系原生多模态(inline_data parts)
+        .image_input_source = .model_family,
         // multimodal functionResponse(functionResponse.parts[].inlineData)仅 Gemini 3 系起
         // 官方支持;旧世代(2.5 等)tool_result 图像走同级 inline_data part 形态。
         .supports_multimodal_function_response = is_gemini3_family,
@@ -575,9 +616,52 @@ test "profileFor: vision 能力矩阵(issue #10)" {
     try std.testing.expect(profileFor(.openai, "GLM-4.6V-Flash").supports_image_input);
     try std.testing.expect(!profileFor(.openai, "deepseek-chat").supports_image_input);
     try std.testing.expect(!profileFor(.openai, "kimi-k3").supports_image_input);
-    try std.testing.expect(!profileFor(.openai, "minimax-m3").supports_image_input);
+    // MiniMax-M3 是原生多模态(issue #273 回归),两条路由同答;M2.x 表里不下结论。
+    try std.testing.expect(profileFor(.openai, "minimax-m3").supports_image_input);
+    try std.testing.expect(profileFor(.anthropic, "MiniMax-M3").supports_image_input);
+    try std.testing.expect(!profileFor(.openai, "minimax-m2.5").supports_image_input);
     try std.testing.expect(!profileFor(.openai, "mistral-large").supports_image_input);
     try std.testing.expect(!profileFor(.other, "mystery").supports_image_input);
+}
+
+test "profileFor: image input says who answered - family table or nobody (issue #273)" {
+    const Source = image_capability.Source;
+    // Known either way: the family table answered.
+    inline for (.{
+        .{ ProviderKind.anthropic, "claude-sonnet-4-6", true },
+        .{ ProviderKind.anthropic, "claude-2.1", false },
+        .{ ProviderKind.openai, "gpt-4o", true },
+        .{ ProviderKind.openai, "o3-mini", false },
+        .{ ProviderKind.openai, "gpt-3.5-turbo", false },
+        .{ ProviderKind.openai, "gpt-4-0613", false },
+        .{ ProviderKind.openai, "glm-5.2", false },
+        .{ ProviderKind.openai, "glm-4.5v", true },
+        .{ ProviderKind.anthropic, "glm-5.3-flash", false },
+        .{ ProviderKind.openai, "qwen3-vl-235b", true },
+        .{ ProviderKind.openai, "minimax-m3", true },
+        .{ ProviderKind.gemini, "gemini-2.5-pro", true },
+    }) |case| {
+        const profile = profileFor(case[0], case[1]);
+        try std.testing.expectEqual(case[2], profile.supports_image_input);
+        try std.testing.expectEqual(Source.model_family, profile.image_input_source);
+    }
+    // Nobody knows: refused by default, but the source says unknown, not "unsupported".
+    inline for (.{
+        .{ ProviderKind.openai, "llama-3.3-70b" },
+        .{ ProviderKind.openai, "grok-4" },
+        .{ ProviderKind.openai, "deepseek-chat" },
+        .{ ProviderKind.openai, "kimi-k3" },
+        .{ ProviderKind.openai, "minimax-m2.5" },
+        .{ ProviderKind.openai, "mistral-large" },
+        .{ ProviderKind.openai, "qwen3-235b" },
+        .{ ProviderKind.anthropic, "test-model" },
+        .{ ProviderKind.other, "mystery" },
+    }) |case| {
+        const profile = profileFor(case[0], case[1]);
+        try std.testing.expect(!profile.supports_image_input);
+        try std.testing.expectEqual(Source.unknown, profile.image_input_source);
+    }
+    try std.testing.expectEqual(@as(?bool, null), familyImageInput("vendor-new-model"));
 }
 
 test "profileFor: multimodal functionResponse 仅 Gemini 3 系 true" {

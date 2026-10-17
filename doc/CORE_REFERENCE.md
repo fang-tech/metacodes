@@ -370,6 +370,20 @@ Anthropic `web_search_20250305`)时 `run` 直接返回 `error.ServerToolsUnsuppo
 本循环不保存 server_tool_use / 结果块,服务端暂停的回合(`pause_turn`)只能靠原样回送这些块续跑,
 放行只会静默截断。WebSearch 的 server tool 只出现在它自己的隔离子请求里;Sealed Skill 网关对
 非空 `provider_tools` 的 `runs.start` 回 `invalid params`(SEALED_SKILL_PROTOCOL §3.4)。
+日期与时区(issue #276):`Options.inject_user_context` 是 CLI 的首条 user-context 消息,总带会话
+开始那天的日期与时区(`core.time_context`,不再依赖 CLAUDE.md/记忆/KG 是否存在);
+`Options.time_announcer` 非 null 时,本地日期晚于模型能看到的日期的第一个 run 在本轮输入之后
+追加一条"The date has changed"提示,随这一轮进入历史,系统提示词与首条消息字节不动;提示被压缩、
+裁剪或清掉后会再给一次。AgentCore 不用它,而是把日期作为每个 Run 的 `currentDate` context block。
+Session 目标(issue #277):`Options.goal_meter` 非 null 时,run 开始时目标为 active 才计账,
+每个 provider 响应(含自动压缩)累加非缓存输入 + 输出,run 结束(任何退出路径,含错误)累加
+耗时并发 `goal_updated`;中途用完预算则目标转 `budget_limited`、立即发 `goal_updated`,并在下一
+回合边界追加一次收尾提醒(不截断 run)。嵌套 run 共用同一 Meter 时只按最外层计一次。
+子 agent(`subagent.SpawnOptions.goal_meter` 默认 null)不计;只有作为 Run 本身、在 Run 线程上
+同步执行的子循环(AgentCore 自带上下文的 Skill 调用 Run)才传入 Meter——可能与其他工具并行的
+子循环共用 Meter 会产生数据竞争。规则在
+`core.goal`;CLI 的 App、`AgentSession` 各持一个 Meter,所以 REPL/web/daemon/headless/AgentCore
+同口径计账。
 
 **一回合做什么**:流式发当前 conversation → 收集 assistant 文本 + tool_use blocks(经 backend
 emit `text_chunk`/`tool_start`)→ 按权限决策 + 并发安全分批执行工具(`tool_exec.executeSlots`)→
@@ -512,8 +526,10 @@ envelope（`rows/cursor/total/truncated`）；其余超限 inline 结果写入 S
 投影；`ReadArtifact` 从首个请求就属于冻结工具目录，避免因溢出动态改 schema 而破坏 prompt cache。
 图像形态结果（`Read` 读图返回的 `{"type":"image",...}`，`result_projection.isImageResult`）豁免两轮投影：
 vision 路由的方言原生消费它（image block / data URL / inlineData），非 vision 路由收到有界占位文本
-（能力真相 = provider `/v1/models` 目录的 `image_input` 声明覆盖 `model_adapter.knownVisionFamily` 家族表，
-见 `Client.dialectFor`；`Read` 在执行期按 `ToolContext.image_input_supported` 先门控——活动模型收不了图就
+（能力真相三层,强者在前:Host 声明(`SessionConfig.model_capabilities`)> provider `/v1/models` 目录的
+`image_input` 声明 > `model_adapter.familyImageInput` 家族表;都没说 = `image_input_source == .unknown`,
+按不支持拒绝(issue #273)。三个 client 的 `dialectFor` 都经 `Dialect.declareImageInput` 叠加,
+`Provider.imageInput` 连同来源一起答;`Read` 在执行期按 `ToolContext.image_input_supported` 先门控——活动模型收不了图就
 返回 `capability_unsupported` 错误并点名目录里能看图的模型，图片根本不进历史；占位文本只剩给读后换模型 /
 fail-closed 方言这类序列化期才发现的情况），
 信封只会把图片变成 base64 预览文本；轮预算按 `IMAGE_RESULT_BUDGET_BYTES`（= `IMAGE_TOKEN_ESTIMATE` × 4

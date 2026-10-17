@@ -12,6 +12,7 @@
 
 const std = @import("std");
 const cc = @import("cc");
+const harness = @import("harness");
 const ppaths = @import("platform").paths;
 
 const session_service = cc.session_service;
@@ -314,4 +315,55 @@ test "#219: a main session handed off with Ctrl+B stays in the new foreground's 
     // The switcher's stop reaches it through the same scope.
     try reg.abortInScope(shown[0].id, app.agentJobScope());
     try std.testing.expect(reg.entries.items[0].abort.isAborted());
+}
+
+const GOAL_FINAL_SSE =
+    "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":7,\"output_tokens\":1}}}\n\n" ++
+    "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n" ++
+    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}\n\n" ++
+    "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n" ++
+    "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":2}}\n\n" ++
+    "data: {\"type\":\"message_stop\"}\n\n";
+
+test "L2 goal (issue #277): every CLI Run charges the App's goal and goal.json follows" {
+    const a = std.testing.allocator;
+    var fx: AppFixture = undefined;
+    try fx.setup();
+    defer fx.deinit();
+    const app = fx.app;
+    const meter = if (app.goal_meter) |*m| m else return error.MissingGoalMeter;
+
+    // REPL, web, daemon and forked Skills build their Options canonically;
+    // headless builds its own. Both carry the App's Meter and date announcer.
+    const canonical = session_service.buildRunOptions(app, null);
+    const headless = cc.repl_headless.buildOptions(app, null, null, null, false, null, null, null);
+    try std.testing.expect(canonical.goal_meter == meter);
+    try std.testing.expect(headless.goal_meter == meter);
+    try std.testing.expect(canonical.time_announcer != null and canonical.time_announcer == headless.time_announcer);
+
+    try app.goal_state.setNew("ship it", null);
+    app.persistGoal();
+    var srv = try harness.MockServer.startCassette(&.{GOAL_FINAL_SSE}, 0);
+    defer srv.stop();
+    const url = try srv.urlOwned(a);
+    defer a.free(url);
+    // The App's allocator throughout, as the REPL uses it: the Run's records
+    // join the App's Conversation.
+    var client = cc.client_mod.Client.initWithBaseUrl(app.allocator, fx.io_rt.io(), "key", "model", url);
+    defer client.deinit();
+    try app.conversation.appendText(.user, "work on the goal");
+    var render = cc.writer_backend.WriterBackend.initNull();
+    const be = render.backend();
+    var options = canonical;
+    options.max_turns = 1;
+    const result = try cc.agent_loop.run(&app.conversation, client.provider(), &.{}, &app.permission_ctx, options, &be, app.allocator);
+    try std.testing.expectEqual(cc.agent_loop.StopReason.end_turn, result.stop_reason);
+    const charged = app.goal_state.current.?.tokens_used;
+    try std.testing.expect(charged > 0);
+
+    // The Meter's observer wrote goal.json when the Run settled.
+    var loaded = cc.core_goal.State.init(a);
+    defer loaded.deinit();
+    try loaded.loadFromDir(app.sessionDir() orelse return error.NoSessionDir);
+    try std.testing.expectEqual(charged, loaded.current.?.tokens_used);
 }

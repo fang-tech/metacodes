@@ -689,3 +689,50 @@ test "L2 AgentSession Bash 子进程 cwd 绑 workspace.root(缺陷 B 回归)" {
     const body = (srv.lastRequest() orelse return error.NoRequestCaptured).body();
     try std.testing.expect(std.mem.count(u8, body, root_basename) >= 2);
 }
+
+test "L2 AgentSession.setModel keeps the route's auth scheme and the Host's image-input declarations (issue #273)" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buf);
+    const root = root_buf[0..root_len];
+    var server = try harness.MockServer.startCassette(&.{ FINAL_SSE, FINAL_SSE }, 0);
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+
+    const host = try cc.agent_session.RuntimeHost.create(a, .{ .core_profile = .minimal });
+    defer host.destroy() catch unreachable;
+    const session = try host.createSession(.{
+        .provider_kind = .anthropic,
+        .auth_scheme = .{ .api_key_header = "x-api-key" },
+        .api_key = "test-key",
+        .model = "test-model",
+        .base_url = url,
+        .permission_mode = .bypass_permissions,
+        .workspace = .{ .root = root, .shell = .disabled },
+        .allowed_tools = &.{"Read"},
+        .model_capabilities = &.{.{ .model = "vendor-vision-3", .image_input = true }},
+    });
+    defer session.destroy() catch unreachable;
+    const before = session.provider.provider().imageInput(null);
+    try std.testing.expect(!before.supported);
+    try std.testing.expectEqual(cc.image_capability.Source.unknown, before.source);
+
+    try session.setModel("vendor-vision-3");
+    // The replacement provider carries the Host's declaration...
+    const after = session.provider.provider().imageInput(null);
+    try std.testing.expect(after.supported);
+    try std.testing.expectEqual(cc.image_capability.Source.host, after.source);
+
+    // ...and the route's authentication: before the fix a model switch fell
+    // back to `authorization: Bearer` on an `x-api-key` endpoint.
+    var sink_state: u8 = 0;
+    const result = try session.runText(1, "after the model switch", 1, .{ .ctx = &sink_state, .emit = Sink.emit });
+    try std.testing.expectEqual(cc.agent_loop.StopReason.end_turn, result.stop_reason);
+    const request = server.lastRequest() orelse return error.MissingRequest;
+    try std.testing.expect(std.mem.indexOf(u8, request.raw, "x-api-key: test-key") != null);
+    try std.testing.expect(std.ascii.indexOfIgnoreCase(request.raw, "authorization: Bearer") == null);
+    try std.testing.expect(std.mem.indexOf(u8, request.body(), "\"model\":\"vendor-vision-3\"") != null);
+}

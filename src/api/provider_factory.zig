@@ -18,6 +18,7 @@ const types = @import("../types.zig");
 const dialect_mod = @import("dialect.zig");
 const auth_header_mod = @import("auth_header.zig");
 const limits_mod = @import("model_limits.zig");
+const image_capability = @import("image_capability.zig");
 
 /// 三选一具体 client。tagged union(ProviderKind)→ "kind 说 X 但字段 null" 的非法态
 /// 编译期不可表示(遵 CLAUDE.md "Make Illegal States Unrepresentable")。
@@ -111,6 +112,10 @@ pub const Options = struct {
     /// 正文阶段流空闲上限的平覆盖(毫秒;见 client.zig bodyIdleLimitMs)。null = 各 client 自己
     /// 从 env 取,未设则按 max_tokens 自动;测试用小值让正文阶段 stall 秒级可复现。
     stream_body_idle_timeout_ms: ?u64 = null,
+    /// Host declarations about models' image input (issue #273), already
+    /// validated and borrowed; each client keeps its own copy. They outrank
+    /// the catalog and the family table.
+    capability_declarations: image_capability.Declarations = .{},
 };
 
 /// Runtime-scoped provider construction. The resolver is a borrowed immutable
@@ -165,32 +170,39 @@ pub fn makeProviderWithOptions(
                 c.model_context = limits.model_context;
                 c.max_tokens_override = limits.max_tokens_override;
             }
+            c.host_capabilities = try options.capability_declarations.clone(a);
             break :blk .{ .anthropic = c };
         },
         .openai => blk: {
             const c = try a.create(openai_mod.OpenAIClient);
-            // No fallible work follows this allocation, so no errdefer is needed.
+            errdefer a.destroy(c);
             c.* = openai_mod.OpenAIClient.init(a, io_rt.io(), api_key, model, base_url);
+            errdefer c.deinit();
             c.protocol = openai_protocol;
             c.dialect_resolver = dialect_resolver;
             c.auth_scheme = options.auth_scheme;
             if (options.stream_idle_timeout_ms) |idle| c.stream_idle_timeout_ms = idle;
             if (options.stream_body_idle_timeout_ms) |idle| c.stream_body_idle_timeout_ms = idle;
             if (options.limits) |limits| {
+                if (limits.catalog) |catalog| c.catalog = try catalog.clone(a);
                 c.model_context = limits.model_context;
             }
+            c.host_capabilities = try options.capability_declarations.clone(a);
             break :blk .{ .openai = c };
         },
         .gemini => blk: {
             const c = try a.create(gemini_mod.GeminiClient);
-            // No fallible work follows this allocation, so no errdefer is needed.
+            errdefer a.destroy(c);
             c.* = gemini_mod.GeminiClient.init(a, io_rt.io(), api_key, model, base_url);
+            errdefer c.deinit();
             c.dialect_resolver = dialect_resolver;
             if (options.stream_idle_timeout_ms) |idle| c.stream_idle_timeout_ms = idle;
             if (options.stream_body_idle_timeout_ms) |idle| c.stream_body_idle_timeout_ms = idle;
             if (options.limits) |limits| {
+                if (limits.catalog) |catalog| c.catalog = try catalog.clone(a);
                 c.model_context = limits.model_context;
             }
+            c.host_capabilities = try options.capability_declarations.clone(a);
             break :blk .{ .gemini = c };
         },
     };

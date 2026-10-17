@@ -855,6 +855,28 @@ const PublicSessionFixture = struct {
             wire.RUN_JOURNAL_EPHEMERAL,
             provider_kind_code,
             protocol_kind_code,
+            &.{},
+        );
+    }
+
+    /// Revision 21: a Session whose Host declares `capabilities`.
+    fn initCapabilities(
+        root: []const u8,
+        base_url: []const u8,
+        model: []const u8,
+        provider_kind_code: u32,
+        protocol_kind_code: u32,
+        capabilities: []const wire.ModelCapabilityV1,
+    ) !PublicSessionFixture {
+        return initProviderConfigured(
+            root,
+            base_url,
+            model,
+            null,
+            wire.RUN_JOURNAL_EPHEMERAL,
+            provider_kind_code,
+            protocol_kind_code,
+            capabilities,
         );
     }
 
@@ -873,6 +895,7 @@ const PublicSessionFixture = struct {
             run_journal_mode_code,
             wire.PROVIDER_ANTHROPIC,
             wire.PROTOCOL_DEFAULT,
+            &.{},
         );
     }
 
@@ -884,6 +907,56 @@ const PublicSessionFixture = struct {
         run_journal_mode_code: u32,
         provider_kind_code: u32,
         protocol_kind_code: u32,
+        capabilities: []const wire.ModelCapabilityV1,
+    ) !PublicSessionFixture {
+        return initObservedProviderConfigured(
+            root,
+            base_url,
+            model,
+            budget,
+            run_journal_mode_code,
+            provider_kind_code,
+            protocol_kind_code,
+            capabilities,
+            null,
+            acceptEvent,
+        );
+    }
+
+    /// A Session whose events go to `on_event` with `ctx`.
+    fn initObserved(
+        root: []const u8,
+        base_url: []const u8,
+        model: []const u8,
+        budget: ?*const wire.DurableBudgetProfileV1,
+        ctx: *anyopaque,
+        on_event: wire.OnEventFnV1,
+    ) !PublicSessionFixture {
+        return initObservedProviderConfigured(
+            root,
+            base_url,
+            model,
+            budget,
+            wire.RUN_JOURNAL_EPHEMERAL,
+            wire.PROVIDER_ANTHROPIC,
+            wire.PROTOCOL_DEFAULT,
+            &.{},
+            ctx,
+            on_event,
+        );
+    }
+
+    fn initObservedProviderConfigured(
+        root: []const u8,
+        base_url: []const u8,
+        model: []const u8,
+        budget: ?*const wire.DurableBudgetProfileV1,
+        run_journal_mode_code: u32,
+        provider_kind_code: u32,
+        protocol_kind_code: u32,
+        capabilities: []const wire.ModelCapabilityV1,
+        event_ctx: ?*anyopaque,
+        on_event: wire.OnEventFnV1,
     ) !PublicSessionFixture {
         const raw_api = abi.metask_agentcore_get_api(wire.ABI_VERSION_V1) orelse
             return error.MissingApi;
@@ -911,10 +984,15 @@ const PublicSessionFixture = struct {
         host_config.durable_budget = budget;
         host_config.run_journal_mode_code = run_journal_mode_code;
         host_config.protocol_kind_code = protocol_kind_code;
+        if (capabilities.len != 0) {
+            host_config.model_capabilities = capabilities.ptr;
+            host_config.model_capability_count = capabilities.len;
+        }
         var session_config = sessionCreateConfig(&host_config, model);
         var callbacks = std.mem.zeroes(wire.SessionCallbacksV1);
         callbacks.struct_size = @sizeOf(wire.SessionCallbacksV1);
-        callbacks.on_event = acceptEvent;
+        callbacks.ctx = event_ctx;
+        callbacks.on_event = on_event;
         try std.testing.expectEqual(
             wire.STATUS_OK,
             self.api.session().create()(
@@ -3978,7 +4056,7 @@ test "L2 public MCP checkpoint restore facade preserves Conversation under narro
 
     var abi_revision_bytes: [4]u8 = undefined;
     @memcpy(&abi_revision_bytes, checkpoint.bytes.items[20..24]);
-    try std.testing.expectEqual(@as(u32, 20), wire.ABI_REVISION);
+    try std.testing.expectEqual(@as(u32, 23), wire.ABI_REVISION);
     // A Session without a prompt profile keeps the marker-8 envelope across
     // ABI revisions; the marker is independent of the table revision.
     try std.testing.expectEqual(
@@ -6717,7 +6795,9 @@ test "L2 opaque ABI routes Host callbacks and enforces Run admission identifiers
         .durable_budget = null,
         .run_journal_mode_code = wire.RUN_JOURNAL_EPHEMERAL,
         .protocol_kind_code = wire.PROTOCOL_DEFAULT,
-        .reserved = [_]u64{0} ** 3,
+        .model_capabilities = null,
+        .model_capability_count = 0,
+        .reserved = [_]u64{0} ** 1,
     };
     var session_config = sessionCreateConfig(&host_config, "test-model");
     var callbacks = wire.SessionCallbacksV1{
@@ -6738,7 +6818,7 @@ test "L2 opaque ABI routes Host callbacks and enforces Run admission identifiers
     try std.testing.expectEqual(wire.STATUS_BUSY, api.runtime().destroy()(runtime, &diagnostic));
     api.bufferRelease()(&diagnostic);
 
-    var options = wire.RunOptionsV1{ .struct_size = @sizeOf(wire.RunOptionsV1), .max_turns = 5, .context_blocks = null, .context_block_count = 0, .reserved = [_]u64{0} ** 2 };
+    var options = wire.RunOptionsV1{ .struct_size = @sizeOf(wire.RunOptionsV1), .max_turns = 5, .context_blocks = null, .context_block_count = 0, .time_context_code = wire.TIME_CONTEXT_SYSTEM, .utc_offset_minutes = 0, .reserved = [_]u64{0} ** 1 };
     var result: wire.RunResultV1 = undefined;
     try std.testing.expectEqual(wire.STATUS_INVALID_ARGUMENT, api.session().abort()(session, 0, wire.ABORT_USER_REQUEST, &diagnostic));
     api.bufferRelease()(&diagnostic);
@@ -6875,7 +6955,7 @@ test "L2 facade gate covers the core-idle epilogue until sessionRun returns" {
         diagnostic: wire.OwnedBytesV1 = .{ .ptr = null, .len = 0 },
 
         fn run(self: *@This()) void {
-            var options = wire.RunOptionsV1{ .struct_size = @sizeOf(wire.RunOptionsV1), .max_turns = 1, .context_blocks = null, .context_block_count = 0, .reserved = [_]u64{0} ** 2 };
+            var options = wire.RunOptionsV1{ .struct_size = @sizeOf(wire.RunOptionsV1), .max_turns = 1, .context_blocks = null, .context_block_count = 0, .time_context_code = wire.TIME_CONTEXT_SYSTEM, .utc_offset_minutes = 0, .reserved = [_]u64{0} ** 1 };
             self.status = self.api.session().runText(self.session, 1, sdk.bytesView("pause in facade epilogue"), &options, &self.result, &self.diagnostic);
         }
     };
@@ -6935,7 +7015,7 @@ test "L2 facade gate covers the core-idle epilogue until sessionRun returns" {
     try std.testing.expectEqual(@as(u64, 1), barrier.seen_run_id.load(.acquire));
 
     var competing_result: wire.RunResultV1 = undefined;
-    var options = wire.RunOptionsV1{ .struct_size = @sizeOf(wire.RunOptionsV1), .max_turns = 1, .context_blocks = null, .context_block_count = 0, .reserved = [_]u64{0} ** 2 };
+    var options = wire.RunOptionsV1{ .struct_size = @sizeOf(wire.RunOptionsV1), .max_turns = 1, .context_blocks = null, .context_block_count = 0, .time_context_code = wire.TIME_CONTEXT_SYSTEM, .utc_offset_minutes = 0, .reserved = [_]u64{0} ** 1 };
     try std.testing.expectEqual(
         wire.STATUS_BUSY,
         api.session().runText(session, 2, sdk.bytesView("must not enter during epilogue"), &options, &competing_result, &diagnostic),
@@ -7106,7 +7186,7 @@ test "L2 invalid UTF-8 Host tool result is released and does not poison Session"
         if (session) |handle| _ = api.session().destroy()(handle, &diagnostic);
     }
 
-    var options = wire.RunOptionsV1{ .struct_size = @sizeOf(wire.RunOptionsV1), .max_turns = 4, .context_blocks = null, .context_block_count = 0, .reserved = [_]u64{0} ** 2 };
+    var options = wire.RunOptionsV1{ .struct_size = @sizeOf(wire.RunOptionsV1), .max_turns = 4, .context_blocks = null, .context_block_count = 0, .time_context_code = wire.TIME_CONTEXT_SYSTEM, .utc_offset_minutes = 0, .reserved = [_]u64{0} ** 1 };
     var result: wire.RunResultV1 = undefined;
     try std.testing.expectEqual(wire.STATUS_OK, api.session().runText(session, 1, sdk.bytesView("invoke failing host"), &options, &result, &diagnostic));
     try std.testing.expectEqual(wire.STOP_END_TURN, result.stop_reason_code);
@@ -7246,7 +7326,9 @@ test "L2 Revision 12 public Host stream callback spools byte zero and returns a 
         .max_turns = 4,
         .context_blocks = null,
         .context_block_count = 0,
-        .reserved = [_]u64{0} ** 2,
+        .time_context_code = wire.TIME_CONTEXT_SYSTEM,
+        .utc_offset_minutes = 0,
+        .reserved = [_]u64{0} ** 1,
     };
     var result: wire.RunResultV1 = undefined;
     try std.testing.expectEqual(wire.STATUS_OK, api.session().runText(
@@ -7385,7 +7467,9 @@ test "L2 Revision 12 Host stream failure rolls back partial bytes and releases d
         .max_turns = 4,
         .context_blocks = null,
         .context_block_count = 0,
-        .reserved = [_]u64{0} ** 2,
+        .time_context_code = wire.TIME_CONTEXT_SYSTEM,
+        .utc_offset_minutes = 0,
+        .reserved = [_]u64{0} ** 1,
     };
     var result: wire.RunResultV1 = undefined;
     try std.testing.expectEqual(wire.STATUS_OK, api.session().runText(
@@ -7530,7 +7614,7 @@ test "L2 Event callback fatal aborts the Run and poisons the ABI Session" {
         if (session) |handle| _ = api.session().destroy()(handle, &diagnostic);
     }
 
-    var options = wire.RunOptionsV1{ .struct_size = @sizeOf(wire.RunOptionsV1), .max_turns = 2, .context_blocks = null, .context_block_count = 0, .reserved = [_]u64{0} ** 2 };
+    var options = wire.RunOptionsV1{ .struct_size = @sizeOf(wire.RunOptionsV1), .max_turns = 2, .context_blocks = null, .context_block_count = 0, .time_context_code = wire.TIME_CONTEXT_SYSTEM, .utc_offset_minutes = 0, .reserved = [_]u64{0} ** 1 };
     var result: wire.RunResultV1 = undefined;
     try std.testing.expectEqual(
         wire.STATUS_CALLBACK_FAILED,
@@ -7596,7 +7680,7 @@ test "L2 Event callback may cooperatively abort without poisoning the ABI Sessio
         if (session) |handle| _ = api.session().destroy()(handle, &diagnostic);
     }
 
-    var options = wire.RunOptionsV1{ .struct_size = @sizeOf(wire.RunOptionsV1), .max_turns = 2, .context_blocks = null, .context_block_count = 0, .reserved = [_]u64{0} ** 2 };
+    var options = wire.RunOptionsV1{ .struct_size = @sizeOf(wire.RunOptionsV1), .max_turns = 2, .context_blocks = null, .context_block_count = 0, .time_context_code = wire.TIME_CONTEXT_SYSTEM, .utc_offset_minutes = 0, .reserved = [_]u64{0} ** 1 };
     var result: wire.RunResultV1 = undefined;
     try std.testing.expectEqual(
         wire.STATUS_OK,
@@ -7675,7 +7759,7 @@ fn expectUiOutcome(mode: UiFailureMode, expected_releases: usize, expected_statu
         if (session) |handle| _ = api.session().destroy()(handle, &diagnostic);
     }
 
-    var options = wire.RunOptionsV1{ .struct_size = @sizeOf(wire.RunOptionsV1), .max_turns = 2, .context_blocks = null, .context_block_count = 0, .reserved = [_]u64{0} ** 2 };
+    var options = wire.RunOptionsV1{ .struct_size = @sizeOf(wire.RunOptionsV1), .max_turns = 2, .context_blocks = null, .context_block_count = 0, .time_context_code = wire.TIME_CONTEXT_SYSTEM, .utc_offset_minutes = 0, .reserved = [_]u64{0} ** 1 };
     var result: wire.RunResultV1 = undefined;
     try std.testing.expectEqual(expected_status, api.session().runText(session, 1, sdk.bytesView("ask through Host UI"), &options, &result, &diagnostic));
     try std.testing.expectEqual(@as(usize, 1), probe.calls);
@@ -8456,7 +8540,7 @@ test "L2 Revision 15 multimodal Run carries ordered image parts into the provide
     }
 }
 
-test "L2 Revision 15 image capability preflight rejects before any Provider request and keeps the Run id reusable" {
+test "L2 Revision 15 image capability preflight rejects before any Provider request and keeps the Run id reusable (unknown since Revision 21)" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -8467,7 +8551,8 @@ test "L2 Revision 15 image capability preflight rejects before any Provider requ
     const url = try server.urlOwned(a);
     defer a.free(url);
 
-    // "test-model" has no vision capability under the Anthropic profile.
+    // Nothing - no Host declaration, catalog, or model family - says
+    // "test-model" takes images: refused as unknown, not as unsupported.
     var fixture = try PublicSessionFixture.init(root, url, "test-model");
     defer fixture.deinit();
 
@@ -8477,11 +8562,14 @@ test "L2 Revision 15 image capability preflight rejects before any Provider requ
     };
     var result = std.mem.zeroes(wire.RunResultV1);
     try std.testing.expectEqual(
-        wire.STATUS_IMAGE_INPUT_UNSUPPORTED,
+        wire.STATUS_IMAGE_INPUT_CAPABILITY_UNKNOWN,
         submitMultimodal(&fixture, 1, &with_image, &result),
     );
+    const refusal = try sdk.borrowedBytes(.{ .ptr = fixture.diagnostic.ptr, .len = fixture.diagnostic.len });
+    try std.testing.expect(std.mem.indexOf(u8, refusal, "model_capabilities") != null);
     fixture.releaseDiagnostic();
     try std.testing.expectEqual(@as(usize, 0), server.requestCount());
+    try expectImageInputDescription(&fixture, false, .unknown);
 
     // Text-only multimodal input needs no image capability, and the rejected
     // Run was never admitted, so the same Run id remains usable.
@@ -8531,6 +8619,271 @@ test "L2 Revision 15 image preflight admits a non-Claude vision model on the Ant
     try std.testing.expect(std.mem.indexOf(u8, body, "\"type\":\"image\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"media_type\":\"image/png\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "UE5HREFUQQ==") != null);
+}
+
+fn modelCapability(model: []const u8, image_input_code: u32) wire.ModelCapabilityV1 {
+    return .{
+        .struct_size = @sizeOf(wire.ModelCapabilityV1),
+        .image_input_code = image_input_code,
+        .model = sdk.bytesView(model),
+        .reserved = [_]u64{0} ** 2,
+    };
+}
+
+/// The Session description's typed `image_input`, through the SDK decoder.
+fn expectImageInputDescription(
+    fixture: *PublicSessionFixture,
+    supported: bool,
+    source: sdk.protocol.ImageInputSource,
+) !void {
+    var description = std.mem.zeroes(wire.OwnedBytesV1);
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        fixture.api.sessionControl().describe()(fixture.session, &description, &fixture.diagnostic),
+    );
+    defer fixture.api.bufferRelease()(&description);
+    const json = try sdk.borrowedBytes(.{ .ptr = description.ptr, .len = description.len });
+    var parsed = try sdk.protocol.decodeSessionDescription(std.testing.allocator, json);
+    defer parsed.deinit();
+    try std.testing.expectEqual(supported, parsed.value.image_input.supported);
+    try std.testing.expectEqual(source, parsed.value.image_input.source);
+}
+
+const ISSUE_273_IMAGE = "SVNTVUUtMjczLUlNQUdF";
+
+test "L2 Revision 21 a Host declaration admits a model no family knows, and the provider receives the whole image (issue #273)" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try rootPath(&tmp, &root_buffer);
+    var server = try harness.MockServer.startCassette(&.{FINAL_SSE}, 0);
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+
+    // The name is in no built-in family; only the Host knows its route takes
+    // images. AgentCore itself is not changed to admit it.
+    const capabilities = [_]wire.ModelCapabilityV1{modelCapability("Vendor-Vision-1", wire.CAPABILITY_SUPPORTED)};
+    var fixture = try PublicSessionFixture.initCapabilities(root, url, "vendor-vision-1", wire.PROVIDER_ANTHROPIC, wire.PROTOCOL_DEFAULT, &capabilities);
+    defer fixture.deinit();
+    try expectImageInputDescription(&fixture, true, .host);
+
+    const with_image = [_]wire.RunInputPartV1{
+        sdk.textPart("describe this"),
+        sdk.imagePart("image/png", ISSUE_273_IMAGE),
+    };
+    var result = std.mem.zeroes(wire.RunResultV1);
+    try std.testing.expectEqual(wire.STATUS_OK, submitMultimodal(&fixture, 1, &with_image, &result));
+    try std.testing.expectEqual(wire.STOP_END_TURN, result.stop_reason_code);
+    try std.testing.expectEqual(@as(usize, 1), server.requestCount());
+    // The image travels as an image block: not dropped, not text.
+    const body = (server.lastRequest() orelse return error.MissingRequest).body();
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"type\":\"image\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"media_type\":\"image/png\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, ISSUE_273_IMAGE) != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "was read successfully but omitted") == null);
+}
+
+test "L2 Revision 21 a Host 'unsupported' outranks the model family, and a known text family is unsupported, not unknown (issue #273)" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try rootPath(&tmp, &root_buffer);
+    var server = try harness.MockServer.startCassette(&.{FINAL_SSE}, 0);
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+    const with_image = [_]wire.RunInputPartV1{
+        sdk.textPart("describe this"),
+        sdk.imagePart("image/png", ISSUE_273_IMAGE),
+    };
+    var result = std.mem.zeroes(wire.RunResultV1);
+
+    // The family table says Claude takes images; this Host's route does not.
+    const capabilities = [_]wire.ModelCapabilityV1{modelCapability("claude-sonnet-4-6", wire.CAPABILITY_UNSUPPORTED)};
+    var declared = try PublicSessionFixture.initCapabilities(root, url, "claude-sonnet-4-6", wire.PROVIDER_ANTHROPIC, wire.PROTOCOL_DEFAULT, &capabilities);
+    defer declared.deinit();
+    try std.testing.expectEqual(wire.STATUS_IMAGE_INPUT_UNSUPPORTED, submitMultimodal(&declared, 1, &with_image, &result));
+    const by_host = try sdk.borrowedBytes(.{ .ptr = declared.diagnostic.ptr, .len = declared.diagnostic.len });
+    try std.testing.expect(std.mem.indexOf(u8, by_host, "declared by the Host") != null);
+    declared.releaseDiagnostic();
+    try expectImageInputDescription(&declared, false, .host);
+
+    // A family the table knows to be text-only answers "unsupported" itself.
+    var family = try PublicSessionFixture.init(root, url, "claude-2.1");
+    defer family.deinit();
+    try std.testing.expectEqual(wire.STATUS_IMAGE_INPUT_UNSUPPORTED, submitMultimodal(&family, 1, &with_image, &result));
+    family.releaseDiagnostic();
+    try expectImageInputDescription(&family, false, .model_family);
+
+    try std.testing.expectEqual(@as(usize, 0), server.requestCount());
+}
+
+test "L2 Revision 21 a remote that rejects a declared image is a provider error after the image was sent (issue #273)" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try rootPath(&tmp, &root_buffer);
+    var server = try harness.MockServer.startRepeatingStatus(
+        "{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"this model does not accept images\"}}",
+        "HTTP/1.1 400 Bad Request",
+        "",
+    );
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+
+    // The Host said yes and was wrong: the refusal is the provider's, carried
+    // by the Run's stop reason, never re-labelled as a local capability status.
+    const capabilities = [_]wire.ModelCapabilityV1{modelCapability("vendor-vision-1", wire.CAPABILITY_SUPPORTED)};
+    var fixture = try PublicSessionFixture.initCapabilities(root, url, "vendor-vision-1", wire.PROVIDER_ANTHROPIC, wire.PROTOCOL_DEFAULT, &capabilities);
+    defer fixture.deinit();
+    const with_image = [_]wire.RunInputPartV1{
+        sdk.textPart("describe this"),
+        sdk.imagePart("image/png", ISSUE_273_IMAGE),
+    };
+    var result = std.mem.zeroes(wire.RunResultV1);
+    try std.testing.expectEqual(wire.STATUS_OK, submitMultimodal(&fixture, 1, &with_image, &result));
+    try std.testing.expectEqual(wire.STOP_API_ERROR, result.stop_reason_code);
+    try std.testing.expect(server.requestCount() >= 1);
+    const body = (server.lastRequest() orelse return error.MissingRequest).body();
+    try std.testing.expect(std.mem.indexOf(u8, body, ISSUE_273_IMAGE) != null);
+}
+
+test "L2 Revision 21 MiniMax-M3 takes images over the OpenAI Chat Completions route without a declaration (issue #273)" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try rootPath(&tmp, &root_buffer);
+    var server = try harness.MockServer.startCassette(&.{OPENAI_FINAL_SSE}, 0);
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+
+    var fixture = try PublicSessionFixture.initProvider(root, url, "MiniMax-M3", wire.PROVIDER_OPENAI, wire.PROTOCOL_DEFAULT);
+    defer fixture.deinit();
+    try expectImageInputDescription(&fixture, true, .model_family);
+    const with_image = [_]wire.RunInputPartV1{
+        sdk.textPart("describe this"),
+        sdk.imagePart("image/png", ISSUE_273_IMAGE),
+    };
+    var result = std.mem.zeroes(wire.RunResultV1);
+    try std.testing.expectEqual(wire.STATUS_OK, submitMultimodal(&fixture, 1, &with_image, &result));
+    try std.testing.expectEqual(wire.STOP_END_TURN, result.stop_reason_code);
+    const body = (server.lastRequest() orelse return error.MissingRequest).body();
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"image_url\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "data:image/png;base64," ++ ISSUE_273_IMAGE) != null);
+}
+
+test "L2 Revision 21 set_model keeps the Host's declarations, and an OpenAI route honours them (issue #273)" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try rootPath(&tmp, &root_buffer);
+    var server = try harness.MockServer.startCassette(&.{OPENAI_FINAL_SSE}, 0);
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+
+    const capabilities = [_]wire.ModelCapabilityV1{modelCapability("vendor-vision-2", wire.CAPABILITY_SUPPORTED)};
+    var fixture = try PublicSessionFixture.initCapabilities(root, url, "vendor-text-1", wire.PROVIDER_OPENAI, wire.PROTOCOL_DEFAULT, &capabilities);
+    defer fixture.deinit();
+    const with_image = [_]wire.RunInputPartV1{
+        sdk.textPart("describe this"),
+        sdk.imagePart("image/png", ISSUE_273_IMAGE),
+    };
+    var result = std.mem.zeroes(wire.RunResultV1);
+    // The Session's own model is undeclared and unknown.
+    try std.testing.expectEqual(wire.STATUS_IMAGE_INPUT_CAPABILITY_UNKNOWN, submitMultimodal(&fixture, 1, &with_image, &result));
+    fixture.releaseDiagnostic();
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        fixture.api.sessionControl().setModel()(fixture.session, sdk.bytesView("vendor-vision-2"), &fixture.diagnostic),
+    );
+    try expectImageInputDescription(&fixture, true, .host);
+    try std.testing.expectEqual(wire.STATUS_OK, submitMultimodal(&fixture, 1, &with_image, &result));
+    try std.testing.expectEqual(wire.STOP_END_TURN, result.stop_reason_code);
+    const body = (server.lastRequest() orelse return error.MissingRequest).body();
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"model\":\"vendor-vision-2\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "data:image/png;base64," ++ ISSUE_273_IMAGE) != null);
+}
+
+test "Revision 21 Host capability declarations are validated before a Session exists" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try rootPath(&tmp, &root_buffer);
+    const raw_api = abi.metask_agentcore_get_api(wire.ABI_VERSION_V1) orelse return error.MissingApi;
+    const api = try sdk.Api.validate(@ptrCast(@alignCast(raw_api)));
+    var runtime: ?*wire.RuntimeHandle = null;
+    var diagnostic = std.mem.zeroes(wire.OwnedBytesV1);
+    var runtime_config = std.mem.zeroes(wire.RuntimeConfigV1);
+    runtime_config.struct_size = @sizeOf(wire.RuntimeConfigV1);
+    try std.testing.expectEqual(wire.STATUS_OK, api.runtime().create()(&runtime_config, null, &runtime, &diagnostic));
+    defer _ = api.runtime().destroy()(runtime, &diagnostic);
+
+    var host = std.mem.zeroes(wire.SessionHostConfigV1);
+    host.struct_size = @sizeOf(wire.SessionHostConfigV1);
+    host.provider_kind_code = wire.PROVIDER_ANTHROPIC;
+    host.permission_mode_code = wire.PERMISSION_FULL_ACCESS;
+    host.shell_policy_code = wire.SHELL_DISABLED;
+    host.api_key = sdk.bytesView("test-key");
+    host.base_url = sdk.bytesView("http://127.0.0.1:1");
+    host.workspace_root = sdk.bytesView(root);
+    host.workspace_home = sdk.bytesView(root);
+    var callbacks = std.mem.zeroes(wire.SessionCallbacksV1);
+    callbacks.struct_size = @sizeOf(wire.SessionCallbacksV1);
+    callbacks.on_event = acceptEvent;
+    var config = sessionCreateConfig(&host, "test-model");
+
+    const Case = struct { entries: []const wire.ModelCapabilityV1, pointer: bool = true, count: ?u64 = null, status: u32 };
+    const long_name = "m" ** (wire.MAX_MODEL_CAPABILITY_MODEL_BYTES_V1 + 1);
+    var with_reserved = modelCapability("m", wire.CAPABILITY_SUPPORTED);
+    with_reserved.reserved[1] = 1;
+    var short_struct = modelCapability("m", wire.CAPABILITY_SUPPORTED);
+    short_struct.struct_size -= 8;
+    var many: [wire.MAX_MODEL_CAPABILITIES_V1 + 1]wire.ModelCapabilityV1 = undefined;
+    var many_names: [wire.MAX_MODEL_CAPABILITIES_V1 + 1][8]u8 = undefined;
+    for (&many, &many_names, 0..) |*entry, *name, i| {
+        const printed = try std.fmt.bufPrint(name, "m{d}", .{i});
+        entry.* = modelCapability(printed, wire.CAPABILITY_SUPPORTED);
+    }
+    const one = [_]wire.ModelCapabilityV1{modelCapability("m", wire.CAPABILITY_SUPPORTED)};
+    const cases = [_]Case{
+        // Same model twice, ignoring case: ambiguous, never resolved by order.
+        .{ .entries = &.{ modelCapability("Vendor-M", wire.CAPABILITY_SUPPORTED), modelCapability("vendor-m", wire.CAPABILITY_UNSUPPORTED) }, .status = wire.STATUS_INVALID_ARGUMENT },
+        // Zero is not a declaration; unknown codes are refused.
+        .{ .entries = &.{modelCapability("m", 0)}, .status = wire.STATUS_INVALID_ARGUMENT },
+        .{ .entries = &.{modelCapability("m", 3)}, .status = wire.STATUS_INVALID_ARGUMENT },
+        .{ .entries = &.{modelCapability("", wire.CAPABILITY_SUPPORTED)}, .status = wire.STATUS_INVALID_ARGUMENT },
+        .{ .entries = &.{with_reserved}, .status = wire.STATUS_INVALID_ARGUMENT },
+        .{ .entries = &.{short_struct}, .status = wire.STATUS_INVALID_ARGUMENT },
+        .{ .entries = &.{modelCapability(long_name, wire.CAPABILITY_SUPPORTED)}, .status = wire.STATUS_RESOURCE_LIMIT },
+        .{ .entries = &many, .status = wire.STATUS_RESOURCE_LIMIT },
+        // A pointer with no count, and a count with no pointer.
+        .{ .entries = &one, .count = 0, .status = wire.STATUS_INVALID_ARGUMENT },
+        .{ .entries = &one, .pointer = false, .status = wire.STATUS_INVALID_ARGUMENT },
+    };
+    for (cases) |case| {
+        host.model_capabilities = if (case.pointer) case.entries.ptr else null;
+        host.model_capability_count = case.count orelse case.entries.len;
+        var session: ?*wire.SessionHandle = null;
+        try std.testing.expectEqual(case.status, api.session().create()(runtime, &config, &callbacks, &session, &diagnostic));
+        try std.testing.expect(session == null);
+        api.bufferRelease()(&diagnostic);
+    }
+    // Reserved storage after the new fields still has to be zero.
+    host.model_capabilities = null;
+    host.model_capability_count = 0;
+    host.reserved[0] = 1;
+    var session: ?*wire.SessionHandle = null;
+    try std.testing.expectEqual(wire.STATUS_INVALID_ARGUMENT, api.session().create()(runtime, &config, &callbacks, &session, &diagnostic));
+    api.bufferRelease()(&diagnostic);
 }
 
 test "Revision 15 multimodal wire validation bounds every length before payload access" {
@@ -8692,6 +9045,7 @@ test "L2 Revision 15 multimodal Run reaches OpenAI Responses under a non-Anthrop
         wire.RUN_JOURNAL_DURABLE_WORKSPACE,
         wire.PROVIDER_OPENAI,
         wire.OPENAI_PROTOCOL_RESPONSES,
+        &.{},
     );
     defer fixture.deinit();
     const parts = [_]wire.RunInputPartV1{
@@ -9016,7 +9370,7 @@ test "L2 RunState: an abort accepted from the finalizing callback yields one ter
         if (session) |handle| _ = api.session().destroy()(handle, &diagnostic);
     }
 
-    var options = wire.RunOptionsV1{ .struct_size = @sizeOf(wire.RunOptionsV1), .max_turns = 2, .context_blocks = null, .context_block_count = 0, .reserved = [_]u64{0} ** 2 };
+    var options = wire.RunOptionsV1{ .struct_size = @sizeOf(wire.RunOptionsV1), .max_turns = 2, .context_blocks = null, .context_block_count = 0, .time_context_code = wire.TIME_CONTEXT_SYSTEM, .utc_offset_minutes = 0, .reserved = [_]u64{0} ** 1 };
     var result: wire.RunResultV1 = undefined;
     try std.testing.expectEqual(
         wire.STATUS_OK,
@@ -9067,7 +9421,7 @@ test "L2 RunState: a Host rejecting the terminal snapshot fails the Run with CAL
         if (session) |handle| _ = api.session().destroy()(handle, &diagnostic);
     }
 
-    var options = wire.RunOptionsV1{ .struct_size = @sizeOf(wire.RunOptionsV1), .max_turns = 2, .context_blocks = null, .context_block_count = 0, .reserved = [_]u64{0} ** 2 };
+    var options = wire.RunOptionsV1{ .struct_size = @sizeOf(wire.RunOptionsV1), .max_turns = 2, .context_blocks = null, .context_block_count = 0, .time_context_code = wire.TIME_CONTEXT_SYSTEM, .utc_offset_minutes = 0, .reserved = [_]u64{0} ** 1 };
     var result: wire.RunResultV1 = undefined;
     // 修复前:终态快照被拒绝的结果被丢弃,这里返回 STATUS_OK。
     try std.testing.expectEqual(
@@ -9772,13 +10126,199 @@ test "L2 public context blocks lead the Run's user record and stay in history" {
     try std.testing.expect(reminder_at < prompt_at);
 
     // The next Run without blocks still carries the first Run's context in
-    // its history: the cached prefix only grows.
+    // its history: the cached prefix only grows. (Time context off: the
+    // runtime would otherwise add this Run's own date, Revision 22.)
     var plain = options;
     plain.context_blocks = null;
     plain.context_block_count = 0;
+    plain.time_context_code = wire.TIME_CONTEXT_OFF;
     try std.testing.expectEqual(wire.STATUS_OK, fixture.api.session().runText(fixture.session, 2, sdk.bytesView("and the refunds"), &plain, &result, &fixture.diagnostic));
     const second = (server.requestAt(1) orelse return error.NoRequestCaptured).body();
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, second, "<system-reminder>\\nThe host application"));
+}
+
+/// `Today's date is YYYY-MM-DD (Weekday).` at `unix_seconds` in a zone
+/// `offset_minutes` east of UTC.
+fn expectedDate(buf: []u8, unix_seconds: i64, offset_minutes: i32) ![]const u8 {
+    const date = core.time_context.localDate(unix_seconds, offset_minutes);
+    return std.fmt.bufPrint(buf, "Today's date is {d}-{d:0>2}-{d:0>2} ({s}).", .{ date.year, date.month, date.day, @tagName(date.weekday) });
+}
+
+/// The request names the date at one of two instants (a Run straddling a
+/// midnight sees either).
+fn expectDateIn(body: []const u8, before: i64, after: i64, offset_minutes: i32) !void {
+    var a_buf: [64]u8 = undefined;
+    var b_buf: [64]u8 = undefined;
+    if (std.mem.indexOf(u8, body, try expectedDate(&a_buf, before, offset_minutes)) != null) return;
+    if (std.mem.indexOf(u8, body, try expectedDate(&b_buf, after, offset_minutes)) != null) return;
+    std.debug.print("request body: {s}\n", .{body});
+    return error.MissingTimeContext;
+}
+
+test "L2 Revision 22 each Run carries today's date and the process time zone by default, and history keeps each Run's own (issue #276)" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try rootPath(&tmp, &root_buffer);
+    var server = try harness.MockServer.startCassette(&.{ FINAL_SSE, FINAL_SSE }, 0);
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+    var fixture = try PublicSessionFixture.init(root, url, "test-model");
+    defer fixture.deinit();
+
+    // No context blocks, no time option: the Host supplies nothing.
+    var options = std.mem.zeroes(wire.RunOptionsV1);
+    options.struct_size = @sizeOf(wire.RunOptionsV1);
+    options.max_turns = 1;
+    var result = std.mem.zeroes(wire.RunResultV1);
+    const before = core.time_context.currentUnixSeconds();
+    try std.testing.expectEqual(wire.STATUS_OK, fixture.api.session().runText(fixture.session, 1, sdk.bytesView("what day is it"), &options, &result, &fixture.diagnostic));
+    const after = core.time_context.currentUnixSeconds();
+    const zone = core.time_context.systemZone(before);
+    const first = (server.requestAt(0) orelse return error.NoRequestCaptured).body();
+    try std.testing.expect(std.mem.indexOf(u8, first, "# currentDate\\nToday's date is ") != null);
+    try expectDateIn(first, before, after, zone.offset_minutes);
+    // The zone is named (or said to be unknown), never left implicit.
+    try std.testing.expect(std.mem.indexOf(u8, first, "Time zone: UTC") != null or
+        std.mem.indexOf(u8, first, "Time zone: ") != null or
+        std.mem.indexOf(u8, first, "the user's time zone is unknown") != null);
+    // The date rides the Run's user record, ahead of the prompt, not the system prompt.
+    try std.testing.expect(std.mem.indexOf(u8, first, "# currentDate").? < std.mem.indexOf(u8, first, "what day is it").?);
+
+    // The next Run gets its own date; the first Run's stays in history.
+    try std.testing.expectEqual(wire.STATUS_OK, fixture.api.session().runText(fixture.session, 2, sdk.bytesView("and tomorrow"), &options, &result, &fixture.diagnostic));
+    const second = (server.requestAt(1) orelse return error.NoRequestCaptured).body();
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, second, "# currentDate\\nToday's date is "));
+}
+
+test "L2 Revision 22 a Host UTC offset decides the date and names the zone (issue #276)" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try rootPath(&tmp, &root_buffer);
+    var server = try harness.MockServer.startCassette(&.{ FINAL_SSE, FINAL_SSE }, 0);
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+    var fixture = try PublicSessionFixture.init(root, url, "test-model");
+    defer fixture.deinit();
+
+    var options = std.mem.zeroes(wire.RunOptionsV1);
+    options.struct_size = @sizeOf(wire.RunOptionsV1);
+    options.max_turns = 1;
+    options.time_context_code = wire.TIME_CONTEXT_UTC_OFFSET;
+    var result = std.mem.zeroes(wire.RunResultV1);
+    // The two ends of the offset range are a day apart for most of every day.
+    for ([_]i32{ wire.MAX_UTC_OFFSET_MINUTES_V1, -12 * 60 }, [_][]const u8{ "Time zone: UTC+14:00.", "Time zone: UTC-12:00." }, 0..) |offset, label, i| {
+        options.utc_offset_minutes = offset;
+        const before = core.time_context.currentUnixSeconds();
+        try std.testing.expectEqual(wire.STATUS_OK, fixture.api.session().runText(fixture.session, i + 1, sdk.bytesView("what day is it"), &options, &result, &fixture.diagnostic));
+        const after = core.time_context.currentUnixSeconds();
+        const body = (server.requestAt(i) orelse return error.NoRequestCaptured).body();
+        try expectDateIn(body, before, after, offset);
+        try std.testing.expect(std.mem.indexOf(u8, body, label) != null);
+    }
+}
+
+test "L2 Revision 22 OFF adds no date, and a Host currentDate block is the Run's only one (issue #276)" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try rootPath(&tmp, &root_buffer);
+    var server = try harness.MockServer.startCassette(&.{ FINAL_SSE, FINAL_SSE }, 0);
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+    var fixture = try PublicSessionFixture.init(root, url, "test-model");
+    defer fixture.deinit();
+
+    var options = std.mem.zeroes(wire.RunOptionsV1);
+    options.struct_size = @sizeOf(wire.RunOptionsV1);
+    options.max_turns = 1;
+    options.time_context_code = wire.TIME_CONTEXT_OFF;
+    var result = std.mem.zeroes(wire.RunResultV1);
+    try std.testing.expectEqual(wire.STATUS_OK, fixture.api.session().runText(fixture.session, 1, sdk.bytesView("no clock please"), &options, &result, &fixture.diagnostic));
+    try std.testing.expect(std.mem.indexOf(u8, (server.requestAt(0) orelse return error.NoRequestCaptured).body(), "currentDate") == null);
+
+    // Under the default, the Host's own block wins and the runtime adds none.
+    const blocks = [_]wire.ContextBlockV1{.{ .struct_size = @sizeOf(wire.ContextBlockV1), .reserved0 = 0, .label = sdk.bytesView("currentDate"), .text = sdk.bytesView("It is the user's birthday, 1999-12-31."), .reserved = [_]u64{0} ** 2 }};
+    options.time_context_code = wire.TIME_CONTEXT_SYSTEM;
+    options.context_blocks = &blocks;
+    options.context_block_count = blocks.len;
+    try std.testing.expectEqual(wire.STATUS_OK, fixture.api.session().runText(fixture.session, 2, sdk.bytesView("what day is it"), &options, &result, &fixture.diagnostic));
+    const body = (server.requestAt(1) orelse return error.NoRequestCaptured).body();
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, "# currentDate"));
+    try std.testing.expect(std.mem.indexOf(u8, body, "It is the user's birthday, 1999-12-31.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "Today's date is ") == null);
+}
+
+fn expectTimeContextReason(fixture: *PublicSessionFixture, reason: []const u8) !void {
+    defer fixture.releaseDiagnostic();
+    const text = try sdk.borrowedBytes(.{ .ptr = fixture.diagnostic.ptr, .len = fixture.diagnostic.len });
+    if (std.mem.indexOf(u8, text, reason) == null) {
+        std.debug.print("expected {s} in diagnostic: {s}\n", .{ reason, text });
+        return error.TestUnexpectedDiagnostic;
+    }
+}
+
+test "Revision 22 time context is validated before a Run is admitted (issue #276)" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try rootPath(&tmp, &root_buffer);
+    var server = try harness.MockServer.startCassette(&.{FINAL_SSE}, 0);
+    defer server.stop();
+    const url = try server.urlOwned(std.testing.allocator);
+    defer std.testing.allocator.free(url);
+    var fixture = try PublicSessionFixture.init(root, url, "test-model");
+    defer fixture.deinit();
+    var result = std.mem.zeroes(wire.RunResultV1);
+    const host_date = [_]wire.ContextBlockV1{.{ .struct_size = @sizeOf(wire.ContextBlockV1), .reserved0 = 0, .label = sdk.bytesView("currentDate"), .text = sdk.bytesView("Today is Host day."), .reserved = [_]u64{0} ** 2 }};
+
+    // Each refusal names the time-context rule it broke, not a later check
+    // that happens to refuse the same input.
+    const Case = struct { code: u32, offset: i32, host_block: bool = false, reason: []const u8 = "InvalidTimeContext" };
+    for ([_]Case{
+        .{ .code = 3, .offset = 0 }, // unknown code
+        .{ .code = wire.TIME_CONTEXT_SYSTEM, .offset = 60 }, // an offset without UTC_OFFSET
+        .{ .code = wire.TIME_CONTEXT_OFF, .offset = -60 },
+        .{ .code = wire.TIME_CONTEXT_UTC_OFFSET, .offset = wire.MAX_UTC_OFFSET_MINUTES_V1 + 1 },
+        .{ .code = wire.TIME_CONTEXT_UTC_OFFSET, .offset = wire.MIN_UTC_OFFSET_MINUTES_V1 - 1 },
+        .{ .code = wire.TIME_CONTEXT_UTC_OFFSET, .offset = 480, .host_block = true, .reason = "ConflictingTimeContext" }, // two answers
+    }) |case| {
+        var options = std.mem.zeroes(wire.RunOptionsV1);
+        options.struct_size = @sizeOf(wire.RunOptionsV1);
+        options.max_turns = 1;
+        options.time_context_code = case.code;
+        options.utc_offset_minutes = case.offset;
+        if (case.host_block) {
+            options.context_blocks = &host_date;
+            options.context_block_count = host_date.len;
+        }
+        try std.testing.expectEqual(wire.STATUS_INVALID_ARGUMENT, fixture.api.session().runText(fixture.session, 1, sdk.bytesView("x"), &options, &result, &fixture.diagnostic));
+        try expectTimeContextReason(&fixture, case.reason);
+    }
+    // A Skill invocation carries no context, so it takes no offset either.
+    var skill_input = std.mem.zeroes(wire.RunInputV1);
+    skill_input.struct_size = @sizeOf(wire.RunInputV1);
+    skill_input.kind_code = wire.RUN_INPUT_SKILL;
+    var skill_options = std.mem.zeroes(wire.RunOptionsV1);
+    skill_options.struct_size = @sizeOf(wire.RunOptionsV1);
+    skill_options.max_turns = 1;
+    skill_options.time_context_code = wire.TIME_CONTEXT_UTC_OFFSET;
+    skill_options.utc_offset_minutes = 60;
+    try std.testing.expectEqual(wire.STATUS_INVALID_ARGUMENT, fixture.api.session().runInput()(fixture.session, 1, &skill_input, &skill_options, &result, &fixture.diagnostic));
+    try expectTimeContextReason(&fixture, "InvalidTimeContext");
+    // Nothing was sent and Run 1 was never admitted.
+    try std.testing.expectEqual(@as(usize, 0), server.requestCount());
+    var ok_options = std.mem.zeroes(wire.RunOptionsV1);
+    ok_options.struct_size = @sizeOf(wire.RunOptionsV1);
+    ok_options.max_turns = 1;
+    try std.testing.expectEqual(wire.STATUS_OK, fixture.api.session().runText(fixture.session, 1, sdk.bytesView("x"), &ok_options, &result, &fixture.diagnostic));
 }
 
 /// Answers each Permission request with `allow_session` and, while the Run is
@@ -10284,6 +10824,9 @@ const RunInputFixture = struct {
         var options = std.mem.zeroes(wire.RunOptionsV1);
         options.struct_size = @sizeOf(wire.RunOptionsV1);
         options.max_turns = 4;
+        // These tests size budgets and requests to the byte; the Revision 22
+        // date block would move their arithmetic, not what they test.
+        options.time_context_code = wire.TIME_CONTEXT_OFF;
         result.* = std.mem.zeroes(wire.RunResultV1);
         self.api.bufferRelease()(&self.diagnostic);
         return self.api.session().runText(self.session, run_id, sdk.bytesView(prompt), &options, result, &self.diagnostic);
@@ -10904,4 +11447,469 @@ test "L2 Revision 20 input accepted before the first request rides that request 
     const prompt = std.mem.indexOf(u8, first, "ROOT_PROMPT") orelse return error.MissingRootPrompt;
     const input = std.mem.indexOf(u8, first, "BEFORE_FIRST_REQUEST") orelse return error.MissingAdoptedInput;
     try std.testing.expect(prompt < input);
+}
+
+// ── Revision 23: goals (#277) ───────────────────────────────────────────
+
+/// A turn that calls a tool the Session does not have (an error result, so
+/// the Run takes another turn) and bills 50 tokens.
+const GOAL_TOOL_TURN_SSE =
+    "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_goal\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":40,\"output_tokens\":1}}}\n\n" ++
+    "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"tu_goal\",\"name\":\"NoSuchTool\",\"input\":{}}}\n\n" ++
+    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{}\"}}\n\n" ++
+    "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n" ++
+    "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":9}}\n\n" ++
+    "data: {\"type\":\"message_stop\"}\n\n";
+
+/// Records `goal_updated` events and the usage the provider reported.
+const GoalEventProbe = struct {
+    updates: u32 = 0,
+    last_status: ?sdk.protocol.GoalStatus = null,
+    last_tokens: u64 = 0,
+    usage_tokens: u64 = 0,
+
+    fn event(raw: ?*anyopaque, _: ?*const wire.RunContextV1, event_json: wire.BytesViewV1) callconv(.c) u32 {
+        const self: *@This() = @ptrCast(@alignCast(raw orelse return wire.EVENT_FATAL));
+        const encoded = sdk.borrowedBytes(event_json) catch return wire.EVENT_FATAL;
+        const parsed = sdk.decodeCoreEvent(std.heap.c_allocator, encoded) catch return wire.EVENT_FATAL;
+        defer parsed.deinit();
+        switch (parsed.value) {
+            .known => |known| switch (known) {
+                .goal_updated => |goal| {
+                    self.updates += 1;
+                    self.last_status = goal.status;
+                    self.last_tokens = goal.tokens_used;
+                },
+                .usage => |usage| self.usage_tokens += usage.input_tokens + usage.output_tokens,
+                else => {},
+            },
+            .unknown => {},
+        }
+        return wire.EVENT_CONTINUE;
+    }
+};
+
+const GoalReading = struct {
+    arena: std.heap.ArenaAllocator,
+    goal: ?sdk.protocol.Goal,
+
+    fn deinit(self: *GoalReading) void {
+        self.arena.deinit();
+    }
+};
+
+fn readGoal(api: sdk.Api, session: ?*wire.SessionHandle) !GoalReading {
+    var json = std.mem.zeroes(wire.OwnedBytesV1);
+    var diagnostic = std.mem.zeroes(wire.OwnedBytesV1);
+    defer api.bufferRelease()(&diagnostic);
+    try std.testing.expectEqual(wire.STATUS_OK, api.goal().get()(session, &json, &diagnostic));
+    defer api.bufferRelease()(&json);
+    var reading = GoalReading{ .arena = std.heap.ArenaAllocator.init(std.testing.allocator), .goal = null };
+    errdefer reading.arena.deinit();
+    const encoded = try sdk.borrowedBytes(.{ .ptr = json.ptr, .len = json.len });
+    reading.goal = (try sdk.protocol.decodeGoalDocument(reading.arena.allocator(), encoded)).goal;
+    return reading;
+}
+
+fn goalSet(objective: []const u8, token_budget: u64) wire.GoalSetV1 {
+    var request = std.mem.zeroes(wire.GoalSetV1);
+    request.struct_size = @sizeOf(wire.GoalSetV1);
+    request.objective = sdk.bytesView(objective);
+    request.token_budget = token_budget;
+    return request;
+}
+
+fn goalUpdate(fields: u32) wire.GoalUpdateV1 {
+    var update = std.mem.zeroes(wire.GoalUpdateV1);
+    update.struct_size = @sizeOf(wire.GoalUpdateV1);
+    update.fields = fields;
+    return update;
+}
+
+fn goalContinuationInput() wire.RunInputV1 {
+    var input = std.mem.zeroes(wire.RunInputV1);
+    input.struct_size = @sizeOf(wire.RunInputV1);
+    input.kind_code = wire.RUN_INPUT_GOAL_CONTINUATION;
+    return input;
+}
+
+fn expectDiagnosticNames(api: sdk.Api, diagnostic: *wire.OwnedBytesV1, reason: []const u8) !void {
+    defer api.bufferRelease()(diagnostic);
+    const text = try sdk.borrowedBytes(.{ .ptr = diagnostic.ptr, .len = diagnostic.len });
+    if (std.mem.indexOf(u8, text, reason) == null) {
+        std.debug.print("expected {s} in diagnostic: {s}\n", .{ reason, text });
+        return error.TestUnexpectedDiagnostic;
+    }
+}
+
+test "L2 Revision 23 a goal-continuation Run works toward the Host's goal, charges it, reports the budget running out, and a checkpoint carries it (issue #277)" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try rootPath(&tmp, &root_buffer);
+    var server = try harness.MockServer.startCassette(&.{ GOAL_TOOL_TURN_SSE, FINAL_SSE, FINAL_SSE }, 0);
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+
+    const raw_api = abi.metask_agentcore_get_api(wire.ABI_VERSION_V1) orelse return error.MissingApi;
+    const api = try sdk.Api.validate(@ptrCast(@alignCast(raw_api)));
+    var diagnostic = std.mem.zeroes(wire.OwnedBytesV1);
+    var runtime_config = std.mem.zeroes(wire.RuntimeConfigV1);
+    runtime_config.struct_size = @sizeOf(wire.RuntimeConfigV1);
+    var runtime: ?*wire.RuntimeHandle = null;
+    try std.testing.expectEqual(wire.STATUS_OK, api.runtime().create()(&runtime_config, null, &runtime, &diagnostic));
+    defer _ = api.runtime().destroy()(runtime, &diagnostic);
+
+    var host = std.mem.zeroes(wire.SessionHostConfigV1);
+    host.struct_size = @sizeOf(wire.SessionHostConfigV1);
+    host.provider_kind_code = wire.PROVIDER_ANTHROPIC;
+    host.permission_mode_code = wire.PERMISSION_FULL_ACCESS;
+    host.shell_policy_code = wire.SHELL_DISABLED;
+    host.api_key = sdk.bytesView("test-key");
+    host.base_url = sdk.bytesView(url);
+    host.workspace_root = sdk.bytesView(root);
+    host.workspace_home = sdk.bytesView(root);
+    var create_config = sessionCreateConfig(&host, "test-model");
+    var probe = GoalEventProbe{};
+    var callbacks = std.mem.zeroes(wire.SessionCallbacksV1);
+    callbacks.struct_size = @sizeOf(wire.SessionCallbacksV1);
+    callbacks.ctx = &probe;
+    callbacks.on_event = GoalEventProbe.event;
+    var session: ?*wire.SessionHandle = null;
+    try std.testing.expectEqual(wire.STATUS_OK, api.session().create()(runtime, &create_config, &callbacks, &session, &diagnostic));
+    defer if (session) |handle| {
+        _ = api.session().destroy()(handle, &diagnostic);
+    };
+
+    {
+        var reading = try readGoal(api, session);
+        defer reading.deinit();
+        try std.testing.expect(reading.goal == null);
+    }
+    var set = goalSet("  ship <it> & say so  ", 30);
+    try std.testing.expectEqual(wire.STATUS_OK, api.goal().set()(session, &set, &diagnostic));
+    const goal_id: [24]u8 = blk: {
+        var reading = try readGoal(api, session);
+        defer reading.deinit();
+        const goal = reading.goal orelse return error.MissingGoal;
+        try std.testing.expectEqualStrings("ship <it> & say so", goal.objective);
+        try std.testing.expectEqual(sdk.protocol.GoalStatus.active, goal.status);
+        try std.testing.expectEqual(@as(?u64, 30), goal.token_budget);
+        try std.testing.expectEqual(@as(u64, 0), goal.tokens_used);
+        break :blk goal.id[0..24].*;
+    };
+
+    // The runtime writes the continuation input from the goal; the budget
+    // runs out on the first turn, so the second request asks for a wrap-up.
+    var options = std.mem.zeroes(wire.RunOptionsV1);
+    options.struct_size = @sizeOf(wire.RunOptionsV1);
+    options.max_turns = 4;
+    var result = std.mem.zeroes(wire.RunResultV1);
+    var continuation = goalContinuationInput();
+    try std.testing.expectEqual(wire.STATUS_OK, api.session().runInput()(session, 1, &continuation, &options, &result, &diagnostic));
+    try std.testing.expectEqual(wire.STOP_END_TURN, result.stop_reason_code);
+    try std.testing.expectEqual(@as(usize, 2), server.requestCount());
+    const first = (server.requestAt(0) orelse return error.MissingRequest).body();
+    const second = (server.requestAt(1) orelse return error.MissingRequest).body();
+    try std.testing.expect(std.mem.indexOf(u8, first, "Continue working toward the active goal.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first, "ship &lt;it&gt; &amp; say so") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first, "token budget for the active goal is used up") == null);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, second, "token budget for the active goal is used up"));
+    // The events and the goal agree with what the provider billed.
+    try std.testing.expect(probe.usage_tokens > 30);
+    try std.testing.expect(probe.updates >= 2);
+    try std.testing.expectEqual(sdk.protocol.GoalStatus.budget_limited, probe.last_status.?);
+    try std.testing.expectEqual(probe.usage_tokens, probe.last_tokens);
+    {
+        var reading = try readGoal(api, session);
+        defer reading.deinit();
+        const goal = reading.goal orelse return error.MissingGoal;
+        try std.testing.expectEqual(sdk.protocol.GoalStatus.budget_limited, goal.status);
+        try std.testing.expectEqual(probe.usage_tokens, goal.tokens_used);
+        try std.testing.expectEqualStrings(&goal_id, goal.id);
+    }
+
+    // A goal that is not active cannot be continued; nothing is sent.
+    try std.testing.expectEqual(wire.STATUS_GOAL_CONFLICT, api.session().runInput()(session, 2, &continuation, &options, &result, &diagnostic));
+    try expectDiagnosticNames(api, &diagnostic, "GoalNotActive");
+    try std.testing.expectEqual(@as(usize, 2), server.requestCount());
+    // Room in the budget and resume, in one update.
+    var resume_update = goalUpdate(wire.GOAL_FIELD_TOKEN_BUDGET | wire.GOAL_FIELD_ACTION);
+    resume_update.token_budget = 1000;
+    resume_update.action_code = wire.GOAL_ACTION_ACTIVATE;
+    try std.testing.expectEqual(wire.STATUS_OK, api.goal().update()(session, &resume_update, &diagnostic));
+
+    // The checkpoint carries the goal (the marker-10 envelope).
+    var checkpoint = PublicCheckpointBuffer{};
+    defer checkpoint.deinit();
+    var limits = publicCheckpointLimits();
+    var sink = checkpoint.sink();
+    var export_config = std.mem.zeroes(wire.CheckpointExportConfigV1);
+    export_config.struct_size = @sizeOf(wire.CheckpointExportConfigV1);
+    export_config.limits = &limits;
+    export_config.sink = &sink;
+    var export_result = std.mem.zeroes(wire.CheckpointExportResultV1);
+    try std.testing.expectEqual(wire.STATUS_OK, api.sessionControl().exportCheckpoint()(session, &export_config, &export_result, &diagnostic));
+    try std.testing.expectEqual(@as(u32, 10), std.mem.readInt(u32, checkpoint.bytes.items[20..24], .little));
+    try std.testing.expectEqual(wire.STATUS_OK, api.session().destroy()(session, &diagnostic));
+    session = null;
+
+    var source = checkpoint.source();
+    var restore_config = std.mem.zeroes(wire.SessionRestoreConfigV1);
+    restore_config.struct_size = @sizeOf(wire.SessionRestoreConfigV1);
+    restore_config.host = &host;
+    restore_config.source = &source;
+    restore_config.limits = &limits;
+    var restore_report = std.mem.zeroes(wire.OwnedBytesV1);
+    try std.testing.expectEqual(wire.STATUS_OK, api.sessionControl().restore()(runtime, &restore_config, &callbacks, &session, &restore_report, &diagnostic));
+    api.bufferRelease()(&restore_report);
+    const charged_before_restore = probe.usage_tokens;
+    {
+        var reading = try readGoal(api, session);
+        defer reading.deinit();
+        const goal = reading.goal orelse return error.MissingGoal;
+        try std.testing.expectEqualStrings(&goal_id, goal.id);
+        try std.testing.expectEqual(sdk.protocol.GoalStatus.active, goal.status);
+        try std.testing.expectEqual(@as(?u64, 1000), goal.token_budget);
+        try std.testing.expectEqual(charged_before_restore, goal.tokens_used);
+    }
+    // The restored Session keeps charging the same goal.
+    try std.testing.expectEqual(wire.STATUS_OK, api.session().runInput()(session, 2, &continuation, &options, &result, &diagnostic));
+    try std.testing.expectEqual(@as(usize, 3), server.requestCount());
+    var reading = try readGoal(api, session);
+    defer reading.deinit();
+    const goal = reading.goal orelse return error.MissingGoal;
+    try std.testing.expect(probe.usage_tokens > charged_before_restore);
+    try std.testing.expectEqual(probe.usage_tokens, goal.tokens_used);
+    try std.testing.expectEqual(sdk.protocol.GoalStatus.active, goal.status);
+}
+
+test "Revision 23 goal operations are validated, and a refusal changes nothing (issue #277)" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try rootPath(&tmp, &root_buffer);
+    var server = try harness.MockServer.startCassette(&.{FINAL_SSE}, 0);
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+    var fixture = try PublicSessionFixture.init(root, url, "test-model");
+    defer fixture.deinit();
+    const api = fixture.api;
+    const session = fixture.session;
+    var options = std.mem.zeroes(wire.RunOptionsV1);
+    options.struct_size = @sizeOf(wire.RunOptionsV1);
+    options.max_turns = 1;
+    var result = std.mem.zeroes(wire.RunResultV1);
+
+    // Without a goal: update and continuation conflict, clear changes nothing.
+    var pause = goalUpdate(wire.GOAL_FIELD_ACTION);
+    pause.action_code = wire.GOAL_ACTION_PAUSE;
+    try std.testing.expectEqual(wire.STATUS_GOAL_CONFLICT, api.goal().update()(session, &pause, &fixture.diagnostic));
+    try expectDiagnosticNames(api, &fixture.diagnostic, "NoGoal");
+    try std.testing.expectEqual(wire.STATUS_OK, api.goal().clear()(session, &fixture.diagnostic));
+    var continuation = goalContinuationInput();
+    try std.testing.expectEqual(wire.STATUS_GOAL_CONFLICT, api.session().runInput()(session, 1, &continuation, &options, &result, &fixture.diagnostic));
+    try expectDiagnosticNames(api, &fixture.diagnostic, "NoGoal");
+    continuation.text = sdk.bytesView("x");
+    try std.testing.expectEqual(wire.STATUS_INVALID_ARGUMENT, api.session().runInput()(session, 1, &continuation, &options, &result, &fixture.diagnostic));
+    fixture.releaseDiagnostic();
+
+    // Malformed set requests.
+    const too_many_codepoints = "\u{4e2d}" ** 4001;
+    const too_many_bytes = "x" ** (wire.MAX_GOAL_OBJECTIVE_BYTES_V1 + 1);
+    for ([_][]const u8{ " \t\n", "bad \xff byte", too_many_codepoints, too_many_bytes }) |objective| {
+        var request = goalSet(objective, 0);
+        try std.testing.expectEqual(wire.STATUS_INVALID_ARGUMENT, api.goal().set()(session, &request, &fixture.diagnostic));
+        fixture.releaseDiagnostic();
+    }
+    var wrong_size = goalSet("ship it", 0);
+    wrong_size.struct_size -= 8;
+    try std.testing.expectEqual(wire.STATUS_INVALID_ARGUMENT, api.goal().set()(session, &wrong_size, &fixture.diagnostic));
+    fixture.releaseDiagnostic();
+    var reserved = goalSet("ship it", 0);
+    reserved.reserved[2] = 1;
+    try std.testing.expectEqual(wire.STATUS_INVALID_ARGUMENT, api.goal().set()(session, &reserved, &fixture.diagnostic));
+    fixture.releaseDiagnostic();
+    {
+        var reading = try readGoal(api, session);
+        defer reading.deinit();
+        try std.testing.expect(reading.goal == null);
+    }
+
+    // 4000 code points is the limit, not past it.
+    var longest = goalSet("\u{4e2d}" ** 4000, 0);
+    try std.testing.expectEqual(wire.STATUS_OK, api.goal().set()(session, &longest, &fixture.diagnostic));
+    var set = goalSet("ship it", 0);
+    try std.testing.expectEqual(wire.STATUS_OK, api.goal().set()(session, &set, &fixture.diagnostic));
+
+    // Malformed updates.
+    const Bad = struct { fields: u32, objective: []const u8 = "", token_budget: u64 = 0, action_code: u32 = 0 };
+    for ([_]Bad{
+        .{ .fields = 0 },
+        .{ .fields = 8 },
+        .{ .fields = wire.GOAL_FIELD_ACTION, .action_code = 9 },
+        .{ .fields = wire.GOAL_FIELD_ACTION, .action_code = wire.GOAL_ACTION_PAUSE, .objective = "stray" },
+        .{ .fields = wire.GOAL_FIELD_ACTION, .action_code = wire.GOAL_ACTION_PAUSE, .token_budget = 5 },
+        .{ .fields = wire.GOAL_FIELD_TOKEN_BUDGET, .token_budget = 5, .action_code = wire.GOAL_ACTION_PAUSE },
+        .{ .fields = wire.GOAL_FIELD_OBJECTIVE, .objective = "  " },
+    }) |bad| {
+        var update = goalUpdate(bad.fields);
+        if (bad.objective.len != 0) update.objective = sdk.bytesView(bad.objective);
+        update.token_budget = bad.token_budget;
+        update.action_code = bad.action_code;
+        try std.testing.expectEqual(wire.STATUS_INVALID_ARGUMENT, api.goal().update()(session, &update, &fixture.diagnostic));
+        fixture.releaseDiagnostic();
+    }
+
+    // Refused transitions name the rule, and leave the objective unchanged
+    // even when the same update also edits it.
+    var complete = goalUpdate(wire.GOAL_FIELD_ACTION);
+    complete.action_code = wire.GOAL_ACTION_COMPLETE;
+    try std.testing.expectEqual(wire.STATUS_OK, api.goal().update()(session, &complete, &fixture.diagnostic));
+    var block = goalUpdate(wire.GOAL_FIELD_ACTION);
+    block.action_code = wire.GOAL_ACTION_BLOCK;
+    try std.testing.expectEqual(wire.STATUS_GOAL_CONFLICT, api.goal().update()(session, &block, &fixture.diagnostic));
+    try expectDiagnosticNames(api, &fixture.diagnostic, "GoalComplete");
+    var edit_and_pause = goalUpdate(wire.GOAL_FIELD_OBJECTIVE | wire.GOAL_FIELD_ACTION);
+    edit_and_pause.objective = sdk.bytesView("ship more");
+    edit_and_pause.action_code = wire.GOAL_ACTION_PAUSE;
+    try std.testing.expectEqual(wire.STATUS_GOAL_CONFLICT, api.goal().update()(session, &edit_and_pause, &fixture.diagnostic));
+    try expectDiagnosticNames(api, &fixture.diagnostic, "GoalNotActive");
+    var complete_continuation = goalContinuationInput();
+    try std.testing.expectEqual(wire.STATUS_GOAL_CONFLICT, api.session().runInput()(session, 1, &complete_continuation, &options, &result, &fixture.diagnostic));
+    try expectDiagnosticNames(api, &fixture.diagnostic, "GoalNotActive");
+    {
+        var reading = try readGoal(api, session);
+        defer reading.deinit();
+        const goal = reading.goal orelse return error.MissingGoal;
+        try std.testing.expectEqualStrings("ship it", goal.objective);
+        try std.testing.expectEqual(sdk.protocol.GoalStatus.complete, goal.status);
+        try std.testing.expect(goal.token_budget == null);
+    }
+    try std.testing.expectEqual(wire.STATUS_OK, api.goal().clear()(session, &fixture.diagnostic));
+    {
+        var reading = try readGoal(api, session);
+        defer reading.deinit();
+        try std.testing.expect(reading.goal == null);
+    }
+    // Nothing above reached the provider, and Run 1 was never admitted.
+    try std.testing.expectEqual(@as(usize, 0), server.requestCount());
+    try std.testing.expectEqual(wire.STATUS_OK, api.session().runText(session, 1, sdk.bytesView("x"), &options, &result, &fixture.diagnostic));
+}
+
+test "Revision 23 a goal the durable budget cannot hold is refused before anything changes (issue #277)" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try rootPath(&tmp, &root_buffer);
+    var server = try harness.MockServer.startCassette(&.{FINAL_SSE}, 0);
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+    const budget = wire.DurableBudgetProfileV1{
+        .struct_size = @sizeOf(wire.DurableBudgetProfileV1),
+        .reserved0 = 0,
+        .hard_bytes = 8 * 1024,
+        .soft_bytes = 7 * 1024,
+        .input_cap_bytes = 512,
+        .provider_request_cap_bytes = 4096,
+        .provider_result_cap_bytes = 2048,
+        .tool_result_cap_bytes = 2048,
+        .mcp_result_cap_bytes = 2048,
+        .audit_reserve_bytes = 512,
+        .terminal_reserve_bytes = 512,
+        .reserved = [_]u64{0} ** 4,
+    };
+    var fixture = try PublicSessionFixture.initWithBudget(root, url, "test-model", &budget);
+    defer fixture.deinit();
+    const api = fixture.api;
+    const session = fixture.session;
+
+    var small = goalSet("ship it", 0);
+    try std.testing.expectEqual(wire.STATUS_OK, api.goal().set()(session, &small, &fixture.diagnostic));
+    // 12,000 bytes of objective do not fit in 8 KiB with the Run reserve.
+    var large = goalSet("\u{4e2d}" ** 4000, 0);
+    try std.testing.expectEqual(wire.STATUS_CHECKPOINT_BUDGET_REQUIRED, api.goal().set()(session, &large, &fixture.diagnostic));
+    fixture.releaseDiagnostic();
+    var edit = goalUpdate(wire.GOAL_FIELD_OBJECTIVE);
+    edit.objective = sdk.bytesView("\u{4e2d}" ** 4000);
+    try std.testing.expectEqual(wire.STATUS_CHECKPOINT_BUDGET_REQUIRED, api.goal().update()(session, &edit, &fixture.diagnostic));
+    fixture.releaseDiagnostic();
+    var reading = try readGoal(api, session);
+    defer reading.deinit();
+    try std.testing.expectEqualStrings("ship it", (reading.goal orelse return error.MissingGoal).objective);
+}
+
+test "L2 Revision 23 a Skill invocation Run in its own context is charged to the Session's goal (issue #277)" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try rootPath(&tmp, &root_buf);
+    try writeSkillFixture(
+        a,
+        root,
+        "forked",
+        "---\nname: Forked\ndescription: Runs in a fresh child Conversation\ncontext: fork\n---\nFORKED_SKILL_SENTINEL",
+    );
+    var server = try harness.MockServer.startCassette(&.{FINAL_SSE}, 0);
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+    var fixture = try PublicSessionFixture.init(root, url, "test-model");
+    defer fixture.deinit();
+
+    var query = wire.SkillCatalogQueryV1{
+        .struct_size = @sizeOf(wire.SkillCatalogQueryV1),
+        .reserved0 = 0,
+        .workspace_root = sdk.bytesView(root),
+        .workspace_home = sdk.bytesView(root),
+        .workspace_epoch = sdk.bytesView("goal-fork-epoch"),
+        .additional_sources = null,
+        .additional_source_count = 0,
+        .reserved = [_]u64{0} ** 1,
+    };
+    var catalog: ?*wire.SkillCatalogHandle = null;
+    var descriptor = std.mem.zeroes(wire.OwnedBytesV1);
+    defer fixture.api.bufferRelease()(&descriptor);
+    try std.testing.expectEqual(wire.STATUS_OK, fixture.api.skill().resolveCatalog()(fixture.runtime, &query, &catalog, &descriptor, &fixture.diagnostic));
+    defer if (catalog) |handle| {
+        _ = fixture.api.skill().releaseCatalog()(handle, &fixture.diagnostic);
+    };
+    const descriptor_bytes = try sdk.borrowedBytes(.{ .ptr = descriptor.ptr, .len = descriptor.len });
+    var policy = try DecodedSkillPolicy.init(a, descriptor_bytes);
+    defer policy.deinit();
+    const ids = try extractCatalogIdentities(a, descriptor_bytes, "forked");
+    defer a.free(ids.revision);
+    defer a.free(ids.skill_id);
+    try std.testing.expectEqual(wire.STATUS_OK, fixture.api.skill().bindPolicy()(fixture.session, catalog, &policy.policy, &fixture.diagnostic));
+
+    var set = goalSet("ship it", 0);
+    try std.testing.expectEqual(wire.STATUS_OK, fixture.api.goal().set()(fixture.session, &set, &fixture.diagnostic));
+    var options = std.mem.zeroes(wire.RunOptionsV1);
+    options.struct_size = @sizeOf(wire.RunOptionsV1);
+    options.max_turns = 2;
+    var result = std.mem.zeroes(wire.RunResultV1);
+    try std.testing.expectEqual(wire.STATUS_OK, fixture.api.session().runSkill(
+        fixture.session,
+        1,
+        sdk.bytesView(ids.skill_id),
+        sdk.bytesView(ids.revision),
+        sdk.bytesView(""),
+        &options,
+        &result,
+        &fixture.diagnostic,
+    ));
+    try std.testing.expectEqual(wire.STOP_END_TURN, result.stop_reason_code);
+    try std.testing.expectEqual(@as(usize, 1), server.requestCount());
+    try std.testing.expect(std.mem.indexOf(u8, try requestBody(server, 0), "FORKED_SKILL_SENTINEL") != null);
+    var reading = try readGoal(fixture.api, fixture.session);
+    defer reading.deinit();
+    const goal = reading.goal orelse return error.MissingGoal;
+    try std.testing.expect(goal.tokens_used > 0);
 }

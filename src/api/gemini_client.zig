@@ -49,6 +49,8 @@ const capability = @import("capability.zig");
 const cache = @import("cache.zig");
 const request_overrides = @import("request_overrides.zig");
 const dialect_mod = @import("dialect.zig");
+const catalog_mod = @import("catalog.zig");
+const image_capability = @import("image_capability.zig");
 const AbortSignal = @import("../util/abort.zig").AbortSignal;
 const model_context_mod = @import("../app/model_context.zig");
 
@@ -97,6 +99,12 @@ pub const GeminiClient = struct {
     /// 方言字段覆盖(null = profile 默认)。来源:计划 jolly-glacier。
     overrides: request_overrides.RequestOverrides = .{},
     dialect_resolver: dialect_mod.Resolver = .{},
+    /// The provider's model catalog, when the caller has one (owned). Its
+    /// image_input declarations override the family table (issue #273).
+    catalog: ?catalog_mod.Catalog = null,
+    /// Host declarations about models' image input; they outrank the catalog
+    /// (issue #273). Owned; empty by default.
+    host_capabilities: image_capability.Declarations = .{},
 
     /// 有状态缓存句柄表(GeminiClient 私有,不上浮中立契约)。
     /// prepareCache 据 system+tools 的 prefix 哈希查表命中则引用,未命中/过期则(MVP)走隐式。
@@ -118,6 +126,8 @@ pub const GeminiClient = struct {
         for (self.cache_table.items) |e| self.allocator.free(e.cache_name);
         self.cache_table.deinit(self.allocator);
         self.http_client.deinit();
+        if (self.catalog) |*catalog| catalog.deinit();
+        self.host_capabilities.deinit();
     }
 
     // ── 有状态缓存查表(Gemini 范式核心)──────────────────────────────────────
@@ -171,6 +181,8 @@ pub const GeminiClient = struct {
             .setRequestOverridesFn = &pSetRequestOverrides,
             .supportsFn = &pSupports,
             .supportsForModelFn = &pSupportsForModel,
+            .imageInputFn = &pImageInput,
+            .visionModelsFn = &pVisionModels,
             .routeFn = &pRoute,
         };
     }
@@ -222,11 +234,35 @@ pub const GeminiClient = struct {
         return null;
     }
     fn pSupports(ctx: *anyopaque, cap: provider_mod.Capability) bool {
-        return capability.supports(.gemini, cast(ctx).model, cap);
+        return cast(ctx).supportsForModel(cap, cast(ctx).model);
     }
     fn pSupportsForModel(ctx: *anyopaque, cap: provider_mod.Capability, model: []const u8) bool {
-        _ = ctx;
-        return capability.supports(.gemini, model, cap);
+        return cast(ctx).supportsForModel(cap, model);
+    }
+    fn pImageInput(ctx: *anyopaque, model: []const u8) image_capability.Resolution {
+        const profile = cast(ctx).dialectFor(model).profileFor(.gemini, model);
+        return .{ .supported = profile.supports_image_input, .source = profile.image_input_source };
+    }
+    fn pVisionModels(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror![]const []const u8 {
+        const catalog = &(cast(ctx).catalog orelse return try allocator.alloc([]const u8, 0));
+        return catalog.visionModels(allocator);
+    }
+
+    /// The dialect for `model` with the Host's or the catalog's image_input
+    /// declaration applied (Host first) - the one profile the serializer's
+    /// gate and every capability query read, as in the Anthropic client.
+    pub fn dialectFor(self: *const GeminiClient, model: []const u8) dialect_mod.Dialect {
+        var dialect = self.dialect_resolver.resolve(.gemini, model);
+        const from_catalog: ?bool = if (self.catalog) |*catalog| catalog.imageInputFor(model) else null;
+        dialect.declareImageInput(self.host_capabilities.imageInputFor(model), from_catalog);
+        return dialect;
+    }
+
+    pub fn supportsForModel(self: *const GeminiClient, cap: provider_mod.Capability, model: []const u8) bool {
+        return switch (cap) {
+            .image_input => self.dialectFor(model).profileFor(.gemini, model).supports_image_input,
+            else => capability.supports(.gemini, model, cap),
+        };
     }
     fn pSend(ctx: *anyopaque, messages: []const types.ApiMessage, system: ?[]const u8, tools: ?[]const json_mod.ToolDefinition, model_override: ?[]const u8) anyerror!provider_mod.ApiResponse {
         _ = ctx;
@@ -257,7 +293,7 @@ pub const GeminiClient = struct {
         var overrides = self.overrides;
         if (overrides.reasoning_effort == null) overrides.reasoning_effort = self.reasoning_effort;
         overrides.tool_choice = tool_choice;
-        const dialect = self.dialect_resolver.resolve(.gemini, model);
+        const dialect = self.dialectFor(model);
         // 图像 tool_result 定案(原生块 / 占位)由序列化器实际报告,随流句柄回传。
         var report = json_mod.SerializationReport{};
         defer report.deinit(self.allocator);
@@ -1511,4 +1547,32 @@ test "issue #269 Gemini: a blocked prompt reports why it stopped without any can
     defer std.testing.allocator.free(text);
     try std.testing.expectEqualStrings("", text);
     try std.testing.expectEqual(StopReason.unknown, stop);
+}
+
+test "GeminiClient: catalog then Host declarations answer image input, Host first (issue #273)" {
+    const a = std.testing.allocator;
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
+    defer io_rt.deinit();
+    var client = GeminiClient.init(a, io_rt.io(), "k", "gemini-2.5-flash", "http://localhost");
+    defer client.deinit();
+    const p = client.provider();
+    // The family table alone.
+    try std.testing.expectEqual(true, p.supports(.image_input));
+    try std.testing.expectEqual(
+        if (true) image_capability.Source.model_family else image_capability.Source.unknown,
+        p.imageInput(null).source,
+    );
+    // A catalog declaration overrides the family table, in both directions.
+    var catalog = catalog_mod.Catalog.init(a);
+    try catalog.loadFromModelsListJson("{\"data\":[{\"id\":\"gemini-2.5-flash\",\"capabilities\":{\"image_input\":{\"supported\":false}}}]}");
+    client.catalog = catalog;
+    try std.testing.expectEqual(!true, p.supports(.image_input));
+    try std.testing.expectEqual(image_capability.Source.catalog, p.imageInput(null).source);
+    try std.testing.expectEqual(!true, client.dialectFor("gemini-2.5-flash").profileFor(.gemini, "gemini-2.5-flash").supports_image_input);
+    // A Host declaration outranks the catalog, for this and any named model.
+    client.host_capabilities = try image_capability.Declarations.init(a, &.{.{ .model = "gemini-2.5-flash", .image_input = true }});
+    try std.testing.expectEqual(true, p.supports(.image_input));
+    try std.testing.expectEqual(image_capability.Source.host, p.imageInput(null).source);
+    // Every name on the Gemini wire is a Gemini-family model.
+    try std.testing.expectEqual(image_capability.Source.model_family, p.imageInput("vendor-unlisted").source);
 }

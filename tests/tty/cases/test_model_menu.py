@@ -4,7 +4,7 @@ import http.server
 import threading
 import json
 
-from tty_driver import run
+from tty_driver import READY, WAIT_S, run, submit, wait_for
 from asserts import TTYAssert
 
 
@@ -153,7 +153,7 @@ def test_tty_model_command_opens_the_route_picker(bin_path):
     try:
         raw = run(
             bin_path,
-            ["sleep:1.0", "type:/model", "key:enter", "sleep:0.6"],
+            submit("/model", "Provider"),
             base_url=base_url,
             env={"METACODES_NO_PROBE": None},
             startup_drain=1.2,
@@ -178,15 +178,13 @@ def test_tty_model_picker_commits_a_route_and_switches(bin_path):
     try:
         raw = run(
             bin_path,
-            [
-                "sleep:1.0",
-                "type:/model",
+            # 每一阶段等它的标题上屏再按下一个键(Model 用整行匹配:Provider 阶段的
+            # `metask 16 models` 是小写,但别让子串碰运气)。
+            submit("/model", "Provider") + [
                 "key:enter",
-                "sleep:0.6",
+                f"waitline:Model:{WAIT_S}",
                 "key:enter",
-                "sleep:0.4",
-                "key:enter",
-                "sleep:0.8",
+                wait_for("switched to"),
             ],
             base_url=base_url,
             env={"METACODES_NO_PROBE": None},
@@ -213,13 +211,14 @@ def test_tty_models_after_model_selection_shows_reasoning_default_none(bin_path)
         raw = run(
             bin_path,
             [
-                "sleep:1.0",
+                READY,
                 "type:/models",
+                wait_for("Dev key"),
                 "key:down",
                 "key:enter",
-                "sleep:0.4",
+                wait_for(DEV_MODEL),
                 "key:enter",
-                "sleep:0.5",
+                wait_for("Reasoning effort"),
             ],
             base_url=base_url,
             env={"METACODES_NO_PROBE": None},
@@ -243,7 +242,7 @@ def test_tty_models_first_shows_account_api_keys_not_model_list(bin_path):
     try:
         raw = run(
             bin_path,
-            ["sleep:1.0", "type:/models", "sleep:0.5"],
+            [READY, "type:/models", wait_for("Dev key")],
             base_url=base_url,
             env={"METACODES_NO_PROBE": None},
             startup_drain=1.2,
@@ -273,19 +272,20 @@ def test_tty_models_selects_api_key_then_model_and_answers_with_selected_key(bin
         raw = run(
             bin_path,
             [
-                "sleep:1.0",
+                READY,
                 "type:/models",
-                "sleep:0.3",
+                wait_for("Dev key"),
                 "key:down",
                 "key:enter",
-                "sleep:0.5",
+                wait_for(DEV_MODEL),
                 "key:enter",
-                "sleep:0.5",
+                wait_for("Reasoning effort"),
                 "key:enter",
-                "sleep:0.5",
+                # 这一下提交 `/model use ...`:等新的空输入框起来再打字。
+                READY,
                 "type:ping",
                 "key:enter",
-                "sleep:1.5",
+                wait_for("answer ok from selected key"),
             ],
             base_url=base_url,
             env={"METACODES_NO_PROBE": None},

@@ -11,7 +11,7 @@ artifact store, and TinyKG admission are not replaceable extensions.
 | CLI | `metacodes-<version>-<target-id>/bin/metacodes` (the release unit, `release/LAYOUT.md`; `zig-out/bin/metacodes` in a development tree) | pre-1.0 | flags may evolve with changelog notice; `manifest.json` records version, commit, target, contract numbers and every file's digest |
 | Provider control plane | `src/provider/` kernel API | experimental | schema-versioned documents and revisioned mutations |
 | Zig source API | `@import("metacodes-core")` | experimental | pin repository commit and Zig toolchain |
-| AgentCore C ABI | `metask_agentcore_get_api(1)` | experimental rev 20 | exact root/child layouts and bundle manifest |
+| AgentCore C ABI | `metask_agentcore_get_api(1)` | experimental rev 23 | exact root/child layouts and bundle manifest |
 | Process plugins | strict manifest + stdio protocol | versioned v1 | reject unknown fields and digest drift |
 | Plugin inventory | `--dump-plugins`, Zig, Web state | versioned v1 | additive observation fields only where specified |
 | TinyKG executable distribution | `vendor/tinykg/manifest.json` | bundle v1 | exact target, format, source commit, and SHA-256 pinning |
@@ -272,18 +272,27 @@ form (`Dialect.serializeImagePart`): Anthropic emits a base64 `image` source
 block, OpenAI-compatible endpoints emit an `image_url` data URL content part
 (the Responses protocol emits `input_image`), and Gemini emits an
 `inline_data` part. Capability is per-model data
-(`ModelProfile.supports_image_input`, queryable as `Capability.image_input`):
-a model without vision fails the request with `error.ImageInputUnsupported`
-before any network I/O — images are never silently dropped, OCR'd, or
-replaced with placeholder text. The truth has two layers, resolved in
-`Client.dialectFor`: the provider's `/v1/models` catalog
+(`ModelProfile.supports_image_input` with `ModelProfile.image_input_source`,
+queryable as `Capability.image_input` or, with its source, as
+`Provider.imageInput`): a model without vision fails a request carrying an
+image in user input with `error.ImageInputUnsupported` before any network
+I/O — an image in user input is never silently dropped, OCR'd, or replaced
+with placeholder text (an image *tool result* that cannot be sent becomes an
+explicit placeholder; see below). The truth has three layers, resolved in each
+client's `dialectFor` (Anthropic, OpenAI and Gemini alike) through
+`Dialect.declareImageInput`: a Host declaration
+(`SessionConfig.model_capabilities`, or `SessionHostConfigV1.model_capabilities`
+over the AgentCore ABI) outranks the provider's `/v1/models` catalog
 (`capabilities.image_input.supported`, parsed into `api/catalog.zig`
-`Entry.image_input` and applied as `Dialect.image_input_override`) wins
-whenever it declares the model; otherwise `model_adapter.knownVisionFamily`
-decides from the model *family* regardless of wire protocol (a `gpt-5.x`,
-`gemini-*`, `qwen*-vl` or `glm-4.Nv` name is vision on an Anthropic-compatible
-route too, issue #112), and unknown names fail closed. `Provider.supportsForModel`
-answers the same question for a subagent's `model_override`. Image blocks round-trip through the JSONL
+`Entry.image_input`), which outranks the model *family* table
+(`model_adapter.familyImageInput`, regardless of wire protocol: a `gpt-5.x`,
+`gemini-*`, `qwen*-vl`, `glm-4.Nv` or `MiniMax-M3` name is vision on an
+Anthropic-compatible route too, issue #112). The family table answers "no"
+only for families it knows to be text-only; a name nothing covers is
+`image_input_source == .unknown` and fails closed (issue #273: an unknown
+route can drop an image without an error, so it is not sent on a guess).
+`Provider.supportsForModel` and `Provider.imageInput` answer the same question
+for a subagent's `model_override`. Image blocks round-trip through the JSONL
 transcript and the AgentCore checkpoint (block tag 5), so restored sessions
 resend the original bytes.
 
@@ -663,7 +672,7 @@ non-null value with `error.AgentEffortUnsupportedProvider`.
 `WorkspaceConfig.additional_dirs` widens exactly what the workspace root grants:
 `accept_edits` auto-approval of Write/Edit/NotebookEdit and sandboxed shell
 writes. It is not named in the system prompt. These two are source-level only;
-AgentCore revision 20 does not carry them.
+AgentCore revision 23 does not carry them.
 
 ### Permission modes the settings disable
 
@@ -863,15 +872,16 @@ The source-free bundle is one coordinate root: `sdk/metask/agentcore.h`
 (C11/C++17), the `sdk/zig` and `sdk/rust` bindings, one target-specific static
 library, the manifest-pinned ripgrep runtime asset, and a manifest whose file
 allow-list and SHA-256 values are mandatory. Consumers call only
-`metask_agentcore_get_api(METASK_AGENTCORE_ABI_V1)` and must validate ABI revision 20,
-the exact 64-byte root, all five mandatory typed tables, reserved zeros, function
+`metask_agentcore_get_api(METASK_AGENTCORE_ABI_V1)` and must validate ABI revision 23,
+the exact 72-byte root, all six mandatory typed tables, reserved zeros, function
 slots, and the schema-1 bundle manifest. The ABI is experimental, with no
 compatibility shim between revisions: pin a bundle, not only a semantic version.
-What the five tables cover, provider protocol selection, the `on_event`
+What the six tables cover, provider protocol selection, the `on_event`
 observation stream and its visible-output tags, input submitted to an active
 Run (`session->submit_input`, the `input_adopted` event and the `RunResultV1`
-input counts), process plugins, Host streaming tools, journal profiles, and the
-Completion boundary are specified once in
+input counts), the Session goal (the `goal` table, goal-continuation Runs, the
+`goal_updated` event), process plugins, Host streaming tools, journal profiles,
+and the Completion boundary are specified once in
 [AGENTCORE_BINARY_ABI.md](AGENTCORE_BINARY_ABI.md) and not repeated here.
 
 ## Tool result contract
@@ -929,7 +939,29 @@ renders the same system prompt on every Run, and replacing it while idle is one
 deliberate cache boundary, announced by the next Run's `prompt_manifest`.
 Volatile Host facts (the date, page state) belong in per-Run context blocks,
 which join the conversation as user-role content after the existing history, so
-they extend the cached prefix instead of moving the system prompt.
+they extend the cached prefix instead of moving the system prompt. The date is
+supplied by default (issue #276): AgentCore leads each Run's context with a
+`currentDate` block in the process's time zone, or in a UTC offset the Host
+gives per Run (`RunOptionsV1.time_context_code` / `utc_offset_minutes`); a Host
+`currentDate` block replaces it, and `TIME_CONTEXT_OFF` drops it. The CLI's
+user-context message always states the session's start date and zone, and the
+first Run on a later local date gets one "the date has changed" notice in that
+turn (`agent_loop.Options.time_announcer`). Source-level Hosts build the same
+text with `core.time_context` (`systemZone`, `Zone.fromHostOffset`, `today`).
+
+A Session goal (issue #277) is one objective with an optional token budget.
+`core.goal` owns its rules: the transition table (`State.apply`, `update`), and
+the `Meter` the agent loop charges per provider response (non-cached input plus
+output, automatic compaction included) for every Run that began on an active
+goal, however the Run ends. A budget used up mid-Run makes the goal
+`budget_limited` and asks the model, once, at the next turn boundary to wrap
+up; the Run is not cut off. `AgentSession` owns a goal (`setGoal`,
+`updateGoal`, `clearGoal`, `currentGoal`), charges it on every Run, and emits
+`CoreEvent.goal_updated`; AgentCore exposes it as the `goal` table and the
+`RUN_INPUT_GOAL_CONTINUATION` input kind. The CLI's `/goal` and `/loop` use the
+same rules, and every CLI entry point - REPL, web, daemon, forked Skills,
+headless - charges the App's goal through `session_service.buildRunOptions` and
+writes goal.json when it changes.
 
 ## Errors and ownership
 

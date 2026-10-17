@@ -34,6 +34,7 @@ const sync = @import("platform").sync;
 
 pub const ProviderKind = model_adapter.ProviderKind;
 pub const ModelProfile = model_adapter.ModelProfile;
+pub const ImageInputSource = @import("image_capability.zig").Source;
 pub const ReasoningEffort = types.ReasoningEffort;
 
 /// Provider-visible, request-scoped capabilities. This is deliberately typed:
@@ -335,6 +336,10 @@ pub const Dialect = struct {
     /// 不同路由上能力不同,名字猜不出来)。由持有目录的 client 在 resolve 之后填入;
     /// `profileFor` 是唯一的读取点,序列化守门(serializeImagePart)与能力查询自然同源。
     image_input_override: ?bool = null,
+    /// Who made `image_input_override`: the provider catalog or the Host
+    /// (issue #273). Recorded on the profile so a refusal can say whether a
+    /// declaration or the family table answered.
+    image_input_override_source: ImageInputSource = .catalog,
 
     /// 便利转发:inline 调对应方法(免调用方写 `dialect.serializeThinkingFn(dialect.ctx, ...)`)。
     pub fn serializeThinking(self: Dialect, p: ModelProfile, effort: ?ReasoningEffort, out: *std.ArrayList(u8), a: std.mem.Allocator) !void {
@@ -376,9 +381,23 @@ pub const Dialect = struct {
         if (!p.supports_image_input) return false;
         return try self.serializeImagePartFn(self.ctx, p, image, out, a);
     }
+    /// Applies the declarations about one model's image input, the Host's over
+    /// the catalog's; with neither, the family table answers (issue #273).
+    pub fn declareImageInput(self: *Dialect, host: ?bool, catalog: ?bool) void {
+        if (host) |declared| {
+            self.image_input_override = declared;
+            self.image_input_override_source = .host;
+        } else if (catalog) |declared| {
+            self.image_input_override = declared;
+            self.image_input_override_source = .catalog;
+        }
+    }
     pub fn profileFor(self: Dialect, kind: ProviderKind, model: []const u8) ModelProfile {
         var profile = self.profileFn(self.ctx, kind, model);
-        if (self.image_input_override) |declared| profile.supports_image_input = declared;
+        if (self.image_input_override) |declared| {
+            profile.supports_image_input = declared;
+            profile.image_input_source = self.image_input_override_source;
+        }
         return profile;
     }
 
@@ -1072,6 +1091,12 @@ test "Dialect.image_input_override: 目录声明覆盖家族表,null 保持家�
     try std.testing.expect(c.profileFor(.anthropic, "claude-sonnet-4-20250514").supports_image_input);
     c.image_input_override = false;
     try std.testing.expect(!c.profileFor(.anthropic, "claude-sonnet-4-20250514").supports_image_input);
+    // The profile names who answered (issue #273): the catalog by default, the
+    // Host when the client says so; without an override, the family table.
+    try std.testing.expectEqual(ImageInputSource.catalog, c.profileFor(.anthropic, "claude-sonnet-4-20250514").image_input_source);
+    c.image_input_override_source = .host;
+    try std.testing.expectEqual(ImageInputSource.host, c.profileFor(.anthropic, "claude-sonnet-4-20250514").image_input_source);
+    try std.testing.expectEqual(ImageInputSource.unknown, dialectFor(.anthropic, "glm-5.3-flash").profileFor(.anthropic, "vendor-new").image_input_source);
     // 守门 wrapper 读的是同一个 profile:override=false 时 serializeImagePart 返 false 且不写字节。
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(std.testing.allocator);

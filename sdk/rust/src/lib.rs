@@ -16,7 +16,7 @@ pub enum AbiError {
     LengthOverflow,
 }
 
-/// Validated Revision 20 root plus mandatory domain tables. Discovery rejects
+/// Validated Revision 22 root plus mandatory domain tables. Discovery rejects
 /// every other layout; there is no legacy probe or alternate dispatch.
 #[derive(Clone, Copy)]
 pub struct Api {
@@ -60,6 +60,7 @@ impl Api {
             || !unsafe { validate_session_control_api(table.session_control) }
             || !unsafe { validate_skill_api(table.skill) }
             || !unsafe { validate_mcp_api(table.mcp) }
+            || !unsafe { validate_goal_api(table.goal) }
         {
             return Err(AbiError::UnsupportedAbi);
         }
@@ -110,6 +111,13 @@ impl Api {
     pub fn mcp(self) -> McpApi {
         McpApi {
             raw: NonNull::new(self.table().mcp.cast_mut()).expect("validated MCP API"),
+        }
+    }
+
+    /// Revision 23: the Session's goal.
+    pub fn goal(self) -> GoalApi {
+        GoalApi {
+            raw: NonNull::new(self.table().goal.cast_mut()).expect("validated Goal API"),
         }
     }
 }
@@ -252,6 +260,45 @@ impl McpApi {
     pub fn update_selection(self) -> raw::metask_agentcore_session_update_mcp_fn_v1 {
         self.table().update_selection
     }
+}
+
+#[derive(Clone, Copy)]
+pub struct GoalApi {
+    raw: NonNull<raw::metask_agentcore_goal_api_v1>,
+}
+
+impl GoalApi {
+    fn table(self) -> &'static raw::metask_agentcore_goal_api_v1 {
+        unsafe { self.raw.as_ref() }
+    }
+
+    pub fn get(self) -> raw::metask_agentcore_goal_get_fn_v1 {
+        self.table().get
+    }
+    pub fn set(self) -> raw::metask_agentcore_goal_set_fn_v1 {
+        self.table().set
+    }
+    pub fn update(self) -> raw::metask_agentcore_goal_update_fn_v1 {
+        self.table().update
+    }
+    pub fn clear(self) -> raw::metask_agentcore_goal_clear_fn_v1 {
+        self.table().clear
+    }
+}
+
+unsafe fn validate_goal_api(ptr: *const raw::metask_agentcore_goal_api_v1) -> bool {
+    if ptr.is_null()
+        || (ptr as usize) % std::mem::align_of::<raw::metask_agentcore_goal_api_v1>() != 0
+    {
+        return false;
+    }
+    let table = unsafe { &*ptr };
+    table.struct_size as usize == size_of::<raw::metask_agentcore_goal_api_v1>()
+        && table.reserved0 == 0
+        && table.get.is_some()
+        && table.set.is_some()
+        && table.update.is_some()
+        && table.clear.is_some()
 }
 
 unsafe fn validate_runtime_api(ptr: *const raw::metask_agentcore_runtime_api_v1) -> bool {
@@ -617,7 +664,7 @@ mod tests {
 
     #[test]
     fn revision_fifteen_layout_codes_and_host_buffer_helpers_are_exact() {
-        assert_eq!(raw::METASK_AGENTCORE_ABI_REVISION, 20);
+        assert_eq!(raw::METASK_AGENTCORE_ABI_REVISION, 23);
         assert_eq!(raw::METASK_AGENTCORE_MAX_SUBMITTED_INPUTS_V1, 64);
         assert_eq!(raw::METASK_AGENTCORE_MAX_SUBMITTED_INPUT_BYTES_V1, 16_777_216);
         assert_eq!(size_of::<raw::metask_agentcore_submitted_input_v1>(), 48);
@@ -638,6 +685,16 @@ mod tests {
         );
         assert_eq!(raw::METASK_AGENTCORE_STATUS_SKILL_CATALOG_INCOMPLETE, 27);
         assert_eq!(raw::METASK_AGENTCORE_STATUS_IMAGE_INPUT_UNSUPPORTED, 28);
+        assert_eq!(raw::METASK_AGENTCORE_STATUS_IMAGE_INPUT_CAPABILITY_UNKNOWN, 29);
+        assert_eq!(raw::METASK_AGENTCORE_CAPABILITY_SUPPORTED, 1);
+        assert_eq!(raw::METASK_AGENTCORE_CAPABILITY_UNSUPPORTED, 2);
+        assert_eq!(raw::METASK_AGENTCORE_MAX_MODEL_CAPABILITIES_V1, 256);
+        assert_eq!(raw::METASK_AGENTCORE_MAX_MODEL_CAPABILITY_MODEL_BYTES_V1, 256);
+        assert_eq!(size_of::<raw::metask_agentcore_model_capability_v1>(), 40);
+        assert_eq!(
+            size_of::<raw::metask_agentcore_session_host_config_v1>(),
+            168
+        );
         assert_eq!(raw::METASK_AGENTCORE_RUN_INPUT_MULTIMODAL, 3);
         assert_eq!(raw::METASK_AGENTCORE_RUN_INPUT_PART_TEXT, 1);
         assert_eq!(raw::METASK_AGENTCORE_RUN_INPUT_PART_IMAGE, 2);
@@ -668,7 +725,10 @@ mod tests {
         );
         assert_eq!(size_of::<raw::metask_agentcore_skill_api_v1>(), 32);
         assert_eq!(size_of::<raw::metask_agentcore_mcp_api_v1>(), 40);
-        assert_eq!(size_of::<raw::metask_agentcore_api_v1>(), 64);
+        assert_eq!(size_of::<raw::metask_agentcore_goal_api_v1>(), 40);
+        assert_eq!(size_of::<raw::metask_agentcore_goal_set_v1>(), 56);
+        assert_eq!(size_of::<raw::metask_agentcore_goal_update_v1>(), 64);
+        assert_eq!(size_of::<raw::metask_agentcore_api_v1>(), 72);
         assert_eq!(
             size_of::<raw::metask_agentcore_process_plugin_source_v1>(),
             48

@@ -499,7 +499,8 @@ fn pendingRequestFn(
 }
 var pending_requester_dummy: u8 = 0;
 
-fn buildOptions(
+/// The headless Run's Options (pub for the App-level wiring tests).
+pub fn buildOptions(
     app: *app_mod.App,
     scoped_recall: ?[]const u8,
     request_gate: ?request_gate_mod.Gate,
@@ -568,6 +569,8 @@ fn buildOptions(
         .tool_defs = app.tool_defs,
         .system_prompt = app.system_prompt,
         .inject_user_context = app.user_context,
+        .time_announcer = if (app.time_announcer) |*announcer| announcer else null,
+        .goal_meter = if (app.goal_meter) |*meter| meter else null,
         .synthetic_user_input = scoped_recall,
         .dyn_registry = &app.dyn_registry,
         .host_services = app.hostServices(),

@@ -100,7 +100,7 @@ test "L2: AutoMem 索引 → 首条 user message(经 user_context.build)" {
         .cwd = "",
         .home = "",
         .auto_mem = "# Memory Index\n- [ProjGoal](goal.md) — ship memory system",
-    })).?;
+    }));
     defer a.free(uc);
 
     var conv = cc.conversation.Conversation.init(a);

@@ -121,7 +121,7 @@ dylib 加载，也不把活跃 Session 的 catalog 改写为新代。
 `Registrar.provide(T, local_name, pointer, cleanup)`，consumer 只有在 descriptor 的
 `requires` 明确包含 provider 时，才能用相同 `T` 与 key 调用 `require`。解析发生在
 依赖拓扑序 activation 中；consumer 把返回指针注入自己的 Host tool/context，commit
-之后没有可变 service lookup。该能力不进入 AgentCore v1 revision 20 C ABI，也不暴露任何内核
+之后没有可变 service lookup。该能力不进入 AgentCore v1 revision 23 C ABI，也不暴露任何内核
 service。
 
 `advisory_hook` capability 接受一个 `StaticPlugin.advisory_policy`。它是同步、借用、
@@ -277,6 +277,43 @@ journal 的 `run_started.prompt` 记下它；与上一个 Run 不同时，Run �
 Host 事实不写进档案：`core.context_blocks` 把它们渲染成一条 `<system-reminder>`，
 作为该 Run 用户记录的首段进入 Conversation。
 
+### 日期与时区
+
+`core.time_context`（issue #276）给模型"今天是哪天、什么时区"：`systemZone(now)` 取进程时区
+（POSIX 经 libc `localtime_r`，Windows 经动态时区信息；拿不到则 UTC 并标明时区未知），
+`Zone.fromHostOffset(minutes)` 用 Host 给的 UTC 偏移（±14:00 内），`today(allocator, now, &zone)`
+产出 `Today's date is 2026-10-17 (Saturday). Time zone: Asia/Shanghai (UTC+08:00).`，
+`label`（`currentDate`）是对应 context block 的标签。源码级 Host 用它构造每个 Run 的 block；
+AgentCore 已默认这样做。CLI 的 `Announcer` 记住模型看到的日期，跨过本地午夜后的第一个 Run
+追加一次"日期已变"提示（`agent_loop.Options.time_announcer`），提示离开活跃窗口后会再给。
+
+### Session 目标
+
+`core.goal`（issue #277）是 Session 的一个目标：目标文本（trim 后 1..4000 个码点的 UTF-8）、
+可选 token 预算、六种状态。规则只在这里：`State.apply(.pause | .activate | .complete | .block)`
+按转移表执行，拒绝（`GoalNotActive` / `BudgetExhausted` / `GoalComplete`）不改任何东西；
+`State.update(.{ .objective, .token_budget, .action })` 三者要么全生效要么全不生效。
+`Meter` 由 `agent_loop.Options.goal_meter` 接入：Run 开始时目标为 active 才计账，按每个
+provider 响应累加非缓存输入 + 输出（含自动压缩），Run 结束（无论怎么结束）累加耗时；
+中途用完预算则转 `budget_limited`、发 `CoreEvent.goal_updated`，并在下一回合边界提醒模型
+收尾一次，不截断 Run。`continuationPrompt(allocator, goal)` 是续跑 Run 的输入文本。
+
+`AgentSession` 自带目标与 Meter：`setGoal(objective, budget)` / `updateGoal(changes)` /
+`clearGoal()` 只在空闲时可调（运行中 `error.SessionBusy`），`currentGoal()` 在调用方保持
+Session 不变更期间有效；每个 Run 自动计账，checkpoint 恢复（`RestoredSessionState.goal`）
+带回同一目标与用量。AgentCore 的 `goal` 表与 `RUN_INPUT_GOAL_CONTINUATION` 就是它的封装。
+
+### 模型能力声明
+
+`SessionConfig.model_capabilities`（`[]const core.image_capability.Declaration`，
+`{model, image_input}`）是 Host 对自己路由上模型是否收图的声明（issue #273），借用一次、
+复制进 Session；同一模型（忽略大小写）出现两次时创建以 `error.DuplicateModel` 失败。
+声明压过 provider 目录与内置家族表，对 Session 当前模型、每个 `setModel` 目标和工具用的
+provider 都生效。`Provider.imageInput(model_override)` 返回 `{supported, source}`，`source`
+是 `host` / `catalog` / `model_family` / `unknown`——`unknown` 表示没有任何来源说过，
+按不支持拒绝，但与"已知不支持"区分开。`setModel` 重建 provider 时沿用 Session 的
+`auth_scheme` 与这份声明。
+
 ### Session 范围的权限与 transcript 持久化
 
 权限与工作区跟着 Session 走：`SessionConfig` 的 `workspace`（root/home/state_root/
@@ -344,10 +381,10 @@ admission。
 AgentCore 面向不把 metacodes 源码加入构建图的原生 Host(C11 / C++17 / Zig /
 Rust:同一 C Header + 静态库 + bindings)。消费入口只有
 `metask_agentcore_get_api(uint32_t requested_abi)`。
-当前是实验性的 ABI v1 revision 20。Host 必须同时校验 abi version、精确
+当前是实验性的 ABI v1 revision 23。Host 必须同时校验 abi version、精确
 revision、64 字节根表、五张必选 typed 子表、reserved fields 和 manifest hash;
 不存在静默降级或旧 revision shim。
-revision 20 只有一个 `runtime->create`;它的 nullable `plugins` 参数、Host 流式
+revision 23 只有一个 `runtime->create`;它的 nullable `plugins` 参数、Host 流式
 工具、MCP 流式响应、journal profile,以及全部 ownership、回调重入、Session
 poison、并发与持久化语义,只以同 revision 的 Header 与
 [`AGENTCORE_BINARY_ABI.md`](AGENTCORE_BINARY_ABI.md)(Contract 一节及其子节)
@@ -371,7 +408,7 @@ agentcore:gate`)的命令、库文件名与按 target 的发布状态矩阵,见
 | 浏览器/桌面壳 | Web HTTP + SSE + typed request 回填；跨进程的行格式用 `protocol.wire` |
 | 按 id 动态开关多个 Session 的网络宿主(云端、多标签 GUI) | `session_host.SessionHost`(见 API.md "SessionHost") + 宿主自己的传输与认证 |
 | 不带源码的 C/C++/Zig/Rust 原生产品 | 精确 pinned AgentCore bundle |
-| 显式信任的可执行工具插件 | `--process-plugin-dir`、Zig `RuntimeConfig.process_plugins`，或 AgentCore v1 revision 20 `runtime->create(..., plugins, ...)`；见 `PLUGIN_PROCESS_PROTOCOL.md` |
+| 显式信任的可执行工具插件 | `--process-plugin-dir`、Zig `RuntimeConfig.process_plugins`，或 AgentCore v1 revision 23 `runtime->create(..., plugins, ...)`；见 `PLUGIN_PROCESS_PROTOCOL.md` |
 | 不可信/多租户可执行插件 | 暂不支持；process v1 是故障/资源边界，不是 OS sandbox |
 
 这些入口改变的是 Host 表达和扩展组合，不是 agent loop 的因果所有权。

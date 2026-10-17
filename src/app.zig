@@ -486,6 +486,10 @@ pub const App = struct {
     tasks: TaskStore,
     /// Session-scoped objective state for /goal and /loop.
     goal_state: GoalState,
+    /// Issue #277: charges `goal_state` for every Run on this App - REPL,
+    /// web, daemon, headless alike - and writes goal.json when it changes.
+    /// Set once `app` has its final address.
+    goal_meter: ?@import("core/goal.zig").Meter = null,
     /// User-controlled automatic continuation. /loop on sets enabled + remaining budget;
     /// the REPL starts continuations only from idle boundaries via agent_loop.run().
     loop_enabled: bool = false,
@@ -496,6 +500,9 @@ pub const App = struct {
     /// init 时构建一次(memoize),agent_loop 每轮 prepend。owned;deinit free。
     /// null = 无记忆内容 / CLAUDE_CODE_DISABLE_CLAUDE_MDS。
     user_context: ?[]u8 = null,
+    /// Issue #276: the date `user_context` states and the date the model was
+    /// last told; runs announce a later local date once (agent_loop).
+    time_announcer: ?@import("core/time_context.zig").Announcer = null,
     /// 运行时工具表（Skill + MCP 工具都注册到这里）。
     dyn_registry: DynRegistry,
     /// 已连接的 MCP server。每个 owns 一个 McpClient + McpSession（一一对应）。
@@ -828,6 +835,7 @@ pub const App = struct {
                 app.api_client.catalog.loadFromModelsListJson(fetched.body) catch |err| {
                     @import("util/log.zig").debug("catalog", "Metask client catalog parse failed: {s}", .{@errorName(err)});
                 };
+                app.syncClientCatalogs();
                 // No snapshot refresh here: the registry and swarm do not exist yet; their
                 // first snapshot is taken from the fully loaded catalog at registry init below.
             };
@@ -970,12 +978,24 @@ pub const App = struct {
             break :blk (idx orelse &.{});
         };
         defer if (auto_mem.len > 0) allocator.free(auto_mem);
+        // One instant and zone for the session-start date text and the
+        // announcer that tracks what the model was told since (issue #276).
+        const time_context = @import("core/time_context.zig");
+        const session_start = @import("util/time.zig").nowUnix();
+        const session_zone = time_context.systemZone(session_start);
+        app.time_announcer = time_context.Announcer.init(session_start, &session_zone, time_context.Announcer.defaultNow);
+        app.goal_meter = .{
+            .state = &app.goal_state,
+            .observer = .{ .ctx = app, .changed = goalChanged },
+        };
         app.user_context = @import("core/memory/user_context.zig").build(allocator, .{
             .cwd = app.cwdAbs(),
             .home = app.homeDir(),
             .state_root = app.stateRoot(),
             .auto_mem = auto_mem,
             .kg_summary = app.kg_summary,
+            .now = session_start,
+            .zone = session_zone,
         }) catch |err| blk: {
             @import("util/log.zig").warn("memory", "user_context build failed: {s}", .{@errorName(err)});
             break :blk null;
@@ -1741,8 +1761,26 @@ pub const App = struct {
         app.models_picker_key_index = idx;
     }
 
+    /// The OpenAI and Gemini clients keep their own copy of the parent catalog,
+    /// so its image_input declarations reach their serializers and capability
+    /// answers as they reach the Anthropic client's (issue #273). A failed
+    /// copy keeps the previous one: the family table still answers.
+    fn syncClientCatalogs(app: *App) void {
+        inline for (.{ &app.openai_client, &app.gemini_client }) |slot| {
+            if (slot.*) |*client| sync: {
+                const copy = app.api_client.catalog.clone(app.allocator) catch |err| {
+                    @import("util/log.zig").warn("catalog", "client catalog copy failed: {s}", .{@errorName(err)});
+                    break :sync;
+                };
+                if (client.catalog) |*old| old.deinit();
+                client.catalog = copy;
+            }
+        }
+    }
+
     /// Refresh worker-owned catalog snapshots after the mutable parent catalog changes.
     fn refreshChildCatalogSnapshots(app: *App) !void {
+        app.syncClientCatalogs();
         const source = @import("api/model_limits.zig").ModelLimitsSource{
             .catalog = &app.api_client.catalog,
             .model_context = &app.model_context,
@@ -2006,6 +2044,11 @@ pub const App = struct {
     /// Agent loop 每轮结束后调用一次，把 conversation 新增的 message 刷到 transcript。
     pub fn persistTranscript(app: *App) void {
         if (app.transcript_writer) |*w| w.flush(&app.conversation);
+    }
+
+    fn goalChanged(raw: *anyopaque, _: *const GoalState, _: @import("core/goal.zig").Meter.Change) void {
+        const app: *App = @ptrCast(@alignCast(raw));
+        app.persistGoal();
     }
 
     /// Persist the current /goal state into the active session directory.

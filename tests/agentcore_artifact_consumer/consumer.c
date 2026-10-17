@@ -6,10 +6,10 @@
 #include <string.h>
 
 #if defined(METASK_AGENTCORE_CALLBACK_CONTINUE) || defined(METASK_AGENTCORE_CALLBACK_FATAL)
-#error "revision 20 must not retain historical callback aliases"
+#error "revision 23 must not retain historical callback aliases"
 #endif
 
-#if METASK_AGENTCORE_ABI_REVISION != 20u || \
+#if METASK_AGENTCORE_ABI_REVISION != 23u || \
     METASK_AGENTCORE_MAX_SUBMITTED_INPUTS_V1 != 64u || \
     METASK_AGENTCORE_MAX_SUBMITTED_INPUT_BYTES_V1 != 16777216u || \
     METASK_AGENTCORE_PROMPT_OP_ADD != 1u || \
@@ -18,6 +18,16 @@
     METASK_AGENTCORE_MAX_CONTEXT_BLOCKS_V1 != 32u || \
     METASK_AGENTCORE_STATUS_SKILL_CATALOG_INCOMPLETE != 27u || \
     METASK_AGENTCORE_STATUS_IMAGE_INPUT_UNSUPPORTED != 28u || \
+    METASK_AGENTCORE_STATUS_IMAGE_INPUT_CAPABILITY_UNKNOWN != 29u || \
+    METASK_AGENTCORE_CAPABILITY_SUPPORTED != 1u || \
+    METASK_AGENTCORE_CAPABILITY_UNSUPPORTED != 2u || \
+    METASK_AGENTCORE_MAX_MODEL_CAPABILITIES_V1 != 256u || \
+    METASK_AGENTCORE_MAX_MODEL_CAPABILITY_MODEL_BYTES_V1 != 256u || \
+    METASK_AGENTCORE_TIME_CONTEXT_SYSTEM != 0u || \
+    METASK_AGENTCORE_TIME_CONTEXT_UTC_OFFSET != 1u || \
+    METASK_AGENTCORE_TIME_CONTEXT_OFF != 2u || \
+    METASK_AGENTCORE_MIN_UTC_OFFSET_MINUTES_V1 != -840 || \
+    METASK_AGENTCORE_MAX_UTC_OFFSET_MINUTES_V1 != 840 || \
     METASK_AGENTCORE_RUN_INPUT_MULTIMODAL != 3u || \
     METASK_AGENTCORE_RUN_INPUT_PART_TEXT != 1u || \
     METASK_AGENTCORE_RUN_INPUT_PART_IMAGE != 2u || \
@@ -34,8 +44,19 @@
     METASK_AGENTCORE_MCP_ERA_2025_06_18 != 3u || \
     METASK_AGENTCORE_MCP_APPLY_APPLIED != 1u || \
     METASK_AGENTCORE_MCP_APPLY_SUPERSEDED != 2u || \
-    METASK_AGENTCORE_MCP_APPLY_REJECTED != 3u
-#error "source-free Revision 20 codes must match the public contract"
+    METASK_AGENTCORE_MCP_APPLY_REJECTED != 3u || \
+    METASK_AGENTCORE_STATUS_GOAL_CONFLICT != 30u || \
+    METASK_AGENTCORE_RUN_INPUT_GOAL_CONTINUATION != 4u || \
+    METASK_AGENTCORE_GOAL_FIELD_OBJECTIVE != 1u || \
+    METASK_AGENTCORE_GOAL_FIELD_TOKEN_BUDGET != 2u || \
+    METASK_AGENTCORE_GOAL_FIELD_ACTION != 4u || \
+    METASK_AGENTCORE_GOAL_ACTION_PAUSE != 1u || \
+    METASK_AGENTCORE_GOAL_ACTION_ACTIVATE != 2u || \
+    METASK_AGENTCORE_GOAL_ACTION_COMPLETE != 3u || \
+    METASK_AGENTCORE_GOAL_ACTION_BLOCK != 4u || \
+    METASK_AGENTCORE_MAX_GOAL_OBJECTIVE_CODEPOINTS_V1 != 4000u || \
+    METASK_AGENTCORE_MAX_GOAL_OBJECTIVE_BYTES_V1 != 16384u
+#error "source-free Revision 23 codes must match the public contract"
 #endif
 
 #ifdef _WIN32
@@ -168,6 +189,10 @@ struct test_server {
     int result;
     int rounds;
     struct needle_scan scan;
+    /* Revision 22: the runtime's time context for the UTC-offset Run. */
+    struct needle_scan time_scan;
+    /* Revision 23: the input the runtime writes for a goal continuation. */
+    struct needle_scan goal_scan;
 };
 
 static int socket_is_valid(socket_handle fd) {
@@ -213,7 +238,9 @@ static int write_all(socket_handle fd, const void *bytes, size_t len) {
     return 0;
 }
 
-static int read_request(socket_handle fd, struct needle_scan *scan) {
+static int read_request(socket_handle fd, struct needle_scan *scan,
+                        struct needle_scan *time_scan,
+                        struct needle_scan *goal_scan) {
     char header[64 * 1024 + 1];
     size_t total = 0;
     char *end = NULL;
@@ -226,6 +253,8 @@ static int read_request(socket_handle fd, struct needle_scan *scan) {
     }
     if (end == NULL) return -1;
     scan_feed(scan, header, total);
+    scan_feed(time_scan, header, total);
+    scan_feed(goal_scan, header, total);
     size_t header_len = (size_t)(end - header) + 4;
     size_t content_len = 0;
     char *length = strstr(header, "Content-Length:");
@@ -237,6 +266,8 @@ static int read_request(socket_handle fd, struct needle_scan *scan) {
         int count = socket_read(fd, discard, needed < sizeof(discard) ? needed : sizeof(discard));
         if (count <= 0) return -1;
         scan_feed(scan, discard, (size_t)count);
+        scan_feed(time_scan, discard, (size_t)count);
+        scan_feed(goal_scan, discard, (size_t)count);
         body_read += (size_t)count;
     }
     return 0;
@@ -270,7 +301,9 @@ static void *serve_rounds(void *raw) {
             server->result = -1;
             THREAD_RETURN;
         }
-        if (!socket_is_valid(client) || read_request(client, &server->scan) != 0) {
+        if (!socket_is_valid(client) ||
+            read_request(client, &server->scan, &server->time_scan,
+                         &server->goal_scan) != 0) {
             if (socket_is_valid(client)) close_socket(client);
             server->result = -1;
             THREAD_RETURN;
@@ -307,6 +340,10 @@ static int start_server(struct test_server *server, int rounds,
         server->scan.needle = needle;
         server->scan.needle_len = strlen(needle);
     }
+    server->time_scan.needle = "Time zone: UTC+05:30.";
+    server->time_scan.needle_len = strlen(server->time_scan.needle);
+    server->goal_scan.needle = "Continue working toward the active goal.";
+    server->goal_scan.needle_len = strlen(server->goal_scan.needle);
 #ifdef _WIN32
     WSADATA winsock;
     if (WSAStartup(MAKEWORD(2, 2), &winsock) != 0) return -1;
@@ -475,6 +512,24 @@ static int description_contains(const metask_agentcore_api_v1 *api,
     return scan.found;
 }
 
+/* Revision 23: whether goal->get's JSON contains `needle`. */
+static int goal_contains(const metask_agentcore_api_v1 *api,
+                         metask_agentcore_session *session,
+                         const char *needle) {
+    metask_agentcore_owned_bytes_v1 goal = {0};
+    metask_agentcore_owned_bytes_v1 diagnostic = {0};
+    struct needle_scan scan = {0};
+    if (api->goal->get(session, &goal, &diagnostic) != METASK_AGENTCORE_STATUS_OK) {
+        api->buffer_release(&diagnostic);
+        return 0;
+    }
+    scan.needle = needle;
+    scan.needle_len = strlen(needle);
+    scan_feed(&scan, (const char *)goal.ptr, (size_t)goal.len);
+    api->buffer_release(&goal);
+    return scan.found;
+}
+
 static uint32_t host_stream(
     void *ctx, const metask_agentcore_run_context_v1 *run,
     metask_agentcore_bytes_view_v1 arguments,
@@ -607,7 +662,7 @@ int main(int argc, char **argv) {
         return release_error(api, &diagnostic, 13);
     }
     struct test_server server;
-    if (start_server(&server, 2, "\"data\":\"aWNvbi1ieXRlcw==\"") != 0) {
+    if (start_server(&server, 3, "\"data\":\"aWNvbi1ieXRlcw==\"") != 0) {
         api->runtime->destroy(runtime, &diagnostic);
         return release_error(api, &diagnostic, 14);
     }
@@ -631,6 +686,19 @@ int main(int argc, char **argv) {
     metask_agentcore_bytes_view_v1 allowed_tools[] = {view("HostStreamC")};
     session_host.allowed_tools = allowed_tools;
     session_host.allowed_tool_count = 1;
+    /* Revision 21: the Host's own knowledge of its models' image input. The
+     * vision model's name is in no built-in family; the Claude name is, and
+     * the Host's "unsupported" outranks that family. */
+    metask_agentcore_model_capability_v1 model_capabilities[2];
+    memset(model_capabilities, 0, sizeof(model_capabilities));
+    model_capabilities[0].struct_size = (uint32_t)sizeof(model_capabilities[0]);
+    model_capabilities[0].image_input_code = METASK_AGENTCORE_CAPABILITY_SUPPORTED;
+    model_capabilities[0].model = view("c-consumer-vision");
+    model_capabilities[1].struct_size = (uint32_t)sizeof(model_capabilities[1]);
+    model_capabilities[1].image_input_code = METASK_AGENTCORE_CAPABILITY_UNSUPPORTED;
+    model_capabilities[1].model = view("claude-c-consumer");
+    session_host.model_capabilities = model_capabilities;
+    session_host.model_capability_count = 2;
     /* A Host persona: replace the kernel identity, add one Host section. */
     metask_agentcore_prompt_section_v1 prompt_sections[2];
     memset(prompt_sections, 0, sizeof(prompt_sections));
@@ -777,10 +845,11 @@ int main(int argc, char **argv) {
     options.struct_size = sizeof(options);
     options.max_turns = 1;
 
-    /* Multimodal pre-provider probes: the current model has no image
-     * capability and malformed wire is rejected outright. Neither request
-     * reaches the mock provider (both response rounds stay unconsumed) and
-     * the rejected Run id stays reusable. */
+    /* Multimodal pre-provider probes: nothing says the current model takes
+     * images (CAPABILITY_UNKNOWN, not UNSUPPORTED), a model the Host declared
+     * unsupported is refused, and malformed wire is rejected outright. None
+     * of these requests reaches the mock provider (both response rounds stay
+     * unconsumed) and the rejected Run id stays reusable. */
     metask_agentcore_run_input_part_v1 image_parts[2];
     memset(image_parts, 0, sizeof(image_parts));
     image_parts[0].struct_size = (uint32_t)sizeof(image_parts[0]);
@@ -798,7 +867,9 @@ int main(int argc, char **argv) {
     metask_agentcore_run_result_v1 result = {0};
     if (api->session->run_input(session, 1, &multimodal, &options, &result,
                                 &diagnostic) !=
-        METASK_AGENTCORE_STATUS_IMAGE_INPUT_UNSUPPORTED) {
+            METASK_AGENTCORE_STATUS_IMAGE_INPUT_CAPABILITY_UNKNOWN ||
+        !description_contains(api, session,
+                              "\"image_input\":{\"supported\":false,\"source\":\"unknown\"}")) {
         api->buffer_release(&diagnostic);
         stop_server(&server);
         api->session->destroy(session, &diagnostic);
@@ -832,9 +903,31 @@ int main(int argc, char **argv) {
     }
     api->buffer_release(&diagnostic);
 
-    /* Vision-capable model for the two real provider rounds. */
+    /* The family table says Claude takes images; the Host's declaration says
+     * this route does not, and the Host wins - before any provider round. */
     if (api->session_control->set_model(session, view("claude-c-consumer"),
-                                        &diagnostic) != METASK_AGENTCORE_STATUS_OK) {
+                                        &diagnostic) != METASK_AGENTCORE_STATUS_OK ||
+        (api->buffer_release(&diagnostic),
+         api->session->run_input(session, 1, &multimodal, &options, &result,
+                                 &diagnostic)) !=
+            METASK_AGENTCORE_STATUS_IMAGE_INPUT_UNSUPPORTED ||
+        !description_contains(api, session,
+                              "\"image_input\":{\"supported\":false,\"source\":\"host\"}")) {
+        api->buffer_release(&diagnostic);
+        stop_server(&server);
+        api->session->destroy(session, &diagnostic);
+        api->buffer_release(&diagnostic);
+        api->runtime->destroy(runtime, &diagnostic);
+        return release_error(api, &diagnostic, 65);
+    }
+    api->buffer_release(&diagnostic);
+
+    /* Vision-capable model for the two real provider rounds: a name no
+     * built-in family knows, admitted only by the Host's declaration. */
+    if (api->session_control->set_model(session, view("c-consumer-vision"),
+                                        &diagnostic) != METASK_AGENTCORE_STATUS_OK ||
+        !description_contains(api, session,
+                              "\"image_input\":{\"supported\":true,\"source\":\"host\"}")) {
         stop_server(&server);
         api->session->destroy(session, &diagnostic);
         api->runtime->destroy(runtime, &diagnostic);
@@ -897,20 +990,66 @@ int main(int argc, char **argv) {
 
     /* End-to-end multimodal Run: the ordered text+image parts must reach the
      * captured provider request bytes (base64 payload verified by the mock
-     * server's rolling scan). */
+     * server's rolling scan). Revision 22: the Host gives the user's UTC
+     * offset, and the runtime's date context names it in the same request. */
+    metask_agentcore_run_options_v1 offset_options = options;
+    offset_options.time_context_code = METASK_AGENTCORE_TIME_CONTEXT_UTC_OFFSET;
+    offset_options.utc_offset_minutes = 330;
     active_run_id = 2;
-    run_status = api->session->run_input(session, 2, &multimodal, &options,
+    run_status = api->session->run_input(session, 2, &multimodal, &offset_options,
                                          &result, &diagnostic);
     active_run_id = 0;
-    stop_server(&server);
     if (run_status != METASK_AGENTCORE_STATUS_OK ||
         result.stop_reason_code != METASK_AGENTCORE_STOP_END_TURN ||
-        event_calls == 0 || server.result != 0 || !server.scan.found) {
+        event_calls == 0 || !server.scan.found || !server.time_scan.found) {
         api->buffer_release(&diagnostic);
+        stop_server(&server);
         api->session->destroy(session, &diagnostic);
         api->buffer_release(&diagnostic);
         api->runtime->destroy(runtime, &diagnostic);
         return release_error(api, &diagnostic, 24);
+    }
+
+    /* Revision 23: the Host sets a goal; a goal-continuation Run, whose
+     * input the runtime writes, works toward it and is charged to it. Once
+     * paused, the goal cannot be continued and nothing is sent. */
+    {
+        metask_agentcore_goal_set_v1 goal = {0};
+        metask_agentcore_goal_update_v1 pause = {0};
+        metask_agentcore_run_input_v1 continuation = {0};
+        goal.struct_size = (uint32_t)sizeof(goal);
+        goal.objective = view("ship the C consumer");
+        goal.token_budget = 100000;
+        pause.struct_size = (uint32_t)sizeof(pause);
+        pause.fields = METASK_AGENTCORE_GOAL_FIELD_ACTION;
+        pause.action_code = METASK_AGENTCORE_GOAL_ACTION_PAUSE;
+        continuation.struct_size = (uint32_t)sizeof(continuation);
+        continuation.kind_code = METASK_AGENTCORE_RUN_INPUT_GOAL_CONTINUATION;
+        int goal_ok = goal_contains(api, session, "{\"goal\":null}") &&
+                      api->goal->set(session, &goal, &diagnostic) == METASK_AGENTCORE_STATUS_OK &&
+                      goal_contains(api, session, "\"status\":\"active\"") &&
+                      goal_contains(api, session, "\"tokens_used\":0,");
+        active_run_id = 3;
+        run_status = goal_ok ? api->session->run_input(session, 3, &continuation,
+                                                       &options, &result, &diagnostic)
+                             : METASK_AGENTCORE_STATUS_INTERNAL_ERROR;
+        active_run_id = 0;
+        stop_server(&server);
+        if (run_status != METASK_AGENTCORE_STATUS_OK ||
+            result.stop_reason_code != METASK_AGENTCORE_STOP_END_TURN ||
+            server.result != 0 || !server.goal_scan.found ||
+            goal_contains(api, session, "\"tokens_used\":0,") ||
+            api->goal->update(session, &pause, &diagnostic) != METASK_AGENTCORE_STATUS_OK ||
+            !goal_contains(api, session, "\"status\":\"paused\"") ||
+            api->session->run_input(session, 4, &continuation, &options, &result,
+                                    &diagnostic) != METASK_AGENTCORE_STATUS_GOAL_CONFLICT) {
+            api->buffer_release(&diagnostic);
+            api->session->destroy(session, &diagnostic);
+            api->buffer_release(&diagnostic);
+            api->runtime->destroy(runtime, &diagnostic);
+            return release_error(api, &diagnostic, 26);
+        }
+        api->buffer_release(&diagnostic);
     }
     if (api->session->destroy(session, &diagnostic) != METASK_AGENTCORE_STATUS_OK) {
         api->buffer_release(&diagnostic);
@@ -921,6 +1060,6 @@ int main(int argc, char **argv) {
         return release_error(api, &diagnostic, 20);
     }
     api->buffer_release(&diagnostic);
-    puts("AgentCore source-free C consumer: ABI table, callback, active-Run input, multimodal input and lifecycle OK");
+    puts("AgentCore source-free C consumer: ABI table, callback, active-Run input, multimodal input, goal and lifecycle OK");
     return 0;
 }

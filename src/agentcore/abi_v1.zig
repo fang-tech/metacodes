@@ -14,6 +14,7 @@ pub const mcp_session = @import("mcp_session.zig");
 pub const mcp_checkpoint = @import("mcp_checkpoint.zig");
 pub const mcp_canonical = @import("mcp_canonical.zig");
 pub const prompt_checkpoint = @import("prompt_checkpoint.zig");
+pub const goal_checkpoint = @import("goal_checkpoint.zig");
 const builtin = @import("builtin");
 const sync = @import("platform").sync;
 const process = @import("platform").process;
@@ -2194,6 +2195,8 @@ const AbiSession = struct {
             if (self.mcp_selection) |*selection| selection else null,
         );
         defer allocator.free(mcp_state);
+        const goal_section = try goal_checkpoint.encode(allocator, self.core_session.currentGoal());
+        defer allocator.free(goal_section);
         const terminal = self.terminalForCheckpoint(&lease);
         return session_checkpoint.measureSnapshot(.{
             .session_id = lease.session_id,
@@ -2212,6 +2215,7 @@ const AbiSession = struct {
                 .mcp = mcp_state,
             },
             .prompt_profile = self.prompt_checkpoint_section,
+            .goal = goal_section,
         }, self.budget_state.profile.checkpointLimits());
     }
 
@@ -2390,6 +2394,8 @@ const AbiSession = struct {
             if (self.mcp_selection) |*selection| selection else null,
         );
         defer allocator.free(mcp_state);
+        const goal_section = try goal_checkpoint.encode(allocator, self.core_session.currentGoal());
+        defer allocator.free(goal_section);
 
         const CompactGuard = struct {
             controller: *session_budget.Controller,
@@ -2405,6 +2411,7 @@ const AbiSession = struct {
             permission_state: []const u8,
             mcp_state: []const u8,
             prompt_profile: []const u8,
+            goal: []const u8,
 
             fn allows(
                 raw: *anyopaque,
@@ -2429,6 +2436,7 @@ const AbiSession = struct {
                         .mcp = guard.mcp_state,
                     },
                     .prompt_profile = guard.prompt_profile,
+                    .goal = guard.goal,
                 }, guard.profile.checkpointLimits()) catch {
                     guard.controller.failReplacementBudget(
                         guard.profile.hard_bytes +| 1,
@@ -2456,6 +2464,7 @@ const AbiSession = struct {
             .permission_state = permission_state,
             .mcp_state = mcp_state,
             .prompt_profile = self.prompt_checkpoint_section,
+            .goal = goal_section,
         };
         // A concurrent abortCompact may still be inside `cancel` on
         // `budget_provider` when Core returns. Wait for it on every exit:
@@ -2572,6 +2581,8 @@ const AbiSession = struct {
             if (self.mcp_selection) |*selection| selection else null,
         );
         defer allocator.free(mcp_state);
+        const goal_section = try goal_checkpoint.encode(allocator, self.core_session.currentGoal());
+        defer allocator.free(goal_section);
         const next_generation = std.math.add(
             u64,
             self.checkpoint_generation,
@@ -2595,6 +2606,7 @@ const AbiSession = struct {
                 .mcp = mcp_state,
             },
             .prompt_profile = self.prompt_checkpoint_section,
+            .goal = goal_section,
         }, bounded_limits, sink);
         self.commitCheckpointGeneration(next_generation);
         self.budget_state.commitVerifiedUsage(report.total_bytes);
@@ -2665,6 +2677,7 @@ const AbiSession = struct {
             .permission_mode = self.core_session.permission_ctx.modeValue(),
             .catalog_generation = self.catalog_generation,
             .model = model,
+            .image_input = self.core_session.provider.provider().imageInput(null),
             .conversation_messages = @intCast(lease.conversation.messages.items.len),
             .compact_boundary = @intCast(lease.conversation.compact_boundary),
             .skill_revision = if (self.skill_binding) |*binding|
@@ -2831,6 +2844,63 @@ const AbiSession = struct {
         allocator.free(self.prompt_checkpoint_section);
         self.prompt_checkpoint_section = replacement;
         self.commitDurableReplacement(projected);
+    }
+
+    /// Revision 23 (#277). The goal is durable state: its checkpoint section
+    /// changes size only with the objective, so set, an objective edit and
+    /// clear are admitted against the durable budget before the Core changes
+    /// anything. Charging during a Run keeps the size.
+    fn currentGoalSectionBytes(self: *AbiSession) u64 {
+        const goal = self.core_session.currentGoal() orelse return 0;
+        return goal_checkpoint.encodedLen(goal.objective);
+    }
+
+    fn setGoalAdmitted(self: *AbiSession, objective: []const u8, token_budget: ?u64) !void {
+        const projected = try self.admitDurableReplacement(
+            self.currentGoalSectionBytes(),
+            goal_checkpoint.encodedLen(objective),
+        );
+        try self.core_session.setGoal(objective, token_budget);
+        self.commitDurableReplacement(projected);
+    }
+
+    fn updateGoalAdmitted(self: *AbiSession, changes: core.goal.State.Update) !void {
+        const current_bytes = self.currentGoalSectionBytes();
+        if (current_bytes == 0) return error.NoGoal;
+        const replacement_bytes: u64 = if (changes.objective) |objective|
+            goal_checkpoint.encodedLen(objective)
+        else
+            current_bytes;
+        if (replacement_bytes == current_bytes) return self.core_session.updateGoal(changes);
+        const projected = try self.admitDurableReplacement(current_bytes, replacement_bytes);
+        try self.core_session.updateGoal(changes);
+        self.commitDurableReplacement(projected);
+    }
+
+    fn clearGoalAdmitted(self: *AbiSession) !void {
+        const current_bytes = self.currentGoalSectionBytes();
+        if (current_bytes == 0) return;
+        const projected = try self.admitDurableReplacement(current_bytes, 0);
+        try self.core_session.clearGoal();
+        self.commitDurableReplacement(projected);
+    }
+
+    /// `{"goal":null}` or `{"goal":{…}}`, read under a checkpoint lease so
+    /// no Run, compact or mutation changes it meanwhile.
+    fn readGoal(self: *AbiSession) ![]u8 {
+        if (!self.tryBeginCheckpoint()) return error.SessionBusy;
+        defer self.finishCheckpoint();
+        var lease = try self.core_session.snapshotCommitted();
+        defer lease.deinit();
+        var out: std.Io.Writer.Allocating = .init(allocator);
+        defer out.deinit();
+        try out.writer.writeAll("{\"goal\":");
+        if (self.core_session.currentGoal()) |goal|
+            try core.goal.writeJson(&out.writer, goal)
+        else
+            try out.writer.writeAll("null");
+        try out.writer.writeByte('}');
+        return out.toOwnedSlice();
     }
 
     /// Host rules are compiled by the canonical Core parser/matcher; the
@@ -4022,6 +4092,13 @@ const ForkExecutorContext = struct {
                     .external_run_root => .run_root,
                     .model_tool => .model_tool,
                 },
+                // Revision 23 (#277): a Skill invocation Run is the Run, on
+                // the Run's thread, so it is charged to the Session's goal. A
+                // model-invoked fork may run beside other tools: never.
+                .goal_meter = switch (mode) {
+                    .external_run_root => &self.session.goal_meter,
+                    .model_tool => null,
+                },
                 .model_override = null,
                 .project_dir = self.session.workspace.root,
                 .sandbox = self.session.workspace.sandbox(),
@@ -4241,6 +4318,45 @@ fn parseMultimodalParts(
 /// Wire validation of a prompt profile: layouts, codes and limits, every
 /// length bounded before its pointer is read. The profile's own rules are
 /// `refusePromptProfile`'s. Slices borrow the Host's memory for the call.
+/// Revision 21: the Host's model-capability declarations, validated and
+/// borrowed from the call (the Session copies them). Null with a zero count is
+/// no statement; every entry names a distinct model (ignoring case) and says
+/// SUPPORTED or UNSUPPORTED - zero is not a declaration.
+fn parseModelCapabilities(
+    arena: std.mem.Allocator,
+    host: *const wire.SessionHostConfigV1,
+    metadata: *u64,
+) ![]const core.image_capability.Declaration {
+    if (host.model_capability_count == 0) {
+        if (host.model_capabilities != null) return error.InvalidModelCapabilities;
+        return &.{};
+    }
+    if (host.model_capability_count > wire.MAX_MODEL_CAPABILITIES_V1) return error.ResourceLimit;
+    const count: usize = @intCast(host.model_capability_count);
+    const raw = (host.model_capabilities orelse return error.InvalidModelCapabilities)[0..count];
+    const out = try arena.alloc(core.image_capability.Declaration, count);
+    for (raw, out, 0..) |entry, *slot, i| {
+        if (entry.struct_size != @sizeOf(wire.ModelCapabilityV1) or !allZero(entry.reserved))
+            return error.InvalidModelCapabilities;
+        if (entry.model.len > wire.MAX_MODEL_CAPABILITY_MODEL_BYTES_V1) return error.ResourceLimit;
+        try addMetadata(metadata, entry.model.len, wire.MAX_SESSION_METADATA_BYTES_V1);
+        const model = try text(entry.model);
+        if (model.len == 0) return error.InvalidModelCapabilities;
+        for (out[0..i]) |earlier| {
+            if (std.ascii.eqlIgnoreCase(earlier.model, model)) return error.DuplicateModelCapability;
+        }
+        slot.* = .{
+            .model = model,
+            .image_input = switch (entry.image_input_code) {
+                wire.CAPABILITY_SUPPORTED => true,
+                wire.CAPABILITY_UNSUPPORTED => false,
+                else => return error.InvalidModelCapabilities,
+            },
+        };
+    }
+    return out;
+}
+
 fn parsePromptProfile(
     arena: std.mem.Allocator,
     raw_ptr: ?*const wire.PromptProfileV1,
@@ -4331,6 +4447,44 @@ fn parseContextBlocks(
     return blocks;
 }
 
+/// Revision 22 (#276): the runtime's `currentDate` block for this Run, or
+/// null when the Host turned it off, supplied its own, or the input is a Skill
+/// invocation (which carries no context). A Host `currentDate` block together
+/// with an explicit UTC offset is two answers to one question and is refused.
+fn timeContextBlock(
+    arena: std.mem.Allocator,
+    options: *const wire.RunOptionsV1,
+    host_blocks: []const core.context_blocks.Block,
+    kind_code: u32,
+    unix_seconds: i64,
+) !?core.context_blocks.Block {
+    const host_has_time = for (host_blocks) |block| {
+        if (std.mem.eql(u8, block.label, core.time_context.label)) break true;
+    } else false;
+    const zone: core.time_context.Zone = switch (options.time_context_code) {
+        wire.TIME_CONTEXT_SYSTEM => blk: {
+            if (options.utc_offset_minutes != 0) return error.InvalidTimeContext;
+            if (host_has_time or kind_code == wire.RUN_INPUT_SKILL) return null;
+            break :blk core.time_context.systemZone(unix_seconds);
+        },
+        wire.TIME_CONTEXT_UTC_OFFSET => blk: {
+            if (host_has_time) return error.ConflictingTimeContext;
+            if (kind_code == wire.RUN_INPUT_SKILL) return error.InvalidTimeContext;
+            break :blk core.time_context.Zone.fromHostOffset(options.utc_offset_minutes) catch
+                return error.InvalidTimeContext;
+        },
+        wire.TIME_CONTEXT_OFF => {
+            if (options.utc_offset_minutes != 0) return error.InvalidTimeContext;
+            return null;
+        },
+        else => return error.InvalidTimeContext,
+    };
+    return .{
+        .label = core.time_context.label,
+        .text = try core.time_context.today(arena, unix_seconds, &zone),
+    };
+}
+
 fn ownedSlice(v: wire.OwnedBytesV1) error{ InvalidArgument, Overflow }![]const u8 {
     return borrowed(.{ .ptr = v.ptr, .len = v.len });
 }
@@ -4379,6 +4533,7 @@ fn failError(status: u32, err: anyerror, out_error: ?*wire.OwnedBytesV1) u32 {
 fn statusText(status: u32) []const u8 {
     return switch (status) {
         wire.STATUS_INVALID_ARGUMENT => "invalid argument",
+        wire.STATUS_GOAL_CONFLICT => "goal conflict",
         wire.STATUS_OUT_OF_MEMORY => "out of memory",
         wire.STATUS_BUSY => "busy",
         wire.STATUS_STALE_RUN => "stale run",
@@ -5747,6 +5902,8 @@ const SessionBuildConfig = struct {
     run_journal: core.agent_session.RunJournalConfig = .ephemeral,
     /// Validated; borrowed for the call.
     prompt_profile: core.prompt_sections.Profile = .{},
+    /// Revision 21 Host declarations; validated, borrowed for the call.
+    model_capabilities: []const core.image_capability.Declaration = &.{},
 };
 
 const RestoreHostConfig = struct {
@@ -5763,6 +5920,8 @@ const RestoreHostConfig = struct {
     workspace_scope_id: [64]u8,
     budget_profile: session_budget.Profile = .{},
     run_journal: core.agent_session.RunJournalConfig = .ephemeral,
+    /// Revision 21: current Host declarations; checkpoints carry none.
+    model_capabilities: []const core.image_capability.Declaration = &.{},
 };
 
 const InternalRestoreResult = struct {
@@ -5934,6 +6093,12 @@ fn buildAbiSession(
     const prompt_section = try prompt_checkpoint.encode(allocator, config.prompt_profile);
     var keep_prompt_section = false;
     defer if (!keep_prompt_section) allocator.free(prompt_section);
+    // Revision 23 (#277): the checkpoint's goal, usage and all.
+    var restored_goal: ?core.goal.Goal = if (config.restored) |decoded|
+        try goal_checkpoint.decode(allocator, decoded.goal)
+    else
+        null;
+    defer if (restored_goal) |*goal| goal.deinit(allocator);
     const self = try allocator.create(AbiSession);
     errdefer allocator.destroy(self);
     self.* = .{
@@ -6022,6 +6187,7 @@ fn buildAbiSession(
         .run_ui_requester = .{ .ctx = self, .requestFn = AbiSession.requestUi },
         .host_identity_ctx = self,
         .prompt_profile = config.prompt_profile,
+        .model_capabilities = config.model_capabilities,
     };
     self.core_session = if (config.restored) |decoded|
         try runtime.core_runtime.createRestoredSession(core_config, .{
@@ -6029,6 +6195,7 @@ fn buildAbiSession(
             .last_run_id = decoded.descriptor.last_run_id,
             .last_compact_id = decoded.descriptor.last_compact_id,
             .conversation = @constCast(&decoded.conversation),
+            .goal = if (restored_goal) |*goal| goal else null,
         })
     else
         try runtime.core_runtime.createSession(core_config);
@@ -6342,6 +6509,7 @@ fn restoreCheckpoint(
         .budget_profile = config.budget_profile,
         .run_journal = config.run_journal,
         .prompt_profile = restored_prompt_profile.profile(),
+        .model_capabilities = config.model_capabilities,
     });
     keep_binding = true;
     return .{
@@ -6417,6 +6585,12 @@ const SessionDescriptionJson = struct {
     permission_mode: []const u8,
     catalog_generation: u64,
     model: []const u8,
+    /// Revision 21: whether `model` takes image input and who said so
+    /// (`host`, `catalog`, `model_family`, or `unknown`).
+    image_input: struct {
+        supported: bool,
+        source: []const u8,
+    },
     conversation: struct {
         message_count: u64,
         compact_boundary: u64,
@@ -6544,6 +6718,10 @@ fn encodeSessionDescription(
         .permission_mode = permissionModeName(description.permission_mode),
         .catalog_generation = description.catalog_generation,
         .model = description.model,
+        .image_input = .{
+            .supported = description.image_input.supported,
+            .source = description.image_input.source.name(),
+        },
         .conversation = .{
             .message_count = description.conversation_messages,
             .compact_boundary = description.compact_boundary,
@@ -6749,6 +6927,8 @@ fn sessionCreate(runtime_handle: ?*wire.RuntimeHandle, config_ptr: ?*const wire.
     const prompt_profile = parsePromptProfile(scratch.allocator(), config.prompt_profile) catch |err|
         return failError(inputErrorStatus(err), err, out_error);
     if (refusePromptProfile(prompt_profile, out_error)) |status| return status;
+    const model_capabilities = parseModelCapabilities(scratch.allocator(), host, &session_metadata) catch |err|
+        return failError(inputErrorStatus(err), err, out_error);
     if (shell == .sandboxed) {
         sandbox_admission.validate(allocator) catch |err| return failError(
             if (err == error.OutOfMemory) wire.STATUS_OUT_OF_MEMORY else wire.STATUS_INVALID_ARGUMENT,
@@ -6774,6 +6954,7 @@ fn sessionCreate(runtime_handle: ?*wire.RuntimeHandle, config_ptr: ?*const wire.
         .budget_profile = budget_profile,
         .run_journal = run_journal,
         .prompt_profile = prompt_profile,
+        .model_capabilities = model_capabilities,
     }) catch |err| {
         return failError(
             if (err == error.OutOfMemory)
@@ -6906,6 +7087,8 @@ fn sessionRestore(
     ) catch |err| return failError(inputErrorStatus(err), err, out_error);
     const budget_profile = parseDurableBudget(host.durable_budget) catch |err|
         return failError(inputErrorStatus(err), err, out_error);
+    const model_capabilities = parseModelCapabilities(scratch.allocator(), host, &session_metadata) catch |err|
+        return failError(inputErrorStatus(err), err, out_error);
     const limits = parseCheckpointLimits(limits_raw) catch |err|
         return failError(inputErrorStatus(err), err, out_error);
     if (shell == .sandboxed) sandbox_admission.validate(allocator) catch |err|
@@ -6948,6 +7131,7 @@ fn sessionRestore(
             .workspace_scope_id = workspace_scope_id,
             .budget_profile = budget_profile,
             .run_journal = run_journal,
+            .model_capabilities = model_capabilities,
         },
         &current_skill_binding,
         source.interface(),
@@ -7087,6 +7271,132 @@ fn sessionSetPromptProfile(
     if (refusePromptProfile(profile, out_error)) |status| return status;
     self.setPromptProfileAdmitted(profile) catch |err|
         return failError(sessionMutationStatus(err), err, out_error);
+    return wire.STATUS_OK;
+}
+
+fn goalStatus(err: anyerror) u32 {
+    return switch (err) {
+        error.NoGoal, error.GoalNotActive, error.BudgetExhausted, error.GoalComplete => wire.STATUS_GOAL_CONFLICT,
+        error.EmptyObjective, error.ObjectiveTooLong, error.InvalidObjective, error.InvalidBudget => wire.STATUS_INVALID_ARGUMENT,
+        else => sessionMutationStatus(err),
+    };
+}
+
+/// A Host objective: borrowed bytes, refused undecoded past the byte limit,
+/// then in stored form (trimmed, 1..4000 code points of UTF-8).
+fn goalObjective(objective_view: wire.BytesViewV1) ![]const u8 {
+    if (objective_view.len > wire.MAX_GOAL_OBJECTIVE_BYTES_V1) return error.ObjectiveTooLong;
+    const bytes = borrowed(objective_view) catch return error.InvalidObjective;
+    return core.goal.normalizeObjective(bytes);
+}
+
+fn goalAction(code: u32) ?core.goal.Action {
+    return switch (code) {
+        wire.GOAL_ACTION_PAUSE => .pause,
+        wire.GOAL_ACTION_ACTIVATE => .activate,
+        wire.GOAL_ACTION_COMPLETE => .complete,
+        wire.GOAL_ACTION_BLOCK => .block,
+        else => null,
+    };
+}
+
+fn goalGet(
+    handle: ?*wire.SessionHandle,
+    out_goal_json: ?*wire.OwnedBytesV1,
+    out_error: ?*wire.OwnedBytesV1,
+) callconv(.c) u32 {
+    if (out_goal_json) |out| out.* = .{ .ptr = null, .len = 0 };
+    emptyError(out_error);
+    const self = sessionFrom(handle orelse
+        return fail(wire.STATUS_INVALID_ARGUMENT, "session is required", out_error));
+    const out = out_goal_json orelse
+        return fail(wire.STATUS_INVALID_ARGUMENT, "out_goal_json is required", out_error);
+    const encoded = self.readGoal() catch |err|
+        return failError(goalStatus(err), err, out_error);
+    out.* = .{ .ptr = encoded.ptr, .len = encoded.len };
+    return wire.STATUS_OK;
+}
+
+fn goalSet(
+    handle: ?*wire.SessionHandle,
+    request_ptr: ?*const wire.GoalSetV1,
+    out_error: ?*wire.OwnedBytesV1,
+) callconv(.c) u32 {
+    emptyError(out_error);
+    const self = sessionFrom(handle orelse
+        return fail(wire.STATUS_INVALID_ARGUMENT, "session is required", out_error));
+    const request = request_ptr orelse
+        return fail(wire.STATUS_INVALID_ARGUMENT, "GoalSetV1 is required", out_error);
+    if (request.struct_size != @sizeOf(wire.GoalSetV1) or request.reserved0 != 0 or !allZero(request.reserved))
+        return fail(wire.STATUS_INVALID_ARGUMENT, "invalid GoalSetV1", out_error);
+    const objective = goalObjective(request.objective) catch |err|
+        return failError(goalStatus(err), err, out_error);
+    if (!self.tryBeginMutation())
+        return fail(wire.STATUS_BUSY, "Session has an active facade call", out_error);
+    defer self.finishMutation();
+    if (self.facade_poisoned.load(.acquire))
+        return fail(wire.STATUS_INVALID_STATE, "Session is poisoned by a previous admitted Run failure", out_error);
+    self.setGoalAdmitted(objective, if (request.token_budget == 0) null else request.token_budget) catch |err|
+        return failError(goalStatus(err), err, out_error);
+    return wire.STATUS_OK;
+}
+
+fn goalUpdate(
+    handle: ?*wire.SessionHandle,
+    update_ptr: ?*const wire.GoalUpdateV1,
+    out_error: ?*wire.OwnedBytesV1,
+) callconv(.c) u32 {
+    emptyError(out_error);
+    const self = sessionFrom(handle orelse
+        return fail(wire.STATUS_INVALID_ARGUMENT, "session is required", out_error));
+    const update = update_ptr orelse
+        return fail(wire.STATUS_INVALID_ARGUMENT, "GoalUpdateV1 is required", out_error);
+    const known_fields = wire.GOAL_FIELD_OBJECTIVE | wire.GOAL_FIELD_TOKEN_BUDGET | wire.GOAL_FIELD_ACTION;
+    if (update.struct_size != @sizeOf(wire.GoalUpdateV1) or update.reserved0 != 0 or
+        !allZero(update.reserved) or update.fields == 0 or (update.fields & ~known_fields) != 0)
+        return fail(wire.STATUS_INVALID_ARGUMENT, "invalid GoalUpdateV1", out_error);
+    var changes: core.goal.State.Update = .{};
+    if ((update.fields & wire.GOAL_FIELD_OBJECTIVE) != 0) {
+        changes.objective = goalObjective(update.objective) catch |err|
+            return failError(goalStatus(err), err, out_error);
+    } else if (!canonicalEmpty(update.objective)) {
+        return fail(wire.STATUS_INVALID_ARGUMENT, "objective without GOAL_FIELD_OBJECTIVE must be canonical empty", out_error);
+    }
+    if ((update.fields & wire.GOAL_FIELD_TOKEN_BUDGET) != 0) {
+        changes.token_budget = if (update.token_budget == 0) @as(?u64, null) else update.token_budget;
+    } else if (update.token_budget != 0) {
+        return fail(wire.STATUS_INVALID_ARGUMENT, "token_budget without GOAL_FIELD_TOKEN_BUDGET must be zero", out_error);
+    }
+    if ((update.fields & wire.GOAL_FIELD_ACTION) != 0) {
+        changes.action = goalAction(update.action_code) orelse
+            return fail(wire.STATUS_INVALID_ARGUMENT, "unknown GOAL_ACTION code", out_error);
+    } else if (update.action_code != 0) {
+        return fail(wire.STATUS_INVALID_ARGUMENT, "action_code without GOAL_FIELD_ACTION must be zero", out_error);
+    }
+    if (!self.tryBeginMutation())
+        return fail(wire.STATUS_BUSY, "Session has an active facade call", out_error);
+    defer self.finishMutation();
+    if (self.facade_poisoned.load(.acquire))
+        return fail(wire.STATUS_INVALID_STATE, "Session is poisoned by a previous admitted Run failure", out_error);
+    self.updateGoalAdmitted(changes) catch |err|
+        return failError(goalStatus(err), err, out_error);
+    return wire.STATUS_OK;
+}
+
+fn goalClear(
+    handle: ?*wire.SessionHandle,
+    out_error: ?*wire.OwnedBytesV1,
+) callconv(.c) u32 {
+    emptyError(out_error);
+    const self = sessionFrom(handle orelse
+        return fail(wire.STATUS_INVALID_ARGUMENT, "session is required", out_error));
+    if (!self.tryBeginMutation())
+        return fail(wire.STATUS_BUSY, "Session has an active facade call", out_error);
+    defer self.finishMutation();
+    if (self.facade_poisoned.load(.acquire))
+        return fail(wire.STATUS_INVALID_STATE, "Session is poisoned by a previous admitted Run failure", out_error);
+    self.clearGoalAdmitted() catch |err|
+        return failError(goalStatus(err), err, out_error);
     return wire.STATUS_OK;
 }
 
@@ -7285,21 +7595,50 @@ fn sessionRunInput(
             out_error,
         );
     }
-    const context_reminder = core.context_blocks.render(context_scratch.allocator(), context_blocks) catch
+    // Revision 22 (#276): today's date and time zone lead the Run's context
+    // unless the Host turned that off or said it itself.
+    const time_block = timeContextBlock(
+        context_scratch.allocator(),
+        options,
+        context_blocks,
+        input.kind_code,
+        core.time_context.currentUnixSeconds(),
+    ) catch |err| return failError(inputErrorStatus(err), err, out_error);
+    const run_blocks: []const core.context_blocks.Block = if (time_block) |block| blk: {
+        const all = context_scratch.allocator().alloc(core.context_blocks.Block, context_blocks.len + 1) catch
+            return fail(wire.STATUS_OUT_OF_MEMORY, "out of memory", out_error);
+        all[0] = block;
+        @memcpy(all[1..], context_blocks);
+        break :blk all;
+    } else context_blocks;
+    const context_reminder = core.context_blocks.render(context_scratch.allocator(), run_blocks) catch
         return fail(wire.STATUS_OUT_OF_MEMORY, "out of memory", out_error);
     if (context_reminder != null and input.kind_code == wire.RUN_INPUT_SKILL)
         return fail(wire.STATUS_INVALID_ARGUMENT, "context blocks are not accepted with SkillInvocation input", out_error);
     const execution: SkillExecution = switch (input.kind_code) {
-        wire.RUN_INPUT_TEXT => text_run: {
+        wire.RUN_INPUT_TEXT, wire.RUN_INPUT_GOAL_CONTINUATION => text_run: {
             if (!canonicalEmpty(input.skill_id) or !canonicalEmpty(input.catalog_revision) or
                 !canonicalEmpty(input.arguments_json))
                 return fail(wire.STATUS_INVALID_ARGUMENT, "TextInput Skill fields must be canonical empty", out_error);
             if (input.parts != null or input.part_count != 0)
                 return fail(wire.STATUS_INVALID_ARGUMENT, "TextInput parts must be null with zero count", out_error);
-            if (input.text.len > wire.MAX_PROMPT_BYTES_V1)
-                return fail(wire.STATUS_RESOURCE_LIMIT, "prompt exceeds AgentCore ABI v1 limit", out_error);
-            const prompt = text(input.text) catch |err|
-                return failError(wire.STATUS_INVALID_ARGUMENT, err, out_error);
+            const prompt = if (input.kind_code == wire.RUN_INPUT_TEXT) prompt: {
+                if (input.text.len > wire.MAX_PROMPT_BYTES_V1)
+                    return fail(wire.STATUS_RESOURCE_LIMIT, "prompt exceeds AgentCore ABI v1 limit", out_error);
+                break :prompt text(input.text) catch |err|
+                    return failError(wire.STATUS_INVALID_ARGUMENT, err, out_error);
+            } else prompt: {
+                // Revision 23 (#277): the runtime writes the input from the
+                // Session's goal, which only this admitted call can change now.
+                if (!canonicalEmpty(input.text))
+                    return fail(wire.STATUS_INVALID_ARGUMENT, "GoalContinuation text must be canonical empty", out_error);
+                const goal = self.core_session.currentGoal() orelse
+                    return failError(wire.STATUS_GOAL_CONFLICT, error.NoGoal, out_error);
+                if (goal.status != .active)
+                    return failError(wire.STATUS_GOAL_CONFLICT, error.GoalNotActive, out_error);
+                break :prompt core.goal.continuationPrompt(context_scratch.allocator(), goal) catch
+                    return fail(wire.STATUS_OUT_OF_MEMORY, "out of memory", out_error);
+            };
             const context_parts = [_]core.message.UserContentPart{
                 .{ .text = context_reminder orelse "" },
                 .{ .text = prompt },
@@ -7390,15 +7729,27 @@ fn sessionRunInput(
                 @memcpy(all[1..], parts);
                 break :with_context all;
             } else parts;
-            // Capability preflight (single truth: ModelProfile.supports_image_input).
-            // Rejection happens before admission and before any Provider request,
-            // so the Run ID stays reusable and Conversation is untouched.
-            if (has_image and !self.core_session.provider.provider().supports(.image_input))
-                return fail(
-                    wire.STATUS_IMAGE_INPUT_UNSUPPORTED,
-                    "session model does not support image input",
+            // Capability preflight (single truth: the profile `Dialect.profileFor`
+            // returns, with the Host's declarations applied). Rejection happens
+            // before admission and before any Provider request, so the Run ID stays
+            // reusable and Conversation is untouched. An unknown capability is its
+            // own status: a declaration fixes it, another model is not required.
+            if (has_image) {
+                const resolution = self.core_session.provider.provider().imageInput(null);
+                if (!resolution.supported) return fail(
+                    if (resolution.isUnknown())
+                        wire.STATUS_IMAGE_INPUT_CAPABILITY_UNKNOWN
+                    else
+                        wire.STATUS_IMAGE_INPUT_UNSUPPORTED,
+                    switch (resolution.source) {
+                        .unknown => "image input capability of the Session model is unknown: no Host declaration, provider catalog entry or built-in model family covers it; declare it in SessionHostConfigV1.model_capabilities",
+                        .host => "the Session model does not take image input (declared by the Host)",
+                        .catalog => "the Session model does not take image input (declared by the provider catalog)",
+                        .model_family => "the Session model does not take image input (built-in model family)",
+                    },
                     out_error,
                 );
+            }
             const multimodal_execution = self.runMultimodalWithBoundSkills(
                 &runtime.materializations,
                 run_id,
@@ -7791,6 +8142,15 @@ const mcp_api_v1 = wire.McpApiV1{
     .update_selection = sessionUpdateMcp,
 };
 
+const goal_api_v1 = wire.GoalApiV1{
+    .struct_size = @sizeOf(wire.GoalApiV1),
+    .reserved0 = 0,
+    .get = goalGet,
+    .set = goalSet,
+    .update = goalUpdate,
+    .clear = goalClear,
+};
+
 const api_v1 = wire.ApiV1{
     .struct_size = @sizeOf(wire.ApiV1),
     .abi_version = wire.ABI_VERSION_V1,
@@ -7802,6 +8162,7 @@ const api_v1 = wire.ApiV1{
     .session_control = &session_control_api_v1,
     .skill = &skill_api_v1,
     .mcp = &mcp_api_v1,
+    .goal = &goal_api_v1,
 };
 
 pub export fn metask_agentcore_get_api(requested_abi: u32) callconv(.c) ?*const anyopaque {
@@ -8002,13 +8363,14 @@ test "ABI discovery is versioned" {
     try std.testing.expect(metask_agentcore_get_api(0) == null);
     const raw = metask_agentcore_get_api(wire.ABI_VERSION_V1) orelse return error.MissingApi;
     const api: *const wire.ApiV1 = @ptrCast(@alignCast(raw));
-    try std.testing.expectEqual(@as(u32, 20), api.abi_revision);
-    try std.testing.expectEqual(@as(usize, 64), api.struct_size);
+    try std.testing.expectEqual(@as(u32, 23), api.abi_revision);
+    try std.testing.expectEqual(@as(usize, 72), api.struct_size);
     try std.testing.expect(api.runtime != null);
     try std.testing.expect(api.session != null);
     try std.testing.expect(api.session_control != null);
     try std.testing.expect(api.skill != null);
     try std.testing.expect(api.mcp != null);
+    try std.testing.expect(api.goal != null);
 }
 
 test "UI response parser owns AskUserQuestion answers" {

@@ -1,7 +1,7 @@
 # AgentCore SDK
 
 This directory contains source-free host bindings for the experimental AgentCore
-C ABI v1 revision 20:
+C ABI v1 revision 23:
 
 - `metask/agentcore.h` — normative C11/C++17 layout declarations;
 - `zig/` — typed Zig consumer bindings;
@@ -9,8 +9,8 @@ C ABI v1 revision 20:
 - `VERSION` — SDK package version, distinct from ABI revision.
 
 Do not copy individual files into a release. Consume the complete generated bundle
-and validate its manifest, hashes, target, ABI version, exact 64-byte root, all
-five mandatory typed tables, function slots, and reserved fields. Revision 20 is
+and validate its manifest, hashes, target, ABI version, exact 72-byte root, all
+six mandatory typed tables, function slots, and reserved fields. Revision 23 is
 the Agent Runtime surface; it does not expose an independent Completion client.
 `SessionCreateConfigV1.prompt_profile` edits the named system-prompt sections
 (replace the identity, add Host sections; governance sections stay locked) and
@@ -27,6 +27,23 @@ adoption as `input_adopted`, and `RunResultV1.input_accepted_count` /
 `session_run_input` accepts text, typed Skill, and multimodal inputs; a
 `RUN_INPUT_MULTIMODAL` Run submits an ordered `RunInputPartV1` array of text and
 base64 image parts, preflighted against the Session model's image capability.
+Every Run's context leads with today's date and time zone unless the Host
+supplies its own `currentDate` block or sets `RunOptionsV1.time_context_code`
+to `TIME_CONTEXT_OFF`; `TIME_CONTEXT_UTC_OFFSET` dates the Run in
+`utc_offset_minutes` instead of the process's zone.
+`SessionHostConfigV1.model_capabilities` lets the Host declare which of its
+models take image input; a declaration outranks the built-in model-family
+table, holds across `set_model` and restore, and `describe` reports the answer
+with its source. An image Run for a model nothing covers is refused as
+`IMAGE_INPUT_CAPABILITY_UNKNOWN` (29), distinct from `IMAGE_INPUT_UNSUPPORTED`
+(28).
+The `goal` table gives a Session one objective with an optional token budget:
+`get` writes it as JSON, `set` replaces it, `update` changes objective, budget
+and status together or not at all, and `clear` removes it. A
+`RUN_INPUT_GOAL_CONTINUATION` Run, whose input the runtime writes from the
+goal, works toward it; every Run that begins on an active goal is charged to
+it, `goal_updated` events report the budget running out and each Run's
+settlement, and checkpoints carry the goal. Refusals are `GOAL_CONFLICT` (30).
 `SessionHostConfigV1.protocol_kind_code` is provider-scoped: zero preserves the
 provider default, while OpenAI may explicitly select
 `OPENAI_PROTOCOL_RESPONSES`. Pair it with `provider_kind_code`, the full endpoint
