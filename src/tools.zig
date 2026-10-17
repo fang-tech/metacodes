@@ -675,6 +675,21 @@ pub const registry: []const ToolEntry = &.{
         .execute = .{ .legacy_inline = swarm_tools.executeSendMessage },
         .swarm_gated = true,
     },
+    .{
+        // Issue #277: AgentCore's host-scheduled spawn. The CLI uses Task(name);
+        // AgentCore cannot (Task is process-level, excluded from its Session
+        // catalog), so the team surface offers this Session-owned tool. It
+        // records a spawn request; the embedding Host creates the teammate.
+        .name = "SpawnTeammate",
+        .description = "Delegate work to a teammate agent that runs in parallel and coordinates through the shared mailbox. You are the team lead. The teammate is created by the host, joins the team, works on the task, then idles waiting for SendMessage. Args: name (the teammate's name), prompt (the task), agent_type (optional role). Talk to it afterwards with SendMessage.",
+        .input_schema = .{ .type = "object", .prop_specs = &.{
+            .{ .name = "name", .type = "string", .description = "The teammate's name" },
+            .{ .name = "prompt", .type = "string", .description = "The task for the teammate" },
+            .{ .name = "agent_type", .type = "string", .description = "Optional role, e.g. general-purpose or explore" },
+        }, .required = &.{ "name", "prompt" } },
+        .execute = .{ .legacy_inline = swarm_tools.executeSpawnTeammate },
+        .swarm_gated = true,
+    },
 };
 
 comptime {
