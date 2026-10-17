@@ -121,7 +121,7 @@ dylib 加载，也不把活跃 Session 的 catalog 改写为新代。
 `Registrar.provide(T, local_name, pointer, cleanup)`，consumer 只有在 descriptor 的
 `requires` 明确包含 provider 时，才能用相同 `T` 与 key 调用 `require`。解析发生在
 依赖拓扑序 activation 中；consumer 把返回指针注入自己的 Host tool/context，commit
-之后没有可变 service lookup。该能力不进入 AgentCore v1 revision 23 C ABI，也不暴露任何内核
+之后没有可变 service lookup。该能力不进入 AgentCore v1 revision 24 C ABI，也不暴露任何内核
 service。
 
 `advisory_hook` capability 接受一个 `StaticPlugin.advisory_policy`。它是同步、借用、
@@ -303,6 +303,17 @@ provider 响应累加非缓存输入 + 输出（含自动压缩），Run 结束�
 Session 不变更期间有效；每个 Run 自动计账，checkpoint 恢复（`RestoredSessionState.goal`）
 带回同一目标与用量。AgentCore 的 `goal` 表与 `RUN_INPUT_GOAL_CONTINUATION` 就是它的封装。
 
+### 宿主调度 team（issue #277）
+
+`RuntimeConfig.enable_teams` 打开后，team 工具（`TeamCreate`/`TeamDelete`/
+`SendMessage`/`SpawnTeammate`）进入目录，`AgentSession` 可由 `SessionConfig.team`
+（`TeamConfig`，lead 或 member 角色）加入一个宿主调度的 team。lead 用
+`SpawnTeammate` 不再起线程，而是在 `SwarmContext.pending_spawns` 里记一条请求，由
+宿主 Host 负责创建并运行对应的 member Session；`swarm_tools.writeTeamDescription`
+给出 team 名册与待处理请求，`swarm_tools.pollLeadInbox` 取 lead 收件箱的下一条输入。
+team 成员由 Host 在 create/restore 时提供，不进 checkpoint。AgentCore 的 `team` 表
+（`describe`/`poll`）就是它的封装。
+
 ### 模型能力声明
 
 `SessionConfig.model_capabilities`（`[]const core.image_capability.Declaration`，
@@ -381,10 +392,10 @@ admission。
 AgentCore 面向不把 metacodes 源码加入构建图的原生 Host(C11 / C++17 / Zig /
 Rust:同一 C Header + 静态库 + bindings)。消费入口只有
 `metask_agentcore_get_api(uint32_t requested_abi)`。
-当前是实验性的 ABI v1 revision 23。Host 必须同时校验 abi version、精确
+当前是实验性的 ABI v1 revision 24。Host 必须同时校验 abi version、精确
 revision、64 字节根表、五张必选 typed 子表、reserved fields 和 manifest hash;
 不存在静默降级或旧 revision shim。
-revision 23 只有一个 `runtime->create`;它的 nullable `plugins` 参数、Host 流式
+revision 24 只有一个 `runtime->create`;它的 nullable `plugins` 参数、Host 流式
 工具、MCP 流式响应、journal profile,以及全部 ownership、回调重入、Session
 poison、并发与持久化语义,只以同 revision 的 Header 与
 [`AGENTCORE_BINARY_ABI.md`](AGENTCORE_BINARY_ABI.md)(Contract 一节及其子节)
@@ -408,7 +419,7 @@ agentcore:gate`)的命令、库文件名与按 target 的发布状态矩阵,见
 | 浏览器/桌面壳 | Web HTTP + SSE + typed request 回填；跨进程的行格式用 `protocol.wire` |
 | 按 id 动态开关多个 Session 的网络宿主(云端、多标签 GUI) | `session_host.SessionHost`(见 API.md "SessionHost") + 宿主自己的传输与认证 |
 | 不带源码的 C/C++/Zig/Rust 原生产品 | 精确 pinned AgentCore bundle |
-| 显式信任的可执行工具插件 | `--process-plugin-dir`、Zig `RuntimeConfig.process_plugins`，或 AgentCore v1 revision 23 `runtime->create(..., plugins, ...)`；见 `PLUGIN_PROCESS_PROTOCOL.md` |
+| 显式信任的可执行工具插件 | `--process-plugin-dir`、Zig `RuntimeConfig.process_plugins`，或 AgentCore v1 revision 24 `runtime->create(..., plugins, ...)`；见 `PLUGIN_PROCESS_PROTOCOL.md` |
 | 不可信/多租户可执行插件 | 暂不支持；process v1 是故障/资源边界，不是 OS sandbox |
 
 这些入口改变的是 Host 表达和扩展组合，不是 agent loop 的因果所有权。

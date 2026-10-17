@@ -155,7 +155,7 @@ uses an old `zig-out` artifact.
 |---|---|---|
 | CLI / headless / Web host | Operators and local products | Pre-1.0 command surface |
 | `metacodes-core` Zig module | Same-toolchain Zig hosts | Source API, experimental |
-| AgentCore C ABI v1 revision 23 | Source-free native hosts | Exact-revision bundle pinning |
+| AgentCore C ABI v1 revision 24 | Source-free native hosts | Exact-revision bundle pinning |
 | Static and process plugins | Trusted in-process and isolated tools | Versioned plugin contracts |
 | Provider dialects | Model-family request/response adaptation | Deterministic, trusted plugins only |
 

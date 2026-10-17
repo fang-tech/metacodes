@@ -20,6 +20,7 @@ test {
     _ = @import("component/web_search_test.zig");
     _ = @import("component/allowed_tools_test.zig");
     _ = @import("component/agent_session_tools_test.zig");
+    _ = @import("component/agent_session_team_test.zig");
     _ = @import("component/recovery_allowance_test.zig");
     _ = @import("component/agent_session_host_tools_test.zig");
     _ = @import("component/plugin_runtime_test.zig");

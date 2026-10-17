@@ -166,7 +166,7 @@ pub const Api = struct {
             !validateSessionApi(raw.session) or
             !validateSessionControlApi(raw.session_control) or
             !validateSkillApi(raw.skill) or !validateMcpApi(raw.mcp) or
-            !validateGoalApi(raw.goal))
+            !validateGoalApi(raw.goal) or !validateTeamApi(raw.team))
             return error.UnsupportedAbi;
         return .{ .raw = raw };
     }
@@ -188,6 +188,9 @@ pub const Api = struct {
     }
     pub fn goal(self: Api) GoalApi {
         return .{ .raw = self.raw.goal.? };
+    }
+    pub fn team(self: Api) TeamApi {
+        return .{ .raw = self.raw.team.? };
     }
     pub fn bufferRelease(self: Api) types.BufferReleaseFnV1 {
         return self.raw.buffer_release.?;
@@ -437,6 +440,25 @@ fn validateGoalApi(raw: ?*const types.GoalApiV1) bool {
         api.get != null and api.set != null and api.update != null and api.clear != null;
 }
 
+/// Revision 24: the Session's host-scheduled team (issue #277).
+pub const TeamApi = struct {
+    raw: *const types.TeamApiV1,
+
+    pub fn describe(self: TeamApi) types.TeamDescribeFnV1 {
+        return self.raw.describe.?;
+    }
+    pub fn poll(self: TeamApi) types.TeamPollFnV1 {
+        return self.raw.poll.?;
+    }
+};
+
+fn validateTeamApi(raw: ?*const types.TeamApiV1) bool {
+    const api = raw orelse return false;
+    if (@intFromPtr(api) % @alignOf(types.TeamApiV1) != 0) return false;
+    return api.struct_size == @sizeOf(types.TeamApiV1) and api.reserved0 == 0 and
+        api.describe != null and api.poll != null;
+}
+
 fn validateRuntimeApi(raw: ?*const types.RuntimeApiV1) bool {
     const api = raw orelse return false;
     if (@intFromPtr(api) % @alignOf(types.RuntimeApiV1) != 0) return false;
@@ -506,7 +528,7 @@ test "RunContext validator bounds length before pointer slicing" {
     try std.testing.expectEqualStrings(id, valid.session_id);
 }
 
-test "Revision 23 SDK rejects Revision 13 through 22 and stale reference roots" {
+test "Revision 24 SDK rejects Revision 13 through 23 and stale reference roots" {
     const Revision13Api = extern struct {
         struct_size: u32,
         abi_version: u32,
@@ -522,8 +544,9 @@ test "Revision 23 SDK rejects Revision 13 through 22 and stale reference roots" 
     try std.testing.expectEqual(@as(usize, 280), @sizeOf(Revision13Api));
     try std.testing.expectError(error.UnsupportedAbi, Api.validate(&revision13));
 
-    // Revisions 14 through 22 (16 withdrawn) had the 64-byte root, eight
-    // bytes short of Revision 23's: the size check rejects each of them.
+    // Revisions 14 through 22 (16 withdrawn) had the 64-byte root; Revision 23
+    // added the goal table for a 72-byte root. Both are short of Revision 24's
+    // 80-byte root, so the size check rejects every one of them.
     const Revision22Api = extern struct {
         struct_size: u32,
         abi_version: u32,
@@ -531,7 +554,15 @@ test "Revision 23 SDK rejects Revision 13 through 22 and stale reference roots" 
         reserved0: u32,
         tail: [48]u8,
     };
+    const Revision23Api = extern struct {
+        struct_size: u32,
+        abi_version: u32,
+        abi_revision: u32,
+        reserved0: u32,
+        tail: [56]u8,
+    };
     try std.testing.expectEqual(@as(usize, 64), @sizeOf(Revision22Api));
+    try std.testing.expectEqual(@as(usize, 72), @sizeOf(Revision23Api));
     for ([_]u32{ 14, 15, 16, 17, 18, 19, 20, 21, 22 }) |older| {
         var root: Revision22Api align(@alignOf(types.ApiV1)) = std.mem.zeroes(Revision22Api);
         root.struct_size = @sizeOf(Revision22Api);
@@ -539,11 +570,18 @@ test "Revision 23 SDK rejects Revision 13 through 22 and stale reference roots" 
         root.abi_revision = older;
         try std.testing.expectError(error.UnsupportedAbi, Api.validate(&root));
     }
+    {
+        var root: Revision23Api align(@alignOf(types.ApiV1)) = std.mem.zeroes(Revision23Api);
+        root.struct_size = @sizeOf(Revision23Api);
+        root.abi_version = types.ABI_VERSION_V1;
+        root.abi_revision = 23;
+        try std.testing.expectError(error.UnsupportedAbi, Api.validate(&root));
+    }
 
-    // The unreleased 72-byte reference layout has Revision 23's size, so it
-    // fails at the revision check (it never carried 23) or, carrying 23, at
-    // its missing tables.
-    for ([_]u32{ 13, 22, types.ABI_REVISION }) |revision| {
+    // The 80-byte reference layout has Revision 24's size, so it fails at the
+    // revision check (it never carried 24) or, carrying 24, at its missing
+    // tables.
+    for ([_]u32{ 13, 23, types.ABI_REVISION }) |revision| {
         var stale_reference: types.ApiV1 align(@alignOf(types.ApiV1)) = std.mem.zeroes(types.ApiV1);
         stale_reference.struct_size = @sizeOf(types.ApiV1);
         stale_reference.abi_version = types.ABI_VERSION_V1;
