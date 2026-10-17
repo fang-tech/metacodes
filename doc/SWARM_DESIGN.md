@@ -90,6 +90,34 @@ metacodes swarm = **一组对等 teammate agent + lead**,经**文件邮箱**通�
 - **排除(用户指令)**:Linux bubblewrap 沙箱不做。macOS Seatbelt 沙箱复用(同 App/同 Bash 工具,settings 开则自然套 wrapCommand)。
 - register SW7:真 fork+exec e2e / Seatbelt 验证。
 
+## 7b. 宿主调度 teammate(AgentCore,issue #277)
+
+`src/swarm/context.zig`(`Scheduler`/`SpawnRequest`/`pending_spawns`)、
+`src/swarm/tools.zig`(`executeSpawnTeammate`/`writeTeamDescription`/`pollLeadInbox`)、
+`src/core/agent_session.zig`(`RuntimeConfig.enable_teams`/`SessionConfig.team`)。
+
+CLI 的 teammate 是进程内线程或进程外 worktree(SW1/SW6),由 metacodes 进程自己调度。
+嵌入式 AgentCore Host 不一样:它自己掌握进程与会话生命周期,AgentCore **不替它起任何
+teammate**。于是引入第二种 `SwarmContext.scheduler`:
+
+- **`.in_process`**(CLI 默认):`Task(name=…)` 起线程/进程,维持 `teammates` registry。
+- **`.host`**(AgentCore):`SpawnTeammate`(新 team 原生工具)不起线程,只把一条
+  `SpawnRequest{name,prompt,agent_type,effort}` 记进 `pending_spawns`(按 name 去重、原位
+  替换),然后返回 `{"teammate","backend":"host","status":"requested"}`。lead 不持
+  registry(`teammates == null`)。
+
+Host 侧闭环:`RuntimeConfig.enable_teams` 把 team 工具(`TeamCreate`/`TeamDelete`/
+`SendMessage`/`SpawnTeammate`)放进目录;lead 和 member 都用 `SessionConfig.team`
+(`TeamConfig`,lead/member 角色)加入——member 在创建时即幂等加入名册并建收件箱。lead 跑完一轮后,
+Host 用 `writeTeamDescription` 读 `pending_spawns`、为每个待处理请求创建并运行一个 member
+Session,再用 `pollLeadInbox` 把 lead 收件箱的下一条消息喂给它的下一轮 Run。team 成员由
+Host 在 create/restore 时提供,不进 checkpoint(与 model_capabilities 同理)。AgentCore 的
+`team` 表(`describe`/`poll`)就是这一对操作的 C ABI 封装(见 `AGENTCORE_BINARY_ABI.md`
+"Teams")。
+
+与 in-process 共用同一套文件邮箱与名册语义,两条路径逐份核对安全属性(SW1 `waitForWork`
+vs host `pollLeadInbox`)。
+
 ## 8. 真模型 e2e(SW7)
 
 - 真 glm 模型 headless e2e:`TeamCreate`(→ team demo 建成)+ `Task(name=helper)`(→ 真 teammate 线程 `helper@demo` spawn),两工具 `tool.exec done` 成功。**e2e 抓到并修真 bug**:headless 未接 `.swarm`(只 REPL 接)→ SwarmUnavailable;修后端到端 PASS。

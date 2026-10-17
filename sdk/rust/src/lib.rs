@@ -61,6 +61,7 @@ impl Api {
             || !unsafe { validate_skill_api(table.skill) }
             || !unsafe { validate_mcp_api(table.mcp) }
             || !unsafe { validate_goal_api(table.goal) }
+            || !unsafe { validate_team_api(table.team) }
         {
             return Err(AbiError::UnsupportedAbi);
         }
@@ -118,6 +119,13 @@ impl Api {
     pub fn goal(self) -> GoalApi {
         GoalApi {
             raw: NonNull::new(self.table().goal.cast_mut()).expect("validated Goal API"),
+        }
+    }
+
+    /// Revision 24: the Session's host-scheduled team (issue #277).
+    pub fn team(self) -> TeamApi {
+        TeamApi {
+            raw: NonNull::new(self.table().team.cast_mut()).expect("validated Team API"),
         }
     }
 }
@@ -299,6 +307,37 @@ unsafe fn validate_goal_api(ptr: *const raw::metask_agentcore_goal_api_v1) -> bo
         && table.set.is_some()
         && table.update.is_some()
         && table.clear.is_some()
+}
+
+#[derive(Clone, Copy)]
+pub struct TeamApi {
+    raw: NonNull<raw::metask_agentcore_team_api_v1>,
+}
+
+impl TeamApi {
+    fn table(self) -> &'static raw::metask_agentcore_team_api_v1 {
+        unsafe { self.raw.as_ref() }
+    }
+
+    pub fn describe(self) -> raw::metask_agentcore_team_describe_fn_v1 {
+        self.table().describe
+    }
+    pub fn poll(self) -> raw::metask_agentcore_team_poll_fn_v1 {
+        self.table().poll
+    }
+}
+
+unsafe fn validate_team_api(ptr: *const raw::metask_agentcore_team_api_v1) -> bool {
+    if ptr.is_null()
+        || (ptr as usize) % std::mem::align_of::<raw::metask_agentcore_team_api_v1>() != 0
+    {
+        return false;
+    }
+    let table = unsafe { &*ptr };
+    table.struct_size as usize == size_of::<raw::metask_agentcore_team_api_v1>()
+        && table.reserved0 == 0
+        && table.describe.is_some()
+        && table.poll.is_some()
 }
 
 unsafe fn validate_runtime_api(ptr: *const raw::metask_agentcore_runtime_api_v1) -> bool {
@@ -664,7 +703,7 @@ mod tests {
 
     #[test]
     fn revision_fifteen_layout_codes_and_host_buffer_helpers_are_exact() {
-        assert_eq!(raw::METASK_AGENTCORE_ABI_REVISION, 23);
+        assert_eq!(raw::METASK_AGENTCORE_ABI_REVISION, 24);
         assert_eq!(raw::METASK_AGENTCORE_MAX_SUBMITTED_INPUTS_V1, 64);
         assert_eq!(raw::METASK_AGENTCORE_MAX_SUBMITTED_INPUT_BYTES_V1, 16_777_216);
         assert_eq!(size_of::<raw::metask_agentcore_submitted_input_v1>(), 48);
@@ -728,7 +767,13 @@ mod tests {
         assert_eq!(size_of::<raw::metask_agentcore_goal_api_v1>(), 40);
         assert_eq!(size_of::<raw::metask_agentcore_goal_set_v1>(), 56);
         assert_eq!(size_of::<raw::metask_agentcore_goal_update_v1>(), 64);
-        assert_eq!(size_of::<raw::metask_agentcore_api_v1>(), 72);
+        assert_eq!(size_of::<raw::metask_agentcore_team_api_v1>(), 24);
+        assert_eq!(size_of::<raw::metask_agentcore_team_config_v1>(), 88);
+        assert_eq!(raw::METASK_AGENTCORE_TEAM_ROLE_LEAD, 1);
+        assert_eq!(raw::METASK_AGENTCORE_TEAM_ROLE_MEMBER, 2);
+        assert_eq!(raw::METASK_AGENTCORE_MAX_TEAM_NAME_BYTES_V1, 64);
+        assert_eq!(raw::METASK_AGENTCORE_MAX_TEAM_MEMBER_BYTES_V1, 64);
+        assert_eq!(size_of::<raw::metask_agentcore_api_v1>(), 80);
         assert_eq!(
             size_of::<raw::metask_agentcore_process_plugin_source_v1>(),
             48

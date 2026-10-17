@@ -34,6 +34,20 @@ status, compatibility boundaries, and entry points are defined by
     the goal. Status 30 `GOAL_CONFLICT`; the `goal_updated` event; a goal
     section in checkpoints (marker 10), admitted against the durable budget.
   - SDK 0.10.0-dev.
+- Host-scheduled teams in AgentCore and at the Swarm entry points (issue #277).
+  - **Host scheduler.** With `enable_teams`, a lead Session delegates with
+    `SpawnTeammate` by recording a spawn request instead of starting an
+    in-process thread; the embedding Host creates and runs each member
+    Session. `TeamCreate`, `TeamDelete`, `SendMessage` and `SpawnTeammate` are
+    Session-owned team builtins, admitted only by the flag. Team membership is
+    Host-supplied at create and restore and carries no checkpoint state.
+  - **AgentCore Revision 24.** A seventh root table, `team`, with `describe`
+    (team roster and pending spawns as JSON) and `poll` (the lead's next queued
+    input, marked read); the root grows from 72 to 80 bytes.
+    `RuntimeConfigV1.enable_teams` admits the team tools and
+    `SessionHostConfigV1.team` (`TeamConfigV1`, lead or member) joins a Session
+    to a team.
+  - SDK 0.11.0-dev.
 - Date and time zone for the model at every entry point (issue #276).
   - **CLI.** The user-context message always states the date the session
     started on, with its time zone - without CLAUDE.md, memory or KG, and
@@ -59,6 +73,26 @@ status, compatibility boundaries, and entry points are defined by
     `INVALID_ARGUMENT`.
   - **Source-level Hosts** build the same block with `core.time_context`.
   - SDK 0.9.0-dev.
+- Learning turn, kernel side ([doc/LEARNING_TURN_DESIGN.md](doc/LEARNING_TURN_DESIGN.md)):
+  `agent_loop.Options.learning_turn` (enforce or observe). When the host
+  check gate's verdict ends a root run, the same conversation gets one
+  distill message carrying the verdict and the stored lessons for the task,
+  and writes up to four conditioned lessons with `KgRemember` kind `lesson`
+  (`holds_when:`, `uncertain:`, `lesson:`, optional `supersedes:`); a
+  reconcile message follows only when a lesson was accepted and stored
+  lessons exist. The lesson header (`lesson-v1 verdict= task= run=`) is
+  host-bound: `KgRemember` refuses kind `lesson` outside a learning turn
+  and any header that differs from the verdict the host saw. During a pass
+  only Read, Grep, Glob, KgRecall, KgContext and KgRemember run, process
+  gates neither sense nor end it, and the attempt's answer stays the final
+  result. Each pass is capped at six model turns. Tainted, unavailable and
+  unchecked verdicts teach nothing, and neither does a run with no ready
+  TinyKG store (`none_unstorable`). The next attempt at a hinted task sees
+  the newest unsuperseded lessons in the scoped-recall injection (no
+  lessons, byte-identical injection). One terminal `learning_turn`
+  observation record per armed run (`metacodes-learning-turn-v1`, validated
+  by `scripts/eval/workbuddy/trace.py`). Not yet reachable from the CLI:
+  flags and the headless end-of-run form are the design's steps 5–6.
 - Sealed Skills: the §8.5 disclosure screen keeps two corpora under their
   own policies — the Skill's instructions and its `sealed/` references —
   so `egress.disclosure` is one word for both or

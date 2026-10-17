@@ -21,6 +21,25 @@ pub const ProcessTeammate = struct {
     repo: []u8, // git repo 根(removeWorktree 的 git -C);空 = 用进程 cwd
 };
 
+pub const Scheduler = enum { in_process, host };
+
+/// Issue #277: a teammate the lead model asked for, for the host scheduler to
+/// create. Owned by `SwarmContext.allocator`.
+pub const SpawnRequest = struct {
+    name: []u8,
+    prompt: []u8,
+    agent_type: ?[]u8 = null,
+    effort: ?[]u8 = null,
+
+    fn deinit(self: *SpawnRequest, a: std.mem.Allocator) void {
+        a.free(self.name);
+        a.free(self.prompt);
+        if (self.agent_type) |v| a.free(v);
+        if (self.effort) |v| a.free(v);
+        self.* = undefined;
+    }
+};
+
 pub const SwarmContext = struct {
     allocator: std.mem.Allocator,
     /// Session that owns this team roster; resume must not address a prior
@@ -39,6 +58,14 @@ pub const SwarmContext = struct {
     /// SW6:teammate spawn 后端。true = 进程外(fork+exec metacodes --teammate,cwd/worktree 隔离);
     /// false = 进程内线程(默认,SW1)。lead 从 config.teammate_out_of_process 设。
     out_of_process: bool = false,
+    /// Issue #277: who runs teammates. `in_process` is the CLI (threads, or
+    /// `--teammate-mode process` children). `host` is AgentCore: the runtime
+    /// starts no teammate; the lead's `Task(name)` records a pending spawn
+    /// request the embedding Host fulfils by creating a teammate Session.
+    scheduler: Scheduler = .in_process,
+    /// Host-scheduled spawn requests the lead model has made and the Host has
+    /// not yet fulfilled. Owned by `allocator`; replaced in place by name.
+    pending_spawns: std.ArrayList(SpawnRequest) = .empty,
 
     /// 当前 team 名(sanitized)。空 = 尚未 TeamCreate。owned(建/拆时管理)。
     team_sanitized: []u8 = &.{},
@@ -176,6 +203,48 @@ pub const SwarmContext = struct {
     pub fn deinit(self: *SwarmContext) void {
         self.detachTeam();
         self.process_teammates.deinit(self.allocator);
+        self.clearPendingSpawns();
+        self.pending_spawns.deinit(self.allocator);
+    }
+
+    fn clearPendingSpawns(self: *SwarmContext) void {
+        for (self.pending_spawns.items) |*req| req.deinit(self.allocator);
+        self.pending_spawns.clearRetainingCapacity();
+    }
+
+    /// Records a host-scheduled spawn request (issue #277). A second request
+    /// for the same name replaces the first: the lead re-delegating to a name
+    /// supersedes an unfulfilled request rather than queuing a duplicate.
+    /// The strings are copied.
+    pub fn requestSpawn(self: *SwarmContext, name: []const u8, prompt: []const u8, agent_type: ?[]const u8, effort: ?[]const u8) !void {
+        var req = SpawnRequest{
+            .name = try self.allocator.dupe(u8, name),
+            .prompt = try self.allocator.dupe(u8, prompt),
+        };
+        errdefer req.deinit(self.allocator);
+        if (agent_type) |v| req.agent_type = try self.allocator.dupe(u8, v);
+        if (effort) |v| req.effort = try self.allocator.dupe(u8, v);
+        for (self.pending_spawns.items) |*existing| {
+            if (std.mem.eql(u8, existing.name, name)) {
+                existing.deinit(self.allocator);
+                existing.* = req;
+                return;
+            }
+        }
+        try self.pending_spawns.append(self.allocator, req);
+    }
+
+    /// Drops the pending request for `name`, if any (the Host fulfilled it, or
+    /// the member joined the roster). Returns whether one was removed.
+    pub fn clearPendingSpawn(self: *SwarmContext, name: []const u8) bool {
+        for (self.pending_spawns.items, 0..) |*req, i| {
+            if (std.mem.eql(u8, req.name, name)) {
+                req.deinit(self.allocator);
+                _ = self.pending_spawns.orderedRemove(i);
+                return true;
+            }
+        }
+        return false;
     }
 
     /// Drop the current roster before changing session identity. A team is
@@ -184,6 +253,8 @@ pub const SwarmContext = struct {
     /// This is also used by `deinit`, so all worker and worktree cleanup stays
     /// in one ordered path.
     pub fn detachTeam(self: *SwarmContext) void {
+        // Pending host spawn requests belong to the current team.
+        self.clearPendingSpawns();
         const preserve_durable_team = self.hasUntrackedProcessMember();
         // SW6:先关进程外 teammate(SIGTERM→等死→收尸→removeWorktree;等死在删 worktree 之前,
         // 否则与 teammate 写 worktree 竞态),再收 in-process。
@@ -226,3 +297,28 @@ pub const SwarmContext = struct {
         return team_mod.configPath(self.state_root, self.team_sanitized, buf);
     }
 };
+
+test "host scheduler records, supersedes and clears pending spawn requests (#277)" {
+    const testing = std.testing;
+    var sw = SwarmContext{ .allocator = testing.allocator, .scheduler = .host };
+    defer sw.deinit();
+
+    try sw.requestSpawn("solver", "fix the parser", "general-purpose", "high");
+    try sw.requestSpawn("writer", "write the docs", null, null);
+    try testing.expectEqual(@as(usize, 2), sw.pending_spawns.items.len);
+    try testing.expectEqualStrings("fix the parser", sw.pending_spawns.items[0].prompt);
+    try testing.expectEqualStrings("high", sw.pending_spawns.items[0].effort.?);
+    try testing.expect(sw.pending_spawns.items[1].agent_type == null);
+
+    // Re-delegating to a name replaces the request in place, not a duplicate.
+    try sw.requestSpawn("solver", "fix the parser again", "explore", null);
+    try testing.expectEqual(@as(usize, 2), sw.pending_spawns.items.len);
+    try testing.expectEqualStrings("fix the parser again", sw.pending_spawns.items[0].prompt);
+    try testing.expectEqualStrings("explore", sw.pending_spawns.items[0].agent_type.?);
+    try testing.expect(sw.pending_spawns.items[0].effort == null);
+
+    try testing.expect(sw.clearPendingSpawn("solver"));
+    try testing.expect(!sw.clearPendingSpawn("solver"));
+    try testing.expectEqual(@as(usize, 1), sw.pending_spawns.items.len);
+    try testing.expectEqualStrings("writer", sw.pending_spawns.items[0].name);
+}

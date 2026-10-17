@@ -4,11 +4,11 @@
 /// doc/AGENTCORE_BINARY_ABI.md, Status). No stability promise: layouts and
 /// semantics may change incompatibly between commits. Pin an exact bundle.
 pub const ABI_VERSION_V1: u32 = 1;
-pub const ABI_REVISION: u32 = 23;
+pub const ABI_REVISION: u32 = 24;
 
 comptime {
     if (@sizeOf(usize) != 8)
-        @compileError("AgentCore ABI v1 revision 23 requires a 64-bit pointer ABI");
+        @compileError("AgentCore ABI v1 revision 24 requires a 64-bit pointer ABI");
 }
 
 pub const Status = enum(u32) {
@@ -320,6 +320,15 @@ pub const GOAL_ACTION_BLOCK: u32 = 4;
 /// views longer than MAX_GOAL_OBJECTIVE_BYTES_V1 are refused undecoded.
 pub const MAX_GOAL_OBJECTIVE_CODEPOINTS_V1: u64 = 4000;
 pub const MAX_GOAL_OBJECTIVE_BYTES_V1: u64 = 16_384;
+/// Revision 24 `TeamConfigV1.role_code` values (issue #277). A lead creates
+/// the team and delegates with `SpawnTeammate` (a host spawn request); a
+/// member joins the roster on create and talks through `SendMessage`.
+pub const TEAM_ROLE_LEAD: u32 = 1;
+pub const TEAM_ROLE_MEMBER: u32 = 2;
+/// Revision 24: a team name / member name is non-empty and at most this many
+/// bytes; a session id / lease is the canonical 24 lowercase-hex characters.
+pub const MAX_TEAM_NAME_BYTES_V1: u64 = 64;
+pub const MAX_TEAM_MEMBER_BYTES_V1: u64 = 64;
 
 pub const SKILL_SOURCE_USER: u32 = 1;
 pub const SKILL_SOURCE_WORKSPACE: u32 = 2;
@@ -665,7 +674,11 @@ pub const RuntimeConfigV1 = extern struct {
     mcp_servers: ?[*]const McpServerV1,
     mcp_server_count: u64,
     mcp_catalog_limits: ?*const McpCatalogLimitsV1,
-    reserved: [4]u64,
+    /// Revision 24 (issue #277): nonzero admits the team tools (TeamCreate /
+    /// TeamDelete / SendMessage / SpawnTeammate) into the catalog so a team
+    /// Session can select them. Teams are opt-in; zero keeps them out.
+    enable_teams: u64,
+    reserved: [3]u64,
 };
 
 /// Explicit executable authority supplied by the embedding Host. `root` is an
@@ -813,7 +826,28 @@ pub const SessionHostConfigV1 = extern struct {
     /// every `set_model` target, and its tool-scoped providers.
     model_capabilities: ?[*]const ModelCapabilityV1,
     model_capability_count: u64,
-    reserved: [1]u64,
+    /// Revision 24 (issue #277): this Session's place in a host-scheduled
+    /// team, borrowed for the call. Null is no team. Requires the Runtime's
+    /// `enable_teams`.
+    team: ?*const TeamConfigV1,
+};
+
+/// Revision 24: a Session's team membership (issue #277). The lead's
+/// `team_name` may be empty — its `TeamCreate` names the team; a member names
+/// the team it joins and carries the lead's session id and a fresh lease.
+pub const TeamConfigV1 = extern struct {
+    struct_size: u32,
+    /// TEAM_ROLE_LEAD or TEAM_ROLE_MEMBER.
+    role_code: u32,
+    /// Member: the team to join (required). Lead: empty, or the team name.
+    team_name: BytesViewV1,
+    /// Member only: this member's name (required).
+    member_name: BytesViewV1,
+    /// Member only: the lead's session id (24 lowercase hex) it joins under.
+    lead_session_id: BytesViewV1,
+    /// Member only: a fresh per-spawn lease (24 lowercase hex).
+    member_lease: BytesViewV1,
+    reserved: [2]u64,
 };
 
 /// Revision 21: one Host statement about one model.
@@ -1290,6 +1324,23 @@ pub const GoalClearFnV1 = *const fn (
     session: ?*SessionHandle,
     out_diagnostic: ?*OwnedBytesV1,
 ) callconv(.c) u32;
+/// Revision 24 (issue #277). Writes this Session's team as JSON:
+/// `{"team":null}` or `{"team":{"name","role","members":[{name,session_id,
+/// lease_id,status}],"pending_spawns":[{name,prompt,agent_type,effort}]}}`.
+/// BUSY like `describe` while a Run, compact, checkpoint or mutation runs.
+pub const TeamDescribeFnV1 = *const fn (
+    session: ?*SessionHandle,
+    out_team_json: ?*OwnedBytesV1,
+    out_diagnostic: ?*OwnedBytesV1,
+) callconv(.c) u32;
+/// Revision 24. Takes the lead's pending inbox as the model input for its
+/// next Run, marked read: `{"input":null}` or `{"input":"<text>"}`. Idle-only;
+/// a non-lead or team-less Session writes `{"input":null}`.
+pub const TeamPollFnV1 = *const fn (
+    session: ?*SessionHandle,
+    out_input_json: ?*OwnedBytesV1,
+    out_diagnostic: ?*OwnedBytesV1,
+) callconv(.c) u32;
 /// Releases only library-owned diagnostics, never Host-owned tool or UI
 /// callback buffers.
 pub const BufferReleaseFnV1 = *const fn (?*OwnedBytesV1) callconv(.c) void;
@@ -1364,6 +1415,15 @@ pub const ApiV1 = extern struct {
     skill: ?*const SkillApiV1,
     mcp: ?*const McpApiV1,
     goal: ?*const GoalApiV1,
+    team: ?*const TeamApiV1,
+};
+
+/// Revision 24 (issue #277): the Session's host-scheduled team.
+pub const TeamApiV1 = extern struct {
+    struct_size: u32,
+    reserved0: u32,
+    describe: ?TeamDescribeFnV1,
+    poll: ?TeamPollFnV1,
 };
 
 test "ABI v1 public layouts are fixed on supported 64-bit targets" {
@@ -1417,6 +1477,8 @@ test "ABI v1 public layouts are fixed on supported 64-bit targets" {
     try std.testing.expectEqual(@as(usize, 32), @sizeOf(SkillApiV1));
     try std.testing.expectEqual(@as(usize, 40), @sizeOf(McpApiV1));
     try std.testing.expectEqual(@as(usize, 40), @sizeOf(GoalApiV1));
+    try std.testing.expectEqual(@as(usize, 24), @sizeOf(TeamApiV1));
+    try std.testing.expectEqual(@as(usize, 88), @sizeOf(TeamConfigV1));
     try std.testing.expectEqual(@as(usize, 56), @sizeOf(GoalSetV1));
     try std.testing.expectEqual(@as(usize, 64), @sizeOf(GoalUpdateV1));
     try std.testing.expectEqual(@as(usize, 8), @offsetOf(GoalSetV1, "objective"));
@@ -1424,8 +1486,9 @@ test "ABI v1 public layouts are fixed on supported 64-bit targets" {
     try std.testing.expectEqual(@as(usize, 8), @offsetOf(GoalUpdateV1, "objective"));
     try std.testing.expectEqual(@as(usize, 24), @offsetOf(GoalUpdateV1, "token_budget"));
     try std.testing.expectEqual(@as(usize, 32), @offsetOf(GoalUpdateV1, "action_code"));
-    try std.testing.expectEqual(@as(usize, 72), @sizeOf(ApiV1));
+    try std.testing.expectEqual(@as(usize, 80), @sizeOf(ApiV1));
     try std.testing.expectEqual(@as(usize, 64), @offsetOf(ApiV1, "goal"));
+    try std.testing.expectEqual(@as(usize, 72), @offsetOf(ApiV1, "team"));
     try std.testing.expectEqual(@as(usize, 8), @offsetOf(RunContextV1, "session"));
     try std.testing.expectEqual(@as(usize, 16), @offsetOf(RunContextV1, "run_id"));
     try std.testing.expectEqual(@as(usize, 24), @offsetOf(RunContextV1, "session_id"));
@@ -1440,6 +1503,7 @@ test "ABI v1 public layouts are fixed on supported 64-bit targets" {
     try std.testing.expectEqual(@as(usize, 200), @offsetOf(McpServerV1, "configuration_fingerprint"));
     try std.testing.expectEqual(@as(usize, 40), @offsetOf(RuntimeConfigV1, "mcp_servers"));
     try std.testing.expectEqual(@as(usize, 56), @offsetOf(RuntimeConfigV1, "mcp_catalog_limits"));
+    try std.testing.expectEqual(@as(usize, 64), @offsetOf(RuntimeConfigV1, "enable_teams"));
     try std.testing.expectEqual(@as(usize, 8), @offsetOf(ProcessPluginSourceV1, "root"));
     try std.testing.expectEqual(@as(usize, 8), @offsetOf(RuntimePluginConfigV1, "process_plugins"));
     try std.testing.expectEqual(@as(usize, 24), @offsetOf(RuntimePluginConfigV1, "host_stream_tools"));
@@ -1454,7 +1518,7 @@ test "ABI v1 public layouts are fixed on supported 64-bit targets" {
     try std.testing.expectEqual(@as(usize, 140), @offsetOf(SessionHostConfigV1, "protocol_kind_code"));
     try std.testing.expectEqual(@as(usize, 144), @offsetOf(SessionHostConfigV1, "model_capabilities"));
     try std.testing.expectEqual(@as(usize, 152), @offsetOf(SessionHostConfigV1, "model_capability_count"));
-    try std.testing.expectEqual(@as(usize, 160), @offsetOf(SessionHostConfigV1, "reserved"));
+    try std.testing.expectEqual(@as(usize, 160), @offsetOf(SessionHostConfigV1, "team"));
     try std.testing.expectEqual(@as(usize, 40), @sizeOf(ModelCapabilityV1));
     try std.testing.expectEqual(@as(usize, 4), @offsetOf(ModelCapabilityV1, "image_input_code"));
     try std.testing.expectEqual(@as(usize, 8), @offsetOf(ModelCapabilityV1, "model"));
@@ -1558,9 +1622,9 @@ test "typed provider kind validates every public code" {
     );
 }
 
-test "Revision 23 keeps MCP wire codes stable" {
+test "Revision 24 keeps MCP wire codes stable" {
     const std = @import("std");
-    try std.testing.expectEqual(@as(u32, 23), ABI_REVISION);
+    try std.testing.expectEqual(@as(u32, 24), ABI_REVISION);
     try std.testing.expectEqual(@as(u32, 1), MCP_NEGOTIATION_AUTO);
     try std.testing.expectEqual(@as(u32, 2), MCP_NEGOTIATION_MODERN_ONLY);
     try std.testing.expectEqual(@as(u32, 3), MCP_NEGOTIATION_LEGACY_ONLY);

@@ -20,6 +20,7 @@ test {
     _ = @import("component/web_search_test.zig");
     _ = @import("component/allowed_tools_test.zig");
     _ = @import("component/agent_session_tools_test.zig");
+    _ = @import("component/agent_session_team_test.zig");
     _ = @import("component/recovery_allowance_test.zig");
     _ = @import("component/agent_session_host_tools_test.zig");
     _ = @import("component/plugin_runtime_test.zig");
@@ -45,6 +46,7 @@ test {
     _ = @import("component/requirement_ledger_test.zig");
     _ = @import("component/delivery_cadence_test.zig");
     _ = @import("component/check_gate_test.zig");
+    _ = @import("component/learning_turn_test.zig");
     _ = @import("component/test_integrity_test.zig");
     _ = @import("component/progress_updates_test.zig");
     _ = @import("component/stall_gate_test.zig");

@@ -1,7 +1,7 @@
 # AgentCore SDK
 
 This directory contains source-free host bindings for the experimental AgentCore
-C ABI v1 revision 23:
+C ABI v1 revision 24:
 
 - `metask/agentcore.h` — normative C11/C++17 layout declarations;
 - `zig/` — typed Zig consumer bindings;
@@ -9,8 +9,8 @@ C ABI v1 revision 23:
 - `VERSION` — SDK package version, distinct from ABI revision.
 
 Do not copy individual files into a release. Consume the complete generated bundle
-and validate its manifest, hashes, target, ABI version, exact 72-byte root, all
-six mandatory typed tables, function slots, and reserved fields. Revision 23 is
+and validate its manifest, hashes, target, ABI version, exact 80-byte root, all
+seven mandatory typed tables, function slots, and reserved fields. Revision 24 is
 the Agent Runtime surface; it does not expose an independent Completion client.
 `SessionCreateConfigV1.prompt_profile` edits the named system-prompt sections
 (replace the identity, add Host sections; governance sections stay locked) and
@@ -44,6 +44,13 @@ and status together or not at all, and `clear` removes it. A
 goal, works toward it; every Run that begins on an active goal is charged to
 it, `goal_updated` events report the budget running out and each Run's
 settlement, and checkpoints carry the goal. Refusals are `GOAL_CONFLICT` (30).
+The `team` table gives a Session its host-scheduled team (issue #277): with
+`RuntimeConfigV1.enable_teams` the team tools (`TeamCreate`, `TeamDelete`,
+`SendMessage`, `SpawnTeammate`) enter the catalog and a lead or member Session
+carries a `SessionHostConfigV1.team`. `describe` writes the roster and pending
+spawn requests as JSON; `poll` takes the lead's next queued input, marked read.
+AgentCore runs no teammate threads — the Host creates the member Sessions a
+lead's pending spawns name.
 `SessionHostConfigV1.protocol_kind_code` is provider-scoped: zero preserves the
 provider default, while OpenAI may explicitly select
 `OPENAI_PROTOCOL_RESPONSES`. Pair it with `provider_kind_code`, the full endpoint

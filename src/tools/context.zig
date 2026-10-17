@@ -400,6 +400,10 @@ pub const ToolContext = struct {
     /// The run's user request, for System-One judgments that need more than a
     /// tool argument (KgRecall evidence). Empty when unknown or no advisor.
     jev_request: []const u8 = "",
+    /// Set only during a learning pass (`core/learning_turn.zig`): the header a
+    /// `KgRemember` of kind `lesson` must carry, and the turn's lesson budget.
+    /// Null everywhere else, where kind `lesson` is refused.
+    lesson_binding: ?*@import("../kg/lesson.zig").Binding = null,
     /// KG per-project 指针目录(`{home}/.metacodes/projects/<git根hash>`)。任务锚指针
     /// (kg_task_anchor)写到此;旧会话的 kg_root 指针仍从此读回。空串 = 未配置。
     kg_projects_dir: []const u8 = "",

@@ -41,6 +41,8 @@ const progress_updates_mod = @import("progress_updates.zig");
 const check_gate_mod = @import("check_gate.zig");
 const test_integrity_mod = @import("test_integrity.zig");
 const stall_gate_mod = @import("stall_gate.zig");
+const learning_turn_mod = @import("learning_turn.zig");
+const lesson_mod = @import("../kg/lesson.zig");
 const util_time = @import("../util/time.zig");
 const util_json = @import("../util/json.zig");
 const log = @import("../util/log.zig");
@@ -301,6 +303,10 @@ pub const RunResult = struct {
     /// seamless concatenation, so this is the only trace a host that reads
     /// only the result has of it (issue #269).
     continuations: u32 = 0,
+    /// Non-null when a learning turn was armed and the run reached its
+    /// terminal boundary (`learning_turn.zig`). `stop_reason` stays the
+    /// attempt's own; this says what the learning turn did after it.
+    learning: ?learning_turn_mod.Report = null,
 };
 
 /// Probe supplied by an interactive host so a queued user message can end the
@@ -584,6 +590,16 @@ pub const Options = struct {
     /// so macro runs and embedders never run a check; the terminal
     /// `check_gate` observation record is emitted once per run when armed.
     check_gate: ?check_gate_mod.Options = null,
+    /// Learning turn (doc/LEARNING_TURN_DESIGN.md): after the check gate's
+    /// verdict ends the run, the same conversation distills conditioned
+    /// lessons (`KgRemember` kind `lesson`) and reconciles them with the
+    /// stored ones, in at most two bounded passes during which only read
+    /// tools and KgRemember run. Needs `check_gate` for its verdict; without
+    /// a check at the terminal boundary it records `none_unchecked`. Observe
+    /// mode decides the same and injects nothing. Root run only; canonical
+    /// buildRunOptions leaves it null; one terminal `learning_turn`
+    /// observation record per armed run.
+    learning_turn: ?learning_turn_mod.Options = null,
     /// Test integrity obligation (TestIntegrity.lean): tests that existed when
     /// the run started are compared with that baseline at end-of-turn
     /// boundaries; enforce mode sends one message when the model stops with
@@ -874,6 +890,19 @@ fn finishRun(backend: *const UiBackend, sess: @import("session_id.zig").SessionI
 /// 调 `close`,不用先判断"现在到底开着没"。反向的配对由 `begin` 兜底:若某个循环出口
 /// 漏了收段,下一轮 `begin` 先把悬开段以 .partial 收口再开新段,消费者永远不会看到
 /// 无配对的 `output_segment_begin`(漏关仍是 bug——正文进不了 Ledger,故留 warn 日志)。
+/// KgRemember calls of kind `lesson` that ran and were refused (bad envelope,
+/// wrong header, budget spent): the learning record's `lessons_refused`.
+fn countRefusedLessons(slots: []const @import("tool_exec.zig").Slot) u32 {
+    var refused: u32 = 0;
+    for (slots) |slot| {
+        if (slot.decision != .run or !slot.is_error) continue;
+        if (!std.mem.eql(u8, slot.name, "KgRemember")) continue;
+        const kind = util_json.extractStringField(slot.input, "kind") orelse continue;
+        if (std.ascii.eqlIgnoreCase(kind, lesson_mod.SCHEMA_TYPE)) refused +|= 1;
+    }
+    return refused;
+}
+
 const OutputChannel = struct {
     backend: *const UiBackend,
     session: @import("session_id.zig").SessionId,
@@ -882,6 +911,10 @@ const OutputChannel = struct {
     /// 本段已流出的可见字节数。**权威计数**:兜底关闭时 assistant_text 缓冲已随 turn 作用域
     /// 释放,拿不到文本,但字节数仍必须如实上报。
     pending_bytes: u64 = 0,
+    /// Set when a learning turn starts: the answer is already final, so any
+    /// later close that would make text part of the result (an abort inside a
+    /// learning pass closes `.final`) is recorded as commentary instead.
+    final_sealed: bool = false,
 
     fn begin(self: *OutputChannel, turn: u32) void {
         // 配对兜底(见顶注):漏关的段在这里以 .partial 收口,end 事件照发。
@@ -906,7 +939,11 @@ const OutputChannel = struct {
 
     /// `text` 是本段已流出的可见字节(借用;record 内立即拷贝需要保留的部分)。段的 bytes
     /// 取自权威计数器而非 text.len——兜底路径传 "" 但字节数照报。
-    fn close(self: *OutputChannel, disposition: output_semantics.Disposition, text: []const u8) void {
+    fn close(self: *OutputChannel, requested: output_semantics.Disposition, text: []const u8) void {
+        const disposition: output_semantics.Disposition = if (self.final_sealed and requested.contributesToFinal())
+            .commentary
+        else
+            requested;
         const seg = self.tracker.close(disposition, self.pending_bytes) orelse return;
         self.pending_bytes = 0;
         self.backend.emitEvent(self.session, .{ .output_segment_end = .{
@@ -1150,12 +1187,16 @@ pub fn run(
     defer if (opts.goal_meter) |meter| if (meter.endRun()) |settled| backend.emitEvent(opts.session, .{ .goal_updated = settled });
     var result = try runCounted(conversation, provider, tool_defs, permission_ctx, opts, backend, allocator, &counters);
     result.continuations = counters.continuations;
+    result.learning = counters.learning;
     return result;
 }
 
 const RunCounters = struct {
     /// max_tokens 续写次数(见 MAX_CONTINUATIONS);RunResult.continuations 的来源。
     continuations: u32 = 0,
+    /// The learning turn's report once it decided (RunResult.learning), set by a
+    /// defer in runCounted so an abort inside a pass still reports it.
+    learning: ?learning_turn_mod.Report = null,
 };
 
 fn runCounted(
@@ -1276,6 +1317,44 @@ fn runCounted(
     // 宿主检查门 + Stop hook 拦截(CheckGate.lean):各自有界的续跑预算,不走注入计量器
     // (续跑由外部裁决驱动,不是咨询性 nudge)。终局记录只在检查门武装时落一条。
     var check_gate_state = check_gate_mod.State{};
+    // Learning turn (learning_turn.zig): decided once at the terminal
+    // boundary; its passes borrow turns past max_turns like the KG repair.
+    var learning_state = learning_turn_mod.State{};
+    defer learning_state.deinit(allocator);
+    defer if (opts.learning_turn) |learning| if (learning_state.decision != null) {
+        counters.learning = learning_state.report(learning.mode);
+    };
+    var learning_borrowed_turns: u32 = 0;
+    defer if (opts.learning_turn) |learning| if (depth == 0) {
+        if (opts.tool_observer) |observer| {
+            const report = learning_state.report(learning.mode);
+            _ = observer.emit(.{ .learning_turn = .{
+                .enforced = report.enforced,
+                .grounding = switch (report.grounding) {
+                    .unchecked => .unchecked,
+                    .passed => .passed,
+                    .failed => .failed,
+                    .tainted => .tainted,
+                    .unavailable => .unavailable,
+                },
+                .decision = switch (report.decision) {
+                    .none_unfinished => .none_unfinished,
+                    .none_unchecked => .none_unchecked,
+                    .none_unavailable => .none_unavailable,
+                    .none_tainted => .none_tainted,
+                    .none_unstorable => .none_unstorable,
+                    .distill => .distill,
+                },
+                .passes = report.passes,
+                .distill_turns = report.distill_turns,
+                .reconcile_turns = report.reconcile_turns,
+                .lessons_accepted = report.lessons_accepted,
+                .lessons_refused = report.lessons_refused,
+                .reconciled = report.reconciled,
+                .truncated = report.truncated,
+            } });
+        }
+    };
     // Test-integrity sensor (TestIntegrity.lean): the suite as it was when the
     // run started. The check gate reads it too, to taint a pass over weakened
     // tests; only an armed obligation messages, records and reports.
@@ -1423,7 +1502,7 @@ fn runCounted(
     // the transcript or across process revisions.
     var compact_summary_reserve_tokens: usize = 0;
 
-    outer_turn: while (turns < opts.max_turns +| kg_coverage_borrowed_turns) : (turns += 1) {
+    outer_turn: while (turns < opts.max_turns +| kg_coverage_borrowed_turns +| learning_borrowed_turns) : (turns += 1) {
         // 开头检查 abort
         if (opts.abort) |a| if (a.isAborted()) {
             log.warn("agent", "aborted before turn {d}", .{turns + 1});
@@ -1436,11 +1515,26 @@ fn runCounted(
                 return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .budget, .turns = turns, .tool_calls = total_tool_calls });
             }
         }
+        // Learning pass turn cap: a pass that keeps calling tools ends here;
+        // the attempt's answer stands and the record says the pass was cut.
+        if (learning_state.active() and !learning_state.beginPassTurn()) {
+            learning_state.truncated = true;
+            log.info("agent", "learning turn {s} pass cut at {d} turns", .{ @tagName(learning_state.phase), learning_turn_mod.PASS_MAX_TURNS });
+            return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .end_turn, .turns = turns, .tool_calls = total_tool_calls });
+        }
+        // The one predicate for "this round is a learning pass, not the
+        // attempt". A pass is the tail of a finished attempt: queued input,
+        // backgrounding, job notifications, advisory nudges, process sensors
+        // and the fault breaker all skip it, and a new turn-boundary or
+        // post-execution gate must check it too. The phase only changes in
+        // the end-turn branch, which leaves the iteration, so the value holds
+        // for the whole iteration.
+        const in_learning_pass = learning_state.active();
 
         // 转后台请求(Ctrl+B):turn 边界检查——此刻 conversation 干净(上轮 tool_result 已 append),
         // 返回 .backgrounded 让调用方深拷贝转后台续跑。**只在 turn 开头查**(run 是同步循环,无中途
         // 暂停点;唯一安全转后台点是 turn 边界)。与 abort 分开:这不是中断,是把完整对话搬去后台。
-        if (opts.background_request) |bg| if (bg.load(.acquire)) {
+        if (!in_learning_pass) if (opts.background_request) |bg| if (bg.load(.acquire)) {
             log.info("agent", "background requested before turn {d} → backgrounding", .{turns + 1});
             return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .backgrounded, .turns = turns, .tool_calls = total_tool_calls });
         };
@@ -1450,7 +1544,7 @@ fn runCounted(
         // 刚追加的"接着写"提示与转向指令并排会让模型换题,而 Ledger 仍把下一段当同一答案的续写。
         if (continuation_pending) {
             continuation_pending = false;
-        } else {
+        } else if (!in_learning_pass) {
             if (try drainUiEvents(backend, sess, conversation, allocator, turns + 1)) |reason| {
                 log.warn("agent", "interrupt from UI backend before turn {d}: {s}", .{ turns + 1, @tagName(reason) });
                 return finishRun(backend, sess, trace_id, depth, .{
@@ -1479,7 +1573,7 @@ fn runCounted(
         // 2026-09-19 polling incident: deliver metadata at the boundary so
         // the model need not poll, while keeping child bytes behind BashOutput
         // and preserving owner/duplicate/role invariants.
-        if (opts.job_notifications) |registry| {
+        if (!in_learning_pass) if (opts.job_notifications) |registry| {
             notification_delivery: {
                 const owner = opts.agent_ident orelse opts.session;
                 const events = registry.takeUnannouncedExits(owner, allocator) catch |err| {
@@ -1515,7 +1609,7 @@ fn runCounted(
                     log.info("agent", "job notification delivered ids={s} turn={d}", .{ ids.items, turns + 1 });
                 }
             }
-        }
+        };
 
         // Delivery-cadence obligation: the run is still exploring and nothing
         // is on disk. Decided at the turn boundary (the conversation is clean:
@@ -1523,7 +1617,7 @@ fn runCounted(
         // shared meter, and never a denial. Observe mode advances the level
         // without injecting so control arms record the same crossings.
         // Formal model: DeliveryCadence.lean.
-        if ((opts.delivery_cadence or opts.delivery_cadence_observe) and
+        if (!in_learning_pass and (opts.delivery_cadence or opts.delivery_cadence_observe) and
             (!opts.delivery_cadence or host_injection_meter.remaining() > 0))
         {
             const decision = delivery_cadence_state.decide(opts.delivery_cadence_thresholds);
@@ -1551,7 +1645,7 @@ fn runCounted(
         // denial; observe mode counts the decision without injecting. Only a run
         // whose commentary a person reads (event_projection). Formal model:
         // ProgressUpdates.lean.
-        if ((opts.progress_updates or opts.progress_updates_observe) and
+        if (!in_learning_pass and (opts.progress_updates or opts.progress_updates_observe) and
             opts.event_projection.admitsProgressNudge(opts.agent_depth))
         {
             const now_ns = util_time.nowNs();
@@ -1952,6 +2046,7 @@ fn runCounted(
             .kg_lexical_ledger = &kg_lexical_ledger,
             .jev = opts.jev,
             .jev_request = kg_enumeration_text orelse "",
+            .lesson_binding = if (learning_state.active()) &learning_state.binding else null,
             .kg_projects_dir = opts.kg_projects_dir,
             .memdir_abs = opts.memdir_abs,
             .api_client = opts.api_client,
@@ -2730,6 +2825,30 @@ fn runCounted(
         if (has_tool_use) output_channel.close(.commentary, assistant_text.items);
 
         if (!has_tool_use) {
+            // A learning pass ended (learning_turn.zig): after distill, go on
+            // to reconcile when a lesson was accepted and stored lessons exist;
+            // otherwise the run ends with the attempt's own stop reason. No
+            // process gate judges a learning pass — the answer is already final.
+            if (learning_state.active()) {
+                output_channel.close(.commentary, assistant_text.items);
+                backend.emitEvent(sess, .{ .diag_turn_end = .{ .trace_id = trace_id, .depth = depth, .turn = turns + 1, .tool_calls = total_tool_calls } });
+                if (learning_state.phase == .distill) {
+                    learning_state.distill_accepted = learning_state.binding.acceptedCount();
+                    if (learning_turn_mod.afterDistill(learning_state.distill_accepted, learning_state.existing) == .reconcile) {
+                        const text = try learning_turn_mod.renderReconcile(allocator, &learning_state);
+                        defer allocator.free(text);
+                        learning_state.startPass(.reconcile);
+                        learning_borrowed_turns +|= learning_turn_mod.PASS_MAX_TURNS;
+                        log.infoId("agent", rid, "learning turn reconcile accepted={d} existing={d}", .{ learning_state.distill_accepted, learning_state.existing });
+                        try conversation.appendText(.user, text);
+                        continue;
+                    }
+                }
+                const report = learning_state.report(opts.learning_turn.?.mode);
+                learning_state.phase = .idle;
+                log.infoId("agent", rid, "learning turn done passes={d} lessons={d} refused={d}", .{ report.passes, report.lessons_accepted, report.lessons_refused });
+                return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .end_turn, .turns = turns + 1, .tool_calls = total_tool_calls });
+            }
             if (turn_stop_reason == .max_tokens and
                 continuations.* >= MAX_CONTINUATIONS and
                 assistant_text.items.len == 0)
@@ -3058,6 +3177,9 @@ fn runCounted(
                 backend.emitEvent(sess, .clear_current_tool);
                 defer outcome.deinit(allocator);
                 check_gate_state.noteVerdict(&outcome);
+                // Only an enforced learning turn ever quotes the verdict.
+                if (opts.learning_turn) |learning| if (learning.mode == .enforce and depth == 0)
+                    learning_state.captureVerdict(allocator, gate.command, &outcome);
                 const decision = check_gate_mod.decide(gate.mode, gate.max_continuations, check_gate_state.continuations, outcome.verdict);
                 log.infoId("agent", rid, "host check verdict={s} passed={d}/{d} exit={d} decision={s} continuations={d}/{d}", .{
                     @tagName(outcome.verdict), outcome.passed, outcome.total, outcome.exit_code, @tagName(decision), check_gate_state.continuations, gate.max_continuations,
@@ -3099,6 +3221,32 @@ fn runCounted(
             // 自然 end_turn 且无任何主机异议 → 这一段(连同同 group 的续写段)就是最终结果。
             if (test_integrity_state.armed) test_integrity_state.noteFinalAnswer(assistant_text.items);
             output_channel.close(.final, assistant_text.items);
+            // Learning turn (learning_turn.zig): the answer is final; decide on
+            // the verdict the check gate left at this workspace.
+            if (opts.learning_turn) |learning| if (depth == 0) {
+                const grounding: learning_turn_mod.Grounding = if (opts.check_gate != null and check_gate_state.checks > 0 and !check_gate_state.dirty)
+                    learning_turn_mod.groundingOf(check_gate_state.last_verdict)
+                else
+                    .unchecked;
+                const store: ?*@import("../kg/client.zig").KgClient = if (opts.kg) |kg| (if (kg.ready) kg else null) else null;
+                const decision = learning_turn_mod.decide(grounding, store != null);
+                learning_state.grounding = grounding;
+                learning_state.decision = decision;
+                log.infoId("agent", rid, "learning turn {s} grounding={s} decision={s}", .{ @tagName(learning.mode), @tagName(grounding), @tagName(decision) });
+                if (decision == .distill and learning.mode == .enforce) {
+                    learning_state.bind(if (grounding == .passed) .passed else .failed, learning, trace_id);
+                    const existing = try lesson_mod.collectForTask(allocator, store.?, learning_state.binding.task, learning_turn_mod.MAX_EXISTING_SHOWN);
+                    defer lesson_mod.freeStored(allocator, existing);
+                    learning_state.existing = existing.len;
+                    const text = try learning_turn_mod.renderDistill(allocator, &learning_state, existing);
+                    defer allocator.free(text);
+                    output_channel.final_sealed = true;
+                    learning_state.startPass(.distill);
+                    learning_borrowed_turns +|= learning_turn_mod.PASS_MAX_TURNS;
+                    try conversation.appendText(.user, text);
+                    continue :outer_turn;
+                }
+            };
             return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .end_turn, .turns = turns + 1, .tool_calls = total_tool_calls });
         }
 
@@ -3195,6 +3343,29 @@ fn runCounted(
                 tu.name // dispatcher universe: exact-name policy, no repair
             else
                 tools_mod.resolveToolNameExact(&name_probe_ctx, tu.name) orelse tu.name;
+            // Learning pass: only read tools and KgRemember run, so the workspace
+            // the check judged is the workspace the run hands back.
+            if (learning_state.active() and !learning_turn_mod.allowedDuringPass(canonical_name)) {
+                backend.emitEvent(sess, .{ .policy_decision = .{
+                    .trace_id = trace_id,
+                    .depth = depth,
+                    .id = tu.id,
+                    .tool = tu.name,
+                    .decision = "deny",
+                    .source = "learning_turn",
+                    .allowed = false,
+                } });
+                var lslot = tool_exec.Slot{ .decision = .denied, .name = tu.name, .id = tu.id, .input = tu.input };
+                lslot.content = try tool_error.errorToJson(
+                    "LearningTurnToolUnavailable",
+                    "tool '{s}' does not run in a learning turn: only Read, Grep, Glob, KgRecall, KgContext and KgRemember do, and the workspace stays as the check judged it",
+                    .{tu.name},
+                    allocator,
+                );
+                lslot.is_error = true;
+                try slots.append(allocator, lslot);
+                continue;
+            }
             // PreToolUse hook(有配置才跑):可 block(拒)或 updatedInput(改写工具输入)。
             var eff_input = tu.input;
             if (hookset) |hs| if (hs.hasPre()) {
@@ -3337,6 +3508,7 @@ fn runCounted(
             .kg_lexical_ledger = &kg_lexical_ledger,
             .jev = opts.jev,
             .jev_request = kg_enumeration_text orelse "",
+            .lesson_binding = if (learning_state.active()) &learning_state.binding else null,
             .kg_projects_dir = opts.kg_projects_dir,
             .memdir_abs = opts.memdir_abs,
             .api_client = opts.api_client,
@@ -3494,20 +3666,24 @@ fn runCounted(
         // suspend and host-fatal paths return without reaching the turn's
         // tail (Codex review 2026-09-21: a suspended sibling batch used to
         // leave the terminal record at zero).
-        if (opts.delivery_cadence or opts.delivery_cadence_observe)
+        // A learning pass is outside the attempt (in_learning_pass): the
+        // process sensors below neither count it nor can end it. Only its
+        // lesson refusals are counted.
+        if (in_learning_pass) learning_state.lessons_refused +|= countRefusedLessons(slots.items);
+        if (!in_learning_pass and (opts.delivery_cadence or opts.delivery_cadence_observe))
             delivery_cadence_state.observeSlots(allocator, slots.items);
         // Host-check-gate sensor, same placement and reason: a delivery-capable
         // action must mark the run dirty before any early return.
-        if (opts.check_gate != null) check_gate_state.observeSlots(allocator, slots.items);
-        if (test_integrity_state.armed) test_integrity_state.observeSlots(allocator, slots.items);
+        if (!in_learning_pass and opts.check_gate != null) check_gate_state.observeSlots(allocator, slots.items);
+        if (!in_learning_pass and test_integrity_state.armed) test_integrity_state.observeSlots(allocator, slots.items);
         // Stall-gate sensor, same placement: the content is still on the slots
         // (it moves into result_blocks below). First forget what the model can
         // no longer see — compaction or microcompaction since the last round —
         // so a re-read of a cleared result counts as news.
-        if (stall_state) |state| {
+        if (!in_learning_pass) if (stall_state) |state| {
             state.forgetInvisible(conversation.messages.items, conversation.activeStart());
             _ = state.observeSlots(slots.items);
-        }
+        };
         // 文件修改证据先于一切分支落地:fatal 同样可能发生在盘已改之后,先投再上抛。
         drainFileChanges(slots.items, &base_ctx, backend, sess, opts.file_change_journal, allocator);
         try exec_outcome;
@@ -3741,7 +3917,8 @@ fn runCounted(
             // content 的所有权已归 result_blocks,这里只读。**必须在 tool_result 之后发**:
             // TUI 在 tool_result 时才把动态卡 commit 进滚动区,先发故障行会让它印在上一张卡
             // 下面,读起来像是上一条命令出了错(2026-09-23 实录)。
-            if (s.is_error and isEnvironmentFault(content)) {
+            // A learning pass ran after the attempt ended: its faults do not count toward the breaker.
+            if (!in_learning_pass and s.is_error and isEnvironmentFault(content)) {
                 environment_faults += 1;
                 backend.emitEvent(sess, .{ .environment_fault = .{
                     .tool = s.name,
@@ -3857,7 +4034,7 @@ fn runCounted(
         try conversation.append(.{ .role = .user, .blocks = blocks_owned });
         // The round's results are now the last message, one block per slot:
         // the stall gate anchors each key to the block the model will see.
-        if (stall_state) |state| state.anchorRound(conversation.messages.items);
+        if (!in_learning_pass) if (stall_state) |state| state.anchorRound(conversation.messages.items);
 
         // 环境故障熔断:第 MAX_ENVIRONMENT_FAULTS 次之后停。放在结果提交进对话**之后**,
         // 续接时模型看得到全部证据;用 .tool_loop 收口(ABI 里保留的熔断停止原因),并发
@@ -3873,7 +4050,7 @@ fn runCounted(
         // so a resumed run sees all the evidence; the environment-fault breaker
         // above is the more specific cause and goes first. Enforce ends the run
         // without injecting anything; observe only records the decision.
-        if (opts.stall_gate) |mode| if (stall_state) |state| if (state.decide(opts.stall_gate_thresholds)) |cause| {
+        if (!in_learning_pass) if (opts.stall_gate) |mode| if (stall_state) |state| if (state.decide(opts.stall_gate_thresholds)) |cause| {
             const report = state.noteDecided(cause);
             log.warn("agent", "stall gate {s}: cause={s} stale_rounds={d} repeats={d} tool={s} round={d}", .{ @tagName(mode), @tagName(cause), report.stale_rounds, report.repeats, report.tool.slice(), report.round });
             if (mode == .enforce) {

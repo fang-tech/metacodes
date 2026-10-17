@@ -2903,6 +2903,30 @@ const AbiSession = struct {
         return out.toOwnedSlice();
     }
 
+    /// Revision 24 (issue #277): the Session's team as `team->describe` JSON,
+    /// read under a checkpoint lease so no Run or mutation changes it.
+    fn readTeam(self: *AbiSession) ![]u8 {
+        if (!self.tryBeginCheckpoint()) return error.SessionBusy;
+        defer self.finishCheckpoint();
+        var lease = try self.core_session.snapshotCommitted();
+        defer lease.deinit();
+        if (self.core_session.swarm) |*sw|
+            return core.swarm_tools.writeTeamDescription(allocator, sw);
+        return allocator.dupe(u8, "{\"team\":null}");
+    }
+
+    /// Revision 24: the lead's pending inbox as the model input for its next
+    /// Run, marked read. A non-lead or team-less Session yields none. Marking
+    /// read mutates the inbox, so it takes the mutation gate.
+    fn pollTeam(self: *AbiSession) !?[]u8 {
+        if (!self.tryBeginMutation()) return error.SessionBusy;
+        defer self.finishMutation();
+        if (self.facade_poisoned.load(.acquire)) return error.InvalidSessionState;
+        const sw = if (self.core_session.swarm) |*s| s else return null;
+        if (!sw.is_lead or !sw.hasTeam()) return null;
+        return core.swarm_tools.pollLeadInbox(allocator, sw);
+    }
+
     /// Host rules are compiled by the canonical Core parser/matcher; the
     /// AgentCore facade adds lifecycle admission and authority invalidation.
     fn updatePermissionRules(
@@ -4322,6 +4346,46 @@ fn parseMultimodalParts(
 /// borrowed from the call (the Session copies them). Null with a zero count is
 /// no statement; every entry names a distinct model (ignoring case) and says
 /// SUPPORTED or UNSUPPORTED - zero is not a declaration.
+/// Revision 24 (issue #277): the Host's `TeamConfigV1`, validated, as a core
+/// `TeamConfig` borrowing the wire byte views (create copies what it keeps).
+/// Null is no team. Every malformed field is `error.InvalidTeamConfig`.
+fn parseTeamConfig(team_ptr: ?*const wire.TeamConfigV1) !?core.agent_session.TeamConfig {
+    const team = team_ptr orelse return null;
+    if (team.struct_size != @sizeOf(wire.TeamConfigV1) or !allZero(team.reserved))
+        return error.InvalidTeamConfig;
+    const role: @FieldType(core.agent_session.TeamConfig, "role") = switch (team.role_code) {
+        wire.TEAM_ROLE_LEAD => .lead,
+        wire.TEAM_ROLE_MEMBER => .member,
+        else => return error.InvalidTeamConfig,
+    };
+    const team_name = borrowed(team.team_name) catch return error.InvalidTeamConfig;
+    const member_name = borrowed(team.member_name) catch return error.InvalidTeamConfig;
+    const lead_session = borrowed(team.lead_session_id) catch return error.InvalidTeamConfig;
+    const member_lease = borrowed(team.member_lease) catch return error.InvalidTeamConfig;
+    if (team_name.len > wire.MAX_TEAM_NAME_BYTES_V1 or member_name.len > wire.MAX_TEAM_MEMBER_BYTES_V1)
+        return error.InvalidTeamConfig;
+    switch (role) {
+        .lead => {
+            // A lead names its team through TeamCreate; the member fields are empty.
+            if (member_name.len != 0 or lead_session.len != 0 or member_lease.len != 0)
+                return error.InvalidTeamConfig;
+        },
+        .member => {
+            if (team_name.len == 0 or member_name.len == 0) return error.InvalidTeamConfig;
+            if (core.session_id.SessionId.fromSlice(lead_session) == null or
+                core.session_id.SessionId.fromSlice(member_lease) == null)
+                return error.InvalidTeamConfig;
+        },
+    }
+    return .{
+        .role = role,
+        .team_name = team_name,
+        .member_name = member_name,
+        .lead_session_id = lead_session,
+        .member_lease = member_lease,
+    };
+}
+
 fn parseModelCapabilities(
     arena: std.mem.Allocator,
     host: *const wire.SessionHostConfigV1,
@@ -5521,6 +5585,8 @@ fn runtimeCreateImpl(
         .host_sync_tools = native_tools,
         .host_stream_tools = native_stream_tools,
         .process_plugins = process_plugins,
+        // Issue #277: nonzero admits the team tools into the catalog.
+        .enable_teams = config.enable_teams != 0,
     }) catch |err| {
         // 依赖缺失是宿主可修复的部署问题:诊断必须直接说明缺什么、怎么给。
         if (err == error.ToolDependencyUnavailable)
@@ -5904,6 +5970,8 @@ const SessionBuildConfig = struct {
     prompt_profile: core.prompt_sections.Profile = .{},
     /// Revision 21 Host declarations; validated, borrowed for the call.
     model_capabilities: []const core.image_capability.Declaration = &.{},
+    /// Revision 24: team membership, borrowed for the call (issue #277).
+    team: ?core.agent_session.TeamConfig = null,
 };
 
 const RestoreHostConfig = struct {
@@ -5922,6 +5990,9 @@ const RestoreHostConfig = struct {
     run_journal: core.agent_session.RunJournalConfig = .ephemeral,
     /// Revision 21: current Host declarations; checkpoints carry none.
     model_capabilities: []const core.image_capability.Declaration = &.{},
+    /// Revision 24: team membership; the Host re-supplies it at restore, as
+    /// with model_capabilities — checkpoints carry none (issue #277).
+    team: ?core.agent_session.TeamConfig = null,
 };
 
 const InternalRestoreResult = struct {
@@ -6188,6 +6259,7 @@ fn buildAbiSession(
         .host_identity_ctx = self,
         .prompt_profile = config.prompt_profile,
         .model_capabilities = config.model_capabilities,
+        .team = config.team,
     };
     self.core_session = if (config.restored) |decoded|
         try runtime.core_runtime.createRestoredSession(core_config, .{
@@ -6510,6 +6582,7 @@ fn restoreCheckpoint(
         .run_journal = config.run_journal,
         .prompt_profile = restored_prompt_profile.profile(),
         .model_capabilities = config.model_capabilities,
+        .team = config.team,
     });
     keep_binding = true;
     return .{
@@ -6835,7 +6908,6 @@ fn sessionCreate(runtime_handle: ?*wire.RuntimeHandle, config_ptr: ?*const wire.
     const out = out_session orelse return fail(wire.STATUS_INVALID_ARGUMENT, "out_session is required", out_error);
     if (config.struct_size != @sizeOf(wire.SessionCreateConfigV1) or config.reserved0 != 0 or !allZero(config.reserved) or
         host.struct_size != @sizeOf(wire.SessionHostConfigV1) or
-        !allZero(host.reserved) or
         callbacks.struct_size != @sizeOf(wire.SessionCallbacksV1) or callbacks.reserved0 != 0 or
         !allZero(callbacks.reserved) or callbacks.on_event == null or
         (callbacks.on_ui_request != null and callbacks.release_response == null))
@@ -6929,6 +7001,8 @@ fn sessionCreate(runtime_handle: ?*wire.RuntimeHandle, config_ptr: ?*const wire.
     if (refusePromptProfile(prompt_profile, out_error)) |status| return status;
     const model_capabilities = parseModelCapabilities(scratch.allocator(), host, &session_metadata) catch |err|
         return failError(inputErrorStatus(err), err, out_error);
+    const team_config = parseTeamConfig(host.team) catch |err|
+        return failError(inputErrorStatus(err), err, out_error);
     if (shell == .sandboxed) {
         sandbox_admission.validate(allocator) catch |err| return failError(
             if (err == error.OutOfMemory) wire.STATUS_OUT_OF_MEMORY else wire.STATUS_INVALID_ARGUMENT,
@@ -6955,6 +7029,7 @@ fn sessionCreate(runtime_handle: ?*wire.RuntimeHandle, config_ptr: ?*const wire.
         .run_journal = run_journal,
         .prompt_profile = prompt_profile,
         .model_capabilities = model_capabilities,
+        .team = team_config,
     }) catch |err| {
         return failError(
             if (err == error.OutOfMemory)
@@ -7004,7 +7079,6 @@ fn sessionRestore(
     if (config.struct_size != @sizeOf(wire.SessionRestoreConfigV1) or
         config.reserved0 != 0 or !allZero(config.reserved) or
         host.struct_size != @sizeOf(wire.SessionHostConfigV1) or
-        !allZero(host.reserved) or
         callbacks.struct_size != @sizeOf(wire.SessionCallbacksV1) or
         callbacks.reserved0 != 0 or !allZero(callbacks.reserved) or
         callbacks.on_event == null or
@@ -7089,6 +7163,8 @@ fn sessionRestore(
         return failError(inputErrorStatus(err), err, out_error);
     const model_capabilities = parseModelCapabilities(scratch.allocator(), host, &session_metadata) catch |err|
         return failError(inputErrorStatus(err), err, out_error);
+    const team_config = parseTeamConfig(host.team) catch |err|
+        return failError(inputErrorStatus(err), err, out_error);
     const limits = parseCheckpointLimits(limits_raw) catch |err|
         return failError(inputErrorStatus(err), err, out_error);
     if (shell == .sandboxed) sandbox_admission.validate(allocator) catch |err|
@@ -7132,6 +7208,7 @@ fn sessionRestore(
             .budget_profile = budget_profile,
             .run_journal = run_journal,
             .model_capabilities = model_capabilities,
+            .team = team_config,
         },
         &current_skill_binding,
         source.interface(),
@@ -8151,6 +8228,58 @@ const goal_api_v1 = wire.GoalApiV1{
     .clear = goalClear,
 };
 
+fn teamDescribe(
+    handle: ?*wire.SessionHandle,
+    out_team_json: ?*wire.OwnedBytesV1,
+    out_error: ?*wire.OwnedBytesV1,
+) callconv(.c) u32 {
+    if (out_team_json) |out| out.* = .{ .ptr = null, .len = 0 };
+    emptyError(out_error);
+    const self = sessionFrom(handle orelse
+        return fail(wire.STATUS_INVALID_ARGUMENT, "session is required", out_error));
+    const out = out_team_json orelse
+        return fail(wire.STATUS_INVALID_ARGUMENT, "out_team_json is required", out_error);
+    const encoded = self.readTeam() catch |err|
+        return failError(sessionMutationStatus(err), err, out_error);
+    out.* = .{ .ptr = encoded.ptr, .len = encoded.len };
+    return wire.STATUS_OK;
+}
+
+fn teamPoll(
+    handle: ?*wire.SessionHandle,
+    out_input_json: ?*wire.OwnedBytesV1,
+    out_error: ?*wire.OwnedBytesV1,
+) callconv(.c) u32 {
+    if (out_input_json) |out| out.* = .{ .ptr = null, .len = 0 };
+    emptyError(out_error);
+    const self = sessionFrom(handle orelse
+        return fail(wire.STATUS_INVALID_ARGUMENT, "session is required", out_error));
+    const out = out_input_json orelse
+        return fail(wire.STATUS_INVALID_ARGUMENT, "out_input_json is required", out_error);
+    const input = self.pollTeam() catch |err|
+        return failError(sessionMutationStatus(err), err, out_error);
+    var buf: std.Io.Writer.Allocating = .init(allocator);
+    defer buf.deinit();
+    buf.writer.writeAll("{\"input\":") catch return fail(wire.STATUS_OUT_OF_MEMORY, "out of memory", out_error);
+    if (input) |input_text| {
+        defer allocator.free(input_text);
+        core.util_json.writeJsonString(&buf.writer, input_text) catch return fail(wire.STATUS_OUT_OF_MEMORY, "out of memory", out_error);
+    } else {
+        buf.writer.writeAll("null") catch return fail(wire.STATUS_OUT_OF_MEMORY, "out of memory", out_error);
+    }
+    buf.writer.writeByte('}') catch return fail(wire.STATUS_OUT_OF_MEMORY, "out of memory", out_error);
+    const encoded = buf.toOwnedSlice() catch return fail(wire.STATUS_OUT_OF_MEMORY, "out of memory", out_error);
+    out.* = .{ .ptr = encoded.ptr, .len = encoded.len };
+    return wire.STATUS_OK;
+}
+
+const team_api_v1 = wire.TeamApiV1{
+    .struct_size = @sizeOf(wire.TeamApiV1),
+    .reserved0 = 0,
+    .describe = teamDescribe,
+    .poll = teamPoll,
+};
+
 const api_v1 = wire.ApiV1{
     .struct_size = @sizeOf(wire.ApiV1),
     .abi_version = wire.ABI_VERSION_V1,
@@ -8163,6 +8292,7 @@ const api_v1 = wire.ApiV1{
     .skill = &skill_api_v1,
     .mcp = &mcp_api_v1,
     .goal = &goal_api_v1,
+    .team = &team_api_v1,
 };
 
 pub export fn metask_agentcore_get_api(requested_abi: u32) callconv(.c) ?*const anyopaque {
@@ -8363,8 +8493,8 @@ test "ABI discovery is versioned" {
     try std.testing.expect(metask_agentcore_get_api(0) == null);
     const raw = metask_agentcore_get_api(wire.ABI_VERSION_V1) orelse return error.MissingApi;
     const api: *const wire.ApiV1 = @ptrCast(@alignCast(raw));
-    try std.testing.expectEqual(@as(u32, 23), api.abi_revision);
-    try std.testing.expectEqual(@as(usize, 72), api.struct_size);
+    try std.testing.expectEqual(@as(u32, 24), api.abi_revision);
+    try std.testing.expectEqual(@as(usize, 80), api.struct_size);
     try std.testing.expect(api.runtime != null);
     try std.testing.expect(api.session != null);
     try std.testing.expect(api.session_control != null);

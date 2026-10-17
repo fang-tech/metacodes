@@ -120,24 +120,29 @@ pub fn executeTeamCreate(ctx: *const ToolContext, args: []const u8) anyerror![]u
     // 留下"teammates 已置但 team_sanitized 未置"的半态(Linus L1)。
     const team_owned = try sw.allocator.dupe(u8, team_s);
     errdefer sw.allocator.free(team_owned);
-    sw.teammates = try teammate_mod.TeammateRegistry.initWithDialectResolver(
-        sw.allocator,
-        sw.api_key,
-        sw.base_url,
-        sw.model,
-        sw.provider_kind,
-        sw.openai_protocol,
-        sw.state_root,
-        sw.dialect_resolver,
-    );
+    // Issue #277: the host scheduler runs no teammate thread, so the lead
+    // keeps no in-process registry. Spawning is `SpawnTeammate` → a request
+    // the Host fulfils by creating a teammate Session.
+    if (sw.scheduler == .in_process) {
+        sw.teammates = try teammate_mod.TeammateRegistry.initWithDialectResolver(
+            sw.allocator,
+            sw.api_key,
+            sw.base_url,
+            sw.model,
+            sw.provider_kind,
+            sw.openai_protocol,
+            sw.state_root,
+            sw.dialect_resolver,
+        );
+        if (sw.limits) |limits| try sw.teammates.?.setLimits(limits);
+        // issue #16:auth scheme 随 lead 已解析的路由走。少了它,teammate 会把正确
+        // 的密钥发到错误的头上。
+        sw.teammates.?.auth_scheme = sw.auth_scheme;
+    }
     errdefer if (sw.teammates) |*t| {
         t.deinit();
         sw.teammates = null;
     };
-    if (sw.limits) |limits| try sw.teammates.?.setLimits(limits);
-    // issue #16:auth scheme 随 lead 已解析的路由走。少了它,teammate 会把正确
-    // 的密钥发到错误的头上。
-    sw.teammates.?.auth_scheme = sw.auth_scheme;
     // SW3:确保共享 KG inbox root 存在(lead 的 TaskCreate 落此,teammate frontier 自领此)。
     // best-effort——KG 不可用只是没有 DAG 协调,mailbox 派活仍工作。
     ensureSharedTaskRoot(ctx);
@@ -211,7 +216,11 @@ pub fn executeTeamDelete(ctx: *const ToolContext, args: []const u8) anyerror![]u
 pub fn executeSendMessage(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     const sw = ctx.swarm orelse return error.SwarmUnavailable;
     if (!sw.hasTeam()) return error.NoActiveTeam;
-    if (!std.mem.eql(u8, sw.session.asSlice(), ctx.session.asSlice())) return error.NoActiveTeam;
+    // The session check guards a lead against addressing a team a prior
+    // session owned after /resume. A member's SwarmContext is the roster
+    // owner's session (built per Session by the Host, issue #277), so its own
+    // run id differs by design; the SwarmContext itself is its authorization.
+    if (sw.is_lead and !std.mem.eql(u8, sw.session.asSlice(), ctx.session.asSlice())) return error.NoActiveTeam;
 
     const to_raw = util_json.extractStringField(args, "to") orelse return error.MissingRecipient;
     const to = try util_json.unescapeString(to_raw, ctx.allocator);
@@ -282,6 +291,98 @@ pub fn executeSendMessage(ctx: *const ToolContext, args: []const u8) anyerror![]
     try out.writer.writeAll("{\"to\":");
     try util_json.writeJsonString(&out.writer, to_s);
     try out.writer.writeAll(",\"delivered\":1}");
+    return out.toOwnedSlice();
+}
+
+/// Issue #277: the Session's team as JSON for AgentCore's `team->describe`:
+/// `{"team":null}` or `{"team":{"name","role","members":[{name,session_id,
+/// lease_id,status}],"pending_spawns":[{name,prompt,agent_type,effort}]}}`.
+/// `members` comes from the on-disk roster; `pending_spawns` from the lead's
+/// unfulfilled `SpawnTeammate` requests. Owned by `allocator`.
+pub fn writeTeamDescription(allocator: std.mem.Allocator, sw: *const SwarmContext) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    const w = &out.writer;
+    if (!sw.hasTeam()) {
+        try w.writeAll("{\"team\":null}");
+        return out.toOwnedSlice();
+    }
+    try w.writeAll("{\"team\":{\"name\":");
+    try util_json.writeJsonString(w, sw.team_sanitized);
+    try w.writeAll(",\"role\":");
+    try util_json.writeJsonString(w, if (sw.is_lead) "lead" else "member");
+    try w.writeAll(",\"members\":[");
+    var cfg_buf: [std.fs.max_path_bytes]u8 = undefined;
+    if (team_mod.load(allocator, sw.configPath(&cfg_buf))) |loaded| {
+        var tf = loaded;
+        defer tf.deinit();
+        for (tf.members.items, 0..) |*m, i| {
+            if (i != 0) try w.writeAll(",");
+            try w.writeAll("{\"name\":");
+            try util_json.writeJsonString(w, m.name);
+            try w.writeAll(",\"session_id\":");
+            try util_json.writeJsonString(w, m.session_id orelse "");
+            try w.writeAll(",\"lease_id\":");
+            try util_json.writeJsonString(w, m.lease_id orelse "");
+            try w.writeAll(",\"status\":");
+            try util_json.writeJsonString(w, if (m.is_active) "active" else "idle");
+            try w.writeAll("}");
+        }
+    }
+    try w.writeAll("],\"pending_spawns\":[");
+    for (sw.pending_spawns.items, 0..) |*req, i| {
+        if (i != 0) try w.writeAll(",");
+        try w.writeAll("{\"name\":");
+        try util_json.writeJsonString(w, req.name);
+        try w.writeAll(",\"prompt\":");
+        try util_json.writeJsonString(w, req.prompt);
+        try w.writeAll(",\"agent_type\":");
+        if (req.agent_type) |t| try util_json.writeJsonString(w, t) else try w.writeAll("null");
+        try w.writeAll(",\"effort\":");
+        if (req.effort) |e| try util_json.writeJsonString(w, e) else try w.writeAll("null");
+        try w.writeAll("}");
+    }
+    try w.writeAll("]}}");
+    return out.toOwnedSlice();
+}
+
+/// Issue #277: the host-scheduled spawn tool. The lead model names a teammate
+/// and its task; the runtime records a request and returns, leaving the
+/// embedding Host to create and run the teammate Session. The CLI uses
+/// `Task(name=…)` instead (in-process threads); this tool exists only for the
+/// AgentCore host scheduler and refuses otherwise.
+pub fn executeSpawnTeammate(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
+    const sw = ctx.swarm orelse return error.SwarmUnavailable;
+    if (sw.scheduler != .host) return error.SpawnTeammateHostOnly;
+    if (!sw.is_lead) return error.NotTeamLead;
+    if (!sw.hasTeam()) return error.NoActiveTeam;
+    if (!std.mem.eql(u8, sw.session.asSlice(), ctx.session.asSlice())) return error.NoActiveTeam;
+
+    const name_raw = util_json.extractStringField(args, "name") orelse return error.MissingName;
+    const name = try util_json.unescapeString(name_raw, ctx.allocator);
+    defer ctx.allocator.free(name);
+    var name_buf: [64]u8 = undefined;
+    const name_s = team_mod.sanitizeAgentName(name, &name_buf);
+    if (name_s.len == 0) return error.BadName;
+    if (std.mem.eql(u8, name_s, team_mod.TEAM_LEAD_NAME)) return error.BadName;
+
+    const prompt_raw = util_json.extractStringField(args, "prompt") orelse return error.MissingMessage;
+    const prompt = try util_json.unescapeString(prompt_raw, ctx.allocator);
+    defer ctx.allocator.free(prompt);
+    if (prompt.len == 0) return error.MissingMessage;
+
+    const agent_type: ?[]const u8 = if (util_json.extractStringField(args, "agent_type")) |t|
+        try util_json.unescapeString(t, ctx.allocator)
+    else
+        null;
+    defer if (agent_type) |t| ctx.allocator.free(t);
+
+    try sw.requestSpawn(name_s, prompt, agent_type, null);
+    var out: std.Io.Writer.Allocating = .init(ctx.allocator);
+    errdefer out.deinit();
+    try out.writer.writeAll("{\"teammate\":");
+    try util_json.writeJsonString(&out.writer, name_s);
+    try out.writer.writeAll(",\"backend\":\"host\",\"status\":\"requested\"}");
     return out.toOwnedSlice();
 }
 
