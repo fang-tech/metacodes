@@ -8,6 +8,7 @@ const std = @import("std");
 const sync = @import("platform").sync;
 const types = @import("../types.zig");
 const provider_factory = @import("../api/provider_factory.zig");
+const image_capability = @import("../api/image_capability.zig");
 const provider_mod = @import("../api/provider.zig");
 const Conversation = @import("conversation.zig").Conversation;
 const message_mod = @import("message.zig");
@@ -641,6 +642,12 @@ pub const SessionConfig = struct {
     api_key: []const u8,
     model: []const u8,
     base_url: ?[]const u8 = null,
+    /// What the Host knows about its models' image input (issue #273),
+    /// borrowed for the call and copied into the Session. A declaration
+    /// outranks the family table and holds for the Session's model, every
+    /// `setModel` target, and tool-scoped providers. Two entries naming the
+    /// same model (ignoring case) fail creation with `error.DuplicateModel`.
+    model_capabilities: []const image_capability.Declaration = &.{},
     permission_mode: types.PermissionMode = .default,
     permission_rules: ?permission_settings.RuleSetInput = null,
     workspace: WorkspaceConfig,
@@ -1233,6 +1240,9 @@ pub const AgentSession = struct {
     /// own route does; a subagent sending bearer at an `x-api-key` endpoint has
     /// the right key and the wrong header.
     auth_scheme: ?@import("../provider/credential.zig").AuthScheme = null,
+    /// Owned copy of `SessionConfig.model_capabilities`, handed to every
+    /// provider this Session builds.
+    model_capabilities: image_capability.Declarations = .{},
     provider: provider_factory.OwnedProvider,
     /// The effort last applied to `provider`; reapplied to a replacement
     /// provider by `setModel`.
@@ -1312,7 +1322,7 @@ pub const AgentSession = struct {
             self.base_url,
             self.openai_protocol,
             self.runtime.plugin_snapshot.dialectResolver(),
-            .{ .auth_scheme = self.auth_scheme, .limits = null },
+            .{ .auth_scheme = self.auth_scheme, .limits = null, .capability_declarations = self.model_capabilities },
         );
     }
 
@@ -1391,6 +1401,8 @@ pub const AgentSession = struct {
         errdefer if (base_url) |url| allocator.free(url);
         var prompt_profile = try prompt_sections.OwnedProfile.clone(allocator, config.prompt_profile);
         errdefer prompt_profile.deinit();
+        var model_capabilities = try image_capability.Declarations.init(allocator, config.model_capabilities);
+        errdefer model_capabilities.deinit();
 
         var conversation = if (hooks.restored) |restored|
             try restored.conversation.cloneInto(allocator)
@@ -1406,7 +1418,7 @@ pub const AgentSession = struct {
             base_url,
             config.openai_protocol,
             runtime.plugin_snapshot.dialectResolver(),
-            .{ .auth_scheme = config.auth_scheme, .limits = null },
+            .{ .auth_scheme = config.auth_scheme, .limits = null, .capability_declarations = model_capabilities },
         );
         errdefer owned_provider.deinit();
         if (config.reasoning_effort) |effort| try owned_provider.provider().setReasoningEffort(effort);
@@ -1444,6 +1456,7 @@ pub const AgentSession = struct {
             .base_url = base_url,
             .openai_protocol = config.openai_protocol,
             .auth_scheme = config.auth_scheme,
+            .model_capabilities = model_capabilities,
             .provider = owned_provider,
             .reasoning_effort = config.reasoning_effort,
             .conversation = conversation,
@@ -1536,6 +1549,7 @@ pub const AgentSession = struct {
         self.tools.deinit();
         self.workspace.deinit();
         self.prompt_profile.deinit();
+        self.model_capabilities.deinit();
         if (self.last_prompt_manifest) |*manifest| manifest.deinit();
         allocator.free(self.artifact_root);
         allocator.free(self.run_journal_root);
@@ -1657,7 +1671,9 @@ pub const AgentSession = struct {
             return error.OutOfMemory;
         };
         errdefer self.allocator.free(replacement_model);
-        var replacement_provider = provider_factory.makeProviderWithDialectResolver(
+        // Same options as creation: the route's auth scheme and the Host's
+        // capability declarations belong to the Session, not to one model.
+        var replacement_provider = provider_factory.makeProviderWithOptions(
             self.allocator,
             provider_kind,
             self.api_key,
@@ -1665,6 +1681,7 @@ pub const AgentSession = struct {
             self.base_url,
             self.openai_protocol,
             self.runtime.plugin_snapshot.dialectResolver(),
+            .{ .auth_scheme = self.auth_scheme, .limits = null, .capability_declarations = self.model_capabilities },
         ) catch |err| {
             self.cancelMutation();
             return err;

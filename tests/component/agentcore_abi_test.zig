@@ -855,6 +855,28 @@ const PublicSessionFixture = struct {
             wire.RUN_JOURNAL_EPHEMERAL,
             provider_kind_code,
             protocol_kind_code,
+            &.{},
+        );
+    }
+
+    /// Revision 21: a Session whose Host declares `capabilities`.
+    fn initCapabilities(
+        root: []const u8,
+        base_url: []const u8,
+        model: []const u8,
+        provider_kind_code: u32,
+        protocol_kind_code: u32,
+        capabilities: []const wire.ModelCapabilityV1,
+    ) !PublicSessionFixture {
+        return initProviderConfigured(
+            root,
+            base_url,
+            model,
+            null,
+            wire.RUN_JOURNAL_EPHEMERAL,
+            provider_kind_code,
+            protocol_kind_code,
+            capabilities,
         );
     }
 
@@ -873,6 +895,7 @@ const PublicSessionFixture = struct {
             run_journal_mode_code,
             wire.PROVIDER_ANTHROPIC,
             wire.PROTOCOL_DEFAULT,
+            &.{},
         );
     }
 
@@ -884,6 +907,7 @@ const PublicSessionFixture = struct {
         run_journal_mode_code: u32,
         provider_kind_code: u32,
         protocol_kind_code: u32,
+        capabilities: []const wire.ModelCapabilityV1,
     ) !PublicSessionFixture {
         const raw_api = abi.metask_agentcore_get_api(wire.ABI_VERSION_V1) orelse
             return error.MissingApi;
@@ -911,6 +935,10 @@ const PublicSessionFixture = struct {
         host_config.durable_budget = budget;
         host_config.run_journal_mode_code = run_journal_mode_code;
         host_config.protocol_kind_code = protocol_kind_code;
+        if (capabilities.len != 0) {
+            host_config.model_capabilities = capabilities.ptr;
+            host_config.model_capability_count = capabilities.len;
+        }
         var session_config = sessionCreateConfig(&host_config, model);
         var callbacks = std.mem.zeroes(wire.SessionCallbacksV1);
         callbacks.struct_size = @sizeOf(wire.SessionCallbacksV1);
@@ -3978,7 +4006,7 @@ test "L2 public MCP checkpoint restore facade preserves Conversation under narro
 
     var abi_revision_bytes: [4]u8 = undefined;
     @memcpy(&abi_revision_bytes, checkpoint.bytes.items[20..24]);
-    try std.testing.expectEqual(@as(u32, 20), wire.ABI_REVISION);
+    try std.testing.expectEqual(@as(u32, 21), wire.ABI_REVISION);
     // A Session without a prompt profile keeps the marker-8 envelope across
     // ABI revisions; the marker is independent of the table revision.
     try std.testing.expectEqual(
@@ -6717,7 +6745,9 @@ test "L2 opaque ABI routes Host callbacks and enforces Run admission identifiers
         .durable_budget = null,
         .run_journal_mode_code = wire.RUN_JOURNAL_EPHEMERAL,
         .protocol_kind_code = wire.PROTOCOL_DEFAULT,
-        .reserved = [_]u64{0} ** 3,
+        .model_capabilities = null,
+        .model_capability_count = 0,
+        .reserved = [_]u64{0} ** 1,
     };
     var session_config = sessionCreateConfig(&host_config, "test-model");
     var callbacks = wire.SessionCallbacksV1{
@@ -8456,7 +8486,7 @@ test "L2 Revision 15 multimodal Run carries ordered image parts into the provide
     }
 }
 
-test "L2 Revision 15 image capability preflight rejects before any Provider request and keeps the Run id reusable" {
+test "L2 Revision 15 image capability preflight rejects before any Provider request and keeps the Run id reusable (unknown since Revision 21)" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -8467,7 +8497,8 @@ test "L2 Revision 15 image capability preflight rejects before any Provider requ
     const url = try server.urlOwned(a);
     defer a.free(url);
 
-    // "test-model" has no vision capability under the Anthropic profile.
+    // Nothing - no Host declaration, catalog, or model family - says
+    // "test-model" takes images: refused as unknown, not as unsupported.
     var fixture = try PublicSessionFixture.init(root, url, "test-model");
     defer fixture.deinit();
 
@@ -8477,11 +8508,14 @@ test "L2 Revision 15 image capability preflight rejects before any Provider requ
     };
     var result = std.mem.zeroes(wire.RunResultV1);
     try std.testing.expectEqual(
-        wire.STATUS_IMAGE_INPUT_UNSUPPORTED,
+        wire.STATUS_IMAGE_INPUT_CAPABILITY_UNKNOWN,
         submitMultimodal(&fixture, 1, &with_image, &result),
     );
+    const refusal = try sdk.borrowedBytes(.{ .ptr = fixture.diagnostic.ptr, .len = fixture.diagnostic.len });
+    try std.testing.expect(std.mem.indexOf(u8, refusal, "model_capabilities") != null);
     fixture.releaseDiagnostic();
     try std.testing.expectEqual(@as(usize, 0), server.requestCount());
+    try expectImageInputDescription(&fixture, false, .unknown);
 
     // Text-only multimodal input needs no image capability, and the rejected
     // Run was never admitted, so the same Run id remains usable.
@@ -8531,6 +8565,271 @@ test "L2 Revision 15 image preflight admits a non-Claude vision model on the Ant
     try std.testing.expect(std.mem.indexOf(u8, body, "\"type\":\"image\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"media_type\":\"image/png\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "UE5HREFUQQ==") != null);
+}
+
+fn modelCapability(model: []const u8, image_input_code: u32) wire.ModelCapabilityV1 {
+    return .{
+        .struct_size = @sizeOf(wire.ModelCapabilityV1),
+        .image_input_code = image_input_code,
+        .model = sdk.bytesView(model),
+        .reserved = [_]u64{0} ** 2,
+    };
+}
+
+/// The Session description's typed `image_input`, through the SDK decoder.
+fn expectImageInputDescription(
+    fixture: *PublicSessionFixture,
+    supported: bool,
+    source: sdk.protocol.ImageInputSource,
+) !void {
+    var description = std.mem.zeroes(wire.OwnedBytesV1);
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        fixture.api.sessionControl().describe()(fixture.session, &description, &fixture.diagnostic),
+    );
+    defer fixture.api.bufferRelease()(&description);
+    const json = try sdk.borrowedBytes(.{ .ptr = description.ptr, .len = description.len });
+    var parsed = try sdk.protocol.decodeSessionDescription(std.testing.allocator, json);
+    defer parsed.deinit();
+    try std.testing.expectEqual(supported, parsed.value.image_input.supported);
+    try std.testing.expectEqual(source, parsed.value.image_input.source);
+}
+
+const ISSUE_273_IMAGE = "SVNTVUUtMjczLUlNQUdF";
+
+test "L2 Revision 21 a Host declaration admits a model no family knows, and the provider receives the whole image (issue #273)" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try rootPath(&tmp, &root_buffer);
+    var server = try harness.MockServer.startCassette(&.{FINAL_SSE}, 0);
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+
+    // The name is in no built-in family; only the Host knows its route takes
+    // images. AgentCore itself is not changed to admit it.
+    const capabilities = [_]wire.ModelCapabilityV1{modelCapability("Vendor-Vision-1", wire.CAPABILITY_SUPPORTED)};
+    var fixture = try PublicSessionFixture.initCapabilities(root, url, "vendor-vision-1", wire.PROVIDER_ANTHROPIC, wire.PROTOCOL_DEFAULT, &capabilities);
+    defer fixture.deinit();
+    try expectImageInputDescription(&fixture, true, .host);
+
+    const with_image = [_]wire.RunInputPartV1{
+        sdk.textPart("describe this"),
+        sdk.imagePart("image/png", ISSUE_273_IMAGE),
+    };
+    var result = std.mem.zeroes(wire.RunResultV1);
+    try std.testing.expectEqual(wire.STATUS_OK, submitMultimodal(&fixture, 1, &with_image, &result));
+    try std.testing.expectEqual(wire.STOP_END_TURN, result.stop_reason_code);
+    try std.testing.expectEqual(@as(usize, 1), server.requestCount());
+    // The image travels as an image block: not dropped, not text.
+    const body = (server.lastRequest() orelse return error.MissingRequest).body();
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"type\":\"image\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"media_type\":\"image/png\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, ISSUE_273_IMAGE) != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "was read successfully but omitted") == null);
+}
+
+test "L2 Revision 21 a Host 'unsupported' outranks the model family, and a known text family is unsupported, not unknown (issue #273)" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try rootPath(&tmp, &root_buffer);
+    var server = try harness.MockServer.startCassette(&.{FINAL_SSE}, 0);
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+    const with_image = [_]wire.RunInputPartV1{
+        sdk.textPart("describe this"),
+        sdk.imagePart("image/png", ISSUE_273_IMAGE),
+    };
+    var result = std.mem.zeroes(wire.RunResultV1);
+
+    // The family table says Claude takes images; this Host's route does not.
+    const capabilities = [_]wire.ModelCapabilityV1{modelCapability("claude-sonnet-4-6", wire.CAPABILITY_UNSUPPORTED)};
+    var declared = try PublicSessionFixture.initCapabilities(root, url, "claude-sonnet-4-6", wire.PROVIDER_ANTHROPIC, wire.PROTOCOL_DEFAULT, &capabilities);
+    defer declared.deinit();
+    try std.testing.expectEqual(wire.STATUS_IMAGE_INPUT_UNSUPPORTED, submitMultimodal(&declared, 1, &with_image, &result));
+    const by_host = try sdk.borrowedBytes(.{ .ptr = declared.diagnostic.ptr, .len = declared.diagnostic.len });
+    try std.testing.expect(std.mem.indexOf(u8, by_host, "declared by the Host") != null);
+    declared.releaseDiagnostic();
+    try expectImageInputDescription(&declared, false, .host);
+
+    // A family the table knows to be text-only answers "unsupported" itself.
+    var family = try PublicSessionFixture.init(root, url, "claude-2.1");
+    defer family.deinit();
+    try std.testing.expectEqual(wire.STATUS_IMAGE_INPUT_UNSUPPORTED, submitMultimodal(&family, 1, &with_image, &result));
+    family.releaseDiagnostic();
+    try expectImageInputDescription(&family, false, .model_family);
+
+    try std.testing.expectEqual(@as(usize, 0), server.requestCount());
+}
+
+test "L2 Revision 21 a remote that rejects a declared image is a provider error after the image was sent (issue #273)" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try rootPath(&tmp, &root_buffer);
+    var server = try harness.MockServer.startRepeatingStatus(
+        "{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"this model does not accept images\"}}",
+        "HTTP/1.1 400 Bad Request",
+        "",
+    );
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+
+    // The Host said yes and was wrong: the refusal is the provider's, carried
+    // by the Run's stop reason, never re-labelled as a local capability status.
+    const capabilities = [_]wire.ModelCapabilityV1{modelCapability("vendor-vision-1", wire.CAPABILITY_SUPPORTED)};
+    var fixture = try PublicSessionFixture.initCapabilities(root, url, "vendor-vision-1", wire.PROVIDER_ANTHROPIC, wire.PROTOCOL_DEFAULT, &capabilities);
+    defer fixture.deinit();
+    const with_image = [_]wire.RunInputPartV1{
+        sdk.textPart("describe this"),
+        sdk.imagePart("image/png", ISSUE_273_IMAGE),
+    };
+    var result = std.mem.zeroes(wire.RunResultV1);
+    try std.testing.expectEqual(wire.STATUS_OK, submitMultimodal(&fixture, 1, &with_image, &result));
+    try std.testing.expectEqual(wire.STOP_API_ERROR, result.stop_reason_code);
+    try std.testing.expect(server.requestCount() >= 1);
+    const body = (server.lastRequest() orelse return error.MissingRequest).body();
+    try std.testing.expect(std.mem.indexOf(u8, body, ISSUE_273_IMAGE) != null);
+}
+
+test "L2 Revision 21 MiniMax-M3 takes images over the OpenAI Chat Completions route without a declaration (issue #273)" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try rootPath(&tmp, &root_buffer);
+    var server = try harness.MockServer.startCassette(&.{OPENAI_FINAL_SSE}, 0);
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+
+    var fixture = try PublicSessionFixture.initProvider(root, url, "MiniMax-M3", wire.PROVIDER_OPENAI, wire.PROTOCOL_DEFAULT);
+    defer fixture.deinit();
+    try expectImageInputDescription(&fixture, true, .model_family);
+    const with_image = [_]wire.RunInputPartV1{
+        sdk.textPart("describe this"),
+        sdk.imagePart("image/png", ISSUE_273_IMAGE),
+    };
+    var result = std.mem.zeroes(wire.RunResultV1);
+    try std.testing.expectEqual(wire.STATUS_OK, submitMultimodal(&fixture, 1, &with_image, &result));
+    try std.testing.expectEqual(wire.STOP_END_TURN, result.stop_reason_code);
+    const body = (server.lastRequest() orelse return error.MissingRequest).body();
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"image_url\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "data:image/png;base64," ++ ISSUE_273_IMAGE) != null);
+}
+
+test "L2 Revision 21 set_model keeps the Host's declarations, and an OpenAI route honours them (issue #273)" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try rootPath(&tmp, &root_buffer);
+    var server = try harness.MockServer.startCassette(&.{OPENAI_FINAL_SSE}, 0);
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+
+    const capabilities = [_]wire.ModelCapabilityV1{modelCapability("vendor-vision-2", wire.CAPABILITY_SUPPORTED)};
+    var fixture = try PublicSessionFixture.initCapabilities(root, url, "vendor-text-1", wire.PROVIDER_OPENAI, wire.PROTOCOL_DEFAULT, &capabilities);
+    defer fixture.deinit();
+    const with_image = [_]wire.RunInputPartV1{
+        sdk.textPart("describe this"),
+        sdk.imagePart("image/png", ISSUE_273_IMAGE),
+    };
+    var result = std.mem.zeroes(wire.RunResultV1);
+    // The Session's own model is undeclared and unknown.
+    try std.testing.expectEqual(wire.STATUS_IMAGE_INPUT_CAPABILITY_UNKNOWN, submitMultimodal(&fixture, 1, &with_image, &result));
+    fixture.releaseDiagnostic();
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        fixture.api.sessionControl().setModel()(fixture.session, sdk.bytesView("vendor-vision-2"), &fixture.diagnostic),
+    );
+    try expectImageInputDescription(&fixture, true, .host);
+    try std.testing.expectEqual(wire.STATUS_OK, submitMultimodal(&fixture, 1, &with_image, &result));
+    try std.testing.expectEqual(wire.STOP_END_TURN, result.stop_reason_code);
+    const body = (server.lastRequest() orelse return error.MissingRequest).body();
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"model\":\"vendor-vision-2\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "data:image/png;base64," ++ ISSUE_273_IMAGE) != null);
+}
+
+test "Revision 21 Host capability declarations are validated before a Session exists" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try rootPath(&tmp, &root_buffer);
+    const raw_api = abi.metask_agentcore_get_api(wire.ABI_VERSION_V1) orelse return error.MissingApi;
+    const api = try sdk.Api.validate(@ptrCast(@alignCast(raw_api)));
+    var runtime: ?*wire.RuntimeHandle = null;
+    var diagnostic = std.mem.zeroes(wire.OwnedBytesV1);
+    var runtime_config = std.mem.zeroes(wire.RuntimeConfigV1);
+    runtime_config.struct_size = @sizeOf(wire.RuntimeConfigV1);
+    try std.testing.expectEqual(wire.STATUS_OK, api.runtime().create()(&runtime_config, null, &runtime, &diagnostic));
+    defer _ = api.runtime().destroy()(runtime, &diagnostic);
+
+    var host = std.mem.zeroes(wire.SessionHostConfigV1);
+    host.struct_size = @sizeOf(wire.SessionHostConfigV1);
+    host.provider_kind_code = wire.PROVIDER_ANTHROPIC;
+    host.permission_mode_code = wire.PERMISSION_FULL_ACCESS;
+    host.shell_policy_code = wire.SHELL_DISABLED;
+    host.api_key = sdk.bytesView("test-key");
+    host.base_url = sdk.bytesView("http://127.0.0.1:1");
+    host.workspace_root = sdk.bytesView(root);
+    host.workspace_home = sdk.bytesView(root);
+    var callbacks = std.mem.zeroes(wire.SessionCallbacksV1);
+    callbacks.struct_size = @sizeOf(wire.SessionCallbacksV1);
+    callbacks.on_event = acceptEvent;
+    var config = sessionCreateConfig(&host, "test-model");
+
+    const Case = struct { entries: []const wire.ModelCapabilityV1, pointer: bool = true, count: ?u64 = null, status: u32 };
+    const long_name = "m" ** (wire.MAX_MODEL_CAPABILITY_MODEL_BYTES_V1 + 1);
+    var with_reserved = modelCapability("m", wire.CAPABILITY_SUPPORTED);
+    with_reserved.reserved[1] = 1;
+    var short_struct = modelCapability("m", wire.CAPABILITY_SUPPORTED);
+    short_struct.struct_size -= 8;
+    var many: [wire.MAX_MODEL_CAPABILITIES_V1 + 1]wire.ModelCapabilityV1 = undefined;
+    var many_names: [wire.MAX_MODEL_CAPABILITIES_V1 + 1][8]u8 = undefined;
+    for (&many, &many_names, 0..) |*entry, *name, i| {
+        const printed = try std.fmt.bufPrint(name, "m{d}", .{i});
+        entry.* = modelCapability(printed, wire.CAPABILITY_SUPPORTED);
+    }
+    const one = [_]wire.ModelCapabilityV1{modelCapability("m", wire.CAPABILITY_SUPPORTED)};
+    const cases = [_]Case{
+        // Same model twice, ignoring case: ambiguous, never resolved by order.
+        .{ .entries = &.{ modelCapability("Vendor-M", wire.CAPABILITY_SUPPORTED), modelCapability("vendor-m", wire.CAPABILITY_UNSUPPORTED) }, .status = wire.STATUS_INVALID_ARGUMENT },
+        // Zero is not a declaration; unknown codes are refused.
+        .{ .entries = &.{modelCapability("m", 0)}, .status = wire.STATUS_INVALID_ARGUMENT },
+        .{ .entries = &.{modelCapability("m", 3)}, .status = wire.STATUS_INVALID_ARGUMENT },
+        .{ .entries = &.{modelCapability("", wire.CAPABILITY_SUPPORTED)}, .status = wire.STATUS_INVALID_ARGUMENT },
+        .{ .entries = &.{with_reserved}, .status = wire.STATUS_INVALID_ARGUMENT },
+        .{ .entries = &.{short_struct}, .status = wire.STATUS_INVALID_ARGUMENT },
+        .{ .entries = &.{modelCapability(long_name, wire.CAPABILITY_SUPPORTED)}, .status = wire.STATUS_RESOURCE_LIMIT },
+        .{ .entries = &many, .status = wire.STATUS_RESOURCE_LIMIT },
+        // A pointer with no count, and a count with no pointer.
+        .{ .entries = &one, .count = 0, .status = wire.STATUS_INVALID_ARGUMENT },
+        .{ .entries = &one, .pointer = false, .status = wire.STATUS_INVALID_ARGUMENT },
+    };
+    for (cases) |case| {
+        host.model_capabilities = if (case.pointer) case.entries.ptr else null;
+        host.model_capability_count = case.count orelse case.entries.len;
+        var session: ?*wire.SessionHandle = null;
+        try std.testing.expectEqual(case.status, api.session().create()(runtime, &config, &callbacks, &session, &diagnostic));
+        try std.testing.expect(session == null);
+        api.bufferRelease()(&diagnostic);
+    }
+    // Reserved storage after the new fields still has to be zero.
+    host.model_capabilities = null;
+    host.model_capability_count = 0;
+    host.reserved[0] = 1;
+    var session: ?*wire.SessionHandle = null;
+    try std.testing.expectEqual(wire.STATUS_INVALID_ARGUMENT, api.session().create()(runtime, &config, &callbacks, &session, &diagnostic));
+    api.bufferRelease()(&diagnostic);
 }
 
 test "Revision 15 multimodal wire validation bounds every length before payload access" {
@@ -8692,6 +8991,7 @@ test "L2 Revision 15 multimodal Run reaches OpenAI Responses under a non-Anthrop
         wire.RUN_JOURNAL_DURABLE_WORKSPACE,
         wire.PROVIDER_OPENAI,
         wire.OPENAI_PROTOCOL_RESPONSES,
+        &.{},
     );
     defer fixture.deinit();
     const parts = [_]wire.RunInputPartV1{

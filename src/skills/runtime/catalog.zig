@@ -34,7 +34,7 @@ pub const DEFAULT_PROVIDER_ID = "agents.directory";
 
 /// How a source is discovered and what a Skill from it references.
 pub const Profile = enum {
-    /// AgentCore Revision 20 contract (doc/AGENTCORE_BINARY_ABI.md, "Skill
+    /// AgentCore Revision 21 contract (doc/AGENTCORE_BINARY_ABI.md, "Skill
     /// catalog and typed input"): Skills sit one directory below the root,
     /// symlinks are `unsupported_entry`, any failure to open a present root
     /// fails the whole query, and the complete Skill tree is snapshotted and

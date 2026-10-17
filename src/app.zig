@@ -828,6 +828,7 @@ pub const App = struct {
                 app.api_client.catalog.loadFromModelsListJson(fetched.body) catch |err| {
                     @import("util/log.zig").debug("catalog", "Metask client catalog parse failed: {s}", .{@errorName(err)});
                 };
+                app.syncClientCatalogs();
                 // No snapshot refresh here: the registry and swarm do not exist yet; their
                 // first snapshot is taken from the fully loaded catalog at registry init below.
             };
@@ -1741,8 +1742,26 @@ pub const App = struct {
         app.models_picker_key_index = idx;
     }
 
+    /// The OpenAI and Gemini clients keep their own copy of the parent catalog,
+    /// so its image_input declarations reach their serializers and capability
+    /// answers as they reach the Anthropic client's (issue #273). A failed
+    /// copy keeps the previous one: the family table still answers.
+    fn syncClientCatalogs(app: *App) void {
+        inline for (.{ &app.openai_client, &app.gemini_client }) |slot| {
+            if (slot.*) |*client| sync: {
+                const copy = app.api_client.catalog.clone(app.allocator) catch |err| {
+                    @import("util/log.zig").warn("catalog", "client catalog copy failed: {s}", .{@errorName(err)});
+                    break :sync;
+                };
+                if (client.catalog) |*old| old.deinit();
+                client.catalog = copy;
+            }
+        }
+    }
+
     /// Refresh worker-owned catalog snapshots after the mutable parent catalog changes.
     fn refreshChildCatalogSnapshots(app: *App) !void {
+        app.syncClientCatalogs();
         const source = @import("api/model_limits.zig").ModelLimitsSource{
             .catalog = &app.api_client.catalog,
             .model_context = &app.model_context,

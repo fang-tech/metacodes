@@ -121,7 +121,7 @@ dylib 加载，也不把活跃 Session 的 catalog 改写为新代。
 `Registrar.provide(T, local_name, pointer, cleanup)`，consumer 只有在 descriptor 的
 `requires` 明确包含 provider 时，才能用相同 `T` 与 key 调用 `require`。解析发生在
 依赖拓扑序 activation 中；consumer 把返回指针注入自己的 Host tool/context，commit
-之后没有可变 service lookup。该能力不进入 AgentCore v1 revision 20 C ABI，也不暴露任何内核
+之后没有可变 service lookup。该能力不进入 AgentCore v1 revision 21 C ABI，也不暴露任何内核
 service。
 
 `advisory_hook` capability 接受一个 `StaticPlugin.advisory_policy`。它是同步、借用、
@@ -277,6 +277,17 @@ journal 的 `run_started.prompt` 记下它；与上一个 Run 不同时，Run �
 Host 事实不写进档案：`core.context_blocks` 把它们渲染成一条 `<system-reminder>`，
 作为该 Run 用户记录的首段进入 Conversation。
 
+### 模型能力声明
+
+`SessionConfig.model_capabilities`（`[]const core.image_capability.Declaration`，
+`{model, image_input}`）是 Host 对自己路由上模型是否收图的声明（issue #273），借用一次、
+复制进 Session；同一模型（忽略大小写）出现两次时创建以 `error.DuplicateModel` 失败。
+声明压过 provider 目录与内置家族表，对 Session 当前模型、每个 `setModel` 目标和工具用的
+provider 都生效。`Provider.imageInput(model_override)` 返回 `{supported, source}`，`source`
+是 `host` / `catalog` / `model_family` / `unknown`——`unknown` 表示没有任何来源说过，
+按不支持拒绝，但与"已知不支持"区分开。`setModel` 重建 provider 时沿用 Session 的
+`auth_scheme` 与这份声明。
+
 ### Session 范围的权限与 transcript 持久化
 
 权限与工作区跟着 Session 走：`SessionConfig` 的 `workspace`（root/home/state_root/
@@ -344,10 +355,10 @@ admission。
 AgentCore 面向不把 metacodes 源码加入构建图的原生 Host(C11 / C++17 / Zig /
 Rust:同一 C Header + 静态库 + bindings)。消费入口只有
 `metask_agentcore_get_api(uint32_t requested_abi)`。
-当前是实验性的 ABI v1 revision 20。Host 必须同时校验 abi version、精确
+当前是实验性的 ABI v1 revision 21。Host 必须同时校验 abi version、精确
 revision、64 字节根表、五张必选 typed 子表、reserved fields 和 manifest hash;
 不存在静默降级或旧 revision shim。
-revision 20 只有一个 `runtime->create`;它的 nullable `plugins` 参数、Host 流式
+revision 21 只有一个 `runtime->create`;它的 nullable `plugins` 参数、Host 流式
 工具、MCP 流式响应、journal profile,以及全部 ownership、回调重入、Session
 poison、并发与持久化语义,只以同 revision 的 Header 与
 [`AGENTCORE_BINARY_ABI.md`](AGENTCORE_BINARY_ABI.md)(Contract 一节及其子节)
@@ -371,7 +382,7 @@ agentcore:gate`)的命令、库文件名与按 target 的发布状态矩阵,见
 | 浏览器/桌面壳 | Web HTTP + SSE + typed request 回填；跨进程的行格式用 `protocol.wire` |
 | 按 id 动态开关多个 Session 的网络宿主(云端、多标签 GUI) | `session_host.SessionHost`(见 API.md "SessionHost") + 宿主自己的传输与认证 |
 | 不带源码的 C/C++/Zig/Rust 原生产品 | 精确 pinned AgentCore bundle |
-| 显式信任的可执行工具插件 | `--process-plugin-dir`、Zig `RuntimeConfig.process_plugins`，或 AgentCore v1 revision 20 `runtime->create(..., plugins, ...)`；见 `PLUGIN_PROCESS_PROTOCOL.md` |
+| 显式信任的可执行工具插件 | `--process-plugin-dir`、Zig `RuntimeConfig.process_plugins`，或 AgentCore v1 revision 21 `runtime->create(..., plugins, ...)`；见 `PLUGIN_PROCESS_PROTOCOL.md` |
 | 不可信/多租户可执行插件 | 暂不支持；process v1 是故障/资源边界，不是 OS sandbox |
 
 这些入口改变的是 Host 表达和扩展组合，不是 agent loop 的因果所有权。

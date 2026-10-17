@@ -68,7 +68,7 @@ pub const PermissionCandidate = struct {
     target: ?[]const u8,
 };
 
-/// Exact Revision 20 Permission callback request. Unlike AskUserQuestion this
+/// Exact Revision 21 Permission callback request. Unlike AskUserQuestion this
 /// is a flat typed object, identified by `type == "permission"`.
 pub const PermissionRequest = struct {
     type: []const u8,
@@ -555,6 +555,11 @@ pub const LogicalSessionOrigin = enum {
     restored,
 };
 
+/// Revision 21: who answered whether a model takes image input. `unknown`
+/// means nothing did; such a model is refused with
+/// STATUS_IMAGE_INPUT_CAPABILITY_UNKNOWN until the Host declares it.
+pub const ImageInputSource = enum { unknown, model_family, catalog, host };
+
 pub const SessionLifecycle = enum {
     idle,
     busy,
@@ -597,6 +602,11 @@ pub const SessionDescription = struct {
     permission_mode: PermissionMode,
     catalog_generation: u64,
     model: []const u8,
+    /// Revision 21: whether `model` takes image input and who said so.
+    image_input: struct {
+        supported: bool,
+        source: ImageInputSource,
+    },
     conversation: struct {
         message_count: u64,
         compact_boundary: u64,
@@ -1266,6 +1276,7 @@ fn validateSessionDescription(description: SessionDescription) SkillCatalogDecod
         !validSessionId(description.session_id) or
         description.policy_generation == 0 or
         !validBoundedText(description.model, 4096) or
+        (description.image_input.source == .unknown and description.image_input.supported) or
         description.conversation.compact_boundary > description.conversation.message_count or
         !lowerHex64(description.mcp.selection_fingerprint))
         return error.InvalidPayload;

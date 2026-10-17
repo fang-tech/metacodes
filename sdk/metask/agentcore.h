@@ -5,7 +5,7 @@
 #include <stdint.h>
 
 #if !defined(UINTPTR_MAX) || !defined(UINT64_MAX) || UINTPTR_MAX != UINT64_MAX
-#error "AgentCore ABI v1 revision 20 requires a 64-bit pointer ABI"
+#error "AgentCore ABI v1 revision 21 requires a 64-bit pointer ABI"
 #endif
 
 #ifdef __cplusplus
@@ -13,11 +13,11 @@ extern "C" {
 #endif
 
 /* sdk/zig/types.zig is the normative fixed-layout schema. This header is its
- * Revision 20 C projection; sdk/rust/src/raw.rs is generated from this file.
+ * Revision 21 C projection; sdk/rust/src/raw.rs is generated from this file.
  * AgentCore ABI v1 remains experimental. Consumers pin an exact bundle and
  * must validate the exact root and mandatory child-table layouts together. */
 #define METASK_AGENTCORE_ABI_V1 1u
-#define METASK_AGENTCORE_ABI_REVISION 20u
+#define METASK_AGENTCORE_ABI_REVISION 21u
 
 #define METASK_AGENTCORE_STATUS_OK 0u
 #define METASK_AGENTCORE_STATUS_INVALID_ARGUMENT 1u
@@ -47,6 +47,9 @@ extern "C" {
 #define METASK_AGENTCORE_STATUS_INVALID_MCP_SELECTION 25u
 #define METASK_AGENTCORE_STATUS_SKILL_CATALOG_INCOMPLETE 27u
 #define METASK_AGENTCORE_STATUS_IMAGE_INPUT_UNSUPPORTED 28u
+/* Revision 21: nothing (Host declaration, provider catalog, built-in model
+ * family) says the model takes images; a declaration fixes it. */
+#define METASK_AGENTCORE_STATUS_IMAGE_INPUT_CAPABILITY_UNKNOWN 29u
 
 #define METASK_AGENTCORE_PROVIDER_ANTHROPIC 1u
 #define METASK_AGENTCORE_PROVIDER_OPENAI 2u
@@ -101,6 +104,10 @@ extern "C" {
 /* Base64 payload cap for one image part: exactly the standard base64 encoding
  * of the built-in Read tool's 3.75 MB raw-image limit. */
 #define METASK_AGENTCORE_MAX_RUN_INPUT_IMAGE_DATA_BYTES_V1 5000000ULL
+/* Revision 21: model-capability declarations per Session Host config, and the
+ * bytes of one declared model name. */
+#define METASK_AGENTCORE_MAX_MODEL_CAPABILITIES_V1 256ULL
+#define METASK_AGENTCORE_MAX_MODEL_CAPABILITY_MODEL_BYTES_V1 256ULL
 #define METASK_AGENTCORE_MAX_SKILL_CATALOG_SKILLS_V1 1024ULL
 #define METASK_AGENTCORE_MAX_SKILL_CATALOG_DESCRIPTOR_BYTES_V1 4194304ULL
 #define METASK_AGENTCORE_MAX_SKILL_FILE_CONTENT_BYTES_V1 16777216ULL
@@ -159,6 +166,10 @@ extern "C" {
 #define METASK_AGENTCORE_RUN_INPUT_MULTIMODAL 3u
 #define METASK_AGENTCORE_RUN_INPUT_PART_TEXT 1u
 #define METASK_AGENTCORE_RUN_INPUT_PART_IMAGE 2u
+/* Revision 21 model_capability_v1.image_input_code. Zero is not a declaration;
+ * leave a model out to make no statement. */
+#define METASK_AGENTCORE_CAPABILITY_SUPPORTED 1u
+#define METASK_AGENTCORE_CAPABILITY_UNSUPPORTED 2u
 #define METASK_AGENTCORE_PROMPT_OP_ADD 1u
 #define METASK_AGENTCORE_PROMPT_OP_REPLACE 2u
 #define METASK_AGENTCORE_PROMPT_OP_REMOVE 3u
@@ -551,6 +562,17 @@ typedef struct {
     uint64_t reserved[4];
 } metask_agentcore_durable_budget_profile_v1;
 
+/* Revision 21: one Host statement about one model's image input. `model` is
+ * non-empty UTF-8 of at most METASK_AGENTCORE_MAX_MODEL_CAPABILITY_MODEL_BYTES_V1
+ * bytes, matched against the model a request names ignoring case. */
+typedef struct {
+    uint32_t struct_size;
+    /* METASK_AGENTCORE_CAPABILITY_SUPPORTED or _UNSUPPORTED. */
+    uint32_t image_input_code;
+    metask_agentcore_bytes_view_v1 model;
+    uint64_t reserved[2];
+} metask_agentcore_model_capability_v1;
+
 /* Current Host authority is shared by fresh creation and restore. Restore
  * intersects this authority with checkpoint state; it never accepts a Host
  * supplied logical Session ID and never widens historical authority. */
@@ -576,7 +598,14 @@ typedef struct {
     /* METASK_AGENTCORE_PROTOCOL_DEFAULT, or a protocol code defined for
      * provider_kind_code. No URL or model-name inference is performed. */
     uint32_t protocol_kind_code;
-    uint64_t reserved[3];
+    /* Revision 21: borrowed for the call; null with a zero count makes no
+     * statement. At most METASK_AGENTCORE_MAX_MODEL_CAPABILITIES_V1 entries,
+     * each naming a distinct model. A declaration outranks the built-in model
+     * family table for the Session's model, every set_model target, and its
+     * tool-scoped providers; restore uses the current Host's declarations. */
+    const metask_agentcore_model_capability_v1 *model_capabilities;
+    uint64_t model_capability_count;
+    uint64_t reserved[1];
 } metask_agentcore_session_host_config_v1;
 
 /* One edit of the kernel system-prompt sections. PROMPT_OP_ADD adds a
@@ -881,7 +910,7 @@ typedef uint32_t (*metask_agentcore_session_update_permission_mode_fn_v1)(
 typedef void (*metask_agentcore_buffer_release_fn_v1)(
     metask_agentcore_owned_bytes_v1 *);
 
-/* Function-table order is fixed within Revision 20. No earlier revision layout
+/* Function-table order is fixed within Revision 21. No earlier revision layout
  * is accepted, probed, aliased, or dispatched. */
 typedef struct metask_agentcore_runtime_api_v1 {
     uint32_t struct_size;
@@ -1067,8 +1096,8 @@ metask_agentcore_owned_bytes_v1_release(
 #define METASK_AGENTCORE_ASSERT_OFFSET(type, field, offset) \
     METASK_AGENTCORE_STATIC_ASSERT(offsetof(type, field) == (offset), #type "." #field " offset")
 
-METASK_AGENTCORE_STATIC_ASSERT(METASK_AGENTCORE_ABI_REVISION == 20u,
-                               "AgentCore revision 20");
+METASK_AGENTCORE_STATIC_ASSERT(METASK_AGENTCORE_ABI_REVISION == 21u,
+                               "AgentCore revision 21");
 METASK_AGENTCORE_STATIC_ASSERT(METASK_AGENTCORE_MCP_NEGOTIATION_AUTO == 1u,
                                "MCP auto code");
 METASK_AGENTCORE_STATIC_ASSERT(METASK_AGENTCORE_MCP_NEGOTIATION_MODERN_ONLY == 2u,
@@ -1110,6 +1139,7 @@ METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_mcp_selector_v1, 80);
 METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_mcp_selection_v1, 56);
 METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_durable_budget_profile_v1, 112);
 METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_session_host_config_v1, 168);
+METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_model_capability_v1, 40);
 METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_prompt_section_v1, 72);
 METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_prompt_profile_v1, 56);
 METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_context_block_v1, 56);
@@ -1162,7 +1192,12 @@ METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_session_host_config_v1, mcp_sele
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_session_host_config_v1, durable_budget, 128);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_session_host_config_v1, run_journal_mode_code, 136);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_session_host_config_v1, protocol_kind_code, 140);
-METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_session_host_config_v1, reserved, 144);
+METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_session_host_config_v1, model_capabilities, 144);
+METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_session_host_config_v1, model_capability_count, 152);
+METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_session_host_config_v1, reserved, 160);
+METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_model_capability_v1, image_input_code, 4);
+METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_model_capability_v1, model, 8);
+METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_model_capability_v1, reserved, 24);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_session_create_config_v1, host, 8);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_session_create_config_v1, model, 16);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_session_create_config_v1, prompt_profile, 32);

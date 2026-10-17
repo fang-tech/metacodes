@@ -6,10 +6,10 @@
 #include <string.h>
 
 #if defined(METASK_AGENTCORE_CALLBACK_CONTINUE) || defined(METASK_AGENTCORE_CALLBACK_FATAL)
-#error "revision 20 must not retain historical callback aliases"
+#error "revision 21 must not retain historical callback aliases"
 #endif
 
-#if METASK_AGENTCORE_ABI_REVISION != 20u || \
+#if METASK_AGENTCORE_ABI_REVISION != 21u || \
     METASK_AGENTCORE_MAX_SUBMITTED_INPUTS_V1 != 64u || \
     METASK_AGENTCORE_MAX_SUBMITTED_INPUT_BYTES_V1 != 16777216u || \
     METASK_AGENTCORE_PROMPT_OP_ADD != 1u || \
@@ -18,6 +18,11 @@
     METASK_AGENTCORE_MAX_CONTEXT_BLOCKS_V1 != 32u || \
     METASK_AGENTCORE_STATUS_SKILL_CATALOG_INCOMPLETE != 27u || \
     METASK_AGENTCORE_STATUS_IMAGE_INPUT_UNSUPPORTED != 28u || \
+    METASK_AGENTCORE_STATUS_IMAGE_INPUT_CAPABILITY_UNKNOWN != 29u || \
+    METASK_AGENTCORE_CAPABILITY_SUPPORTED != 1u || \
+    METASK_AGENTCORE_CAPABILITY_UNSUPPORTED != 2u || \
+    METASK_AGENTCORE_MAX_MODEL_CAPABILITIES_V1 != 256u || \
+    METASK_AGENTCORE_MAX_MODEL_CAPABILITY_MODEL_BYTES_V1 != 256u || \
     METASK_AGENTCORE_RUN_INPUT_MULTIMODAL != 3u || \
     METASK_AGENTCORE_RUN_INPUT_PART_TEXT != 1u || \
     METASK_AGENTCORE_RUN_INPUT_PART_IMAGE != 2u || \
@@ -35,7 +40,7 @@
     METASK_AGENTCORE_MCP_APPLY_APPLIED != 1u || \
     METASK_AGENTCORE_MCP_APPLY_SUPERSEDED != 2u || \
     METASK_AGENTCORE_MCP_APPLY_REJECTED != 3u
-#error "source-free Revision 20 codes must match the public contract"
+#error "source-free Revision 21 codes must match the public contract"
 #endif
 
 #ifdef _WIN32
@@ -631,6 +636,19 @@ int main(int argc, char **argv) {
     metask_agentcore_bytes_view_v1 allowed_tools[] = {view("HostStreamC")};
     session_host.allowed_tools = allowed_tools;
     session_host.allowed_tool_count = 1;
+    /* Revision 21: the Host's own knowledge of its models' image input. The
+     * vision model's name is in no built-in family; the Claude name is, and
+     * the Host's "unsupported" outranks that family. */
+    metask_agentcore_model_capability_v1 model_capabilities[2];
+    memset(model_capabilities, 0, sizeof(model_capabilities));
+    model_capabilities[0].struct_size = (uint32_t)sizeof(model_capabilities[0]);
+    model_capabilities[0].image_input_code = METASK_AGENTCORE_CAPABILITY_SUPPORTED;
+    model_capabilities[0].model = view("c-consumer-vision");
+    model_capabilities[1].struct_size = (uint32_t)sizeof(model_capabilities[1]);
+    model_capabilities[1].image_input_code = METASK_AGENTCORE_CAPABILITY_UNSUPPORTED;
+    model_capabilities[1].model = view("claude-c-consumer");
+    session_host.model_capabilities = model_capabilities;
+    session_host.model_capability_count = 2;
     /* A Host persona: replace the kernel identity, add one Host section. */
     metask_agentcore_prompt_section_v1 prompt_sections[2];
     memset(prompt_sections, 0, sizeof(prompt_sections));
@@ -777,10 +795,11 @@ int main(int argc, char **argv) {
     options.struct_size = sizeof(options);
     options.max_turns = 1;
 
-    /* Multimodal pre-provider probes: the current model has no image
-     * capability and malformed wire is rejected outright. Neither request
-     * reaches the mock provider (both response rounds stay unconsumed) and
-     * the rejected Run id stays reusable. */
+    /* Multimodal pre-provider probes: nothing says the current model takes
+     * images (CAPABILITY_UNKNOWN, not UNSUPPORTED), a model the Host declared
+     * unsupported is refused, and malformed wire is rejected outright. None
+     * of these requests reaches the mock provider (both response rounds stay
+     * unconsumed) and the rejected Run id stays reusable. */
     metask_agentcore_run_input_part_v1 image_parts[2];
     memset(image_parts, 0, sizeof(image_parts));
     image_parts[0].struct_size = (uint32_t)sizeof(image_parts[0]);
@@ -798,7 +817,9 @@ int main(int argc, char **argv) {
     metask_agentcore_run_result_v1 result = {0};
     if (api->session->run_input(session, 1, &multimodal, &options, &result,
                                 &diagnostic) !=
-        METASK_AGENTCORE_STATUS_IMAGE_INPUT_UNSUPPORTED) {
+            METASK_AGENTCORE_STATUS_IMAGE_INPUT_CAPABILITY_UNKNOWN ||
+        !description_contains(api, session,
+                              "\"image_input\":{\"supported\":false,\"source\":\"unknown\"}")) {
         api->buffer_release(&diagnostic);
         stop_server(&server);
         api->session->destroy(session, &diagnostic);
@@ -832,9 +853,31 @@ int main(int argc, char **argv) {
     }
     api->buffer_release(&diagnostic);
 
-    /* Vision-capable model for the two real provider rounds. */
+    /* The family table says Claude takes images; the Host's declaration says
+     * this route does not, and the Host wins - before any provider round. */
     if (api->session_control->set_model(session, view("claude-c-consumer"),
-                                        &diagnostic) != METASK_AGENTCORE_STATUS_OK) {
+                                        &diagnostic) != METASK_AGENTCORE_STATUS_OK ||
+        (api->buffer_release(&diagnostic),
+         api->session->run_input(session, 1, &multimodal, &options, &result,
+                                 &diagnostic)) !=
+            METASK_AGENTCORE_STATUS_IMAGE_INPUT_UNSUPPORTED ||
+        !description_contains(api, session,
+                              "\"image_input\":{\"supported\":false,\"source\":\"host\"}")) {
+        api->buffer_release(&diagnostic);
+        stop_server(&server);
+        api->session->destroy(session, &diagnostic);
+        api->buffer_release(&diagnostic);
+        api->runtime->destroy(runtime, &diagnostic);
+        return release_error(api, &diagnostic, 65);
+    }
+    api->buffer_release(&diagnostic);
+
+    /* Vision-capable model for the two real provider rounds: a name no
+     * built-in family knows, admitted only by the Host's declaration. */
+    if (api->session_control->set_model(session, view("c-consumer-vision"),
+                                        &diagnostic) != METASK_AGENTCORE_STATUS_OK ||
+        !description_contains(api, session,
+                              "\"image_input\":{\"supported\":true,\"source\":\"host\"}")) {
         stop_server(&server);
         api->session->destroy(session, &diagnostic);
         api->runtime->destroy(runtime, &diagnostic);

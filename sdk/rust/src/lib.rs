@@ -16,7 +16,7 @@ pub enum AbiError {
     LengthOverflow,
 }
 
-/// Validated Revision 20 root plus mandatory domain tables. Discovery rejects
+/// Validated Revision 21 root plus mandatory domain tables. Discovery rejects
 /// every other layout; there is no legacy probe or alternate dispatch.
 #[derive(Clone, Copy)]
 pub struct Api {
@@ -617,7 +617,7 @@ mod tests {
 
     #[test]
     fn revision_fifteen_layout_codes_and_host_buffer_helpers_are_exact() {
-        assert_eq!(raw::METASK_AGENTCORE_ABI_REVISION, 20);
+        assert_eq!(raw::METASK_AGENTCORE_ABI_REVISION, 21);
         assert_eq!(raw::METASK_AGENTCORE_MAX_SUBMITTED_INPUTS_V1, 64);
         assert_eq!(raw::METASK_AGENTCORE_MAX_SUBMITTED_INPUT_BYTES_V1, 16_777_216);
         assert_eq!(size_of::<raw::metask_agentcore_submitted_input_v1>(), 48);
@@ -638,6 +638,16 @@ mod tests {
         );
         assert_eq!(raw::METASK_AGENTCORE_STATUS_SKILL_CATALOG_INCOMPLETE, 27);
         assert_eq!(raw::METASK_AGENTCORE_STATUS_IMAGE_INPUT_UNSUPPORTED, 28);
+        assert_eq!(raw::METASK_AGENTCORE_STATUS_IMAGE_INPUT_CAPABILITY_UNKNOWN, 29);
+        assert_eq!(raw::METASK_AGENTCORE_CAPABILITY_SUPPORTED, 1);
+        assert_eq!(raw::METASK_AGENTCORE_CAPABILITY_UNSUPPORTED, 2);
+        assert_eq!(raw::METASK_AGENTCORE_MAX_MODEL_CAPABILITIES_V1, 256);
+        assert_eq!(raw::METASK_AGENTCORE_MAX_MODEL_CAPABILITY_MODEL_BYTES_V1, 256);
+        assert_eq!(size_of::<raw::metask_agentcore_model_capability_v1>(), 40);
+        assert_eq!(
+            size_of::<raw::metask_agentcore_session_host_config_v1>(),
+            168
+        );
         assert_eq!(raw::METASK_AGENTCORE_RUN_INPUT_MULTIMODAL, 3);
         assert_eq!(raw::METASK_AGENTCORE_RUN_INPUT_PART_TEXT, 1);
         assert_eq!(raw::METASK_AGENTCORE_RUN_INPUT_PART_IMAGE, 2);

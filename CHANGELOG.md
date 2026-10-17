@@ -19,6 +19,19 @@ status, compatibility boundaries, and entry points are defined by
   references were being replaced by `[sealed]` when cited (seen with the
   Browser Use Cloud reference skill) sets `references` to `off` and keeps
   its instructions screened; the install summary shows both policies.
+- AgentCore Revision 21: Host model-capability declarations (issue #273).
+  `SessionHostConfigV1.model_capabilities` / `model_capability_count` (two
+  former reserved words; the struct stays 168 bytes) carry up to 256 40-byte
+  `ModelCapabilityV1` entries, each saying whether one model takes image input
+  (`CAPABILITY_SUPPORTED` / `CAPABILITY_UNSUPPORTED`). A declaration outranks
+  the provider catalog and the built-in model-family table for the Session's
+  model, every `set_model` target and its tool-scoped providers, and a restore
+  uses the current Host's declarations. `describe` reports
+  `"image_input":{"supported":…,"source":"host"|"catalog"|"model_family"|"unknown"}`.
+  Source-level hosts pass the same through `SessionConfig.model_capabilities`;
+  `Provider.imageInput` answers with the source. The OpenAI and Gemini clients
+  now apply a catalog's `image_input` declaration too (only the Anthropic
+  client did), and the CLI hands them the Metask catalog. SDK 0.8.0-dev.
 - Sealed gateway at scale ([doc/SEALED_GATEWAY_SCALE_DESIGN.md](doc/SEALED_GATEWAY_SCALE_DESIGN.md)):
   `metacodes sealed serve` runs a bounded worker pool with a queue and a cap
   on in-flight model calls, refuses over-capacity requests before reading
@@ -254,6 +267,14 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Changed
 
+- An image Run for a model that no Host declaration, provider catalog entry or
+  built-in model family covers now returns AgentCore status 29
+  `IMAGE_INPUT_CAPABILITY_UNKNOWN` instead of 28 `IMAGE_INPUT_UNSUPPORTED`; 28
+  now means a source says the model does not take images. Both still refuse
+  before any provider request: an unknown route can drop an image without an
+  error, so it is not sent on a guess (issue #273). Hosts that treated 28 as
+  "pick another model" should treat 29 as "declare the model, or pick another".
+
 - The Sealed Skill Protocol document says everywhere what the code does:
   the gateway holds no inference account. Roles and identities (§1.2: the
   subscriber's own provider account; the inference-gateway identity relays,
@@ -380,6 +401,16 @@ status, compatibility boundaries, and entry points are defined by
   `kg_root` pointers are still read.
 
 ### Fixed
+
+- MiniMax-M3 takes image input: the model table now says so (MiniMax's
+  OpenAI-compatible Chat Completions documentation lists image understanding
+  for M3), so AgentCore and the CLI no longer refuse its images (issue #273).
+- `AgentSession.setModel` rebuilt the provider without the Session's
+  `auth_scheme`, so a route authenticated with `x-api-key` or a custom header
+  fell back to `authorization: Bearer` after a model switch.
+- doc/API.md said images are never replaced with placeholder text while a
+  later paragraph documents the placeholder for image tool results; the first
+  statement now covers images in user input only.
 
 - `metacodes sealed serve` stops cleanly. Ctrl+C (SIGINT; also SIGTERM and
   SIGHUP, or the console closing on Windows) now only raises the process-wide

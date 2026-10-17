@@ -4,7 +4,7 @@ const wire = sdk.types;
 const Server = @import("mock_server.zig").Server;
 
 comptime {
-    if (wire.ABI_REVISION != 20 or
+    if (wire.ABI_REVISION != 21 or
         wire.MAX_SUBMITTED_INPUTS_V1 != 64 or
         wire.MAX_SUBMITTED_INPUT_BYTES_V1 != 16 * 1024 * 1024 or
         wire.PROMPT_OP_ADD != 1 or
@@ -14,6 +14,11 @@ comptime {
         wire.MAX_CONTEXT_BLOCKS_V1 != 32 or
         @intFromEnum(wire.Status.skill_catalog_incomplete) != 27 or
         @intFromEnum(wire.Status.image_input_unsupported) != 28 or
+        @intFromEnum(wire.Status.image_input_capability_unknown) != 29 or
+        wire.CAPABILITY_SUPPORTED != 1 or
+        wire.CAPABILITY_UNSUPPORTED != 2 or
+        wire.MAX_MODEL_CAPABILITIES_V1 != 256 or
+        wire.MAX_MODEL_CAPABILITY_MODEL_BYTES_V1 != 256 or
         wire.RUN_INPUT_MULTIMODAL != 3 or
         wire.RUN_INPUT_PART_TEXT != 1 or
         wire.RUN_INPUT_PART_IMAGE != 2 or
@@ -31,10 +36,10 @@ comptime {
         wire.MCP_APPLY_APPLIED != 1 or
         wire.MCP_APPLY_SUPERSEDED != 2 or
         wire.MCP_APPLY_REJECTED != 3)
-        @compileError("source-free Revision 20 codes must match the public contract");
+        @compileError("source-free Revision 21 codes must match the public contract");
     if (@hasDecl(wire, "SessionRefreshSkillCatalogFnV1") or
         @hasField(wire.ApiV1, "session_refresh_skill_catalog"))
-        @compileError("revision 20 must not expose the removed catalog refresh entry");
+        @compileError("revision 21 must not expose the removed catalog refresh entry");
     if (wire.MAX_SKILL_FILE_CONTENT_BYTES_V1 != 16 * 1024 * 1024 or
         wire.MAX_SKILL_CONTENT_BYTES_V1 != 32 * 1024 * 1024 or
         wire.MAX_SKILL_FILES_V1 != 1024 or
@@ -680,7 +685,9 @@ pub fn main(init: std.process.Init) !void {
         .durable_budget = null,
         .run_journal_mode_code = wire.RUN_JOURNAL_DURABLE_WORKSPACE,
         .protocol_kind_code = wire.PROTOCOL_DEFAULT,
-        .reserved = [_]u64{0} ** 3,
+        .model_capabilities = null,
+        .model_capability_count = 0,
+        .reserved = [_]u64{0} ** 1,
     };
     // A Host section the Session renders into every Run's system prompt and
     // carries through its checkpoint.
@@ -900,6 +907,17 @@ pub fn main(init: std.process.Init) !void {
     session_host.protocol_kind_code = wire.OPENAI_PROTOCOL_RESPONSES;
     session_host.base_url = sdk.bytesView(responses_url);
     session_host.skill_catalog = restored_catalog;
+    // Revision 21: restore takes the current Host's capability declarations
+    // (checkpoints carry none). `artifact-vision` is in no built-in model
+    // family; only this declaration lets an image reach the Responses wire.
+    const restore_capabilities = [_]wire.ModelCapabilityV1{.{
+        .struct_size = @sizeOf(wire.ModelCapabilityV1),
+        .image_input_code = wire.CAPABILITY_SUPPORTED,
+        .model = sdk.bytesView("artifact-vision"),
+        .reserved = [_]u64{0} ** 2,
+    }};
+    session_host.model_capabilities = &restore_capabilities;
+    session_host.model_capability_count = restore_capabilities.len;
     var checkpoint_source = checkpoint.source();
     var restore_config = std.mem.zeroes(wire.SessionRestoreConfigV1);
     restore_config.struct_size = @sizeOf(wire.SessionRestoreConfigV1);
@@ -937,12 +955,26 @@ pub fn main(init: std.process.Init) !void {
     }
     api.bufferRelease()(&restore_report);
 
-    // The checkpoint intentionally carries the earlier fixture model. Once the
-    // restored session is switched to OpenAI Responses, select a verified
-    // vision-capable model before exercising the multimodal ABI path.
+    // The checkpoint intentionally carries the earlier fixture model, which
+    // nothing declares able to take images: an image Run is refused before any
+    // provider round as CAPABILITY_UNKNOWN (not UNSUPPORTED), and its id stays
+    // reusable. Then select the model the Host declared vision-capable.
+    const probe_parts = [_]wire.RunInputPartV1{
+        sdk.textPart("describe the attached icon"),
+        sdk.imagePart("image/png", "aWNvbi1ieXRlcw=="),
+    };
+    try expectStatus(.image_input_capability_unknown, api.session().runMultimodal(
+        session,
+        3,
+        &probe_parts,
+        &options,
+        &result,
+        &diagnostic,
+    ), diagnostic);
+    api.bufferRelease()(&diagnostic);
     try expectStatus(
         .ok,
-        api.sessionControl().setModel()(session, sdk.bytesView("gpt-5.2"), &diagnostic),
+        api.sessionControl().setModel()(session, sdk.bytesView("artifact-vision"), &diagnostic),
         diagnostic,
     );
 
@@ -985,7 +1017,7 @@ pub fn main(init: std.process.Init) !void {
     try expectStatus(.ok, api.runtime().destroy()(runtime, &diagnostic), diagnostic);
     runtime = null;
 
-    std.debug.print("AgentCore source-free consumer: Revision 20 Agent Runtime, active-Run input, prompt profile, permission mode update, OpenAI Responses, multimodal input, active-Run journal, Host/MCP streaming, process-plugin configuration, Workspace Skill Catalog, tools, checkpoint, Runtime rebuild, restore and continued Run OK\n", .{});
+    std.debug.print("AgentCore source-free consumer: Revision 21 Agent Runtime, Host model capabilities, active-Run input, prompt profile, permission mode update, OpenAI Responses, multimodal input, active-Run journal, Host/MCP streaming, process-plugin configuration, Workspace Skill Catalog, tools, checkpoint, Runtime rebuild, restore and continued Run OK\n", .{});
 }
 
 const CatalogIdentities = struct {
