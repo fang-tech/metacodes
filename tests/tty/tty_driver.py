@@ -18,6 +18,18 @@
   - `wait:PATTERN:N` = 等渲染后的屏幕任一行含 PATTERN(至多 N 秒),命中后短 settle
     防抓半帧。超时不抛错(交给用例自身断言给出屏幕 diff)。
   两后端共享同一份实现(_Capture),只有"读一片字节"原语按平台实现——语义永不分叉。
+
+空闲期(不在生成)按 Enter 提交命令之后,**不要用 sleep: 等结果**,用 wait_for()/submit():
+  - 空闲期没有 spinner,流的静默不代表画面已到。hosted Windows runner 上 ConPTY 回显慢,
+    `sleep:0.4` + 收尾 0.6s 静默就截屏,截到的是还没提交的输入框(TTY (Windows) job
+    117303780270,test_task_tab T29)。
+  - 在两次读输入之间发的键,POSIX 上会被丢掉:readLineRaw 返回时复原终端、下一次读输入
+    进 raw mode,生成期开始进 raw mode、结束时复原,这几处都是 TCSAFLUSH,丢掉这之间收到
+    的输入(用 SIGSTOP 卡住 REPL 复现过:旧的 `sleep:0.2` 后接着打的 `/goal budget 42` 整条
+    丢失)。所以提交后先等 READY(新的空输入框)再打字;要在生成期按键,先
+    wait_for("esc to interrupt") 等进入生成态;生成结束后再发键,等 IDLE。
+  - 生成期的 sleep: 本身会等(spinner 每 100ms 重画,turn 结束才静默),但只等到静默,
+    不保证下一个输入框已经画出来。
 """
 import atexit
 import os
@@ -53,6 +65,38 @@ TAIL_MAX = 6.0
 # 关掉终端后等子进程退出的上限。以前是无超时 waitpid:一个不退出的子进程会把整个 runner
 # 挂死,在 CI 上吃满 job 超时(#222)。超时即 SIGKILL 并让该用例失败——不退出本身就是 bug。
 EXIT_GRACE = 15.0
+# 用例里等屏幕条件的上限。成功路径命中即返回,上限给足不增加耗时;只有失败路径等满,
+# 然后由用例的断言给出屏幕 diff。
+WAIT_S = 20
+
+
+def wait_for(pattern, timeout=WAIT_S):
+    """等屏幕任一行含 pattern 的事件(wait: 语义:超时不抛错)。"""
+    return f"wait:{pattern}:{timeout}"
+
+
+# 空输入框已画出(灰色 placeholder,render_region.zig)⇒ 这一次 readLineRaw 已进 raw mode,
+# 此后打的字不会被 TCSAFLUSH 丢。不会被旧画面误命中:打字时框里是刚打的字,提交时
+# readLineRaw 擦掉旧框,新框画出来它才再出现。注意生成期的输入框也显示它:模型 turn 结束后
+# 要发键,等 IDLE。
+READY = wait_for('Try "fix typecheck errors"')
+# 空闲输入框已画出:footer 整行等于空闲态文案——生成期同一行会多出 ` · esc to interrupt`。
+# 只对 bypassPermissions、没有 agent 的会话成立(footer 文案随 mode 和 agent 入口变)。
+IDLE = f"waitline:⏵⏵ bypass permissions on (shift+tab to cycle):{WAIT_S}"
+
+
+def submit(command, rendered, timeout=WAIT_S):
+    """等空输入框,提交一条命令,再等它的产物 rendered 上屏(见模块文档)。
+
+    可以串起来:每条开头的 READY 会等上一条处理完。所以中间各条的 rendered 屏上早有了也
+    无妨,决定截屏时刻的只有最后一条——它必须是屏上还没有的文本,而且在输出收尾时仍在屏上
+    (比一屏长的输出会把开头滚出去,那样会等满超时)。输入行 `❯ <command>` 里的子串会在
+    提交前就命中,直接拒绝。
+    """
+    if rendered in "❯ " + command:
+        raise ValueError(f"rendered={rendered!r} 出现在输入行里,提交前就会命中")
+    return [READY, f"type:{command}", "key:enter", wait_for(rendered, timeout)]
+
 
 # 高层键名 → 字节
 SPECIAL = {

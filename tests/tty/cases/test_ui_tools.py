@@ -18,7 +18,7 @@ import subprocess
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from tty_driver import run, case_tmpdir
+from tty_driver import IDLE, READY, run, case_tmpdir, wait_for
 from asserts import TTYAssert
 from e2e_helpers import SkipTest  # noqa: E402
 
@@ -142,8 +142,10 @@ def test_T35_write_diff_in_transcript(bin_path):
 
     raw = replay_run(
         cdir,
-        ["sleep:0.8", "type:write the file", "key:enter", "sleep:2.0",
-         "key:ctrl_x", "key:ctrl_o", "sleep:1.0", "type:q"],
+        # 等 turn 收尾、空闲输入框起来再开 transcript(否则会在生成期打开,走另一条路径;
+        # 落在生成结束到下次读输入之间的键会被 TCSAFLUSH 丢掉)。
+        [READY, "type:write the file", "key:enter", wait_for("Done."), IDLE,
+         "key:ctrl_x", "key:ctrl_o", wait_for("Showing detailed transcript"), "type:q"],
         term_size=(40, 100), bin_path=bin_path, before_each=_reset35, success=_ok35,
     )
 
@@ -214,7 +216,7 @@ def test_T36_edit_diff_live_inline(bin_path):
         s = _re.sub(rb"\x1b\[[0-9;?>]*[A-Za-z]", b"", raw).decode("utf-8", "replace")
         return "+BAR" in s and "-foo" in s
 
-    raw = replay_run(cdir, ["sleep:0.8", "type:edit it", "key:enter", "sleep:2.5"],
+    raw = replay_run(cdir, [READY, "type:edit it", "key:enter", wait_for("Done")],
                      term_size=(40, 100), bin_path=bin_path, before_each=_reset_file, success=_ok)
 
     # 文件真被改
@@ -278,7 +280,8 @@ def test_T37_taskcreate_shows_tasktab(bin_path):
         [("a", _sse_tool("tu1", "TaskCreate", {"subject": "build the widget", "description": "d", "activeForm": "Building the widget"})),
          ("b", _sse_tool("tu2", "TaskUpdate", {"taskId": "1", "status": "in_progress"})),
          ("c", _sse_text("started"))],
-        ["sleep:0.8", "type:make a task", "key:enter", "sleep:2.5"],
+        # 断言看的是空闲态布局(清单行紧贴输入框上边框),等空闲输入框。
+        [READY, "type:make a task", "key:enter", wait_for("◼"), IDLE],
         term_size=(40, 100),
         env={"METACODES_KG_BIN": "/nonexistent/kg-disabled-for-test"},
     )
@@ -303,7 +306,7 @@ def test_T40_assistant_markdown_render(bin_path):
     """
     md = "## Heading\\n\\nSome **bold** text.\\n\\n- one\\n- two\\n\\n```py\\nprint('x')\\n```"
     raw = _run_cassette([("a", _sse_text(md))],
-                        ["sleep:0.8", "type:show md", "key:enter", "sleep:2.5"])
+                        [READY, "type:show md", "key:enter", wait_for("Heading")])
     a = TTYAssert(raw)
     screen = "\n".join(a.final.line_text(r) for r in range(a.final.rows))
     # 标题渲染:去 ## + ⏺ 段首(整屏应有 "⏺ Heading",且无裸 "## Heading")。
@@ -331,7 +334,8 @@ def test_T41_webfetch_output_reasonable(bin_path):
     raw = _run_cassette(
         [("a", _sse_tool("tu1", "WebFetch", {"url": url})),
          ("b", _sse_text("done"))],
-        ["sleep:0.8", "type:fetch it", "key:enter", "sleep:4.0"],
+        # WebFetch 真联网,耗时随网络浮动:等 turn 的收尾文字,不睡固定 4s。
+        [READY, "type:fetch it", "key:enter", wait_for("done")],
     )
     a = TTYAssert(raw)
     screen = "\n".join(a.final.line_text(r) for r in range(a.final.rows))
@@ -357,8 +361,10 @@ def test_T42_transcript_close_reanchors_box_to_bottom(bin_path):
     reply = "line one\\nline two\\nline three\\nline four\\nline five\\nline six"
     raw = _run_cassette(
         [("a", _sse_text(reply))],
-        ["sleep:0.8", "type:hi", "key:enter", "sleep:2.0",
-         "key:ctrl_x", "key:ctrl_o", "sleep:0.5", "key:ctrl_o", "sleep:0.5"],
+        # 等回复末行和空闲输入框再开;viewer 开着时主屏 footer 不在,关掉后回来——以此等开、等关。
+        [READY, "type:hi", "key:enter", wait_for("line six"), IDLE,
+         "key:ctrl_x", "key:ctrl_o", wait_for("Showing detailed transcript"),
+         "key:ctrl_o", wait_for("bypass permissions on")],
         term_size=(16, 80),
     )
     a = TTYAssert(raw, rows=16, cols=80)  # PTY 是 16 行;TTYAssert 默认 24 → top>=rows//2 用错分母
