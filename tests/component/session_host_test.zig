@@ -346,6 +346,125 @@ test "L2 SessionHost interrupt releases a pending prompt and stops the Run" {
     try std.testing.expectEqual(cc.session_host.InterruptOutcome.no_run, hosted.interrupt());
 }
 
+/// Watches the window between an interrupt's (or close's) decision to cancel
+/// and its kernel abort. A Run released from its prompt in that window took
+/// the cancelled prompt as a denied tool, sent its next request and, against
+/// a fast provider, ended normally before the abort arrived: the interrupt
+/// then reported `too_late` and the Run never stopped (seen on Windows CI).
+const ResumeWatch = struct {
+    var server: ?*harness.MockServer = null;
+    var ran = false;
+    var resumed_early = false;
+
+    fn beforeAbort(hosted: *HostedSession) void {
+        ran = true;
+        // A released Run shows itself within milliseconds: it closes the
+        // prompt, then sends its next provider request.
+        var waited: u32 = 0;
+        while (waited < 300) : (waited += 10) {
+            if ((countLines(&hosted.journal, "\"type\":\"ui_request_closed\"") catch 0) != 0 or
+                server.?.requestCount() >= 2)
+            {
+                resumed_early = true;
+                return;
+            }
+            std.Io.sleep(std.testing.io, .fromMilliseconds(10), .awake) catch {};
+        }
+    }
+
+    fn arm(watched: *harness.MockServer) void {
+        server = watched;
+        ran = false;
+        resumed_early = false;
+        cc.session_host.testing_hooks.before_abort = beforeAbort;
+    }
+
+    fn disarm() void {
+        cc.session_host.testing_hooks.before_abort = null;
+        server = null;
+    }
+};
+
+const PromptFixture = struct {
+    tmp: std.testing.TmpDir,
+    ws_buf: [std.fs.max_path_bytes]u8 = undefined,
+    home_buf: [std.fs.max_path_bytes]u8 = undefined,
+    workspace: []const u8 = "",
+    write: []u8 = &.{},
+    done: []u8 = &.{},
+    server: *harness.MockServer = undefined,
+    url: []u8 = &.{},
+    runtime: *cc.agent_session.AgentRuntime = undefined,
+    host: SessionHost = undefined,
+    hosted: *HostedSession = undefined,
+
+    /// In place: a Session whose first Run is parked on a Write prompt.
+    fn start(self: *PromptFixture) !void {
+        const a = std.testing.allocator;
+        self.* = .{ .tmp = std.testing.tmpDir(.{}) };
+        self.workspace = try subdir(&self.tmp, "workspace", &self.ws_buf);
+        const home = try subdir(&self.tmp, "home", &self.home_buf);
+        const path = try std.fmt.allocPrint(a, "{s}/never.txt", .{self.workspace});
+        defer a.free(path);
+        self.write = try writeToolSse(a, path);
+        self.done = try textSse(a, "done");
+        const bodies = [_][]const u8{ self.write, self.done };
+        self.server = try harness.MockServer.startCassette(&bodies, 0);
+        self.url = try self.server.urlOwned(a);
+        self.runtime = try cc.agent_session.AgentRuntime.create(a, .{ .builtin_tools = &.{"Write"} });
+        self.host = SessionHost.init(a, self.runtime, .{});
+        self.hosted = try self.host.open(.{ .config = baseConfig(self.url, self.workspace, home, &.{"Write"}) });
+        try self.hosted.submit(.{ .text = "write it" });
+        try waitFor(&self.hosted.journal, "\"type\":\"ui_request\"", 1);
+    }
+
+    fn stop(self: *PromptFixture) void {
+        const a = std.testing.allocator;
+        self.host.release(self.hosted);
+        self.host.deinit();
+        self.runtime.destroy() catch unreachable;
+        self.server.stop();
+        a.free(self.url);
+        a.free(self.done);
+        a.free(self.write);
+        self.tmp.cleanup();
+    }
+};
+
+test "L2 SessionHost interrupt keeps the prompt pending until the Run's abort is in force" {
+    var fx: PromptFixture = undefined;
+    try fx.start();
+    defer fx.stop();
+    ResumeWatch.arm(fx.server);
+    defer ResumeWatch.disarm();
+
+    try std.testing.expectEqual(cc.session_host.InterruptOutcome.requested, fx.hosted.interrupt());
+    try std.testing.expect(ResumeWatch.ran);
+    try std.testing.expect(!ResumeWatch.resumed_early);
+    try waitFor(&fx.hosted.journal, "\"type\":\"run_done\"", 1);
+    try std.testing.expectEqual(@as(usize, 1), try countLines(&fx.hosted.journal, "\"stop_reason\":\"aborted\""));
+    try std.testing.expectEqual(@as(usize, 1), try countLines(&fx.hosted.journal, "\"type\":\"ui_request_closed\",\"id\":1,\"outcome\":\"cancelled\""));
+    // The Run stopped at the boundary after the prompt: no second request.
+    try std.testing.expectEqual(@as(usize, 1), fx.server.requestCount());
+    try std.testing.expect(!try exists(fx.workspace, "never.txt"));
+}
+
+test "L2 SessionHost close keeps the prompt pending until the Run's abort is in force" {
+    var fx: PromptFixture = undefined;
+    try fx.start();
+    defer fx.stop();
+    ResumeWatch.arm(fx.server);
+    defer ResumeWatch.disarm();
+
+    try fx.host.close(fx.hosted.id);
+    try std.testing.expect(ResumeWatch.ran);
+    try std.testing.expect(!ResumeWatch.resumed_early);
+    // The shell stays readable after close: the Run was aborted, not finished.
+    try std.testing.expectEqual(@as(usize, 1), try countLines(&fx.hosted.journal, "\"stop_reason\":\"aborted\""));
+    try std.testing.expectEqual(@as(usize, 1), fx.server.requestCount());
+    try std.testing.expect(!try exists(fx.workspace, "never.txt"));
+}
+
 test "L2 SessionHost an unreadable answer denies the prompt and closes it as malformed" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

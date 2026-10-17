@@ -475,6 +475,13 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- `SessionHost`: an interrupt or close of a Run waiting on a UI prompt could
+  fail to stop it. The prompt was released before the kernel abort was
+  requested, so the Run took the cancelled prompt as a denied tool, sent its
+  next request, and - against a fast provider - ended normally first; the
+  interrupt then reported `too_late` (seen once on Windows CI). The abort is
+  now in force before the prompt is released; an answer racing the
+  interrupt is still discarded.
 - MiniMax-M3 takes image input: the model table now says so (MiniMax's
   OpenAI-compatible Chat Completions documentation lists image understanding
   for M3), so AgentCore and the CLI no longer refuse its images (issue #273).

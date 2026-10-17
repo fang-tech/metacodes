@@ -79,6 +79,9 @@ pub const RenderRegion = struct {
     frame_active: bool = false,
     // Ctrl+O alt-screen toggle 去抖时戳(单调 ms;0=从未)。见 noteCtrloAndShouldSuppressReopen。
     last_overlay_ctrlo_ms: i64 = 0,
+    // 上次 Ctrl+O 活动(开、关、被抑制)之后,读循环是否等到过一次 poll 超时(输入静默)。
+    // 见 noteCtrloAndShouldSuppressReopen / noteInputIdle。
+    ctrlo_input_idle: bool = true,
     // 画区时对续接点的快照:eraseRegion 必须按"画区那一刻"的半行状态还原,
     // 而非用 live 的 text_pending_newline/pending_col——后者会被 writeGenText.updatePendingTail
     // 在一对 draw/erase 之间改掉,导致 erase 选错分支 → 光标错位一行 → print 落到 scrollback。
@@ -131,21 +134,50 @@ pub const RenderRegion = struct {
     /// footer 多行堆叠 + 退出后输入框不幂等(偏移/残留)。离线 pty 复现不出(Screen 模型如实
     /// 模拟 alt-screen 存/复原,1049h/l 配对即干净),但真机抖动是确凿的。
     ///
-    /// 修法:open 前调本函数,**记下本次 Ctrl+O 时戳**(故名 note...),并返回是否抑制——若距上次
-    /// Ctrl+O < 阈值则抑制重开,使"按住一次"只产生一对 open/close(viewer 自身的 close 仍正常,
-    /// 只压住紧随其后的 reopen)。每次 Ctrl+O 都刷新时戳,按住期间持续刷新 → 全程不重开;松开后
-    /// (间隔 > 阈值)的下次 Ctrl+O 正常开。close 由 viewer 内部消费、不经此门 → 故意打开再关闭恒生效。
-    /// 返回 true = 本次应被抑制(调用方不开 viewer)。**有副作用**(写 last_overlay_ctrlo_ms),名字已点明。
+    /// 修法:open 前调本函数,**记下本次 Ctrl+O 时戳**(故名 note...),并返回是否抑制,使"按住一次"
+    /// 只产生一对 open/close(viewer 自身的 close 仍正常,只压住紧随其后的 reopen)。
     ///
-    /// 线程安全:`last_overlay_ctrlo_ms` 只被 Ctrl+O 处理路径碰。生成期由 watcher 线程调(tui_backend),
+    /// 判定看**输入是否静默过**,不只看处理时刻的间隔(shouldSuppressReopen)。只看间隔时,一串
+    /// 早已到齐的连发会被处理侧的停顿劈开:生成期每个键都要拿渲染锁(applyGenKey),emit 线程持锁
+    /// 画帧时 watcher 就等;viewer 本身开一次也要时间。任何一处停顿超过窗口,下一个连发就被当成新
+    /// 的一下 → 重开;落在一串的最后一个键上,viewer 就悬挂在那(离线 TTY 用例在 hosted Windows 上
+    /// 两次 h/l=3/2。旧判定分不出停顿和间隔:本地在末键前插 150ms 间隔即复现同一签名;viewer 每次
+    /// 开 150ms,20 下全部 toggle;按住时系统连发延迟本身就超过窗口,恒得两对)。
+    /// 现在:上次 Ctrl+O 活动(开、关 —— noteOverlayClosed、被抑制)之后,读循环没等到过一次 poll
+    /// 超时(noteInputIdle),说明这个键在缓冲里排着,属于同一串 → 抑制,处理再慢也一样;等到过
+    /// 静默且距上次活动超过窗口,才是有意的再按一下。输入本身停顿超过一个 poll 周期(生成期
+    /// 100ms、输入期 200ms)仍算新的一下——那与人有意再按无从区分,是有意的。
+    /// 返回 true = 本次应被抑制(调用方不开 viewer)。**有副作用**(写时戳、清静默标志),名字已点明。
+    ///
+    /// 线程安全:这几个字段只被 Ctrl+O 处理路径和读循环碰。生成期由 watcher 线程调(tui_backend),
     /// 输入期由主线程调(loop.zig)——两期**时间互斥**(要么在生成、要么在输入提示符,绝不并发),
     /// 故无并发读写,不需锁。即便退一万步有 torn read:aligned i64 在 arm64/x86-64 上读写本就原子,
     /// 且值是单调时戳,最坏结果只是去抖窗口偏一下,绝不崩。
     pub fn noteCtrloAndShouldSuppressReopen(self: *RenderRegion) bool {
         const now = util_time.nowMs();
-        const prev = self.last_overlay_ctrlo_ms;
+        const suppress = shouldSuppressReopen(self.last_overlay_ctrlo_ms, now, self.ctrlo_input_idle);
         self.last_overlay_ctrlo_ms = now;
-        return prev != 0 and (now - prev) < OVERLAY_REOPEN_DEBOUNCE_MS;
+        self.ctrlo_input_idle = false;
+        return suppress;
+    }
+
+    /// viewer 关闭也算一次 Ctrl+O 活动(关它的那个键被 viewer 自己读走,不经 noteCtrlo…)。
+    /// 不记的话窗口从"开"算起,viewer 开得越久,紧跟着的连发越容易被当成新的一下。
+    pub fn noteOverlayClosed(self: *RenderRegion) void {
+        self.last_overlay_ctrlo_ms = util_time.nowMs();
+        self.ctrlo_input_idle = false;
+    }
+
+    /// 读循环的 poll 超时(一个周期内没有输入)时调:此后再来的 Ctrl+O 不再算上一串的连发。
+    pub fn noteInputIdle(self: *RenderRegion) void {
+        self.ctrlo_input_idle = true;
+    }
+
+    /// 去抖判定(纯函数,便于单测)。prev_ms=0 表示从未按过。没等到过输入静默 → 同一串,抑制;
+    /// 等到过但离上次活动不到窗口 → 仍抑制(保留原 120ms 窗口)。
+    pub fn shouldSuppressReopen(prev_ms: i64, now_ms: i64, input_idle: bool) bool {
+        if (prev_ms == 0) return false;
+        return !input_idle or (now_ms - prev_ms) < OVERLAY_REOPEN_DEBOUNCE_MS;
     }
 
     pub fn enterExclusiveOverlay(self: *RenderRegion) void {
@@ -2333,6 +2365,35 @@ test "RenderRegion init/deinit no leak" {
     var r = RenderRegion.init(std.testing.allocator, 2, theme_mod.select(.monochrome, .none), .none);
     defer r.deinit();
     try std.testing.expect(r.cols >= 1);
+}
+
+test "Ctrl+O 去抖判定:没等到输入静默就是同一串,隔多久都抑制" {
+    const S = RenderRegion.shouldSuppressReopen;
+    // 从未按过:第一下必开。
+    try std.testing.expect(!S(0, 5, false));
+    try std.testing.expect(!S(0, 5, true));
+    // 处理侧停顿(拿渲染锁 / viewer 开得慢)把同一串连发隔开 5s:输入没静默过 → 仍抑制。
+    // 旧判定只看间隔,这里会重开(hosted Windows 上 h/l=3/2 的那种悬挂 viewer)。
+    try std.testing.expect(S(1000, 6000, false));
+    // 等到过静默、离上次活动超过窗口:有意的再按一下 → 开。
+    try std.testing.expect(!S(1000, 1000 + RenderRegion.OVERLAY_REOPEN_DEBOUNCE_MS, true));
+    // 等到过静默但还在窗口内:仍抑制(保留原窗口)。
+    try std.testing.expect(S(1000, 1000 + RenderRegion.OVERLAY_REOPEN_DEBOUNCE_MS - 1, true));
+}
+
+test "Ctrl+O 去抖状态:开/关/抑制清掉静默标志,poll 超时置上" {
+    var r = RenderRegion.init(std.testing.allocator, 2, theme_mod.select(.monochrome, .none), .none);
+    defer r.deinit();
+    try std.testing.expect(r.ctrlo_input_idle);
+    try std.testing.expect(!r.noteCtrloAndShouldSuppressReopen()); // 第一下:开
+    try std.testing.expect(!r.ctrlo_input_idle);
+    r.noteInputIdle();
+    r.noteOverlayClosed(); // viewer 读走了关它的键:也是一次活动
+    try std.testing.expect(!r.ctrlo_input_idle);
+    try std.testing.expect(r.last_overlay_ctrlo_ms != 0);
+    try std.testing.expect(r.noteCtrloAndShouldSuppressReopen()); // 缓冲里排着的连发:抑制
+    r.noteInputIdle();
+    try std.testing.expect(r.ctrlo_input_idle);
 }
 
 test "setCurrentTool/clearCurrentTool: 存取 + 截断 + 归零(读 ui.tools 真相源)" {

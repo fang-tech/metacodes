@@ -10,7 +10,7 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from tty_driver import run  # noqa: E402
+from tty_driver import IDLE, READY, run, wait_for  # noqa: E402
 from asserts import TTYAssert  # noqa: E402
 
 
@@ -77,8 +77,8 @@ def test_picker_opens_during_generation_without_alt_screen(bin_path):
     with SlowMockServer([slow_text_then_end(n_chunks=14, delay=0.4)]) as srv:
         raw = run(
             bin_path,
-            ["sleep:0.8", "type:go", "key:enter", "sleep:1.5", "key:ctrl_o",
-             "wait:Provider:3", "sleep:10"],
+            [READY, "type:go", "key:enter", wait_for("esc to interrupt"), "key:ctrl_o",
+             wait_for("Provider"), "sleep:10"],
             base_url=srv.url,
             startup_drain=0.8,
             per_key_drain=0.08,
@@ -104,8 +104,10 @@ def test_picker_left_open_by_a_reply_keeps_its_place(bin_path):
     with SlowMockServer([slow_text_then_end(n_chunks=10, delay=0.4)]) as srv:
         raw = run(
             bin_path,
-            ["sleep:0.8", "type:go", "key:enter", "sleep:1.0", "key:ctrl_o",
-             "wait:Provider:3", "type:zai", "sleep:10", "key:esc", "sleep:0.6"],
+            # 回复结束后先等空闲输入框再按 Esc(生成结束到下次读输入之间的键会被 TCSAFLUSH
+            # 丢掉);Esc 清掉过滤后 metask 回到列表(过滤期间它不在屏上),以它为末态标志。
+            [READY, "type:go", "key:enter", wait_for("esc to interrupt"), "key:ctrl_o",
+             wait_for("Provider"), "type:zai", "sleep:10", IDLE, "key:esc", wait_for("metask")],
             base_url=srv.url,
             startup_drain=0.8,
             per_key_drain=0.08,
