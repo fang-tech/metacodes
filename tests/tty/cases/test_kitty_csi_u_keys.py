@@ -16,7 +16,7 @@ import re
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from tty_driver import run  # noqa: E402
+from tty_driver import READY, run, submit, wait_for  # noqa: E402
 from asserts import TTYAssert  # noqa: E402
 
 _ANSI = re.compile(rb"\x1b\[[0-9;?>]*[A-Za-z]")
@@ -62,7 +62,8 @@ def test_csi_u_ctrl_o_toggle(bin_path):
 def test_csi_u_ctrl_t_toggles_task_panel(bin_path):
     # Ctrl+T(cp=116)CSI-u → 切 task 面板。先造一个任务(/task-test),再 CSI-u Ctrl+T 应隐藏它,
     # 再按应重现。验证 CSI-u Ctrl+T 真被识别(纯内存 toggle,不崩、面板状态变化)。
-    base = ["sleep:0.8", "type:/task-test:widget", "key:enter", "sleep:0.4"]
+    # 隐藏没有正向的屏幕标志(任务行消失),Ctrl+T 后只能 sleep;造任务那步等任务行上屏。
+    base = submit("/task-test:widget", "◼")
     shown, _ = _final_text(run(bin_path, base, per_key_drain=0.15))
     hidden, _ = _final_text(run(bin_path, base + [csi_u(116), "sleep:0.3"], per_key_drain=0.15))
     # task 面板显示时含任务标签;CSI-u Ctrl+T 后应不同(toggle 生效)。宽松断言:两屏不同 OR 任务行消失。
@@ -80,7 +81,9 @@ def test_csi_u_ctrl_o_opens_transcript_during_generation(bin_path):
     # 生成期(agent 运行中)CSI-u Ctrl+O → 打开 transcript。慢 mock 给宽窗口。
     from slow_mock_server import SlowMockServer
     with SlowMockServer(_slow_turn()) as srv:
-        raw = run(bin_path, ["sleep:0.8", "type:go", "key:enter", "sleep:2.0", "key:ctrl_x", csi_u(111), "sleep:1.0"],
+        # 同下面 Ctrl+B 用例:等进入生成态再按,而不是睡 2s 赌它已开始。
+        raw = run(bin_path, [READY, "type:go", "key:enter", wait_for("esc to interrupt"),
+                             "key:ctrl_x", csi_u(111), wait_for("Showing detailed transcript")],
                   base_url=srv.url, startup_drain=0.8, per_key_drain=0.15)
     assert b"Showing detailed transcript" in raw, "生成期 CSI-u Ctrl+O 未打开 transcript"
 

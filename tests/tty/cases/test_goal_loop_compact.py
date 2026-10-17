@@ -8,7 +8,7 @@ the local mock below, never to a real provider.
 import http.server
 import threading
 
-from tty_driver import run
+from tty_driver import IDLE, run, submit
 from asserts import TTYAssert
 
 
@@ -48,24 +48,15 @@ def _start_mock():
 
 
 def test_tty_goal_command_lifecycle(bin_path):
-    raw = run(bin_path, [
-        "sleep:0.8",
-        "type:/goal set ship tty goal",
-        "key:enter",
-        "sleep:0.2",
-        "type:/goal budget 42",
-        "key:enter",
-        "sleep:0.2",
-        "type:/goal pause",
-        "key:enter",
-        "sleep:0.2",
-        "type:/goal resume",
-        "key:enter",
-        "sleep:0.2",
-        "type:/exit",
-        "key:enter",
-        "sleep:0.3",
-    ])
+    # 每条先等上一条处理完(submit 开头的 READY)再打:提交后紧跟着打字在 POSIX 上会被
+    # TCSAFLUSH 丢掉(见 tty_driver 模块文档),原先的 sleep:0.2 只是赌命令已经处理完。
+    # 中间各条的标志屏上可能早有(/goal budget 也会打 `Goal [active]`),截屏时刻由最后的
+    # Goodbye 决定。
+    raw = run(bin_path, submit("/goal set ship tty goal", "Goal set.")
+              + submit("/goal budget 42", "budget:  42 tokens")
+              + submit("/goal pause", "Goal [paused]")
+              + submit("/goal resume", "Goal [active]")
+              + submit("/exit", "Goodbye"))
     a = TTYAssert(raw)
     a.assert_prose_contains("Goal set.")
     a.assert_prose_contains("target:  ship tty goal")
@@ -82,24 +73,13 @@ def test_tty_loop_requires_goal_then_enables_and_stops(bin_path):
     # talks to the local mock and the case also checks it stops at its limit.
     server, base_url = _start_mock()
     try:
-        raw = run(bin_path, [
-            "sleep:0.8",
-            "type:/loop on 2",
-            "key:enter",
-            "sleep:0.2",
-            "type:/goal set continue tty work",
-            "key:enter",
-            "sleep:0.2",
-            "type:/loop on 2",
-            "key:enter",
-            "wait:limit reached:8",
-            "type:/loop off",
-            "key:enter",
-            "sleep:0.2",
-            "type:/exit",
-            "key:enter",
-            "sleep:0.3",
-        ], base_url=base_url)
+        raw = run(bin_path, submit("/loop on 2", "Set a goal first")
+                  + submit("/goal set continue tty work", "Goal set.")
+                  # 两轮续跑都打 mock;`limit reached` 是续跑停下的那行。续跑是模型 turn,
+                  # 其后发键先等空闲输入框(IDLE),不是 READY。
+                  + submit("/loop on 2", "limit reached", 30) + [IDLE]
+                  + submit("/loop off", "Loop continuation stopped.")
+                  + submit("/exit", "Goodbye"), base_url=base_url)
     finally:
         server.shutdown()
     a = TTYAssert(raw)
@@ -113,12 +93,7 @@ def test_tty_loop_requires_goal_then_enables_and_stops(bin_path):
 
 
 def test_tty_compact_command_recovers_input_box(bin_path):
-    raw = run(bin_path, [
-        "sleep:0.8",
-        "type:/compact",
-        "key:enter",
-        "sleep:0.3",
-    ])
+    raw = run(bin_path, submit("/compact", "Compacted"))
     a = TTYAssert(raw)
     a.assert_prose_contains("Compacted")
     a.assert_box_present()
@@ -128,15 +103,8 @@ def test_tty_compact_command_recovers_input_box(bin_path):
 def test_tty_auto_compact_event_is_visible(bin_path):
     server, base_url = _start_mock()
     try:
-        raw = run(bin_path, [
-            "sleep:0.8",
-            "type:/compact-stress-test",
-            "key:enter",
-            "sleep:0.2",
-            "type:trigger auto compact",
-            "key:enter",
-            "sleep:2.0",
-        ], base_url=base_url, env={
+        raw = run(bin_path, submit("/compact-stress-test", "[compact-stress-test] injected")
+                  + submit("trigger auto compact", "[auto-compacted"), base_url=base_url, env={
             "METACODES_TEST_HOOKS": "1",
             # 钉死 auto-compact 阈值(该旋钮即为测试而设):真实阈值随模型上下文表浮动
             # (隔离 HOME 初始化的 bundled 表首项是 200k 窗口,12×12KB 注入 ≈36K tokens

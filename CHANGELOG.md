@@ -73,6 +73,26 @@ status, compatibility boundaries, and entry points are defined by
     `INVALID_ARGUMENT`.
   - **Source-level Hosts** build the same block with `core.time_context`.
   - SDK 0.9.0-dev.
+- Learning turn, kernel side ([doc/LEARNING_TURN_DESIGN.md](doc/LEARNING_TURN_DESIGN.md)):
+  `agent_loop.Options.learning_turn` (enforce or observe). When the host
+  check gate's verdict ends a root run, the same conversation gets one
+  distill message carrying the verdict and the stored lessons for the task,
+  and writes up to four conditioned lessons with `KgRemember` kind `lesson`
+  (`holds_when:`, `uncertain:`, `lesson:`, optional `supersedes:`); a
+  reconcile message follows only when a lesson was accepted and stored
+  lessons exist. The lesson header (`lesson-v1 verdict= task= run=`) is
+  host-bound: `KgRemember` refuses kind `lesson` outside a learning turn
+  and any header that differs from the verdict the host saw. During a pass
+  only Read, Grep, Glob, KgRecall, KgContext and KgRemember run, process
+  gates neither sense nor end it, and the attempt's answer stays the final
+  result. Each pass is capped at six model turns. Tainted, unavailable and
+  unchecked verdicts teach nothing, and neither does a run with no ready
+  TinyKG store (`none_unstorable`). The next attempt at a hinted task sees
+  the newest unsuperseded lessons in the scoped-recall injection (no
+  lessons, byte-identical injection). One terminal `learning_turn`
+  observation record per armed run (`metacodes-learning-turn-v1`, validated
+  by `scripts/eval/workbuddy/trace.py`). Not yet reachable from the CLI:
+  flags and the headless end-of-run form are the design's steps 5–6.
 - Sealed Skills: the §8.5 disclosure screen keeps two corpora under their
   own policies — the Skill's instructions and its `sealed/` references —
   so `egress.disclosure` is one word for both or
@@ -469,6 +489,13 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- `SessionHost`: an interrupt or close of a Run waiting on a UI prompt could
+  fail to stop it. The prompt was released before the kernel abort was
+  requested, so the Run took the cancelled prompt as a denied tool, sent its
+  next request, and - against a fast provider - ended normally first; the
+  interrupt then reported `too_late` (seen once on Windows CI). The abort is
+  now in force before the prompt is released; an answer racing the
+  interrupt is still discarded.
 - MiniMax-M3 takes image input: the model table now says so (MiniMax's
   OpenAI-compatible Chat Completions documentation lists image understanding
   for M3), so AgentCore and the CLI no longer refuse its images (issue #273).

@@ -4,13 +4,18 @@
 (loop.zig),无需打模型即可让清单渲染。验证 ◼ <label> 行出现在输入框上方,
 框仍钉底、布局不乱。
 """
-from tty_driver import run
+from tty_driver import run, submit
 from asserts import TTYAssert
+
+# 提交命令后等它的产物上屏(submit,见 tty_driver 模块文档),不睡固定秒数:T29 曾在 hosted
+# Windows runner 上截到还没提交的输入框(TTY (Windows) job 117303780270)。任务行只等图标:
+# 输入行 `❯ /task-test:building widget` 里就有标签;断言本来也分别查图标和标签、不要求两者
+# 相邻,ConPTY 重合成后它们是否相邻没验证过。
 
 
 def test_T25_tasktab_appears_above_box(bin_path):
     # 造任务 → 输入框上方应出现 `◼ building widget` 行(in_progress 图标,对齐 cc TaskListV2)。
-    raw = run(bin_path, ["sleep:0.8", "type:/task-test:building widget", "key:enter", "sleep:0.4"])
+    raw = run(bin_path, submit("/task-test:building widget", "◼"))
     a = TTYAssert(raw)
     a.assert_box_present()
     top = a.box_top_row()
@@ -24,7 +29,7 @@ def test_T25_tasktab_appears_above_box(bin_path):
 
 def test_T26_tasktab_keeps_box_at_bottom(bin_path):
     # 有清单时框仍钉底(下边框紧邻 footer,新增的上方行不破坏底部锚定)。
-    raw = run(bin_path, ["sleep:0.8", "type:/task-test:x", "key:enter", "sleep:0.4"])
+    raw = run(bin_path, submit("/task-test:x", "◼"))
     a = TTYAssert(raw)
     a.assert_box_present()
     a.assert_box_at_bottom()
@@ -44,7 +49,7 @@ def test_T27_no_tasktab_when_no_task(bin_path):
 def test_T28_completed_task_shows_checkmark(bin_path):
     # 回归(用户实测 bug):completed 任务图标应是**勾 ✓**,不是实心圆 ●。
     # /task-test-done 离线造一个 completed 任务,断言清单行含 ✓ 且**不含** ●。
-    raw = run(bin_path, ["sleep:0.8", "type:/task-test-done:answered q1", "key:enter", "sleep:0.4"])
+    raw = run(bin_path, submit("/task-test-done:answered q1", "✓"))
     a = TTYAssert(raw)
     a.assert_box_present()
     full = "\n".join(a.final.line_text(r) for r in range(a.final.rows))
@@ -60,7 +65,7 @@ def test_T28_agent_tree_appears_above_box(bin_path):
     # /agent-test 注册假 running subagent → 输入框上方出现 agent 进度树
     # (⏺ Running 1 Explore agent… + 行 N tool use · tokens + 动作行冒号式),框仍钉底。
     # 对齐 cc v2.1.168 实拍金标准(napicc 录制)。
-    raw = run(bin_path, ["sleep:0.8", "type:/agent-test:inspect repo", "key:enter", "sleep:0.4"])
+    raw = run(bin_path, submit("/agent-test:inspect repo", "Running 1 Explore agent"))
     a = TTYAssert(raw)
     a.assert_box_present()
     a.assert_box_at_bottom()
@@ -81,7 +86,7 @@ def test_T28_agent_tree_appears_above_box(bin_path):
 def test_T29_agent_tree_multi_grouped_title(bin_path):
     # /agent-test-multi 造 3 个 Explore agent(2 running + 1 done)→ 标题 "Running 2 Explore agents…"
     # + 三态动作行(Read: / Initializing… / Done)。
-    raw = run(bin_path, ["sleep:0.8", "type:/agent-test-multi", "key:enter", "sleep:0.4"])
+    raw = run(bin_path, submit("/agent-test-multi", "Running 2 Explore agents"))
     a = TTYAssert(raw)
     a.assert_box_present()
     full = "\n".join(a.final.line_text(r) for r in range(a.final.rows))

@@ -165,6 +165,15 @@ const ERROR_MAP = [_]ErrorSpec{
     .{ .name = "OldLinesNotFound", .code = .string_not_found, .category = .user_error, .recoverable = true },
     .{ .name = "NoOpEdit", .code = .no_op_edit, .category = .user_error, .recoverable = true },
     .{ .name = "RequiredFirstPending", .code = .required_first_pending, .category = .user_error, .recoverable = true },
+    // Learning turn (core/learning_turn.zig): a pass runs read tools and KgRemember
+    // only, a rule rather than an environment fault; a malformed or mis-headed
+    // lesson is the model's to fix, while a lesson outside a learning turn or
+    // past the turn's budget cannot succeed on retry.
+    .{ .name = "LearningTurnToolUnavailable", .code = .permission_denied, .category = .safety, .recoverable = false },
+    .{ .name = "LessonOutsideLearningTurn", .code = .permission_denied, .category = .safety, .recoverable = false },
+    .{ .name = "LessonBudgetSpent", .code = .permission_denied, .category = .safety, .recoverable = false },
+    .{ .name = "LessonHeaderMismatch", .code = .invalid_args, .category = .user_error, .recoverable = true },
+    .{ .name = "LessonSupersedesUnknown", .code = .invalid_args, .category = .user_error, .recoverable = true },
     // 图片读取:非 vision 模型的门控(换模型即可成功 → recoverable);超限是输入问题。
     .{ .name = "ImageInputUnsupported", .code = .capability_unsupported, .category = .system_error, .recoverable = true },
     .{ .name = "ImageTooLarge", .code = .invalid_args, .category = .user_error, .recoverable = true },

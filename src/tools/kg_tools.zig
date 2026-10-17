@@ -17,6 +17,35 @@ const retrieval_protocol = @import("../kg/retrieval_protocol.zig");
 const lexical_query_plan = @import("../kg/lexical_query_plan.zig");
 const scoped_recall_mod = @import("../kg/scoped_recall.zig");
 const jev_advisor = @import("../jev/advisor.zig");
+const lesson_mod = @import("../kg/lesson.zig");
+
+/// Gate for `KgRemember` kind `lesson`. Returns the binding with one of its
+/// slots reserved; every refusal is a tool error naming what to fix.
+fn admitLesson(ctx: *const ToolContext, kg: *kg_mod.KgClient, text: []const u8) anyerror!*lesson_mod.Binding {
+    const binding = ctx.lesson_binding orelse {
+        common.setErrorDetail(ctx.error_detail, ctx.allocator, "kind \"lesson\" is written only in a learning turn, after a host verdict; use another kind here", .{});
+        return error.LessonOutsideLearningTurn;
+    };
+    var header_buf: [lesson_mod.MAX_TASK_BYTES + 96]u8 = undefined;
+    const header = binding.header(&header_buf);
+    const envelope = lesson_mod.parse(text) catch |err| {
+        common.setErrorDetail(ctx.error_detail, ctx.allocator, "lesson envelope invalid ({s}): the first line must be `{s}`, then `holds_when: …`, `uncertain: …`, `lesson: …`, and optionally a final `supersedes: <node id>`; at most {d} bytes", .{ @errorName(err), header, lesson_mod.MAX_BYTES });
+        return error.InvalidLesson;
+    };
+    lesson_mod.checkBinding(envelope, binding) catch |err| {
+        common.setErrorDetail(ctx.error_detail, ctx.allocator, "lesson header must be exactly `{s}` ({s})", .{ header, @errorName(err) });
+        return error.LessonHeaderMismatch;
+    };
+    if (envelope.supersedes) |target| if (!lesson_mod.isStoredLesson(kg, binding.task, target)) {
+        common.setErrorDetail(ctx.error_detail, ctx.allocator, "supersedes: node {d} is not a stored lesson for task {s}; name one listed in the distill message", .{ target, binding.task });
+        return error.LessonSupersedesUnknown;
+    };
+    if (!binding.reserve()) {
+        common.setErrorDetail(ctx.error_detail, ctx.allocator, "this learning turn has written its {d} lessons", .{lesson_mod.MAX_PER_TURN});
+        return error.LessonBudgetSpent;
+    }
+    return binding;
+}
 
 fn requireKg(ctx: *const ToolContext) ?*kg_mod.KgClient {
     return ctx.kg;
@@ -70,6 +99,16 @@ pub fn executeRemember(ctx: *const ToolContext, args: []const u8) anyerror![]u8 
         const raw = util_json.extractStringField(args, "scope") orelse break :blk false;
         break :blk std.ascii.eqlIgnoreCase(raw, "global");
     };
+    // Lessons (doc/LEARNING_TURN_DESIGN.md §2.3): written only inside a learning
+    // turn, with the host-bound header, within the turn's budget. The slot is
+    // reserved before the write and given back if the write fails.
+    const lesson_reserved: ?*lesson_mod.Binding = if (std.ascii.eqlIgnoreCase(resolved.schema_type, lesson_mod.SCHEMA_TYPE))
+        try admitLesson(ctx, kg, text_owned)
+    else
+        null;
+    const store_type: []const u8 = if (lesson_reserved != null) lesson_mod.SCHEMA_TYPE else resolved.schema_type;
+    var lesson_written = false;
+    defer if (lesson_reserved) |binding| if (!lesson_written) binding.release();
 
     // 近重复搭车门(设计 §5):写前 recall,top1 **文本**与新文本高度重合时附提示——不硬拦。
     // 用文本比对而非 BM25 分数:实测 BM25 分数随语料规模变化(1 节点 9.8、2 节点 21),
@@ -100,10 +139,11 @@ pub fn executeRemember(ctx: *const ToolContext, args: []const u8) anyerror![]u8 
     } else |_| {} // 近重复检查失败不阻塞写入
 
     // 写侧类型分布埋点(PM:kill-criterion 的 load-bearing 仪器,measure observation 是否仍霸榜)。
-    log.info("kg", "kg_remember type={s}", .{resolved.schema_type});
-    const node_id = kg.remember(resolved.node_kind, text_owned, resolved.schema_type, scope_global) catch |e| {
+    log.info("kg", "kg_remember type={s}", .{store_type});
+    const node_id = kg.remember(resolved.node_kind, text_owned, store_type, scope_global) catch |e| {
         return kgErrorResult(ctx, kg, e, "KgRemember");
     };
+    lesson_written = true;
     // provenance(best-effort)。
     const sid = ctx.session.asSlice();
     if (sid.len > 0) kg.tagProvenance(node_id, sid);
@@ -116,7 +156,7 @@ pub fn executeRemember(ctx: *const ToolContext, args: []const u8) anyerror![]u8 
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(ctx.allocator);
     try out.print(ctx.allocator, "{{\"remembered\":{{\"node_id\":{d},\"type\":", .{node_id});
-    try appendJsonString(&out, ctx.allocator, resolved.schema_type);
+    try appendJsonString(&out, ctx.allocator, store_type);
     try out.appendSlice(ctx.allocator, ",\"scope\":");
     try appendJsonString(&out, ctx.allocator, if (scope_global) "global" else "project");
     try out.appendSlice(ctx.allocator, "}");

@@ -91,6 +91,8 @@ pub const requirement_ledger = @import("core/requirement_ledger.zig"); // L2 led
 pub const delivery_cadence = @import("core/delivery_cadence.zig"); // L2 delivery-cadence tests
 pub const progress_updates = @import("core/progress_updates.zig"); // L2 progress-update tests (#114)
 pub const check_gate = @import("core/check_gate.zig"); // L2 host check gate / Stop hook block tests
+pub const learning_turn = @import("core/learning_turn.zig"); // L2 learning turn tests
+pub const kg_lesson = @import("kg/lesson.zig"); // lesson envelope (learning turn)
 pub const test_integrity = @import("core/test_integrity.zig"); // L2 test-integrity obligation tests
 pub const stall_gate = @import("core/stall_gate.zig"); // L2 stall-gate tests
 pub const types_mod = types;
@@ -3223,6 +3225,8 @@ test {
     _ = &@import("core/verdict.zig");
     _ = &@import("core/host_check.zig");
     _ = &@import("core/check_gate.zig");
+    _ = &@import("core/learning_turn.zig");
+    _ = &@import("kg/lesson.zig");
     _ = &@import("core/test_integrity.zig");
     _ = &@import("swarm/team.zig");
     _ = &@import("swarm/mailbox.zig");
