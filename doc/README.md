@@ -27,6 +27,10 @@ Run `zig build gate:pr` to execute the single AGENTS.md pre-submit checklist.
 - [Core reference](CORE_REFERENCE.md)
 - [Stall gate](STALL_GATE_DESIGN.md) — the in-run breaker for tool rounds that
   keep returning nothing new.
+- [Isolated verifier](ISOLATED_VERIFIER_DESIGN.md) — design only: an LLM
+  verifier in a fresh context on a git-isolated snapshot as a second verdict
+  source after a green pinned check; demote-only provenance and the
+  pre-registered check-gate v3 replay.
 - [Memory system](MEMORY_SYSTEM_DESIGN.md)
 - [Learning turn](LEARNING_TURN_DESIGN.md) — post-verdict
   distill-and-reconcile turn that turns a check verdict into conditioned
