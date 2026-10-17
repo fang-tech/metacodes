@@ -534,14 +534,6 @@ static int goal_contains(const metask_agentcore_api_v1 *api,
     return scan.found;
 }
 
-/* Revision 24: whether an owned-bytes buffer contains `needle`. */
-static int bytes_contains(const char *ptr, size_t len, const char *needle) {
-    struct needle_scan scan = {0};
-    scan.needle = needle;
-    scan.needle_len = strlen(needle);
-    scan_feed(&scan, ptr, len);
-    return scan.found;
-}
 
 static uint32_t host_stream(
     void *ctx, const metask_agentcore_run_context_v1 *run,
@@ -1067,25 +1059,30 @@ int main(int argc, char **argv) {
         }
         api->buffer_release(&diagnostic);
     }
-    /* Revision 24 (issue #277): a member Session joins (creating) the team
-     * file at creation, so describe and poll are exercised against the real
-     * bundle with no Run. The full lead/member round-trip is the L2 test. */
+    /* Revision 24 (issue #277): a source-free host reaches team->describe and
+     * team->poll on a lead Session with teams enabled. A lead that has not run
+     * TeamCreate has no team, so both report empty. The populated round-trip is
+     * the AgentCore L2 team test. */
     {
         metask_agentcore_team_config_v1 team_cfg = {0};
         team_cfg.struct_size = (uint32_t)sizeof(team_cfg);
-        team_cfg.role_code = METASK_AGENTCORE_TEAM_ROLE_MEMBER;
-        team_cfg.team_name = view("c-consumer-team");
-        team_cfg.member_name = view("c-probe");
-        team_cfg.lead_session_id = view("000000000000000000000001");
-        team_cfg.member_lease = view("000000000000000000000002");
+        team_cfg.role_code = METASK_AGENTCORE_TEAM_ROLE_LEAD;
+        team_cfg.team_name = view("");
 
-        metask_agentcore_session_host_config_v1 team_host = session_host;
-        team_host.team = &team_cfg;
-        team_host.skill_catalog = NULL;
-        team_host.skill_policy = NULL;
+        metask_agentcore_session_host_config_v1 team_host = {0};
+        team_host.struct_size = (uint32_t)sizeof(team_host);
+        team_host.provider_kind_code = METASK_AGENTCORE_PROVIDER_ANTHROPIC;
+        team_host.protocol_kind_code = METASK_AGENTCORE_PROTOCOL_DEFAULT;
+        team_host.permission_mode_code = METASK_AGENTCORE_PERMISSION_FULL_ACCESS;
+        team_host.shell_policy_code = METASK_AGENTCORE_SHELL_DISABLED;
+        team_host.api_key = view("c-consumer-key");
+        team_host.base_url = view(base_url);
+        team_host.workspace_root = view(cwd);
+        team_host.workspace_home = view(cwd);
         metask_agentcore_bytes_view_v1 team_allowed[] = {view("HostStreamC")};
         team_host.allowed_tools = team_allowed;
         team_host.allowed_tool_count = 1;
+        team_host.team = &team_cfg;
 
         metask_agentcore_session_create_config_v1 team_config = {0};
         team_config.struct_size = (uint32_t)sizeof(team_config);
@@ -1101,14 +1098,8 @@ int main(int argc, char **argv) {
             team_session != NULL &&
             api->team->describe(team_session, &team_json, &diagnostic) ==
                 METASK_AGENTCORE_STATUS_OK &&
-            bytes_contains((const char *)team_json.ptr, (size_t)team_json.len,
-                           "\"role\":\"member\"") &&
-            bytes_contains((const char *)team_json.ptr, (size_t)team_json.len,
-                           "\"name\":\"c-consumer-team\"") &&
-            bytes_contains((const char *)team_json.ptr, (size_t)team_json.len,
-                           "\"c-probe\"") &&
-            bytes_contains((const char *)team_json.ptr, (size_t)team_json.len,
-                           "\"pending_spawns\":[]") &&
+            team_json.len == 13 &&
+            memcmp(team_json.ptr, "{\"team\":null}", 13) == 0 &&
             api->team->poll(team_session, &poll_json, &diagnostic) ==
                 METASK_AGENTCORE_STATUS_OK &&
             poll_json.len == 14 &&

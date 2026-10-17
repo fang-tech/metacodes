@@ -1098,33 +1098,31 @@ pub fn main(init: std.process.Init) !void {
         if (charged_goal.tokens_used <= restored_goal.tokens_used) return error.UnexpectedGoal;
     }
 
-    try probe.unregisterSession(session.?);
-    try expectStatus(.ok, api.session().destroy()(session, &diagnostic), diagnostic);
-    session = null;
-    try expectStatus(.ok, api.runtime().destroy()(runtime, &diagnostic), diagnostic);
-    runtime = null;
-
-    // ── Revision 24 (issue #277): host-scheduled team describe and poll ──────
-    // A member Session joins (creating) the team file at creation, so its team
-    // is observable through the public ABI with no Run. The full
-    // lead-delegates / member-replies / lead-polls round-trip is the AgentCore
-    // L2 team test; here the two new table entries are proven wired end to end.
+    // ── Revision 24 (issue #277): the host-scheduled team table ───────────
+    // A source-free host reaches `team->describe` and `team->poll` on a lead
+    // Session with teams enabled. A lead that has not yet run `TeamCreate`
+    // has no team, so both report empty. The populated lead-delegates /
+    // member-replies / poll round-trip is the AgentCore L2 team test.
     {
         var team_cfg = std.mem.zeroes(wire.TeamConfigV1);
         team_cfg.struct_size = @sizeOf(wire.TeamConfigV1);
-        team_cfg.role_code = wire.TEAM_ROLE_MEMBER;
-        team_cfg.team_name = sdk.bytesView("consumer-team");
-        team_cfg.member_name = sdk.bytesView("probe");
-        team_cfg.lead_session_id = sdk.bytesView("000000000000000000000001");
-        team_cfg.member_lease = sdk.bytesView("000000000000000000000002");
+        team_cfg.role_code = wire.TEAM_ROLE_LEAD;
+        team_cfg.team_name = sdk.bytesView("");
 
-        var team_host = session_host;
-        team_host.team = &team_cfg;
-        team_host.skill_catalog = null;
-        team_host.skill_policy = null;
         const team_allowed = [_]wire.BytesViewV1{sdk.bytesView("Read")};
+        var team_host = std.mem.zeroes(wire.SessionHostConfigV1);
+        team_host.struct_size = @sizeOf(wire.SessionHostConfigV1);
+        team_host.provider_kind_code = wire.PROVIDER_ANTHROPIC;
+        team_host.permission_mode_code = wire.PERMISSION_FULL_ACCESS;
+        team_host.shell_policy_code = wire.SHELL_DISABLED;
+        team_host.api_key = sdk.bytesView("artifact-key");
+        team_host.base_url = sdk.bytesView(url);
+        team_host.workspace_root = sdk.bytesView(workspace);
+        team_host.workspace_home = sdk.bytesView(workspace);
         team_host.allowed_tools = &team_allowed;
         team_host.allowed_tool_count = team_allowed.len;
+        team_host.run_journal_mode_code = wire.RUN_JOURNAL_EPHEMERAL;
+        team_host.team = &team_cfg;
 
         var team_create = std.mem.zeroes(wire.SessionCreateConfigV1);
         team_create.struct_size = @sizeOf(wire.SessionCreateConfigV1);
@@ -1141,19 +1139,20 @@ pub fn main(init: std.process.Init) !void {
         defer api.bufferRelease()(&team_json);
         try expectStatus(.ok, api.team().describe()(team_session, &team_json, &diagnostic), diagnostic);
         const team_text = try sdk.borrowedBytes(.{ .ptr = team_json.ptr, .len = team_json.len });
-        if (std.mem.indexOf(u8, team_text, "\"role\":\"member\"") == null or
-            std.mem.indexOf(u8, team_text, "\"name\":\"consumer-team\"") == null or
-            std.mem.indexOf(u8, team_text, "\"probe\"") == null or
-            std.mem.indexOf(u8, team_text, "\"pending_spawns\":[]") == null)
-            return error.UnexpectedTeamDescription;
+        if (!std.mem.eql(u8, team_text, "{\"team\":null}")) return error.UnexpectedTeamDescription;
 
         var poll_json = wire.OwnedBytesV1{ .ptr = null, .len = 0 };
         defer api.bufferRelease()(&poll_json);
         try expectStatus(.ok, api.team().poll()(team_session, &poll_json, &diagnostic), diagnostic);
         const poll_text = try sdk.borrowedBytes(.{ .ptr = poll_json.ptr, .len = poll_json.len });
-        if (!std.mem.eql(u8, poll_text, "{\"input\":null}"))
-            return error.UnexpectedTeamPoll;
+        if (!std.mem.eql(u8, poll_text, "{\"input\":null}")) return error.UnexpectedTeamPoll;
     }
+
+    try probe.unregisterSession(session.?);
+    try expectStatus(.ok, api.session().destroy()(session, &diagnostic), diagnostic);
+    session = null;
+    try expectStatus(.ok, api.runtime().destroy()(runtime, &diagnostic), diagnostic);
+    runtime = null;
 
     std.debug.print("AgentCore source-free consumer: Revision 24 Agent Runtime, goals, host-scheduled team, time context, Host model capabilities, active-Run input, prompt profile, permission mode update, OpenAI Responses, multimodal input, active-Run journal, Host/MCP streaming, process-plugin configuration, Workspace Skill Catalog, tools, checkpoint, Runtime rebuild, restore and continued Run OK\n", .{});
 }
