@@ -23,6 +23,35 @@ const session_intent = @import("session_intent.zig");
 const agent_loop = @import("core/agent_loop.zig");
 const permission_mode = @import("permission/mode.zig");
 const util_json = @import("util/json.zig");
+const util_time = @import("util/time.zig");
+const log = @import("util/log.zig");
+const swarm_tools = @import("swarm/tools.zig");
+
+/// Teammates' replies and notices waiting in the swarm lead's inbox, for a
+/// driver that idles between messages (issue #277). The REPL reads the inbox
+/// at its own turn boundary; web and daemon read it through this while idle,
+/// so a teammate's answer starts the lead's next turn instead of waiting
+/// unread until the user writes again.
+pub const LeadMail = struct {
+    /// The inbox is a locked file: read it at most this often.
+    pub const POLL_MS: util_time.Millis = 500;
+
+    last_poll_ms: util_time.Millis = 0,
+
+    /// The lead's next input (owned by `allocator`), or null: no team,
+    /// nothing new, or too soon since the last look. Mail it returns is
+    /// marked read.
+    pub fn take(self: *LeadMail, app: *app_mod.App, allocator: std.mem.Allocator) ?[]u8 {
+        if (!app.swarm.hasTeam()) return null;
+        const now = util_time.nowMs();
+        if (now - self.last_poll_ms < POLL_MS) return null;
+        self.last_poll_ms = now;
+        return swarm_tools.pollLeadInbox(allocator, &app.swarm) catch |err| {
+            log.warn("swarm", "lead inbox unreadable: {s}", .{@errorName(err)});
+            return null;
+        };
+    }
+};
 
 pub const CommandOutcome = struct {
     kind: Kind,
