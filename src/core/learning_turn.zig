@@ -40,6 +40,36 @@ const MAX_EXISTING_BYTES: usize = 600;
 
 pub const Mode = enum { enforce, observe };
 
+/// Print-mode switch for the evaluation adapter: `enforce` or `observe`
+/// (`main.resolveLearningTurn`; a CLI flag wins).
+pub const MODE_ENV = "METACODES_LEARNING_TURN";
+/// The host's task name, shared with the host check and self-evolution.
+pub const TASK_HINT_ENV = "METACODES_TASK_HINT";
+
+/// The mode the CLI flags ask for; null when both are off. Enforce wins when
+/// both are given (the sibling gates' precedence).
+pub fn modeFromFlags(enforce: bool, observe: bool) ?Mode {
+    if (enforce) return .enforce;
+    if (observe) return .observe;
+    return null;
+}
+
+/// The in-run learning turn for a host's primary run. It is armed only where
+/// the check gate gives it a verdict at the terminal boundary: without one
+/// every run would record `none_unchecked` and teach nothing. `run_label` is
+/// filled by the host once its journal exists.
+pub fn inRunOptions(mode: ?Mode, check_gate_armed: bool, task_hint: []const u8) ?Options {
+    const armed = mode orelse return null;
+    if (!check_gate_armed) return null;
+    return .{ .mode = armed, .task_hint = task_hint };
+}
+
+/// METACODES_TASK_HINT, or empty (project-wide lessons). Process lifetime.
+pub fn taskHintFromEnv() []const u8 {
+    const raw = std.c.getenv(TASK_HINT_ENV) orelse return "";
+    return std.mem.span(raw);
+}
+
 pub const Options = struct {
     mode: Mode,
     /// Host-declared task name (`METACODES_TASK_HINT` in headless runs).
@@ -224,10 +254,32 @@ pub fn renderVerdict(allocator: std.mem.Allocator, command: []const u8, outcome:
     return out.toOwnedSlice();
 }
 
-const EVIDENCE_BOUNDARY =
+pub const EVIDENCE_BOUNDARY =
     "What this verdict establishes: which checks passed or failed in the workspace you left. " ++
     "It does not establish why your approach succeeded or failed, and a pass does not establish " ++
     "that every requirement of the task was met.\n";
+
+/// The stored lessons a learning message lists, newest first, with their node
+/// ids so a `supersedes:` line can name one. Shared by both forms.
+pub fn writeExisting(w: *std.Io.Writer, existing: []const lesson.Stored) !void {
+    try w.writeAll("\nLessons already stored for this task (written after earlier verdicts; they may be wrong or stale):\n");
+    if (existing.len == 0) try w.writeAll("(none)\n");
+    for (existing) |stored| {
+        try w.print("- node {d} [{s}] holds when: ", .{ stored.node_id, @tagName(stored.envelope.verdict) });
+        try lesson.writeOneLine(w, lesson.boundedUtf8(stored.envelope.holds_when, 160));
+        try w.writeAll(" — ");
+        try lesson.writeOneLine(w, lesson.boundedUtf8(stored.envelope.lesson, MAX_EXISTING_BYTES));
+        try w.writeByte('\n');
+    }
+}
+
+/// What a lesson under `verdict` may claim. Shared by both forms.
+pub fn verdictRule(verdict: lesson.Verdict) []const u8 {
+    return switch (verdict) {
+        .failed => "The verdict is FAILED: record what failed and what you would test next, never a claim that it works. ",
+        .passed => "The verdict is PASSED for the checks that ran: record what made it work and, under uncertain, what the check did not cover. ",
+    };
+}
 
 /// The distill message. `existing` are the stored lessons for this task,
 /// newest first.
@@ -243,15 +295,7 @@ pub fn renderDistill(allocator: std.mem.Allocator, state: *const State, existing
     try w.writeAll(state.verdict_text orelse "The host ran the pinned check when you stopped.\n");
     try w.writeByte('\n');
     try w.writeAll(EVIDENCE_BOUNDARY);
-    try w.writeAll("\nLessons already stored for this task (written after earlier verdicts; they may be wrong or stale):\n");
-    if (existing.len == 0) try w.writeAll("(none)\n");
-    for (existing) |stored| {
-        try w.print("- node {d} [{s}] holds when: ", .{ stored.node_id, @tagName(stored.envelope.verdict) });
-        try lesson.writeOneLine(w, lesson.boundedUtf8(stored.envelope.holds_when, 160));
-        try w.writeAll(" — ");
-        try lesson.writeOneLine(w, lesson.boundedUtf8(stored.envelope.lesson, MAX_EXISTING_BYTES));
-        try w.writeByte('\n');
-    }
+    try writeExisting(w, existing);
     try w.print(
         "\nWrite 0 to {d} lessons, each with one KgRemember call, kind \"lesson\", whose text is exactly:\n" ++
             "{s}\n" ++
@@ -262,10 +306,7 @@ pub fn renderDistill(allocator: std.mem.Allocator, state: *const State, existing
         .{ lesson.MAX_PER_TURN, header },
     );
     try w.writeAll("Rules: copy the first line exactly; the host rejects any other header. ");
-    if (state.binding.verdict == .failed)
-        try w.writeAll("The verdict is FAILED: record what failed and what you would test next, never a claim that it works. ")
-    else
-        try w.writeAll("The verdict is PASSED for the checks that ran: record what made it work and, under uncertain, what the check did not cover. ");
+    try w.writeAll(verdictRule(state.binding.verdict));
     try w.writeAll("Make a causal claim only where your own trajectory supports it; put the rest under uncertain. " ++
         "Write nothing if this attempt taught nothing reusable. Only Read, Grep, Glob, KgRecall, KgContext and KgRemember run in this turn; " ++
         "do not change any file. End with one line saying what you recorded.");
@@ -304,6 +345,25 @@ test "unavailable_never_learns / unchecked / tainted_never_learns" {
 test "unstorable_never_learns: a grounded verdict with no store runs no pass" {
     try testing.expectEqual(Decision.none_unstorable, decide(.failed, false));
     try testing.expectEqual(Decision.none_unstorable, decide(.passed, false));
+}
+
+test "distill_iff: only a passed or failed verdict with a ready store distills" {
+    for (std.enums.values(Grounding)) |grounding| for ([_]bool{ true, false }) |ready| {
+        const grounded = grounding == .passed or grounding == .failed;
+        try testing.expectEqual(grounded and ready, decide(grounding, ready) == .distill);
+    };
+}
+
+test "modeFromFlags / inRunOptions: enforce wins; no check gate, no in-run turn" {
+    try testing.expectEqual(@as(?Mode, null), modeFromFlags(false, false));
+    try testing.expectEqual(@as(?Mode, .enforce), modeFromFlags(true, true));
+    try testing.expectEqual(@as(?Mode, .observe), modeFromFlags(false, true));
+    try testing.expect(inRunOptions(.enforce, false, "etag") == null);
+    try testing.expect(inRunOptions(null, true, "etag") == null);
+    const armed = inRunOptions(.observe, true, "etag").?;
+    try testing.expectEqual(Mode.observe, armed.mode);
+    try testing.expectEqualStrings("etag", armed.task_hint);
+    try testing.expectEqualStrings("", armed.run_label);
 }
 
 test "reconciled counts only a reconcile pass" {

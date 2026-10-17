@@ -14,6 +14,8 @@ const std = @import("std");
 const verdict = @import("verdict.zig");
 const kg_client_mod = @import("../kg/client.zig");
 const self_evolution = @import("self_evolution.zig");
+const check_gate = @import("check_gate.zig");
+const learning_turn = @import("learning_turn.zig");
 const log = @import("../util/log.zig");
 
 pub const CHECK_ENV = "METACODES_HOST_CHECK";
@@ -48,6 +50,33 @@ pub const Pin = struct {
         var digest: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(cmd, &digest, .{});
         return std.mem.eql(u8, &digest, &self.sha256);
+    }
+};
+
+/// The end-of-run verdict source of a print-mode learning turn is armed:
+/// self-evolution on, a pinnable check, and a task hint (`runAndIngest` runs
+/// nothing without one). `main.resolveLearningTurn` refuses the learning flags
+/// when neither this nor the check gate is armed.
+pub fn endOfRunArmedFromEnv() bool {
+    if (!self_evolution.enabledFromEnv()) return false;
+    if (Pin.fromEnv() == null) return false;
+    const hint = learning_turn.taskHintFromEnv();
+    return hint.len > 0 and hint.len <= 200;
+}
+
+/// What the end-of-run check established, for the end-of-run learning turn
+/// (`learning_end_of_run.zig`): the grounding and the verdict rendered the way
+/// the in-run learning turn quotes a check-gate verdict.
+pub const Evidence = struct {
+    /// `unchecked` until the check runs; `unavailable` when it was refused
+    /// (pin mismatch) or produced no verdict.
+    grounding: learning_turn.Grounding = .unchecked,
+    /// Owned; null unless the check produced a verdict.
+    verdict_text: ?[]u8 = null,
+
+    pub fn deinit(self: *Evidence, allocator: std.mem.Allocator) void {
+        if (self.verdict_text) |text| allocator.free(text);
+        self.verdict_text = null;
     }
 };
 
@@ -91,7 +120,24 @@ pub fn runAndIngest(
     final_note: []const u8,
     attempt_seed_ns: u64,
 ) ?Summary {
+    return runAndIngestWithEvidence(allocator, kg, pin, task_hint, final_note, attempt_seed_ns, null);
+}
+
+/// `runAndIngest` that also fills `evidence` for the end-of-run learning
+/// turn. The verdict classes are the check gate's: exit 126/127 (the shell
+/// could not run the command) and an unparseable run are `unavailable`; a pass
+/// is exit 0 with no failing result; the git-status taint rule wins over both.
+pub fn runAndIngestWithEvidence(
+    allocator: std.mem.Allocator,
+    kg: *kg_client_mod.KgClient,
+    pin: *const Pin,
+    task_hint: []const u8,
+    final_note: []const u8,
+    attempt_seed_ns: u64,
+    evidence: ?*Evidence,
+) ?Summary {
     if (task_hint.len == 0 or task_hint.len > 200) return null;
+    if (evidence) |e| e.grounding = .unavailable;
     if (!pin.stillIntact()) {
         log.warn("verdict", "host check pin mismatch — refusing to execute (fail-closed)", .{});
         return null;
@@ -107,6 +153,7 @@ pub fn runAndIngest(
         defer allocator.free(st.output);
         tainted = verdict.taintedByWorkspaceEdits(&parsed, st.output);
     }
+    if (evidence) |e| captureEvidence(allocator, e, pin.commandSlice(), run.output, run.exit_code, &parsed, tainted);
     var artifact: []u8 = &.{};
     defer if (artifact.len > 0) allocator.free(artifact);
     if (runShell(allocator, "git diff HEAD")) |df| {
@@ -130,6 +177,44 @@ pub fn runAndIngest(
         parsed.passed, parsed.total, @tagName(provenance), ingested,
     });
     return .{ .passed = parsed.passed, .total = parsed.total, .tainted = tainted, .ingested = ingested };
+}
+
+fn captureEvidence(
+    allocator: std.mem.Allocator,
+    evidence: *Evidence,
+    command: []const u8,
+    output: []u8,
+    exit_code: i64,
+    parsed: *const verdict.ParseOutcome,
+    tainted: bool,
+) void {
+    var any_failed = false;
+    for (parsed.results) |result| {
+        if (result.kind == .failed) any_failed = true;
+    }
+    const code: i32 = std.math.cast(i32, exit_code) orelse -1;
+    const grounded: check_gate.Verdict = if (code == 126 or code == 127)
+        .unavailable
+    else if (tainted)
+        .tainted
+    else if (code == 0 and !any_failed)
+        .passed
+    else
+        .failed;
+    // A borrowed view: the caller owns `output` and `parsed`, so this value
+    // is never deinit'ed.
+    const view = check_gate.Outcome{
+        .verdict = grounded,
+        .exit_code = code,
+        .passed = parsed.passed,
+        .total = parsed.total,
+        .output = output,
+        .parsed = parsed.*,
+    };
+    evidence.grounding = learning_turn.groundingOf(grounded);
+    if (grounded == .unavailable) return;
+    evidence.deinit(allocator);
+    evidence.verdict_text = learning_turn.renderVerdict(allocator, command, &view) catch null;
 }
 
 // ── 测试 ─────────────────────────────────────────────────────────────

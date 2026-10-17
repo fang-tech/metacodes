@@ -1,12 +1,17 @@
 # Learning turn: post-verdict distillation and reconciliation
 
-Status: steps 1–4 of §11 (the in-run path) implemented 2026-10-17 in
-`src/core/learning_turn.zig`, `src/kg/lesson.zig`, `src/core/agent_loop.zig`,
-`src/tools/kg_tools.zig` and `src/kg/scoped_recall.zig`, with component
-tests in `tests/component/learning_turn_test.zig` and record validation in
-`scripts/eval/workbuddy/trace.py`. Steps 5–8 (end-of-run form, CLI flags,
-Lean mirror, experiment file) are not implemented, so nothing outside an
-embedding host can arm the turn yet. §12 lists where the implementation
+Status: all eight steps of §11 implemented 2026-10-17. The in-run path
+(steps 1–4) lives in `src/core/learning_turn.zig`, `src/kg/lesson.zig`,
+`src/core/agent_loop.zig`, `src/tools/kg_tools.zig` and
+`src/kg/scoped_recall.zig`; the end-of-run form in
+`src/core/learning_end_of_run.zig` and `src/core/host_check.zig`; the flags
+in `src/main.zig` (`resolveLearningTurn`), `src/repl/loop.zig` and
+`src/repl/headless.zig`; the proofs in
+`control-plane/lean/MetaCodesControl/LearningTurn.lean`; the protocol in
+[learning-turn-v1.md](../evals/experiments/learning-turn-v1.md), not yet run.
+Tests: `tests/component/learning_turn_test.zig` and
+`tests/component/learning_end_of_run_test.zig`; record validation in
+`scripts/eval/workbuddy/trace.py`. §12 lists where the implementation
 departs from the design text below; where they disagree, §12 and the code
 are current. The design is the first of three borrowings from RSIAgent
 (AetherLabsAI/RSIAgent, arXiv 2609.15364).
@@ -433,10 +438,10 @@ negative result for the design, not a partial success.
 | 2. **Done.** In-run attach after the check-gate terminal decision; output-ledger closure; record emission | `src/core/agent_loop.zig`, `src/tools/observation.zig` | component test with a mock provider: failed verdict → distill message → a `KgRemember` of type `lesson` → reconcile message; passed verdict → distill only; tainted → no message, record says so; observe → no message, record carries `would_distill` |
 | 3. **Done** (without the memory-section change, §12). `lesson` envelope and acceptance on the `KgRemember` path | `src/tools/kg_tools.zig` | component test: an accepted envelope is stored with schema type `lesson` and recalled by its marker; a refused one is not stored |
 | 4. **Done.** Same-task lesson section in the outcome note | `src/kg/scoped_recall.zig` | injection test: newest 3 unsuperseded lessons, 320-byte bodies, byte-identical note when no lesson exists |
-| 5. End-of-run form | `src/core/host_check.zig`, `src/core/self_evolution.zig` | headless test: `METACODES_LEARNING_TURN=enforce` with a pinned failing check → one provider request → ≥ 1 `remember` call; caps honoured |
-| 6. Flags, parse errors, `doctor` line | `src/main.zig` | CLI tests like `--check-gate` without `--host-check` |
-| 7. `LearningTurn.lean`; trace validation; CHANGELOG | `control-plane/lean/...`, `scripts/eval/workbuddy/trace.py` | `zig build test` with the kernel; `trace.py` fixtures |
-| 8. Pre-registered experiment file | `evals/experiments/learning-turn-v1.md` | the protocol of §9 |
+| 5. **Done.** End-of-run form | `src/core/host_check.zig`, `src/core/self_evolution.zig` | headless test: `METACODES_LEARNING_TURN=enforce` with a pinned failing check → one provider request → ≥ 1 `remember` call; caps honoured |
+| 6. **Done** (no `doctor` line, §12). Flags, parse errors, `doctor` line | `src/main.zig` | CLI tests like `--check-gate` without `--host-check` |
+| 7. **Done.** `LearningTurn.lean`; trace validation; CHANGELOG | `control-plane/lean/...`, `scripts/eval/workbuddy/trace.py` | `zig build test` with the kernel; `trace.py` fixtures |
+| 8. **Done** (not run). Pre-registered experiment file | `evals/experiments/learning-turn-v1.md` | the protocol of §9 |
 
 Steps 1–4 are the in-run path and are independently useful; 5 exists for the
 harness; 7–8 are the proof and the measurement. Nothing here changes the
@@ -486,3 +491,57 @@ Where the implemented steps 1–4 depart from the text above, and why:
 - **`RunResult.learning` on every exit.** The report rides the run-wide
   counters, so a pass that is aborted or cut still reports its decision and
   lessons.
+
+### Steps 5–8 (2026-10-17)
+
+- **The verdict source is the check gate, not `--host-check` alone.** The
+  in-run turn grounds on the check gate's verdict at the terminal boundary,
+  so `--learning-turn` with `--host-check` but no `--check-gate[-observe]`
+  would record `none_unchecked` forever; it is refused. The in-run options
+  are armed only where the check gate is (`learning_turn.inRunOptions`).
+- **The end-of-run source needs its whole chain.** It counts only in print
+  mode and only with `METACODES_SELF_EVOLUTION` on, a pinnable
+  `METACODES_HOST_CHECK` and a task hint, because `host_check.runAndIngest`
+  runs nothing without the hint (`host_check.endOfRunArmedFromEnv`).
+  `METACODES_LEARNING_TURN` is likewise read in print mode only, so a REPL
+  started from an evaluation shell is not refused for it.
+- **End-of-run eligibility.** The form runs after an attempt that ended on its
+  own (`end_turn`) and only when the in-run turn did not decide on a verdict:
+  unarmed, or `none_unchecked` because the model changed nothing after the
+  last check. A tainted, unavailable or unstorable in-run decision stands; a
+  second check must not re-litigate it (`learning_end_of_run.modeFor`).
+- **One request, one pass.** The end-of-run packet lists the stored lessons
+  and asks for corrections as `supersedes:` lessons, so distill and reconcile
+  share the single request the bounds allow; the report counts one pass and
+  `reconciled = 0`.
+- **Every claimed envelope is judged.** The response is cut at every line that
+  starts with the lesson marker, whatever header it claims, so a lesson
+  claiming another verdict is counted in `lessons_refused` instead of being
+  ignored as prose.
+- **Caps on both sides of the request.** Before sending: the provider's
+  `max_tokens` must not exceed the author output cap, and the packet is
+  bounded in bytes below the input cap. After: the reported usage and its
+  cost at the author pricing must fit the caps, or nothing is stored. Like the
+  self-evolution author, the request goes straight to the provider, outside
+  the evaluation request gate.
+- **Evidence classes are the check gate's.** `host_check` grades its run for
+  the learning turn the way `check_gate.runCheck` does: exit 126/127 or an
+  unparseable run is `unavailable`, a pass is exit 0 with no failing result,
+  the git-status taint wins; a refused pin is `unavailable`. The verdict is
+  quoted with the same renderer as the in-run turn.
+- **The end-of-run report is a log line.** The journal is sealed before the
+  host check runs, so the end-of-run form cannot append a
+  `metacodes-learning-turn-v1` record; it logs the same fields at warn level
+  (with the request's token usage). Its durable effect is the lesson nodes. A
+  journal record for it would need the host check moved before the seal.
+- **No `doctor` line.** None of the sibling gates (check gate, test
+  integrity, stall gate) has one; the flags are per-run treatment switches,
+  not installation state.
+- **Lean.** `LearningTurn.lean` transcribes `decide` and `afterDistill` and
+  proves the pure properties, then models the loop as a trace of events
+  (terminal boundary, pass turn, accepted lesson, pass end) and proves over
+  any trace: at most two passes and two host messages (`turns_bounded`), the
+  per-pass turn cap, the lesson cap, reconcile only after an accepted lesson,
+  no message in observe mode, and the final segment closed before any
+  learning message. The bounded theorems depend on `propext` and
+  `Quot.sound` (from `omega`), as `ProgressUpdates.lean`'s do.

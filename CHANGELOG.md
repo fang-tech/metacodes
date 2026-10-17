@@ -91,8 +91,28 @@ status, compatibility boundaries, and entry points are defined by
   the newest unsuperseded lessons in the scoped-recall injection (no
   lessons, byte-identical injection). One terminal `learning_turn`
   observation record per armed run (`metacodes-learning-turn-v1`, validated
-  by `scripts/eval/workbuddy/trace.py`). Not yet reachable from the CLI:
-  flags and the headless end-of-run form are the design's steps 5–6.
+  by `scripts/eval/workbuddy/trace.py`).
+- Learning turn, host side (design steps 5–8): `--learning-turn` /
+  `--learning-turn-observe`, and `METACODES_LEARNING_TURN=enforce|observe` in
+  print mode (a flag wins). The flags need a verdict source and are refused
+  without one, like `--check-gate` without `--host-check`: the check gate
+  (REPL and print mode; it arms the in-run turn, with
+  `METACODES_TASK_HINT` as the task and the journal run id in lesson
+  headers), or in print mode the self-evolution host check
+  (`METACODES_HOST_CHECK` with `METACODES_SELF_EVOLUTION=1` and a task hint).
+  After that host check, when the attempt ended on its own and the in-run
+  turn had no verdict, the end-of-run form spends one no-tools provider
+  request under the self-evolution author caps (tokens and cost, checked on
+  the provider's reported usage) and writes the lessons its response carries
+  through the same header binding `KgRemember` enforces; every envelope that
+  claims another header counts as refused. `LearningTurn.lean` mirrors the
+  policy and proves, over any event trace, at most two passes and two host
+  messages, at most six turns per pass and four lessons, reconcile only after
+  an accepted lesson, no message in observe mode, and the answer closed
+  before any learning message. `evals/experiments/learning-turn-v1.md`
+  preregisters the paired evaluation (development configuration with the
+  validator pinned, held-out configuration with the visible suite pinned,
+  stopping rules); nothing has been run.
 - Sealed Skills: the §8.5 disclosure screen keeps two corpora under their
   own policies — the Skill's instructions and its `sealed/` references —
   so `egress.disclosure` is one word for both or

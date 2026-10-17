@@ -58,7 +58,9 @@ pub const AUTHOR_MAX_OUTPUT_TOKENS: u64 = 40_000;
 /// 6µ$/Ktok 计 40k→240k,worst=360k。上限是许可天花板不是预期花费;
 /// 实际 author 输出是一小段 JSON。有静态测试钉住这笔账。
 pub const AUTHOR_MAX_COST_MICROUSD: u64 = 400_000;
-fn authorPricing() rule_author.PricingAuthority {
+/// The author's conservative pricing; also the end-of-run learning turn's
+/// cost check (`learning_end_of_run.checkUsage`).
+pub fn authorPricing() rule_author.PricingAuthority {
     return .{
         .provenance_sha256 = observation.sha256Hex("metacodes-self-evolution-pricing-v1"),
         .input_microusd_per_mtok = 2_000_000,
