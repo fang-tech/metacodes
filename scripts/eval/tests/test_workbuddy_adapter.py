@@ -4427,6 +4427,114 @@ class WorkBuddyCheckGateRecordTest(unittest.TestCase):
             self._metrics(self._valid(), self._valid())
 
 
+class WorkBuddyLearningTurnRecordTest(unittest.TestCase):
+    """Field-level contract for the learning turn journal record
+    (doc/LEARNING_TURN_DESIGN.md §6)."""
+
+    def _metrics(self, *records):
+        rows = [
+            {"schema_version": "metacodes-tool-observation-journal-v1",
+             "sequence": 0, "monotonic_elapsed_ns": 1,
+             "session_id": "s" * 24, "run_id": "r" * 24,
+             "event": {"run_started": {}}},
+        ]
+        for index, record in enumerate(records, start=1):
+            rows.append(
+                {"schema_version": "metacodes-tool-observation-journal-v1",
+                 "sequence": index, "monotonic_elapsed_ns": index + 1,
+                 "session_id": "s" * 24, "run_id": "r" * 24,
+                 "event": {"tool_observation": {"learning_turn": record}}})
+        rows.append(
+            {"schema_version": "metacodes-tool-observation-journal-v1",
+             "sequence": len(records) + 1, "monotonic_elapsed_ns": len(records) + 2,
+             "session_id": "s" * 24, "run_id": "r" * 24,
+             "event": {"run_finished": {}}})
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            transcript = root / "t.jsonl"
+            observation = root / "o.jsonl"
+            transcript.write_text("", encoding="utf-8")
+            observation.write_text(
+                "".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8"
+            )
+            return load_control_metrics(transcript, observation)
+
+    def _valid(self):
+        # A failed verdict: distill accepted one lesson, reconcile superseded one.
+        return {
+            "schema_version": "metacodes-learning-turn-v1",
+            "enforced": True, "grounding": "failed", "decision": "distill",
+            "passes": 2, "distill_turns": 2, "reconcile_turns": 1,
+            "lessons_accepted": 2, "lessons_refused": 1, "reconciled": 1,
+            "truncated": False,
+        }
+
+    def _quiet(self, **patch):
+        record = self._valid()
+        record.update({"passes": 0, "distill_turns": 0, "reconcile_turns": 0,
+                       "lessons_accepted": 0, "lessons_refused": 0, "reconciled": 0})
+        record.update(patch)
+        return record
+
+    def test_valid_record_exports_counters(self):
+        lean = self._metrics(self._valid())["lean"]
+        self.assertEqual(lean["learning_turn_records"], 1)
+        self.assertEqual(lean["learning_turn_enforced"], 1)
+        self.assertEqual(lean["learning_turn_decision"], "distill")
+        self.assertEqual(lean["learning_turn_passes"], 2)
+        self.assertEqual(lean["learning_turn_lessons_accepted"], 2)
+        self.assertEqual(lean["learning_turn_reconciled"], 1)
+
+    def test_quiet_decisions_are_valid(self):
+        for record in (
+            self._quiet(enforced=False),  # observe: decided, nothing ran
+            self._quiet(grounding="unchecked", decision="none_unchecked"),
+            self._quiet(grounding="tainted", decision="none_tainted"),
+            self._quiet(grounding="unavailable", decision="none_unavailable"),
+            self._quiet(grounding="unchecked", decision="none_unfinished"),
+            self._quiet(grounding="failed", decision="none_unstorable"),
+        ):
+            with self.subTest(record=record):
+                self.assertEqual(self._metrics(record)["lean"]["learning_turn_records"], 1)
+
+    def test_malformed_fields_fail_loudly(self):
+        for key, value, message in (
+            ("schema_version", "metacodes-learning-turn-v0", "learning turn record is invalid"),
+            ("decision", "maybe", "learning turn record is invalid"),
+            ("decision", "none_spent", "learning turn record is invalid"),  # retired value
+            ("grounding", "green", "learning turn record is invalid"),
+            ("truncated", "no", "learning turn record is invalid"),
+            ("passes", "two", "learning turn passes is invalid"),
+        ):
+            bad = self._valid()
+            bad[key] = value
+            with self.subTest(key=key), self.assertRaisesRegex(TraceError, message):
+                self._metrics(bad)
+
+    def test_policy_relationships_are_enforced(self):
+        for bad in (
+            self._quiet(enforced=False, passes=1, distill_turns=1),  # observe ran a pass
+            self._quiet(),  # enforce distill that never ran
+            self._quiet(grounding="tainted"),  # distill on a tainted verdict
+            self._quiet(grounding="passed", decision="none_unchecked"),
+            self._quiet(grounding="failed", decision="none_tainted"),
+            self._quiet(grounding="unchecked", decision="none_unchecked", lessons_accepted=1),
+            self._quiet(grounding="tainted", decision="none_unstorable"),
+            dict(self._valid(), passes=3),
+            dict(self._valid(), distill_turns=7),
+            dict(self._valid(), lessons_accepted=5),
+            dict(self._valid(), reconciled=3),
+            dict(self._valid(), passes=1),  # reconcile turns without a reconcile pass
+            dict(self._valid(), lessons_accepted=1, reconciled=1),  # reconcile without a distill lesson
+        ):
+            with self.subTest(record=bad), self.assertRaisesRegex(TraceError, "violates the learning policy"):
+                self._metrics(bad)
+
+    def test_duplicate_record_fails_loudly(self):
+        with self.assertRaisesRegex(TraceError, "duplicate learning turn record"):
+            self._metrics(self._valid(), self._valid())
+
+
 class WorkBuddyStallGateRecordTest(unittest.TestCase):
     """Field-level contract for the stall gate journal record (the
     union-roster probe only proves the KIND is known)."""

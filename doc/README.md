@@ -28,6 +28,9 @@ Run `zig build gate:pr` to execute the single AGENTS.md pre-submit checklist.
 - [Stall gate](STALL_GATE_DESIGN.md) — the in-run breaker for tool rounds that
   keep returning nothing new.
 - [Memory system](MEMORY_SYSTEM_DESIGN.md)
+- [Learning turn](LEARNING_TURN_DESIGN.md) — post-verdict
+  distill-and-reconcile turn that turns a check verdict into conditioned
+  lessons; in-run path implemented, CLI flags pending.
 - [Jev System-One memory advisor](JEV_SYSTEM_ONE.md) — optional judge for
   recall injection, memory relations and enumeration intent.
 - [Jev × Harness 接入方案](JEV_HARNESS_INTEGRATION_DESIGN.md) — historical

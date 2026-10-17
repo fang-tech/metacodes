@@ -447,32 +447,8 @@ pub fn renderContinuation(
     const w = &out.writer;
     try w.print(MARKER ++ "\nYou ended your turn, so the host ran the pinned check command itself: `{s}`\n", .{options.command});
     try w.print("Result: FAILED (exit code {d}).\n", .{outcome.exit_code});
-    if (outcome.parsed) |parsed| {
-        var listed: usize = 0;
-        var failing: usize = 0;
-        for (parsed.results) |result| {
-            if (result.kind != .failed or std.mem.eql(u8, result.name, "pinned check")) continue;
-            failing += 1;
-            if (listed == MAX_LISTED_FAILURES) continue;
-            if (listed == 0) try w.writeAll("Failing:\n");
-            listed += 1;
-            try w.writeAll("- ");
-            try w.writeAll(result.name);
-            const reason = if (result.message.len > 0) result.message else result.callsite;
-            if (reason.len > 0) {
-                try w.writeAll(": ");
-                try writeOneLine(w, reason, MAX_REASON_BYTES);
-            }
-            try w.writeByte('\n');
-        }
-        if (failing > listed) try w.print("- … and {d} more\n", .{failing - listed});
-    }
-    const tail = utf8Tail(outcome.output, MAX_TAIL_BYTES);
-    if (tail.len > 0) {
-        try w.writeAll("Output tail:\n");
-        try w.writeAll(tail);
-        if (tail[tail.len - 1] != '\n') try w.writeByte('\n');
-    }
+    try writeFailures(w, outcome);
+    try writeOutputTail(w, outcome);
     const mode = cognitive_mode.schedule(state.streak);
     try w.print("This failure set has come back {d} time(s) in a row; reading for this attempt: {s}.\n", .{ state.streak, mode.directive() });
     try w.writeAll("Find the cause in your changes, fix it, and run the check yourself before you finish. " ++
@@ -480,6 +456,40 @@ pub fn renderContinuation(
     const left = options.max_continuations -| state.continuations;
     try w.print("Host-check continuations left after this one: {d}.", .{left});
     return out.toOwnedSlice();
+}
+
+/// The failing checks of `outcome` as a `Failing:` list (at most
+/// `MAX_LISTED_FAILURES`, one line each). Shared by the continuation message
+/// and the learning turn's verdict, so both quote a verdict the same way.
+pub fn writeFailures(w: *std.Io.Writer, outcome: *const Outcome) !void {
+    const parsed = outcome.parsed orelse return;
+    var listed: usize = 0;
+    var failing: usize = 0;
+    for (parsed.results) |result| {
+        if (result.kind != .failed or std.mem.eql(u8, result.name, "pinned check")) continue;
+        failing += 1;
+        if (listed == MAX_LISTED_FAILURES) continue;
+        if (listed == 0) try w.writeAll("Failing:\n");
+        listed += 1;
+        try w.writeAll("- ");
+        try w.writeAll(result.name);
+        const reason = if (result.message.len > 0) result.message else result.callsite;
+        if (reason.len > 0) {
+            try w.writeAll(": ");
+            try writeOneLine(w, reason, MAX_REASON_BYTES);
+        }
+        try w.writeByte('\n');
+    }
+    if (failing > listed) try w.print("- … and {d} more\n", .{failing - listed});
+}
+
+/// The last `MAX_TAIL_BYTES` of the check's output under `Output tail:`.
+pub fn writeOutputTail(w: *std.Io.Writer, outcome: *const Outcome) !void {
+    const tail = utf8Tail(outcome.output, MAX_TAIL_BYTES);
+    if (tail.len == 0) return;
+    try w.writeAll("Output tail:\n");
+    try w.writeAll(tail);
+    if (tail[tail.len - 1] != '\n') try w.writeByte('\n');
 }
 
 /// The continuation message for a blocking Stop hook (Claude Code wording).
