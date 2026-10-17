@@ -909,6 +909,55 @@ const PublicSessionFixture = struct {
         protocol_kind_code: u32,
         capabilities: []const wire.ModelCapabilityV1,
     ) !PublicSessionFixture {
+        return initObservedProviderConfigured(
+            root,
+            base_url,
+            model,
+            budget,
+            run_journal_mode_code,
+            provider_kind_code,
+            protocol_kind_code,
+            capabilities,
+            null,
+            acceptEvent,
+        );
+    }
+
+    /// A Session whose events go to `on_event` with `ctx`.
+    fn initObserved(
+        root: []const u8,
+        base_url: []const u8,
+        model: []const u8,
+        budget: ?*const wire.DurableBudgetProfileV1,
+        ctx: *anyopaque,
+        on_event: wire.OnEventFnV1,
+    ) !PublicSessionFixture {
+        return initObservedProviderConfigured(
+            root,
+            base_url,
+            model,
+            budget,
+            wire.RUN_JOURNAL_EPHEMERAL,
+            wire.PROVIDER_ANTHROPIC,
+            wire.PROTOCOL_DEFAULT,
+            &.{},
+            ctx,
+            on_event,
+        );
+    }
+
+    fn initObservedProviderConfigured(
+        root: []const u8,
+        base_url: []const u8,
+        model: []const u8,
+        budget: ?*const wire.DurableBudgetProfileV1,
+        run_journal_mode_code: u32,
+        provider_kind_code: u32,
+        protocol_kind_code: u32,
+        capabilities: []const wire.ModelCapabilityV1,
+        event_ctx: ?*anyopaque,
+        on_event: wire.OnEventFnV1,
+    ) !PublicSessionFixture {
         const raw_api = abi.metask_agentcore_get_api(wire.ABI_VERSION_V1) orelse
             return error.MissingApi;
         var self = PublicSessionFixture{
@@ -942,7 +991,8 @@ const PublicSessionFixture = struct {
         var session_config = sessionCreateConfig(&host_config, model);
         var callbacks = std.mem.zeroes(wire.SessionCallbacksV1);
         callbacks.struct_size = @sizeOf(wire.SessionCallbacksV1);
-        callbacks.on_event = acceptEvent;
+        callbacks.ctx = event_ctx;
+        callbacks.on_event = on_event;
         try std.testing.expectEqual(
             wire.STATUS_OK,
             self.api.session().create()(
@@ -4006,7 +4056,7 @@ test "L2 public MCP checkpoint restore facade preserves Conversation under narro
 
     var abi_revision_bytes: [4]u8 = undefined;
     @memcpy(&abi_revision_bytes, checkpoint.bytes.items[20..24]);
-    try std.testing.expectEqual(@as(u32, 22), wire.ABI_REVISION);
+    try std.testing.expectEqual(@as(u32, 23), wire.ABI_REVISION);
     // A Session without a prompt profile keeps the marker-8 envelope across
     // ABI revisions; the marker is independent of the table revision.
     try std.testing.expectEqual(
@@ -11397,4 +11447,469 @@ test "L2 Revision 20 input accepted before the first request rides that request 
     const prompt = std.mem.indexOf(u8, first, "ROOT_PROMPT") orelse return error.MissingRootPrompt;
     const input = std.mem.indexOf(u8, first, "BEFORE_FIRST_REQUEST") orelse return error.MissingAdoptedInput;
     try std.testing.expect(prompt < input);
+}
+
+// ── Revision 23: goals (#277) ───────────────────────────────────────────
+
+/// A turn that calls a tool the Session does not have (an error result, so
+/// the Run takes another turn) and bills 50 tokens.
+const GOAL_TOOL_TURN_SSE =
+    "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_goal\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":40,\"output_tokens\":1}}}\n\n" ++
+    "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"tu_goal\",\"name\":\"NoSuchTool\",\"input\":{}}}\n\n" ++
+    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{}\"}}\n\n" ++
+    "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n" ++
+    "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":9}}\n\n" ++
+    "data: {\"type\":\"message_stop\"}\n\n";
+
+/// Records `goal_updated` events and the usage the provider reported.
+const GoalEventProbe = struct {
+    updates: u32 = 0,
+    last_status: ?sdk.protocol.GoalStatus = null,
+    last_tokens: u64 = 0,
+    usage_tokens: u64 = 0,
+
+    fn event(raw: ?*anyopaque, _: ?*const wire.RunContextV1, event_json: wire.BytesViewV1) callconv(.c) u32 {
+        const self: *@This() = @ptrCast(@alignCast(raw orelse return wire.EVENT_FATAL));
+        const encoded = sdk.borrowedBytes(event_json) catch return wire.EVENT_FATAL;
+        const parsed = sdk.decodeCoreEvent(std.heap.c_allocator, encoded) catch return wire.EVENT_FATAL;
+        defer parsed.deinit();
+        switch (parsed.value) {
+            .known => |known| switch (known) {
+                .goal_updated => |goal| {
+                    self.updates += 1;
+                    self.last_status = goal.status;
+                    self.last_tokens = goal.tokens_used;
+                },
+                .usage => |usage| self.usage_tokens += usage.input_tokens + usage.output_tokens,
+                else => {},
+            },
+            .unknown => {},
+        }
+        return wire.EVENT_CONTINUE;
+    }
+};
+
+const GoalReading = struct {
+    arena: std.heap.ArenaAllocator,
+    goal: ?sdk.protocol.Goal,
+
+    fn deinit(self: *GoalReading) void {
+        self.arena.deinit();
+    }
+};
+
+fn readGoal(api: sdk.Api, session: ?*wire.SessionHandle) !GoalReading {
+    var json = std.mem.zeroes(wire.OwnedBytesV1);
+    var diagnostic = std.mem.zeroes(wire.OwnedBytesV1);
+    defer api.bufferRelease()(&diagnostic);
+    try std.testing.expectEqual(wire.STATUS_OK, api.goal().get()(session, &json, &diagnostic));
+    defer api.bufferRelease()(&json);
+    var reading = GoalReading{ .arena = std.heap.ArenaAllocator.init(std.testing.allocator), .goal = null };
+    errdefer reading.arena.deinit();
+    const encoded = try sdk.borrowedBytes(.{ .ptr = json.ptr, .len = json.len });
+    reading.goal = (try sdk.protocol.decodeGoalDocument(reading.arena.allocator(), encoded)).goal;
+    return reading;
+}
+
+fn goalSet(objective: []const u8, token_budget: u64) wire.GoalSetV1 {
+    var request = std.mem.zeroes(wire.GoalSetV1);
+    request.struct_size = @sizeOf(wire.GoalSetV1);
+    request.objective = sdk.bytesView(objective);
+    request.token_budget = token_budget;
+    return request;
+}
+
+fn goalUpdate(fields: u32) wire.GoalUpdateV1 {
+    var update = std.mem.zeroes(wire.GoalUpdateV1);
+    update.struct_size = @sizeOf(wire.GoalUpdateV1);
+    update.fields = fields;
+    return update;
+}
+
+fn goalContinuationInput() wire.RunInputV1 {
+    var input = std.mem.zeroes(wire.RunInputV1);
+    input.struct_size = @sizeOf(wire.RunInputV1);
+    input.kind_code = wire.RUN_INPUT_GOAL_CONTINUATION;
+    return input;
+}
+
+fn expectDiagnosticNames(api: sdk.Api, diagnostic: *wire.OwnedBytesV1, reason: []const u8) !void {
+    defer api.bufferRelease()(diagnostic);
+    const text = try sdk.borrowedBytes(.{ .ptr = diagnostic.ptr, .len = diagnostic.len });
+    if (std.mem.indexOf(u8, text, reason) == null) {
+        std.debug.print("expected {s} in diagnostic: {s}\n", .{ reason, text });
+        return error.TestUnexpectedDiagnostic;
+    }
+}
+
+test "L2 Revision 23 a goal-continuation Run works toward the Host's goal, charges it, reports the budget running out, and a checkpoint carries it (issue #277)" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try rootPath(&tmp, &root_buffer);
+    var server = try harness.MockServer.startCassette(&.{ GOAL_TOOL_TURN_SSE, FINAL_SSE, FINAL_SSE }, 0);
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+
+    const raw_api = abi.metask_agentcore_get_api(wire.ABI_VERSION_V1) orelse return error.MissingApi;
+    const api = try sdk.Api.validate(@ptrCast(@alignCast(raw_api)));
+    var diagnostic = std.mem.zeroes(wire.OwnedBytesV1);
+    var runtime_config = std.mem.zeroes(wire.RuntimeConfigV1);
+    runtime_config.struct_size = @sizeOf(wire.RuntimeConfigV1);
+    var runtime: ?*wire.RuntimeHandle = null;
+    try std.testing.expectEqual(wire.STATUS_OK, api.runtime().create()(&runtime_config, null, &runtime, &diagnostic));
+    defer _ = api.runtime().destroy()(runtime, &diagnostic);
+
+    var host = std.mem.zeroes(wire.SessionHostConfigV1);
+    host.struct_size = @sizeOf(wire.SessionHostConfigV1);
+    host.provider_kind_code = wire.PROVIDER_ANTHROPIC;
+    host.permission_mode_code = wire.PERMISSION_FULL_ACCESS;
+    host.shell_policy_code = wire.SHELL_DISABLED;
+    host.api_key = sdk.bytesView("test-key");
+    host.base_url = sdk.bytesView(url);
+    host.workspace_root = sdk.bytesView(root);
+    host.workspace_home = sdk.bytesView(root);
+    var create_config = sessionCreateConfig(&host, "test-model");
+    var probe = GoalEventProbe{};
+    var callbacks = std.mem.zeroes(wire.SessionCallbacksV1);
+    callbacks.struct_size = @sizeOf(wire.SessionCallbacksV1);
+    callbacks.ctx = &probe;
+    callbacks.on_event = GoalEventProbe.event;
+    var session: ?*wire.SessionHandle = null;
+    try std.testing.expectEqual(wire.STATUS_OK, api.session().create()(runtime, &create_config, &callbacks, &session, &diagnostic));
+    defer if (session) |handle| {
+        _ = api.session().destroy()(handle, &diagnostic);
+    };
+
+    {
+        var reading = try readGoal(api, session);
+        defer reading.deinit();
+        try std.testing.expect(reading.goal == null);
+    }
+    var set = goalSet("  ship <it> & say so  ", 30);
+    try std.testing.expectEqual(wire.STATUS_OK, api.goal().set()(session, &set, &diagnostic));
+    const goal_id: [24]u8 = blk: {
+        var reading = try readGoal(api, session);
+        defer reading.deinit();
+        const goal = reading.goal orelse return error.MissingGoal;
+        try std.testing.expectEqualStrings("ship <it> & say so", goal.objective);
+        try std.testing.expectEqual(sdk.protocol.GoalStatus.active, goal.status);
+        try std.testing.expectEqual(@as(?u64, 30), goal.token_budget);
+        try std.testing.expectEqual(@as(u64, 0), goal.tokens_used);
+        break :blk goal.id[0..24].*;
+    };
+
+    // The runtime writes the continuation input from the goal; the budget
+    // runs out on the first turn, so the second request asks for a wrap-up.
+    var options = std.mem.zeroes(wire.RunOptionsV1);
+    options.struct_size = @sizeOf(wire.RunOptionsV1);
+    options.max_turns = 4;
+    var result = std.mem.zeroes(wire.RunResultV1);
+    var continuation = goalContinuationInput();
+    try std.testing.expectEqual(wire.STATUS_OK, api.session().runInput()(session, 1, &continuation, &options, &result, &diagnostic));
+    try std.testing.expectEqual(wire.STOP_END_TURN, result.stop_reason_code);
+    try std.testing.expectEqual(@as(usize, 2), server.requestCount());
+    const first = (server.requestAt(0) orelse return error.MissingRequest).body();
+    const second = (server.requestAt(1) orelse return error.MissingRequest).body();
+    try std.testing.expect(std.mem.indexOf(u8, first, "Continue working toward the active goal.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first, "ship &lt;it&gt; &amp; say so") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first, "token budget for the active goal is used up") == null);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, second, "token budget for the active goal is used up"));
+    // The events and the goal agree with what the provider billed.
+    try std.testing.expect(probe.usage_tokens > 30);
+    try std.testing.expect(probe.updates >= 2);
+    try std.testing.expectEqual(sdk.protocol.GoalStatus.budget_limited, probe.last_status.?);
+    try std.testing.expectEqual(probe.usage_tokens, probe.last_tokens);
+    {
+        var reading = try readGoal(api, session);
+        defer reading.deinit();
+        const goal = reading.goal orelse return error.MissingGoal;
+        try std.testing.expectEqual(sdk.protocol.GoalStatus.budget_limited, goal.status);
+        try std.testing.expectEqual(probe.usage_tokens, goal.tokens_used);
+        try std.testing.expectEqualStrings(&goal_id, goal.id);
+    }
+
+    // A goal that is not active cannot be continued; nothing is sent.
+    try std.testing.expectEqual(wire.STATUS_GOAL_CONFLICT, api.session().runInput()(session, 2, &continuation, &options, &result, &diagnostic));
+    try expectDiagnosticNames(api, &diagnostic, "GoalNotActive");
+    try std.testing.expectEqual(@as(usize, 2), server.requestCount());
+    // Room in the budget and resume, in one update.
+    var resume_update = goalUpdate(wire.GOAL_FIELD_TOKEN_BUDGET | wire.GOAL_FIELD_ACTION);
+    resume_update.token_budget = 1000;
+    resume_update.action_code = wire.GOAL_ACTION_ACTIVATE;
+    try std.testing.expectEqual(wire.STATUS_OK, api.goal().update()(session, &resume_update, &diagnostic));
+
+    // The checkpoint carries the goal (the marker-10 envelope).
+    var checkpoint = PublicCheckpointBuffer{};
+    defer checkpoint.deinit();
+    var limits = publicCheckpointLimits();
+    var sink = checkpoint.sink();
+    var export_config = std.mem.zeroes(wire.CheckpointExportConfigV1);
+    export_config.struct_size = @sizeOf(wire.CheckpointExportConfigV1);
+    export_config.limits = &limits;
+    export_config.sink = &sink;
+    var export_result = std.mem.zeroes(wire.CheckpointExportResultV1);
+    try std.testing.expectEqual(wire.STATUS_OK, api.sessionControl().exportCheckpoint()(session, &export_config, &export_result, &diagnostic));
+    try std.testing.expectEqual(@as(u32, 10), std.mem.readInt(u32, checkpoint.bytes.items[20..24], .little));
+    try std.testing.expectEqual(wire.STATUS_OK, api.session().destroy()(session, &diagnostic));
+    session = null;
+
+    var source = checkpoint.source();
+    var restore_config = std.mem.zeroes(wire.SessionRestoreConfigV1);
+    restore_config.struct_size = @sizeOf(wire.SessionRestoreConfigV1);
+    restore_config.host = &host;
+    restore_config.source = &source;
+    restore_config.limits = &limits;
+    var restore_report = std.mem.zeroes(wire.OwnedBytesV1);
+    try std.testing.expectEqual(wire.STATUS_OK, api.sessionControl().restore()(runtime, &restore_config, &callbacks, &session, &restore_report, &diagnostic));
+    api.bufferRelease()(&restore_report);
+    const charged_before_restore = probe.usage_tokens;
+    {
+        var reading = try readGoal(api, session);
+        defer reading.deinit();
+        const goal = reading.goal orelse return error.MissingGoal;
+        try std.testing.expectEqualStrings(&goal_id, goal.id);
+        try std.testing.expectEqual(sdk.protocol.GoalStatus.active, goal.status);
+        try std.testing.expectEqual(@as(?u64, 1000), goal.token_budget);
+        try std.testing.expectEqual(charged_before_restore, goal.tokens_used);
+    }
+    // The restored Session keeps charging the same goal.
+    try std.testing.expectEqual(wire.STATUS_OK, api.session().runInput()(session, 2, &continuation, &options, &result, &diagnostic));
+    try std.testing.expectEqual(@as(usize, 3), server.requestCount());
+    var reading = try readGoal(api, session);
+    defer reading.deinit();
+    const goal = reading.goal orelse return error.MissingGoal;
+    try std.testing.expect(probe.usage_tokens > charged_before_restore);
+    try std.testing.expectEqual(probe.usage_tokens, goal.tokens_used);
+    try std.testing.expectEqual(sdk.protocol.GoalStatus.active, goal.status);
+}
+
+test "Revision 23 goal operations are validated, and a refusal changes nothing (issue #277)" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try rootPath(&tmp, &root_buffer);
+    var server = try harness.MockServer.startCassette(&.{FINAL_SSE}, 0);
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+    var fixture = try PublicSessionFixture.init(root, url, "test-model");
+    defer fixture.deinit();
+    const api = fixture.api;
+    const session = fixture.session;
+    var options = std.mem.zeroes(wire.RunOptionsV1);
+    options.struct_size = @sizeOf(wire.RunOptionsV1);
+    options.max_turns = 1;
+    var result = std.mem.zeroes(wire.RunResultV1);
+
+    // Without a goal: update and continuation conflict, clear changes nothing.
+    var pause = goalUpdate(wire.GOAL_FIELD_ACTION);
+    pause.action_code = wire.GOAL_ACTION_PAUSE;
+    try std.testing.expectEqual(wire.STATUS_GOAL_CONFLICT, api.goal().update()(session, &pause, &fixture.diagnostic));
+    try expectDiagnosticNames(api, &fixture.diagnostic, "NoGoal");
+    try std.testing.expectEqual(wire.STATUS_OK, api.goal().clear()(session, &fixture.diagnostic));
+    var continuation = goalContinuationInput();
+    try std.testing.expectEqual(wire.STATUS_GOAL_CONFLICT, api.session().runInput()(session, 1, &continuation, &options, &result, &fixture.diagnostic));
+    try expectDiagnosticNames(api, &fixture.diagnostic, "NoGoal");
+    continuation.text = sdk.bytesView("x");
+    try std.testing.expectEqual(wire.STATUS_INVALID_ARGUMENT, api.session().runInput()(session, 1, &continuation, &options, &result, &fixture.diagnostic));
+    fixture.releaseDiagnostic();
+
+    // Malformed set requests.
+    const too_many_codepoints = "\u{4e2d}" ** 4001;
+    const too_many_bytes = "x" ** (wire.MAX_GOAL_OBJECTIVE_BYTES_V1 + 1);
+    for ([_][]const u8{ " \t\n", "bad \xff byte", too_many_codepoints, too_many_bytes }) |objective| {
+        var request = goalSet(objective, 0);
+        try std.testing.expectEqual(wire.STATUS_INVALID_ARGUMENT, api.goal().set()(session, &request, &fixture.diagnostic));
+        fixture.releaseDiagnostic();
+    }
+    var wrong_size = goalSet("ship it", 0);
+    wrong_size.struct_size -= 8;
+    try std.testing.expectEqual(wire.STATUS_INVALID_ARGUMENT, api.goal().set()(session, &wrong_size, &fixture.diagnostic));
+    fixture.releaseDiagnostic();
+    var reserved = goalSet("ship it", 0);
+    reserved.reserved[2] = 1;
+    try std.testing.expectEqual(wire.STATUS_INVALID_ARGUMENT, api.goal().set()(session, &reserved, &fixture.diagnostic));
+    fixture.releaseDiagnostic();
+    {
+        var reading = try readGoal(api, session);
+        defer reading.deinit();
+        try std.testing.expect(reading.goal == null);
+    }
+
+    // 4000 code points is the limit, not past it.
+    var longest = goalSet("\u{4e2d}" ** 4000, 0);
+    try std.testing.expectEqual(wire.STATUS_OK, api.goal().set()(session, &longest, &fixture.diagnostic));
+    var set = goalSet("ship it", 0);
+    try std.testing.expectEqual(wire.STATUS_OK, api.goal().set()(session, &set, &fixture.diagnostic));
+
+    // Malformed updates.
+    const Bad = struct { fields: u32, objective: []const u8 = "", token_budget: u64 = 0, action_code: u32 = 0 };
+    for ([_]Bad{
+        .{ .fields = 0 },
+        .{ .fields = 8 },
+        .{ .fields = wire.GOAL_FIELD_ACTION, .action_code = 9 },
+        .{ .fields = wire.GOAL_FIELD_ACTION, .action_code = wire.GOAL_ACTION_PAUSE, .objective = "stray" },
+        .{ .fields = wire.GOAL_FIELD_ACTION, .action_code = wire.GOAL_ACTION_PAUSE, .token_budget = 5 },
+        .{ .fields = wire.GOAL_FIELD_TOKEN_BUDGET, .token_budget = 5, .action_code = wire.GOAL_ACTION_PAUSE },
+        .{ .fields = wire.GOAL_FIELD_OBJECTIVE, .objective = "  " },
+    }) |bad| {
+        var update = goalUpdate(bad.fields);
+        if (bad.objective.len != 0) update.objective = sdk.bytesView(bad.objective);
+        update.token_budget = bad.token_budget;
+        update.action_code = bad.action_code;
+        try std.testing.expectEqual(wire.STATUS_INVALID_ARGUMENT, api.goal().update()(session, &update, &fixture.diagnostic));
+        fixture.releaseDiagnostic();
+    }
+
+    // Refused transitions name the rule, and leave the objective unchanged
+    // even when the same update also edits it.
+    var complete = goalUpdate(wire.GOAL_FIELD_ACTION);
+    complete.action_code = wire.GOAL_ACTION_COMPLETE;
+    try std.testing.expectEqual(wire.STATUS_OK, api.goal().update()(session, &complete, &fixture.diagnostic));
+    var block = goalUpdate(wire.GOAL_FIELD_ACTION);
+    block.action_code = wire.GOAL_ACTION_BLOCK;
+    try std.testing.expectEqual(wire.STATUS_GOAL_CONFLICT, api.goal().update()(session, &block, &fixture.diagnostic));
+    try expectDiagnosticNames(api, &fixture.diagnostic, "GoalComplete");
+    var edit_and_pause = goalUpdate(wire.GOAL_FIELD_OBJECTIVE | wire.GOAL_FIELD_ACTION);
+    edit_and_pause.objective = sdk.bytesView("ship more");
+    edit_and_pause.action_code = wire.GOAL_ACTION_PAUSE;
+    try std.testing.expectEqual(wire.STATUS_GOAL_CONFLICT, api.goal().update()(session, &edit_and_pause, &fixture.diagnostic));
+    try expectDiagnosticNames(api, &fixture.diagnostic, "GoalNotActive");
+    var complete_continuation = goalContinuationInput();
+    try std.testing.expectEqual(wire.STATUS_GOAL_CONFLICT, api.session().runInput()(session, 1, &complete_continuation, &options, &result, &fixture.diagnostic));
+    try expectDiagnosticNames(api, &fixture.diagnostic, "GoalNotActive");
+    {
+        var reading = try readGoal(api, session);
+        defer reading.deinit();
+        const goal = reading.goal orelse return error.MissingGoal;
+        try std.testing.expectEqualStrings("ship it", goal.objective);
+        try std.testing.expectEqual(sdk.protocol.GoalStatus.complete, goal.status);
+        try std.testing.expect(goal.token_budget == null);
+    }
+    try std.testing.expectEqual(wire.STATUS_OK, api.goal().clear()(session, &fixture.diagnostic));
+    {
+        var reading = try readGoal(api, session);
+        defer reading.deinit();
+        try std.testing.expect(reading.goal == null);
+    }
+    // Nothing above reached the provider, and Run 1 was never admitted.
+    try std.testing.expectEqual(@as(usize, 0), server.requestCount());
+    try std.testing.expectEqual(wire.STATUS_OK, api.session().runText(session, 1, sdk.bytesView("x"), &options, &result, &fixture.diagnostic));
+}
+
+test "Revision 23 a goal the durable budget cannot hold is refused before anything changes (issue #277)" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try rootPath(&tmp, &root_buffer);
+    var server = try harness.MockServer.startCassette(&.{FINAL_SSE}, 0);
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+    const budget = wire.DurableBudgetProfileV1{
+        .struct_size = @sizeOf(wire.DurableBudgetProfileV1),
+        .reserved0 = 0,
+        .hard_bytes = 8 * 1024,
+        .soft_bytes = 7 * 1024,
+        .input_cap_bytes = 512,
+        .provider_request_cap_bytes = 4096,
+        .provider_result_cap_bytes = 2048,
+        .tool_result_cap_bytes = 2048,
+        .mcp_result_cap_bytes = 2048,
+        .audit_reserve_bytes = 512,
+        .terminal_reserve_bytes = 512,
+        .reserved = [_]u64{0} ** 4,
+    };
+    var fixture = try PublicSessionFixture.initWithBudget(root, url, "test-model", &budget);
+    defer fixture.deinit();
+    const api = fixture.api;
+    const session = fixture.session;
+
+    var small = goalSet("ship it", 0);
+    try std.testing.expectEqual(wire.STATUS_OK, api.goal().set()(session, &small, &fixture.diagnostic));
+    // 12,000 bytes of objective do not fit in 8 KiB with the Run reserve.
+    var large = goalSet("\u{4e2d}" ** 4000, 0);
+    try std.testing.expectEqual(wire.STATUS_CHECKPOINT_BUDGET_REQUIRED, api.goal().set()(session, &large, &fixture.diagnostic));
+    fixture.releaseDiagnostic();
+    var edit = goalUpdate(wire.GOAL_FIELD_OBJECTIVE);
+    edit.objective = sdk.bytesView("\u{4e2d}" ** 4000);
+    try std.testing.expectEqual(wire.STATUS_CHECKPOINT_BUDGET_REQUIRED, api.goal().update()(session, &edit, &fixture.diagnostic));
+    fixture.releaseDiagnostic();
+    var reading = try readGoal(api, session);
+    defer reading.deinit();
+    try std.testing.expectEqualStrings("ship it", (reading.goal orelse return error.MissingGoal).objective);
+}
+
+test "L2 Revision 23 a Skill invocation Run in its own context is charged to the Session's goal (issue #277)" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try rootPath(&tmp, &root_buf);
+    try writeSkillFixture(
+        a,
+        root,
+        "forked",
+        "---\nname: Forked\ndescription: Runs in a fresh child Conversation\ncontext: fork\n---\nFORKED_SKILL_SENTINEL",
+    );
+    var server = try harness.MockServer.startCassette(&.{FINAL_SSE}, 0);
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+    var fixture = try PublicSessionFixture.init(root, url, "test-model");
+    defer fixture.deinit();
+
+    var query = wire.SkillCatalogQueryV1{
+        .struct_size = @sizeOf(wire.SkillCatalogQueryV1),
+        .reserved0 = 0,
+        .workspace_root = sdk.bytesView(root),
+        .workspace_home = sdk.bytesView(root),
+        .workspace_epoch = sdk.bytesView("goal-fork-epoch"),
+        .additional_sources = null,
+        .additional_source_count = 0,
+        .reserved = [_]u64{0} ** 1,
+    };
+    var catalog: ?*wire.SkillCatalogHandle = null;
+    var descriptor = std.mem.zeroes(wire.OwnedBytesV1);
+    defer fixture.api.bufferRelease()(&descriptor);
+    try std.testing.expectEqual(wire.STATUS_OK, fixture.api.skill().resolveCatalog()(fixture.runtime, &query, &catalog, &descriptor, &fixture.diagnostic));
+    defer if (catalog) |handle| {
+        _ = fixture.api.skill().releaseCatalog()(handle, &fixture.diagnostic);
+    };
+    const descriptor_bytes = try sdk.borrowedBytes(.{ .ptr = descriptor.ptr, .len = descriptor.len });
+    var policy = try DecodedSkillPolicy.init(a, descriptor_bytes);
+    defer policy.deinit();
+    const ids = try extractCatalogIdentities(a, descriptor_bytes, "forked");
+    defer a.free(ids.revision);
+    defer a.free(ids.skill_id);
+    try std.testing.expectEqual(wire.STATUS_OK, fixture.api.skill().bindPolicy()(fixture.session, catalog, &policy.policy, &fixture.diagnostic));
+
+    var set = goalSet("ship it", 0);
+    try std.testing.expectEqual(wire.STATUS_OK, fixture.api.goal().set()(fixture.session, &set, &fixture.diagnostic));
+    var options = std.mem.zeroes(wire.RunOptionsV1);
+    options.struct_size = @sizeOf(wire.RunOptionsV1);
+    options.max_turns = 2;
+    var result = std.mem.zeroes(wire.RunResultV1);
+    try std.testing.expectEqual(wire.STATUS_OK, fixture.api.session().runSkill(
+        fixture.session,
+        1,
+        sdk.bytesView(ids.skill_id),
+        sdk.bytesView(ids.revision),
+        sdk.bytesView(""),
+        &options,
+        &result,
+        &fixture.diagnostic,
+    ));
+    try std.testing.expectEqual(wire.STOP_END_TURN, result.stop_reason_code);
+    try std.testing.expectEqual(@as(usize, 1), server.requestCount());
+    try std.testing.expect(std.mem.indexOf(u8, try requestBody(server, 0), "FORKED_SKILL_SENTINEL") != null);
+    var reading = try readGoal(fixture.api, fixture.session);
+    defer reading.deinit();
+    const goal = reading.goal orelse return error.MissingGoal;
+    try std.testing.expect(goal.tokens_used > 0);
 }

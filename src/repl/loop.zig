@@ -775,8 +775,6 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
         defer if (tui_be != null) {
             app.permission_ctx.ui_requester = null;
         };
-        const usage_before = app.usage;
-        const started_ns = util_time.nowNs();
         // scoped 自动召回(一等公民 P1):按用户请求自动装配相关记忆到尾部(cache-safe,有命中才注入)。
         const scoped_recall = if (app.kg) |*k| (scoped_recall_mod.build(allocator, k, &app.conversation, &app.abort, .{ .advisor = app.jevAdvisor() }) catch null) else null;
         defer if (scoped_recall) |s| allocator.free(s);
@@ -877,7 +875,7 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
         };
         if (run_control) |control| try control.finishRun(@tagName(result.stop_reason));
         app.clearPendingModelSwitchCompact();
-        accountGoalUsageAfterRun(app, usage_before, started_ns);
+        stopLoopIfGoalLimited(app);
         // 停 watcher + 清 stdin 缓冲（生成期间用户可能误按的键，别污染下一轮）
         if (tui_be) |*tb| tb.stopInput();
         if (gen_region) |*r| r.leaveGenerating(app);
@@ -3364,19 +3362,19 @@ fn handleGoal(app: *app_mod.App, rest: []const u8) !void {
             return;
         },
         .pause => {
-            try setGoalStatus(app, .paused);
+            applyGoalAction(app, .pause);
             return;
         },
         .resume_goal => {
-            try setGoalStatus(app, .active);
+            applyGoalAction(app, .activate);
             return;
         },
         .complete => {
-            try setGoalStatus(app, .complete);
+            applyGoalAction(app, .complete);
             return;
         },
         .blocked => {
-            try setGoalStatus(app, .blocked);
+            applyGoalAction(app, .block);
             return;
         },
         .invalid => {},
@@ -3384,8 +3382,8 @@ fn handleGoal(app: *app_mod.App, rest: []const u8) !void {
     std.debug.print("usage: /goal [view|set <objective>|edit <objective>|budget <tokens|none>|pause|resume|complete|blocked|clear]\n", .{});
 }
 
-fn setGoalStatus(app: *app_mod.App, status: goal_mod.Status) !void {
-    app.goal_state.setStatus(status) catch |err| {
+fn applyGoalAction(app: *app_mod.App, action: goal_mod.Action) void {
+    app.goal_state.apply(action) catch |err| {
         printGoalError(err);
         return;
     };
@@ -3416,7 +3414,7 @@ fn printGoalHelp() void {
         \\  /goal set <objective>         Create or replace the session goal
         \\  /goal edit <objective>        Edit the current objective
         \\  /goal budget <tokens|none>    Set or clear token budget
-        \\  /goal pause|resume            Pause or resume continuation eligibility
+        \\  /goal pause|resume            Pause the goal, or make it active again
         \\  /goal complete|blocked        Mark final status
         \\  /goal clear                   Remove the goal
         \\
@@ -3426,8 +3424,13 @@ fn printGoalHelp() void {
 fn printGoalError(err: anyerror) void {
     const msg = switch (err) {
         error.EmptyObjective => "empty objective",
+        error.ObjectiveTooLong => "objective is longer than 4000 characters",
+        error.InvalidObjective => "objective is not valid UTF-8",
         error.NoGoal => "no goal set",
         error.InvalidBudget => "invalid budget",
+        error.GoalNotActive => "only an active goal can be paused",
+        error.BudgetExhausted => "the token budget is used up; raise it with /goal budget <tokens> or clear it with /goal budget none",
+        error.GoalComplete => "the goal is complete; /goal resume reopens it",
         else => @errorName(err),
     };
     std.debug.print("\x1b[31m/goal failed: {s}\x1b[0m\n", .{msg});
@@ -3507,13 +3510,9 @@ fn shouldRunLoopContinuation(app: *const app_mod.App, queued_count: usize) bool 
 }
 
 fn runLoopContinuation(app: *app_mod.App, allocator: std.mem.Allocator, backend: *const ui_backend_mod.UiBackend) !void {
-    const g = app.goal_state.current orelse return;
+    const g = if (app.goal_state.current) |*g| g else return;
     if (app.loop_remaining > 0) app.loop_remaining -= 1;
-    const prompt = try std.fmt.allocPrint(
-        allocator,
-        "<system-reminder>Continue working toward the active goal. Goal: {s}. If the goal appears complete or genuinely blocked, say that explicitly in your response so the user can mark it with /goal complete or /goal blocked. Slash commands are user input controls; do not claim you executed one. Do not start unrelated work.</system-reminder>",
-        .{g.objective},
-    );
+    const prompt = try goal_mod.continuationPrompt(allocator, g);
     defer allocator.free(prompt);
     std.debug.print("\x1b[2m[loop continuation: {d} remaining]\x1b[0m\n", .{app.loop_remaining});
     try runInjectedAgentWithSynthetic(app, allocator, backend, prompt);
@@ -3540,36 +3539,14 @@ pub fn shouldRunLoopContinuationInput(input_state: LoopGateInput) bool {
     return true;
 }
 
-fn accountGoalUsageAfterRun(app: *app_mod.App, before: usage_mod.UsageTotals, started_ns: util_time.Nanos) void {
-    if (app.goal_state.current == null) return;
-    const delta = goalBudgetTokenDelta(before, app.usage);
-    const elapsed_ms = elapsedSinceMs(started_ns);
-    if (delta == 0 and elapsed_ms == 0) return;
-    const id = app.goal_state.current.?.id;
-    app.goal_state.accountProgress(delta, elapsed_ms, id[0..]) catch |err| {
-        @import("../util/log.zig").warn("goal", "usage accounting failed: {s}", .{@errorName(err)});
-        return;
-    };
-    app.persistGoal();
-    if (app.goal_state.current) |g| {
-        if (g.status == .budget_limited) {
-            app.loop_enabled = false;
-            app.loop_remaining = 0;
-            std.debug.print("\x1b[2m[goal budget reached]\x1b[0m\n", .{});
-        }
-    }
-}
-
-fn goalBudgetTokenDelta(before: usage_mod.UsageTotals, after: usage_mod.UsageTotals) u64 {
-    const input_delta = after.input_tokens -| before.input_tokens;
-    const output_delta = after.output_tokens -| before.output_tokens;
-    return input_delta +| output_delta;
-}
-
-fn elapsedSinceMs(started_ns: util_time.Nanos) u64 {
-    const now = util_time.nowNs();
-    if (now <= started_ns) return 0;
-    return @intCast(@divTrunc(now - started_ns, std.time.ns_per_ms));
+/// The agent loop charged the goal (`App.goal_meter`); a budget it used up
+/// ends `/loop` continuation.
+fn stopLoopIfGoalLimited(app: *app_mod.App) void {
+    const g = app.goal_state.current orelse return;
+    if (g.status != .budget_limited or !app.loop_enabled) return;
+    app.loop_enabled = false;
+    app.loop_remaining = 0;
+    std.debug.print("\x1b[2m[goal budget reached]\x1b[0m\n", .{});
 }
 
 /// 把当前 conversation 拍平成纯文本(role: text),用于 /btw /recap 的上下文喂养。
@@ -4301,8 +4278,6 @@ fn runInjectedAgentWithSynthetic(app: *app_mod.App, allocator: std.mem.Allocator
     // U11:字段装配走 canonical buildRunOptions(此前本路径缺 agents/skills_set/mcp/
     // cron/host_services 等字段——注入 run 里模型能力被静默削弱的漂移在此修复);
     // emit_tool_cards 维持本路径既有关闭状态(WriterBackend 文本流,卡片会刷屏)。
-    const usage_before = app.usage;
-    const started_ns = util_time.nowNs();
     var run_opts = session_service.buildRunOptions(app, synthetic_user_input);
     run_opts.emit_tool_cards = false;
     const result = agent_loop.run(
@@ -4319,7 +4294,7 @@ fn runInjectedAgentWithSynthetic(app: *app_mod.App, allocator: std.mem.Allocator
         return;
     };
     app.clearPendingModelSwitchCompact();
-    accountGoalUsageAfterRun(app, usage_before, started_ns);
+    stopLoopIfGoalLimited(app);
     app.persistTranscript();
     if (result.stop_reason == .aborted) {
         std.debug.print("\x1b[33m^C (cancelled)\x1b[0m\n", .{});
@@ -4645,20 +4620,4 @@ test "L2 #16: /resume 切 app.session_id + permission_ctx.session(路由键随�
     try std.testing.expectEqualStrings(sid.asSlice(), app.permission_ctx.session.asSlice()); // 路由键同步
     try std.testing.expectEqualStrings(app.activeModel(), app.transcript_writer.?.model);
     try std.testing.expect(!app.agentJobScope().contains(old_id));
-}
-
-test "/goal accounting delta charges only input plus output usage" {
-    const before = usage_mod.UsageTotals{
-        .input_tokens = 10,
-        .output_tokens = 20,
-        .cache_read_input_tokens = 100,
-        .cache_creation_input_tokens = 200,
-    };
-    const after = usage_mod.UsageTotals{
-        .input_tokens = 15,
-        .output_tokens = 27,
-        .cache_read_input_tokens = 999,
-        .cache_creation_input_tokens = 999,
-    };
-    try std.testing.expectEqual(@as(u64, 12), goalBudgetTokenDelta(before, after));
 }

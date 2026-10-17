@@ -256,6 +256,29 @@ pub const PromptManifest = struct {
 
 pub const MAX_PROMPT_MANIFEST_SECTIONS_V1: usize = 128;
 
+/// Revision 23: a Session goal's status. `usage_limited` and
+/// `budget_limited` are reached by the runtime, never requested.
+pub const GoalStatus = enum { active, paused, blocked, usage_limited, budget_limited, complete };
+
+/// Revision 23: a Session goal, as `goal->get` writes it under `"goal"` and
+/// a `goal_updated` event carries it. Tokens are non-cached input plus
+/// output; time is the wall time of the Runs that charged it.
+pub const Goal = struct {
+    id: []const u8,
+    objective: []const u8,
+    status: GoalStatus,
+    token_budget: ?u64,
+    tokens_used: u64,
+    time_used_ms: u64,
+    created_at_ms: i64,
+    updated_at_ms: i64,
+};
+
+/// `goal->get`'s document.
+pub const GoalDocument = struct {
+    goal: ?Goal,
+};
+
 pub const PromptSectionOp = enum {
     add,
     replace,
@@ -355,6 +378,10 @@ pub const CoreEvent = union(enum) {
     /// Session's first Run, a profile change, a model or tool-surface change).
     /// Delivered once, before the Run's first provider request.
     prompt_manifest: PromptManifest,
+    /// Revision 23: the Session's goal changed during a Run - its budget ran
+    /// out (`budget_limited`), or the Run ended and its usage and time are on
+    /// the goal.
+    goal_updated: Goal,
     stream_done,
 };
 
@@ -754,6 +781,7 @@ pub fn decodeCoreEvent(allocator: std.mem.Allocator, encoded: []const u8) Decode
         switch (known) {
             .permission_provenance => |value| try validatePermissionProvenance(value),
             .prompt_manifest => |value| try validatePromptManifest(value),
+            .goal_updated => |value| try validateGoal(value),
             .tool_result => |value| try validateFileReferences(value.file_refs),
             .file_changes => |value| try validateFileChanges(value.changes),
             .input_adopted => |value| if (value.input_id == 0 or value.sequence == 0 or value.turn == 0)
@@ -798,6 +826,28 @@ fn validPromptSectionId(id: []const u8) bool {
             return false;
     }
     return true;
+}
+
+/// A goal the runtime could have written: a 24-character lowercase hex id,
+/// a stored-form objective of at most 4000 code points, and a positive
+/// budget if any.
+pub fn validateGoal(goal: Goal) DecodeError!void {
+    if (goal.id.len != 24 or goal.objective.len == 0) return error.InvalidPayload;
+    for (goal.id) |c| if (!((c >= '0' and c <= '9') or (c >= 'a' and c <= 'f'))) return error.InvalidPayload;
+    const codepoints = std.unicode.utf8CountCodepoints(goal.objective) catch return error.InvalidPayload;
+    if (codepoints > 4000 or !std.mem.eql(u8, std.mem.trim(u8, goal.objective, " \t\r\n"), goal.objective))
+        return error.InvalidPayload;
+    if (goal.token_budget) |budget| if (budget == 0) return error.InvalidPayload;
+}
+
+/// Parses `goal->get`'s document into `arena`, validated like the event.
+pub fn decodeGoalDocument(arena: std.mem.Allocator, encoded: []const u8) DecodeError!GoalDocument {
+    const document = std.json.parseFromSliceLeaky(GoalDocument, arena, encoded, .{
+        .allocate = .alloc_always,
+        .duplicate_field_behavior = .@"error",
+    }) catch |err| return normalizeDecodeError(err);
+    if (document.goal) |goal| try validateGoal(goal);
+    return document;
 }
 
 fn validatePromptManifest(manifest: PromptManifest) DecodeError!void {
@@ -1485,6 +1535,7 @@ test "CoreEvent decoder covers every ABI v1 tag" {
         "{\"run_state\":{\"run_id\":9,\"transition_seq\":1,\"phase\":\"starting\",\"turn\":0,\"tool_calls\":0,\"in_flight_tools\":[]}}",
         "{\"permission_provenance\":{\"decision\":\"allow\",\"source\":\"explicit_allow\",\"matched_rule_id\":null,\"session_id\":\"000000000000000000000001\",\"run_id\":1,\"tool_call_id\":\"tool-1\",\"request_id\":null,\"tool\":{\"namespace\":\"builtin\",\"name\":\"Read\",\"binding\":\"0000000000000000000000000000000000000000000000000000000000000000\"},\"canonical_arguments_digest\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"policy_generation\":1,\"used_session_rule\":false,\"callback_outcome\":null,\"response\":null}}",
         "{\"prompt_manifest\":{\"sha256\":\"" ++ "a" ** 64 ++ "\",\"sections\":[{\"id\":\"metacodes:identity\",\"order\":-1000,\"origin\":\"host\",\"class\":\"replaceable\",\"sha256\":\"" ++ "b" ** 64 ++ "\"},{\"id\":\"metacodes:safety-policy\",\"order\":-900,\"origin\":\"kernel\",\"class\":\"locked\",\"sha256\":\"" ++ "c" ** 64 ++ "\"}]}}",
+        "{\"goal_updated\":{\"id\":\"0123456789abcdef01234567\",\"objective\":\"ship it\",\"status\":\"budget_limited\",\"token_budget\":100,\"tokens_used\":120,\"time_used_ms\":5,\"created_at_ms\":1,\"updated_at_ms\":2}}",
         "{\"stream_done\":{}}",
     };
     try std.testing.expectEqual(std.meta.fields(std.meta.Tag(CoreEvent)).len, cases.len);
@@ -1492,6 +1543,27 @@ test "CoreEvent decoder covers every ABI v1 tag" {
         const parsed = try decodeCoreEvent(std.testing.allocator, encoded);
         parsed.deinit();
     }
+}
+
+test "goal events and documents carry only goals the runtime could have written (Revision 23)" {
+    const a = std.testing.allocator;
+    const good = "{\"id\":\"0123456789abcdef01234567\",\"objective\":\"ship it\",\"status\":\"active\",\"token_budget\":null,\"tokens_used\":0,\"time_used_ms\":0,\"created_at_ms\":1,\"updated_at_ms\":1}";
+    const event = try decodeCoreEvent(a, "{\"goal_updated\":" ++ good ++ "}");
+    event.deinit();
+    for ([_][]const u8{
+        "{\"goal_updated\":{\"id\":\"0123456789ABCDEF01234567\",\"objective\":\"ship it\",\"status\":\"active\",\"token_budget\":null,\"tokens_used\":0,\"time_used_ms\":0,\"created_at_ms\":1,\"updated_at_ms\":1}}",
+        "{\"goal_updated\":{\"id\":\"0123456789abcdef01234567\",\"objective\":\" ship it\",\"status\":\"active\",\"token_budget\":null,\"tokens_used\":0,\"time_used_ms\":0,\"created_at_ms\":1,\"updated_at_ms\":1}}",
+        "{\"goal_updated\":{\"id\":\"0123456789abcdef01234567\",\"objective\":\"ship it\",\"status\":\"active\",\"token_budget\":0,\"tokens_used\":0,\"time_used_ms\":0,\"created_at_ms\":1,\"updated_at_ms\":1}}",
+        "{\"goal_updated\":{\"id\":\"0123456789abcdef01234567\",\"objective\":\"ship it\",\"status\":\"done\",\"token_budget\":null,\"tokens_used\":0,\"time_used_ms\":0,\"created_at_ms\":1,\"updated_at_ms\":1}}",
+    }) |encoded| try std.testing.expectError(error.InvalidPayload, decodeCoreEvent(a, encoded));
+
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    try std.testing.expect((try decodeGoalDocument(arena.allocator(), "{\"goal\":null}")).goal == null);
+    const document = try decodeGoalDocument(arena.allocator(), "{\"goal\":" ++ good ++ "}");
+    try std.testing.expectEqualStrings("ship it", document.goal.?.objective);
+    try std.testing.expectEqual(GoalStatus.active, document.goal.?.status);
+    try std.testing.expectError(error.InvalidPayload, decodeGoalDocument(arena.allocator(), "{\"goal\":{\"id\":\"x\"}}"));
 }
 
 test "decoded strings are owned independently of callback input" {

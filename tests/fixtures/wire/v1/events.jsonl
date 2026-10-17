@@ -33,6 +33,7 @@
 {"v":1,"type":"ui_request_pending","data":{"tool_use_id":"tu_3","request_json":"{\"kind\":\"video_timeline\"}"}}
 {"v":1,"type":"ui_request_resolved","data":null}
 {"v":1,"type":"prompt_manifest","data":{"sha256":"cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd","sections":[{"id":"metacodes:identity","order":0,"origin":"kernel","class":"replaceable","sha256":"abababababababababababababababababababababababababababababababab"},{"id":"host:rules","order":500,"origin":"host","class":"removable","sha256":"0101010101010101010101010101010101010101010101010101010101010101"}]}}
+{"v":1,"type":"goal_updated","data":{"id":"0123456789abcdef01234567","objective":"ship \"wire\"","status":"budget_limited","token_budget":100,"tokens_used":120,"time_used_ms":5,"created_at_ms":1,"updated_at_ms":2}}
 {"v":1,"type":"diag_turn_begin","data":{"trace_id":"0123456789ab","depth":0,"turn":1}}
 {"v":1,"type":"diag_turn_end","data":{"trace_id":"0123456789ab","depth":0,"turn":1,"tool_calls":2}}
 {"v":1,"type":"diag_model_request","data":{"trace_id":"0123456789ab","depth":0,"turn":1,"attempt":1,"elapsed_ms":30,"outcome":"ok"}}

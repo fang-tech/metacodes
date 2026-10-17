@@ -39,6 +39,7 @@ const ToolDefinition = @import("../json.zig").ToolDefinition;
 const tool_observation_journal = @import("tool_observation_journal.zig");
 const util_fs = @import("../util/fs.zig");
 const prompt_sections = @import("prompt_sections.zig");
+const goal_mod = @import("goal.zig");
 const system_prompt_mod = @import("system_prompt.zig");
 const run_input = @import("run_input.zig");
 
@@ -814,6 +815,8 @@ pub const RestoredSessionState = struct {
     last_run_id: u64,
     last_compact_id: u64,
     conversation: *Conversation,
+    /// Issue #277: the checkpoint's goal, deep-cloned like the Conversation.
+    goal: ?*const goal_mod.Goal = null,
 };
 
 /// Borrowed committed state protected by the Session's checkpointing activity.
@@ -1268,6 +1271,11 @@ pub const AgentSession = struct {
     /// Manifest of the system prompt the latest Run sent; a Run whose prompt
     /// differs delivers its manifest as a `prompt_manifest` event.
     last_prompt_manifest: ?prompt_sections.OwnedManifest = null,
+    /// Issue #277: the Session's goal, changed only while idle (`setGoal`,
+    /// `updateGoal`, `clearGoal`) or by its own Runs through `goal_meter`.
+    goal_state: goal_mod.State,
+    /// Charges `goal_state` for each Run; points into this Session.
+    goal_meter: goal_mod.Meter = undefined,
     abort_signal: AbortSignal,
     compact_abort_signal: AbortSignal,
     active_sink: ?EventSink = null,
@@ -1409,6 +1417,11 @@ pub const AgentSession = struct {
         else
             Conversation.init(allocator);
         errdefer conversation.deinit();
+        var goal_state = goal_mod.State.init(allocator);
+        errdefer goal_state.deinit();
+        if (hooks.restored) |restored| if (restored.goal) |g| {
+            goal_state.current = try g.clone(allocator);
+        };
 
         var owned_provider = try provider_factory.makeProviderWithOptions(
             allocator,
@@ -1473,6 +1486,7 @@ pub const AgentSession = struct {
             .host_run_ui_requester = config.run_ui_requester,
             .host_identity_ctx = config.host_identity_ctx,
             .prompt_profile = prompt_profile,
+            .goal_state = goal_state,
             .abort_signal = AbortSignal.init(),
             .compact_abort_signal = AbortSignal.init(),
             .run_inputs = run_input.Queue.init(allocator, .{}),
@@ -1489,6 +1503,7 @@ pub const AgentSession = struct {
             else
                 0,
         };
+        self.goal_meter = goal_mod.Meter.init(&self.goal_state);
         self.permission_ctx.session_rules = &self.session_rules;
         self.permission_ctx.settings = if (self.imported_permission_rules) |*rules|
             rules
@@ -1549,6 +1564,7 @@ pub const AgentSession = struct {
         self.tools.deinit();
         self.workspace.deinit();
         self.prompt_profile.deinit();
+        self.goal_state.deinit();
         self.model_capabilities.deinit();
         if (self.last_prompt_manifest) |*manifest| manifest.deinit();
         allocator.free(self.artifact_root);
@@ -1955,6 +1971,56 @@ pub const AgentSession = struct {
     /// Session from mutating: during its own Run, compact or checkpoint lease.
     pub fn promptProfile(self: *const AgentSession) prompt_sections.Profile {
         return self.prompt_profile.profile();
+    }
+
+    pub const GoalMutationError = goal_mod.State.UpdateError || error{ SessionBusy, InvalidSessionState };
+
+    /// The Session's goal (issue #277), or null. Valid while the caller keeps
+    /// the Session from mutating, as for `promptProfile`.
+    pub fn currentGoal(self: *const AgentSession) ?*const goal_mod.Goal {
+        return if (self.goal_state.current) |*g| g else null;
+    }
+
+    /// Replaces any goal with a new active one (new id, usage from zero).
+    /// Idle-only, like `setPromptProfile`; a refusal changes nothing.
+    pub fn setGoal(self: *AgentSession, objective: []const u8, token_budget: ?u64) GoalMutationError!void {
+        try self.beginGoalMutation();
+        defer self.endGoalMutation();
+        self.goal_state.setNew(objective, token_budget) catch |err| return switch (err) {
+            error.EmptyObjective, error.ObjectiveTooLong, error.InvalidObjective, error.InvalidBudget, error.OutOfMemory => |e| e,
+        };
+    }
+
+    /// Applies `changes` to the goal together or not at all. Idle-only.
+    pub fn updateGoal(self: *AgentSession, changes: goal_mod.State.Update) GoalMutationError!void {
+        try self.beginGoalMutation();
+        defer self.endGoalMutation();
+        try self.goal_state.update(changes);
+    }
+
+    /// Removes the goal; without one, changes nothing. Idle-only.
+    pub fn clearGoal(self: *AgentSession) error{ SessionBusy, InvalidSessionState }!void {
+        try self.beginGoalMutation();
+        defer self.endGoalMutation();
+        self.goal_state.clearInMemory();
+    }
+
+    fn beginGoalMutation(self: *AgentSession) error{ SessionBusy, InvalidSessionState }!void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.in_flight_provider_cancels != 0) return error.SessionBusy;
+        switch (self.state) {
+            .idle => self.state = .mutating,
+            .running, .abort_requested, .compacting, .compact_finishing, .mutating, .checkpointing => return error.SessionBusy,
+            .poisoned, .destroying => return error.InvalidSessionState,
+        }
+    }
+
+    fn endGoalMutation(self: *AgentSession) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        std.debug.assert(self.state == .mutating);
+        self.state = .idle;
     }
 
     /// Manifest of the system prompt the latest Run sent, or null before the
@@ -2437,6 +2503,7 @@ pub const AgentSession = struct {
                 .parent_model = self.model,
                 .colorize = false,
                 .system_prompt = system_prompt,
+                .goal_meter = &self.goal_meter,
             },
             &backend,
             self.allocator,

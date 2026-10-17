@@ -12,6 +12,28 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Added
 
+- Session goals at every entry point, and in AgentCore (issue #277).
+  - **One set of rules.** `core.goal` owns the status table: pause needs an
+    active goal, resuming a goal whose budget is used up is refused until the
+    budget is raised (in the same update if wanted), a complete goal cannot be
+    blocked. Refusals change nothing; objectives are 1-4000 code points.
+  - **Accounting by the agent loop.** Each provider response's non-cached
+    input plus output (automatic compaction included) is charged to the goal
+    a Run began on while active, and the Run's time when it ends - a Run that
+    ends in an error included. A budget used up mid-Run makes the goal
+    `budget_limited` and asks the model once, at the next turn, to wrap up;
+    the Run is not cut off.
+  - **CLI.** REPL, web, daemon, forked Skills and headless all charge the
+    session's goal (web, daemon and headless never did, though a resumed
+    daemon session loaded it), and goal.json is written whenever it changes.
+    `/goal resume` past a used-up budget now says so instead of reactivating.
+  - **AgentCore Revision 23.** A sixth root table, `goal`, with `get` (JSON),
+    `set`, `update` (objective, budget and action together or not at all)
+    and `clear`; the root grows from 64 to 72 bytes. A
+    `RUN_INPUT_GOAL_CONTINUATION` Run's input is written by the runtime from
+    the goal. Status 30 `GOAL_CONFLICT`; the `goal_updated` event; a goal
+    section in checkpoints (marker 10), admitted against the durable budget.
+  - SDK 0.10.0-dev.
 - Date and time zone for the model at every entry point (issue #276).
   - **CLI.** The user-context message always states the date the session
     started on, with its time zone - without CLAUDE.md, memory or KG, and

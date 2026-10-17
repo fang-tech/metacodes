@@ -6,10 +6,10 @@
 #include <string.h>
 
 #if defined(METASK_AGENTCORE_CALLBACK_CONTINUE) || defined(METASK_AGENTCORE_CALLBACK_FATAL)
-#error "revision 22 must not retain historical callback aliases"
+#error "revision 23 must not retain historical callback aliases"
 #endif
 
-#if METASK_AGENTCORE_ABI_REVISION != 22u || \
+#if METASK_AGENTCORE_ABI_REVISION != 23u || \
     METASK_AGENTCORE_MAX_SUBMITTED_INPUTS_V1 != 64u || \
     METASK_AGENTCORE_MAX_SUBMITTED_INPUT_BYTES_V1 != 16777216u || \
     METASK_AGENTCORE_PROMPT_OP_ADD != 1u || \
@@ -44,8 +44,19 @@
     METASK_AGENTCORE_MCP_ERA_2025_06_18 != 3u || \
     METASK_AGENTCORE_MCP_APPLY_APPLIED != 1u || \
     METASK_AGENTCORE_MCP_APPLY_SUPERSEDED != 2u || \
-    METASK_AGENTCORE_MCP_APPLY_REJECTED != 3u
-#error "source-free Revision 22 codes must match the public contract"
+    METASK_AGENTCORE_MCP_APPLY_REJECTED != 3u || \
+    METASK_AGENTCORE_STATUS_GOAL_CONFLICT != 30u || \
+    METASK_AGENTCORE_RUN_INPUT_GOAL_CONTINUATION != 4u || \
+    METASK_AGENTCORE_GOAL_FIELD_OBJECTIVE != 1u || \
+    METASK_AGENTCORE_GOAL_FIELD_TOKEN_BUDGET != 2u || \
+    METASK_AGENTCORE_GOAL_FIELD_ACTION != 4u || \
+    METASK_AGENTCORE_GOAL_ACTION_PAUSE != 1u || \
+    METASK_AGENTCORE_GOAL_ACTION_ACTIVATE != 2u || \
+    METASK_AGENTCORE_GOAL_ACTION_COMPLETE != 3u || \
+    METASK_AGENTCORE_GOAL_ACTION_BLOCK != 4u || \
+    METASK_AGENTCORE_MAX_GOAL_OBJECTIVE_CODEPOINTS_V1 != 4000u || \
+    METASK_AGENTCORE_MAX_GOAL_OBJECTIVE_BYTES_V1 != 16384u
+#error "source-free Revision 23 codes must match the public contract"
 #endif
 
 #ifdef _WIN32
@@ -180,6 +191,8 @@ struct test_server {
     struct needle_scan scan;
     /* Revision 22: the runtime's time context for the UTC-offset Run. */
     struct needle_scan time_scan;
+    /* Revision 23: the input the runtime writes for a goal continuation. */
+    struct needle_scan goal_scan;
 };
 
 static int socket_is_valid(socket_handle fd) {
@@ -226,7 +239,8 @@ static int write_all(socket_handle fd, const void *bytes, size_t len) {
 }
 
 static int read_request(socket_handle fd, struct needle_scan *scan,
-                        struct needle_scan *time_scan) {
+                        struct needle_scan *time_scan,
+                        struct needle_scan *goal_scan) {
     char header[64 * 1024 + 1];
     size_t total = 0;
     char *end = NULL;
@@ -240,6 +254,7 @@ static int read_request(socket_handle fd, struct needle_scan *scan,
     if (end == NULL) return -1;
     scan_feed(scan, header, total);
     scan_feed(time_scan, header, total);
+    scan_feed(goal_scan, header, total);
     size_t header_len = (size_t)(end - header) + 4;
     size_t content_len = 0;
     char *length = strstr(header, "Content-Length:");
@@ -252,6 +267,7 @@ static int read_request(socket_handle fd, struct needle_scan *scan,
         if (count <= 0) return -1;
         scan_feed(scan, discard, (size_t)count);
         scan_feed(time_scan, discard, (size_t)count);
+        scan_feed(goal_scan, discard, (size_t)count);
         body_read += (size_t)count;
     }
     return 0;
@@ -286,7 +302,8 @@ static void *serve_rounds(void *raw) {
             THREAD_RETURN;
         }
         if (!socket_is_valid(client) ||
-            read_request(client, &server->scan, &server->time_scan) != 0) {
+            read_request(client, &server->scan, &server->time_scan,
+                         &server->goal_scan) != 0) {
             if (socket_is_valid(client)) close_socket(client);
             server->result = -1;
             THREAD_RETURN;
@@ -325,6 +342,8 @@ static int start_server(struct test_server *server, int rounds,
     }
     server->time_scan.needle = "Time zone: UTC+05:30.";
     server->time_scan.needle_len = strlen(server->time_scan.needle);
+    server->goal_scan.needle = "Continue working toward the active goal.";
+    server->goal_scan.needle_len = strlen(server->goal_scan.needle);
 #ifdef _WIN32
     WSADATA winsock;
     if (WSAStartup(MAKEWORD(2, 2), &winsock) != 0) return -1;
@@ -493,6 +512,24 @@ static int description_contains(const metask_agentcore_api_v1 *api,
     return scan.found;
 }
 
+/* Revision 23: whether goal->get's JSON contains `needle`. */
+static int goal_contains(const metask_agentcore_api_v1 *api,
+                         metask_agentcore_session *session,
+                         const char *needle) {
+    metask_agentcore_owned_bytes_v1 goal = {0};
+    metask_agentcore_owned_bytes_v1 diagnostic = {0};
+    struct needle_scan scan = {0};
+    if (api->goal->get(session, &goal, &diagnostic) != METASK_AGENTCORE_STATUS_OK) {
+        api->buffer_release(&diagnostic);
+        return 0;
+    }
+    scan.needle = needle;
+    scan.needle_len = strlen(needle);
+    scan_feed(&scan, (const char *)goal.ptr, (size_t)goal.len);
+    api->buffer_release(&goal);
+    return scan.found;
+}
+
 static uint32_t host_stream(
     void *ctx, const metask_agentcore_run_context_v1 *run,
     metask_agentcore_bytes_view_v1 arguments,
@@ -625,7 +662,7 @@ int main(int argc, char **argv) {
         return release_error(api, &diagnostic, 13);
     }
     struct test_server server;
-    if (start_server(&server, 2, "\"data\":\"aWNvbi1ieXRlcw==\"") != 0) {
+    if (start_server(&server, 3, "\"data\":\"aWNvbi1ieXRlcw==\"") != 0) {
         api->runtime->destroy(runtime, &diagnostic);
         return release_error(api, &diagnostic, 14);
     }
@@ -962,16 +999,57 @@ int main(int argc, char **argv) {
     run_status = api->session->run_input(session, 2, &multimodal, &offset_options,
                                          &result, &diagnostic);
     active_run_id = 0;
-    stop_server(&server);
     if (run_status != METASK_AGENTCORE_STATUS_OK ||
         result.stop_reason_code != METASK_AGENTCORE_STOP_END_TURN ||
-        event_calls == 0 || server.result != 0 || !server.scan.found ||
-        !server.time_scan.found) {
+        event_calls == 0 || !server.scan.found || !server.time_scan.found) {
         api->buffer_release(&diagnostic);
+        stop_server(&server);
         api->session->destroy(session, &diagnostic);
         api->buffer_release(&diagnostic);
         api->runtime->destroy(runtime, &diagnostic);
         return release_error(api, &diagnostic, 24);
+    }
+
+    /* Revision 23: the Host sets a goal; a goal-continuation Run, whose
+     * input the runtime writes, works toward it and is charged to it. Once
+     * paused, the goal cannot be continued and nothing is sent. */
+    {
+        metask_agentcore_goal_set_v1 goal = {0};
+        metask_agentcore_goal_update_v1 pause = {0};
+        metask_agentcore_run_input_v1 continuation = {0};
+        goal.struct_size = (uint32_t)sizeof(goal);
+        goal.objective = view("ship the C consumer");
+        goal.token_budget = 100000;
+        pause.struct_size = (uint32_t)sizeof(pause);
+        pause.fields = METASK_AGENTCORE_GOAL_FIELD_ACTION;
+        pause.action_code = METASK_AGENTCORE_GOAL_ACTION_PAUSE;
+        continuation.struct_size = (uint32_t)sizeof(continuation);
+        continuation.kind_code = METASK_AGENTCORE_RUN_INPUT_GOAL_CONTINUATION;
+        int goal_ok = goal_contains(api, session, "{\"goal\":null}") &&
+                      api->goal->set(session, &goal, &diagnostic) == METASK_AGENTCORE_STATUS_OK &&
+                      goal_contains(api, session, "\"status\":\"active\"") &&
+                      goal_contains(api, session, "\"tokens_used\":0,");
+        active_run_id = 3;
+        run_status = goal_ok ? api->session->run_input(session, 3, &continuation,
+                                                       &options, &result, &diagnostic)
+                             : METASK_AGENTCORE_STATUS_INTERNAL_ERROR;
+        active_run_id = 0;
+        stop_server(&server);
+        if (run_status != METASK_AGENTCORE_STATUS_OK ||
+            result.stop_reason_code != METASK_AGENTCORE_STOP_END_TURN ||
+            server.result != 0 || !server.goal_scan.found ||
+            goal_contains(api, session, "\"tokens_used\":0,") ||
+            api->goal->update(session, &pause, &diagnostic) != METASK_AGENTCORE_STATUS_OK ||
+            !goal_contains(api, session, "\"status\":\"paused\"") ||
+            api->session->run_input(session, 4, &continuation, &options, &result,
+                                    &diagnostic) != METASK_AGENTCORE_STATUS_GOAL_CONFLICT) {
+            api->buffer_release(&diagnostic);
+            api->session->destroy(session, &diagnostic);
+            api->buffer_release(&diagnostic);
+            api->runtime->destroy(runtime, &diagnostic);
+            return release_error(api, &diagnostic, 26);
+        }
+        api->buffer_release(&diagnostic);
     }
     if (api->session->destroy(session, &diagnostic) != METASK_AGENTCORE_STATUS_OK) {
         api->buffer_release(&diagnostic);
@@ -982,6 +1060,6 @@ int main(int argc, char **argv) {
         return release_error(api, &diagnostic, 20);
     }
     api->buffer_release(&diagnostic);
-    puts("AgentCore source-free C consumer: ABI table, callback, active-Run input, multimodal input and lifecycle OK");
+    puts("AgentCore source-free C consumer: ABI table, callback, active-Run input, multimodal input, goal and lifecycle OK");
     return 0;
 }

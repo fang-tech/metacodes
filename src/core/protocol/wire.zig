@@ -20,7 +20,10 @@
 //! `data` is the CoreEvent payload with the field names of
 //! core/protocol/ui_event.zig, except `prompt_manifest`, whose digests are
 //! lowercase hex in the run journal's shape:
-//! `{"sha256":"<hex>","sections":[{"id","order","origin","class","sha256"}]}`.
+//! `{"sha256":"<hex>","sections":[{"id","order","origin","class","sha256"}]}`,
+//! and `goal_updated`, the goal as goal.json and AgentCore's `goal->get` write
+//! it: `{"id","objective","status","token_budget","tokens_used","time_used_ms",
+//! "created_at_ms","updated_at_ms"}`.
 //! UI request payloads are spelled out below, so the internal structs behind
 //! them may change freely:
 //!
@@ -49,6 +52,7 @@ const ui_request = @import("ui_request.zig");
 const util_json = @import("../../util/json.zig");
 const PermissionChoice = @import("permission_choice.zig").PermissionChoice;
 const prompt_sections = @import("../prompt_sections.zig");
+const goal = @import("../goal.zig");
 
 const CoreEvent = ui_event.CoreEvent;
 const UiRequest = ui_request.UiRequest;
@@ -178,10 +182,33 @@ fn writeEventToWith(json: *std.json.Stringify, context: ?RunContext, event: Core
     try json.objectField("data");
     switch (event) {
         .prompt_manifest => |manifest| try writeManifest(json, manifest),
+        .goal_updated => |updated| try writeGoal(json, updated),
         inline else => |payload| {
             if (@TypeOf(payload) == void) try json.write(null) else try json.write(payload);
         },
     }
+    try json.endObject();
+}
+
+/// Field for field as `goal.writeJson`, so every surface spells a goal alike.
+fn writeGoal(json: *std.json.Stringify, updated: *const goal.Goal) std.json.Stringify.Error!void {
+    try json.beginObject();
+    try json.objectField("id");
+    try json.write(updated.id[0..]);
+    try json.objectField("objective");
+    try json.write(updated.objective);
+    try json.objectField("status");
+    try json.write(@tagName(updated.status));
+    try json.objectField("token_budget");
+    try json.write(updated.token_budget);
+    try json.objectField("tokens_used");
+    try json.write(updated.tokens_used);
+    try json.objectField("time_used_ms");
+    try json.write(updated.time_used_ms);
+    try json.objectField("created_at_ms");
+    try json.write(updated.created_at_ms);
+    try json.objectField("updated_at_ms");
+    try json.write(updated.updated_at_ms);
     try json.endObject();
 }
 

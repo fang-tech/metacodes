@@ -486,6 +486,10 @@ pub const App = struct {
     tasks: TaskStore,
     /// Session-scoped objective state for /goal and /loop.
     goal_state: GoalState,
+    /// Issue #277: charges `goal_state` for every Run on this App - REPL,
+    /// web, daemon, headless alike - and writes goal.json when it changes.
+    /// Set once `app` has its final address.
+    goal_meter: ?@import("core/goal.zig").Meter = null,
     /// User-controlled automatic continuation. /loop on sets enabled + remaining budget;
     /// the REPL starts continuations only from idle boundaries via agent_loop.run().
     loop_enabled: bool = false,
@@ -980,6 +984,10 @@ pub const App = struct {
         const session_start = @import("util/time.zig").nowUnix();
         const session_zone = time_context.systemZone(session_start);
         app.time_announcer = time_context.Announcer.init(session_start, &session_zone, time_context.Announcer.defaultNow);
+        app.goal_meter = .{
+            .state = &app.goal_state,
+            .observer = .{ .ctx = app, .changed = goalChanged },
+        };
         app.user_context = @import("core/memory/user_context.zig").build(allocator, .{
             .cwd = app.cwdAbs(),
             .home = app.homeDir(),
@@ -2036,6 +2044,11 @@ pub const App = struct {
     /// Agent loop 每轮结束后调用一次，把 conversation 新增的 message 刷到 transcript。
     pub fn persistTranscript(app: *App) void {
         if (app.transcript_writer) |*w| w.flush(&app.conversation);
+    }
+
+    fn goalChanged(raw: *anyopaque, _: *const GoalState, _: @import("core/goal.zig").Meter.Change) void {
+        const app: *App = @ptrCast(@alignCast(raw));
+        app.persistGoal();
     }
 
     /// Persist the current /goal state into the active session directory.
