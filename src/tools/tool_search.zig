@@ -71,10 +71,20 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         // 动态(MCP)工具的名字模型未必记得,关键字匹配又是 AND 语义,一次猜错就该有出路。
         const available = try availableDeferredNames(ctx, allocator);
         defer allocator.free(available);
+        const resident = try availableResidentNames(ctx, allocator);
+        defer allocator.free(resident);
         if (available.len > 0) {
-            setDetail(ctx, allocator, "No deferred tool matched query \"{s}\". Deferred tools available right now: {s}. Use select:<exact_name> to fetch one, or fewer keywords (every keyword must appear in one tool's name or description).", .{ query, available });
+            if (resident.len > 0) {
+                setDetail(ctx, allocator, "No deferred tool matched query \"{s}\". ToolSearch only searches deferred tools. Resident tools already in your tool list are directly callable; use them without ToolSearch (available directly: {s}). Deferred tools available right now: {s}. Use select:<exact_name> to fetch one, or fewer keywords (every keyword must appear in one tool's name or description).", .{ query, resident, available });
+            } else {
+                setDetail(ctx, allocator, "No deferred tool matched query \"{s}\". Deferred tools available right now: {s}. Use select:<exact_name> to fetch one, or fewer keywords (every keyword must appear in one tool's name or description).", .{ query, available });
+            }
         } else {
-            setDetail(ctx, allocator, "No deferred tool matched query \"{s}\": no deferred tools are registered in this session (no MCP server or plugin tool is connected). Use the tools already in your tool list.", .{query});
+            if (resident.len > 0) {
+                setDetail(ctx, allocator, "No deferred tool matched query \"{s}\": no deferred tools are registered in this session (no MCP server or plugin tool is connected). ToolSearch only searches deferred tools; resident tools already in your tool list are directly callable without ToolSearch (available directly: {s}).", .{ query, resident });
+            } else {
+                setDetail(ctx, allocator, "No deferred tool matched query \"{s}\": no deferred tools are registered in this session (no MCP server or plugin tool is connected). Use the tools already in your tool list.", .{query});
+            }
         }
         return error.NoToolMatch;
     }
@@ -115,19 +125,34 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
 pub const MAX_LISTED_NAMES: usize = 40;
 
 fn availableDeferredNames(ctx: *const ToolContext, allocator: std.mem.Allocator) ![]u8 {
+    return availableNames(ctx, allocator, true);
+}
+
+/// Names of resident tools that can be called without ToolSearch. Keeping this
+/// in the no-match diagnostic prevents a failed deferred lookup from being
+/// misread as a lack of core tools such as Read, Write, or Bash.
+fn availableResidentNames(ctx: *const ToolContext, allocator: std.mem.Allocator) ![]u8 {
+    return availableNames(ctx, allocator, false);
+}
+
+fn availableNames(ctx: *const ToolContext, allocator: std.mem.Allocator, comptime want_deferred: bool) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
     var count: usize = 0;
     var omitted: usize = 0;
     for (tools.registry) |*t| {
-        if (!t.deferred) continue;
+        if (t.deferred != want_deferred) continue;
+        // ToolSearch itself is the discovery mechanism, not a resident tool
+        // the model should retry after a failed search.
+        if (!want_deferred and std.mem.eql(u8, t.name, "ToolSearch")) continue;
         if (t.tinykg_gated and ctx.kg == null) continue;
+        if (t.swarm_gated and ctx.swarm == null) continue;
         if (ctx.execution_policy) |policy| if (!policy.allowsTool(t.name)) continue;
         try appendName(allocator, &out, t.name, &count, &omitted);
     }
     if (ctx.dyn_registry) |dr| {
         for (dr.entries.items) |*e| {
-            if (!e.deferred) continue;
+            if (e.deferred != want_deferred) continue;
             if (ctx.execution_policy) |policy| if (!policy.allowsTool(e.name)) continue;
             try appendName(allocator, &out, e.name, &count, &omitted);
         }
@@ -251,8 +276,14 @@ test "ToolSearch: 落空时 detail 列出当前可激活的 deferred 工具名(�
     const d = detail orelse return error.TestExpectedDetail;
     try testing.expect(std.mem.indexOf(u8, d, "knowforge__search") != null);
     try testing.expect(std.mem.indexOf(u8, d, "knowforge__overview") != null);
-    try testing.expect(std.mem.indexOf(u8, d, "skill__resident") == null);
+    try testing.expect(std.mem.indexOf(u8, d, "skill__resident") != null);
     try testing.expect(std.mem.indexOf(u8, d, "select:<exact_name>") != null);
+    // A miss in the deferred pool must not imply that the core tools vanished;
+    // they are already callable without another ToolSearch round trip.
+    try testing.expect(std.mem.indexOf(u8, d, "ToolSearch only searches deferred tools") != null);
+    try testing.expect(std.mem.indexOf(u8, d, "directly callable") != null);
+    try testing.expect(std.mem.indexOf(u8, d, "Read") != null);
+    try testing.expect(std.mem.indexOf(u8, d, "Bash") != null);
     // 静态 deferred 受同样的门控:唯一的静态 deferred(FormalAuditTask)是 TinyKG 门控,
     // 本 ctx 没有 kg → 不列(列了模型也激活不了)。
     try testing.expect(std.mem.indexOf(u8, d, "FormalAuditTask") == null);
@@ -317,5 +348,11 @@ test "ToolSearch: 关键字不命中常驻内置工具(它们非 deferred)" {
     var detail: ?[]const u8 = null;
     const ctx = ToolContext{ .allocator = a, .error_detail = &detail };
     try testing.expectError(error.NoToolMatch, execute(&ctx, "{\"query\":\"edit file\"}"));
-    if (detail) |d| a.free(d);
+    const d = detail orelse return error.TestExpectedDetail;
+    defer a.free(d);
+    try testing.expect(std.mem.indexOf(u8, d, "ToolSearch only searches deferred tools") != null);
+    try testing.expect(std.mem.indexOf(u8, d, "directly callable") != null);
+    try testing.expect(std.mem.indexOf(u8, d, "Read") != null);
+    try testing.expect(std.mem.indexOf(u8, d, "Write") != null);
+    try testing.expect(std.mem.indexOf(u8, d, "Bash") != null);
 }
