@@ -40,6 +40,9 @@ const tool_observation_journal = @import("tool_observation_journal.zig");
 const util_fs = @import("../util/fs.zig");
 const prompt_sections = @import("prompt_sections.zig");
 const goal_mod = @import("goal.zig");
+const swarm_context = @import("../swarm/context.zig");
+const swarm_team = @import("../swarm/team.zig");
+const swarm_mailbox = @import("../swarm/mailbox.zig");
 const system_prompt_mod = @import("system_prompt.zig");
 const run_input = @import("run_input.zig");
 
@@ -57,7 +60,22 @@ pub const DEFAULT_BUILTIN_TOOLS = first_party_plugins.CODING_TOOLS ++ first_part
 /// implementation and the Host does not register an executor callback.
 pub const SESSION_BUILTIN_TOOLS = DEFAULT_BUILTIN_TOOLS ++ [_][]const u8{"AskUserQuestion"};
 
+/// Issue #277: the team tools, admissible only when the Runtime enables teams
+/// (`RuntimeConfig.enable_teams`). Unlike Task they are Session-owned — their
+/// whole dependency is the Session's `SwarmContext` — so they do not violate
+/// the process-level-tool exclusion. `SpawnTeammate` records a host spawn
+/// request; the Host, not the runtime, creates the teammate Session.
+pub const TEAM_BUILTIN_TOOLS = [_][]const u8{ "TeamCreate", "TeamDelete", "SendMessage", "SpawnTeammate" };
+
+pub fn isTeamBuiltin(name: []const u8) bool {
+    for (TEAM_BUILTIN_TOOLS) |supported| {
+        if (std.mem.eql(u8, supported, name)) return true;
+    }
+    return false;
+}
+
 pub fn isSessionBuiltin(name: []const u8) bool {
+    if (isTeamBuiltin(name)) return true;
     for (SESSION_BUILTIN_TOOLS) |supported| {
         if (std.mem.eql(u8, supported, name)) return true;
     }
@@ -69,6 +87,91 @@ fn containsToolName(names: []const []const u8, needle: []const u8) bool {
         if (std.mem.eql(u8, name, needle)) return true;
     }
     return false;
+}
+
+/// Issue #277: the host-scheduled `SwarmContext` for `config.team`. A lead
+/// starts with no team on disk (its `TeamCreate` / `team->create` makes it);
+/// a member joins the roster of an existing team and ensures its own inbox.
+/// `out_self_name` receives the member's Session-owned name buffer (the lead
+/// keeps the static "team-lead").
+fn buildSwarmContext(
+    allocator: std.mem.Allocator,
+    team: TeamConfig,
+    own_session_id: SessionId,
+    state_root: []const u8,
+    out_self_name: *?[]u8,
+) !swarm_context.SwarmContext {
+    if (state_root.len == 0) return error.TeamStateRootRequired;
+    switch (team.role) {
+        .lead => return .{
+            .allocator = allocator,
+            .scheduler = .host,
+            .is_lead = true,
+            .session = own_session_id,
+            .state_root = state_root,
+        },
+        .member => {
+            if (team.member_name.len == 0 or team.team_name.len == 0) return error.InvalidTeamConfig;
+            const lead_session = SessionId.fromSlice(team.lead_session_id) orelse return error.InvalidTeamConfig;
+            const lease = SessionId.fromSlice(team.member_lease) orelse return error.InvalidTeamConfig;
+            var name_buf: [64]u8 = undefined;
+            const name_s = swarm_team.sanitizeAgentName(team.member_name, &name_buf);
+            if (name_s.len == 0 or std.mem.eql(u8, name_s, swarm_team.TEAM_LEAD_NAME)) return error.InvalidTeamConfig;
+
+            const self_name = try allocator.dupe(u8, name_s);
+            errdefer allocator.free(self_name);
+            const team_name = try allocator.dupe(u8, team.team_name);
+            errdefer allocator.free(team_name);
+
+            var cfg_buf: [std.fs.max_path_bytes]u8 = undefined;
+            const cfg = swarm_team.configPath(state_root, team_name, &cfg_buf);
+            const JoinCtx = struct {
+                name: []const u8,
+                team: []const u8,
+                session: []const u8,
+                lease: []const u8,
+                fn mutate(c: @This(), tf: *swarm_team.TeamFile) anyerror!void {
+                    // A member rejoining under the same identity is idempotent.
+                    if (tf.findMember(c.name)) |existing| {
+                        const es = existing.session_id orelse return error.InvalidTeamConfig;
+                        const el = existing.lease_id orelse return error.InvalidTeamConfig;
+                        if (std.mem.eql(u8, es, c.session) and std.mem.eql(u8, el, c.lease)) return;
+                        return error.InvalidTeamConfig; // a different worker holds this name
+                    }
+                    var agent_id_buf: [96]u8 = undefined;
+                    const agent_id = swarm_team.formatAgentId(c.name, c.team, &agent_id_buf) orelse return error.InvalidTeamConfig;
+                    try tf.addMember(.{
+                        .agent_id = agent_id,
+                        .name = c.name,
+                        .session_id = c.session,
+                        .lease_id = c.lease,
+                        .backend_type = "process",
+                    });
+                }
+            };
+            try swarm_team.updateTeam(allocator, cfg, JoinCtx{
+                .name = name_s,
+                .team = team_name,
+                .session = lead_session.asSlice(),
+                .lease = lease.asSlice(),
+            }, JoinCtx.mutate);
+
+            var inbox_buf: [std.fs.max_path_bytes]u8 = undefined;
+            try swarm_mailbox.ensureInbox(swarm_team.inboxPath(state_root, team_name, name_s, &inbox_buf));
+
+            out_self_name.* = self_name;
+            return .{
+                .allocator = allocator,
+                .scheduler = .host,
+                .is_lead = false,
+                .session = lead_session,
+                .lease = lease,
+                .self_name = self_name,
+                .state_root = state_root,
+                .team_sanitized = team_name,
+            };
+        },
+    }
 }
 
 test "WebSearch and WebFetch are AgentSession-owned builtins" {
@@ -148,6 +251,10 @@ pub const RuntimeConfig = struct {
     host_stream_tools: []const tool_catalog.HostStreamTool = &.{},
     static_plugins: []const plugin_runtime.StaticPlugin = &.{},
     process_plugins: []const plugin_runtime.PackageSource = &.{},
+    /// Issue #277: admit the team tools (`TEAM_BUILTIN_TOOLS`) into the
+    /// catalog so team Sessions can select them. Off by default — teams are
+    /// opt-in, as `--agent-teams` is in the CLI.
+    enable_teams: bool = false,
 };
 
 pub const HostSyncTool = tool_catalog.HostSyncTool;
@@ -241,6 +348,7 @@ pub const AgentRuntime = struct {
     ) !*AgentRuntime {
         if (config.builtin_tools) |explicit| {
             for (explicit) |name| {
+                if (isTeamBuiltin(name)) return error.UnsupportedBuiltinTool; // team tools come from enable_teams, not the explicit list
                 if (!isSessionBuiltin(name)) return error.UnsupportedBuiltinTool;
             }
         }
@@ -271,6 +379,11 @@ pub const AgentRuntime = struct {
             }
         }
         try builtin_tools.appendSlice(allocator, plugin_snapshot.builtin_tools);
+        if (config.enable_teams) {
+            for (TEAM_BUILTIN_TOOLS) |name| {
+                if (!containsToolName(builtin_tools.items, name)) try builtin_tools.append(allocator, name);
+            }
+        }
         for (builtin_tools.items) |name| {
             if (!isSessionBuiltin(name)) return error.UnsupportedBuiltinTool;
         }
@@ -682,6 +795,27 @@ pub const SessionConfig = struct {
     /// default. A provider without an effort control refuses a non-null value
     /// at create with `error.AgentEffortUnsupportedProvider`.
     reasoning_effort: ?types.ReasoningEffort = null,
+    /// Issue #277: this Session's place in a host-scheduled team. Null is no
+    /// team. When set, the Runtime must have `enable_teams`, the team tools
+    /// are available, and the Session runs with a `host`-scheduled
+    /// `SwarmContext` rooted under the workspace state root.
+    team: ?TeamConfig = null,
+};
+
+/// Issue #277: a Session's team role. The lead creates the team and delegates
+/// (`SpawnTeammate` records a request the Host fulfils); a member joins the
+/// roster on create and talks through `SendMessage`.
+pub const TeamConfig = struct {
+    role: enum { lead, member },
+    /// The already-sanitized team name (the lead's `TeamCreate` also sets
+    /// this on disk; a member names the team it joins).
+    team_name: []const u8,
+    /// Member role only: this member's name and the lead's session id (24-hex)
+    /// it joins under, plus a fresh per-spawn lease (24-hex). A member with a
+    /// missing or malformed identity fails `create`.
+    member_name: []const u8 = "",
+    lead_session_id: []const u8 = "",
+    member_lease: []const u8 = "",
 };
 
 pub const Config = SessionConfig;
@@ -1276,6 +1410,16 @@ pub const AgentSession = struct {
     goal_state: goal_mod.State,
     /// Charges `goal_state` for each Run; points into this Session.
     goal_meter: goal_mod.Meter = undefined,
+    /// Issue #277: this Session's team membership, when `SessionConfig.team`
+    /// was set. Host-scheduled: the lead's `SpawnTeammate` records requests
+    /// the embedding Host fulfils; the runtime never starts a teammate. Null
+    /// for a Session with no team. The Run passes `&swarm.?` as the agent
+    /// loop's swarm context so the team tools execute.
+    swarm: ?swarm_context.SwarmContext = null,
+    /// Member role only: the Session-owned copy of this member's name that
+    /// `swarm.self_name` borrows (the lead's `self_name` is the static
+    /// "team-lead"). Freed at deinit.
+    swarm_self_name: ?[]u8 = null,
     abort_signal: AbortSignal,
     compact_abort_signal: AbortSignal,
     active_sink: ?EventSink = null,
@@ -1460,6 +1604,17 @@ pub const AgentSession = struct {
         var permission_ctx = permission.createContext(config.permission_mode, allocator);
         permission_ctx.session = session_id;
 
+        // Issue #277: this Session's host-scheduled team membership. Built from
+        // slices and ids, not `self` pointers, so it is assembled before the
+        // literal like `goal_state`. The member also joins the on-disk roster.
+        var swarm_self_name: ?[]u8 = null;
+        errdefer if (swarm_self_name) |n| allocator.free(n);
+        var swarm_ctx: ?swarm_context.SwarmContext = if (config.team) |team|
+            try buildSwarmContext(allocator, team, session_id, workspace.state_root, &swarm_self_name)
+        else
+            null;
+        errdefer if (swarm_ctx) |*s| s.deinit();
+
         self.* = .{
             .allocator = allocator,
             .runtime = runtime,
@@ -1487,6 +1642,8 @@ pub const AgentSession = struct {
             .host_identity_ctx = config.host_identity_ctx,
             .prompt_profile = prompt_profile,
             .goal_state = goal_state,
+            .swarm = swarm_ctx,
+            .swarm_self_name = swarm_self_name,
             .abort_signal = AbortSignal.init(),
             .compact_abort_signal = AbortSignal.init(),
             .run_inputs = run_input.Queue.init(allocator, .{}),
@@ -1565,6 +1722,8 @@ pub const AgentSession = struct {
         self.workspace.deinit();
         self.prompt_profile.deinit();
         self.goal_state.deinit();
+        if (self.swarm) |*s| s.deinit();
+        if (self.swarm_self_name) |n| allocator.free(n);
         self.model_capabilities.deinit();
         if (self.last_prompt_manifest) |*manifest| manifest.deinit();
         allocator.free(self.artifact_root);
@@ -2504,6 +2663,9 @@ pub const AgentSession = struct {
                 .colorize = false,
                 .system_prompt = system_prompt,
                 .goal_meter = &self.goal_meter,
+                // Issue #277: the team tools execute against this; the SWARM
+                // addendum rides the system prompt while a team is active.
+                .swarm = if (self.swarm) |*s| s else null,
             },
             &backend,
             self.allocator,

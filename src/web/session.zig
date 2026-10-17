@@ -426,6 +426,7 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, surface: server_mod.
 
     const be = wb.backend();
     var exit_code: u8 = 0;
+    var lead_mail = session_service_mod.LeadMail{};
 
     outer: while (true) {
         // ── 斜杠命令:driver 线程独占执行(唯一 conversation/allocator toucher,无并发)。
@@ -453,11 +454,13 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, surface: server_mod.
             // abort 二义:user_ctrl_c=真 SIGINT(退出进程)vs user_interrupt=浏览器 Stop
             // (只中断 run)。空闲期若 flag 亮:SIGINT → 退出;残留的 interrupt(门 race 漏进
             // 来的)→ 复位丢弃,继续等。
-            var msg = inbox.popFront() orelse {
+            var msg = inbox.popFront() orelse idle: {
                 if (app.abort.isAborted()) {
                     if (app.abort.reason() == .user_ctrl_c) break :outer;
                     app.abort.reset(); // 残留 interrupt,不退出
                 }
+                // #277: a teammate's reply is the lead's next turn.
+                if (lead_mail.take(app, web_alloc)) |text| break :idle Submission{ .text = text };
                 time.sleepMs(50);
                 continue;
             };

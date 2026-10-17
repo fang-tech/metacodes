@@ -275,9 +275,21 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         const sw = ctx.swarm orelse return error.SwarmUnavailable;
         if (!sw.is_lead) return error.NotTeamLead; // teammate 不 spawn teammate(扁平 roster)
         if (!sw.hasTeam()) return error.NoActiveTeam;
-        if (sw.teammates == null) return error.NoActiveTeam; // lead 无 registry(不该发生)
         const name = try util_json.unescapeString(name_raw, ctx.allocator);
         defer ctx.allocator.free(name);
+
+        // Issue #277: under the host scheduler the runtime starts no teammate.
+        // Record the request for the embedding Host to fulfil (it creates a
+        // teammate Session), and tell the model it was requested. The lead
+        // addresses the teammate once it has joined the roster.
+        if (sw.scheduler == .host) {
+            var name_buf: [64]u8 = undefined;
+            const name_s = @import("../swarm/team.zig").sanitizeAgentName(name, &name_buf);
+            if (name_s.len == 0) return error.BadName;
+            try sw.requestSpawn(name_s, prompt, subagent_type_raw, if (child_effort) |e| @tagName(e) else null);
+            return std.fmt.allocPrint(ctx.allocator, "{{\"teammate\":\"{s}\",\"backend\":\"host\",\"status\":\"requested\"}}", .{name_s});
+        }
+        if (sw.teammates == null) return error.NoActiveTeam; // lead 无 registry(不该发生)
 
         // SW6:进程外 backend(--teammate-mode process)→ fork+exec + worktree 隔离。
         if (sw.out_of_process) {

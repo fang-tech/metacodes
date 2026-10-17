@@ -34,6 +34,20 @@ status, compatibility boundaries, and entry points are defined by
     the goal. Status 30 `GOAL_CONFLICT`; the `goal_updated` event; a goal
     section in checkpoints (marker 10), admitted against the durable budget.
   - SDK 0.10.0-dev.
+- Host-scheduled teams in AgentCore and at the Swarm entry points (issue #277).
+  - **Host scheduler.** With `enable_teams`, a lead Session delegates with
+    `SpawnTeammate` by recording a spawn request instead of starting an
+    in-process thread; the embedding Host creates and runs each member
+    Session. `TeamCreate`, `TeamDelete`, `SendMessage` and `SpawnTeammate` are
+    Session-owned team builtins, admitted only by the flag. Team membership is
+    Host-supplied at create and restore and carries no checkpoint state.
+  - **AgentCore Revision 24.** A seventh root table, `team`, with `describe`
+    (team roster and pending spawns as JSON) and `poll` (the lead's next queued
+    input, marked read); the root grows from 72 to 80 bytes.
+    `RuntimeConfigV1.enable_teams` admits the team tools and
+    `SessionHostConfigV1.team` (`TeamConfigV1`, lead or member) joins a Session
+    to a team.
+  - SDK 0.11.0-dev.
 - Date and time zone for the model at every entry point (issue #276).
   - **CLI.** The user-context message always states the date the session
     started on, with its time zone - without CLAUDE.md, memory or KG, and

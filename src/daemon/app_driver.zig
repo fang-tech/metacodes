@@ -73,6 +73,7 @@ pub fn driverFn(host: *SessionHost, ctx: *anyopaque) void {
     const app_alloc = app.allocator; // agent_loop + scoped_recall(与 conversation 同源)
     const infra = host.allocator; // msg free / announceRunDone(线程安全 c_alloc)
     const be = dctx.wb.backend();
+    var lead_mail = @import("../session_service.zig").LeadMail{};
 
     while (!host.stopRequested()) {
         // U11:斜杠命令(host.cmdbox,transport 只入队)在 driver 独占点执行——与 web run()
@@ -97,8 +98,10 @@ pub fn driverFn(host: *SessionHost, ctx: *anyopaque) void {
         if (app.abort.isAborted() and app.abort.reason() == .user_interrupt) app.abort.reset();
 
         if (!pending_run) {
-            var msg = host.inbox.popFront() orelse {
+            var msg = host.inbox.popFront() orelse idle: {
                 reapAgentDone(app, &be, host.id, infra); // 空闲期也 reap:后台 job 可能在无新消息时完成
+                // #277: a teammate's reply is the lead's next turn.
+                if (lead_mail.take(app, infra)) |text| break :idle @import("../web/submission.zig").Submission{ .text = text };
                 time.sleepMs(50);
                 continue;
             };

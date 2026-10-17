@@ -94,6 +94,8 @@ const Fixture = struct {
         max_sessions: usize = 8,
         token: ?[]const u8 = null,
         uds: bool = false,
+        /// `--agent-teams`: sessions offer TeamCreate/SendMessage.
+        agent_teams: bool = false,
     };
 
     /// In place: `self` must be at its final address.
@@ -126,8 +128,9 @@ const Fixture = struct {
             try harness.MockServer.startCassette(options.responses, 0);
         errdefer self.provider.stop();
         const url = try arena.dupeZ(u8, try self.provider.urlOwned(arena));
-        const argv = [_][*:0]const u8{ "metacodes", "serve", "0", "--base-url", url.ptr, "--model", "test-model", "--permission", "bypassPermissions", "--no-lsp" };
-        var config = cc.parseArgsForTest(&argv, arena);
+        const base_argv = [_][*:0]const u8{ "metacodes", "serve", "0", "--base-url", url.ptr, "--model", "test-model", "--permission", "bypassPermissions", "--no-lsp" };
+        const teams_argv = base_argv ++ [_][*:0]const u8{"--agent-teams"};
+        var config = cc.parseArgsForTest(if (options.agent_teams) &teams_argv else &base_argv, arena);
         try std.testing.expect(config.parse_error == null);
         config.state_root = self.state_root;
 
@@ -1019,3 +1022,71 @@ test "#254 flags: --sessions N ≥ 0 and --max-sessions M ≥ 1 for serve only; 
     const plain = cc.parseArgsForTest(&.{ "metacodes", "serve" }, allocator);
     try std.testing.expectEqual(@as(?usize, null), plain.serve_sessions);
 }
+
+const swarm_team = cc.swarm_team;
+const swarm_mailbox = cc.swarm_mailbox;
+
+const AddMemberCtx = struct { name: []const u8, agent_id: []const u8, session: []const u8, lease: []const u8 };
+fn addMember(c: AddMemberCtx, tf: *swarm_team.TeamFile) anyerror!void {
+    // addMember copies the strings.
+    try tf.addMember(.{
+        .agent_id = c.agent_id,
+        .name = c.name,
+        .session_id = c.session,
+        .lease_id = c.lease,
+        .backend_type = "process",
+    });
+}
+
+test "#277 an idle daemon lead takes a teammate's reply as its next turn, without a new message" {
+    const a = std.testing.allocator;
+    var fx: Fixture = undefined;
+    try fx.setup(.{
+        .agent_teams = true,
+        .responses = &.{
+            toolUseSse("tu_team", "TeamCreate", "{\\\"name\\\":\\\"crew\\\"}"),
+            textSse("team ready"),
+            textSse("thanks solver"),
+        },
+    });
+    defer fx.deinit();
+
+    const id = try fx.create("");
+    const sse = try Stream.openSse(&fx, id);
+    defer sse.destroy();
+    try fx.message(id, "form a team");
+    try sse.waitFor("team ready");
+    try sse.waitFor("\"run_done\"");
+    try std.testing.expectEqual(@as(usize, 2), fx.provider.requestCount());
+
+    // A teammate of this lead session answers into the lead's inbox (what
+    // its SendMessage does), with the identity the roster records.
+    var config_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const config_path = swarm_team.configPath(fx.state_root, "crew", &config_buffer);
+    const lease = cc.session_id.gen();
+    try swarm_team.updateTeam(a, config_path, AddMemberCtx{
+        .name = "solver",
+        .agent_id = "solver@crew",
+        .session = id.asSlice(),
+        .lease = lease.asSlice(),
+    }, addMember);
+    var inbox_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const inbox = swarm_team.inboxPath(fx.state_root, "crew", swarm_team.TEAM_LEAD_NAME, &inbox_buffer);
+    try swarm_mailbox.deliverWithIdentity(a, inbox, "solver", "the answer is 42", null, "done", id.asSlice(), lease.asSlice());
+
+    // No message from the client: the idle driver delivers the mail itself.
+    try sse.waitFor("thanks solver");
+    const deadline = cc.util_time.nowMs() + 5000;
+    while (fx.provider.requestCount() < 3) {
+        if (cc.util_time.nowMs() >= deadline) return error.NoTurnForTheMail;
+        cc.util_time.sleepMs(20);
+    }
+    const third = (fx.provider.requestAt(2) orelse return error.MissingRequest).body();
+    try std.testing.expect(std.mem.indexOf(u8, third, "teammate_id=\\\"solver\\\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, third, "the answer is 42") != null);
+    // Read once: the next idle poll finds nothing, so no fourth request.
+    cc.util_time.sleepMs(3 * swarm_lead_poll_ms);
+    try std.testing.expectEqual(@as(usize, 3), fx.provider.requestCount());
+}
+
+const swarm_lead_poll_ms: u64 = @intCast(cc.session_service.LeadMail.POLL_MS);
