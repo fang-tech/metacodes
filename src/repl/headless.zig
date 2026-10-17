@@ -16,6 +16,8 @@ const app_mod = @import("../app.zig");
 const agent_loop = @import("../core/agent_loop.zig");
 const delivery_cadence_mod = @import("../core/delivery_cadence.zig");
 const check_gate_mod = @import("../core/check_gate.zig");
+const learning_turn_mod = @import("../core/learning_turn.zig");
+const learning_end_of_run_mod = @import("../core/learning_end_of_run.zig");
 const test_integrity_mod = @import("../core/test_integrity.zig");
 const stall_gate_mod = @import("../core/stall_gate.zig");
 const output_semantics = @import("../core/output_semantics.zig");
@@ -336,6 +338,10 @@ pub fn run(
             null,
     );
     run_options.obligations = obligation_runtime;
+    // Lesson headers name the run by its journal id (stable for the Run).
+    if (run_options.learning_turn) |*learning| if (run_control) |control| {
+        learning.run_label = control.journal.runId();
+    };
     // 输出语义账本:最终结果由 core 定性并组装。取代旧的 lastAssistantText 猜测——那个只看
     // conversation 最后一条 assistant message,分不清 commentary/final,也拼不回 max_tokens
     // 续写被拆成多条 message 的完整答案。
@@ -400,14 +406,39 @@ pub fn run(
                 lastAssistantText(&app.conversation, allocator) catch null;
             defer if (note_owned) |n| if (n.len > 0) allocator.free(n);
             const note: []const u8 = classified.text orelse (note_owned orelse "");
-            _ = host_check_mod.runAndIngest(
+            // End-of-run learning turn (learning_end_of_run.zig): only after an
+            // attempt that ended on its own, and only when the in-run turn did
+            // not already decide on a verdict.
+            const learning_mode = learning_end_of_run_mod.modeFor(
+                learning_turn_mod.modeFromFlags(app.config.learning_turn, app.config.learning_turn_observe),
+                result.learning,
+                result.stop_reason == .end_turn,
+            );
+            var learning_evidence: host_check_mod.Evidence = .{};
+            defer learning_evidence.deinit(allocator);
+            _ = host_check_mod.runAndIngestWithEvidence(
                 allocator,
                 known_graph,
                 pin,
                 hint,
                 note,
                 @intCast(@import("../util/time.zig").nowWallNs()),
+                if (learning_mode != null) &learning_evidence else null,
             );
+            if (learning_mode) |mode| {
+                _ = learning_end_of_run_mod.run(allocator, .{
+                    .kg = known_graph,
+                    .provider = app.provider(),
+                    .session = app.session_id.asSlice(),
+                    .abort = &app.abort,
+                }, .{
+                    .mode = mode,
+                    .evidence = &learning_evidence,
+                    .task_hint = hint,
+                    .run_label = if (run_control) |control| control.journal.runId() else "",
+                    .final_note = note,
+                });
+            }
         }
         const control = run_control orelse break :evolve;
         const binding = control.journal.runBinding() catch break :evolve;
@@ -510,6 +541,7 @@ pub fn buildOptions(
     execution_boundary: ?@import("../core/execution_effect.zig").Boundary,
     project_rule_gate: ?@import("../tools/context.zig").ProjectRuleGate,
 ) agent_loop.Options {
+    const check_gate = check_gate_mod.optionsFromFlags(app.config.host_check_command, app.config.check_gate, app.config.check_gate_observe, app.config.check_gate_max);
     return .{
         // R2/F3:run 身份用真实 session id(此前缺省 SessionId.single——RunControl/
         // transcript 用真 id 而 agent_loop 内 KG 任务 claim/lease 归属却是 single,
@@ -542,7 +574,14 @@ pub fn buildOptions(
         // Print mode carries evaluation rollouts whose stop-reason sets are
         // fixed: the stall gate runs here only when asked for.
         .stall_gate = stall_gate_mod.modeFor(app.config.stall_gate, .headless),
-        .check_gate = check_gate_mod.optionsFromFlags(app.config.host_check_command, app.config.check_gate, app.config.check_gate_observe, app.config.check_gate_max),
+        .check_gate = check_gate,
+        // In-run learning turn where the check gate grounds it; the
+        // end-of-run form after the host check covers the rest (run()).
+        .learning_turn = learning_turn_mod.inRunOptions(
+            learning_turn_mod.modeFromFlags(app.config.learning_turn, app.config.learning_turn_observe),
+            check_gate != null,
+            learning_turn_mod.taskHintFromEnv(),
+        ),
         .test_integrity = test_integrity_mod.optionsFromFlags(app.config.test_integrity, app.config.test_integrity_observe),
         .delivery_cadence_thresholds = .{
             .first = app.config.delivery_cadence_first orelse delivery_cadence_mod.DEFAULT_FIRST_THRESHOLD,

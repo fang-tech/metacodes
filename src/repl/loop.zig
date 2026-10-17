@@ -20,6 +20,7 @@ const tools = @import("../tools.zig");
 const agent_loop = @import("../core/agent_loop.zig");
 const delivery_cadence_mod = @import("../core/delivery_cadence.zig");
 const check_gate_mod = @import("../core/check_gate.zig");
+const learning_turn_mod = @import("../core/learning_turn.zig");
 const test_integrity_mod = @import("../core/test_integrity.zig");
 const stall_gate_mod = @import("../core/stall_gate.zig");
 const host_injection_meter = @import("../core/host_injection_meter.zig");
@@ -824,6 +825,16 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
         // Host check gate: primary run only, same host-contract shape (a macro
         // run must not trigger a check or emit a second terminal record).
         run_opts.check_gate = check_gate_mod.optionsFromFlags(app.config.host_check_command, app.config.check_gate, app.config.check_gate_observe, app.config.check_gate_max);
+        // Learning turn: primary run only, armed where the check gate gives it
+        // a verdict; lesson headers name the run by its journal id.
+        run_opts.learning_turn = learning_turn_mod.inRunOptions(
+            learning_turn_mod.modeFromFlags(app.config.learning_turn, app.config.learning_turn_observe),
+            run_opts.check_gate != null,
+            learning_turn_mod.taskHintFromEnv(),
+        );
+        if (run_opts.learning_turn) |*learning| if (run_control) |control| {
+            learning.run_label = control.journal.runId();
+        };
         // Test integrity: primary run only, same host-contract shape. The end
         // state is printed after the run whatever the model did.
         var integrity_report = test_integrity_mod.Report.init(allocator);

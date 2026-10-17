@@ -92,6 +92,7 @@ pub const delivery_cadence = @import("core/delivery_cadence.zig"); // L2 deliver
 pub const progress_updates = @import("core/progress_updates.zig"); // L2 progress-update tests (#114)
 pub const check_gate = @import("core/check_gate.zig"); // L2 host check gate / Stop hook block tests
 pub const learning_turn = @import("core/learning_turn.zig"); // L2 learning turn tests
+pub const learning_end_of_run = @import("core/learning_end_of_run.zig"); // L2 end-of-run learning turn tests
 pub const kg_lesson = @import("kg/lesson.zig"); // lesson envelope (learning turn)
 pub const test_integrity = @import("core/test_integrity.zig"); // L2 test-integrity obligation tests
 pub const stall_gate = @import("core/stall_gate.zig"); // L2 stall-gate tests
@@ -565,6 +566,14 @@ pub fn main(init: std.process.Init) !void {
         .token = if (std.c.getenv("METACODES_WEB_TOKEN")) |c| std.mem.span(c) else null,
     }, allocator)) |refusal| {
         std.debug.print("error: {s}\n", .{refusal});
+        std.process.exit(2);
+    }
+    // The learning turn's print-mode environment and its verdict-source rule.
+    if (resolveLearningTurn(&config, .{
+        .mode = if (std.c.getenv(learning_turn.MODE_ENV)) |c| std.mem.span(c) else null,
+        .host_check_armed = host_check.endOfRunArmedFromEnv(),
+    }, allocator)) |refusal| {
+        std.debug.print("error: {s} (use --help to list supported flags)\n", .{refusal});
         std.process.exit(2);
     }
     if (leading_state_dir.value == null) if (config.state_dir) |dir| applyStateDir(dir);
@@ -2637,6 +2646,10 @@ fn parseArgsInto(config: *types.Config, args: *std.process.Args.Iterator, alloca
             config.check_gate = true;
         } else if (std.mem.eql(u8, arg, "--check-gate-observe")) {
             config.check_gate_observe = true;
+        } else if (std.mem.eql(u8, arg, "--learning-turn")) {
+            config.learning_turn = true;
+        } else if (std.mem.eql(u8, arg, "--learning-turn-observe")) {
+            config.learning_turn_observe = true;
         } else if (std.mem.eql(u8, arg, "--test-integrity")) {
             config.test_integrity = true;
         } else if (std.mem.eql(u8, arg, "--test-integrity-observe")) {
@@ -2985,6 +2998,41 @@ fn webTokenHint(err: web_server.TokenError) []const u8 {
     };
 }
 
+/// The learning-turn settings main reads from the environment; tests pass them in.
+pub const LearningTurnEnv = struct {
+    /// METACODES_LEARNING_TURN (`enforce` or `observe`), honoured in print mode.
+    mode: ?[]const u8 = null,
+    /// The end-of-run verdict source is armed: METACODES_SELF_EVOLUTION on,
+    /// METACODES_HOST_CHECK pinnable and METACODES_TASK_HINT set
+    /// (`host_check.endOfRunArmedFromEnv`).
+    host_check_armed: bool = false,
+};
+
+/// After argument parsing: fill the learning-turn mode from
+/// METACODES_LEARNING_TURN where no flag set it (print mode only; a flag
+/// wins), then refuse a learning turn with no verdict source — the rule
+/// `--check-gate` without `--host-check` follows. The in-run source is the
+/// check gate (REPL and print mode); the end-of-run source is the
+/// self-evolution host check (print mode only). Returns the message main
+/// prints before exiting 2 (owned by `allocator`), or null to go on.
+pub fn resolveLearningTurn(config: *types.Config, env: LearningTurnEnv, allocator: std.mem.Allocator) ?[]const u8 {
+    const print_mode = config.prompt != null;
+    if (!config.learning_turn and !config.learning_turn_observe and print_mode) if (env.mode) |text| {
+        const mode = std.meta.stringToEnum(learning_turn.Mode, text) orelse
+            return std.fmt.allocPrint(allocator, "invalid {s} '{s}' (expected enforce or observe)", .{ learning_turn.MODE_ENV, text }) catch "invalid " ++ learning_turn.MODE_ENV;
+        switch (mode) {
+            .enforce => config.learning_turn = true,
+            .observe => config.learning_turn_observe = true,
+        }
+    };
+    if (!config.learning_turn and !config.learning_turn_observe) return null;
+    const in_run = (config.check_gate or config.check_gate_observe) and config.host_check_command != null;
+    if (in_run or (print_mode and env.host_check_armed)) return null;
+    return std.fmt.allocPrint(allocator, "--learning-turn / --learning-turn-observe needs a verdict source: " ++
+        "--check-gate or --check-gate-observe with --host-check <cmd>, or in print mode " ++
+        "METACODES_HOST_CHECK with METACODES_SELF_EVOLUTION=1 and METACODES_TASK_HINT", .{}) catch "--learning-turn needs a verdict source";
+}
+
 /// The web-surface settings main reads from the environment; tests pass them in.
 pub const WebEnv = struct {
     /// METACODES_WEB_BIND.
@@ -3134,6 +3182,10 @@ fn printHelp() void {
         \\  --check-gate          After the model changes files and stops, run --host-check; continue on a clean failure
         \\  --check-gate-observe  Run --host-check at the same points and only record the verdict
         \\  --check-gate-max <n>  Continuations the check gate may grant per run (1..8, default 3)
+        \\  --learning-turn       After a grounded host verdict, let the model record conditioned lessons
+        \\                        for the next attempt (needs --check-gate[-observe], or in print mode
+        \\                        METACODES_HOST_CHECK under METACODES_SELF_EVOLUTION with METACODES_TASK_HINT)
+        \\  --learning-turn-observe  Only record whether a learning turn would have run
         \\  --test-integrity      When the model stops with tests that existed before the run rewritten,
         \\                        deleted or disabled, ask once to restore them or quote the request
         \\  --test-integrity-observe  Only record and report changes to tests that existed before the run
@@ -3226,6 +3278,7 @@ test {
     _ = &@import("core/host_check.zig");
     _ = &@import("core/check_gate.zig");
     _ = &@import("core/learning_turn.zig");
+    _ = &@import("core/learning_end_of_run.zig");
     _ = &@import("kg/lesson.zig");
     _ = &@import("core/test_integrity.zig");
     _ = &@import("swarm/team.zig");

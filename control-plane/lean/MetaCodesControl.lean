@@ -16,6 +16,7 @@ import MetaCodesControl.ProgressUpdates
 import MetaCodesControl.StallGate
 import MetaCodesControl.CheckGate
 import MetaCodesControl.TestIntegrity
+import MetaCodesControl.LearningTurn
 import MetaCodesControl.ContinuityGate
 import MetaCodesControl.HostInjectionMeter
 import MetaCodesControl.CognitiveMode

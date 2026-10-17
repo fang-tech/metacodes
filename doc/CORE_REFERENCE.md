@@ -233,9 +233,19 @@ web_search 显示 query、transcript 回放与 `/recap` 把它们与用户输入
   Read / Grep / Glob / KgRecall / KgContext / KgRemember 能跑,过程传感器与环境故障熔断都不计这些
   轮次。`KgRemember` 在学习回合之外、或 lesson 头与宿主所见不符时拒绝写入。
 - **宿主契约字段**:`Options.learning_turn: ?learning_turn.Options`(mode、task_hint、run_label),
-  canonical `buildRunOptions` 不带,CLI 尚未接线。武装时 Run 结束发一条 `learning_turn` 终局记录
+  canonical `buildRunOptions` 不带。武装时 Run 结束发一条 `learning_turn` 终局记录
   (`metacodes-learning-turn-v1`)。下一次同题尝试(`METACODES_TASK_HINT`)经 scoped recall 看到最新
   且未被取代的 lesson;没有 lesson 时注入逐字节不变。
+- **CLI**:`--learning-turn` / `--learning-turn-observe`,print 模式另认
+  `METACODES_LEARNING_TURN=enforce|observe`(flag 优先)。必须有判定来源,否则参数错误
+  (`main.resolveLearningTurn`):检查门(`--check-gate[-observe]` + `--host-check`,REPL 与
+  print 模式的主 Run 武装 in-run 形态,run_label 取 journal run id),或 print 模式下自演化
+  host check(`METACODES_HOST_CHECK` + `METACODES_SELF_EVOLUTION=1` + task hint)。
+- **收尾形态**(`core/learning_end_of_run.zig`):headless 的 `host_check.runAndIngestWithEvidence`
+  之后,仅当尝试自己结束(`end_turn`)且 in-run 回合没有判定(未武装或 `none_unchecked`)时运行:
+  一次无工具 provider 请求,受自演化 author 上限约束(max_tokens 先验、usage 与成本后验),
+  响应只是证据;宿主按 `KgRemember` 同一套头绑定把信封写成 `lesson` 节点,头不符的信封计入
+  refused。distill 与 reconcile 合在这一次请求里,报告记一段。形式化:`LearningTurn.lean`。
 
 #### 3.2.1.1 候选响应边界:这条响应能不能进 Conversation(`core/response_candidate.zig`)
 

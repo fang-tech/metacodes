@@ -5,6 +5,7 @@ import MetaCodesControl.ProgressUpdates
 import MetaCodesControl.StallGate
 import MetaCodesControl.CheckGate
 import MetaCodesControl.TestIntegrity
+import MetaCodesControl.LearningTurn
 import MetaCodesControl.RuleMetaGovernance
 
 -- Build automation treats this output as part of the shipped trust boundary:
@@ -57,6 +58,17 @@ import MetaCodesControl.RuleMetaGovernance
 #print axioms MetaCodesControl.TestIntegrity.nudges_bounded
 #print axioms MetaCodesControl.TestIntegrity.composed_checks_bounded
 #print axioms MetaCodesControl.TestIntegrity.composed_continuations_bounded
+#print axioms MetaCodesControl.LearningTurn.unavailable_never_learns
+#print axioms MetaCodesControl.LearningTurn.tainted_never_learns
+#print axioms MetaCodesControl.LearningTurn.unstorable_never_learns
+#print axioms MetaCodesControl.LearningTurn.distill_iff
+#print axioms MetaCodesControl.LearningTurn.reconcile_requires_lesson
+#print axioms MetaCodesControl.LearningTurn.turns_bounded
+#print axioms MetaCodesControl.LearningTurn.pass_turns_bounded
+#print axioms MetaCodesControl.LearningTurn.lessons_bounded
+#print axioms MetaCodesControl.LearningTurn.reconcile_follows_accepted_lesson
+#print axioms MetaCodesControl.LearningTurn.answer_is_final
+#print axioms MetaCodesControl.LearningTurn.observe_never_injects
 #print axioms MetaCodesControl.RuleMetaGovernance.llm_cannot_promote_deny
 #print axioms MetaCodesControl.RuleMetaGovernance.unanchored_cannot_promote
 #print axioms MetaCodesControl.RuleMetaGovernance.evidence_unanchored_cannot_promote

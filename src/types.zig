@@ -170,6 +170,14 @@ pub const Config = struct {
     check_gate_observe: bool = false,
     /// `--check-gate-max <n>`: continuation budget (1..8). null = default 3.
     check_gate_max: ?u8 = null,
+    /// `--learning-turn` / `--learning-turn-observe` (print mode also
+    /// `METACODES_LEARNING_TURN=enforce|observe`): after a grounded host
+    /// verdict, distill conditioned lessons for the next attempt; observe only
+    /// records the decision (LearningTurn.lean). Needs a verdict source: the
+    /// check gate, or in print mode the self-evolution host check
+    /// (`main.resolveLearningTurn`). Enforce wins when both are given.
+    learning_turn: bool = false,
+    learning_turn_observe: bool = false,
     /// `--test-integrity` / `--test-integrity-observe`: compare the tests that
     /// existed when a run started with the end state; enforce sends one
     /// message when the model stops with them rewritten, deleted or disabled,
