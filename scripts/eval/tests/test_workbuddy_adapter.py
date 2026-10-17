@@ -4492,6 +4492,7 @@ class WorkBuddyLearningTurnRecordTest(unittest.TestCase):
             self._quiet(grounding="tainted", decision="none_tainted"),
             self._quiet(grounding="unavailable", decision="none_unavailable"),
             self._quiet(grounding="unchecked", decision="none_unfinished"),
+            self._quiet(grounding="failed", decision="none_unstorable"),
         ):
             with self.subTest(record=record):
                 self.assertEqual(self._metrics(record)["lean"]["learning_turn_records"], 1)
@@ -4500,6 +4501,7 @@ class WorkBuddyLearningTurnRecordTest(unittest.TestCase):
         for key, value, message in (
             ("schema_version", "metacodes-learning-turn-v0", "learning turn record is invalid"),
             ("decision", "maybe", "learning turn record is invalid"),
+            ("decision", "none_spent", "learning turn record is invalid"),  # retired value
             ("grounding", "green", "learning turn record is invalid"),
             ("truncated", "no", "learning turn record is invalid"),
             ("passes", "two", "learning turn passes is invalid"),
@@ -4517,6 +4519,7 @@ class WorkBuddyLearningTurnRecordTest(unittest.TestCase):
             self._quiet(grounding="passed", decision="none_unchecked"),
             self._quiet(grounding="failed", decision="none_tainted"),
             self._quiet(grounding="unchecked", decision="none_unchecked", lessons_accepted=1),
+            self._quiet(grounding="tainted", decision="none_unstorable"),
             dict(self._valid(), passes=3),
             dict(self._valid(), distill_turns=7),
             dict(self._valid(), lessons_accepted=5),

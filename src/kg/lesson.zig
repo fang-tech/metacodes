@@ -24,6 +24,7 @@
 
 const std = @import("std");
 const client_mod = @import("client.zig");
+const utf8 = @import("../util/utf8.zig");
 
 pub const SCHEMA_TYPE = "lesson";
 pub const MARKER = "lesson-v1";
@@ -105,14 +106,10 @@ fn labelled(line: []const u8, label: []const u8) ?[]const u8 {
     return if (value.len == 0) null else value;
 }
 
-/// Parse one envelope. Strict: the header and the three required lines come
-/// first, in order; `supersedes:` may only be the last non-empty line.
-pub fn parse(text: []const u8) ParseError!Envelope {
-    if (text.len > MAX_BYTES) return error.TooLarge;
-    const body = std.mem.trim(u8, text, " \t\r\n");
-    var lines = std.mem.splitScalar(u8, body, '\n');
+const Header = struct { verdict: Verdict, task: []const u8, run: []const u8 };
 
-    const header = stripCr(lines.next() orelse return error.MissingHeader);
+/// The `lesson-v1 verdict= task= run=` line, strictly.
+fn parseHeader(header: []const u8) ParseError!Header {
     var tokens = std.mem.splitScalar(u8, header, ' ');
     if (!std.mem.eql(u8, tokens.next() orelse "", MARKER)) return error.MissingHeader;
     const verdict_token = tokens.next() orelse return error.BadHeader;
@@ -127,6 +124,16 @@ pub fn parse(text: []const u8) ParseError!Envelope {
     if (!std.mem.eql(u8, task, NO_TASK) and !validTask(task)) return error.BadTask;
     const run = run_token["run=".len..];
     if (!validRun(run)) return error.BadRun;
+    return .{ .verdict = verdict, .task = task, .run = run };
+}
+
+/// Parse one envelope. Strict: the header and the three required lines come
+/// first, in order; `supersedes:` may only be the last non-empty line.
+pub fn parse(text: []const u8) ParseError!Envelope {
+    if (text.len > MAX_BYTES) return error.TooLarge;
+    const body = std.mem.trim(u8, text, " \t\r\n");
+    var lines = std.mem.splitScalar(u8, body, '\n');
+    const header = try parseHeader(stripCr(lines.next() orelse return error.MissingHeader));
 
     const holds_when = labelled(stripCr(lines.next() orelse ""), "holds_when") orelse return error.MissingHoldsWhen;
     const uncertain = labelled(stripCr(lines.next() orelse ""), "uncertain") orelse return error.MissingUncertain;
@@ -141,7 +148,9 @@ pub fn parse(text: []const u8) ParseError!Envelope {
     if (std.mem.lastIndexOfScalar(u8, body, '\n')) |last_newline| {
         if (last_newline + 1 > lesson_start) {
             const last = stripCr(body[last_newline + 1 ..]);
-            if (std.mem.startsWith(u8, last, "supersedes")) {
+            // Only the labelled field counts; prose that merely starts with
+            // the word stays part of the lesson.
+            if (std.mem.startsWith(u8, last, "supersedes:")) {
                 const value = labelled(last, "supersedes") orelse return error.BadSupersedes;
                 supersedes = std.fmt.parseInt(u64, value, 10) catch return error.BadSupersedes;
                 if (supersedes.? == 0) return error.BadSupersedes;
@@ -152,9 +161,9 @@ pub fn parse(text: []const u8) ParseError!Envelope {
     const lesson = std.mem.trim(u8, body[lesson_start..lesson_end], " \t\r\n");
     if (lesson.len == 0) return error.MissingLesson;
     return .{
-        .verdict = verdict,
-        .task = task,
-        .run = run,
+        .verdict = header.verdict,
+        .task = header.task,
+        .run = header.run,
         .holds_when = holds_when,
         .uncertain = uncertain,
         .lesson = lesson,
@@ -293,28 +302,41 @@ pub fn collectForTask(
     }
     var picked: [RECALL_LIMIT]usize = undefined;
     const n = select(candidates.items, task, @min(max, picked.len), &picked);
-    var out = try allocator.alloc(Stored, n);
-    var moved: usize = 0;
-    errdefer {
-        for (out[0..moved]) |*item| item.deinit(allocator);
-        allocator.free(out);
-    }
-    for (picked[0..n]) |index| {
-        const source = candidates.items[index];
-        const text = try allocator.dupe(u8, source.text);
-        // Re-parse against the copy so every slice borrows memory `out` owns.
-        out[moved] = .{ .node_id = source.node_id, .text = text, .envelope = parse(text) catch unreachable };
-        moved += 1;
+    const out = try allocator.alloc(Stored, n);
+    // Move the picked candidates out (their envelopes already borrow their
+    // own text); the emptied slots free nothing in the deferred cleanup.
+    for (picked[0..n], 0..) |index, slot| {
+        out[slot] = candidates.items[index];
+        candidates.items[index].text = &.{};
     }
     return out;
 }
 
+/// True when `node_id` is a stored `lesson` node for `task` that a reader
+/// would see: the same schema-filtered recall `collectForTask` uses, so a
+/// `supersedes:` can only name a lesson the next attempt could have been
+/// shown. Best effort: a recall failure is false.
+pub fn isStoredLesson(kg: *client_mod.KgClient, task: []const u8, node_id: u64) bool {
+    var query_buffer: [MAX_TASK_BYTES + 32]u8 = undefined;
+    const query = std.fmt.bufPrint(&query_buffer, MARKER ++ " task={s}", .{task}) catch return false;
+    const hits = kg.recallTyped(query, RECALL_LIMIT, false, SCHEMA_TYPE) catch return false;
+    defer {
+        for (hits) |*hit| hit.deinit(kg.allocator);
+        kg.allocator.free(hits);
+    }
+    for (hits) |hit| {
+        if (hit.node_id != node_id or !std.mem.eql(u8, hit.schema_type, SCHEMA_TYPE)) continue;
+        // The header is the excerpt's first line, so a truncated excerpt still carries it.
+        var lines = std.mem.splitScalar(u8, hit.text, '\n');
+        const header = parseHeader(stripCr(lines.next() orelse return false)) catch return false;
+        return std.mem.eql(u8, header.task, task);
+    }
+    return false;
+}
+
 /// Truncate to at most `max` bytes on a UTF-8 boundary.
 pub fn boundedUtf8(text: []const u8, max: usize) []const u8 {
-    if (text.len <= max) return text;
-    var end = max;
-    while (end > 0 and (text[end] & 0xC0) == 0x80) end -= 1;
-    return text[0..end];
+    return text[0..utf8.prefixEnd(text, max)];
 }
 
 pub const NOTE_HEADING = "# Lessons from earlier attempts at this task";
@@ -346,7 +368,8 @@ pub fn renderNote(allocator: std.mem.Allocator, lessons: []const Stored) !?[]u8 
     return try out.toOwnedSlice();
 }
 
-fn writeOneLine(w: *std.Io.Writer, text: []const u8) !void {
+/// `text` on one line: newlines and tabs become spaces.
+pub fn writeOneLine(w: *std.Io.Writer, text: []const u8) !void {
     for (text) |c| try w.writeByte(if (c == '\n' or c == '\r' or c == '\t') ' ' else c);
 }
 
@@ -379,6 +402,12 @@ test "parse reads a final supersedes line and keeps it out of the lesson" {
     const env = try parse(text);
     try testing.expectEqual(@as(?u64, 42), env.supersedes);
     try testing.expect(std.mem.indexOf(u8, env.lesson, "supersedes") == null);
+}
+
+test "a last line that only starts with the word supersedes stays in the lesson" {
+    const env = try parse(GOOD ++ "\nsupersedes the earlier guess about weak tags");
+    try testing.expect(env.supersedes == null);
+    try testing.expect(std.mem.endsWith(u8, env.lesson, "weak tags"));
 }
 
 test "parse rejects each contract violation" {

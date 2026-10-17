@@ -36,21 +36,10 @@ fn admitLesson(ctx: *const ToolContext, kg: *kg_mod.KgClient, text: []const u8) 
         common.setErrorDetail(ctx.error_detail, ctx.allocator, "lesson header must be exactly `{s}` ({s})", .{ header, @errorName(err) });
         return error.LessonHeaderMismatch;
     };
-    if (envelope.supersedes) |target| {
-        const stored = kg.fetchNodeText(target) catch {
-            common.setErrorDetail(ctx.error_detail, ctx.allocator, "supersedes: node {d} is not readable; name a stored lesson for this task", .{target});
-            return error.LessonSupersedesUnknown;
-        };
-        defer kg.allocator.free(stored);
-        const old = lesson_mod.parse(stored) catch {
-            common.setErrorDetail(ctx.error_detail, ctx.allocator, "supersedes: node {d} is not a lesson", .{target});
-            return error.LessonSupersedesUnknown;
-        };
-        if (!std.mem.eql(u8, old.task, binding.task)) {
-            common.setErrorDetail(ctx.error_detail, ctx.allocator, "supersedes: node {d} is a lesson for task {s}, not {s}", .{ target, old.task, binding.task });
-            return error.LessonSupersedesUnknown;
-        }
-    }
+    if (envelope.supersedes) |target| if (!lesson_mod.isStoredLesson(kg, binding.task, target)) {
+        common.setErrorDetail(ctx.error_detail, ctx.allocator, "supersedes: node {d} is not a stored lesson for task {s}; name one listed in the distill message", .{ target, binding.task });
+        return error.LessonSupersedesUnknown;
+    };
     if (!binding.reserve()) {
         common.setErrorDetail(ctx.error_detail, ctx.allocator, "this learning turn has written its {d} lessons", .{lesson_mod.MAX_PER_TURN});
         return error.LessonBudgetSpent;

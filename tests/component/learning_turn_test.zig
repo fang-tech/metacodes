@@ -386,6 +386,8 @@ test "L2 learning turn: a write during a pass is refused and the checked workspa
     defer tmp.cleanup();
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     const root = try tmpRoot(&tmp, &buf);
+    var kg = (try Kg.open(a, root)) orelse return error.SkipZigTest;
+    defer kg.close(a);
 
     const write = try writeSse(a, "write_1", root, "result.txt", "TOTAL=41\n");
     defer a.free(write);
@@ -395,7 +397,7 @@ test "L2 learning turn: a write during a pass is refused and the checked workspa
     defer a.free(sneaky);
     const end = try endTurn(a, "end", "nothing recorded");
     defer a.free(end);
-    var run = try runLoop(a, root, .{}, &.{ write, done, sneaky, end });
+    var run = try runLoop(a, root, .{ .kg = &kg.client }, &.{ write, done, sneaky, end });
     defer run.deinit(a);
 
     try std.testing.expect(std.mem.indexOf(u8, run.body(3), "does not run in a learning turn") != null);
@@ -413,6 +415,8 @@ test "L2 learning turn: a pass that keeps calling tools is cut at its turn cap" 
     defer tmp.cleanup();
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     const root = try tmpRoot(&tmp, &buf);
+    var kg = (try Kg.open(a, root)) orelse return error.SkipZigTest;
+    defer kg.close(a);
 
     const write = try writeSse(a, "write_1", root, "result.txt", "TOTAL=41\n");
     defer a.free(write);
@@ -430,7 +434,7 @@ test "L2 learning turn: a pass that keeps calling tools is cut at its turn cap" 
         reads[made] = try readSse(a, id, root, "result.txt");
         responses[2 + made] = reads[made];
     }
-    var run = try runLoop(a, root, .{}, &responses);
+    var run = try runLoop(a, root, .{ .kg = &kg.client }, &responses);
     defer run.deinit(a);
 
     try std.testing.expectEqual(@as(usize, 2 + learning.PASS_MAX_TURNS), run.requests);
@@ -447,12 +451,14 @@ test "L2 learning turn: observe mode decides and injects nothing" {
     defer tmp.cleanup();
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     const root = try tmpRoot(&tmp, &buf);
+    var kg = (try Kg.open(a, root)) orelse return error.SkipZigTest;
+    defer kg.close(a);
 
     const write = try writeSse(a, "write_1", root, "result.txt", "TOTAL=41\n");
     defer a.free(write);
     const done = try endTurn(a, "done_1", "done");
     defer a.free(done);
-    var run = try runLoop(a, root, .{ .learning = .{ .mode = .observe, .task_hint = TASK } }, &.{ write, done });
+    var run = try runLoop(a, root, .{ .kg = &kg.client, .learning = .{ .mode = .observe, .task_hint = TASK } }, &.{ write, done });
     defer run.deinit(a);
 
     try std.testing.expectEqual(@as(usize, 2), run.requests);
@@ -461,6 +467,26 @@ test "L2 learning turn: observe mode decides and injects nothing" {
     try std.testing.expect(!record.enforced);
     try std.testing.expectEqual(cc.tools.tool_observation.LearningDecision.distill, record.decision);
     try std.testing.expectEqual(@as(u8, 0), record.passes);
+}
+
+test "L2 learning turn: a grounded verdict with no ready store spends no request" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try tmpRoot(&tmp, &buf);
+
+    const write = try writeSse(a, "write_1", root, "result.txt", "TOTAL=41\n");
+    defer a.free(write);
+    const done = try endTurn(a, "done_1", "done");
+    defer a.free(done);
+    var run = try runLoop(a, root, .{}, &.{ write, done });
+    defer run.deinit(a);
+
+    try std.testing.expectEqual(@as(usize, 2), run.requests);
+    try std.testing.expectEqual(learning.Decision.none_unstorable, run.result.learning.?.decision);
+    try std.testing.expectEqual(learning.Grounding.failed, run.result.learning.?.grounding);
+    try std.testing.expectEqual(@as(u8, 0), run.record.last.?.passes);
 }
 
 test "L2 learning turn: without a check there is no verdict and no learning message" {

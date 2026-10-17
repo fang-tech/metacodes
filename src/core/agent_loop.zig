@@ -1187,12 +1187,16 @@ pub fn run(
     defer if (opts.goal_meter) |meter| if (meter.endRun()) |settled| backend.emitEvent(opts.session, .{ .goal_updated = settled });
     var result = try runCounted(conversation, provider, tool_defs, permission_ctx, opts, backend, allocator, &counters);
     result.continuations = counters.continuations;
+    result.learning = counters.learning;
     return result;
 }
 
 const RunCounters = struct {
     /// max_tokens 续写次数(见 MAX_CONTINUATIONS);RunResult.continuations 的来源。
     continuations: u32 = 0,
+    /// The learning turn's report once it decided (RunResult.learning), set by a
+    /// defer in runCounted so an abort inside a pass still reports it.
+    learning: ?learning_turn_mod.Report = null,
 };
 
 fn runCounted(
@@ -1317,6 +1321,9 @@ fn runCounted(
     // boundary; its passes borrow turns past max_turns like the KG repair.
     var learning_state = learning_turn_mod.State{};
     defer learning_state.deinit(allocator);
+    defer if (opts.learning_turn) |learning| if (learning_state.decision != null) {
+        counters.learning = learning_state.report(learning.mode);
+    };
     var learning_borrowed_turns: u32 = 0;
     defer if (opts.learning_turn) |learning| if (depth == 0) {
         if (opts.tool_observer) |observer| {
@@ -1335,7 +1342,7 @@ fn runCounted(
                     .none_unchecked => .none_unchecked,
                     .none_unavailable => .none_unavailable,
                     .none_tainted => .none_tainted,
-                    .none_spent => .none_spent,
+                    .none_unstorable => .none_unstorable,
                     .distill => .distill,
                 },
                 .passes = report.passes,
@@ -1513,22 +1520,21 @@ fn runCounted(
         if (learning_state.active() and !learning_state.beginPassTurn()) {
             learning_state.truncated = true;
             log.info("agent", "learning turn {s} pass cut at {d} turns", .{ @tagName(learning_state.phase), learning_turn_mod.PASS_MAX_TURNS });
-            return finishRun(backend, sess, trace_id, depth, .{
-                .stop_reason = .end_turn,
-                .turns = turns,
-                .tool_calls = total_tool_calls,
-                .learning = learning_state.report(opts.learning_turn.?.mode),
-            });
+            return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .end_turn, .turns = turns, .tool_calls = total_tool_calls });
         }
-        // A learning pass is the tail of a finished attempt: queued input,
-        // backgrounding, job notifications and advisory nudges wait for the
-        // next run instead of landing inside it.
-        const learning_active = learning_state.active();
+        // The one predicate for "this round is a learning pass, not the
+        // attempt". A pass is the tail of a finished attempt: queued input,
+        // backgrounding, job notifications, advisory nudges, process sensors
+        // and the fault breaker all skip it, and a new turn-boundary or
+        // post-execution gate must check it too. The phase only changes in
+        // the end-turn branch, which leaves the iteration, so the value holds
+        // for the whole iteration.
+        const in_learning_pass = learning_state.active();
 
         // 转后台请求(Ctrl+B):turn 边界检查——此刻 conversation 干净(上轮 tool_result 已 append),
         // 返回 .backgrounded 让调用方深拷贝转后台续跑。**只在 turn 开头查**(run 是同步循环,无中途
         // 暂停点;唯一安全转后台点是 turn 边界)。与 abort 分开:这不是中断,是把完整对话搬去后台。
-        if (!learning_active) if (opts.background_request) |bg| if (bg.load(.acquire)) {
+        if (!in_learning_pass) if (opts.background_request) |bg| if (bg.load(.acquire)) {
             log.info("agent", "background requested before turn {d} → backgrounding", .{turns + 1});
             return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .backgrounded, .turns = turns, .tool_calls = total_tool_calls });
         };
@@ -1538,7 +1544,7 @@ fn runCounted(
         // 刚追加的"接着写"提示与转向指令并排会让模型换题,而 Ledger 仍把下一段当同一答案的续写。
         if (continuation_pending) {
             continuation_pending = false;
-        } else if (!learning_active) {
+        } else if (!in_learning_pass) {
             if (try drainUiEvents(backend, sess, conversation, allocator, turns + 1)) |reason| {
                 log.warn("agent", "interrupt from UI backend before turn {d}: {s}", .{ turns + 1, @tagName(reason) });
                 return finishRun(backend, sess, trace_id, depth, .{
@@ -1567,7 +1573,7 @@ fn runCounted(
         // 2026-09-19 polling incident: deliver metadata at the boundary so
         // the model need not poll, while keeping child bytes behind BashOutput
         // and preserving owner/duplicate/role invariants.
-        if (!learning_active) if (opts.job_notifications) |registry| {
+        if (!in_learning_pass) if (opts.job_notifications) |registry| {
             notification_delivery: {
                 const owner = opts.agent_ident orelse opts.session;
                 const events = registry.takeUnannouncedExits(owner, allocator) catch |err| {
@@ -1611,7 +1617,7 @@ fn runCounted(
         // shared meter, and never a denial. Observe mode advances the level
         // without injecting so control arms record the same crossings.
         // Formal model: DeliveryCadence.lean.
-        if (!learning_active and (opts.delivery_cadence or opts.delivery_cadence_observe) and
+        if (!in_learning_pass and (opts.delivery_cadence or opts.delivery_cadence_observe) and
             (!opts.delivery_cadence or host_injection_meter.remaining() > 0))
         {
             const decision = delivery_cadence_state.decide(opts.delivery_cadence_thresholds);
@@ -1639,7 +1645,7 @@ fn runCounted(
         // denial; observe mode counts the decision without injecting. Only a run
         // whose commentary a person reads (event_projection). Formal model:
         // ProgressUpdates.lean.
-        if (!learning_active and (opts.progress_updates or opts.progress_updates_observe) and
+        if (!in_learning_pass and (opts.progress_updates or opts.progress_updates_observe) and
             opts.event_projection.admitsProgressNudge(opts.agent_depth))
         {
             const now_ns = util_time.nowNs();
@@ -2841,7 +2847,7 @@ fn runCounted(
                 const report = learning_state.report(opts.learning_turn.?.mode);
                 learning_state.phase = .idle;
                 log.infoId("agent", rid, "learning turn done passes={d} lessons={d} refused={d}", .{ report.passes, report.lessons_accepted, report.lessons_refused });
-                return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .end_turn, .turns = turns + 1, .tool_calls = total_tool_calls, .learning = report });
+                return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .end_turn, .turns = turns + 1, .tool_calls = total_tool_calls });
             }
             if (turn_stop_reason == .max_tokens and
                 continuations.* >= MAX_CONTINUATIONS and
@@ -3171,7 +3177,9 @@ fn runCounted(
                 backend.emitEvent(sess, .clear_current_tool);
                 defer outcome.deinit(allocator);
                 check_gate_state.noteVerdict(&outcome);
-                if (opts.learning_turn != null) learning_state.captureVerdict(allocator, gate.command, &outcome);
+                // Only an enforced learning turn ever quotes the verdict.
+                if (opts.learning_turn) |learning| if (learning.mode == .enforce and depth == 0)
+                    learning_state.captureVerdict(allocator, gate.command, &outcome);
                 const decision = check_gate_mod.decide(gate.mode, gate.max_continuations, check_gate_state.continuations, outcome.verdict);
                 log.infoId("agent", rid, "host check verdict={s} passed={d}/{d} exit={d} decision={s} continuations={d}/{d}", .{
                     @tagName(outcome.verdict), outcome.passed, outcome.total, outcome.exit_code, @tagName(decision), check_gate_state.continuations, gate.max_continuations,
@@ -3220,18 +3228,14 @@ fn runCounted(
                     learning_turn_mod.groundingOf(check_gate_state.last_verdict)
                 else
                     .unchecked;
-                const decision = learning_turn_mod.decide(learning_state.decisions, grounding);
+                const store: ?*@import("../kg/client.zig").KgClient = if (opts.kg) |kg| (if (kg.ready) kg else null) else null;
+                const decision = learning_turn_mod.decide(grounding, store != null);
                 learning_state.grounding = grounding;
                 learning_state.decision = decision;
                 log.infoId("agent", rid, "learning turn {s} grounding={s} decision={s}", .{ @tagName(learning.mode), @tagName(grounding), @tagName(decision) });
                 if (decision == .distill and learning.mode == .enforce) {
-                    learning_state.decisions += 1;
                     learning_state.bind(if (grounding == .passed) .passed else .failed, learning, trace_id);
-                    const existing: []lesson_mod.Stored = blk: {
-                        const kg = opts.kg orelse break :blk try allocator.alloc(lesson_mod.Stored, 0);
-                        if (!kg.ready) break :blk try allocator.alloc(lesson_mod.Stored, 0);
-                        break :blk try lesson_mod.collectForTask(allocator, kg, learning_state.binding.task, learning_turn_mod.MAX_EXISTING_SHOWN);
-                    };
+                    const existing = try lesson_mod.collectForTask(allocator, store.?, learning_state.binding.task, learning_turn_mod.MAX_EXISTING_SHOWN);
                     defer lesson_mod.freeStored(allocator, existing);
                     learning_state.existing = existing.len;
                     const text = try learning_turn_mod.renderDistill(allocator, &learning_state, existing);
@@ -3242,12 +3246,6 @@ fn runCounted(
                     try conversation.appendText(.user, text);
                     continue :outer_turn;
                 }
-                return finishRun(backend, sess, trace_id, depth, .{
-                    .stop_reason = .end_turn,
-                    .turns = turns + 1,
-                    .tool_calls = total_tool_calls,
-                    .learning = learning_state.report(learning.mode),
-                });
             };
             return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .end_turn, .turns = turns + 1, .tool_calls = total_tool_calls });
         }
@@ -3668,21 +3666,21 @@ fn runCounted(
         // suspend and host-fatal paths return without reaching the turn's
         // tail (Codex review 2026-09-21: a suspended sibling batch used to
         // leave the terminal record at zero).
-        // A learning pass is outside the attempt: the process sensors below
-        // neither count it nor can end it. Only its lesson refusals are counted.
-        const learning_round = learning_state.active();
-        if (learning_round) learning_state.lessons_refused +|= countRefusedLessons(slots.items);
-        if (!learning_round and (opts.delivery_cadence or opts.delivery_cadence_observe))
+        // A learning pass is outside the attempt (in_learning_pass): the
+        // process sensors below neither count it nor can end it. Only its
+        // lesson refusals are counted.
+        if (in_learning_pass) learning_state.lessons_refused +|= countRefusedLessons(slots.items);
+        if (!in_learning_pass and (opts.delivery_cadence or opts.delivery_cadence_observe))
             delivery_cadence_state.observeSlots(allocator, slots.items);
         // Host-check-gate sensor, same placement and reason: a delivery-capable
         // action must mark the run dirty before any early return.
-        if (!learning_round and opts.check_gate != null) check_gate_state.observeSlots(allocator, slots.items);
-        if (!learning_round and test_integrity_state.armed) test_integrity_state.observeSlots(allocator, slots.items);
+        if (!in_learning_pass and opts.check_gate != null) check_gate_state.observeSlots(allocator, slots.items);
+        if (!in_learning_pass and test_integrity_state.armed) test_integrity_state.observeSlots(allocator, slots.items);
         // Stall-gate sensor, same placement: the content is still on the slots
         // (it moves into result_blocks below). First forget what the model can
         // no longer see — compaction or microcompaction since the last round —
         // so a re-read of a cleared result counts as news.
-        if (!learning_round) if (stall_state) |state| {
+        if (!in_learning_pass) if (stall_state) |state| {
             state.forgetInvisible(conversation.messages.items, conversation.activeStart());
             _ = state.observeSlots(slots.items);
         };
@@ -3920,7 +3918,7 @@ fn runCounted(
             // TUI 在 tool_result 时才把动态卡 commit 进滚动区,先发故障行会让它印在上一张卡
             // 下面,读起来像是上一条命令出了错(2026-09-23 实录)。
             // A learning pass ran after the attempt ended: its faults do not count toward the breaker.
-            if (!learning_round and s.is_error and isEnvironmentFault(content)) {
+            if (!in_learning_pass and s.is_error and isEnvironmentFault(content)) {
                 environment_faults += 1;
                 backend.emitEvent(sess, .{ .environment_fault = .{
                     .tool = s.name,
@@ -4036,7 +4034,7 @@ fn runCounted(
         try conversation.append(.{ .role = .user, .blocks = blocks_owned });
         // The round's results are now the last message, one block per slot:
         // the stall gate anchors each key to the block the model will see.
-        if (!learning_round) if (stall_state) |state| state.anchorRound(conversation.messages.items);
+        if (!in_learning_pass) if (stall_state) |state| state.anchorRound(conversation.messages.items);
 
         // 环境故障熔断:第 MAX_ENVIRONMENT_FAULTS 次之后停。放在结果提交进对话**之后**,
         // 续接时模型看得到全部证据;用 .tool_loop 收口(ABI 里保留的熔断停止原因),并发
@@ -4052,7 +4050,7 @@ fn runCounted(
         // so a resumed run sees all the evidence; the environment-fault breaker
         // above is the more specific cause and goes first. Enforce ends the run
         // without injecting anything; observe only records the decision.
-        if (!learning_round) if (opts.stall_gate) |mode| if (stall_state) |state| if (state.decide(opts.stall_gate_thresholds)) |cause| {
+        if (!in_learning_pass) if (opts.stall_gate) |mode| if (stall_state) |state| if (state.decide(opts.stall_gate_thresholds)) |cause| {
             const report = state.noteDecided(cause);
             log.warn("agent", "stall gate {s}: cause={s} stale_rounds={d} repeats={d} tool={s} round={d}", .{ @tagName(mode), @tagName(cause), report.stale_rounds, report.repeats, report.tool.slice(), report.round });
             if (mode == .enforce) {

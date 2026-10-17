@@ -224,7 +224,8 @@ web_search 显示 query、transcript 回放与 `/recap` 把它们与用户输入
 [LEARNING_TURN_DESIGN.md](LEARNING_TURN_DESIGN.md))**:宿主检查门的判定让 Run 结束后,同一段对话把
 这次经验写成带条件的 lesson,供下一次同题尝试读取。
 - **触发**:根 Run(depth 0)的终局边界,检查门对当前工作区给出 passed / failed 判定时;tainted、
-  unavailable、没跑检查都不学。每 Run 至多一次,observe 只记录本该做的决定。
+  unavailable、没跑检查都不学;没有就绪的 TinyKG store 时记 `none_unstorable`,不跑任何一段。
+  每 Run 至多一次,observe 只记录本该做的决定。
 - **两段**:distill 消息带判定、已存的同题 lesson 和宿主绑定的 lesson 头;模型用 `KgRemember`
   kind `lesson` 写至多 4 条(`holds_when:` / `uncertain:` / `lesson:` / 可选 `supersedes:`)。
   只有接受了 lesson 且已有同题 lesson 时才发 reconcile 消息。每段至多 6 个模型轮次。

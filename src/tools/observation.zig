@@ -63,7 +63,7 @@ pub const CheckGateVerdict = enum { not_run, passed, failed, tainted, unavailabl
 /// What the learning turn saw at the run's terminal boundary.
 pub const LearningGrounding = enum { unchecked, passed, failed, tainted, unavailable };
 /// The learning turn's decision (core/learning_turn.zig `Decision`).
-pub const LearningDecision = enum { none_unfinished, none_unchecked, none_unavailable, none_tainted, none_spent, distill };
+pub const LearningDecision = enum { none_unfinished, none_unchecked, none_unavailable, none_tainted, none_unstorable, distill };
 /// Why the stall gate decided (`none`: it never did).
 pub const StallCause = enum { none, repeating, stale };
 pub const TestIntegrityCoverage = enum { git, no_git, git_failed };

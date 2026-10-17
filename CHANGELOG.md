@@ -72,7 +72,8 @@ status, compatibility boundaries, and entry points are defined by
   only Read, Grep, Glob, KgRecall, KgContext and KgRemember run, process
   gates neither sense nor end it, and the attempt's answer stays the final
   result. Each pass is capped at six model turns. Tainted, unavailable and
-  unchecked verdicts teach nothing. The next attempt at a hinted task sees
+  unchecked verdicts teach nothing, and neither does a run with no ready
+  TinyKG store (`none_unstorable`). The next attempt at a hinted task sees
   the newest unsuperseded lessons in the scoped-recall injection (no
   lessons, byte-identical injection). One terminal `learning_turn`
   observation record per armed run (`metacodes-learning-turn-v1`, validated

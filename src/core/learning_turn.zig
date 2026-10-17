@@ -15,7 +15,8 @@
 //! commentary. During a pass only read tools and `KgRemember` run, so the
 //! checked workspace is the workspace the run hands back.
 //!
-//! Bounds: one learning turn per run, at most two passes (reconcile only
+//! Bounds: one learning turn per run (the terminal boundary is reached once),
+//! at most two passes (reconcile only
 //! after an accepted lesson and only when stored lessons exist to reconcile
 //! against), at most `PASS_MAX_TURNS` model turns per pass, at most
 //! `lesson.MAX_PER_TURN` lessons. The two pass messages are one-time protocol
@@ -27,7 +28,6 @@ const check_gate = @import("check_gate.zig");
 const lesson = @import("../kg/lesson.zig");
 
 pub const MARKER = "[learning turn]";
-pub const MAX_LEARNING_TURNS: u8 = 1;
 /// Model turns per pass. A pass is a few reads and up to four writes.
 pub const PASS_MAX_TURNS: u32 = 6;
 /// Stored lessons listed in the distill message.
@@ -36,9 +36,6 @@ pub const MAX_EXISTING_SHOWN: usize = 6;
 /// tool error, so the workspace the check judged is the one the run returns.
 pub const ALLOWED_TOOLS = [_][]const u8{ "Read", "Grep", "Glob", "KgRecall", "KgContext", "KgRemember" };
 
-const MAX_LISTED_FAILURES: usize = 8;
-const MAX_REASON_BYTES: usize = 200;
-const MAX_TAIL_BYTES: usize = 1500;
 const MAX_EXISTING_BYTES: usize = 600;
 
 pub const Mode = enum { enforce, observe };
@@ -76,20 +73,21 @@ pub const Decision = enum {
     none_unavailable,
     /// The run changed the check or weakened tests: a lesson would launder it.
     none_tainted,
-    /// The run already had its learning turn.
-    none_spent,
+    /// A grounded verdict, but no ready memory store could keep a lesson:
+    /// a pass would spend model requests on writes that cannot land.
+    none_unstorable,
     distill,
 };
 
 /// The policy (LearningTurn.lean mirror, design §7). Pure; observe mode makes
-/// the same decision and injects nothing.
-pub fn decide(decisions: u8, grounding: Grounding) Decision {
-    if (decisions >= MAX_LEARNING_TURNS) return .none_spent;
+/// the same decision and injects nothing. Called once, at the terminal
+/// boundary, which a run reaches at most once.
+pub fn decide(grounding: Grounding, store_ready: bool) Decision {
     return switch (grounding) {
         .unchecked => .none_unchecked,
         .unavailable => .none_unavailable,
         .tainted => .none_tainted,
-        .passed, .failed => .distill,
+        .passed, .failed => if (store_ready) .distill else .none_unstorable,
     };
 }
 
@@ -120,7 +118,6 @@ pub const Report = struct {
 /// Run-local learning state. Lives in the agent loop's frame for the whole
 /// run, so `binding` has a stable address while tools hold it.
 pub const State = struct {
-    decisions: u8 = 0,
     grounding: Grounding = .unchecked,
     decision: ?Decision = null,
     phase: Phase = .idle,
@@ -193,7 +190,9 @@ pub const State = struct {
             .reconcile_turns = self.reconcile_turns,
             .lessons_accepted = accepted,
             .lessons_refused = self.lessons_refused,
-            .reconciled = accepted -| self.distill_accepted,
+            // Only a reconcile pass reconciles: a distill pass cut at its cap
+            // or aborted never set `distill_accepted`.
+            .reconciled = if (self.passes >= 2) accepted -| self.distill_accepted else 0,
             .truncated = self.truncated,
         };
     }
@@ -202,17 +201,6 @@ pub const State = struct {
 pub fn allowedDuringPass(tool_name: []const u8) bool {
     for (ALLOWED_TOOLS) |name| if (std.mem.eql(u8, name, tool_name)) return true;
     return false;
-}
-
-fn utf8Tail(text: []const u8, max: usize) []const u8 {
-    if (text.len <= max) return text;
-    var start = text.len - max;
-    while (start < text.len and (text[start] & 0xC0) == 0x80) start += 1;
-    return text[start..];
-}
-
-fn writeOneLine(w: *std.Io.Writer, text: []const u8, max: usize) !void {
-    for (lesson.boundedUtf8(text, max)) |c| try w.writeByte(if (c == '\n' or c == '\r' or c == '\t') ' ' else c);
 }
 
 /// The verdict as the distill message quotes it: outcome, counts, failing
@@ -230,34 +218,9 @@ pub fn renderVerdict(allocator: std.mem.Allocator, command: []const u8, outcome:
     }
     if (outcome.total > 0) try w.print(", {d}/{d} passed", .{ outcome.passed, outcome.total });
     try w.writeAll(".\n");
-    if (outcome.parsed) |parsed| {
-        var listed: usize = 0;
-        var failing: usize = 0;
-        for (parsed.results) |result| {
-            if (result.kind != .failed or std.mem.eql(u8, result.name, "pinned check")) continue;
-            failing += 1;
-            if (listed == MAX_LISTED_FAILURES) continue;
-            if (listed == 0) try w.writeAll("Failing:\n");
-            listed += 1;
-            try w.writeAll("- ");
-            try writeOneLine(w, result.name, MAX_REASON_BYTES);
-            const reason = if (result.message.len > 0) result.message else result.callsite;
-            if (reason.len > 0) {
-                try w.writeAll(": ");
-                try writeOneLine(w, reason, MAX_REASON_BYTES);
-            }
-            try w.writeByte('\n');
-        }
-        if (failing > listed) try w.print("- … and {d} more\n", .{failing - listed});
-    }
-    if (outcome.verdict != .passed) {
-        const tail = utf8Tail(outcome.output, MAX_TAIL_BYTES);
-        if (tail.len > 0) {
-            try w.writeAll("Output tail:\n");
-            try w.writeAll(tail);
-            if (tail[tail.len - 1] != '\n') try w.writeByte('\n');
-        }
-    }
+    // Same failing list and output tail the check gate's continuation quotes.
+    try check_gate.writeFailures(w, outcome);
+    if (outcome.verdict != .passed) try check_gate.writeOutputTail(w, outcome);
     return out.toOwnedSlice();
 }
 
@@ -284,9 +247,9 @@ pub fn renderDistill(allocator: std.mem.Allocator, state: *const State, existing
     if (existing.len == 0) try w.writeAll("(none)\n");
     for (existing) |stored| {
         try w.print("- node {d} [{s}] holds when: ", .{ stored.node_id, @tagName(stored.envelope.verdict) });
-        try writeOneLine(w, stored.envelope.holds_when, 160);
+        try lesson.writeOneLine(w, lesson.boundedUtf8(stored.envelope.holds_when, 160));
         try w.writeAll(" — ");
-        try writeOneLine(w, stored.envelope.lesson, MAX_EXISTING_BYTES);
+        try lesson.writeOneLine(w, lesson.boundedUtf8(stored.envelope.lesson, MAX_EXISTING_BYTES));
         try w.writeByte('\n');
     }
     try w.print(
@@ -315,7 +278,7 @@ pub fn renderReconcile(allocator: std.mem.Allocator, state: *const State) ![]u8 
     return std.fmt.allocPrint(
         allocator,
         MARKER ++ " reconcile\n" ++
-            "You recorded {d} lesson(s). Now reconcile them with the lessons already stored for this task, listed in the previous message " ++
+            "You recorded {d} lesson(s). Now reconcile them with the lessons already stored for this task, listed in the distill message above " ++
             "(KgRecall with the query \"" ++ lesson.MARKER ++ " task={s}\" finds them). For each stored lesson that today's evidence contradicts, " ++
             "narrows or replaces, write the corrected lesson with the same header and a `supersedes:` line naming it; " ++
             "do not leave a contradicted lesson standing beside a new one. You may write {d} more lesson(s) in this turn. " ++
@@ -329,19 +292,31 @@ pub fn renderReconcile(allocator: std.mem.Allocator, state: *const State) ![]u8 
 const testing = std.testing;
 
 test "unavailable_never_learns / unchecked / tainted_never_learns" {
-    try testing.expectEqual(Decision.none_unchecked, decide(0, .unchecked));
-    try testing.expectEqual(Decision.none_unavailable, decide(0, .unavailable));
-    try testing.expectEqual(Decision.none_tainted, decide(0, .tainted));
-    try testing.expectEqual(Decision.distill, decide(0, .failed));
-    try testing.expectEqual(Decision.distill, decide(0, .passed));
+    for ([_]bool{ true, false }) |ready| {
+        try testing.expectEqual(Decision.none_unchecked, decide(.unchecked, ready));
+        try testing.expectEqual(Decision.none_unavailable, decide(.unavailable, ready));
+        try testing.expectEqual(Decision.none_tainted, decide(.tainted, ready));
+    }
+    try testing.expectEqual(Decision.distill, decide(.failed, true));
+    try testing.expectEqual(Decision.distill, decide(.passed, true));
 }
 
-test "turns_bounded: any grounding after one decision is spent" {
-    inline for (@typeInfo(Grounding).@"enum".fields) |field| {
-        const g: Grounding = @enumFromInt(field.value);
-        try testing.expectEqual(Decision.none_spent, decide(MAX_LEARNING_TURNS, g));
-        try testing.expectEqual(Decision.none_spent, decide(MAX_LEARNING_TURNS + 3, g));
-    }
+test "unstorable_never_learns: a grounded verdict with no store runs no pass" {
+    try testing.expectEqual(Decision.none_unstorable, decide(.failed, false));
+    try testing.expectEqual(Decision.none_unstorable, decide(.passed, false));
+}
+
+test "reconciled counts only a reconcile pass" {
+    var state = State{};
+    state.startPass(.distill);
+    try testing.expect(state.binding.reserve());
+    try testing.expect(state.binding.reserve());
+    // Cut at the distill cap: distill_accepted never set, nothing reconciled.
+    try testing.expectEqual(@as(u32, 0), state.report(.enforce).reconciled);
+    state.distill_accepted = state.binding.acceptedCount();
+    state.startPass(.reconcile);
+    try testing.expect(state.binding.reserve());
+    try testing.expectEqual(@as(u32, 1), state.report(.enforce).reconciled);
 }
 
 test "reconcile_requires_lesson: no lesson or nothing stored means finish" {

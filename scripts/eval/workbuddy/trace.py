@@ -1745,7 +1745,7 @@ def _journal_control_metrics(rows: Iterable[Mapping[str, Any]]) -> Dict[str, Any
                         "none_unchecked",
                         "none_unavailable",
                         "none_tainted",
-                        "none_spent",
+                        "none_unstorable",
                         "distill",
                     }
                 ):
@@ -1776,8 +1776,9 @@ def _journal_control_metrics(rows: Iterable[Mapping[str, Any]]) -> Dict[str, Any
                 # distill pass that accepted a lesson, every bound respected.
                 ran = counts["passes"] > 0
                 # The grounding decides the decision unless the run never reached
-                # its terminal boundary or had already spent its learning turn.
-                decided_by_grounding = decision not in {"none_unfinished", "none_spent"}
+                # its terminal boundary; a grounded verdict with no ready store is
+                # none_unstorable rather than distill.
+                decided_by_grounding = decision != "none_unfinished"
                 if (
                     counts["passes"] > 2
                     or counts["distill_turns"] > 6  # learning_turn.PASS_MAX_TURNS
@@ -1786,7 +1787,7 @@ def _journal_control_metrics(rows: Iterable[Mapping[str, Any]]) -> Dict[str, Any
                     or counts["reconciled"] > counts["lessons_accepted"]
                     or (ran and (decision != "distill" or not observation["enforced"]))
                     or (decision == "distill" and observation["enforced"] and not ran)
-                    or (decision == "distill" and grounding not in {"passed", "failed"})
+                    or (decision in {"distill", "none_unstorable"} and grounding not in {"passed", "failed"})
                     or (decided_by_grounding and (decision == "none_unchecked") != (grounding == "unchecked"))
                     or (decided_by_grounding and (decision == "none_tainted") != (grounding == "tainted"))
                     or (decided_by_grounding and (decision == "none_unavailable") != (grounding == "unavailable"))

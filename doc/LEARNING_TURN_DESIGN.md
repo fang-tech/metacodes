@@ -478,3 +478,11 @@ Where the implemented steps 1–4 depart from the text above, and why:
 - **`none_unfinished`.** A run that stops before its terminal boundary
   (abort, stall, budget, turn cap) records that decision rather than a
   grounding-derived one.
+- **`none_unstorable`.** A passed or failed verdict with no ready TinyKG
+  store runs no pass: every write would fail, so the pass would only spend
+  model requests. The once-per-run counter of §3 is gone; the terminal
+  boundary is reached at most once, so the policy is a function of the
+  grounding and the store alone.
+- **`RunResult.learning` on every exit.** The report rides the run-wide
+  counters, so a pass that is aborted or cut still reports its decision and
+  lessons.
