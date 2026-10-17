@@ -476,7 +476,7 @@ test "RunContext validator bounds length before pointer slicing" {
     try std.testing.expectEqualStrings(id, valid.session_id);
 }
 
-test "Revision 21 SDK rejects Revision 13 through 20 and stale reference roots" {
+test "Revision 22 SDK rejects Revision 13 through 21 and stale reference roots" {
     const Revision13Api = extern struct {
         struct_size: u32,
         abi_version: u32,
@@ -492,9 +492,9 @@ test "Revision 21 SDK rejects Revision 13 through 20 and stale reference roots" 
     try std.testing.expectEqual(@as(usize, 280), @sizeOf(Revision13Api));
     try std.testing.expectError(error.UnsupportedAbi, Api.validate(&revision13));
 
-    // Revisions 14 through 20 (16 withdrawn) share the 64-byte root; only the
+    // Revisions 14 through 21 (16 withdrawn) share the 64-byte root; only the
     // revision check rejects them, so each must fail exactly there.
-    for ([_]u32{ 14, 15, 16, 17, 18, 19, 20 }) |older| {
+    for ([_]u32{ 14, 15, 16, 17, 18, 19, 20, 21 }) |older| {
         var root: types.ApiV1 align(@alignOf(types.ApiV1)) =
             std.mem.zeroes(types.ApiV1);
         root.struct_size = @sizeOf(types.ApiV1);

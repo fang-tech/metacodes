@@ -496,6 +496,9 @@ pub const App = struct {
     /// init 时构建一次(memoize),agent_loop 每轮 prepend。owned;deinit free。
     /// null = 无记忆内容 / CLAUDE_CODE_DISABLE_CLAUDE_MDS。
     user_context: ?[]u8 = null,
+    /// Issue #276: the date `user_context` states and the date the model was
+    /// last told; runs announce a later local date once (agent_loop).
+    time_announcer: ?@import("core/time_context.zig").Announcer = null,
     /// 运行时工具表（Skill + MCP 工具都注册到这里）。
     dyn_registry: DynRegistry,
     /// 已连接的 MCP server。每个 owns 一个 McpClient + McpSession（一一对应）。
@@ -971,12 +974,20 @@ pub const App = struct {
             break :blk (idx orelse &.{});
         };
         defer if (auto_mem.len > 0) allocator.free(auto_mem);
+        // One instant and zone for the session-start date text and the
+        // announcer that tracks what the model was told since (issue #276).
+        const time_context = @import("core/time_context.zig");
+        const session_start = @import("util/time.zig").nowUnix();
+        const session_zone = time_context.systemZone(session_start);
+        app.time_announcer = time_context.Announcer.init(session_start, &session_zone, time_context.Announcer.defaultNow);
         app.user_context = @import("core/memory/user_context.zig").build(allocator, .{
             .cwd = app.cwdAbs(),
             .home = app.homeDir(),
             .state_root = app.stateRoot(),
             .auto_mem = auto_mem,
             .kg_summary = app.kg_summary,
+            .now = session_start,
+            .zone = session_zone,
         }) catch |err| blk: {
             @import("util/log.zig").warn("memory", "user_context build failed: {s}", .{@errorName(err)});
             break :blk null;

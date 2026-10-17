@@ -4,11 +4,11 @@
 /// doc/AGENTCORE_BINARY_ABI.md, Status). No stability promise: layouts and
 /// semantics may change incompatibly between commits. Pin an exact bundle.
 pub const ABI_VERSION_V1: u32 = 1;
-pub const ABI_REVISION: u32 = 21;
+pub const ABI_REVISION: u32 = 22;
 
 comptime {
     if (@sizeOf(usize) != 8)
-        @compileError("AgentCore ABI v1 revision 21 requires a 64-bit pointer ABI");
+        @compileError("AgentCore ABI v1 revision 22 requires a 64-bit pointer ABI");
 }
 
 pub const Status = enum(u32) {
@@ -283,6 +283,17 @@ pub const RUN_INPUT_PART_IMAGE: u32 = 2;
 /// declaration and is refused; leave a model out to make no statement.
 pub const CAPABILITY_SUPPORTED: u32 = 1;
 pub const CAPABILITY_UNSUPPORTED: u32 = 2;
+/// Revision 22 `RunOptionsV1.time_context_code`: how the runtime tells the
+/// model today's date and time zone for a Run (a `currentDate` context block).
+/// SYSTEM (zero, the default) uses the process's time zone; UTC_OFFSET uses
+/// `utc_offset_minutes`; OFF adds nothing. A Host block labeled `currentDate`
+/// is the Run's time context and suppresses the runtime's under SYSTEM.
+pub const TIME_CONTEXT_SYSTEM: u32 = 0;
+pub const TIME_CONTEXT_UTC_OFFSET: u32 = 1;
+pub const TIME_CONTEXT_OFF: u32 = 2;
+/// Revision 22: `utc_offset_minutes` bounds (UTC-14:00 .. UTC+14:00).
+pub const MIN_UTC_OFFSET_MINUTES_V1: i32 = -14 * 60;
+pub const MAX_UTC_OFFSET_MINUTES_V1: i32 = 14 * 60;
 
 pub const SKILL_SOURCE_USER: u32 = 1;
 pub const SKILL_SOURCE_WORKSPACE: u32 = 2;
@@ -903,7 +914,12 @@ pub const RunOptionsV1 = extern struct {
     /// zero count adds nothing.
     context_blocks: ?[*]const ContextBlockV1,
     context_block_count: u64,
-    reserved: [2]u64,
+    /// Revision 22: one TIME_CONTEXT_* value; zero is TIME_CONTEXT_SYSTEM.
+    time_context_code: u32,
+    /// Revision 22: minutes east of UTC under TIME_CONTEXT_UTC_OFFSET; zero
+    /// under any other code.
+    utc_offset_minutes: i32,
+    reserved: [1]u64,
 };
 
 /// Terminal Run summary. All fields are defined on STATUS_OK. On
@@ -1173,7 +1189,7 @@ pub const SessionUpdatePermissionModeFnV1 = *const fn (
     permission_mode_code: u32,
     out_diagnostic: ?*OwnedBytesV1,
 ) callconv(.c) u32;
-/// Runs the canonical default best-effort compact policy. Revision 21 accepts
+/// Runs the canonical default best-effort compact policy. Revision 22 accepts
 /// no target token budget and does not guarantee fit for a model context.
 pub const SessionCompactFnV1 = *const fn (
     session: ?*SessionHandle,
@@ -1356,6 +1372,9 @@ test "ABI v1 public layouts are fixed on supported 64-bit targets" {
     try std.testing.expectEqual(@as(usize, 24), @offsetOf(ContextBlockV1, "text"));
     try std.testing.expectEqual(@as(usize, 8), @offsetOf(RunOptionsV1, "context_blocks"));
     try std.testing.expectEqual(@as(usize, 16), @offsetOf(RunOptionsV1, "context_block_count"));
+    try std.testing.expectEqual(@as(usize, 24), @offsetOf(RunOptionsV1, "time_context_code"));
+    try std.testing.expectEqual(@as(usize, 28), @offsetOf(RunOptionsV1, "utc_offset_minutes"));
+    try std.testing.expectEqual(@as(usize, 32), @offsetOf(RunOptionsV1, "reserved"));
     try std.testing.expectEqual(@as(usize, 64), @offsetOf(SessionControlApiV1, "set_prompt_profile"));
     try std.testing.expectEqual(@as(usize, 72), @offsetOf(SessionControlApiV1, "update_permission_mode"));
     try std.testing.expectEqual(@as(usize, 8), @offsetOf(SkillPolicyV1, "granted_skill_ids"));
@@ -1436,9 +1455,9 @@ test "typed provider kind validates every public code" {
     );
 }
 
-test "Revision 21 keeps MCP wire codes stable" {
+test "Revision 22 keeps MCP wire codes stable" {
     const std = @import("std");
-    try std.testing.expectEqual(@as(u32, 21), ABI_REVISION);
+    try std.testing.expectEqual(@as(u32, 22), ABI_REVISION);
     try std.testing.expectEqual(@as(u32, 1), MCP_NEGOTIATION_AUTO);
     try std.testing.expectEqual(@as(u32, 2), MCP_NEGOTIATION_MODERN_ONLY);
     try std.testing.expectEqual(@as(u32, 3), MCP_NEGOTIATION_LEGACY_ONLY);

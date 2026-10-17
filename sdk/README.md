@@ -1,7 +1,7 @@
 # AgentCore SDK
 
 This directory contains source-free host bindings for the experimental AgentCore
-C ABI v1 revision 21:
+C ABI v1 revision 22:
 
 - `metask/agentcore.h` — normative C11/C++17 layout declarations;
 - `zig/` — typed Zig consumer bindings;
@@ -10,7 +10,7 @@ C ABI v1 revision 21:
 
 Do not copy individual files into a release. Consume the complete generated bundle
 and validate its manifest, hashes, target, ABI version, exact 64-byte root, all
-five mandatory typed tables, function slots, and reserved fields. Revision 21 is
+five mandatory typed tables, function slots, and reserved fields. Revision 22 is
 the Agent Runtime surface; it does not expose an independent Completion client.
 `SessionCreateConfigV1.prompt_profile` edits the named system-prompt sections
 (replace the identity, add Host sections; governance sections stay locked) and
@@ -27,6 +27,10 @@ adoption as `input_adopted`, and `RunResultV1.input_accepted_count` /
 `session_run_input` accepts text, typed Skill, and multimodal inputs; a
 `RUN_INPUT_MULTIMODAL` Run submits an ordered `RunInputPartV1` array of text and
 base64 image parts, preflighted against the Session model's image capability.
+Every Run's context leads with today's date and time zone unless the Host
+supplies its own `currentDate` block or sets `RunOptionsV1.time_context_code`
+to `TIME_CONTEXT_OFF`; `TIME_CONTEXT_UTC_OFFSET` dates the Run in
+`utc_offset_minutes` instead of the process's zone.
 `SessionHostConfigV1.model_capabilities` lets the Host declare which of its
 models take image input; a declaration outranks the built-in model-family
 table, holds across `set_model` and restore, and `describe` reports the answer

@@ -458,7 +458,7 @@ test "L2 KG: 注入段经 inject_user_context 进请求体(字节断言,DoD)" {
         .cwd = "",
         .home = "",
         .kg_summary = "# Knowledge Graph\n本项目/全局共 7 条持久记忆——处理涉及既往决策/约定的任务前,先 KgRecall。\n",
-    })).?;
+    }));
     defer a.free(uc);
 
     var srv = try harness.MockServer.start(KG_END_TURN_SSE, 0);

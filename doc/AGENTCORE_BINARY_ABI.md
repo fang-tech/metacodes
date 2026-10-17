@@ -9,7 +9,7 @@ ABI v1 is an experimental in-process embedding contract for synchronous,
 stateful AgentSession execution. It does not expose or define a host product
 model.
 
-**Status: experimental.** Revision 21 is one exact hard-cut Agent Runtime wire
+**Status: experimental.** Revision 22 is one exact hard-cut Agent Runtime wire
 shape. It keeps the existing checkpoint/restore, durable budget, MCP
 Runtime/Session seams, Workspace Skill source/identity/policy binding,
 hash-pinned process-tool packages, Host/MCP byte-zero Tool Result streaming,
@@ -21,14 +21,15 @@ blocks"): `SessionCreateConfigV1.prompt_profile`,
 `prompt_manifest` observation event, Revision 19's
 `session_control->update_permission_mode` (see "Permission mode updates"), and
 Revision 20's `session->submit_input` with the `input_adopted` event and the
-`RunResultV1` input counts (see "Active-Run input"). Over Revision 20 it adds
-Host model-capability declarations: `SessionHostConfigV1` turns two reserved
-words into `model_capabilities` and `model_capability_count`, a 40-byte
-`ModelCapabilityV1` says whether one model takes image input, status 29
-`IMAGE_INPUT_CAPABILITY_UNKNOWN` separates "nothing says this model takes
-images" from status 28 "a source says it does not", and `describe` reports the
-model's image input with its source (see "Model capabilities"). No table or
-descriptor changes size. Revision 16 stays
+`RunResultV1` input counts (see "Active-Run input"), and Revision 21's Host
+model-capability declarations (`SessionHostConfigV1.model_capabilities`,
+`ModelCapabilityV1`, status 29 `IMAGE_INPUT_CAPABILITY_UNKNOWN`, and the
+described `image_input`; see "Model capabilities"). Over Revision 22 it adds
+the Run's time context: `RunOptionsV1` turns its first remaining reserved word
+into `time_context_code` and `utc_offset_minutes`, and by default the runtime
+leads every Run's context with a `currentDate` block naming today's date and
+its time zone (see "Time context"). No table or descriptor changes size.
+Revision 16 stays
 skipped: it named the withdrawn first-class PDF input on `main`, and a
 revision keeps a single meaning. The independent public Completion facade
 stays removed. This is not a general v1 stability promise.
@@ -38,7 +39,7 @@ and treat a different revision as incompatible. Layouts, numeric values,
 function-table order, and semantics may change only through another explicit
 revision cut while v1 remains experimental.
 
-The current experimental bundle is **ABI v1 revision 21**. Revision 21 is a
+The current experimental bundle is **ABI v1 revision 22**. Revision 22 is a
 hard-cut replacement for every earlier revision. The root is no longer a
 capability-tagged flat table. It is a 64-byte exact layout containing the
 stable 16-byte discovery prefix, `buffer_release`, and five non-null typed
@@ -46,7 +47,7 @@ table pointers. Every table is mandatory at discovery; consumers simply avoid
 calling domains they do not use. There is no `query_interface`, string ID,
 optional-capability negotiation, or compatibility shim:
 
-- `metask_agentcore_api_v1` is 64 bytes and requires `abi_revision == 21`;
+- `metask_agentcore_api_v1` is 64 bytes and requires `abi_revision == 22`;
 - Runtime, Session, Session Control, Skill, and MCP tables are respectively
   24, 48, 80, 32, and 40 bytes;
 - the root plus child tables expose 24 functions: root `buffer_release` and
@@ -64,7 +65,8 @@ optional-capability negotiation, or compatibility shim:
   72, 56, and 56 bytes; `SessionCreateConfigV1` replaces one reserved word with
   the nullable `prompt_profile` pointer (offset 32), and the 40-byte
   `RunOptionsV1` replaces two with the `context_blocks` pointer (offset 8) and
-  `context_block_count` (offset 16);
+  `context_block_count` (offset 16), and its next with `time_context_code`
+  (offset 24) and `utc_offset_minutes` (offset 28);
 - `ProcessPluginSourceV1` and `RuntimePluginConfigV1` are respectively 48 and
   72 bytes; `HostResultSinkV1` and `HostStreamToolV1` are respectively 56 and
   96 bytes; the single `runtime->create` takes a nullable plugin config, where
@@ -85,11 +87,11 @@ optional-capability negotiation, or compatibility shim:
 - `SessionHostConfigV1` stays 168 bytes and replaces two of its three reserved
   words with the `model_capabilities` pointer (offset 144) and
   `model_capability_count` (offset 152); `ModelCapabilityV1` is 40 bytes;
-- `manifest.json` keeps schema version 1 and records revision 21 and root size
+- `manifest.json` keeps schema version 1 and records revision 22 and root size
   64. Child-table validation belongs to ABI discovery and is not duplicated in
   bundle metadata.
 
-Revision 21 provides no earlier AgentCore revision compatibility, shim, dual dispatch, or old
+Revision 22 provides no earlier AgentCore revision compatibility, shim, dual dispatch, or old
 table layout. Consumers update the header, SDK, manifest, and library
 atomically, validate the stable
 `struct_size`/`abi_version` prefix before reading later fields, then validate
@@ -98,16 +100,16 @@ per-Run callback validates and copies any retained `RunContext`
 fields during the callback, and Host registries bind/compare `session_id`
 atomically under their per-Session lock.
 
-Revision 21 deliberately exposes explicit process-package sources, their
+Revision 22 deliberately exposes explicit process-package sources, their
 namespaced `host_tool` contributions, and explicit Host stream-tool
 descriptors. It does not expose the generic
 data/static plugin grouping model or `metacodes.plugin-inventory/v1`; those
 remain available through the source-level Zig Runtime plus CLI/Web JSON Host
 interfaces. Projecting generic inventory into this binary table requires a
-later explicit ABI revision. A revision-21 consumer must not infer plugin
+later explicit ABI revision. A revision-22 consumer must not infer plugin
 identity from tool or Skill names, and every reserved field remains zero.
 
-### Revision 21 table topology
+### Revision 22 table topology
 
 The root layout is exact on the required 64-bit pointer ABI:
 
@@ -115,7 +117,7 @@ The root layout is exact on the required 64-bit pointer ABI:
 |---:|---|---|
 | 0 | `struct_size` | exactly 64 |
 | 4 | `abi_version` | exactly 1 |
-| 8 | `abi_revision` | exactly 21 |
+| 8 | `abi_revision` | exactly 22 |
 | 12 | `reserved0` | zero |
 | 16 | `buffer_release` | non-null function |
 | 24 | `runtime` | non-null 24-byte table |
@@ -141,9 +143,9 @@ exact 64-byte/version check, and may dereference a child only after that child
 pointer is non-null and aligned. Wrong revision, reserved values, child sizes,
 or any null slot reject the entire discovery. The 280-byte Revision 13 root and
 the unreleased 72-byte reference layout therefore fail at root size without an
-out-of-bounds read, and stale 64-byte Revision 14, 15, 16, 17, 18, 19, and 20
-roots fail at the revision check. A Revision 19 Session table is also 8 bytes
-short of the Revision 20 and 21 size.
+out-of-bounds read, and stale 64-byte Revision 14, 15, 16, 17, 18, 19, 20, and
+21 roots fail at the revision check. A Revision 19 Session table is also 8
+bytes short of the Revision 20 through 22 size.
 
 A future stability freeze first requires closure of the open items tracked in
 `doc/AGENTCORE_V1_EXPERIMENTAL_LEDGER.md` (every group A item closed; every
@@ -303,19 +305,19 @@ Current delivery status is intentionally target-specific:
 
 | Target | Bundle/archive | Native source-free consumption |
 |---|---|---|
-| `aarch64-macos` | revision 21 ReleaseSafe bundle, schema-1 manifest, public-symbol, and source-free link gates passed locally (2026-10-16) | revision 21 native gate passed locally (2026-10-16): C and Zig source-free consumers (Host model-capability declarations: unknown, Host-unsupported and Host-supported models, the Zig one across restore over OpenAI Responses; both submitting input to an active Run), C/C++ header compile, Rust SDK tests and link probe, including multimodal, fresh/restore and continued Runs |
-| `x86_64-windows-msvc` | revision 14 evidence retained; revision 21 not revalidated | native revision 21 gate pending |
-| `aarch64-windows-msvc` | revision 14 evidence retained; revision 21 not revalidated | native revision 21 gate pending |
-| `aarch64-windows-gnu` | revision 14 evidence retained; revision 21 not revalidated | native revision 21 gate pending |
-| `x86_64-windows-gnu` | revision 13 evidence retained; revision 21 not revalidated | native revision 21 gate pending |
-| `x86_64-linux-gnu` | revision 13 evidence retained; revision 21 not revalidated | native revision 21 gate pending |
-| `x86_64-macos` | revision 13 evidence retained; revision 21 not revalidated | native revision 21 gate pending |
+| `aarch64-macos` | revision 22 ReleaseSafe bundle, schema-1 manifest, public-symbol, and source-free link gates passed locally (2026-10-16) | revision 22 native gate passed locally (2026-10-16): C and Zig source-free consumers (time context with a Host UTC offset, the C one finding the named offset in the provider request; Host model-capability declarations: unknown, Host-unsupported and Host-supported models, the Zig one across restore over OpenAI Responses; both submitting input to an active Run), C/C++ header compile, Rust SDK tests and link probe, including multimodal, fresh/restore and continued Runs |
+| `x86_64-windows-msvc` | revision 14 evidence retained; revision 22 not revalidated | native revision 22 gate pending |
+| `aarch64-windows-msvc` | revision 14 evidence retained; revision 22 not revalidated | native revision 22 gate pending |
+| `aarch64-windows-gnu` | revision 14 evidence retained; revision 22 not revalidated | native revision 22 gate pending |
+| `x86_64-windows-gnu` | revision 13 evidence retained; revision 22 not revalidated | native revision 22 gate pending |
+| `x86_64-linux-gnu` | revision 13 evidence retained; revision 22 not revalidated | native revision 22 gate pending |
+| `x86_64-macos` | revision 13 evidence retained; revision 22 not revalidated | native revision 22 gate pending |
 
 Cross-build success is not a support claim. In particular, the empty macOS
 framework list remains provisional until the corresponding native gates pass.
 This validation status is not an ABI restriction.
 
-Revision 21 hard-cuts the current schema-1 manifest contract in place. The
+Revision 22 hard-cuts the current schema-1 manifest contract in place. The
 manifest records the exact ABI version, revision, and root size, while runtime
 discovery validates all five mandatory child tables. There is no manifest
 migration, dual parser, capability negotiation, or duplicated child-table
@@ -349,7 +351,7 @@ both copies.
 
 `decodeSkillCatalog` returns an owned `ParsedSkillCatalog` for
 `metask.skill-catalog/v1`. Revision 15 hard-cut the current experimental shape
-of that schema, and Revision 21 keeps it: every earlier unreleased experimental
+of that schema, and Revision 22 keeps it: every earlier unreleased experimental
 shape bearing the same token is void, and consumers must interpret the
 descriptor only with the exact bundle they pin. The decoder validates the
 schema, the 1024-Skill limit, identity forms, duplicate concrete `skill_id` or
@@ -434,7 +436,7 @@ ordering and may invoke their callbacks concurrently. The stream has no common
 event sequence number, cursor, replay, or exactly-once contract; only
 `run_state.transition_seq` orders RunState snapshots.
 
-`on_event` is mandatory in Revision 21. `run_state` is emitted for admitted-run
+`on_event` is mandatory in Revision 22. `run_state` is emitted for admitted-run
 start, phase/tool-set/turn/tool-call changes, and terminal closure; it is not a
 mirror of text or usage deltas. Its `transition_seq` starts at 1 for each Run
 and advances only for emitted RunState snapshots. While the observation
@@ -500,7 +502,7 @@ owned typed value. Older Hosts retain the event through the `unknown` path.
 decode it through the `unknown` observation path and ignore or retain it in
 accordance with the forward-compatibility rules above.
 
-`tool_result.file_refs` is an optional Revision 21 observation field. It is
+`tool_result.file_refs` is an optional Revision 22 observation field. It is
 present only for successful selected built-in file-tool executions and contains
 at most 32 entries. Each entry has one locator union (`workspace_path`,
 `absolute_path`, or `uri`), an open-ended bounded `kind` string, a bounded
@@ -527,7 +529,7 @@ their `ctx` and keeps it valid until Session destruction succeeds.
 
 ### Process-plugin Runtime configuration
 
-Revision 21 uses one `runtime->create(runtime_config, plugin_config,
+Revision 22 uses one `runtime->create(runtime_config, plugin_config,
 out_runtime, out_diagnostic)`. The Runtime config is required; the plugin
 config is nullable. Null and an empty, well-formed `RuntimePluginConfigV1`
 create equivalent no-extra-plugin generations. Descriptor arrays and path
@@ -586,7 +588,7 @@ version, pinned executable SHA-256, global tool name and validated reserialized
 input schema.
 The binding—not the display name alone—enters Permission provenance and
 checkpoint authority resolution. Process tools deliberately have no
-`allow_session`/`deny_session` candidate in revision 21, so a Host may answer
+`allow_session`/`deny_session` candidate in revision 22, so a Host may answer
 only the offered one-shot choices unless an independent native rule decides
 first. Changing executable/package/schema authority invalidates a restored
 binding instead of silently reauthorizing the new implementation.
@@ -683,7 +685,7 @@ not define status precedence when multiple other input or admission errors are
 present in the same call.
 
 ABI v1 provides no in-place recovery or mutation of a poisoned Session. The
-Host must destroy that physical handle. Revision 21 checkpoint/restore creates
+Host must destroy that physical handle. Revision 22 checkpoint/restore creates
 a new handle from a previously exported committed checkpoint; it does not
 reconstruct state that was never successfully exported or resume an active
 Run.
@@ -691,7 +693,7 @@ Run.
 When facade poison occurs after Core has returned to an inspectable idle state,
 `session_describe` succeeds and reports lifecycle `poisoned`; it must not report
 `idle`. An active ordinary Session activity makes `session_describe` return
-`METASK_AGENTCORE_STATUS_BUSY`, so a successful Revision 21 description does not
+`METASK_AGENTCORE_STATUS_BUSY`, so a successful Revision 22 description does not
 emit lifecycle `busy`.
 
 A checkpoint is resumable model state, not a raw transcript archive. Before
@@ -738,7 +740,7 @@ requests cooperative abort and any other value returns
 ### Manual compact
 
 `session_compact` runs the canonical default compact policy as a best-effort
-Conversation maintenance operation. Revision 21 has no Host-supplied target
+Conversation maintenance operation. Revision 22 has no Host-supplied target
 token budget and does not guarantee that the result fits the context window of
 the current or a future model. `session_set_model` and `session_compact` are
 independent primitives, not a compound model-migration transaction.
@@ -747,7 +749,7 @@ On `METASK_AGENTCORE_STATUS_OK`, `CompactResultV1.before_context_tokens` and
 `after_context_tokens` are context-size estimates for UI and policy decisions;
 they are not provider billing values. The four provider usage-delta fields are
 semantically separate. `METASK_AGENTCORE_COMPACT_DEGRADED` exposes no structured
-reason in Revision 21, and a Host must not infer one by parsing diagnostics.
+reason in Revision 22, and a Host must not infer one by parsing diagnostics.
 
 Assistant text and other execution output are delivered through `on_event`.
 `RunResultV1` is a terminal summary containing stop reason, turns, and tool
@@ -776,7 +778,7 @@ fresh-create input or restored checkpoint. `protocol_kind_code` occupies byte
 offset 140 in the unchanged 168-byte Host config and accepts:
 
 - `METASK_AGENTCORE_PROTOCOL_DEFAULT` (`0`): use the selected provider's
-  existing default. In Revision 21 that means Anthropic Messages, OpenAI Chat
+  existing default. In Revision 22 that means Anthropic Messages, OpenAI Chat
   Completions, or Gemini GenerateContent;
 - `METASK_AGENTCORE_OPENAI_PROTOCOL_RESPONSES` (`1`): valid only with
   `METASK_AGENTCORE_PROVIDER_OPENAI`; serialize `POST /v1/responses` request
@@ -832,6 +834,35 @@ remote refuses it, and that refusal is the Provider's: the Run ends with
 `describe` reports the answer for the current model as
 `"image_input":{"supported":<bool>,"source":"host"|"catalog"|"model_family"|"unknown"}`;
 `source` is `unknown` only together with `supported:false`.
+
+### Time context
+
+A model has no clock. By default each Run's context starts with a block the
+runtime writes, labeled `currentDate`:
+
+```text
+# currentDate
+Today's date is 2026-10-17 (Saturday). Time zone: Asia/Shanghai (UTC+08:00).
+```
+
+It is taken when the Run starts and joins that Run's user record with the
+Host's context blocks (see "System prompt profiles and context blocks"): history
+keeps each Run's own date, and the system prompt - the cached prefix - never
+changes with the date. `RunOptionsV1.time_context_code` chooses the zone:
+
+| Code | Meaning |
+|---|---|
+| `TIME_CONTEXT_SYSTEM` (0, default) | the AgentCore process's time zone (libc `localtime_r` on POSIX, the dynamic time-zone information on Windows). When the platform cannot tell, the date is in UTC and the block says the user's time zone is unknown. |
+| `TIME_CONTEXT_UTC_OFFSET` (1) | `utc_offset_minutes` east of UTC, within `MIN_UTC_OFFSET_MINUTES_V1`..`MAX_UTC_OFFSET_MINUTES_V1` (UTC-14:00..UTC+14:00), named `UTC±hh:mm`. For a Host whose users are not where the process runs. |
+| `TIME_CONTEXT_OFF` (2) | no block. |
+
+`utc_offset_minutes` is zero under every code but `UTC_OFFSET`. A Host block
+labeled `currentDate` is the Run's time context: under `SYSTEM` the runtime
+adds none, and together with `UTC_OFFSET` it is two answers to one question
+and the Run is refused. A Skill invocation carries no context blocks, so it
+takes `SYSTEM` (nothing is added) or `OFF`. Every violation is
+`INVALID_ARGUMENT` before admission: no `run_id` advances and nothing reaches
+the Provider.
 
 ### Active-Run input
 
@@ -930,13 +961,13 @@ reservation into the Session's durable usage; the Run's end releases the
 rest. Input passes no permission, sandbox, cancellation, or budget decision:
 it only adds a user record.
 
-Support is discovered through Revision 21 itself (the slot is mandatory);
+Support is discovered through Revision 22 itself (the slot is mandatory);
 `MAX_SUBMITTED_INPUTS_V1` (64) and `MAX_SUBMITTED_INPUT_BYTES_V1` (16 MiB) are
 published constants; `session_describe` is unchanged.
 
 ### Active-Run intent/result journal
 
-`SessionHostConfigV1.run_journal_mode_code` is part of the exact revision-21
+`SessionHostConfigV1.run_journal_mode_code` is part of the exact revision-22
 wire contract and accepts only:
 
 - `METASK_AGENTCORE_RUN_JOURNAL_EPHEMERAL` (`0`): the default, zero-journal-I/O
@@ -960,7 +991,7 @@ downgraded to never.
 The journal is outside Conversation and provider request projection. Enabling
 it therefore does not insert prompt bytes, reorder history, or invalidate a
 warm prompt-cache prefix. An unfinished pair or retained crash marker fails
-closed; revision 21 does **not** expose in-place active-Run resume, automatic
+closed; revision 22 does **not** expose in-place active-Run resume, automatic
 tool replay, or exactly-once external effects. It provides durable evidence
 and deterministic recovery classification for a later explicit recovery API,
 not authority to guess whether an external side effect occurred.
@@ -1158,14 +1189,14 @@ published once, not that the Host filesystem is transactional.
 AgentCore does not implicitly read `/etc/metacodes/skills`, `.claude/skills`,
 `.codex/skills`, or `.metacodes/skills`. A Host may explicitly register any
 local directory only when its contents already use the canonical Agent Skill
-format. Directory names do not select a parser; Revision 21 has no Claude/Codex
+format. Directory names do not select a parser; Revision 22 has no Claude/Codex
 format adapter or public Provider Registry. The projected provider id is
 `agents.directory`.
 
 Each valid `skills[]` entry exposes separate identities:
 
 - `skill_policy_key`: the logical invocation slot, equal to
-  `invocation_name` in Revision 21;
+  `invocation_name` in Revision 22;
 - `provider_id`, `source_scope`, `source_instance_id`, and `contribution_id`:
   source identity;
 - `content_revision`: body/resources identity;
@@ -1342,7 +1373,7 @@ synchronous within the same Host Run and projects its public text and usage
 through the ordinary event stream. The provider tool name `Skill` is reserved:
 Runtime creation rejects a Host tool with that name.
 
-Fork children cannot suspend for Host UI interaction in Revision 21. Their UI
+Fork children cannot suspend for Host UI interaction in Revision 22. Their UI
 requester is unavailable, so a child question or permission request fails
 closed as an ordinary fork/tool failure attributed to the outer Run. Inline
 execution may use the outer Run's synchronous UI callback.
@@ -1354,7 +1385,7 @@ product decision.
 
 ### MCP Runtime catalog and Session view
 
-Revision 21 supports exact MCP `2026-07-28`, `2025-11-25`, and `2025-06-18`
+Revision 22 supports exact MCP `2026-07-28`, `2025-11-25`, and `2025-06-18`
 connections. Public negotiation codes preserve Revision 6 meanings:
 `auto=1`, `modern_only=2`, and exact `legacy_only=3`; exact
 `legacy_2025_06_only=4` is appended. Runtime owns negotiation,
@@ -1405,7 +1436,7 @@ returns.
 | Reporting every completed HTTP response's final status and body | Host Connector |
 | Binding one connection context to `purpose_code` and `requested_era_code` | Host Connector |
 
-Revision 21 separates MCP control and result traffic in the type system.
+Revision 22 separates MCP control and result traffic in the type system.
 `McpConnectorV1.request` writes a 40-byte `McpResponseV1` only for bounded
 discovery/initialize/catalog control frames. Stdio responses use
 `http_status == 0`; Streamable HTTP completed responses use their final status
@@ -1516,12 +1547,12 @@ materializes a provider
 with the recorded envelope admission is an invariant violation. View
 destruction releases materialized tools before releasing the retained
 Snapshot. MCP Tasks, notification pumping, and automatic request replay remain
-outside Revision 21.
+outside Revision 22.
 
 The value-only MCP checkpoint section has one current `MCPSEL` format and no
 independent revision axis. Its decoder rejects every earlier `R6MCP`/`R7MCP`
 encoding. Era remains provenance rather than a selection fingerprint input.
-The outer AgentCore ABI Revision 21 remains the sole compatibility boundary.
+The outer AgentCore ABI Revision 22 remains the sole compatibility boundary.
 
 ### Model-visible MCP diagnostics
 
@@ -1673,7 +1704,7 @@ needed.
   (`disableBypassPermissionsMode`, `disableAutoMode`) would also return
   `INVALID_ARGUMENT`, diagnostic `PermissionModeDisabled`; a Session's
   settings are the Host-imported rules, which cannot disable a mode, so this
-  does not occur in revision 21. None of these changes anything.
+  does not occur in revision 22. None of these changes anything.
 - **Effective point.** The first permission decision after the call returns
   `OK`, which is the first Tool call of the next Run.
 - **Grants.** A new mode is a new policy. The call starts a new policy
@@ -1761,7 +1792,7 @@ prompt-outcome contract replaces that seam.
 
 ### Completion boundary
 
-Revision 21 exposes no Completion handle, DTO, status, or function slot.
+Revision 22 exposes no Completion handle, DTO, status, or function slot.
 Independent title, summary, classification, and other product-level model calls
 belong to the Host or a product plugin. If the Agent itself must invoke such a
 capability, the Host exposes a semantically bounded Tool; a generic Completion
@@ -2020,7 +2051,7 @@ reliable automatic classification.
 ### ABI evolution
 
 All v1 POD descriptors and the API table require their exact documented
-`struct_size`; every reserved field must be zero. While Revision 21 remains
+`struct_size`; every reserved field must be zero. While Revision 22 remains
 unreleased and experimental, an explicitly approved hard cut may replace its
 wire shape in place only when the library, headers, SDKs, consumers, tests, and
 documentation move atomically; the replaced bundle is void and no compatibility
@@ -2032,11 +2063,11 @@ or control-message extensions require `metask_agentcore_get_api(2)` and v2
 types. Assigning a meaning or non-zero value to a reserved field is always an
 explicit wire-contract decision, never an inferred compatible extension.
 
-Revision 21's published POD offsets and sizes require a 64-bit pointer ABI.
+Revision 22's published POD offsets and sizes require a 64-bit pointer ABI.
 The header rejects 32-bit consumers at compile time; a future 32-bit contract
 would need separately specified layouts and consumer gates.
 
-Revision 21 has no root capability mask. The five typed table pointers and
+Revision 22 has no root capability mask. The five typed table pointers and
 their exact layouts are the complete ABI surface and are all mandatory.
 Concrete Runtime and Session configuration still determines which tools and
 callbacks are active; that configuration is not ABI capability negotiation.
