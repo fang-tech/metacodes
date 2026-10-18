@@ -137,6 +137,7 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
         parsed_legacy = _parse_result(stable_json(legacy))
         self.assertEqual(parsed_legacy["cache_read_input_tokens"], 0)
         self.assertEqual(parsed_legacy["cache_creation_input_tokens"], 0)
+        self.assertEqual(parsed_legacy["usage_status"], "known")
 
         current = dict(legacy)
         current.update(
@@ -145,6 +146,11 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
         parsed_current = _parse_result(stable_json(current))
         self.assertEqual(parsed_current["cache_read_input_tokens"], 8)
         self.assertEqual(parsed_current["cache_creation_input_tokens"], 3)
+
+        unknown = dict(current, usage_status="unknown")
+        self.assertEqual(_parse_result(stable_json(unknown))["usage_status"], "unknown")
+        with self.assertRaises(ValidationError):
+            _parse_result(stable_json(dict(current, usage_status="maybe")))
 
         partial = dict(legacy)
         partial["cache_read_input_tokens"] = 8
