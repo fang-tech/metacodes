@@ -11,7 +11,7 @@ except ImportError as error:  # pragma: no cover - environment, not logic
     ) from error
 
 from scripts.eval.workbuddy import leaderboard_jobs
-from scripts.eval.workbuddy.launch_gate import PROVIDER_KEY_ENV
+from scripts.eval.workbuddy.launch_gate import JUDGE_KEY_ENV, PROVIDER_KEY_ENV
 
 OVERLAY = Path(__file__).parents[1] / "workbuddy/overlay"
 
@@ -130,8 +130,10 @@ class LeaderboardJobsTest(unittest.TestCase):
                 },
             },
         )
-        # Never the actor credential: judge spend is metered on its own key.
+        # Never the actor credential: the judge spends on its own key, the one
+        # launch_gate keeps only for a launch with a frozen judge budget.
         self.assertNotEqual(judge["backend_key_env"], PROVIDER_KEY_ENV)
+        self.assertEqual(judge["backend_key_env"], JUDGE_KEY_ENV)
 
 
 if __name__ == "__main__":

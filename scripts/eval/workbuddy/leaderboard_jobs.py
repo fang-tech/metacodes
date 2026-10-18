@@ -11,7 +11,9 @@ A paid launch binds one frozen cohort, one attempt and one concurrent trial
 four frozen cohorts, which together cover all 260 tasks once.  Run ``r`` of the
 protocol is these sixteen files with suffix ``-r<r>``; three runs are three
 independent sets of transactions.  The files differ from each other only in
-subset, cohort, run index, task selection and result root.
+subset, cohort, run index, task selection and result root.  A Web or Office
+job runs the judge, so ``launch_gate create`` plans it only with an explicit
+``--judge-budget-usd`` cap, which enters that transaction's budget journal.
 
     python3 -m scripts.eval.workbuddy.leaderboard_jobs \\
         --run 1 --output /path/to/workbuddy-bench/configs/jobs
