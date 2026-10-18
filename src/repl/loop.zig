@@ -109,7 +109,8 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
     const stdin_fd: c_int = 0;
     const tty = platform_term.isatty(stdin_fd);
 
-    // TTY 会话只拥有一个 Renderer。输入期、生成期和队列续发共享同一份终端锚点。
+    // TTY 会话只拥有一个 Renderer。输入期、生成期和队列续发共享同一份固定区状态
+    // (区高、光标所在区内行、UiState),各期之间不再新建 region。
     var tui_region: ?render_region_mod.RenderRegion = if (tty)
         render_region_mod.RenderRegion.init(allocator, 2, app.theme, tui_term_root.detectFromEnv(1))
     else
@@ -659,6 +660,12 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
                 picker_host.keep(app, &r.ui);
             }
         }
+        // The region is shared by the whole session: an exit from this
+        // iteration that skips leaveGenerating (a refused run's `continue`,
+        // an error before the run) would leave it generating and the input
+        // box would never draw again. The explicit calls after stopInput
+        // below keep their ordering; this fallback is a no-op after them.
+        defer if (gen_region) |r| leaveGenerationRegion(app, r);
         if (tty) terminal_title.setFromApp(app, .working); // tab:生成中
 
         var region_writer: ?render_region_mod.RegionWriter =
@@ -875,10 +882,7 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
             if (run_control) |control| try control.finishRun(@errorName(err));
             // 停 watcher + 清 stdin 缓冲
             if (tui_be) |*tb| tb.stopInput();
-            if (gen_region) |r| {
-                if (r.ui.picker_open) app.pending_overlay = .model_picker_kept;
-                r.leaveGenerating(app);
-            }
+            if (gen_region) |r| leaveGenerationRegion(app, r);
             if (tty) terminal_title.setFromApp(app, .idle); // tab:回空闲
             if (tty) drainStdin(stdin_fd);
             app.clearPendingModelSwitchCompact();
@@ -890,10 +894,7 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
         stopLoopIfGoalLimited(app);
         // 停 watcher + 清 stdin 缓冲（生成期间用户可能误按的键，别污染下一轮）
         if (tui_be) |*tb| tb.stopInput();
-        if (gen_region) |r| {
-            if (r.ui.picker_open) app.pending_overlay = .model_picker_kept;
-            r.leaveGenerating(app);
-        }
+        if (gen_region) |r| leaveGenerationRegion(app, r);
         if (tty) terminal_title.setFromApp(app, .idle); // tab:回空闲
         if (tty) drainStdin(stdin_fd);
 
@@ -1209,6 +1210,16 @@ fn installSigwinch() void {
     platform_signal.installResize(onWinch);
 }
 
+/// Leave the generation phase of the shared region (idempotent). #220: a
+/// picker opened during the reply stays open after it, so the hand-off to the
+/// next input read is recorded before the region leaves generation. Called
+/// after the watcher has stopped, and once more by the iteration's defer.
+fn leaveGenerationRegion(app: *app_mod.App, region: *render_region_mod.RenderRegion) void {
+    if (!region.isGenerating()) return;
+    if (region.ui.picker_open) app.pending_overlay = .model_picker_kept;
+    region.leaveGenerating(app);
+}
+
 /// 把提交的输入回显到 scrollback(复刻 Claude Code:提交后历史里留 "❯ <内容>")。
 /// 多行内容续行对齐 2 空格;空输入只打一个换行。commit 路径 + carryover 自动提交共用。
 fn echoUserSubmission(app: *app_mod.App, submitted: []const u8, region: ?*render_region_mod.RenderRegion) void {
@@ -1249,6 +1260,10 @@ fn readLineRaw(
     var vim_state = vim.VimState.init(allocator);
     defer vim_state.deinit();
 
+    // 共享 region 跨整个会话:`/theme` 换的是 app.theme,每次读取开始时同步进来,
+    // 否则输入框/footer 仍画旧主题。
+    region.syncTheme(app.theme);
+
     // `/` 菜单命令源:内建命令 + 本 session 可由用户调用的 skill(对齐 cc:输入 `/` 即联想
     // 出命令与 skill)。每次读取重建:skill catalog 可能已重载,构建成本只是几十个借用切片。
     var slash_arena = std.heap.ArenaAllocator.init(allocator);
@@ -1284,7 +1299,7 @@ fn readLineRaw(
             region.clear();
             transcript_viewer.runWithTheme(fd, allocator, &app.conversation, rows0, region.theme) catch {};
             // 用 Ctrl+X Ctrl+O 关掉时,同一串连发的后续键会落到下面的读循环:记为一次 Ctrl+O 活动,
-            // 否则新 region 的时戳是 0,第一个连发就会重开。
+            // 否则 region 的 Ctrl+O 时戳还停在上一次活动(或 0),第一个连发就会重开。
             region.noteOverlayClosed();
         },
     }
