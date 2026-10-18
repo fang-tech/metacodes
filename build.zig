@@ -2594,6 +2594,25 @@ pub fn build(b: *std.Build) void {
                     process_resume_smoke.step.dependOn(daemon.install_step);
                     process_resume_smoke.setEnvironmentVariable("METACODES_PROCESS_E2E_BIN", b.getInstallPath(.bin, exe.out_filename));
                     test_step.dependOn(&process_resume_smoke.step);
+
+                    // Chained attempts carry memory (scripts/eval/chained_runner.py):
+                    // the real E2E harness, TinyKG daemon, store export/import and
+                    // budget journal, with a loopback provider (paid=0). A lesson
+                    // the treatment writes in attempt 1 must reach attempt 2's
+                    // request, and must not without the chain's fixed TinyKG
+                    // domain. bash harness + POSIX flock journal: POSIX only.
+                    const chained_memory_smoke = b.addSystemCommand(&.{
+                        eval_python_exe,
+                        "scripts/eval/chained_memory_smoke.py",
+                        "--binary",
+                    });
+                    chained_memory_smoke.addArtifactArg(exe);
+                    chained_memory_smoke.addArg("--tinykg-binary");
+                    chained_memory_smoke.addFileArg(tinykg.artifact);
+                    chained_memory_smoke.addArg("--tinykgd-binary");
+                    chained_memory_smoke.addFileArg(daemon.artifact);
+                    eval_test_step.dependOn(&chained_memory_smoke.step);
+                    test_step.dependOn(&chained_memory_smoke.step);
                 }
             }
         }

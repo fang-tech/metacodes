@@ -687,6 +687,7 @@ def cmd_run_chained(args: argparse.Namespace) -> int:
         baseline_revision=args.baseline_revision,
         candidate_revision=args.candidate_revision,
         chain_dir=Path(args.chain_dir),
+        budget_journal_path=Path(args.budget_journal),
         suite_path=Path(args.suite),
         budget_used_cost_usd=args.budget_used_cost_usd,
         budget_used_tokens=args.budget_used_tokens,
@@ -1396,12 +1397,20 @@ def parser() -> argparse.ArgumentParser:
     chained_parser.add_argument("--model-id", default="claude-sonnet-4-20250514")
     chained_parser.add_argument("--baseline-output", required=True)
     chained_parser.add_argument("--candidate-output", required=True)
+    chained_parser.add_argument(
+        "--budget-journal",
+        required=True,
+        help=(
+            "private local budget journal outside --chain-dir and the output "
+            "directories; every attempt is reserved, authorized and committed there"
+        ),
+    )
     chained_parser.add_argument("--budget-used-cost-usd", type=float, default=0.0)
     chained_parser.add_argument("--budget-used-tokens", type=int, default=0)
-    chained_parser.add_argument("--max-cumulative-cost-usd", type=float)
-    chained_parser.add_argument("--max-cumulative-tokens", type=int)
-    chained_parser.add_argument("--max-rollout-cost-usd", type=float)
-    chained_parser.add_argument("--max-rollout-metered-tokens", type=int)
+    chained_parser.add_argument("--max-cumulative-cost-usd", type=float, required=True)
+    chained_parser.add_argument("--max-cumulative-tokens", type=int, required=True)
+    chained_parser.add_argument("--max-rollout-cost-usd", type=float, required=True)
+    chained_parser.add_argument("--max-rollout-metered-tokens", type=int, required=True)
     chained_parser.set_defaults(func=cmd_run_chained)
 
     multi_parser = commands.add_parser(

@@ -190,8 +190,13 @@ quality–cost–latency frontier（dominates / dominated / tradeoff / equivalen
 记忆是否帮到下一次"。`run-chained` 把同一任务、同一臂、同一 replicate 的 K 次尝试串成一条链：
 第 1 次从空 store 开始；每次尝试后 runner 把场景的 store（`.home/.metacodes/kg/store.kg[.v2]`）
 导出成自己保管的 tar，同链下一次尝试在会话开始前由 `tests/e2e/lib.sh` 的 `import_kg_store`
-导入恰好这一份（校验 sha256，并在工作区外写导入见证）。每次尝试带 `METACODES_TASK_HINT=<task id>`；
-工作区每次都回到冻结快照，store 不跨链、不跨 replicate、不跨臂。
+导入恰好这一份（校验 sha256，并在工作区外写导入见证）。每次尝试带 `METACODES_TASK_HINT=<task id>`
+和 `METACODES_KG_DOMAIN=<task id>-<8 位 hash>`（`chained_runner.chain_kg_domain`）：二进制默认按
+工作区的 git 根推 domain，而每次尝试的工作区都是新的 run 目录（`GIT_INIT=1` 时还是新的 git 根），
+lesson 又只写进本 domain、只从本 domain 和 `global` 召回，不固定 domain 的话第 k+1 次永远看不到第
+k 次写的 lesson。domain 只由 task 决定，两臂、各 replicate 相同（模型的工具能读到这个环境变量，
+所以不能带臂名）；隔离靠的是各链自己的 store。工作区每次都回到冻结快照，store 不跨链、不跨
+replicate、不跨臂。
 
 ```bash
 python3 scripts/eval/cli.py run-chained \
@@ -200,8 +205,12 @@ python3 scripts/eval/cli.py run-chained \
   --candidate-binary /path/to/enforce-wrapper \
   --baseline-revision <sha> --candidate-revision <sha> \
   --replicates 2 --attempts 3 \
-  --chain-dir runs/chains \
-  --baseline-output baseline.jsonl --candidate-output candidate.jsonl
+  --chain-dir evals/runs/learning-turn-v1/chains \
+  --baseline-output evals/runs/learning-turn-v1/baseline.jsonl \
+  --candidate-output evals/runs/learning-turn-v1/candidate.jsonl \
+  --budget-journal ~/.metacodes/evals/learning-turn-v1/budget-journal.json \
+  --max-cumulative-cost-usd <cap> --max-cumulative-tokens <cap> \
+  --max-rollout-cost-usd <cap> --max-rollout-metered-tokens <cap>
 ```
 
 rollout 仍是 `run-paired` 的计分行，`trial = replicate × attempts + (attempt − 1)`，所以
@@ -210,8 +219,17 @@ rollout 仍是 `run-paired` 的计分行，`trial = replicate × attempts + (att
 k−1 次的导出 sha，每个 tar 仍要哈希到它的行，导入见证必须吻合（第 1 次必须没有），账本与
 checkpoint 必须列出同一组尝试；任何断裂都在下一个付费 rollout 之前 fail closed。store 在
 `import_run` 之前导出，所以离线评分（任务自己的 success check）碰不到 store 和任何 prompt。
-账本行先于 checkpoint 写入：尝试跑完但 rollout 没记下（中途崩溃、证据无法导入）时，恢复会拒绝
-并交给操作者决定，而不是重跑一次付费尝试。预算参数与 `run-paired` 相同。
+
+预算：四个上限都必填，校验规则与 `run-paired` 同一个函数（有限且 > 0，单次不超过累计）；
+`--budget-journal` 必填，且必须在 chain 目录和输出目录之外（父目录属于当前用户、不可组/他人写）。
+每次尝试按单次上限在 journal 里 reserve，会话开始前 authorize，结束后按实测用量 commit，收据
+（含 rollout 摘要）写进 checkpoint 行，账本行记同一个 transaction id。authorize 之后无论哪一步失败
+（会话、导入见证、store 导出、证据导入、commit），runner 都追加一行 `failed` 账本行，journal 里
+这笔交易保持 authorized、按整份单次上限计入；恢复时拒绝该链，绝不自动重跑一次付费尝试。runner
+在写这一行之前被杀时，journal 里那笔无 checkpoint 的 authorized 交易同样让恢复拒绝。
+`scripts/eval/chained_memory_smoke.py`（`zig build test` 接线，loopback provider，零付费）用真实
+二进制、真实 E2E harness、TinyKG daemon 和 journal 证明第 1 次写的 lesson 进了第 2 次的请求，
+且去掉固定 domain 后进不去。
 
 ### 5.1 三臂长程机制实验（分级合同 v2）
 
