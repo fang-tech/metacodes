@@ -71,8 +71,9 @@ attempts, `timeout_multiplier: 2.0`, `context_window: 200000`,
 | 11 | Receipts | n/a | 10 of 17 transactions `authorized_failure(post_run_evidence_audit)` | both observed causes fixed: the in-container judge consumed numbers from the proxy's one sequence counter (now one counter per log file), and the exit-143 trials (row 10). Still open: an agent-phase timeout voids its transaction's commit (one `AgentTimeoutError` in September's 260) |
 | 12 | Thinking replay | Claude Code returns thinking blocks | metacodes drops them from the next request (`buildApiMessages`) | unchanged: a runtime capability, not a protocol setting; disclosed |
 | 13 | Contamination | public dataset | every task, sealed included, was inspected before the September run | cannot be undone: the run is a diagnostic re-test, reported as such |
+| 14 | Binary vs task images | n/a | the staged binary needed GLIBC_2.34 or older | the split mount carries no C library, and two Security task images ship glibc 2.35, while the default `x86_64-linux-gnu` release build needs GLIBC_2.36 (it exits with "version `GLIBC_2.36' not found" there). `stage_artifacts` now refuses such a binary; the run stages metacodes built with `-Dtarget=x86_64-linux-gnu.2.31` (needs GLIBC_2.28) beside the release's Lean kernels, TinyKG and ripgrep |
 
-Rows 1–6 and 10–11 are changed by this PR; the evidence is
+Rows 1–6, 10–11 and 14 are changed by this PR; the evidence is
 `scripts/eval/tests/test_workbuddy_adapter.py` (`WorkBuddyLeaderboardProtocolTest`:
 the adapter's command replayed against the installed binary shows the
 declared window moving the compaction threshold, the effort fields in the
@@ -84,8 +85,12 @@ installed-proxy sequence test.
 ## 3. Run plan
 
 - **Binary**: a release cut from `main` after this PR, so the result names a
-  version; staged from that release's Linux x86_64 archive (CLI, TinyKG, both
-  Lean kernels, ripgrep) and hash-bound into the split mount.
+  version. The Lean kernels, TinyKG and ripgrep come from that release's
+  Linux x86_64 archive; metacodes itself is built from the same commit with
+  `-Dtarget=x86_64-linux-gnu.2.31` and the release's kernel pins
+  (`scripts/kernel_pins.py`), because the archive's binary needs a newer glibc
+  than two task images ship (§2 row 14). All of it is hash-bound into the
+  split mount.
 - **Model**: GLM-5.2 first, through the September gateway, for a same-model
   comparison with the official rows.
 - **Scope**: all four subsets, three run sets, 48 transactions, 780 trials.

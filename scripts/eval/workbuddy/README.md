@@ -24,7 +24,12 @@ instead of GitHub.
 
 Stage production `linux/amd64` artifacts with explicit source and license
 provenance. The stager parses every ELF header and rejects ARM64 or mixed-arch
-inputs before creating the output directory:
+inputs before creating the output directory. It also rejects an executable
+that needs a newer glibc than the oldest task image ships (2.35): the split
+mount carries no C library, and the default `x86_64-linux-gnu` release build
+needs 2.36, so build the staged metacodes with
+`zig build -Doptimize=ReleaseSafe -Dtarget=x86_64-linux-gnu.2.31 -Dlean-kernels=off $(python3 scripts/kernel_pins.py <release prefix>)`
+and take the kernels from the same release:
 
 ```bash
 python3 -m scripts.eval.workbuddy.stage_artifacts \
