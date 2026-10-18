@@ -12,6 +12,15 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Added
 
+- A startup animation in the interactive TUI: the wordmark "Metask Lab"
+  condenses out of a particle brightness field and is drawn only with the
+  letters of its own name (after chenglou.me/pretext's variable typographic
+  ASCII), then stays above the welcome box. It adapts to the terminal's colour
+  depth and light or dark background, plays only when stdin and stdout are both
+  terminals and the wordmark fits, and any key jumps to the settled frame.
+  `METACODES_NO_STARTUP_ANIMATION=1` or `"startupAnimation": false` in
+  `<state root>/config.json` turns it off.
+
 - Session goals at every entry point, and in AgentCore (issue #277).
   - **One set of rules.** `core.goal` owns the status table: pause needs an
     active goal, resuming a goal whose budget is used up is refused until the

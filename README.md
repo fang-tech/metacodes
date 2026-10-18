@@ -75,6 +75,11 @@ and version. A process picks its state root from `--state-dir`,
 then `METACODES_HOME`, then the install record, then `~/.metacodes`
 ([doc/INSTALL_DESIGN.md](doc/INSTALL_DESIGN.md)).
 
+`metacodes` with no arguments opens the interactive TUI, which starts with a
+short animation of the "Metask Lab" wordmark; any key skips it.
+`METACODES_NO_STARTUP_ANIMATION=1`, or `"startupAnimation": false` in
+`<state root>/config.json`, starts straight at the prompt.
+
 ## Build
 
 The checked-in toolchain contract currently requires Zig 0.16.0 or newer within
