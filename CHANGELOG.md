@@ -368,6 +368,23 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Changed
 
+- CI is ready for GitHub's merge queue and skips suites a change cannot
+  affect ([doc/CI_DESIGN.md](doc/CI_DESIGN.md)).
+  - **Merge queue.** `ci.yml` and `agentcore-windows.yml` run on
+    `merge_group`. The release fast path and the change scope diff a group
+    against its `base_sha`. The version state gate judges the PR at the top
+    of the group, taken from the queue's ref, so a PR queued behind the
+    release PR is dropped until the reopen PR merges. The ruleset switch
+    (merge queue on, "up to date" off) is a separate maintainer step.
+  - **Change scope** (`scripts/ci_scope.py`). Every required job still runs
+    and reports.
+    - A change confined to `doc/**` and the top-level Markdown other than
+      `README.md` and `CHANGELOG.md` runs only the documentation,
+      version-state and gate-manifest checks.
+    - A change confined to documentation, `scripts/eval/**` and `evals/**`
+      runs the gates in full but skips the TTY suites.
+    - Anything else, every push, and any doubt runs everything.
+    - `scripts/tests/test_ci_scope.py` pins which steps run in each scope.
 - AgentCore provider requests now carry a `currentDate` context block in each
   Run's user record unless the Host supplies one or sets `TIME_CONTEXT_OFF`
   (Revision 22, issue #276). Hosts that byte-compare requests should set

@@ -260,7 +260,12 @@ checkout and the version state gate in `Gates`, which runs without
 `--rehearse`. The script never fails its job (an error decides the full
 path), and the required jobs run in full when the decision job itself fails,
 so a doubt costs time, never coverage. Pushes to `main` always run in full,
-including the release merge commit's run.
+including the release merge commit's run. In a merge queue group
+([CI_DESIGN.md](CI_DESIGN.md) §3) the base is the group's `base_sha` instead
+of `HEAD^1`, so only a group whose whole diff is the bump takes the fast
+path; in practice that is the bump queued alone. The version state gate
+judges the PR at the top of the group, so a PR queued behind the release PR
+is dropped from the queue until the reopen PR has merged.
 
 What the fast path gives up is the pre-tag rehearsal of the stable-channel
 release layout on the candidate (`check_version_state.py --rehearse` followed
