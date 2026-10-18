@@ -304,6 +304,27 @@ pub const RenderRegion = struct {
         self.use_unicode = themeUsesUnicode(theme);
     }
 
+    /// Clear the interaction state that belongs to one phase. Before the
+    /// region was shared, every input read and every reply built a fresh one,
+    /// so an agent list, the help footer, the slash highlight, the Ctrl+X
+    /// prefix or the paste hint never outlived the phase it was opened in. An
+    /// agent list left open by a reply would otherwise swallow the next
+    /// prompt's typing. The model picker crosses phases on purpose (#220);
+    /// the loop hands it off, so it is not reset here.
+    pub fn resetPhaseUi(self: *RenderRegion) void {
+        self.lock();
+        defer self.unlock();
+        self.resetPhaseUiLocked();
+    }
+
+    fn resetPhaseUiLocked(self: *RenderRegion) void {
+        self.ui.help_open = false;
+        self.ui.ctrl_x_armed = false;
+        self.ui.slash_sel = 0;
+        self.ui.paste_hint = false;
+        self.ui.agents = .{};
+    }
+
     pub fn deinit(self: *RenderRegion) void {
         self.scratch.deinit();
         self.line_buf.deinit(self.allocator);
@@ -1429,6 +1450,7 @@ pub const RenderRegion = struct {
         defer self.unlock();
         self.clearInner(); // 擦掉输入期框,光标回区顶行首(文本续接点)
         self.applyThemeLocked(app.theme); // 共享 region:/theme 可能在上一轮输入期间换过主题
+        self.resetPhaseUiLocked(); // 输入期打开的 agent 列表/help 等不带进生成期
         self.gen_app = app; // 供 writeGenText print 后重画区
         self.gen_queue = queue;
         self.gen_view = "";
@@ -2489,6 +2511,30 @@ test "syncTheme: a /theme switch reaches the shared region's glyphs" {
     r.syncTheme(theme_mod.select(.light, .basic_16));
     try std.testing.expect(r.use_unicode);
     try std.testing.expectEqualStrings("─", r.theme.box_h);
+}
+
+test "resetPhaseUi: per-phase interaction state does not outlive its phase" {
+    var r = RenderRegion.init(std.testing.allocator, 2, theme_mod.select(.dark, .basic_16), .basic_16);
+    defer r.deinit();
+    // A reply ended with the agent list open, help showing and a Ctrl+X armed.
+    r.ui.agents.view = .list;
+    r.ui.agents.selection_active = true;
+    r.ui.agents.sel = 2;
+    r.ui.help_open = true;
+    r.ui.ctrl_x_armed = true;
+    r.ui.slash_sel = 3;
+    r.ui.paste_hint = true;
+    r.ui.picker_open = true;
+    r.resetPhaseUi();
+    try std.testing.expectEqual(ui_state_mod.AgentView.closed, r.ui.agents.view);
+    try std.testing.expect(!r.ui.agents.selection_active);
+    try std.testing.expectEqual(@as(usize, 0), r.ui.agents.sel);
+    try std.testing.expect(!r.ui.help_open);
+    try std.testing.expect(!r.ui.ctrl_x_armed);
+    try std.testing.expectEqual(@as(usize, 0), r.ui.slash_sel);
+    try std.testing.expect(!r.ui.paste_hint);
+    // The model picker crosses phases on purpose (#220).
+    try std.testing.expect(r.ui.picker_open);
 }
 
 test "input box border is a full-width rule without corners" {

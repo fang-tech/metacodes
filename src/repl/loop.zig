@@ -1263,6 +1263,9 @@ fn readLineRaw(
     // 共享 region 跨整个会话:`/theme` 换的是 app.theme,每次读取开始时同步进来,
     // 否则输入框/footer 仍画旧主题。
     region.syncTheme(app.theme);
+    // 上一期(回复或上一次读取)打开的 agent 列表/help/slash 高亮不带进本次读取:
+    // 否则停在 list 态的 agent 切换器会吞掉新提示的输入。
+    region.resetPhaseUi();
 
     // `/` 菜单命令源:内建命令 + 本 session 可由用户调用的 skill(对齐 cc:输入 `/` 即联想
     // 出命令与 skill)。每次读取重建:skill catalog 可能已重载,构建成本只是几十个借用切片。
