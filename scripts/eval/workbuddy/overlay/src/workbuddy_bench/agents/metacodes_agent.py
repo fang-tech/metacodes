@@ -44,6 +44,20 @@ _DEFAULT_DISABLED_TOOLS = (
     "EnterPlanMode,ExitPlanMode"
 )
 _PROJECT_CONTROL_MODES = {"disabled", "enforced"}
+# The values `metacodes --reasoning-effort` accepts (`max` is the
+# Anthropic-route name of the top level).
+_REASONING_EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
+# The rendered instruction reaches metacodes on stdin from this uploaded file,
+# never through argv: a task's own `pkill -f <service>` matches every process
+# whose command line carries the service name, which used to include the agent
+# itself (2026-09-12 Security study: three exit-143 trials).
+_INSTRUCTION_PREFIX = "metacodes-instruction-"
+# models.toml takes `"key" = N` lines with a u32 window and no escaping, so a
+# declared window needs a route that is a plain token and a sane bound.
+_MODEL_CONTEXT_KEY_CHARS = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._:/-"
+)
+_MAX_CONTEXT_WINDOW = 10_000_000
 _REMOTE_TINYKG_ENV = (
     "TINYKG_REMOTE_URL",
     "TINYKG_API_KEY",
@@ -504,7 +518,28 @@ class MetacodesAgent(BaseInstalledAgent):
         max_output = model_params.get("max_output_tokens")
         self._max_output_tokens = int(max_output) if max_output is not None else None
         self._model_params = dict(model_params)
-        self._context_window = kwargs.pop("context_window", None)
+        reasoning_effort = kwargs.pop("METACODES_REASONING_EFFORT", None)
+        if reasoning_effort is not None and reasoning_effort not in _REASONING_EFFORTS:
+            raise ValueError(
+                "METACODES_REASONING_EFFORT must be one of "
+                + "/".join(_REASONING_EFFORTS)
+                + " or null"
+            )
+        self._reasoning_effort = reasoning_effort
+        # The bench's context window is declared to metacodes (models.toml in
+        # the fresh HOME); the compaction percentage has no metacodes knob and
+        # is recorded only: metacodes compacts at window - output reserve -
+        # buffer, which for 200K/32K is 92% of the room left after the reserve.
+        context_window = kwargs.pop("context_window", None)
+        if context_window is not None and (
+            not isinstance(context_window, int)
+            or isinstance(context_window, bool)
+            or not 0 < context_window <= _MAX_CONTEXT_WINDOW
+        ):
+            raise ValueError(
+                f"context_window must be an integer in 1..{_MAX_CONTEXT_WINDOW} or null"
+            )
+        self._context_window = context_window
         self._context_compact_pct = kwargs.pop("context_compact_pct", None)
         connection = kwargs.pop("connection", None) or {}
         self._conn_mode = str(connection.get("mode") or "")
@@ -725,7 +760,10 @@ class MetacodesAgent(BaseInstalledAgent):
         self, instruction: str, environment: BaseEnvironment, context: AgentContext
     ) -> None:
         instruction = self.render_instruction(instruction)
-        escaped_instruction = shlex.quote(instruction)
+        instruction_bytes = instruction.encode("utf-8")
+        instruction_sha = hashlib.sha256(instruction_bytes).hexdigest()
+        instruction_name = f"{_INSTRUCTION_PREFIX}{instruction_sha[:16]}.md"
+        container_instruction = f"/tmp/{instruction_name}"
         escaped_model = shlex.quote(self.model_name)
         escaped_model_display_name = shlex.quote(self._model_display_name)
         try:
@@ -758,6 +796,22 @@ class MetacodesAgent(BaseInstalledAgent):
             "METACODES_NO_PROBE": "1",
         }
         provider_config = _proxy_provider_config(self._proxy_url, self.model_name)
+        # metacodes sizes auto-compaction from models.toml (exact model match
+        # first) before its catalog and a 200K fallback; the provider
+        # document's limits do not reach that path.  A fresh HOME has no
+        # models.toml, so without this file a route slug falls through to
+        # substring matches in the bundled table or the fallback.
+        model_context = ""
+        if self._context_window is not None:
+            if not self.model_name or any(
+                ch not in _MODEL_CONTEXT_KEY_CHARS for ch in self.model_name
+            ):
+                raise ValueError(
+                    "a declared context window needs a plain route token as the model id"
+                )
+            model_context = (
+                "[models]\n" f'"{self.model_name}" = {self._context_window}\n'
+            )
 
         mount = self._mount_path.rstrip("/")
         output_path = f"/logs/agent/{_OUTPUT_FILENAME}"
@@ -773,6 +827,8 @@ class MetacodesAgent(BaseInstalledAgent):
         ]
         if self._max_output_tokens is not None:
             flags += ["--max-tokens", str(self._max_output_tokens)]
+        if self._reasoning_effort is not None:
+            flags += ["--reasoning-effort", self._reasoning_effort]
         if self._verification_checkpoint:
             flags.append("--verification-checkpoint")
         if self._verification_final_gate:
@@ -974,6 +1030,10 @@ class MetacodesAgent(BaseInstalledAgent):
                 "requirement_ledger": self._requirement_ledger,
                 "requirement_ledger_observe": self._requirement_ledger_observe,
                 "project_control": project_contract,
+                "instruction_delivery": "stdin-uploaded-file",
+                "instruction_sha256": instruction_sha,
+                "reasoning_effort": self._reasoning_effort,
+                "declared_context_window": self._context_window,
             },
             sort_keys=True,
             separators=(",", ":"),
@@ -1027,6 +1087,15 @@ class MetacodesAgent(BaseInstalledAgent):
             'mkdir -p "$run_home" || exit 70; export HOME="$run_home"; '
             'mkdir -p "$HOME/.metacodes" || exit 70; '
             f"printf '%s' {shlex.quote(provider_config)} > \"$HOME/.metacodes/config.json\" || exit 70; "
+            + (
+                f"printf '%s' {shlex.quote(model_context)} > \"$HOME/.metacodes/models.toml\" || exit 70; "
+                if model_context
+                else ""
+            )
+            + f"instruction_file={shlex.quote(container_instruction)}; "
+            'test -f "$instruction_file" && test -r "$instruction_file" || exit 90; '
+            'test "$(sha256sum "$instruction_file" | cut -d" " -f1)" = '
+            f"{instruction_sha} || exit 90; "
             "unset METACODES_PROJECT_KERNEL_PATH METACODES_PROJECT_KERNEL_SHA256; "
             f"{project_setup}"
             "export METACODES_KG_TRANSPORT=cli-exclusive; "
@@ -1071,7 +1140,9 @@ class MetacodesAgent(BaseInstalledAgent):
             # kill a doomed trial early instead of waiting for the terminal
             # result line.  trace.py's final_result already filters
             # type=="result", so the extra event lines are forward-compatible.
-            f"metacodes {' '.join(flags)} -p {escaped_instruction} --json --stream-json "
+            # `-` reads the prompt from stdin: neither metacodes' argv nor this
+            # shell's carries the instruction text (see _INSTRUCTION_PREFIX).
+            f"metacodes {' '.join(flags)} - --json --stream-json "
             # NDJSON stdout is a machine protocol; stderr must never merge
             # with the exactly-once result event.  It also must not vanish:
             # p3 forensics found the "Harbor-owned stderr stream" reaches no
@@ -1079,7 +1150,7 @@ class MetacodesAgent(BaseInstalledAgent):
             # (self-evolution degradations, author parse failures, injection
             # receipts) fell into a void.  Tee it onto the /logs/agent bind
             # mount the trial already exports.
-            "</dev/null 2> >(tee /logs/agent/metacodes-stderr.log >&2) "
+            '<"$instruction_file" 2> >(tee /logs/agent/metacodes-stderr.log >&2) '
             f"| tee {shlex.quote(output_path)}; "
             "agent_status=${PIPESTATUS[0]}; "
             f"{project_postcheck}"
@@ -1099,6 +1170,20 @@ class MetacodesAgent(BaseInstalledAgent):
             f"{shlex.quote(transcript_path)} {shlex.quote(observation_path)} {shlex.quote(output_path)} || exit 76; "
             f"{store_export}"
             'exit "$agent_status"'
+        )
+        # Uploaded last, after every host-side check above has passed.  The
+        # host copy stays beside the trial's agent artifacts as the record of
+        # the exact bytes the agent read; the upload does not rely on the logs
+        # bind mount, and the command re-checks the hash before reading it.
+        # The copy keeps the host file's private mode; root makes it readable
+        # for the non-root agent user inside the container.
+        host_instruction = Path(self.logs_dir) / instruction_name
+        host_instruction.write_bytes(instruction_bytes)
+        os.chmod(host_instruction, 0o600)
+        await environment.upload_file(host_instruction, container_instruction)
+        await self.exec_as_root(
+            environment,
+            command=f"chmod 0444 {shlex.quote(container_instruction)}",
         )
         await self.exec_as_agent(
             environment,

@@ -271,3 +271,58 @@ anonymous-FD route authority, fresh HOME, isolated local TinyKG, cleared remote
 TinyKG configuration, artifact/verifier I/O, ATIF conversion and cache metrics.
 It is always marked `quality_evidence=false` and must never be reported as a
 memory or task-success result.
+
+## Leaderboard protocol
+
+The official leaderboard runs every task three times in think mode with
+reasoning effort high, a 200k window, WebSearch and AskUserQuestion disabled
+and provider-default sampling; Web and Office are judged by Kimi K2.7 Code.
+The plan, the alignment table and the budget are in
+[evals/experiments/workbuddy-leaderboard-v1.md](../../../evals/experiments/workbuddy-leaderboard-v1.md).
+The overlay carries the protocol as configuration the adapter passes to
+metacodes:
+
+- `configs/models/metacodes-glm52-leaderboard.yaml` injects only the output
+  budget, never a sampling parameter; `judge-kimi-k27.yaml` is the published
+  judge configuration;
+- `METACODES_REASONING_EFFORT` becomes `--reasoning-effort`;
+- the bench `context_window` becomes a `models.toml` entry for the exact
+  route in the trial's fresh HOME (metacodes reads the window from there,
+  not from the provider document);
+- the instruction reaches metacodes on stdin from an uploaded, hash-checked
+  file, never through argv, so a task's `pkill -f` cannot match the agent.
+
+One run is sixteen jobs, the four subsets times the four frozen cohorts,
+because a paid launch binds one cohort, one attempt and one trial at a time.
+Write a run's jobs into the checkout:
+
+```bash
+python3 -m scripts.eval.workbuddy.leaderboard_jobs \
+  --run 1 --output /path/to/workbuddy-bench/configs/jobs
+```
+
+Before any paid launch, run the zero-provider preflight on the host that will
+run the jobs, with a fresh checkout and the Linux artifacts to be staged. It
+sends the leaderboard job shape through the official runner and job proxy to
+a loopback scripted provider that refuses any request off protocol, then
+audits the proxy's record of the upstream bodies, the request sequence, the
+runtime contract and the compaction thresholds metacodes derived:
+
+```bash
+python3 -m scripts.eval.workbuddy.run_lb_preflight /path/to/fresh-workbuddy-bench \
+  --metacodes /path/to/linux-amd64/metacodes \
+  --tinykg /path/to/linux-amd64/tinykg \
+  --ripgrep /path/to/linux-amd64/rg \
+  --formal-kernel /path/to/linux-amd64/metacodes-formal-kernel \
+  --metacodes-commit <40-hex> --tinykg-commit <40-hex> \
+  --metacodes-license /path/to/METACODES-NOASSERTION.txt \
+  --tinykg-license /path/to/tinykg/LICENSE \
+  --lean-license /path/to/lean4/LICENSE
+```
+
+Its receipt is `quality_evidence=false` and does not exercise the judge
+route.
+
+The proxy numbers each log file on its own: the job proxy also serves the
+in-container judge, whose records go to the shared file, and one counter
+across both left holes in every run's request wave.

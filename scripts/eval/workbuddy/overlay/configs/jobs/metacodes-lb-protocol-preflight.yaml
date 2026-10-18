@@ -1,0 +1,30 @@
+model: metacodes-lb-mock
+harness: metacodes/0.1.0
+dataset: datasets/metacodes-lb-synthetic/tasks
+harness_backend: local
+model_connection: local_proxy
+jobs_dir: results/metacodes-lb-protocol-preflight
+n_attempts: 1
+record_full_io: true
+extra_allowed_hosts:
+- host.docker.internal
+harness_params_override:
+  METACODES_VERIFICATION_CHECKPOINT: false
+  METACODES_VERIFICATION_FINAL_GATE: false
+  METACODES_VERIFICATION_FINAL_OBSERVE: false
+  METACODES_REQUIREMENT_LEDGER: false
+  METACODES_REQUIREMENT_LEDGER_OBSERVE: false
+  METACODES_MEMORY_ACCUMULATION: false
+  METACODES_SELF_EVOLUTION: false
+  METACODES_OUTCOME_FEEDBACK: false
+  METACODES_CONTINUITY_SEED_SHA256: null
+  METACODES_DISALLOWED_TOOLS: Agent,Task,TaskBatch,TeamCreate,TeamDelete,SendMessage,EnterPlanMode,ExitPlanMode,WebSearch,AskUserQuestion
+  METACODES_REASONING_EFFORT: high
+task_selection:
+  mode: name
+  names:
+  - metacodes-lb-protocol
+orchestrator_override:
+  n_concurrent_trials: 1
+context_window: 200000
+context_compact_pct: 92

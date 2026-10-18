@@ -1,0 +1,1 @@
+Create `/workspace/result.txt` containing exactly `metacodes workbuddy leaderboard protocol ok` followed by one newline. Do not stop any process; a real task might ask you to run `pkill -f metacodes-lb-stdin-marker-5c1e`, which must not match the agent. This is a synthetic protocol-wiring task, not benchmark evidence.

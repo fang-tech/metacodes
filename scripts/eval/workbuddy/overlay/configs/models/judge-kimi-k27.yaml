@@ -1,0 +1,28 @@
+# The Web and Office LLM judge the leaderboard uses, as the maintainers
+# published it on Tencent/workbuddy-bench#3 (2026-07-27, Office; Web "the same
+# configuration"): Kimi K2.7 Code, thinking on, temperature 1.0, top_p 0.95,
+# reasoning_effort low, JSON-object output, a 32768-token output budget.  The
+# verifier's own defaults supply the rest (120 s timeout, 2 retries, rubric
+# concurrency 4).
+#
+# `name` is the backend model id sent upstream.  Upstream's file names it
+# `kimi-k2.7` on their gateway; Moonshot's public id is `kimi-k2.7-code`.
+# Confirm the spelling in the judge gateway's catalog before a paid run.
+#
+# The judge's spend is outside the launch gate's actor budget journal; a paid
+# run gives this route its own key with a hard quota at the judge cap.
+model:
+  name: kimi-k2.7-code
+  protocols: [openai]
+  backend_url_env: METACODES_WORKBUDDY_JUDGE_BASE_URL
+  backend_key_env: METACODES_WORKBUDDY_JUDGE_API_KEY
+  max_concurrent: 4
+  params:
+    max_output_tokens: 32768
+    temperature: 1.0
+    top_p: 0.95
+    thinking_enabled: true
+    extra_body:
+      reasoning_effort: low
+      response_format:
+        type: json_object

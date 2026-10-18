@@ -1,0 +1,12 @@
+# The leaderboard actor model (metacodes-glm52-leaderboard.yaml) pointed at the
+# loopback scripted provider of run_lb_preflight.py.  Everything the proxy
+# injects into the upstream body is identical to the paid configuration.
+model:
+  name: glm-5.2
+  protocols: [anthropic]
+  backend_url_env: METACODES_LB_MOCK_BASE_URL
+  backend_key_env: METACODES_WORKBUDDY_PROVIDER_KEY_FD_REF
+  context_window: 200000
+  max_concurrent: 1
+  params:
+    max_output_tokens: 32768
