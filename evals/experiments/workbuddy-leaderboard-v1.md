@@ -95,10 +95,15 @@ installed-proxy sequence test.
   comparison with the official rows.
 - **Scope**: all four subsets, three run sets, 48 transactions, 780 trials.
 - **Hosts**: patron (16 cores) for Code and Office, kunshan (8 cores) for
-  Security and Web, as in September. A transaction is serial; run up to four
-  transactions at once on patron and three on kunshan.
+  Security and Web, as in September. A transaction is serial and brings its
+  own job proxy on its own port. kunshan's firewall lets containers reach the
+  host only on ports 4400 and 4401 (probed 2026-10-18; the default 3456 is
+  dropped, which is why every September kunshan job used 4401), so kunshan
+  runs at most two transactions at once, each launched with its
+  `PROXY_PORT`, unless the owner opens more ports; patron used the default
+  ports. Plan four on patron and two on kunshan.
 - **Wall time**: September took 10–11 minutes per task serially, so 780
-  trials are about 135 serial hours, roughly 20–25 hours at seven in flight;
+  trials are about 135 serial hours, roughly 23 hours at six in flight;
   plan three days with reviews.
 - **Order**:
   1. zero-cost: `run_lb_preflight` on each host; `environment_preflight` for
@@ -151,3 +156,37 @@ Web US$56/28/28/168 for dev/promotion A/promotion B/sealed), so the operator
 launches a transaction only when committed cost plus open maxima stays under
 the cap; with about US$1.2 actual per task this leaves room for six or seven
 transactions in flight until the last run's sealed cohorts.
+
+## 5. Zero-cost evidence so far
+
+- **Containerized preflight** (`run_lb_preflight`, kunshan, 2026-10-18): the
+  official runner, the job proxy and a fresh pinned checkout, with
+  metacodes built at `4f656124` (`-Dtarget=x86_64-linux-gnu.2.31`) beside the
+  Lean kernels, TinyKG and ripgrep of the CI release dry run of `25bfae9b`.
+  Zero external requests, two scripted ones. The upstream bodies, as the
+  proxy recorded them after its injection, carried only `cache_control`,
+  `max_tokens` (32768), `model`, `output_config` (`effort: high`), `stream`
+  and `thinking` (`adaptive`); 34 tools were visible, none of WebSearch,
+  AskUserQuestion, Agent or Task; the request wave was gapless; metacodes
+  reported its auto-compact threshold as 154,232 with the anchored context at
+  150,205; the instruction arrived on stdin and the verifier awarded 1.
+  Receipt: `quality_evidence=false`.
+- **Dry run** (kunshan, 2026-10-18): `leaderboard_jobs --run 1`, then for
+  one real transaction, Security promotion A (6 tasks):
+  `environment_preflight` built and bound all six task images, and
+  `launch_gate create` produced a `metacodes-workbuddy-paid-launch-v3` plan
+  binding the cohort, the leaderboard job and model (the job file by content
+  hash, so its tool policy, effort and window), the split mount and the
+  runner tools, with a US$24 maximum. No journal was written and no
+  credential was read; the plan was not run.
+- Host facts the runs need: the gate refuses multi-link `bash` and `docker`
+  (`/usr/bin/{bash,docker}` on kunshan have two links; the operator copies in
+  `~/frontier-bench/bin/` pass), and `uv run --frozen` downloads WorkBuddy's
+  locked packages from PyPI on a fresh checkout (about 30 minutes on kunshan).
+- What the preflight caught before any spend: the release archive's
+  metacodes needs GLIBC_2.36 and does not start in two Security task images
+  (§2 row 14), and kunshan drops container traffic to the WorkBuddy default
+  proxy port (§3 Hosts). The first preflight attempt failed closed on the
+  second ("expected 2 scripted requests, found 0").
+- Not yet exercised: the Web/Office judge route, the gateway's answer to the
+  effort fields, and an agent timeout inside a transaction.
