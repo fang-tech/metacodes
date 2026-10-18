@@ -30,6 +30,15 @@ PROJECT_KERNEL_TARGET = Path("libexec/metacodes-project-kernel")
 PROJECT_ROOT = "/workspace"
 MAX_PROJECT_RULE_FILES = 256
 MAX_PROJECT_RULE_BYTES = 64 * 1024 * 1024
+# The split mount carries no C library: each staged executable runs on the
+# glibc of whatever task image it is mounted into.  The oldest one among the
+# official task images built on 2026-10-18 ships glibc 2.35 (Security:
+# vim-tabpanel-modeline-escape and nginx-heap-overflow-rewrite); a binary that
+# needs a newer symbol cannot start there.  The default release build
+# (x86_64-linux-gnu on the runner's glibc) needs 2.36; build the staged
+# metacodes with -Dtarget=x86_64-linux-gnu.2.31 instead.
+MAX_TASK_IMAGE_GLIBC = (2, 35)
+SHT_GNU_VERNEED = 0x6FFFFFFE
 
 
 class StageError(ValueError):
@@ -173,6 +182,70 @@ def _elf_machine(path: Path) -> int | None:
     return int.from_bytes(header[18:20], "little")
 
 
+def _elf_glibc_requirement(path: Path) -> Tuple[int, ...] | None:
+    """The newest ``GLIBC_x.y[.z]`` version an ELF64 LE file needs, or None.
+
+    Read from the ``SHT_GNU_verneed`` section, the table the dynamic loader
+    checks; a static or version-free executable needs none.  A section table
+    that cannot be read is an error, not "no requirement".
+    """
+    data = path.read_bytes()
+    if len(data) < 64:
+        return None
+    shoff = int.from_bytes(data[40:48], "little")
+    shentsize = int.from_bytes(data[58:60], "little")
+    shnum = int.from_bytes(data[60:62], "little")
+    if shoff == 0 or shnum == 0:
+        return None
+    if shentsize != 64 or shoff + shnum * 64 > len(data):
+        raise StageError(f"{path.name} has an unreadable ELF section table")
+
+    def section(index: int) -> Tuple[int, int, int, int]:
+        base = shoff + index * 64
+        sh_type = int.from_bytes(data[base + 4:base + 8], "little")
+        offset = int.from_bytes(data[base + 24:base + 32], "little")
+        size = int.from_bytes(data[base + 32:base + 40], "little")
+        link = int.from_bytes(data[base + 40:base + 44], "little")
+        return sh_type, offset, size, link
+
+    newest: Tuple[int, ...] | None = None
+    for index in range(shnum):
+        sh_type, offset, size, link = section(index)
+        if sh_type != SHT_GNU_VERNEED:
+            continue
+        if link >= shnum or offset + size > len(data):
+            raise StageError(f"{path.name} has an unreadable version-needs section")
+        _, str_offset, str_size, _ = section(link)
+        if str_offset + str_size > len(data):
+            raise StageError(f"{path.name} has an unreadable version string table")
+        strings = data[str_offset:str_offset + str_size]
+        need = offset
+        for _ in range(4096):
+            if need + 16 > offset + size:
+                raise StageError(f"{path.name} has a truncated version-needs entry")
+            count = int.from_bytes(data[need + 2:need + 4], "little")
+            aux = need + int.from_bytes(data[need + 8:need + 12], "little")
+            for _ in range(count):
+                if aux + 16 > offset + size:
+                    raise StageError(f"{path.name} has a truncated version-needs entry")
+                name_at = int.from_bytes(data[aux + 8:aux + 12], "little")
+                end = strings.find(b"\x00", name_at)
+                name = strings[name_at:end if end >= 0 else None].decode("ascii", "replace")
+                match = re.fullmatch(r"GLIBC_(\d+(?:\.\d+)+)", name)
+                if match:
+                    version = tuple(int(part) for part in match.group(1).split("."))
+                    newest = version if newest is None else max(newest, version)
+                step = int.from_bytes(data[aux + 12:aux + 16], "little")
+                if step == 0:
+                    break
+                aux += step
+            step = int.from_bytes(data[need + 12:need + 16], "little")
+            if step == 0:
+                break
+            need += step
+    return newest
+
+
 def stage(
     *,
     output: Path,
@@ -226,6 +299,14 @@ def stage(
                 raise StageError(
                     f"production {label} ELF machine {machine} does not match "
                     f"{TARGET_PLATFORM} (expected {ELF_MACHINE_X86_64})"
+                )
+            needed = _elf_glibc_requirement(source)
+            if needed is not None and needed > MAX_TASK_IMAGE_GLIBC:
+                raise StageError(
+                    f"production {label} needs GLIBC_{'.'.join(map(str, needed))}, "
+                    "newer than the oldest task image's glibc "
+                    f"{'.'.join(map(str, MAX_TASK_IMAGE_GLIBC))}; it would not start "
+                    "there (build with -Dtarget=x86_64-linux-gnu.2.31)"
                 )
 
     output.mkdir(parents=True, mode=0o755)

@@ -10,6 +10,7 @@ same run id cannot be retried.
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import json
 import math
@@ -37,10 +38,11 @@ from ..memory_budget_journal import (
     MAX_USER_AUTHORITY_MICROUSD,
     MAX_USER_AUTHORITY_USD,
     validate_checkpoint_payload,
+    usd_to_microusd,
     usd_to_microusd_ceiling,
 )
 from ..model import O_BINARY, ValidationError, mode_violation, open_nofollow, stable_json
-from . import WORKBUDDY_PINNED_COMMIT
+from . import WORKBUDDY_JUDGE_KEY_ENV, WORKBUDDY_PINNED_COMMIT
 from .environment_preflight import (
     EnvironmentPreflightError,
     validate_receipt as validate_environment_preflight,
@@ -85,6 +87,29 @@ AUTHORIZED_FAILURE_STAGES = {
     "post_run_evidence_audit",
 }
 PROVIDER_KEY_ENV = "METACODES_WORKBUDDY_PROVIDER_KEY_FD_REF"
+# The Web/Office LLM judge spends through its own credential, which the job
+# proxy reads from this variable.  A judge model must name it, and the runner's
+# environment keeps it only for a launch whose manifest froze a judge budget;
+# every other launch has it removed, so an unbudgeted judge cannot spend.
+JUDGE_KEY_ENV = WORKBUDDY_JUDGE_KEY_ENV
+JUDGE_MODES = ("host_side", "in_container")
+# Judge calls are not metered per call, so a judged transaction commits its
+# whole judge cap beside the actor's measured cost.
+JUDGE_COST_ACCOUNTING = "cap_committed_in_full"
+JUDGE_CONTRACT_KEYS = frozenset(
+    {
+        "enabled",
+        "mode",
+        "model_slug",
+        "backend_model_name",
+        "model_config",
+        "backend_key_env",
+        "backend_url_env",
+        "backend_url_sha256",
+        "cost_accounting",
+        "bench_configs",
+    }
+)
 RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{2,127}$")
 MAX_FAILURE_ARTIFACTS = 256
 # Request logs re-send the full accumulated conversation every provider turn,
@@ -167,6 +192,7 @@ def _comparison_covariates(
     runner_tools: Mapping[str, Any],
     host_control_plane: Mapping[str, Any],
     budget: Mapping[str, int],
+    judge: Mapping[str, Any],
 ) -> Dict[str, object]:
     """Return the frozen paired-study inputs excluding only actuation.
 
@@ -203,6 +229,11 @@ def _comparison_covariates(
                 erase_paths(child)
 
     erase_paths(stable_artifacts)
+    # Only a judged job adds the judge covariate, so unjudged arms planned
+    # before judge budgets existed keep pairing with unjudged arms after.
+    stable_judge = json.loads(json.dumps(judge)) if judge.get("enabled") else None
+    if stable_judge is not None:
+        erase_paths(stable_judge)
     stable_host = {
         name: {key: value for key, value in row.items() if key != "path"}
         for name, row in host_control_plane.items()
@@ -211,7 +242,7 @@ def _comparison_covariates(
         name: {key: value for key, value in row.items() if key != "path"}
         for name, row in runner_tools.items()
     }
-    return {
+    covariates: Dict[str, object] = {
         "workbuddy_commit": workbuddy_commit,
         "overlay_sha256": overlay_sha256,
         "cohort": {
@@ -245,6 +276,9 @@ def _comparison_covariates(
         "tool_schema_changed": False,
         "provider_cache_prefix_changed_by_control_plane": False,
     }
+    if stable_judge is not None:
+        covariates["judge"] = stable_judge
+    return covariates
 
 
 def _read_regular(path: Path, *, maximum: int = 16 * 1024 * 1024) -> bytes:
@@ -592,6 +626,233 @@ def _project_rule_tree(root: Path) -> Dict[str, object]:
     }
 
 
+def _deep_merge(base: object, override: object) -> Dict[str, Any]:
+    """WorkBuddy's ``config_loaders.deep_merge``: mappings merge, override wins."""
+    merged: Dict[str, Any] = copy.deepcopy(base) if isinstance(base, dict) else {}
+    for key, value in (override if isinstance(override, dict) else {}).items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _deep_merge(merged[key], value)
+        else:
+            merged[key] = copy.deepcopy(value)
+    return merged
+
+
+def _bench_dataset_id(workbuddy: Path, dataset: object) -> str:
+    """The id WorkBuddy's ``bench_config.load_bench`` keys a bench file on.
+
+    As ``config_loaders.load_dataset_runtime_contract`` finds it: the name of
+    the nearest directory at or above the dataset path that holds a
+    ``dataset.toml``, searched up to the checkout root; "" when none does.
+    """
+    if not isinstance(dataset, str) or not dataset:
+        return ""
+    path = Path(dataset)
+    if not path.is_absolute():
+        path = workbuddy / path
+    root = workbuddy.resolve()
+    for candidate in (path, *path.parents):
+        if (candidate / "dataset.toml").is_file():
+            return candidate.name
+        if candidate.resolve() == root:
+            break
+    return ""
+
+
+def _judge_contract(workbuddy: Path, job: Mapping[str, Any]) -> Dict[str, object]:
+    """Resolve a job's LLM judge the way the pinned runner does, and bind it.
+
+    ``resolve_manifest.resolve_llm_judge`` deep-merges the job's
+    ``llm_judge_override`` over the bench layers (``configs/bench/_default.yaml``
+    < ``configs/bench/<dataset id>.yaml``), so a job without an override still
+    runs a judge when its bench enables one (the Web bench does).  The row binds
+    every file that decided the answer; an enabled judge must spend through
+    ``JUDGE_KEY_ENV``, the one credential the gate keeps or removes.
+    """
+    bench_dir = workbuddy / "configs/bench"
+    layers = [bench_dir / "_default.yaml"]
+    dataset_id = _bench_dataset_id(workbuddy, job.get("dataset"))
+    if dataset_id and (bench_dir / f"{dataset_id}.yaml").is_file():
+        layers.append(bench_dir / f"{dataset_id}.yaml")
+    bench: Dict[str, Any] = {}
+    for layer in layers:
+        bench = _deep_merge(bench, _yaml(layer))
+    base = bench.get("llm_judge") or {}
+    override = job.get("llm_judge_override") or {}
+    if not isinstance(base, dict) or not isinstance(override, dict):
+        raise LaunchError("WorkBuddy llm_judge configuration must be a mapping")
+    resolved = _deep_merge(base, override)
+    enabled = resolved.get("enabled", False)
+    if not isinstance(enabled, bool):
+        raise LaunchError("WorkBuddy resolved llm_judge.enabled must be a boolean")
+    bench_rows = [_identity(layer) for layer in layers]
+    if not enabled:
+        return {"enabled": False, "bench_configs": bench_rows}
+    mode = resolved.get("mode", "host_side")
+    if mode not in JUDGE_MODES:
+        raise LaunchError(f"WorkBuddy llm_judge.mode must be one of {JUDGE_MODES}")
+    slug = resolved.get("model")
+    slug = slug.strip() if isinstance(slug, str) else ""
+    if slug in ("", "<model-slug>") or Path(slug).name != slug:
+        raise LaunchError("WorkBuddy LLM judge is enabled without a judge model slug")
+    model_path = workbuddy / "configs/models" / f"{slug}.yaml"
+    model = _yaml(model_path).get("model")
+    if not isinstance(model, dict):
+        raise LaunchError("WorkBuddy judge model config has no model mapping")
+    name = model.get("name")
+    if not isinstance(name, str) or not name.strip():
+        raise LaunchError("WorkBuddy judge model has no backend model name")
+    if model.get("backend_key_env") != JUDGE_KEY_ENV:
+        raise LaunchError(
+            f"WorkBuddy judge model must name {JUDGE_KEY_ENV} as backend_key_env; "
+            "it is the only judge credential the launch gate accounts for"
+        )
+    url_env = model.get("backend_url_env")
+    if not isinstance(url_env, str) or not url_env:
+        raise LaunchError("WorkBuddy judge model has no backend URL environment name")
+    url = os.environ.get(url_env, "")
+    parsed_url = urllib.parse.urlsplit(url)
+    if parsed_url.scheme not in {"http", "https"} or not parsed_url.hostname:
+        raise LaunchError("WorkBuddy judge base URL is missing or invalid")
+    return {
+        "enabled": True,
+        "mode": mode,
+        "model_slug": slug,
+        "backend_model_name": name,
+        "model_config": _identity(model_path),
+        "backend_key_env": JUDGE_KEY_ENV,
+        "backend_url_env": url_env,
+        "backend_url_sha256": _sha256_bytes(url.encode("utf-8")),
+        "cost_accounting": JUDGE_COST_ACCOUNTING,
+        "bench_configs": bench_rows,
+    }
+
+
+def _complete_identity(row: object) -> bool:
+    return (
+        isinstance(row, dict)
+        and set(row) == {"path", "bytes", "sha256"}
+        and isinstance(row["path"], str)
+        and Path(row["path"]).is_absolute()
+        and isinstance(row["bytes"], int)
+        and not isinstance(row["bytes"], bool)
+        and row["bytes"] > 0
+        and re.fullmatch(r"[0-9a-f]{64}", str(row["sha256"])) is not None
+    )
+
+
+def _validate_judge_contract(manifest: Mapping[str, Any]) -> None:
+    """A manifest's judge row and judge budget agree, or neither exists.
+
+    Neither exists in a manifest created before judge budgets; such a launch
+    never receives the judge credential (``_judge_environment``)."""
+    budget = manifest["budget"]
+    judge = manifest.get("judge")
+    if judge is None and "judge_cost_microusd" not in budget:
+        return
+    cost = budget.get("judge_cost_microusd")
+    bench = judge.get("bench_configs") if isinstance(judge, dict) else None
+    if (
+        manifest.get("schema_version") != SCHEMA_VERSION
+        or not isinstance(judge, dict)
+        or not isinstance(cost, int)
+        or isinstance(cost, bool)
+        or cost < 0
+        # The actor keeps a positive share of the transaction maximum.
+        or cost >= budget["max_cost_microusd"]
+        or not isinstance(bench, list)
+        or not 1 <= len(bench) <= 2
+        or not all(_complete_identity(row) for row in bench)
+    ):
+        raise LaunchError("paid launch judge budget contract is incomplete")
+    if judge.get("enabled") is False:
+        if set(judge) != {"enabled", "bench_configs"} or cost != 0:
+            raise LaunchError("paid launch judge budget contract is incomplete")
+        return
+    if manifest.get("comparison") is not None:
+        raise LaunchError(
+            "a judged paid launch cannot be a paired-comparison arm"
+        )
+    if (
+        judge.get("enabled") is not True
+        or set(judge) != JUDGE_CONTRACT_KEYS
+        or cost < 1
+        or judge.get("mode") not in JUDGE_MODES
+        or any(
+            not isinstance(judge.get(key), str) or not judge[key].strip()
+            for key in ("model_slug", "backend_model_name", "backend_url_env")
+        )
+        or judge.get("backend_key_env") != JUDGE_KEY_ENV
+        or re.fullmatch(r"[0-9a-f]{64}", str(judge.get("backend_url_sha256"))) is None
+        or judge.get("cost_accounting") != JUDGE_COST_ACCOUNTING
+        or not _complete_identity(judge.get("model_config"))
+    ):
+        raise LaunchError("paid launch judge budget contract is incomplete")
+
+
+def _judge_cost_microusd(manifest: Mapping[str, Any]) -> int:
+    """The judge cap a transaction commits beside the actor's cost (0 if unjudged)."""
+    judge = manifest.get("judge")
+    if isinstance(judge, Mapping) and judge.get("enabled") is True:
+        return int(manifest["budget"]["judge_cost_microusd"])
+    return 0
+
+
+def _receipt_judge(manifest: Mapping[str, Any]) -> Dict[str, object] | None:
+    """The receipt's disclosure of a committed judge cap, or None if unjudged."""
+    cost = _judge_cost_microusd(manifest)
+    if not cost:
+        return None
+    judge = manifest["judge"]
+    return {
+        "model_slug": judge["model_slug"],
+        "mode": judge["mode"],
+        "cost_microusd": cost,
+        "accounting": JUDGE_COST_ACCOUNTING,
+    }
+
+
+def _require_judge_credential(manifest: Mapping[str, Any]) -> None:
+    """Before any reservation: a judged launch must be able to reach its judge."""
+    if _judge_cost_microusd(manifest) and not os.environ.get(JUDGE_KEY_ENV):
+        raise LaunchError(
+            f"judged WorkBuddy launch needs {JUDGE_KEY_ENV} in the environment"
+        )
+
+
+def _judge_environment(environment: Dict[str, str], manifest: Mapping[str, Any]) -> None:
+    """Keep the judge credential only for a launch with a frozen judge budget."""
+    if not _judge_cost_microusd(manifest):
+        environment.pop(JUDGE_KEY_ENV, None)
+
+
+def _reobserve_judge(
+    manifest: Mapping[str, Any], workbuddy: Path, job: Mapping[str, Any]
+) -> None:
+    observed = _judge_contract(workbuddy, job)
+    expected = manifest.get("judge")
+    if expected is None:
+        if observed["enabled"]:
+            raise LaunchError(
+                "WorkBuddy job runs an LLM judge but its launch manifest has no "
+                "judge budget; recreate it with --judge-budget-usd"
+            )
+    elif observed != expected:
+        raise LaunchError(
+            "WorkBuddy LLM judge configuration changed after launch manifest creation"
+        )
+
+
+def _judge_budget_usd(value: str) -> int:
+    """argparse type for ``--judge-budget-usd``: finite, positive, whole micro-USD."""
+    try:
+        microusd = usd_to_microusd(value)
+    except ValidationError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+    if microusd <= 0:
+        raise argparse.ArgumentTypeError("judge budget must be positive")
+    return microusd
+
+
 def build_launch_manifest(
     *,
     run_id: str,
@@ -615,6 +876,7 @@ def build_launch_manifest(
     quality_evidence_on_commit: bool = False,
     diagnostic_tasks: "Sequence[str] | None" = None,
     comparison_id: str | None = None,
+    judge_budget_microusd: int | None = None,
 ) -> Dict[str, object]:
     if not RUN_ID_RE.fullmatch(run_id):
         raise LaunchError("run id must be a safe 3-128 character path component")
@@ -679,6 +941,30 @@ def build_launch_manifest(
         raise LaunchError("paid WorkBuddy job requires full request audit and n_attempts=1")
     if (job.get("orchestrator_override") or {}).get("n_concurrent_trials") != 1:
         raise LaunchError("paid WorkBuddy job requires one concurrent trial")
+    # The runner merges a job's ``verifier`` block into the verifier runtime and
+    # copies every ``orchestrator_override`` key onto the top-level runtime, so
+    # either could set WORKBUDDY_VERIFIER_LLM_* and call an LLM outside the
+    # judge budget.  No job this repository writes uses them beyond the one
+    # concurrency key.
+    if "verifier" in job:
+        raise LaunchError(
+            "paid WorkBuddy job must not carry a verifier block: it reaches the "
+            "verifier's environment, where it can route an LLM outside the "
+            "judge budget"
+        )
+    if job.get("orchestrator_override") != {"n_concurrent_trials": 1}:
+        raise LaunchError(
+            "paid WorkBuddy job orchestrator_override may only set "
+            "n_concurrent_trials: 1; other keys reach the top-level runtime"
+        )
+    # ``environment_override`` deep-merges into Harbor's environment config,
+    # whose container-wide ``env`` reaches the task container and its verifier.
+    if "environment_override" in job:
+        raise LaunchError(
+            "paid WorkBuddy job must not carry environment_override: its env "
+            "reaches the task container, where it can route an LLM or carry a "
+            "credential outside the budget"
+        )
     project_control = artifact_row.get("project_control")
     project_overrides = job.get("harness_params_override") or {}
     if not isinstance(project_overrides, dict):
@@ -851,6 +1137,18 @@ def build_launch_manifest(
     parsed_url = urllib.parse.urlsplit(backend_url)
     if parsed_url.scheme not in {"http", "https"} or not parsed_url.hostname:
         raise LaunchError("WorkBuddy provider base URL is missing or invalid")
+    # The judge's spend enters this transaction: a judged job needs an explicit
+    # cap, which joins the reserved maximum and is committed in full.
+    judge = _judge_contract(workbuddy, job)
+    if judge["enabled"] and judge_budget_microusd is None:
+        raise LaunchError(
+            f"WorkBuddy job runs the LLM judge {judge['model_slug']!r}; a judged "
+            "launch needs an explicit judge budget (--judge-budget-usd) so the "
+            "judge's spend enters the budget journal"
+        )
+    if not judge["enabled"] and judge_budget_microusd is not None:
+        raise LaunchError("judge budget given for a job that runs no LLM judge")
+    judge_cost_microusd = judge_budget_microusd or 0
 
     for label, value in (
         ("total_cost_microusd", total_cost_microusd),
@@ -858,13 +1156,21 @@ def build_launch_manifest(
         ("max_cost_microusd", max_cost_microusd),
         ("max_metered_tokens", max_metered_tokens),
         ("prior_exposure_microusd", prior_exposure_microusd),
+        ("judge_budget_microusd", judge_cost_microusd),
     ):
         if not isinstance(value, int) or isinstance(value, bool) or value < 0:
             raise LaunchError(f"{label} must be a non-negative integer")
     if min(total_cost_microusd, total_metered_tokens, max_cost_microusd, max_metered_tokens) <= 0:
         raise LaunchError("budget limits must be positive")
-    if max_cost_microusd > total_cost_microusd or max_metered_tokens > total_metered_tokens:
-        raise LaunchError("wave maximum exceeds its journal authority")
+    if judge["enabled"] and judge_cost_microusd <= 0:
+        raise LaunchError("judge budget must be positive")
+    if (
+        max_cost_microusd + judge_cost_microusd > total_cost_microusd
+        or max_metered_tokens > total_metered_tokens
+    ):
+        raise LaunchError(
+            "wave maximum (actor plus judge cap) exceeds its journal authority"
+        )
     if prior_exposure_microusd + total_cost_microusd > MAX_USER_AUTHORITY_MICROUSD:
         raise LaunchError(
             f"cumulative WorkBuddy authority exceeds the user ${MAX_USER_AUTHORITY_USD} limit"
@@ -873,6 +1179,12 @@ def build_launch_manifest(
         raise LaunchError("quality_evidence_on_commit must be boolean")
     if comparison_id is not None and not RUN_ID_RE.fullmatch(comparison_id):
         raise LaunchError("comparison id must be a safe 3-128 character component")
+    if judge["enabled"] and comparison_id is not None:
+        raise LaunchError(
+            "a job that runs the LLM judge cannot be a paired-comparison arm: "
+            "paired analysis does not admit receipts whose commit includes a "
+            "judge cap; plan it without --comparison-id"
+        )
     if quality_evidence_on_commit and comparison_id is None:
         raise LaunchError("quality evidence requires an explicit paired comparison id")
 
@@ -902,8 +1214,11 @@ def build_launch_manifest(
     budget_contract = {
         "total_cost_microusd": total_cost_microusd,
         "total_metered_tokens": total_metered_tokens,
-        "max_cost_microusd": max_cost_microusd,
+        # The transaction maximum the journal reserves and authorizes: the
+        # actor's cap plus the judge cap (0 for an unjudged job).
+        "max_cost_microusd": max_cost_microusd + judge_cost_microusd,
         "max_metered_tokens": max_metered_tokens,
+        "judge_cost_microusd": judge_cost_microusd,
         "prior_exposure_microusd": prior_exposure_microusd,
         "user_authority_microusd": MAX_USER_AUTHORITY_MICROUSD,
     }
@@ -919,6 +1234,7 @@ def build_launch_manifest(
         runner_tools={"bash": bash_tool, "uv": uv_tool},
         host_control_plane=host_control_plane,
         budget=budget_contract,
+        judge=judge,
     )
     manifest: Dict[str, object] = {
         "schema_version": SCHEMA_VERSION,
@@ -984,6 +1300,7 @@ def build_launch_manifest(
         "harness_fingerprint": harness_fingerprint,
         "host_control_plane": host_control_plane,
         "budget": budget_contract,
+        "judge": judge,
         "execution": {
             "n_attempts": 1,
             "n_concurrent_trials": 1,
@@ -1305,6 +1622,7 @@ def _validate_launch_manifest(manifest: Dict[str, Any]) -> Dict[str, Any]:
         > MAX_USER_AUTHORITY_MICROUSD
     ):
         raise LaunchError("paid launch budget authority is inconsistent")
+    _validate_judge_contract(manifest)
     return manifest
 
 
@@ -1432,6 +1750,7 @@ def _reobserve_launch_inputs(
         manifest,
         label="reobserved WorkBuddy job",
     )
+    _reobserve_judge(manifest, workbuddy, current_job)
     _reobserve_identity(manifest["model"]["config"], "WorkBuddy model config", maximum=16 * 1024 * 1024)
     backend_url = os.environ.get(manifest["model"]["backend_url_env"], "")
     if _sha256_bytes(backend_url.encode("utf-8")) != manifest["model"]["backend_url_sha256"]:
@@ -4065,7 +4384,9 @@ def resume_post_run_audit(
                 resumed_tokens += attempt_row.get("metered_tokens") or 0
             committed = journal.commit(
                 str(matches[0]["transaction_id"]),
-                actual_cost_microusd=usage["cost_microusd"] + resumed_cost,
+                actual_cost_microusd=usage["cost_microusd"]
+                + resumed_cost
+                + _judge_cost_microusd(manifest),
                 actual_metered_tokens=usage["metered_tokens"] + resumed_tokens,
             )
             snapshot = journal.snapshot()
@@ -4126,6 +4447,9 @@ def resume_post_run_audit(
             }:
                 receipt["evaluation_treatment"] = manifest["evaluation_treatment"]
                 receipt["comparison"] = manifest["comparison"]
+            judge_row = _receipt_judge(manifest)
+            if judge_row is not None:
+                receipt["judge"] = judge_row
             _write_private_new(
                 receipt_storage_path,
                 (json.dumps(receipt, sort_keys=True, indent=2) + "\n").encode(
@@ -4174,6 +4498,13 @@ def resume_trials(
 
     _reject_journal_receipt_collision(receipt_path, journal_path)
     manifest = validate_launch_manifest(manifest_path)
+    if _judge_cost_microusd(manifest):
+        # The judge cap is committed once for one pass over the cohort; a
+        # rerun would call the judge again past what the journal accounts.
+        raise LaunchError(
+            "a judged WorkBuddy arm cannot be resumed: rerun trials would call "
+            "the LLM judge again beyond the judge cap its transaction commits"
+        )
     failure = validate_authorized_failure_receipt(
         failure_receipt_path,
         journal_path=journal_path,
@@ -4612,6 +4943,7 @@ def resume_trials(
             "TINYKG_REMOTE_EXPECTED_BUILD_ID",
         ):
             environment.pop(name, None)
+        _judge_environment(environment, manifest)
         environment.update(
             {
                 PROVIDER_KEY_ENV: f"fd://{read_fd}",
@@ -4770,6 +5102,8 @@ def execute_launch(
     official_runner = runner_argv is None
     if official_runner:
         _reobserve_launch_inputs(manifest)
+    _require_judge_credential(manifest)
+    judge_cost = _judge_cost_microusd(manifest)
     budget = manifest["budget"]
     model = manifest["model"]
     authority = BudgetAuthority(
@@ -4877,6 +5211,7 @@ def execute_launch(
                     "METACODES_WB_RESUME_TASKS",
                 ):
                     environment.pop(name, None)
+                _judge_environment(environment, manifest)
                 environment.update(
                     {
                         PROVIDER_KEY_ENV: f"fd://{read_fd}",
@@ -4948,9 +5283,11 @@ def execute_launch(
                         f"failure receipt: {receipt_path}; "
                         f"audit_error={type(exc).__name__}: {str(exc)[:512]}"
                     ) from exc
+                # A judged transaction commits its whole judge cap beside
+                # the actor's measured cost: judge calls are not metered.
                 committed = journal.commit(
                     transaction_id,
-                    actual_cost_microusd=usage["cost_microusd"],
+                    actual_cost_microusd=usage["cost_microusd"] + judge_cost,
                     actual_metered_tokens=usage["metered_tokens"],
                 )
                 snapshot = journal.snapshot()
@@ -4986,6 +5323,9 @@ def execute_launch(
                         "evaluation_treatment"
                     ]
                     receipt["comparison"] = manifest["comparison"]
+                judge_row = _receipt_judge(manifest)
+                if judge_row is not None:
+                    receipt["judge"] = judge_row
                 _write_private_new(
                     receipt_path,
                     (json.dumps(receipt, sort_keys=True, indent=2) + "\n").encode(
@@ -5040,6 +5380,13 @@ def main(argv: list[str] | None = None) -> int:
     create.add_argument("--prior-exposure-microusd", type=int, default=0)
     create.add_argument("--quality-evidence-on-commit", action="store_true")
     create.add_argument("--comparison-id")
+    create.add_argument(
+        "--judge-budget-usd",
+        type=_judge_budget_usd,
+        default=None,
+        help="judge cap for a job that runs the LLM judge (Web/Office): added "
+        "to the transaction maximum and committed in full",
+    )
     create.add_argument("--output", type=Path, required=True)
     run = subparsers.add_parser("run")
     run.add_argument("--manifest", type=Path, required=True)
@@ -5095,6 +5442,7 @@ def main(argv: list[str] | None = None) -> int:
                 quality_evidence_on_commit=args.quality_evidence_on_commit,
                 diagnostic_tasks=(args.diagnostic_tasks.split(",") if args.diagnostic_tasks else None),
                 comparison_id=args.comparison_id,
+                judge_budget_microusd=args.judge_budget_usd,
             )
             _write_private_new(
                 args.output,

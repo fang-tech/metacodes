@@ -4,11 +4,13 @@ import importlib.util
 import sys
 import types
 import ast
+import contextlib
 import hashlib
 import io
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import tarfile
@@ -1884,6 +1886,95 @@ class WorkBuddyArtifactStageTest(unittest.TestCase):
                     allow_synthetic_fixtures=True,
                 )
 
+    @staticmethod
+    def _elf_needing(*versions: str) -> bytes:
+        """An x86_64 ELF whose .gnu.version_r needs libc.so.6 at `versions`."""
+        strings = bytearray(b"\x00libc.so.6\x00")
+        offsets = []
+        for version in versions:
+            offsets.append(len(strings))
+            strings += version.encode("ascii") + b"\x00"
+        need = bytearray()
+        need += (1).to_bytes(2, "little") + len(versions).to_bytes(2, "little")
+        need += (1).to_bytes(4, "little") + (16).to_bytes(4, "little") + (0).to_bytes(4, "little")
+        for index, name_at in enumerate(offsets):
+            last = index == len(offsets) - 1
+            need += (0).to_bytes(4, "little") + (0).to_bytes(2, "little")
+            need += (2 + index).to_bytes(2, "little") + name_at.to_bytes(4, "little")
+            need += (0 if last else 16).to_bytes(4, "little")
+        strings_at = 64
+        need_at = strings_at + len(strings)
+        sections_at = need_at + len(need)
+        header = bytearray(64)
+        header[:7] = b"\x7fELF\x02\x01\x01"
+        header[18:20] = (62).to_bytes(2, "little")
+        header[40:48] = sections_at.to_bytes(8, "little")
+        header[58:60] = (64).to_bytes(2, "little")
+        header[60:62] = (3).to_bytes(2, "little")
+
+        def section(sh_type, offset, size, link=0):
+            row = bytearray(64)
+            row[4:8] = sh_type.to_bytes(4, "little")
+            row[24:32] = offset.to_bytes(8, "little")
+            row[32:40] = size.to_bytes(8, "little")
+            row[40:44] = link.to_bytes(4, "little")
+            return bytes(row)
+
+        return (
+            bytes(header) + bytes(strings) + bytes(need)
+            + section(0, 0, 0)
+            + section(3, strings_at, len(strings))
+            + section(0x6FFFFFFE, need_at, len(need), link=1)
+        )
+
+    def test_production_stage_refuses_a_binary_newer_than_the_oldest_task_glibc(self):
+        from scripts.eval.workbuddy.stage_artifacts import _elf_glibc_requirement
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            license_file = root / "LICENSE"
+            license_file.write_text("license\n", encoding="utf-8")
+            licenses = (
+                ("metacodes", "MIT", license_file),
+                ("tinykg", "Apache-2.0", license_file),
+                ("lean4", "Apache-2.0", license_file),
+            )
+            floor = root / "floor"
+            floor.write_bytes(self._elf_needing("GLIBC_2.2.5", "GLIBC_2.28", "GLIBC_2.17"))
+            recent = root / "recent"
+            recent.write_bytes(self._elf_needing("GLIBC_2.2.5", "GLIBC_2.36", "GLIBC_2.34"))
+            static = root / "static"
+            static.write_bytes(self._elf(62))
+            self.assertEqual(_elf_glibc_requirement(floor), (2, 28))
+            self.assertEqual(_elf_glibc_requirement(recent), (2, 36))
+            self.assertIsNone(_elf_glibc_requirement(static))
+            stage(
+                output=root / "ok",
+                metacodes=floor,
+                tinykg=static,
+                formal_kernel=floor,
+                metacodes_commit=ZERO_COMMIT,
+                tinykg_commit=ONE_COMMIT,
+                licenses=licenses,
+            )
+            # The default release build: GLIBC_2.36 cannot start in the two
+            # Security task images that ship glibc 2.35.
+            with self.assertRaisesRegex(StageError, "needs GLIBC_2.36.*2.35"):
+                stage(
+                    output=root / "recent-stage",
+                    metacodes=recent,
+                    tinykg=static,
+                    formal_kernel=floor,
+                    metacodes_commit=ZERO_COMMIT,
+                    tinykg_commit=ONE_COMMIT,
+                    licenses=licenses,
+                )
+            self.assertFalse((root / "recent-stage").exists())
+            truncated = root / "truncated"
+            truncated.write_bytes(self._elf_needing("GLIBC_2.28")[:-40])
+            with self.assertRaisesRegex(StageError, "unreadable"):
+                _elf_glibc_requirement(truncated)
+
     def test_production_stage_requires_x86_64_and_records_elf_machine(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -2529,6 +2620,142 @@ def _probe_installed_overlay_imports(repo: Path) -> subprocess.CompletedProcess:
     )
 
 
+_ADAPTER_PATH = (
+    Path(__file__).parents[1]
+    / "workbuddy/overlay/src/workbuddy_bench/agents/metacodes_agent.py"
+)
+
+
+@contextlib.contextmanager
+def _stubbed_adapter():
+    """Load the overlay adapter with narrow doubles for WorkBuddy's runtime
+    types, so L2 checks exercise the command MetacodesAgent really builds
+    even when no pinned WorkBuddy checkout is available."""
+    module_names = (
+        "harbor",
+        "harbor.agents",
+        "harbor.agents.installed",
+        "harbor.environments",
+        "harbor.models",
+        "harbor.models.agent",
+        "harbor.models.trajectories",
+        "workbuddy_bench",
+        "workbuddy_bench.agents",
+    )
+    modules = {name: types.ModuleType(name) for name in module_names}
+
+    class BaseInstalledAgent:
+        def __init__(self, logs_dir, *_args, **_kwargs):
+            self.logs_dir = logs_dir
+
+    modules["harbor.agents.installed.base"] = types.ModuleType(
+        "harbor.agents.installed.base"
+    )
+    modules["harbor.agents.installed.base"].BaseInstalledAgent = BaseInstalledAgent
+    modules["harbor.environments.base"] = types.ModuleType("harbor.environments.base")
+    modules["harbor.environments.base"].BaseEnvironment = type("BaseEnvironment", (), {})
+    modules["harbor.models.agent.context"] = types.ModuleType(
+        "harbor.models.agent.context"
+    )
+    modules["harbor.models.agent.context"].AgentContext = type("AgentContext", (), {})
+    for name, class_name in (
+        ("agent", "Agent"),
+        ("final_metrics", "FinalMetrics"),
+        ("observation", "Observation"),
+        ("observation_result", "ObservationResult"),
+        ("step", "Step"),
+        ("tool_call", "ToolCall"),
+        ("trajectory", "Trajectory"),
+    ):
+        modules[f"harbor.models.trajectories.{name}"] = types.ModuleType(
+            f"harbor.models.trajectories.{name}"
+        )
+        setattr(
+            modules[f"harbor.models.trajectories.{name}"],
+            class_name,
+            type(class_name, (), {}),
+        )
+    modules["workbuddy_bench.agents._agent_user"] = types.ModuleType(
+        "workbuddy_bench.agents._agent_user"
+    )
+    modules["workbuddy_bench.agents._agent_user"].ensure_agent_user = lambda *args, **kwargs: None
+    trace_module = types.ModuleType("workbuddy_bench.agents._metacodes_trace")
+    trace_module.OBSERVATION_FILENAME = "tool-observations.jsonl"
+    trace_module.TraceError = type("TraceError", (Exception,), {})
+    trace_module.anthropic_messages_endpoint = lambda url: url + "/v1/messages"
+    trace_module.load_control_metrics = lambda *_args: {}
+    trace_module.load_trace_ir = lambda *_args: {}
+    trace_module.project_state_hash = lambda *_args: "project-hash"
+    modules["workbuddy_bench.agents._metacodes_trace"] = trace_module
+    with mock.patch.dict(sys.modules, modules, clear=False):
+        spec = importlib.util.spec_from_file_location(
+            "workbuddy_bench.agents.metacodes_agent_l2", _ADAPTER_PATH
+        )
+        adapter = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(adapter)
+        yield adapter
+
+
+class _CapturingEnvironment:
+    """Records what the adapter hands the container: uploaded files (with the
+    bytes as they were at upload time) and the root/agent shell commands."""
+
+    def __init__(self):
+        self.uploads = []
+        self.root_commands = []
+        self.agent_commands = []
+        self.agent_envs = []
+
+    async def upload_file(self, source_path, target_path):
+        self.uploads.append((str(target_path), Path(source_path).read_bytes()))
+
+
+def _bare_agent(adapter, logs_dir, **overrides):
+    """A MetacodesAgent with the attributes run() reads, bypassing __init__."""
+    agent = adapter.MetacodesAgent.__new__(adapter.MetacodesAgent)
+    values = {
+        "logs_dir": logs_dir,
+        "model_name": "route-l2",
+        "_model_display_name": "model-l2",
+        "_model_params": {},
+        "_mount_path": "/opt/metacodes",
+        "_disabled_tools": "Agent",
+        "_proxy_url": "http://127.0.0.1:1",
+        "_session_id": "",
+        "_max_output_tokens": None,
+        "_reasoning_effort": None,
+        "_verification_checkpoint": False,
+        "_verification_final_gate": False,
+        "_verification_final_observe": False,
+        "_requirement_ledger": False,
+        "_requirement_ledger_observe": False,
+        "_project_kernel_relative": None,
+        "_project_rules_relative": None,
+        "_project_control_mode": "absent",
+        "_memory_accumulation": False,
+        "_self_evolution": False,
+        "_outcome_feedback": False,
+        "_continuity_seed_sha256": None,
+        "_context_window": None,
+        "_context_compact_pct": None,
+    }
+    values.update(overrides)
+    for name, value in values.items():
+        setattr(agent, name, value)
+    agent.render_instruction = lambda instruction: instruction
+
+    async def exec_as_root(environment, command, **_kwargs):
+        environment.root_commands.append(command)
+
+    async def exec_as_agent(environment, command, **kwargs):
+        environment.agent_commands.append(command)
+        environment.agent_envs.append(kwargs.get("env"))
+
+    agent.exec_as_root = exec_as_root
+    agent.exec_as_agent = exec_as_agent
+    return agent
+
+
 class WorkBuddyOverlayUpgradeTest(unittest.TestCase):
     def test_workbuddy_headless_policy_hides_interactive_plan_without_disabling_tinykg(self):
         overlay = Path(__file__).parents[1] / "workbuddy/overlay"
@@ -2847,7 +3074,7 @@ assert failed, "enforced run without rule_filter events must fail loudly"
         # stderr 落 /logs/agent 自己的文件并透传 fd2(p3 取证:Harbor stderr
         # 流不进任何导出物,warn 诊断链进虚空)——但绝不许并进 NDJSON stdout。
         self.assertIn(
-            '"</dev/null 2> >(tee /logs/agent/metacodes-stderr.log >&2) "',
+            """'<"$instruction_file" 2> >(tee /logs/agent/metacodes-stderr.log >&2) '""",
             source,
         )
         self.assertIn(
@@ -2894,114 +3121,13 @@ assert failed, "enforced run without rule_filter events must fail loudly"
         # Load the overlay adapter with narrow test doubles for WorkBuddy's
         # runtime types so this L2 check exercises the command actually built
         # by MetacodesAgent, even when a pinned WorkBuddy checkout is absent.
-        module_names = (
-            "harbor",
-            "harbor.agents",
-            "harbor.agents.installed",
-            "harbor.environments",
-            "harbor.models",
-            "harbor.models.agent",
-            "harbor.models.trajectories",
-            "workbuddy_bench",
-            "workbuddy_bench.agents",
-        )
-        modules = {name: types.ModuleType(name) for name in module_names}
-
-        class BaseInstalledAgent:
-            def __init__(self, logs_dir, *_args, **_kwargs):
-                self.logs_dir = logs_dir
-
-        modules["harbor.agents.installed.base"] = types.ModuleType(
-            "harbor.agents.installed.base"
-        )
-        modules["harbor.agents.installed.base"].BaseInstalledAgent = BaseInstalledAgent
-        modules["harbor.environments.base"] = types.ModuleType(
-            "harbor.environments.base"
-        )
-        modules["harbor.environments.base"].BaseEnvironment = type(
-            "BaseEnvironment", (), {}
-        )
-        modules["harbor.models.agent.context"] = types.ModuleType(
-            "harbor.models.agent.context"
-        )
-        modules["harbor.models.agent.context"].AgentContext = type(
-            "AgentContext", (), {}
-        )
-        for name, class_name in (
-            ("agent", "Agent"),
-            ("final_metrics", "FinalMetrics"),
-            ("observation", "Observation"),
-            ("observation_result", "ObservationResult"),
-            ("step", "Step"),
-            ("tool_call", "ToolCall"),
-            ("trajectory", "Trajectory"),
-        ):
-            modules[f"harbor.models.trajectories.{name}"] = types.ModuleType(
-                f"harbor.models.trajectories.{name}"
-            )
-            setattr(
-                modules[f"harbor.models.trajectories.{name}"],
-                class_name,
-                type(class_name, (), {}),
-            )
-        modules["workbuddy_bench.agents._agent_user"] = types.ModuleType(
-            "workbuddy_bench.agents._agent_user"
-        )
-        modules["workbuddy_bench.agents._agent_user"].ensure_agent_user = lambda *args, **kwargs: None
-        trace_module = types.ModuleType("workbuddy_bench.agents._metacodes_trace")
-        trace_module.OBSERVATION_FILENAME = "tool-observations.jsonl"
-        trace_module.TraceError = type("TraceError", (Exception,), {})
-        trace_module.anthropic_messages_endpoint = lambda url: url + "/v1/messages"
-        trace_module.load_control_metrics = lambda *_args: {}
-        trace_module.load_trace_ir = lambda *_args: {}
-        trace_module.project_state_hash = lambda *_args: "project-hash"
-        modules["workbuddy_bench.agents._metacodes_trace"] = trace_module
-
-        adapter_path = (
-            Path(__file__).parents[1]
-            / "workbuddy/overlay/src/workbuddy_bench/agents/metacodes_agent.py"
-        )
-        with mock.patch.dict(sys.modules, modules, clear=False):
-            spec = importlib.util.spec_from_file_location(
-                "workbuddy_bench.agents.metacodes_agent_l2", adapter_path
-            )
-            adapter = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(adapter)
+        with _stubbed_adapter() as adapter:
 
             async def capture_command(logs_dir, instruction="instruction"):
-                agent = adapter.MetacodesAgent.__new__(adapter.MetacodesAgent)
-                agent.logs_dir = logs_dir
-                agent.model_name = "route-l2"
-                agent._model_display_name = "model-l2"
-                agent._model_params = {}
-                agent._mount_path = "/opt/metacodes"
-                agent._disabled_tools = "Agent"
-                agent._proxy_url = "http://127.0.0.1:1"
-                agent._session_id = ""
-                agent._max_output_tokens = None
-                agent._verification_checkpoint = False
-                agent._verification_final_gate = False
-                agent._verification_final_observe = False
-                agent._requirement_ledger = False
-                agent._requirement_ledger_observe = False
-                agent._project_kernel_relative = None
-                agent._project_rules_relative = None
-                agent._project_control_mode = "absent"
-                agent._memory_accumulation = False
-                agent._self_evolution = False
-                agent._outcome_feedback = False
-                agent._continuity_seed_sha256 = None
-                agent._context_window = None
-                agent._context_compact_pct = None
-                captured = {}
-                agent.render_instruction = lambda instruction: instruction
-
-                async def fake_exec(_environment, command, **_kwargs):
-                    captured["command"] = command
-
-                agent.exec_as_agent = fake_exec
-                await agent.run(instruction, object(), None)
-                return captured["command"]
+                agent = _bare_agent(adapter, logs_dir)
+                environment = _CapturingEnvironment()
+                await agent.run(instruction, environment, None)
+                return environment.agent_commands[-1]
 
             with tempfile.TemporaryDirectory() as directory:
                 first_logs = Path(directory) / "trial" / "steps" / "find-vuln" / "agent"
@@ -3349,6 +3475,83 @@ asyncio.run(main())
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
         )
+
+    def test_installed_proxy_numbers_each_log_file_without_judge_holes(self):
+        """The job proxy also serves the in-container judge, whose route has
+        no instance id and logs to the shared file.  Each file must still be
+        a gapless 1..N wave: one global counter gave the run file 1,3,5."""
+        checkout_raw = os.environ.get("METACODES_WORKBUDDY_CHECKOUT")
+        if not checkout_raw:
+            self.skipTest("pinned WorkBuddy checkout is unavailable")
+        checkout = Path(checkout_raw).resolve()
+        if not checkout.is_dir():
+            self.skipTest("pinned WorkBuddy checkout is unavailable")
+        overlay_installer.validate_installed_overlay(checkout)
+        program = r'''
+import asyncio, json, tempfile
+from pathlib import Path
+from workbuddy_bench.proxy.config import BackendConfig, ProxyConfig, ProxyMode, RouteConfig
+from workbuddy_bench.proxy.interceptors import RequestContext
+from workbuddy_bench.proxy.pipeline import Pipeline
+
+TERMINAL = (
+    b'event: message_start\ndata: {"type":"message_start","message":{"usage":{"input_tokens":1}}}\n\n'
+    b'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}\n\n'
+    b'event: message_stop\ndata: {"type":"message_stop"}\n\n'
+)
+
+class Sender:
+    async def send_stream_raw(self, *args, **kwargs):
+        yield TERMINAL
+
+def route(slug, instance_id):
+    return RouteConfig(
+        slug=slug, mode=ProxyMode.PASSTHROUGH,
+        backend=BackendConfig(url="http://provider.invalid/v1/messages"),
+        backend_model="glm-5.2", client_protocol="anthropic",
+        backend_protocol="anthropic", interceptors=["log"], instance_id=instance_id,
+    )
+
+async def main():
+    with tempfile.TemporaryDirectory() as directory:
+        config = ProxyConfig(log_dir=directory, log_enabled=True)
+        actor, judge = route("actor", "run-l2"), route("judge", "")
+        config.routes[actor.slug] = actor
+        config.routes[judge.slug] = judge
+        pipeline = Pipeline(config)
+        pipeline.sender = Sender()
+        for selected in (actor, judge, actor, judge, actor):
+            body = {
+                "model": selected.slug, "system": "stable",
+                "messages": [{"role": "user", "content": "task"}], "stream": True,
+            }
+            context = RequestContext(
+                path="/v1/messages", raw_body=json.dumps(body).encode(),
+                parsed_body=dict(body), route=selected,
+            )
+            async for _chunk in pipeline.handle_stream(context):
+                pass
+        def seqs(name):
+            return [
+                json.loads(line)["seq"]
+                for line in (Path(directory) / name).read_text().splitlines()
+            ]
+        assert seqs("run-l2.jsonl") == [1, 2, 3], seqs("run-l2.jsonl")
+        assert seqs("proxy_requests.jsonl") == [1, 2], seqs("proxy_requests.jsonl")
+
+asyncio.run(main())
+'''
+        env = dict(os.environ)
+        env["PYTHONPATH"] = str(checkout / "src")
+        completed = subprocess.run(
+            [str(checkout / ".venv/bin/python"), "-c", program],
+            cwd=checkout,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr[-2000:])
 
     def test_installed_a2o_disconnect_before_sender_is_not_provider_attempt(self):
         checkout_raw = os.environ.get("METACODES_WORKBUDDY_CHECKOUT")
@@ -3863,16 +4066,24 @@ from workbuddy_bench.agents import metacodes_agent as module
 from workbuddy_bench.agents.metacodes_agent import MetacodesAgent
 
 class StubEnvironment:
-    """The continuity channel is the /logs/agent bind mount; the environment
-    object needs no transfer API at all."""
+    """The continuity channel is the /logs/agent bind mount; the only
+    transfer the environment serves is the instruction upload."""
+
+    async def upload_file(self, source_path, target_path):
+        pass
+
+async def no_root_exec(environment, command, **kwargs):
+    pass
 
 def make_agent(logs, **extra):
-    return MetacodesAgent(
+    agent = MetacodesAgent(
         logs, model_name="route-l2", model_params={},
         METACODES_MODEL_DISPLAY_NAME="glm-5.2",
         connection={"mode": "local_proxy", "proxy_url": "http://127.0.0.1:1"},
         METACODES_MEMORY_ACCUMULATION=True, **extra,
     )
+    agent.exec_as_root = no_root_exec
+    return agent
 
 def store_tar(payload: bytes) -> bytes:
     with tempfile.TemporaryDirectory() as d:
@@ -3962,6 +4173,10 @@ from pathlib import Path
 from workbuddy_bench.agents.metacodes_agent import MetacodesAgent
 
 class StubEnvironment:
+    async def upload_file(self, source_path, target_path):
+        pass
+
+async def no_root_exec(environment, command, **kwargs):
     pass
 
 with tempfile.TemporaryDirectory() as directory:
@@ -4037,6 +4252,7 @@ with tempfile.TemporaryDirectory() as directory:
         METACODES_PROJECT_KERNEL_RELATIVE="libexec/metacodes-project-kernel",
     )
     agent.exec_as_agent = fake_exec
+    agent.exec_as_root = no_root_exec
     asyncio.run(agent.run("instruction", StubEnvironment(), None))
     command = captured["command"]
     assert "export METACODES_TASK_HINT=feature-medium-etag_header_for_static; " in command, command[:2000]
@@ -4081,8 +4297,12 @@ with tempfile.TemporaryDirectory() as directory:
     async def fake_exec(environment, command, env, cwd):
         captured["command"] = command
     agent.exec_as_agent = fake_exec
-    class StubEnvironment:
+    async def no_root_exec(environment, command, **kwargs):
         pass
+    agent.exec_as_root = no_root_exec
+    class StubEnvironment:
+        async def upload_file(self, source_path, target_path):
+            pass
     asyncio.run(agent.run("instruction", StubEnvironment(), None))
     command = captured["command"]
     assert 'test ! -e "$METACODES_KG_STORE" || exit 85' in command
@@ -5064,3 +5284,311 @@ class BestArtifactMultiFileTest(unittest.TestCase):
         artifact = self._extract()(self._trial(big))
         self.assertLessEqual(len(artifact), 4096 + 400)
         self.assertIn("HOST-TRUNCATED", artifact)
+
+
+_LEADERBOARD_INSTRUCTION = (
+    "Audit the service, then stop it with `pkill -f tlsgateway-l2-marker` "
+    "before writing /app/report.jsonl.\n"
+)
+
+
+def _sse_events(events):
+    return b"".join(
+        b"event: " + event["type"].encode("utf-8") + b"\ndata: "
+        + json.dumps(event).encode("utf-8") + b"\n\n"
+        for event in events
+    )
+
+
+def _scripted_turn(number, tool_round_input_tokens):
+    """Request 1 asks for one read-only tool call and reports a large prompt;
+    request 2 ends the run.  The reported usage is what anchors metacodes'
+    context estimate for the second request."""
+    if number == 1:
+        return _sse_events([
+            {"type": "message_start", "message": {
+                "id": "msg_l2_1", "role": "assistant", "model": "glm-5.2",
+                "usage": {"input_tokens": tool_round_input_tokens, "output_tokens": 0}}},
+            {"type": "content_block_start", "index": 0, "content_block": {
+                "type": "tool_use", "id": "toolu_l2_glob", "name": "Glob", "input": {}}},
+            {"type": "content_block_delta", "index": 0, "delta": {
+                "type": "input_json_delta", "partial_json": '{"pattern": "*.no-such-suffix"}'}},
+            {"type": "content_block_stop", "index": 0},
+            {"type": "message_delta", "delta": {"stop_reason": "tool_use", "stop_sequence": None},
+             "usage": {"output_tokens": 12}},
+            {"type": "message_stop"},
+        ])
+    return _sse_events([
+        {"type": "message_start", "message": {
+            "id": f"msg_l2_{number}", "role": "assistant", "model": "glm-5.2",
+            "usage": {"input_tokens": 100, "output_tokens": 0}}},
+        {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}},
+        {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "done"}},
+        {"type": "content_block_stop", "index": 0},
+        {"type": "message_delta", "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+         "usage": {"output_tokens": 2}},
+        {"type": "message_stop"},
+    ])
+
+
+@contextlib.contextmanager
+def _scripted_provider(tool_round_input_tokens):
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    bodies = []
+    lock = threading.Lock()
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):  # noqa: N802 - BaseHTTPRequestHandler contract
+            length = int(self.headers.get("Content-Length", "0"))
+            body = json.loads(self.rfile.read(length))
+            with lock:
+                bodies.append({"path": self.path, "body": body})
+                payload = _scripted_turn(len(bodies), tool_round_input_tokens)
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def do_GET(self):  # noqa: N802
+            self.send_error(404)
+
+        def log_message(self, *_args):
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.05})
+    thread.daemon = True
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_address[1]}", bodies
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def _printf_payload(command, target):
+    """The single-quoted printf payload the command writes to `target`."""
+    match = re.search(
+        r"printf '%s' ('(?:[^']|'\"'\"')*') > \"\$HOME/\.metacodes/"
+        + re.escape(target) + r"\"",
+        command,
+    )
+    return None if match is None else shlex.split(match.group(1))[0]
+
+
+def _replay_adapter(binary, instruction, **overrides):
+    """Run what the adapter would run in the container, on this host: its
+    fresh-HOME files, its flags and environment, and the uploaded instruction
+    on stdin, against the installed binary.  Returns (process, events)."""
+    with _stubbed_adapter() as adapter, tempfile.TemporaryDirectory() as root:
+        logs = Path(root) / "trial__l2" / "agent"
+        logs.mkdir(parents=True)
+        agent = _bare_agent(adapter, logs, **overrides)
+        environment = _CapturingEnvironment()
+        asyncio.run(agent.run(instruction, environment, None))
+        command = environment.agent_commands[-1]
+        home = Path(root) / "home"
+        (home / ".metacodes").mkdir(parents=True)
+        (home / ".metacodes/config.json").write_text(
+            _printf_payload(command, "config.json"), encoding="utf-8"
+        )
+        models = _printf_payload(command, "models.toml")
+        if models is not None:
+            (home / ".metacodes/models.toml").write_text(models, encoding="utf-8")
+        flags = shlex.split(
+            re.search(r"metacodes (.*?) - --json --stream-json ", command).group(1)
+        )
+        workspace = Path(root) / "workspace"
+        workspace.mkdir()
+        env = dict(environment.agent_envs[-1])
+        env.update({
+            "HOME": str(home),
+            "PATH": "/usr/bin:/bin",
+            "METACODES_JEV_URL": "off",
+            "METACODES_LOG": "*:error",
+        })
+        ((_target, uploaded),) = environment.uploads
+        done = subprocess.run(
+            [binary, *flags, "-", "--json", "--stream-json"],
+            cwd=workspace,
+            env=env,
+            input=uploaded,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=120,
+        )
+        events = [
+            json.loads(line)
+            for line in done.stdout.decode("utf-8").splitlines()
+            if line.startswith("{")
+        ]
+        done.workspace_files = {
+            path.name: path.read_bytes() for path in workspace.iterdir() if path.is_file()
+        }
+        return done, events
+
+
+class WorkBuddyLeaderboardProtocolTest(unittest.TestCase):
+    """The leaderboard protocol knobs reach metacodes itself: the effort flag,
+    the bench context window, and the instruction off argv."""
+
+    ROUTE = "wb-lb-l2-20261018t0000z--metacodes-glm52-leaderboard"
+
+    def _run_adapter(self, **overrides):
+        with _stubbed_adapter() as adapter, tempfile.TemporaryDirectory() as directory:
+            logs = Path(directory) / "trial__l2" / "agent"
+            logs.mkdir(parents=True)
+            agent = _bare_agent(adapter, logs, **overrides)
+            environment = _CapturingEnvironment()
+            asyncio.run(agent.run(_LEADERBOARD_INSTRUCTION, environment, None))
+            host_copies = {
+                path.name: path.read_bytes()
+                for path in logs.glob("metacodes-instruction-*.md")
+            }
+        return environment, host_copies
+
+    def test_instruction_travels_on_stdin_from_an_uploaded_hash_checked_file(self):
+        environment, host_copies = self._run_adapter(model_name=self.ROUTE)
+        command = environment.agent_commands[-1]
+        digest = hashlib.sha256(_LEADERBOARD_INSTRUCTION.encode("utf-8")).hexdigest()
+        target = f"/tmp/metacodes-instruction-{digest[:16]}.md"
+        # Not one word of the task reaches any argv: the agent's own or the
+        # wrapping shell's, which is what a task's `pkill -f` matches.
+        self.assertNotIn("tlsgateway-l2-marker", command)
+        invocation = re.search(r"metacodes (--model [^;|]*?) - --json --stream-json ", command)
+        self.assertIsNotNone(invocation, command)
+        self.assertIsNone(re.search(r"(^| )(-p|--print)( |$)", invocation.group(1)))
+        self.assertIn('<"$instruction_file" 2> >(tee', command)
+        self.assertIn(f"instruction_file={target}; ", command)
+        self.assertIn(f'| cut -d" " -f1)" = {digest} || exit 90; ', command)
+        self.assertEqual(
+            environment.uploads,
+            [(target, _LEADERBOARD_INSTRUCTION.encode("utf-8"))],
+        )
+        self.assertEqual(environment.root_commands, [f"chmod 0444 {target}"])
+        self.assertEqual(
+            host_copies,
+            {Path(target).name: _LEADERBOARD_INSTRUCTION.encode("utf-8")},
+        )
+        contract = json.loads(
+            re.search(r"printf '%s\\n' ('[^']*') > /logs/agent/metacodes-runtime-contract.json", command)
+            .group(1)
+            .strip("'")
+        )
+        self.assertEqual(contract["instruction_delivery"], "stdin-uploaded-file")
+        self.assertEqual(contract["instruction_sha256"], digest)
+
+    def test_effort_and_window_are_declared_only_when_configured(self):
+        environment, _ = self._run_adapter(model_name=self.ROUTE)
+        command = environment.agent_commands[-1]
+        self.assertNotIn("--reasoning-effort", command)
+        self.assertIsNone(_printf_payload(command, "models.toml"))
+        environment, _ = self._run_adapter(
+            model_name=self.ROUTE,
+            _reasoning_effort="high",
+            _context_window=200000,
+            _max_output_tokens=32768,
+        )
+        command = environment.agent_commands[-1]
+        self.assertIn("--max-tokens 32768 --reasoning-effort high", command)
+        self.assertEqual(
+            _printf_payload(command, "models.toml"),
+            f'[models]\n"{self.ROUTE}" = 200000\n',
+        )
+        contract = json.loads(
+            re.search(r"printf '%s\\n' ('[^']*') > /logs/agent/metacodes-runtime-contract.json", command)
+            .group(1)
+            .strip("'")
+        )
+        self.assertEqual(contract["reasoning_effort"], "high")
+        self.assertEqual(contract["declared_context_window"], 200000)
+
+    def test_out_of_vocabulary_effort_window_and_route_fail_closed(self):
+        with _stubbed_adapter() as adapter, tempfile.TemporaryDirectory() as directory:
+            logs = Path(directory) / "trial__l2" / "agent"
+            logs.mkdir(parents=True)
+            common = dict(
+                METACODES_MODEL_DISPLAY_NAME="glm-5.2",
+                connection={"mode": "local_proxy", "proxy_url": "http://127.0.0.1:1"},
+            )
+            agent = adapter.MetacodesAgent(
+                logs, METACODES_REASONING_EFFORT="high", context_window=200000, **common
+            )
+            self.assertEqual(agent._reasoning_effort, "high")
+            self.assertEqual(agent._context_window, 200000)
+            for bad in (
+                {"METACODES_REASONING_EFFORT": "extreme"},
+                {"METACODES_REASONING_EFFORT": True},
+                {"context_window": "200000"},
+                {"context_window": True},
+                {"context_window": 0},
+                {"context_window": 10_000_001},
+            ):
+                with self.subTest(bad=bad), self.assertRaises(ValueError):
+                    adapter.MetacodesAgent(logs, **bad, **common)
+            quoted = _bare_agent(
+                adapter, logs, model_name='route"x', _context_window=200000
+            )
+            with self.assertRaisesRegex(ValueError, "plain route token"):
+                asyncio.run(quoted.run("x", _CapturingEnvironment(), None))
+            # The window is the only reason the route must be a plain token.
+            asyncio.run(
+                _bare_agent(adapter, logs, model_name='route"x').run(
+                    "x", _CapturingEnvironment(), None
+                )
+            )
+
+    @unittest.skipUnless(
+        POSIX and os.environ.get("METACODES_NATIVE_E2E_BIN"),
+        "set METACODES_NATIVE_E2E_BIN to run the adapter command against the binary",
+    )
+    def test_declared_window_effort_and_stdin_reach_the_real_binary(self):
+        """Replay the adapter's HOME, flags, environment and stdin against the
+        installed binary.  A declared 180K window puts a 130K prompt between
+        metacodes' warning and auto-compact thresholds; the same run without
+        the declaration (200K fallback) stays below the warning."""
+        binary = os.environ["METACODES_NATIVE_E2E_BIN"]
+        window, max_tokens, anchored = 180_000, 32_768, 130_000
+        expected_auto = window - max_tokens - 13_000
+
+        def replay(declare_window):
+            with _scripted_provider(anchored) as (url, bodies):
+                done, events = _replay_adapter(
+                    binary,
+                    _LEADERBOARD_INSTRUCTION,
+                    model_name=self.ROUTE,
+                    _proxy_url=url,
+                    _reasoning_effort="high",
+                    _context_window=window if declare_window else None,
+                    _max_output_tokens=max_tokens,
+                    _disabled_tools="Agent,Task,WebSearch,AskUserQuestion",
+                )
+                return done, events, list(bodies)
+
+        done, events, bodies = replay(declare_window=True)
+        self.assertEqual(done.returncode, 0, done.stderr.decode("utf-8", "replace")[-2000:])
+        self.assertEqual([e["stop_reason"] for e in events if e.get("type") == "result"], ["end_turn"])
+        self.assertEqual(len(bodies), 2)
+        warnings = [e for e in events if e.get("type") == "context_warning"]
+        self.assertEqual(len(warnings), 1, events)
+        self.assertEqual(warnings[0]["auto_compact_threshold"], expected_auto)
+        first = bodies[0]["body"]
+        self.assertEqual(bodies[0]["path"], "/v1/messages")
+        self.assertEqual(first["model"], self.ROUTE)
+        self.assertEqual(first["max_tokens"], max_tokens)
+        self.assertEqual(first["thinking"], {"type": "adaptive"})
+        self.assertEqual(first["output_config"], {"effort": "high"})
+        self.assertNotIn("temperature", first)
+        tools = {tool["name"] for tool in first["tools"]}
+        self.assertTrue({"WebSearch", "AskUserQuestion", "Agent", "Task"}.isdisjoint(tools), tools)
+        self.assertTrue({"Bash", "Read", "WebFetch", "Glob"}.issubset(tools), tools)
+        user_text = json.dumps(first["messages"][-1], ensure_ascii=False)
+        self.assertIn("tlsgateway-l2-marker", user_text)
+
+        done, events, bodies = replay(declare_window=False)
+        self.assertEqual(done.returncode, 0, done.stderr.decode("utf-8", "replace")[-2000:])
+        self.assertEqual(len(bodies), 2)
+        self.assertEqual([e for e in events if e.get("type") == "context_warning"], [])

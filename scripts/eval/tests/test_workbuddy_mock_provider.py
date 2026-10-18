@@ -11,10 +11,14 @@ from pathlib import Path
 from unittest import mock
 
 from scripts.eval.workbuddy.mock_provider import (
+    LEADERBOARD_ANCHOR_INPUT_TOKENS,
+    LEADERBOARD_RESULT,
+    LEADERBOARD_STDIN_MARKER,
     MOCK_CREDENTIAL,
     READY_DEADLINE_S,
     ScenarioError,
     _control_plane_sse,
+    _leaderboard_sse,
     _private_new,
 )
 from scripts.eval.tests.posix_only import POSIX
@@ -144,6 +148,74 @@ class WorkBuddyMockProviderTest(unittest.TestCase):
         request["messages"][-1]["content"][0]["is_error"] = True
         with self.assertRaisesRegex(ScenarioError, "Write reported an error"):
             _control_plane_sse(7, request)
+
+    @staticmethod
+    def _leaderboard_request(with_result=False, **changes):
+        messages = [{"role": "user", "content": [
+            {"type": "text", "text": "<system-reminder>context</system-reminder>"},
+            {"type": "text", "text": f"Create the file. {LEADERBOARD_STDIN_MARKER}"},
+        ]}]
+        if with_result:
+            messages += [
+                {"role": "assistant", "content": [{
+                    "type": "tool_use", "id": "leaderboard-write-result",
+                    "name": "Write", "input": {}}]},
+                {"role": "user", "content": [{
+                    "type": "tool_result", "tool_use_id": "leaderboard-write-result",
+                    "content": "wrote", "is_error": False}]},
+            ]
+        request = {
+            "model": "wb-run--metacodes-lb-mock",
+            "stream": True,
+            "max_tokens": 32768,
+            "thinking": {"type": "adaptive"},
+            "output_config": {"effort": "high"},
+            "messages": messages,
+            "tools": [{"name": name} for name in ("Bash", "Read", "Write", "WebFetch", "KgRecall")],
+        }
+        request.update(changes)
+        return request
+
+    def test_leaderboard_scenario_accepts_the_protocol_body_and_anchors_usage(self):
+        payload = _leaderboard_sse(1, self._leaderboard_request())
+        self.assertIn(b'"name":"Write"', payload)
+        self.assertIn(LEADERBOARD_RESULT.strip().encode(), payload)
+        self.assertIn(f'"input_tokens":{LEADERBOARD_ANCHOR_INPUT_TOKENS}'.encode(), payload)
+        payload = _leaderboard_sse(2, self._leaderboard_request(with_result=True))
+        self.assertIn(b'"stop_reason":"end_turn"', payload)
+        with self.assertRaises(ScenarioError):
+            _leaderboard_sse(3, self._leaderboard_request(with_result=True))
+
+    def test_leaderboard_scenario_refuses_every_protocol_deviation(self):
+        tools = [{"name": n} for n in ("Bash", "Read", "Write", "WebFetch")]
+        deviations = {
+            "temperature": {"temperature": 0.0},
+            "top_p": {"top_p": 0.95},
+            "no thinking": {"thinking": None},
+            "enabled thinking": {"thinking": {"type": "enabled", "budget_tokens": 1024}},
+            "no effort": {"output_config": None},
+            "low effort": {"output_config": {"effort": "low"}},
+            "max tokens": {"max_tokens": 32000},
+            "websearch": {"tools": tools + [{"name": "WebSearch"}]},
+            "ask user": {"tools": tools + [{"name": "AskUserQuestion"}]},
+            "task": {"tools": tools + [{"name": "Task"}]},
+            "no write": {"tools": [{"name": "Bash"}, {"name": "WebFetch"}]},
+        }
+        for label, change in deviations.items():
+            request = self._leaderboard_request(**change)
+            for key, value in change.items():
+                if value is None:
+                    request.pop(key)
+            with self.subTest(label), self.assertRaises(ScenarioError):
+                _leaderboard_sse(1, request)
+        missing_marker = self._leaderboard_request()
+        missing_marker["messages"][0]["content"][1]["text"] = "Create the file."
+        with self.assertRaises(ScenarioError):
+            _leaderboard_sse(1, missing_marker)
+        failed = self._leaderboard_request(with_result=True)
+        failed["messages"][-1]["content"][0]["is_error"] = True
+        with self.assertRaises(ScenarioError):
+            _leaderboard_sse(2, failed)
 
     def test_private_artifact_handles_short_writes_and_is_durable(self):
         with tempfile.TemporaryDirectory() as directory:

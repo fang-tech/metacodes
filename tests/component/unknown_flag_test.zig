@@ -79,8 +79,10 @@ test "every known evaluation treatment flag still parses cleanly" {
 test "every overlay VALUE flag parses with a legitimate value" {
     const a = std.testing.allocator;
     // The value flags metacodes_agent.py emits: --model, --model-display-name,
-    // --permission, --disallowed-tools, --max-tokens. Pins vocabulary AND
-    // that the strict value parsing accepts the exact values the overlay sends.
+    // --permission, --disallowed-tools, --max-tokens, --reasoning-effort. Pins
+    // vocabulary AND that the strict value parsing accepts the exact values the
+    // overlay sends. (`-`, the stdin prompt, is read during parsing; the
+    // adapter's L2 runs it against the installed binary instead.)
     const argv = [_][*:0]const u8{
         "metacodes",
         "--model",
@@ -93,10 +95,13 @@ test "every overlay VALUE flag parses with a legitimate value" {
         "WebFetch,WebSearch",
         "--max-tokens",
         "32768",
+        "--reasoning-effort",
+        "high",
     };
     const config = cc.parseArgsForTest(&argv, a);
     try std.testing.expect(config.parse_error == null);
     try std.testing.expectEqual(@as(?u32, 32768), config.max_tokens);
+    try std.testing.expectEqual(@as(?cc.types_mod.ReasoningEffort, .high), config.reasoning_effort);
     try std.testing.expectEqual(cc.types_mod.PermissionMode.bypass_permissions, config.permission_mode);
     a.free(config.model);
     a.free(config.model_display_name.?);

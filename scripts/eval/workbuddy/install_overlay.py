@@ -196,6 +196,12 @@ _PROXY_LOGGER_INIT_NEW = '''        self._seq = 0
         # when its response happens to finish.  Completion order is not request
         # order when a client closes a stream immediately after message_stop.
         self._request_seqs: dict[str, int] = {}
+        # One counter per log file (route instance_id): each file is audited
+        # as a gapless 1..N wave on its own.  The job proxy also serves the
+        # in-container judge route, whose records land in the shared file; a
+        # single counter left holes in every run file (2026-09: ten Web and
+        # Office receipts failed the wave-sequence audit that way).
+        self._seqs: dict[str, int] = {}
         # Per-stream accumulators keyed by request_id
         self._stream_bufs: dict[str, _StreamAccumulator] = {}
 '''
@@ -206,8 +212,9 @@ _PROXY_LOGGER_REQUEST_OLD = '''        if ctx.client_body is None:
 '''
 _PROXY_LOGGER_REQUEST_NEW = '''        if ctx.client_body is None:
             ctx.client_body = _json_safe(ctx.ensure_parsed())
-        self._seq += 1
-        self._request_seqs[ctx.request_id] = self._seq
+        log_key = _route_instance_id(ctx)
+        self._seqs[log_key] = self._seqs.get(log_key, 0) + 1
+        self._request_seqs[ctx.request_id] = self._seqs[log_key]
         if ctx.is_stream:
             self._stream_bufs[ctx.request_id] = _StreamAccumulator()
 '''
@@ -263,8 +270,9 @@ _PROXY_LOGGER_SEQ_NEW = '''        """Build a JSONL record."""
         if request_seq is None:
             # Defensive compatibility for direct test callers that bypassed
             # on_request; production paths always allocate before provider I/O.
-            self._seq += 1
-            request_seq = self._seq
+            log_key = _route_instance_id(ctx)
+            self._seqs[log_key] = self._seqs.get(log_key, 0) + 1
+            request_seq = self._seqs[log_key]
 
         client_request_body = _json_safe(ctx.client_body or ctx.parsed_body or {})
 '''
