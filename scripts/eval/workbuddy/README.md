@@ -38,11 +38,11 @@ python3 -m scripts.eval.workbuddy.stage_artifacts \
   --lean-license /path/to/lean4/LICENSE
 ```
 
-The repository currently has no repository-wide metacodes license.  Until that
-changes, production staging must use
-`scripts/eval/workbuddy/licenses/METACODES-NOASSERTION.txt` together with
-`--metacodes-license-spdx NOASSERTION`; the artifact manifest preserves that
-fact instead of implying a license grant.
+metacodes is MIT-licensed: production staging passes the repository's
+`LICENSE` with `--metacodes-license-spdx MIT`, and the artifact manifest
+records it.  `scripts/eval/workbuddy/licenses/METACODES-NOASSERTION.txt` with
+`--metacodes-license-spdx NOASSERTION` describes artifacts staged before the
+license existed and is kept only to reproduce those receipts.
 
 Run the zero-provider W0 vertical slice:
 
@@ -315,7 +315,7 @@ python3 -m scripts.eval.workbuddy.run_lb_preflight /path/to/fresh-workbuddy-benc
   --ripgrep /path/to/linux-amd64/rg \
   --formal-kernel /path/to/linux-amd64/metacodes-formal-kernel \
   --metacodes-commit <40-hex> --tinykg-commit <40-hex> \
-  --metacodes-license /path/to/METACODES-NOASSERTION.txt \
+  --metacodes-license /path/to/metacodes/LICENSE \
   --tinykg-license /path/to/tinykg/LICENSE \
   --lean-license /path/to/lean4/LICENSE
 ```

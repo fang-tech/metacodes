@@ -212,6 +212,7 @@ def run_lb_preflight(
     lean_license: Path,
     bash: Path,
     uv: Path,
+    metacodes_license_spdx: str = "MIT",
 ) -> Dict[str, object]:
     workbuddy = workbuddy.resolve(strict=True)
     _fresh_checkout(workbuddy)
@@ -233,7 +234,7 @@ def run_lb_preflight(
         metacodes_commit=metacodes_commit,
         tinykg_commit=tinykg_commit,
         licenses=(
-            ("metacodes", "NOASSERTION", metacodes_license),
+            ("metacodes", metacodes_license_spdx, metacodes_license),
             ("tinykg", "Apache-2.0", tinykg_license),
             ("lean4", "Apache-2.0", lean_license),
         ),
@@ -403,6 +404,7 @@ def main(argv: List[str] | None = None) -> int:
     parser.add_argument("--metacodes-commit", required=True)
     parser.add_argument("--tinykg-commit", required=True)
     parser.add_argument("--metacodes-license", type=Path, required=True)
+    parser.add_argument("--metacodes-license-spdx", default="MIT")
     parser.add_argument("--tinykg-license", type=Path, required=True)
     parser.add_argument("--lean-license", type=Path, required=True)
     parser.add_argument("--bash", type=Path, default=Path(shutil.which("bash") or "bash"))
@@ -420,6 +422,7 @@ def main(argv: List[str] | None = None) -> int:
             metacodes_license=args.metacodes_license,
             tinykg_license=args.tinykg_license,
             lean_license=args.lean_license,
+            metacodes_license_spdx=args.metacodes_license_spdx,
             bash=args.bash,
             uv=args.uv,
         )
