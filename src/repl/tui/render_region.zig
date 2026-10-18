@@ -76,6 +76,9 @@ pub const RenderRegion = struct {
     // 旧的 spinner_frame/verb/gen_start_ms/current_tool*/tool_cards* 字段已删(单一真相源)。
     text_pending_newline: bool = false,
     pending_col: u16 = 0, // 半行 chunk 累计显示列(消息穿过续接用)
+    // 终端在生成期 resize 后会重排 scrollback。此时旧的半行列已经没有
+    // 物理意义；在下一次区重画/文本输出前补一个换行，把续接点封口。
+    resize_seal_pending: bool = false,
     region_drawn: bool = false, // 生成期固定区当前是否画在屏上(true ⟹ 光标钉区顶行首)
     /// 帧内标志:true 时 eraseRegion/drawGenRegion 不各自 reset/flush,由外层 frame 统一
     /// 一次 flush(并用 DEC 2026 同步输出包裹)→ 擦除+重画成原子帧,消除 Windows 闪烁。
@@ -185,6 +188,7 @@ pub const RenderRegion = struct {
 
     pub fn enterExclusiveOverlay(self: *RenderRegion) void {
         self.lock();
+        self.observeResize();
         // 半行封口(text_pending_newline 时补 \n):旧 inline 模式为对齐 DECSC 存档点在行首。alt-screen 下
         // 不再用 DECSC,但补 \n 仍无害(保 scrollback 末行干净),保留不动。
         if (self.generating and self.text_pending_newline) {
@@ -198,6 +202,7 @@ pub const RenderRegion = struct {
         // overlay_region_height:DEAD(viewer 丢弃 anchor_hint),保留不动,见上注。
         self.overlay_region_height = self.prev_rows;
         if (self.generating and self.region_drawn) self.eraseRegion();
+        self.sealResizedLine();
         // 区状态清零:exit 从干净态 drawGenRegion 重画(对话由 alt-screen 退出自动恢复)。
         self.region_drawn = false;
         self.prev_rows = 0;
@@ -377,11 +382,45 @@ pub const RenderRegion = struct {
         self.emitTerminal(bytes);
     }
 
-    fn measureSize(self: *RenderRegion) void {
+    fn measureSize(self: *RenderRegion) bool {
         if (term.getSize(self.fd)) |sz| {
+            const changed = sz.cols != self.cols or sz.rows != self.rows;
             self.cols = sz.cols;
             self.rows = sz.rows;
+            return changed;
         }
+        return false;
+    }
+
+    /// Detect a terminal resize before any operation that relies on the
+    /// cursor's pre-resize position. Scrollback reflow makes the saved
+    /// `pending_col` stale; discard that continuation and seal the old line
+    /// after the fixed region has been erased.
+    fn observeResize(self: *RenderRegion) void {
+        if (!self.measureSize() or !self.generating) return;
+        self.invalidateContinuationForResize();
+    }
+
+    fn invalidateContinuationForResize(self: *RenderRegion) void {
+        const had_pending = self.text_pending_newline or self.region_drawn_pending_nl;
+        self.region_drawn_pending_nl = false;
+        self.region_drawn_pending_col = 0;
+        if (had_pending) {
+            self.text_pending_newline = false;
+            self.pending_col = 0;
+            self.resize_seal_pending = true;
+        }
+    }
+
+    /// Consume the newline deferred by observeResize. Callers invoke this only
+    /// after eraseRegion has returned the cursor to the text stream, so the
+    /// line is sealed without using the stale continuation column.
+    fn sealResizedLine(self: *RenderRegion) void {
+        if (!self.resize_seal_pending) return;
+        if (!self.frame_active) self.resetScratch();
+        self.scratch.writer.writeAll("\n") catch {};
+        self.resize_seal_pending = false;
+        if (!self.frame_active) self.flush();
     }
 
     // =====================================================================
@@ -542,7 +581,7 @@ pub const RenderRegion = struct {
     }
 
     fn renderFrameInner(self: *RenderRegion, app: *const app_mod.App, content: []const u8, cursor: usize) void {
-        self.measureSize();
+        _ = self.measureSize();
         const w = &self.scratch.writer;
         const own_frame = !self.frame_active;
         if (own_frame) {
@@ -1462,6 +1501,9 @@ pub const RenderRegion = struct {
         self.cursor_in_region_row = 0;
         self.text_pending_newline = false;
         self.pending_col = 0;
+        self.resize_seal_pending = false;
+        self.region_drawn_pending_nl = false;
+        self.region_drawn_pending_col = 0;
         // 生成期状态单一真相源 = self.ui(drawGenRegion 读它)。
         self.ui.phase = .generating;
         self.ui.spinner = .{ .frame = 0, .verb = verbs.pick(@intCast(util_time.nowMs() & 0xffff)), .start_ms = util_time.nowMs() };
@@ -1480,6 +1522,7 @@ pub const RenderRegion = struct {
         self.lock();
         defer self.unlock();
         if (!self.generating) return;
+        self.observeResize();
         self.flushGenAssistantLocked(); // 助手文本残行(markdown)先 flush
         self.flushLineBuf(); // 再把行缓冲残行(无尾随 \n 的末行)输出,别丢
         self.eraseRegion(); // 擦掉固定区(若在),光标回文本续接点
@@ -1491,6 +1534,7 @@ pub const RenderRegion = struct {
             self.text_pending_newline = false;
             self.pending_col = 0;
         }
+        self.sealResizedLine();
         // -- 完成态 spinner:**不**提交进 scrollback(产品决策)--
         // spinner 是纯瞬态指示器,生成结束即随固定区一起擦掉(上面 eraseRegion 已抹掉),不留任何
         // `✻ Verb for Ns` 进历史消息区。旧版每轮(≥0.5s)都 commit 一行 → 1~2s 琐碎短轮也堆噪声
@@ -1506,6 +1550,9 @@ pub const RenderRegion = struct {
         self.prev_rows = 0;
         self.input_cursor_row = 0;
         self.cursor_in_region_row = 0;
+        self.region_drawn_pending_nl = false;
+        self.region_drawn_pending_col = 0;
+        self.resize_seal_pending = false;
         self.visible = false;
     }
 
@@ -1529,10 +1576,12 @@ pub const RenderRegion = struct {
     /// erase→draw 两步之间呈现"空白帧"导致的输入框闪烁 + 分隔线分段。所有"擦了立刻重画
     /// 固定区"的路径统一走这里。**须已持锁**。
     fn redrawFrameLocked(self: *RenderRegion, app: *const app_mod.App) void {
+        self.observeResize();
         self.resetScratch();
         self.scratch.writer.writeAll(ansi.sync.begin) catch {};
         self.frame_active = true;
         if (self.region_drawn) self.eraseRegion(); // frame 内:不 reset 不 flush
+        self.sealResizedLine();
         self.drawGenRegion(app); //                  frame 内:不 reset 不 flush
         self.frame_active = false;
         self.scratch.writer.writeAll(ansi.sync.end) catch {};
@@ -1601,11 +1650,13 @@ pub const RenderRegion = struct {
     pub fn endScrollLine(self: *RenderRegion) void {
         self.lock();
         defer self.unlock();
+        self.observeResize();
         self.flushGenAssistantLocked();
         self.flushLineBuf();
         if (!self.text_pending_newline) return; // 已在行首 → 幂等 no-op
         const was_drawn = self.region_drawn;
         if (self.region_drawn) self.eraseRegion();
+        self.sealResizedLine();
         const w = &self.scratch.writer;
         self.resetScratch();
         w.writeAll("\n") catch {};
@@ -1861,6 +1912,7 @@ pub const RenderRegion = struct {
     /// print 仅在 region_drawn==false 时发生(eraseRegion 后),draw/erase 成对、续接点用画区快照还原。
     fn emitToScroll(self: *RenderRegion, text: []const u8) void {
         if (text.len == 0) return;
+        self.observeResize();
         const was_drawn = self.region_drawn;
         // 区在屏时:擦区 + 文本流入 scrollback + 重画区 三步包成一帧(DEC 2026 同步输出),
         // 否则 Windows 会先呈现"擦掉区的空白"再刷文本再刷区 → 输入框闪。区不在屏时纯输出文本。
@@ -1871,6 +1923,7 @@ pub const RenderRegion = struct {
             self.frame_active = true;
             self.eraseRegion(); // frame 内:不 reset 不 flush,续接 scratch
         }
+        self.sealResizedLine();
         w.writeAll(text) catch {}; // 文本直接流入 scrollback
         self.updatePendingTail(text);
         if (was_drawn) {
@@ -1919,7 +1972,6 @@ pub const RenderRegion = struct {
     /// 前置 region_drawn=false;后置 region_drawn=true,**光标停在 editor 编辑点**(供 IME 候选窗对齐),
     /// 并记 cursor_in_region_row(距区顶行数)供 eraseRegion 回顶。半行文本尾先 \n 封口让区独占整行。
     fn drawGenRegion(self: *RenderRegion, app: *const app_mod.App) void {
-        self.measureSize();
         const w = &self.scratch.writer;
         if (!self.frame_active) self.resetScratch(); // 帧内:接续 frame(sync_begin + erase),勿清
         var nb: [16]u8 = undefined;
@@ -2593,6 +2645,37 @@ test "generation erase walks up from the edit row, clears with ED0, returns to t
     try std.testing.expect(std.mem.indexOf(u8, out, ansi.cursor.restore) == null);
     try std.testing.expect(std.mem.indexOfScalar(u8, out, '\n') == null);
     try std.testing.expect(!r.region_drawn);
+}
+
+test "a generation resize invalidates the saved half-line cursor before erase" {
+    var r = RenderRegion.init(std.testing.allocator, 2, theme_mod.select(.dark, .none), .none);
+    defer r.deinit();
+    r.text_pending_newline = true;
+    r.pending_col = 37;
+    r.region_drawn_pending_nl = true;
+    r.region_drawn_pending_col = 37;
+
+    r.invalidateContinuationForResize();
+
+    try std.testing.expect(!r.text_pending_newline);
+    try std.testing.expectEqual(@as(u16, 0), r.pending_col);
+    try std.testing.expect(!r.region_drawn_pending_nl);
+    try std.testing.expectEqual(@as(u16, 0), r.region_drawn_pending_col);
+    try std.testing.expect(r.resize_seal_pending);
+
+    // The deferred newline is consumed exactly once after erase has returned
+    // the cursor to the text stream.
+    r.region_drawn = true;
+    r.prev_rows = 2;
+    r.cursor_in_region_row = 1;
+    r.frame_active = true;
+    r.eraseRegion();
+    var nb: [16]u8 = undefined;
+    try std.testing.expect(std.mem.indexOf(u8, r.scratch.written(), ansi.cursor.forward(37, &nb)) == null);
+    const before_seal = r.scratch.written().len;
+    r.sealResizedLine();
+    try std.testing.expect(!r.resize_seal_pending);
+    try std.testing.expectEqualStrings("\n", r.scratch.written()[before_seal..]);
 }
 
 test "leaveGenerating is idempotent so a deferred fallback cannot double-finish" {
