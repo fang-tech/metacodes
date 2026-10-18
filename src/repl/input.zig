@@ -449,7 +449,6 @@ pub const LineEditor = struct {
     allocator: std.mem.Allocator,
     /// 上一次按键是否是 Ctrl+C（用于"双击退出"语义）。任何其他按键重置为 false。
     ctrl_c_armed: bool = false,
-    /// 上一次按键是否是 Esc(用于 Esc Esc 双击清 draft)。
     /// yank ring:Ctrl+W/K/U 删除的内容存这,Ctrl+Y 粘回。
     yank_buf: std.ArrayList(u8),
     /// undo 栈:破坏性编辑前快照 buf+cursor。深度上限 undo_max_depth,超了丢最旧。

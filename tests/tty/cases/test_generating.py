@@ -208,26 +208,25 @@ def test_T24_esc_interrupts_then_resends_queue(bin_path):
         a._fail("中断后队列消息未自动续发提交")
 
 
-def test_esc_steers_draft_without_interrupting_generation(bin_path):
-    """生成期 Esc 有 draft 时只入队，空框 Esc 才中断当前 run。"""
+def test_esc_with_draft_interrupts_then_resends_draft(bin_path):
+    """生成期 Esc 即使框里有字也立即中断当前推理;已打的字先入队,中断后自动续发。
+    T22/T24 的离线版(慢 mock 流保证 Esc 落在生成窗口内,不依赖真模型时序)。"""
     from slow_mock_server import SlowMockServer, simple_text, slow_text_then_end
 
     with SlowMockServer([
-        # Keep the first stream open well past the input sequence.  Otherwise
-        # a fast mock can finish before Esc is delivered, which tests idle
-        # draft clearing rather than the generation steer path.
+        # 首轮流 40×0.3s 远长于按键序列:Esc 必然落在生成期,自然结束不会掩盖"没中断"。
         slow_text_then_end(n_chunks=40, delay=0.3),
-        simple_text("STEERED_OK"),
+        simple_text("RESENT_OK"),
     ]) as srv:
         raw = run(bin_path, [
             "sleep:0.8", "type:first", "key:enter", "sleep:0.8",
-            "type:STEERED", "sleep:0.3", "key:esc", "sleep:12.0",
+            "type:DRAFTED", "sleep:0.3", "key:esc", "sleep:4.0",
         ], base_url=srv.url, startup_drain=0.8, per_key_drain=0.05)
 
-    assert len(srv.requests) >= 2, "Esc steer 后队列消息没有在首轮结束后自动提交"
-    assert b"STEERED" in srv.requests[1], "Esc steer 消息没有进入下一轮请求"
-    assert b"STEERED_OK" in raw, "Esc steer 后的下一轮响应没有显示"
-    assert b"cancelled" not in raw.lower(), "带 draft 的 Esc 错误地中断了当前推理"
+    assert b"cancelled" in raw.lower(), "带 draft 的 Esc 没有中断当前推理"
+    assert len(srv.requests) >= 2, "Esc 中断后草稿没有自动续发"
+    assert b"DRAFTED" in srv.requests[1], "续发请求不含 Esc 前已打的草稿"
+    assert b"RESENT_OK" in raw, "续发轮的响应没有显示"
 
 
 def test_empty_esc_and_ctrl_c_interrupt_generation(bin_path):
