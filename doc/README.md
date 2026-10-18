@@ -2,6 +2,20 @@
 
 Start here rather than reading design ledgers chronologically.
 
+## Start here
+
+- **Using metacodes:** [Getting started](GETTING_STARTED.md) — install,
+  providers, Metask OAuth, build from source.
+- **Embedding it in your program:** [API overview](API.md), then
+  [LIB_API](LIB_API.md) for Zig hosts or the
+  [AgentCore binary ABI](AGENTCORE_BINARY_ABI.md) and [SDK](../sdk/README.md)
+  for C, C++, Rust and FFI hosts.
+- **Contributing:** [CONTRIBUTING](../CONTRIBUTING.md) for where to start,
+  [AGENTS](../AGENTS.md) for the engineering contract, and
+  [tests/README](../tests/README.md) for the test layers.
+- **Evaluating it:** [Benchmarks](BENCHMARKS.md) and the evaluation framework
+  in [evals/README.md](../evals/README.md).
+
 Run `zig build gate:pr` to execute the single AGENTS.md pre-submit checklist.
 
 ## Supported contracts

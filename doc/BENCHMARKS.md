@@ -45,6 +45,32 @@ limit and queue wait appears, which is the trigger §3 names for the evented
 backend. Before the two fixes the same 64-client load ran at 249 Steps/s
 with a p50 of 141 ms.
 
+### Footprint snapshot
+
+Measured 2026-10-18 on Apple Silicon, macOS, `main` at `7efc170`, built with
+`zig build -Doptimize=ReleaseSmall` into a scratch prefix (development layout:
+TinyKG not staged, so the run below had memory degraded; `METACODES_JEV_URL=off`).
+One machine, one sitting; these are observations, not gates.
+
+| Measurement | Value | How |
+|---|---|---|
+| Core binary | 5,501,128 bytes (4.9 MB stripped, 2.6 MB gzipped) | `wc -c`, `strip`, `gzip -c \| wc -c` |
+| Warm start, `--help` | 5.1–7.2 ms over 6 runs | wall time after one warm-up run |
+| Idle process peak RSS, `--help` | 2.7 MB (1.7 MB peak footprint) | `/usr/bin/time -l` |
+| Headless run, 20 tool rounds | 23 MB peak RSS (13.9 MB peak footprint), 2.3 s wall | `-p` with `--permission bypassPermissions` against a local Anthropic-SSE mock that answers each turn with one `Glob` call |
+| Release archives, 0.5.0 | 16.6 MB Linux x86_64, 20.8 MB macOS arm64, 16.5 MB Windows x86_64 | GitHub release assets; each holds the CLI, TinyKG CLI and daemon, both Lean kernels and ripgrep |
+
+Same machine, the same `--help` peak-RSS probe on two other agent CLIs:
+Codex CLI 0.163.0 at 20 MB and Claude Code 2.1.278 at 121 MB. `--help` is only
+the process floor, not a session; it is reported because it is reproducible
+with one command, not as a like-for-like workload comparison.
+
+The size red line in [PERF_MEMORY_PRINCIPLES.md](PERF_MEMORY_PRINCIPLES.md) §2
+was first calibrated on a 1.29 MB build (2026-06-05) at 1.5 MB; on 2026-10-18 it
+was recalibrated to 6 MiB from this measurement. Startup and idle RSS stay
+inside their original lines, and the 20-round run is inside the 30 MB typical
+session line. `scripts/perf_baseline.sh` is not wired into CI.
+
 Build/test performance experiments follow the recording discipline normatively
 listed in [tests/README.md](../tests/README.md) — timings, resource ceilings,
 result counts, shard/platform/toolchain, and cache state, with cold and warm
@@ -173,8 +199,46 @@ protocol facts:
 | W9 sealed (156 × 3) | final held-out evidence | Sealed, unread |
 | W10 full (260 × 3) | optional official leaderboard convention | Not started |
 
-No external WorkBuddy quality score exists yet; scorer output from the 503
+No ladder-grade external WorkBuddy score exists yet: the stages above have not
+produced a receipt-clean promotion or sealed result. Scorer output from the 503
 round is repository baseline noise and is never reported as an agent result.
+
+### Diagnostic full run (0.1.0, September 2026)
+
+Outside the ladder, metacodes 0.1.0 (commit `1d27f07`) with GLM-5.2 ran all
+260 tasks once in the baseline configuration (every experimental treatment off,
+project control not staged). The archived audit
+[2026-09-12-metacodes-takeover-audit](../evals/benchmarks/2026-09-12-metacodes-takeover-audit/report.md)
+selects one complete run per job without regard to reward. Next to the official
+leaderboard for the same model
+([v1.2, 2026-10-15](https://workbuddybench.com/), three-run means, think mode):
+
+| Harness | Code | Web | Office | Security |
+|---|---:|---:|---:|---:|
+| metacodes 0.1.0, self-run, 1 pass | 72.66 | 81.14 | 78.81 | 58.97 |
+| CodeBuddy Code 2.109.3, official | 71.5 | 67.4 | 79.6 | — |
+| Claude Code 2.1.187, official | 77.1 | 60.7 | 79.6 | — |
+
+v1.2 lists no Security score for GLM-5.2; the snapshot cited by the
+[Security trajectory study](../evals/benchmarks/2026-09-12-security-trajectory-research/report.md)
+listed 76.32 (CodeBuddy Code) and 80.86 (Claude Code). Why this is an
+observation and not a ladder result or a leaderboard entry:
+
+- one pass against a three-run mean, with no variance estimate;
+- the sealed cohort had been inspected and fixes made before this run, so it is
+  a diagnostic re-test, not a blind held-out result;
+- 7 of 17 selected transactions committed their receipts; the other 10 ended
+  `authorized_failure(post_run_evidence_audit)` after the runner finished, and
+  their scores come from Harbor's `result.json`;
+- in the Security batches, the only ones whose request bodies were audited,
+  requests ran at temperature 0.0 rather than provider defaults, and WebSearch
+  and AskUserQuestion stayed visible although the official runs disable them;
+- the Office and Web judge configuration was not confirmed identical to the
+  official one.
+
+The README summarizes this as "the same band as the leading harnesses: between
+them on Code, within a point on Office, ahead on Web, behind on Security"; no
+stronger claim is made.
 
 ## 5. Rules for running and reporting
 
