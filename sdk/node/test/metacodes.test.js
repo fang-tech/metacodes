@@ -247,6 +247,15 @@ test('a UI answer JSON.stringify throws on rejects the Run and the session survi
   assert.equal(again.text, 'second');
 });
 
+test('a handler rejecting with a value that has no string form still answers the call', { skip, timeout: TIMEOUT }, async (t) => {
+  const provider = await withProvider(t, [['tool', 'odd', {}], ['echo']]);
+  const odd = metacodes.tool({ name: 'odd', description: 'Throws a bare object.', handler: () => { throw Object.create(null); } });
+  const { session } = open(t, { tools: [], hostTools: [odd] }, provider, workspace(t), { permissionMode: 'full_access' });
+  const result = await session.run('go');
+  assert.match(result.text, /Error/);
+  assert.equal(result.stopReason, 'end_turn');
+});
+
 // -- an active Run: submit, abort, close -----------------------------------
 
 function blockingTool() {
@@ -257,7 +266,8 @@ function blockingTool() {
   const wait = metacodes.tool({
     name: 'wait',
     description: 'Waits for the test.',
-    handler: async () => { started(); await released; return 'waited'; },
+    // Capped so a broken test fails instead of holding the suite.
+    handler: async () => { started(); await Promise.race([released, new Promise((resolve) => setTimeout(resolve, 10_000))]); return 'waited'; },
   });
   return { wait, started: startedPromise, release };
 }

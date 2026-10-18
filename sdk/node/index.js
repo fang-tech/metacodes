@@ -98,7 +98,6 @@ function bundledRipgrep(libraryPath) {
   return null;
 }
 
-/** Answer a blocked native call exactly once; a second answer would touch freed memory. */
 // JSON for a value a handler returned. A value JSON.stringify throws on (a
 // BigInt, a cycle) or turns into undefined (a function, a symbol) is the
 // handler's error: it must reach the rejection handler that completes the
@@ -110,10 +109,17 @@ function toJson(value, what) {
   return text;
 }
 
+// A rejection value can be anything, including one String() throws on
+// (Object.create(null)); the text must never throw.
 function errorText(error) {
-  return `${error && error.name ? error.name : 'Error'}: ${error && error.message ? error.message : String(error)}`;
+  try {
+    return `${error && error.name ? error.name : 'Error'}: ${error && error.message ? error.message : String(error)}`;
+  } catch (_) {
+    return 'Error: the handler rejected with a value that has no string form';
+  }
 }
 
+/** Answer a blocked native call exactly once; a second answer would touch freed memory. */
 function once(handle, fallbackStatus) {
   let done = false;
   return (status, text) => {
@@ -243,7 +249,10 @@ class Runtime {
       .then(
         (text) => finish(HOST_OK, text),
         (error) => finish(HOST_FAILED, errorText(error)),
-      );
+      )
+      // Last resort: the call is answered whatever went wrong above; once()
+      // ignores a second answer.
+      .catch(() => finish(HOST_FAILED, 'Error'));
   }
 
   /** Create a Session; see README.md for the options. */
@@ -383,7 +392,8 @@ class Session {
           if (this._active && !this._active.error) this._active.error = error;
           finish(UI_UNAVAILABLE, '');
         },
-      );
+      )
+      .catch(() => finish(UI_UNAVAILABLE, ''));
   }
 
   _done(outcome) {

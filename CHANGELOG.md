@@ -588,15 +588,18 @@ status, compatibility boundaries, and entry points are defined by
     Leaving a `with` block during a `stream()` the loop stopped with `break`
     returned BUSY, dropped the handle, made `abort()` a no-op and leaked both
     the Session and the Runtime. `close()` now aborts a run that is still
-    going and waits for it, and keeps the handle (and the Runtime's) whenever
-    AgentCore refuses. Called from one of the Session's own callbacks, it
-    raises RuntimeError instead of deadlocking.
+    going and waits for it (`close(timeout=…)` raises TimeoutError and
+    keeps the Session open), and keeps the handle (and the Runtime's)
+    whenever AgentCore refuses. Called from one of that Session's own
+    callbacks, it raises RuntimeError instead of deadlocking; closing another
+    Session from a callback still works.
   - **Node: a tool result `JSON.stringify` cannot encode crashed the host.**
     A BigInt, a cycle or a function raised an unhandled rejection that exited
     the process, or, with an `unhandledRejection` handler installed, left
     AgentCore waiting forever. It is now a model-visible tool error. An
     `onUiRequest` answer that cannot be encoded is not answered, and the run
-    rejects with the error.
+    rejects with the error. A rejection value with no string form, such as
+    `Object.create(null)`, still answers the call.
   - **Node** names status codes 11–25 and 27 instead of `STATUS_ERROR`.
   - **L2 tests against the real library** for `submit`, `abort`,
     `close()` during a run, allow and deny rules, `set_permission_mode`,

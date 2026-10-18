@@ -249,11 +249,8 @@ class PythonSdkTest(unittest.TestCase):
         # while __exit__ closes the Session: close() aborts it, waits for it
         # and destroys the Session, instead of failing BUSY and dropping the
         # handle (which leaked the Session and made abort() a no-op).
-        started = threading.Event()
-
         @metacodes.tool(description="Takes a moment.")
         def slow(_arguments):
-            started.set()
             time.sleep(0.3)
             return "slow done"
 
@@ -261,14 +258,18 @@ class PythonSdkTest(unittest.TestCase):
         with MockProvider(script) as provider:
             runtime = metacodes.Runtime(tools=(), host_tools=[slow])
             with self.session(runtime, provider, permission_mode="full_access") as session:
-                for _event in session.stream("go"):
-                    if started.is_set():
-                        break
-                self.assertTrue(started.wait(5))
+                stream = session.stream("go")
+                for _event in stream:
+                    break  # the Run's first event: it is still going
             self.assertFalse(session._handle)
             self.assertNotIn(session, runtime._sessions)
             runtime.close()
             self.assertFalse(runtime._handle)
+            stream._thread.join(5)
+        # The Run was stopped, not finished: it never sent the request that
+        # would follow the tool's.
+        self.assertEqual(stream.result.stop_reason, "aborted")
+        self.assertLessEqual(len(provider.requests), 1)
 
     def test_close_from_a_callback_is_refused_and_the_session_survives(self) -> None:
         refused = []
@@ -287,6 +288,43 @@ class PythonSdkTest(unittest.TestCase):
                 self.assertEqual(len(refused), 1)
                 self.assertTrue(session._handle)
                 self.assertEqual(session.run("second").text, "two")
+
+    def test_a_tool_can_open_and_close_another_session(self) -> None:
+        # Only a Session's own callbacks may not close it; a child Session a
+        # tool opens and closes is fine.
+        box = {}
+
+        @metacodes.tool(description="Asks a child session.")
+        def delegate(_arguments):
+            with self.session(box["runtime"], box["provider"]) as child:
+                return "child said: " + child.run("sub task").text
+
+        script = [("tool", "delegate", {}), ("text", "child answer"), ("echo",)]
+        with MockProvider(script) as provider:
+            with metacodes.Runtime(tools=(), host_tools=[delegate]) as runtime:
+                box.update(runtime=runtime, provider=provider)
+                session = self.session(runtime, provider, permission_mode="full_access")
+                result = session.run("delegate it")
+                self.assertEqual(runtime._sessions, [session])
+        self.assertEqual(result.text, "saw: child said: child answer")
+
+    def test_close_with_a_timeout_leaves_a_blocked_run_open(self) -> None:
+        wait, started, release = self.blocking_tool()
+        with MockProvider([("tool", "wait", {}), ("text", "done")]) as provider:
+            with metacodes.Runtime(tools=(), host_tools=[wait]) as runtime:
+                session = self.session(runtime, provider, permission_mode="full_access")
+                thread, box = self.run_in_background(session, "start")
+                self.assertTrue(started.wait(10))
+                with self.assertRaises(TimeoutError):
+                    session.close(timeout=0.2)
+                self.assertTrue(session._handle)
+                self.assertIn(session, runtime._sessions)
+                release.set()
+                thread.join(10)
+                session.close()
+                self.assertFalse(session._handle)
+        self.assertNotIn("error", box)
+        self.assertEqual(box["result"].stop_reason, "aborted")
 
     def run_in_background(self, session, prompt):
         box = {}
