@@ -18,7 +18,9 @@
 # The judge spends through METACODES_WORKBUDDY_JUDGE_API_KEY, which the
 # launch gate passes only to a launch planned with --judge-budget-usd: the
 # cap joins that transaction's reserved maximum and is committed in full.
-# The key also keeps a hard gateway quota at the judge cap.
+# That cap is a reservation the journal counts, not a measurement; the gate
+# does not meter real judge usage.  The key's run-wide hard gateway quota is
+# the only enforced limit on real judge spend.
 model:
   name: kimi-k2.7-code
   protocols: [openai]

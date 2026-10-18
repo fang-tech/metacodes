@@ -310,10 +310,17 @@ requires a judge model to name that key, and refuses a judged job unless
 `--judge-budget-usd <cap>` is given. The cap is added to the transaction
 maximum the journal reserves and authorizes; judge calls are not metered per
 call, so the commit charges the whole cap beside the actor's measured cost,
-and the receipt's `judge` row says so. `run` keeps the judge key in the
-runner's environment only for such a launch, removes it for every other
-launch, and refuses a judged launch whose environment lacks it before any
-reservation; `resume-trials` refuses a judged arm.
+and the receipt's `judge` row says so. The cap is a reservation the journal
+counts, not a measurement: the gate does not meter the judge's real usage,
+and the judge key's hard gateway quota is the only enforced limit on it.
+`run` keeps the judge key in the runner's environment only for such a
+launch, removes it for every other launch (as W0, W0.5 and the leaderboard
+preflight do), and refuses a judged launch whose environment lacks it before
+any reservation; `resume-trials` refuses a judged arm, and `create` refuses
+a judged job as a paired-comparison arm. A paid job may not carry a
+`verifier` block or `orchestrator_override` keys besides
+`n_concurrent_trials`: the runner merges either into its runtime config,
+where it could set the verifier's LLM route outside the judge budget.
 
 One run is sixteen jobs, the four subsets times the four frozen cohorts,
 because a paid launch binds one cohort, one attempt and one trial at a time.

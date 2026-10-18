@@ -178,15 +178,24 @@ charges the whole cap beside the actor's measured cost, and the receipt's
 `METACODES_WORKBUDDY_JUDGE_API_KEY` as its key; the runner's environment
 keeps that variable only for a judge-budgeted launch and has it removed for
 every other one, and a judged transaction cannot be resumed with
-`resume-trials` (a rerun would call the judge again past its cap). The
-operator sizes each Web or Office cap from the September judge load for its
-tasks, keeping the caps of all 24 judged transactions within the US$150. The
-judge key also keeps a hard gateway quota of US$150: the journal accounts the
-caps, and the quota stops the judge if its real spend outruns them. Evidence:
+`resume-trials` (a rerun would call the judge again past its cap). A judged
+job cannot be a paired-comparison arm (`--comparison-id` is refused), and a
+paid job may not carry its own `verifier` block or any
+`orchestrator_override` key besides `n_concurrent_trials`, either of which
+could route a verifier LLM around the judge budget. The operator sizes each
+Web or Office cap from the September judge load for its tasks, keeping the
+caps of all 24 judged transactions within the US$150.
+
+The per-transaction judge cap is a reservation the journal counts, not a
+measurement: the gate does not meter the judge's real usage (it neither reads
+nor prices the judge's records in the proxy log), and nothing stops a
+transaction's judge at its cap. The only enforced limit on real judge spend is
+the judge key's run-wide hard gateway quota of US$150, so real judge spend can
+exceed the caps committed so far by up to the quota minus those caps. Evidence:
 `WorkBuddyJudgeBudgetTest` in `scripts/eval/tests/test_workbuddy_launch_gate.py`
 (the refusal without a cap, the cap in the reserved maximum, the failure
-exposure and the commit, and the runner's environment with and without the
-judge key).
+exposure and the commit, the runner's environment with and without the judge
+key, and the paired-arm and verifier-route refusals).
 
 A journal's exposure is its committed actual cost plus the maximum of every
 transaction not yet committed, and an `authorized_failure` keeps its maximum,
