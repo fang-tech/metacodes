@@ -594,6 +594,14 @@ test "L2 e2e: a ToolSearch miss names only tools the request carried (#287)" {
     const defs = try cc.tools.toToolDefinitionsFull(defs_arena.allocator(), &dyn, &pc);
     try std.testing.expect(findDef(defs, "TeamCreate") == null);
     try std.testing.expect(findDef(defs, "ToolSearch") != null);
+    // An execution policy then takes Bash out of the request, though it is in
+    // the run's catalog: the miss must follow the filtered request.
+    var policy_defs: std.ArrayList(cc.json_mod.ToolDefinition) = .empty;
+    for (defs) |d| {
+        if (std.mem.eql(u8, d.name, "Bash") or std.mem.eql(u8, d.name, "BashOutput")) continue;
+        try policy_defs.append(defs_arena.allocator(), d);
+    }
+    var policy = cc.tool_context.ToolSetExecutionPolicy{ .definitions = policy_defs.items };
     var home_buf: [256]u8 = undefined;
     const home = cc.util_fs.testing.uniqueDir(&home_buf, "cc-zig-toolsearch-l2");
     defer cc.util_fs.testing.rmrfBestEffort(home);
@@ -601,7 +609,7 @@ test "L2 e2e: a ToolSearch miss names only tools the request carried (#287)" {
     var sw = cc.swarm_context.SwarmContext{ .allocator = a, .state_root = home };
     defer sw.deinit();
 
-    const search_sse = try toolSearchSse(a, "send team message read");
+    const search_sse = try toolSearchSse(a, "send team message read bash");
     defer a.free(search_sse);
     var srv = try harness.MockServer.startCassette(&[_][]const u8{ search_sse, MINIMAL_END_TURN_SSE }, 0);
     defer srv.stop();
@@ -627,6 +635,7 @@ test "L2 e2e: a ToolSearch miss names only tools the request carried (#287)" {
         .activated_tools = &activated,
         .dyn_registry = &dyn,
         .swarm = &sw,
+        .execution_policy = policy.executionPolicy(),
         .host_services = .{ .ctx = @ptrCast(&activation), .activateToolFn = &Activation.activate },
         .auto_compact_threshold = std.math.maxInt(usize),
     }, &be, a);
@@ -635,6 +644,8 @@ test "L2 e2e: a ToolSearch miss names only tools the request carried (#287)" {
     const first = srv.requestAt(0) orelse return error.NoRequestCaptured;
     const first_tools = first.jsonField("tools") orelse return error.ToolsFieldMissing;
     try std.testing.expect(std.mem.indexOf(u8, first_tools, "\"name\":\"SendMessage\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, first_tools, "\"name\":\"Bash\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, first_tools, "\"name\":\"Read\"") != null);
 
     // The miss points at the loaded tool the keywords were after and offers
     // the deferred pool, but claims none of the team tools the request left out.
@@ -644,7 +655,7 @@ test "L2 e2e: a ToolSearch miss names only tools the request carried (#287)" {
     try std.testing.expect(std.mem.indexOf(u8, detail, "ToolSearch only searches deferred tools") != null);
     try std.testing.expect(std.mem.indexOf(u8, detail, "matching your keywords: Read") != null);
     try std.testing.expect(std.mem.indexOf(u8, detail, "knowforge__search") != null);
-    for ([_][]const u8{ "SendMessage", "TeamCreate", "TeamDelete", "SpawnTeammate" }) |name| {
+    for ([_][]const u8{ "SendMessage", "TeamCreate", "TeamDelete", "SpawnTeammate", "Bash" }) |name| {
         try std.testing.expect(std.mem.indexOf(u8, detail, name) == null);
     }
 }

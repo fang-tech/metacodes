@@ -122,16 +122,22 @@ fn visibleToModel(ctx: *const ToolContext, name: []const u8, deferred: bool) boo
 }
 
 /// `visibleToModel` for a built-in. The system prompt lists a deferred TinyKG
-/// tool only when the store is attached, so ToolSearch offers none without
-/// it. With no request at hand the Swarm and TinyKG tools also need their
-/// host contexts, standing in for the `tools.toToolDefinitionsFull` gates.
+/// tool only while the store is ready (`App.kgReady`), so ToolSearch offers
+/// none otherwise. With no request at hand the Swarm and TinyKG tools also
+/// need their host contexts, standing in for the `tools.toToolDefinitionsFull`
+/// gates.
 fn staticVisible(ctx: *const ToolContext, t: *const tools.ToolEntry) bool {
-    if (t.tinykg_gated and t.deferred and ctx.kg == null) return false;
+    if (t.tinykg_gated and t.deferred and !kgReady(ctx)) return false;
     if (ctx.request_tools == null) {
         if (t.tinykg_gated and ctx.kg == null) return false;
         if (t.swarm_gated and ctx.swarm == null) return false;
     }
     return visibleToModel(ctx, t.name, t.deferred);
+}
+
+fn kgReady(ctx: *const ToolContext) bool {
+    const kg = ctx.kg orelse return false;
+    return kg.ready;
 }
 
 /// 本 session 当前可激活的 deferred 工具名(静态 deferred 受执行策略/TinyKG 门控;动态
