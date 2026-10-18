@@ -128,6 +128,14 @@ pub const Runtime = struct {
             .{},
         );
         errdefer next_snapshot.deinit();
+        for (next_snapshot.skills) |record| switch (record.definition.description_source) {
+            .frontmatter => {},
+            .body_first_line, .missing => @import("../util/log.zig").warn(
+                "skill",
+                "/{s}: SKILL.md has no `description`; listings use {s} (see /skills)",
+                .{ record.invocation_name, if (record.definition.description_source == .missing) "nothing" else "its first line" },
+            ),
+        };
 
         var next_materializations: ?runtime.materialization.Manager =
             runtime.materialization.Manager.initWithBorrowedIo(

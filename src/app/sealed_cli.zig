@@ -42,6 +42,10 @@ pub fn run(args: *std.process.Args.Iterator, allocator: std.mem.Allocator, io: s
         std.debug.print("{s}", .{USAGE});
         return 2;
     };
+    if (std.mem.eql(u8, sub, "--help") or std.mem.eql(u8, sub, "-h")) {
+        stdoutWrite(USAGE);
+        return 0;
+    }
     if (std.mem.eql(u8, sub, "install")) return install(args, allocator, io, state_root);
     if (std.mem.eql(u8, sub, "list")) return list(allocator, state_root);
     if (std.mem.eql(u8, sub, "bind")) return bind(args, allocator, state_root);
@@ -57,6 +61,15 @@ fn envValue(allocator: std.mem.Allocator, name: []const u8) ?[]const u8 {
     defer allocator.free(z);
     const raw = std.c.getenv(z.ptr) orelse return null;
     return std.mem.span(raw);
+}
+
+fn stdoutWrite(bytes: []const u8) void {
+    var pos: usize = 0;
+    while (pos < bytes.len) {
+        const n = pfs.write(1, bytes[pos..][0 .. bytes.len - pos]);
+        if (n <= 0) break;
+        pos += @as(usize, @intCast(n));
+    }
 }
 
 fn install(args: *std.process.Args.Iterator, allocator: std.mem.Allocator, io: std.Io, state_root: []const u8) u8 {
