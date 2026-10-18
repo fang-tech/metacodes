@@ -102,8 +102,13 @@ installed-proxy sequence test.
   2. W1 probe, paid, cap US$1: two actor requests (one tool round) through
      the gateway with the leaderboard flags, to see the gateway accept
      `thinking: adaptive` and `output_config.effort`; one judge request to
-     confirm the Kimi K2.7 Code model id. If the gateway rejects the effort
-     fields, stop and decide; do not silently drop them;
+     confirm the Kimi K2.7 Code model id. The gateway (`shuzuan-org/sub2api`)
+     parses `thinking.type` `enabled`/`adaptive` and `output_config.effort`
+     as Claude API fields and forwards them with no GLM-specific rewrite, so
+     only the upstream's answer is unknown. If it rejects them, stop and
+     decide; the candidate fallback is `thinking: {type: enabled}` injected by
+     the model config, recorded as "effort not expressible for GLM-5.2 on this
+     route". Do not silently drop the fields;
   3. `r1` dev cohorts (52 tasks), then review cost, receipts and failures;
   4. the rest of `r1`, then `r2`, then `r3`.
 - **Stop rules**: an `authorized_failure` receipt stops further launches on
