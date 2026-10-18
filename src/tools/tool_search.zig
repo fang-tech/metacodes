@@ -39,7 +39,9 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
             if (tools.getTool(name)) |t| {
                 if (staticVisible(ctx, t)) try matched.append(allocator, name);
             } else if (ctx.dyn_registry) |dr| {
-                if (dr.find(name) != null and visibleToModel(ctx, name)) try matched.append(allocator, name);
+                if (dr.find(name)) |e| {
+                    if (visibleToModel(ctx, name, e.deferred)) try matched.append(allocator, name);
+                }
             }
         }
     } else {
@@ -53,7 +55,7 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         if (ctx.dyn_registry) |dr| {
             for (dr.entries.items) |*e| {
                 if (!e.deferred) continue;
-                if (!visibleToModel(ctx, e.name)) continue;
+                if (!visibleToModel(ctx, e.name, true)) continue;
                 if (matched.items.len >= max_results) break;
                 if (matchesKeywords(query, e.name, e.description)) try matched.append(allocator, e.name);
             }
@@ -96,13 +98,20 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     return try out.toOwnedSlice();
 }
 
-/// Whether the request this call answers shows `name` to the model: the
-/// execution policy, the active Skill's tool pool and the provider capability
-/// gate, the same filters `agent_loop.buildEffectiveToolSet` applies before
-/// the request. Every name ToolSearch returns or reports as callable passes
-/// it, so a miss never names a tool the request hid (#287). Without a provider
-/// no capability can be confirmed, so a capability-gated tool is not claimed.
-fn visibleToModel(ctx: *const ToolContext, name: []const u8) bool {
+/// Whether this turn's request showed the model `name`: in its tools array for
+/// a resident tool, in its catalog for a deferred one. Every name ToolSearch
+/// returns or reports as callable passes it, so a miss never names a tool the
+/// request hid (#287).
+///
+/// With no request at hand (unit tests, direct dispatch) it applies the
+/// filters `agent_loop.buildEffectiveToolSet` would: the execution policy, the
+/// active Skill's tool pool and the provider capability gate. Without a
+/// provider no capability can be confirmed, so a capability-gated tool is not
+/// claimed.
+fn visibleToModel(ctx: *const ToolContext, name: []const u8, deferred: bool) bool {
+    if (ctx.request_tools) |request| {
+        return if (deferred) request.offersDeferred(name) else request.advertises(name);
+    }
     if (ctx.execution_policy) |policy| if (!policy.allowsTool(name)) return false;
     if (ctx.permission_ctx) |perm| if (perm.active_skill) |skill| if (!skill.allowsTool(name)) return false;
     if (capability.requiredCapability(name)) |cap| {
@@ -112,12 +121,23 @@ fn visibleToModel(ctx: *const ToolContext, name: []const u8) bool {
     return true;
 }
 
-/// `visibleToModel` plus the registry gates `tools.toToolDefinitionsFull`
-/// applies to built-ins (TinyKG and Swarm tools exist only with their host).
+/// `visibleToModel` for a built-in. The system prompt lists a deferred TinyKG
+/// tool only while the store is ready (`App.kgReady`), so ToolSearch offers
+/// none otherwise. With no request at hand the Swarm and TinyKG tools also
+/// need their host contexts, standing in for the `tools.toToolDefinitionsFull`
+/// gates.
 fn staticVisible(ctx: *const ToolContext, t: *const tools.ToolEntry) bool {
-    if (t.tinykg_gated and ctx.kg == null) return false;
-    if (t.swarm_gated and ctx.swarm == null) return false;
-    return visibleToModel(ctx, t.name);
+    if (t.tinykg_gated and t.deferred and !kgReady(ctx)) return false;
+    if (ctx.request_tools == null) {
+        if (t.tinykg_gated and ctx.kg == null) return false;
+        if (t.swarm_gated and ctx.swarm == null) return false;
+    }
+    return visibleToModel(ctx, t.name, t.deferred);
+}
+
+fn kgReady(ctx: *const ToolContext) bool {
+    const kg = ctx.kg orelse return false;
+    return kg.ready;
 }
 
 /// 本 session 当前可激活的 deferred 工具名(静态 deferred 受执行策略/TinyKG 门控;动态
@@ -156,7 +176,7 @@ fn listNames(ctx: *const ToolContext, allocator: std.mem.Allocator, listing: Lis
     if (ctx.dyn_registry) |dr| {
         for (dr.entries.items) |*e| {
             if (!listing.admits(e.deferred, e.name)) continue;
-            if (!visibleToModel(ctx, e.name)) continue;
+            if (!visibleToModel(ctx, e.name, e.deferred)) continue;
             try appendName(allocator, &out, e.name, &count, &omitted);
         }
     }
@@ -522,4 +542,65 @@ test "ToolSearch: WebSearch is reported as loaded only when the provider can sea
         try testing.expectEqual(supported, listHas(segment(d, NAMED_START, NAMED_END), "WebSearch"));
         try testing.expectEqual(supported, std.mem.indexOf(u8, d, "WebSearch") != null);
     }
+}
+
+test "ToolSearch: with a request at hand, it answers from the request's own tools" {
+    const a = testing.allocator;
+    var dyn = DynRegistry.init(a);
+    defer dyn.deinit();
+    try dyn.register("knowforge__search", "Search the knowledge base", &.{}, dynExec, null, true);
+    try dyn.register("hidden__search", "Search something the request left out", &.{}, dynExec, null, true);
+    const schema: json_mod.InputSchema = .{ .type = "object", .properties = null, .required = &.{} };
+    // Teams are on and TinyKG tools are advertised while neither host context
+    // is attached here, and Bash is left out: the request decides, not the
+    // registry gates.
+    const advertised = [_]json_mod.ToolDefinition{
+        .{ .name = "Read", .description = "", .input_schema = schema },
+        .{ .name = "TeamCreate", .description = "", .input_schema = schema },
+        .{ .name = "KgRecall", .description = "", .input_schema = schema },
+        .{ .name = "ToolSearch", .description = "", .input_schema = schema },
+    };
+    const catalog = advertised ++ [_]json_mod.ToolDefinition{
+        .{ .name = "knowforge__search", .description = "", .input_schema = schema, .deferred = true },
+    };
+    var detail: ?[]const u8 = null;
+    defer if (detail) |d| a.free(d);
+    const ctx = ToolContext{
+        .allocator = a,
+        .dyn_registry = &dyn,
+        .error_detail = &detail,
+        .request_tools = .{ .advertised = &advertised, .catalog = &catalog },
+    };
+    try testing.expectError(error.NoToolMatch, execute(&ctx, "{\"query\":\"read team bash send recall\"}"));
+    const d = detail orelse return error.TestExpectedDetail;
+    const named = segment(d, NAMED_START, NAMED_END);
+    try testing.expect(listHas(named, "Read"));
+    try testing.expect(listHas(named, "TeamCreate"));
+    try testing.expect(listHas(named, "KgRecall"));
+    try testing.expect(!listHas(named, "Bash"));
+    try testing.expect(!listHas(named, "SendMessage"));
+    const loaded = segment(d, LOADED_START, ".");
+    try testing.expect(listHas(loaded, "TeamCreate"));
+    try testing.expect(!listHas(loaded, "Bash"));
+    try testing.expect(!listHas(loaded, "TeamDelete"));
+    const offered = segment(d, "Deferred tools available right now: ", ". Use select:");
+    try testing.expect(listHas(offered, "knowforge__search"));
+    try testing.expect(!listHas(offered, "hidden__search"));
+
+    var select_detail: ?[]const u8 = null;
+    defer if (select_detail) |sd| a.free(sd);
+    const select_ctx = ToolContext{
+        .allocator = a,
+        .dyn_registry = &dyn,
+        .error_detail = &select_detail,
+        .request_tools = .{ .advertised = &advertised, .catalog = &catalog },
+    };
+    try testing.expectError(error.NoToolMatch, execute(&select_ctx, "{\"query\":\"select:Bash\"}"));
+    if (select_detail) |sd| a.free(sd);
+    select_detail = null;
+    try testing.expectError(error.NoToolMatch, execute(&select_ctx, "{\"query\":\"select:hidden__search\"}"));
+    const out = try execute(&select_ctx, "{\"query\":\"select:TeamCreate,knowforge__search\"}");
+    defer a.free(out);
+    try testing.expect(std.mem.indexOf(u8, out, "\"name\":\"TeamCreate\"") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "knowforge__search") != null);
 }

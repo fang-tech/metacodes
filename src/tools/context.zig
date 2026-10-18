@@ -313,6 +313,32 @@ pub const ToolDispatcher = struct {
     }
 };
 
+/// What one turn's provider request showed the model (`ToolContext.request_tools`).
+pub const RequestTools = struct {
+    /// The request's tools array: the tools callable this turn.
+    advertised: []const ToolDefinition,
+    /// The same catalog before deferred tools are dropped for not being
+    /// activated: also holds the deferred tools ToolSearch may still fetch.
+    catalog: []const ToolDefinition,
+
+    pub fn advertises(self: RequestTools, name: []const u8) bool {
+        return findDefinition(self.advertised, name) != null;
+    }
+
+    /// `name` is a deferred tool of this turn's catalog.
+    pub fn offersDeferred(self: RequestTools, name: []const u8) bool {
+        const definition = findDefinition(self.catalog, name) orelse return false;
+        return definition.deferred;
+    }
+
+    fn findDefinition(definitions: []const ToolDefinition, name: []const u8) ?*const ToolDefinition {
+        for (definitions) |*definition| {
+            if (std.mem.eql(u8, definition.name, name)) return definition;
+        }
+        return null;
+    }
+};
+
 /// Borrowed, immutable upper bound for one execution context. The owner must
 /// keep `ctx` alive until every synchronous tool execution has quiesced.
 ///
@@ -536,6 +562,12 @@ pub const ToolContext = struct {
     /// capability_unsupported 并交代替代路径;null = 宿主没告知(纯单测/旧宿主)→ 不门控,
     /// 图片照旧进 tool_result,由序列化层按方言发原生块或占位文本。
     image_input_supported: ?bool = null,
+    /// The tools this turn's provider request showed the model, after every
+    /// runtime filter (`agent_loop.buildEffectiveToolSet`). Borrowed from the
+    /// turn: valid only while that turn's tools execute. null = no agent-loop
+    /// turn (unit tests, direct dispatch). ToolSearch answers from it, so its
+    /// miss text and `select:` agree with what the model was given (#287).
+    request_tools: ?RequestTools = null,
     /// 当前 provider 的模型档位表(low/mid/high → {model, effort};App 启动时按
     /// provider_kind 从 <state root>/config.json 选定)。null = 未配置:档位名
     /// 一律 inherit 父模型,绝不回退硬编码模型 ID。

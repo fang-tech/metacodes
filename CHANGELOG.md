@@ -513,11 +513,12 @@ status, compatibility boundaries, and entry points are defined by
   (issue #287). A miss says that ToolSearch only searches deferred tools,
   names the loaded tools whose names match the query's keywords (`file read
   write edit bash` points at Read, Write, Edit and Bash), and lists the other
-  loaded tools and the deferred ones still to fetch. Every name it reports or
-  returns a schema for passes the filters the request applied (execution
-  policy, the active Skill's tool pool, the provider's web-search capability,
-  the TinyKG and Swarm gates), so it never calls a hidden tool callable, and
-  `select:` no longer hands out a hidden tool's schema.
+  loaded tools and the deferred ones still to fetch. It answers from the
+  turn's own request (`ToolContext.request_tools`: the tools array and the
+  deferred catalog `agent_loop` built), so it never calls a tool the request
+  left out callable - team tools without `--agent-teams`, tools outside the
+  active Skill's pool, WebSearch on a provider that cannot search - and
+  `select:` no longer hands out such a tool's schema.
 - `SessionHost`: an interrupt or close of a Run waiting on a UI prompt could
   fail to stop it. The prompt was released before the kernel abort was
   requested, so the Run took the cancelled prompt as a denied tool, sent its
