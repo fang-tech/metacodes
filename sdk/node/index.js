@@ -98,6 +98,27 @@ function bundledRipgrep(libraryPath) {
   return null;
 }
 
+// JSON for a value a handler returned. A value JSON.stringify throws on (a
+// BigInt, a cycle) or turns into undefined (a function, a symbol) is the
+// handler's error: it must reach the rejection handler that completes the
+// pending call, not escape as an unhandled rejection that kills the host or
+// leaves AgentCore waiting for a call that never completes.
+function toJson(value, what) {
+  const text = JSON.stringify(value ?? null);
+  if (typeof text !== 'string') throw new TypeError(`${what} is not JSON-serializable`);
+  return text;
+}
+
+// A rejection value can be anything, including one String() throws on
+// (Object.create(null)); the text must never throw.
+function errorText(error) {
+  try {
+    return `${error && error.name ? error.name : 'Error'}: ${error && error.message ? error.message : String(error)}`;
+  } catch (_) {
+    return 'Error: the handler rejected with a value that has no string form';
+  }
+}
+
 /** Answer a blocked native call exactly once; a second answer would touch freed memory. */
 function once(handle, fallbackStatus) {
   let done = false;
@@ -224,10 +245,14 @@ class Runtime {
     const hostTool = this.hostTools[index];
     Promise.resolve()
       .then(() => hostTool.handler(args ? JSON.parse(args) : {}))
+      .then((value) => (typeof value === 'string' ? value : toJson(value, `${hostTool.name} result`)))
       .then(
-        (value) => finish(HOST_OK, typeof value === 'string' ? value : JSON.stringify(value ?? null)),
-        (error) => finish(HOST_FAILED, `${error && error.name ? error.name : 'Error'}: ${error && error.message ? error.message : String(error)}`),
-      );
+        (text) => finish(HOST_OK, text),
+        (error) => finish(HOST_FAILED, errorText(error)),
+      )
+      // Last resort: the call is answered whatever went wrong above; once()
+      // ignores a second answer.
+      .catch(() => finish(HOST_FAILED, 'Error'));
   }
 
   /** Create a Session; see README.md for the options. */
@@ -360,13 +385,15 @@ class Session {
     }
     Promise.resolve()
       .then(() => this._onUiRequest(request))
+      .then((answer) => (answer == null ? null : toJson(answer, 'onUiRequest answer')))
       .then(
-        (answer) => (answer == null ? finish(UI_UNAVAILABLE, '') : finish(UI_ANSWERED, JSON.stringify(answer))),
+        (text) => (text == null ? finish(UI_UNAVAILABLE, '') : finish(UI_ANSWERED, text)),
         (error) => {
           if (this._active && !this._active.error) this._active.error = error;
           finish(UI_UNAVAILABLE, '');
         },
-      );
+      )
+      .catch(() => finish(UI_UNAVAILABLE, ''));
   }
 
   _done(outcome) {

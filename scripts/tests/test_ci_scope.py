@@ -257,6 +257,19 @@ class WorkflowTest(unittest.TestCase):
                     self.assertIn("env.%s != 'false'" % var, step.get("if", ""))
                     self.assertIn("env.FAST_PATH != 'true'", step.get("if", ""))
 
+    def test_the_sdk_job_reports_on_every_run(self) -> None:
+        # Not a required check today; reporting under its own name on every
+        # run keeps it safe to make one.
+        spec = self.jobs["sdk-bindings"]
+        self.assertEqual(spec["if"], "${{ !cancelled() }}")
+        self.assertEqual(spec["env"]["SDK"], "${{ needs.scope.outputs.tty }}")
+        for step in spec["steps"]:
+            label = step_label(step)
+            if label in ECHO_STEPS:
+                continue
+            with self.subTest(step=label):
+                self.assertEqual(step.get("if"), "env.SDK != 'false'")
+
     def run_decide(self, job: str, event: str) -> tuple:
         step = next(s for s in self.jobs[job]["steps"] if s.get("name") == "Decide")
         with tempfile.TemporaryDirectory() as tmp:

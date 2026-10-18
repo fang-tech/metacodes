@@ -7,6 +7,7 @@ import json
 import os
 import queue
 import threading
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence
@@ -16,6 +17,32 @@ from . import _native as n
 DEFAULT_TOOLS = ("Read", "Glob", "Grep")
 # The CLI agent loop's own default (src/core/agent_loop.zig Options.max_turns).
 DEFAULT_MAX_TURNS = 400
+
+# The AgentCore handles of the Sessions whose callbacks (event, UI request,
+# host tool) are running on this thread. close() waits for the Session's
+# active Run to return, which a callback of that Run would wait for in turn,
+# so it refuses there instead of deadlocking. Closing any other Session from
+# a callback (a tool that opens and closes a child Session) is fine.
+_CALLBACK = threading.local()
+
+
+class _InCallback:
+    def __init__(self, handle: Optional[int]) -> None:
+        self._handle = handle
+
+    def __enter__(self) -> None:
+        if not hasattr(_CALLBACK, "handles"):
+            _CALLBACK.handles = []
+        _CALLBACK.handles.append(self._handle)
+
+    def __exit__(self, *_: Any) -> None:
+        _CALLBACK.handles.pop()
+
+
+def _in_callback_of(handle: Optional[int]) -> bool:
+    return handle is not None and handle in getattr(_CALLBACK, "handles", ())
+
+
 SHELL_TOOLS = ("Bash", "BashOutput", "KillShell")
 _API_KEY_ENV = {
     "anthropic": ("ANTHROPIC_API_KEY",),
@@ -229,7 +256,11 @@ class Runtime:
                 self._results.pop(address, None)
 
     def _make_execute(self, host_tool: Tool) -> Callable[..., int]:
-        def execute(_ctx: Any, _run: Any, arguments: n.BytesView, out: Any) -> int:
+        def execute(_ctx: Any, run: Any, arguments: n.BytesView, out: Any) -> int:
+            with _InCallback(run.contents.session if run else None):
+                return run_tool(arguments, out)
+
+        def run_tool(arguments: n.BytesView, out: Any) -> int:
             try:
                 raw = n.view_bytes(arguments)
                 parsed = json.loads(raw.decode("utf-8")) if raw else {}
@@ -250,14 +281,18 @@ class Runtime:
         self._sessions.append(session)
         return session
 
-    def close(self) -> None:
+    def close(self, timeout: Optional[float] = None) -> None:
+        """Close every Session (see :meth:`Session.close`; ``timeout`` applies
+        to each), then destroy the Runtime. The handle is kept when AgentCore
+        refuses, so ``close()`` can be retried."""
         if not self._handle:
             return
         for session in list(self._sessions):
-            session.close()
+            session.close(timeout)
         diagnostic = n.OwnedBytes()
         status = self._lib.api.runtime.contents.destroy(self._handle, ctypes.byref(diagnostic))
-        self._handle = ctypes.c_void_p()
+        if status == n.STATUS_OK:
+            self._handle = ctypes.c_void_p()
         self._lib.check("runtime.destroy", status, diagnostic)
 
     def __enter__(self) -> "Runtime":
@@ -385,6 +420,10 @@ class Session:
     # Callbacks run on AgentCore threads; ctypes takes the GIL for them.
 
     def _event(self, _ctx: Any, _run: Any, view: n.BytesView) -> int:
+        with _InCallback(self._handle.value):
+            return self._dispatch_event(view)
+
+    def _dispatch_event(self, view: n.BytesView) -> int:
         try:
             event = json.loads(n.view_bytes(view).decode("utf-8"))
             if isinstance(event, dict) and len(event) == 1:
@@ -403,6 +442,10 @@ class Session:
         return n.EVENT_CONTINUE
 
     def _ui_request(self, _ctx: Any, _run: Any, view: n.BytesView, out: Any) -> int:
+        with _InCallback(self._handle.value):
+            return self._answer_ui_request(view, out)
+
+    def _answer_ui_request(self, view: n.BytesView, out: Any) -> int:
         out.contents.ptr = None
         out.contents.len = 0
         if self._on_ui_request is None:
@@ -564,15 +607,44 @@ class Session:
         )
         self._lib.check("session.update_permission_mode", status, diagnostic)
 
-    def close(self) -> None:
+    def close(self, timeout: Optional[float] = None) -> None:
+        """Destroy the Session.
+
+        A Run still going (a :meth:`stream` the caller stopped iterating, or a
+        :meth:`run` on another thread) is aborted and waited for first, since
+        AgentCore refuses to destroy a Session with an active Run. Abort is
+        cooperative: a host tool or ``on_ui_request`` that blocks keeps the
+        Run, and so ``close()``, waiting. With ``timeout`` (seconds) a Run
+        that has not returned by then raises TimeoutError and the Session
+        stays open; the abort stays requested, so that Run still ends
+        ``aborted``. The handle is dropped only once AgentCore has destroyed
+        the Session; on a refusal it is kept, so the Session stays usable and
+        ``close()`` can be retried. Calling it from one of this Session's own
+        callbacks raises RuntimeError: that callback's Run could never return.
+        """
         if not self._handle:
             return
-        diagnostic = n.OwnedBytes()
-        status = self._lib.api.session.contents.destroy(self._handle, ctypes.byref(diagnostic))
-        self._handle = ctypes.c_void_p()
-        if self in self._runtime._sessions:
-            self._runtime._sessions.remove(self)
-        self._lib.check("session.destroy", status, diagnostic)
+        if _in_callback_of(self._handle.value):
+            raise RuntimeError("Session.close() cannot be called from one of the Session's own callbacks")
+        deadline = None if timeout is None else time.monotonic() + timeout
+        # Abort until the active run() returns and releases the lock: a Run
+        # started on another thread in between is aborted too.
+        while not self._run_lock.acquire(timeout=0.05):
+            self._abort_active()
+            if deadline is not None and time.monotonic() >= deadline:
+                raise TimeoutError("the active Run did not return within %ss; the Session stays open" % timeout)
+        try:
+            if not self._handle:
+                return
+            diagnostic = n.OwnedBytes()
+            status = self._lib.api.session.contents.destroy(self._handle, ctypes.byref(diagnostic))
+            if status == n.STATUS_OK:
+                self._handle = ctypes.c_void_p()
+                if self in self._runtime._sessions:
+                    self._runtime._sessions.remove(self)
+            self._lib.check("session.destroy", status, diagnostic)
+        finally:
+            self._run_lock.release()
 
     def __enter__(self) -> "Session":
         return self
