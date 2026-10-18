@@ -2087,6 +2087,8 @@ fn runCounted(
             // 子 agent 不拿父模型的能力当自己的(与 result_budget 同一派生规则)。
             .active_model = opts.model_override orelse provider.model(),
             .image_input_supported = provider.supportsForModel(.image_input, opts.model_override),
+            // ToolSearch answers from the tools this request actually carried.
+            .request_tools = .{ .advertised = gated_tool_defs, .catalog = deferred_catalog_defs },
             .model_tiers = opts.model_tiers,
             .skills = opts.skills_set,
             .mcp_sessions = opts.mcp_sessions,
@@ -3558,6 +3560,8 @@ fn runCounted(
             // 子 agent 不拿父模型的能力当自己的(与 result_budget 同一派生规则)。
             .active_model = opts.model_override orelse provider.model(),
             .image_input_supported = provider.supportsForModel(.image_input, opts.model_override),
+            // ToolSearch answers from the tools this request actually carried.
+            .request_tools = .{ .advertised = gated_tool_defs, .catalog = deferred_catalog_defs },
             .model_tiers = opts.model_tiers,
             .skills = opts.skills_set,
             .mcp_sessions = opts.mcp_sessions,

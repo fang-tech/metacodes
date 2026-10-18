@@ -580,6 +580,75 @@ test "L2 e2e: 动态(MCP)deferred 工具列进 system prompt、不进 tools;Tool
     try std.testing.expect(std.mem.indexOf(u8, second_system, "- knowforge__overview") != null);
 }
 
+test "L2 e2e: a ToolSearch miss names only tools the request carried (#287)" {
+    const a = std.testing.allocator;
+    var dyn = cc.tools_dynamic.DynRegistry.init(a);
+    defer dyn.deinit();
+    try dyn.register("knowforge__search", "Search a KnowForge knowledge base.", &.{}, deferredProbe, null, true);
+
+    // Teams off, as in a default session: the request carries no team tools,
+    // while the host still attaches a swarm context, as session_service does.
+    var defs_arena = std.heap.ArenaAllocator.init(a);
+    defer defs_arena.deinit();
+    var pc = cc.tools.PromptContext{ .agent_teams = false };
+    const defs = try cc.tools.toToolDefinitionsFull(defs_arena.allocator(), &dyn, &pc);
+    try std.testing.expect(findDef(defs, "TeamCreate") == null);
+    try std.testing.expect(findDef(defs, "ToolSearch") != null);
+    var home_buf: [256]u8 = undefined;
+    const home = cc.util_fs.testing.uniqueDir(&home_buf, "cc-zig-toolsearch-l2");
+    defer cc.util_fs.testing.rmrfBestEffort(home);
+    try cc.util_fs.mkdirParents(home);
+    var sw = cc.swarm_context.SwarmContext{ .allocator = a, .state_root = home };
+    defer sw.deinit();
+
+    const search_sse = try toolSearchSse(a, "send team message read");
+    defer a.free(search_sse);
+    var srv = try harness.MockServer.startCassette(&[_][]const u8{ search_sse, MINIMAL_END_TURN_SSE }, 0);
+    defer srv.stop();
+    const url = try srv.urlOwned(a);
+    defer a.free(url);
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
+    defer io_runtime.deinit();
+    var client = cc.client_mod.Client.initWithBaseUrl(a, io_runtime.io(), "test-key", "claude-sonnet-4-20250514", url);
+    defer client.deinit();
+
+    var activated = std.StringHashMap(void).init(a);
+    var activation = Activation{ .allocator = a, .map = &activated };
+    defer activation.deinit();
+    var conv = cc.conversation.Conversation.init(a);
+    defer conv.deinit();
+    try conv.appendText(.user, "message the team");
+    var perm = cc.permission.createContext(.bypass_permissions, a);
+    perm.no_interactive_prompt = true;
+    var wb = cc.writer_backend.WriterBackend.initNull();
+    const be = wb.backend();
+    const result = try cc.agent_loop.run(&conv, client.provider(), defs, &perm, .{
+        .max_turns = 3,
+        .activated_tools = &activated,
+        .dyn_registry = &dyn,
+        .swarm = &sw,
+        .host_services = .{ .ctx = @ptrCast(&activation), .activateToolFn = &Activation.activate },
+        .auto_compact_threshold = std.math.maxInt(usize),
+    }, &be, a);
+    try std.testing.expectEqual(cc.agent_loop.StopReason.end_turn, result.stop_reason);
+
+    const first = srv.requestAt(0) orelse return error.NoRequestCaptured;
+    const first_tools = first.jsonField("tools") orelse return error.ToolsFieldMissing;
+    try std.testing.expect(std.mem.indexOf(u8, first_tools, "\"name\":\"SendMessage\"") == null);
+
+    // The miss points at the loaded tool the keywords were after and offers
+    // the deferred pool, but claims none of the team tools the request left out.
+    const tool_result_msg = conv.messages.items[2];
+    try std.testing.expect(tool_result_msg.blocks[0] == .tool_result);
+    const detail = tool_result_msg.blocks[0].tool_result.content;
+    try std.testing.expect(std.mem.indexOf(u8, detail, "ToolSearch only searches deferred tools") != null);
+    try std.testing.expect(std.mem.indexOf(u8, detail, "matching your keywords: Read") != null);
+    try std.testing.expect(std.mem.indexOf(u8, detail, "knowforge__search") != null);
+    for ([_][]const u8{ "SendMessage", "TeamCreate", "TeamDelete", "SpawnTeammate" }) |name| {
+        try std.testing.expect(std.mem.indexOf(u8, detail, name) == null);
+    }
+}
+
 test "L2: --sections refines --dump-prompt and is refused on its own" {
     const a = std.testing.allocator;
     {
