@@ -1,0 +1,42 @@
+{
+  "name": "metacodes",
+  "version": "0.11.0-dev.0",
+  "description": "Embed the metacodes agent runtime (AgentCore C ABI) in Node.js",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "license": "MIT",
+  "author": "Metask Lab",
+  "homepage": "https://github.com/metask-ai/metacodes/tree/main/sdk/node",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/metask-ai/metacodes.git",
+    "directory": "sdk/node"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "os": [
+    "darwin",
+    "linux"
+  ],
+  "files": [
+    "index.js",
+    "index.d.ts",
+    "src/",
+    "scripts/",
+    "prebuilds/",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "node scripts/build.js",
+    "test": "node --test test/metacodes.test.js"
+  },
+  "keywords": [
+    "agent",
+    "ai-agents",
+    "agent-harness",
+    "coding-agent",
+    "llm",
+    "embedded"
+  ]
+}

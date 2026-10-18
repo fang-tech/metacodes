@@ -12,6 +12,18 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Added
 
+- Python and Node packages over the AgentCore shared library (`sdk/python`,
+  `sdk/node`; experimental, not yet published). Both offer a Runtime/Session
+  API, streaming events, the final answer rebuilt from output segments, tools
+  written in Python or JavaScript (async in Node), permission and question
+  requests, abort and mid-Run input, and refuse any library whose ABI revision
+  differs. Python uses ctypes and has no dependencies; `build_wheel.py` makes a
+  reproducible platform wheel with the library and ripgrep inside. Node uses a
+  Node-API addon compiled with `zig cc` that runs each Run on its own thread.
+  The new `sdk-bindings` CI job (Linux, macOS; not required) runs both
+  packages' end-to-end suites against a loopback mock provider, including the
+  installed wheel.
+
 - Session goals at every entry point, and in AgentCore (issue #277).
   - **One set of rules.** `core.goal` owns the status table: pause needs an
     active goal, resuming a goal whose budget is used up is refused until the
@@ -412,6 +424,11 @@ status, compatibility boundaries, and entry points are defined by
       runs the gates in full but skips the TTY suites.
     - Anything else, every push, and any doubt runs everything.
     - `scripts/tests/test_ci_scope.py` pins which steps run in each scope.
+
+- `scripts/perf_baseline.sh`: the ReleaseSmall binary-size red line is 6 MiB,
+  recalibrated from the 2026-10-18 measurement (5.50 MB); the 1.5 MB line was
+  set on a 1.29 MB build in June. Startup and idle-RSS lines are unchanged.
+
 - AgentCore provider requests now carry a `currentDate` context block in each
   Run's user record unless the Host supplies one or sets `TIME_CONTEXT_OFF`
   (Revision 22, issue #276). Hosts that byte-compare requests should set
