@@ -3382,6 +3382,11 @@ class WorkBuddyJudgeBudgetTest(unittest.TestCase):
                 launch_gate.argparse.ArgumentTypeError
             ):
                 launch_gate._judge_budget_usd(bad)
+
+    # `create` writes its manifest through a private directory fd
+    # (_open_private_artifact_parent), which Windows cannot open.
+    @requires_posix_dir_fd
+    def test_create_passes_the_judge_budget_flag_to_the_manifest(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             os.chmod(root, 0o700)
