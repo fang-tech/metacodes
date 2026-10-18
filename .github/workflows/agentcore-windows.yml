@@ -2,6 +2,9 @@ name: AgentCore Windows
 
 on:
   pull_request:
+  # The merge queue (doc/CI_DESIGN.md §3): a check that does not report on
+  # merge_group would hold every group if the ruleset ever requires it.
+  merge_group:
   push:
     branches: [main]
   workflow_dispatch:
@@ -24,16 +27,18 @@ jobs:
       # must report on every pull request; the old `on.pull_request.paths`
       # filter left doc-only / evals-only PRs permanently BLOCKED (#134). The
       # expensive steps still run only when a path that can affect the native
-      # gate changed; other PRs report success from this step alone.
+      # gate changed; other PRs report success from this step alone. A merge
+      # queue group is judged by its whole diff against the group's base.
       - name: Decide whether the change can affect the native gate
         id: scope
         shell: bash
         run: |
           set -euo pipefail
-          if [ "${{ github.event_name }}" != "pull_request" ]; then
-            echo "relevant=true" >> "$GITHUB_OUTPUT"; exit 0
-          fi
-          base="${{ github.event.pull_request.base.sha }}"
+          case "${{ github.event_name }}" in
+            pull_request) base="${{ github.event.pull_request.base.sha }}" ;;
+            merge_group) base="${{ github.event.merge_group.base_sha }}" ;;
+            *) echo "relevant=true" >> "$GITHUB_OUTPUT"; exit 0 ;;
+          esac
           git fetch -q --depth=1 origin "$base"
           changed=$(git diff --name-only "$base" HEAD)
           pattern='^build\.zig|^scripts/agentcore_manifest\.zig|^src/agentcore/.*|^src/core/.*|^src/lsp/.*|^src/lsp_test_root\.zig|^src/platform/.*|^sdk/.*|^tests/component/agentcore_abi_test\.zig|^tests/agentcore_artifact_consumer/.*|^\.github/workflows/agentcore-windows\.yml'

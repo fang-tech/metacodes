@@ -56,6 +56,14 @@ Run `zig build gate:pr` to execute the single AGENTS.md pre-submit checklist.
   [evals/ATTRIBUTION_EVAL.md](../evals/ATTRIBUTION_EVAL.md),
   [scripts/eval/workbuddy/README.md](../scripts/eval/workbuddy/README.md).
 
+## Build, CI and release
+
+- [CI design](CI_DESIGN.md) — required checks, the change scope that skips
+  suites a change cannot affect, and the merge queue that tests a batch of
+  PRs once.
+- [Release automation](RELEASE_AUTOMATION_DESIGN.md) — version bumping,
+  cutting, tagging, publishing, and the CI fast path for release PRs.
+
 ## History
 
 - `doc/history/AGENTCORE_V1_REVISION14_PLUGIN_ABI_PLAN.md` — revision 14 plugin ABI plan.
