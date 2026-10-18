@@ -216,9 +216,11 @@ pub fn discardPendingInput(fd: c_int) void {
             return;
         }
     }
-    var scratch: [64]u8 = undefined;
+    // Bounded (16 KiB, room for a paste) so a stream that never stops
+    // cannot hold the caller; each read follows a zero-timeout check.
+    var scratch: [256]u8 = undefined;
     var rounds: u8 = 0;
-    while (rounds < 16 and waitReadable(fd, 0) > 0) : (rounds += 1) {
+    while (rounds < 64 and waitReadable(fd, 0) > 0) : (rounds += 1) {
         if (readInput(fd, &scratch) <= 0) break;
     }
 }

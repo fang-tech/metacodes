@@ -5,8 +5,9 @@
 //! the settled wordmark, and always ends with the cursor shown and SGR reset.
 //! The key that skips is consumed, without blocking even when it types
 //! nothing (a bare modifier on Windows): before the prompt exists there is
-//! nowhere for it to go, and the input box's own raw-mode entry flushes
-//! type-ahead. The size is checked before every frame, the settled one
+//! nowhere for it to go. On POSIX the input box's own raw-mode entry
+//! (TCSA.FLUSH) flushes type-ahead anyway; on Windows, entering raw mode does
+//! not, so the discard is what drops it. The size is checked before every frame, the settled one
 //! included, so no frame is drawn at a size the terminal no longer has.
 
 const std = @import("std");

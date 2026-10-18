@@ -1086,15 +1086,12 @@ fn firstUserLine(conv: *const Conversation) []const u8 {
     return "main session";
 }
 
-/// Drain stdin buffer: 非阻塞读尽剩余字节。生成结束后调用，避免用户在 LLM 输出时
-/// 误按的字符进入下一轮输入缓冲。
+/// Drain stdin buffer: 非阻塞丢弃剩余输入。生成结束后调用，避免用户在 LLM 输出时
+/// 误按的字符进入下一轮输入缓冲。Through discardPendingInput: on Windows a bare
+/// modifier pressed during the reply is a readable key-down that ReadConsoleW
+/// would block on, holding the next prompt until a printable key.
 fn drainStdin(fd: c_int) void {
-    while (true) {
-        if (platform_term.waitReadable(fd, 0) <= 0) return; // 可移植:timeout=0 立即返回
-        var buf: [256]u8 = undefined;
-        const n = platform_term.readInput(fd, buf[0..buf.len]);
-        if (n <= 0) return;
-    }
+    platform_term.discardPendingInput(fd);
 }
 
 /// 非 tty / 管道模式下的朴素逐字节行读（保留 M0 行为）。
