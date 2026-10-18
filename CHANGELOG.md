@@ -405,6 +405,26 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Changed
 
+- CI is ready for GitHub's merge queue and skips suites a change cannot
+  affect ([doc/CI_DESIGN.md](doc/CI_DESIGN.md)).
+  - **Merge queue.** `ci.yml` and `agentcore-windows.yml` run on
+    `merge_group`. The release fast path and the change scope diff a group
+    against its `base_sha`. The version state gate judges the PR at the
+    group's head, taken from the queue's ref, so a PR queued behind the
+    release PR is dropped until the reopen PR merges. The ruleset switch
+    (merge queue on, "up to date" off) is a separate maintainer step.
+  - **Change scope** (`scripts/ci_scope.py`). Every required job still runs
+    and reports.
+    - A change that adds or edits only `doc/**` and the top-level Markdown
+      the release layout does not install (everything but `README.md`,
+      `CHANGELOG.md` and `THIRD_PARTY_NOTICES.md`) runs only the
+      documentation, version-state and gate-manifest checks. Removing or
+      moving a doc file runs everything.
+    - A change confined to documentation, `scripts/eval/**` and `evals/**`
+      runs the gates in full but skips the TTY suites.
+    - Anything else, every push, and any doubt runs everything.
+    - `scripts/tests/test_ci_scope.py` pins which steps run in each scope.
+
 - `scripts/perf_baseline.sh`: the ReleaseSmall binary-size red line is 6 MiB,
   recalibrated from the 2026-10-18 measurement (5.50 MB); the 1.5 MB line was
   set on a 1.29 MB build in June. Startup and idle-RSS lines are unchanged.

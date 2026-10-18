@@ -63,7 +63,10 @@ full suite in Debug, the core suite in ReleaseSafe;
 step), so this block is the single source. The one exception is a release or
 reopen PR that adds only `scripts/release_cut.py`'s generated bump to a base
 whose full CI passed: it takes the CI fast path
-(`doc/RELEASE_AUTOMATION_DESIGN.md` §3). Run the full suite with
+(`doc/RELEASE_AUTOMATION_DESIGN.md` §3). A change confined to documentation,
+or to documentation and the evaluation harness, skips the CI suites it cannot
+affect (`scripts/ci_scope.py`), and merge-queue groups run the same jobs
+(`doc/CI_DESIGN.md`). Run the full suite with
 `-Doptimize=ReleaseSafe` as well when a change touches unsafe code or an ABI.
 
 The Python steps need Python >= 3.9 and PyYAML (`requirements-dev.txt`).
