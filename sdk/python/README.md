@@ -63,7 +63,8 @@ and waits for it first. That includes a `stream()` the loop stopped early with
 Abort is cooperative, so a tool or `on_ui_request` that blocks keeps
 `close()` waiting too. An `on_ui_request` waiting for the thread that is
 closing never returns. `close(timeout=seconds)` raises TimeoutError instead,
-and leaves the Session open.
+and leaves the Session open. The abort has been requested by then, so the run
+still ends `aborted` once the blocking call returns.
 
 The handle is dropped only once AgentCore has destroyed the Session. If
 AgentCore refuses, `close()` raises and the Session stays usable. One of the

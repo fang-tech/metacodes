@@ -616,7 +616,8 @@ class Session:
         cooperative: a host tool or ``on_ui_request`` that blocks keeps the
         Run, and so ``close()``, waiting. With ``timeout`` (seconds) a Run
         that has not returned by then raises TimeoutError and the Session
-        stays open. The handle is dropped only once AgentCore has destroyed
+        stays open; the abort stays requested, so that Run still ends
+        ``aborted``. The handle is dropped only once AgentCore has destroyed
         the Session; on a refusal it is kept, so the Session stays usable and
         ``close()`` can be retried. Calling it from one of this Session's own
         callbacks raises RuntimeError: that callback's Run could never return.

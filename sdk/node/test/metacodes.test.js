@@ -267,7 +267,12 @@ function blockingTool() {
     name: 'wait',
     description: 'Waits for the test.',
     // Capped so a broken test fails instead of holding the suite.
-    handler: async () => { started(); await Promise.race([released, new Promise((resolve) => setTimeout(resolve, 10_000))]); return 'waited'; },
+    // unref(): the cap must not keep the test process alive after the suite.
+    handler: async () => {
+      started();
+      await Promise.race([released, new Promise((resolve) => setTimeout(resolve, 10_000).unref())]);
+      return 'waited';
+    },
   });
   return { wait, started: startedPromise, release };
 }
