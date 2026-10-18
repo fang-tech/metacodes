@@ -16,8 +16,9 @@ pub enum AbiError {
     LengthOverflow,
 }
 
-/// Validated Revision 22 root plus mandatory domain tables. Discovery rejects
-/// every other layout; there is no legacy probe or alternate dispatch.
+/// Validated root at exactly `METASK_AGENTCORE_ABI_REVISION`, plus its
+/// mandatory domain tables. Discovery rejects every other layout; there is no
+/// legacy probe or alternate dispatch.
 #[derive(Clone, Copy)]
 pub struct Api {
     raw: NonNull<raw::metask_agentcore_api_v1>,
