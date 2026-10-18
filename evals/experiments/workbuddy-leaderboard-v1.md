@@ -109,10 +109,13 @@ installed-proxy sequence test.
   1. zero-cost: `run_lb_preflight` on each host; `environment_preflight` for
      every cohort; `launch_gate create` for all 48 transactions (no provider
      I/O);
-  2. W1 probe, paid, cap US$1: two actor requests (one tool round) through
-     the gateway with the leaderboard flags, to see the gateway accept
-     `thinking: adaptive` and `output_config.effort`; one judge request to
-     confirm the Kimi K2.7 Code model id. The gateway (`shuzuan-org/sub2api`)
+  2. W1 probe, paid, cap US$1 (done 2026-10-18, §5): two actor requests
+     (one tool round) through the gateway with the leaderboard flags, to see
+     the gateway accept `thinking: adaptive` and `output_config.effort`; one
+     judge request to confirm the Kimi K2.7 Code model id. Outcome: the
+     effort fields are accepted; Kimi is not in the judge key's catalog, so
+     Web and Office cannot be judged as on the leaderboard until a credential
+     that reaches Kimi K2.7 Code exists. The gateway (`shuzuan-org/sub2api`)
      parses `thinking.type` `enabled`/`adaptive` and `output_config.effort`
      as Claude API fields and forwards them with no GLM-specific rewrite, so
      only the upstream's answer is unknown. If it rejects them, stop and
@@ -188,5 +191,25 @@ transactions in flight until the last run's sealed cohorts.
   (§2 row 14), and kunshan drops container traffic to the WorkBuddy default
   proxy port (§3 Hosts). The first preflight attempt failed closed on the
   second ("expected 2 scripted requests, found 0").
-- Not yet exercised: the Web/Office judge route, the gateway's answer to the
-  effort fields, and an agent timeout inside a transaction.
+- **W1 probe** (paid, authorized by the owner with a US$1 cap, kunshan,
+  2026-10-18): one durable budget journal (US$1 authority), one transaction
+  per route, each `request_authorized` before sending; metacodes `4f656124`
+  with the leaderboard flags through a relay that only rewrote the route to
+  `glm-5.2` and added the key, capped at two upstream requests and an
+  ~8K-token stream cutoff.
+  - GLM-5.2 on the gateway returned HTTP 200 to both requests with
+    `thinking: {type: adaptive}`, `output_config: {effort: high}` and
+    `max_tokens: 32768`: request 1 came back as a thinking block (65
+    characters, no signature) and a `tool_use`; request 2, whose history
+    carried the `tool_use` without the thinking block, was accepted and read
+    13,888 prompt tokens from cache. So the fields are accepted; whether
+    `effort` changes GLM-5.2's thinking depth is not observable from one
+    trivial task.
+  - The judge key's catalog lists one model and no Kimi id, so no judge
+    request was sent: Kimi K2.7 Code is not reachable with the current judge
+    credential, and its model id on the gateway is still unknown.
+  - Spend: 2 provider requests, 28,163 metered tokens, US$0.048 at the
+    repository's conservative GLM-5.2 guardrail rates (an estimate, not the
+    gateway's bill); the judge transaction committed zero.
+- Not yet exercised: the Web/Office judge route and an agent timeout inside a
+  transaction.
