@@ -44,7 +44,7 @@ plus an add, so moving a file out of `doc/` is a code change.
 
 | Scope | Every changed path is | What runs |
 |---|---|---|
-| `docs` | `doc/**`, or a top-level `*.md` other than the three the release layout installs, added or edited (not removed) | Documentation link and fact checks, their unit tests, the gate-manifest test, the version state gate and the diff check |
+| `docs` | `doc/**`, or a top-level `*.md` other than the three the release layout installs, added or edited (not removed or changed in type) | Documentation link and fact checks, their unit tests, the gate-manifest test, the version state gate and the diff check |
 | `eval` | documentation, `scripts/eval/**` or `evals/**` | All three gates in full; the TTY jobs report success without running |
 | `full` | anything else | Everything |
 
@@ -83,9 +83,10 @@ actually land:
   it and the PR itself merged in order. The workflow runs on that branch
   through the `merge_group` event.
 - Each entry is tested once, on top of the entries ahead of it. Up to the
-  build concurrency of these runs go in parallel. N queued PRs therefore
-  take about one run's wall time and N runs, instead of N runs in series
-  plus a merge-`main`-and-rerun round for each PR still waiting.
+  build concurrency of these runs go in parallel. Up to that many queued PRs
+  therefore take about one run's wall time and one run each, instead of
+  runs in series plus a merge-`main`-and-rerun round for each PR still
+  waiting.
 - When an entry's run passes, the queue merges it together with the entries
   ahead of it that passed, up to the maximum group size, and `main` becomes
   exactly a tested tree. When it fails, the queue drops that PR and rebuilds

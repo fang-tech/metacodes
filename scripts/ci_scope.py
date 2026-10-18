@@ -70,12 +70,12 @@ def _shown(paths: Sequence[str]) -> str:
 
 def classify(paths: Sequence[str], deleted: Sequence[str] = ()) -> Tuple[str, str]:
     """(scope, reason) for the changed `paths`, of which `deleted` were
-    removed (a rename is a removal plus an addition)."""
+    removed or changed type (a rename is a removal plus an addition)."""
     if not paths:
         return "full", "full scope: the change has no paths"
     removed_docs = [path for path in deleted if is_docs(path)]
     if removed_docs:
-        return "full", f"full scope: {_shown(removed_docs)} removed; pins and links elsewhere can name a documentation path"
+        return "full", f"full scope: {_shown(removed_docs)} removed or changed type; pins and links elsewhere can name a documentation path"
     if all(is_docs(path) for path in paths):
         return "docs", f"docs scope: only documentation changed ({_shown(paths)})"
     outside = [path for path in paths if not (is_docs(path) or is_eval(path))]
@@ -114,7 +114,10 @@ def decide(
         return "full", f"full scope: no base for the {event} run"
     try:
         found = list(changes(base, candidate))
-        return classify([path for _, path in found], [path for status, path in found if status == "D"])
+        # Only an addition or an edit leaves a path where pins expect it; a
+        # removal or a type change (a file turned into a symlink, which
+        # plugin_release_gate refuses) widens the scope.
+        return classify([path for _, path in found], [path for status, path in found if status not in ("A", "M")])
     except Exception as exc:  # any doubt is the full scope, never a red job
         return "full", f"full scope: the scope check failed: {exc}"
 

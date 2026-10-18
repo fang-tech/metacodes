@@ -185,6 +185,16 @@ class MainTest(unittest.TestCase):
         self.assertEqual((got["scope"], got["suites"], got["tty"]), ("full", "true", "true"))
         self.assertIn("doc/A.md removed", got["reason"])
 
+    @unittest.skipIf(os.name == "nt", "POSIX symlink fixture")
+    def test_a_documentation_file_turned_into_a_symlink_is_the_full_scope(self) -> None:
+        # plugin_release_gate refuses a pinned path that is a symlink.
+        (self.repo / "doc" / "A.md").unlink()
+        os.symlink("../main.zig", self.repo / "doc" / "A.md")
+        self.commit("symlink")
+        got = self.run_main("pull_request", "HEAD^1")
+        self.assertEqual(got["scope"], "full")
+        self.assertIn("doc/A.md removed or changed type", got["reason"])
+
     def test_an_added_documentation_file_keeps_the_docs_scope(self) -> None:
         (self.repo / "doc" / "B.md").write_text("b\n", encoding="utf-8")
         self.commit("add")
