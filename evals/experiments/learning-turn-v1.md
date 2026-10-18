@@ -37,27 +37,37 @@ reported on its own.
   One ReleaseSafe binary through two `#!/bin/sh` wrappers that differ only by
   that flag. Observe mode makes the same decision at the same boundary and
   records it (`metacodes-learning-turn-v1`, `enforced=false`), so the baseline
-  measures how often the treatment would have acted.
+  measures how often the treatment would have acted. The binary needs its
+  TinyKG pair (`tinykg` and `tinykgd`) beside it, as in the release layout
+  or after `zig build tinykg:stage`: without the daemon a session's TinyKG
+  is degraded and stores nothing.
 - **Verdict source.** Both wrappers pass `--host-check <cmd>
   --check-gate-observe`: the check runs at every boundary after a
   delivery-capable action, never continues the run, and leaves the verdict the
   learning turn decides on. The check gate is in observe mode in both arms so
   the learning flag is the only difference.
-- **Verdict memory in both arms.** Both arms run with
-  `METACODES_SELF_EVOLUTION=1`, `METACODES_HOST_CHECK=<the same cmd>` and
-  `METACODES_TASK_HINT=<task id>`, so every attempt files its `task_outcome`
-  row and the next attempt gets the deterministic same-task outcome note. This
-  is today's verdict-only memory; the treatment adds lessons on top of it.
-  Because the in-run turn decides whenever the check gate checked the final
-  workspace, the end-of-run form runs only when the model changed nothing
-  (`none_unchecked` in-run); those rollouts are counted and reported, and the
-  end-of-run form is not otherwise under test here.
+- **Memory in both arms.** Both arms carry the same store across the chain
+  (below), so the baseline is the dev16 memory-accumulation arm's treatment:
+  an accumulating store with whatever the model wrote during its attempts.
+  The treatment adds the lessons its learning turns write. The native E2E
+  harness drives the REPL, where `host_check` and self-evolution do not run,
+  so no `task_outcome` row is filed in either arm and the end-of-run form
+  never runs (see the amendment below).
 - **Chains.** A chain is K = 3 sequential attempts at one task in one arm, on
-  one TinyKG store that starts empty at attempt 1 (`METACODES_KG_STORE` per
-  chain) and persists across the chain. Attempt 1 runs with no lesson in either
-  arm; the treatment can act only from attempt 2. Chains of the two arms for
-  the same (task, replicate) are run alternately, starting arm order balanced
-  across tasks.
+  one TinyKG store that starts empty at attempt 1 and persists across the
+  chain, run by `scripts/eval/cli.py run-chained` with
+  `METACODES_TASK_HINT=<task id>` and one TinyKG domain per task
+  (`METACODES_KG_DOMAIN`, `chained_runner.chain_kg_domain`) on every
+  attempt: lessons are project-scoped, and the binary's default domain
+  follows the workspace's git root, which is a new run directory every
+  attempt. Attempt 1 runs with no
+  lesson in either arm; the treatment can act only from attempt 2. Replicates
+  run one after another; within a replicate every task's attempt k runs, both
+  arms back to back, before any attempt k+1, and the arm that goes first
+  alternates by task and replicate. Attempt number is therefore confounded
+  with time within each arm, but never between the arms of a pair, which is
+  the comparison the primary metric makes. The per-arm hash-chained store
+  ledger (`metacodes-chain-ledger-v1`) is part of the evidence.
 - **Model and limits.** glm-5.3-flash through the Metask route, as in
   check-gate v1–v3. `METACODES_MAX_TURNS=60` in both wrappers.
 - **Workspace.** Each attempt starts from the task's frozen snapshot; nothing
@@ -129,8 +139,9 @@ pass rate of a later attempt.
 - **Attempt phase unchanged.** The `check_gate`, `stall_gate` and
   `test_integrity` records of the attempt phase are compared between arms; a
   learning pass must not change them (§12: a pass is outside the attempt).
-- **End-of-run rollouts.** Count of treatment rollouts where the in-run turn
-  decided `none_unchecked` and the end-of-run form ran instead.
+- **Unchecked boundaries.** Count of treatment rollouts where the in-run turn
+  decided `none_unchecked` (the model changed nothing after the last check);
+  in the REPL harness these learn nothing.
 
 ## Claim boundary
 
@@ -142,18 +153,44 @@ failures; a null there is the expected result if the lessons cannot see what
 the visible check does not cover. Neither configuration says anything about
 the end-of-run form, external benchmarks or other models.
 
-## Launch prerequisites (not met by this file)
+## Launch prerequisites
 
-1. **A chained runner.** `scripts/eval/cli.py run-paired` runs independent
-   rollouts; it does not run K sequential attempts on one carried store with a
-   task hint. The runner must gain that (store per chain, starting empty,
-   `METACODES_TASK_HINT` = task id) with a test proving the store carries
-   across attempts and not across chains or arms, before stage A.
-2. **Validator wrappers.** Configuration D needs a pinned command that runs
-   the full validator in the workspace; configuration H needs the offline
-   grading step after each attempt.
-3. **Owner authorization** with a dollar cap and the durable budget journal
+1. **A chained runner. Met (2026-10-18).** `cli.py run-chained`
+   (`scripts/eval/chained_runner.py`) runs the chains above;
+   `scripts/eval/tests/test_chained_runner.py` proves the store carries
+   across the attempts of a chain and never across chains, replicates or
+   arms, that every attempt at a task runs in one TinyKG domain, and that a
+   broken ledger, a changed archive or a missing import witness stops the
+   run before another paid attempt. Every attempt is reserved, authorized
+   and committed in the durable budget journal (`--budget-journal` and all
+   four caps are required); an attempt that fails after authorization is
+   recorded as failed, stays charged at its full allowance and is never
+   re-run. `scripts/eval/chained_memory_smoke.py` (wired into
+   `zig build test`, loopback provider, nothing paid) runs the real binary
+   through the real harness on `d1_cg3_cron` and shows the treatment's
+   attempt-1 lesson in attempt 2's first request, and not without the fixed
+   domain.
+2. **Offline grading for configuration H. Met.** The suite's success check
+   already runs the full validator on each attempt's final workspace after
+   the session; its output lands only in the rollout record, and the runner
+   exports the store before that check runs.
+3. **A pinned full-validator command for configuration D. Not met.** The
+   check command is fixed per wrapper, so it needs a dispatcher that runs the
+   validator of the task named by `METACODES_TASK_HINT` against the
+   workspace.
+4. **Owner authorization** with a dollar cap and the durable budget journal
    (AGENTS.md). Until then nothing here runs.
+
+## Amendment (2026-10-18, before any rollout)
+
+The shared design first said both arms would run with
+`METACODES_SELF_EVOLUTION=1` and `METACODES_HOST_CHECK`, so every attempt
+would file a `task_outcome` row ("verdict-only memory"). That cannot happen
+in the native E2E harness these cohorts run in: it drives the REPL, and the
+self-evolution host check and the end-of-run learning form exist only in
+print mode. The baseline is therefore the accumulating store without
+lessons, which is the dev16 memory arm this protocol already named as the
+baseline to beat. No rollout had run when this was changed.
 
 ## Authorization
 
