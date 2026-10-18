@@ -119,12 +119,22 @@ status, compatibility boundaries, and entry points are defined by
   (`tests/e2e/lib.sh` `import_kg_store` extracts the previous attempt's
   exported store into the fresh fake HOME before the session and writes an
   import witness outside the workspace), with `METACODES_TASK_HINT` set to
-  the task id. Rollouts keep the `run-paired` format
-  (`trial = replicate × attempts + attempt − 1`); a per-arm hash-chained
-  ledger (`metacodes-chain-ledger-v1`) links each attempt's import to the
-  previous export and fails closed on any break, changed archive, missing
-  witness or ledger/checkpoint disagreement. The store is exported before the
-  offline grade runs. `learning-turn-v1.md` records its launch prerequisites
+  the task id and one TinyKG domain per task (`METACODES_KG_DOMAIN`; the
+  default follows each attempt's new git root, so project-scoped lessons
+  would never be recalled by the next attempt). Rollouts keep the
+  `run-paired` format (`trial = replicate × attempts + attempt − 1`); a
+  per-arm hash-chained ledger (`metacodes-chain-ledger-v1`) links each
+  attempt's import to the previous export and fails closed on any break,
+  changed archive, missing witness or ledger/checkpoint disagreement. The
+  store is exported before the offline grade runs. `--budget-journal` and
+  all four caps are required (validated by `run-paired`'s own rules); every
+  attempt is reserved, authorized and committed in the durable budget
+  journal, and an attempt that fails after authorization is recorded as
+  failed, stays charged at its full allowance and is never re-run by a
+  resume. `scripts/eval/chained_memory_smoke.py` (`zig build test`, loopback
+  provider) shows a lesson written in attempt 1 reaching attempt 2's request
+  through the real binary and harness, and not without the fixed domain.
+  `learning-turn-v1.md` records its launch prerequisites
   as met except a pinned full-validator command for configuration D, and an
   amendment: the REPL harness files no outcome rows, so the baseline is the
   accumulating store without lessons.

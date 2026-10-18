@@ -831,6 +831,7 @@ def _run_once(
     runtime_api_key: str | None = None,
     task_hint: str | None = None,
     store_import: Tuple[Path, str] | None = None,
+    kg_domain: str | None = None,
 ) -> Path:
     """Run one native E2E invocation and return its new run directory.
 
@@ -838,6 +839,10 @@ def _run_once(
     name the task their lessons and outcome rows belong to). `store_import`
     is a (tar, sha256) pair `tests/e2e/lib.sh` extracts into the scenario's
     fresh TinyKG state before the session starts (`import_kg_store`).
+    `kg_domain` becomes METACODES_KG_DOMAIN, the TinyKG project the session
+    writes project-scoped memory into and recalls from; without it the
+    binary derives the domain from the workspace's git root, which is a new
+    run directory every invocation.
     """
     runs_dir = repo_root / "tests/e2e/runs"
     before = (
@@ -898,6 +903,16 @@ def _run_once(
             raise ValidationError("store import requires an existing archive and its sha256")
         env["E2E_KG_STORE_IMPORT"] = str(Path(archive).resolve())
         env["E2E_KG_STORE_IMPORT_SHA256"] = archive_sha256
+    if kg_domain is not None:
+        # The rule src/app.zig computeKgDomain applies to an override: a
+        # value the binary would reject is a session silently without
+        # TinyKG, so it is refused here before anything runs.
+        if not 1 <= len(kg_domain) <= 128 or not all(
+            character.isascii() and (character.isalnum() or character in "-_.")
+            for character in kg_domain
+        ):
+            raise ValidationError("TinyKG domain must be 1-128 bytes of [A-Za-z0-9._-]")
+        env["METACODES_KG_DOMAIN"] = kg_domain
     if timeout_seconds is not None:
         env["E2E_TIMEOUT"] = str(timeout_seconds)
     if max_metered_tokens is not None:
@@ -1119,44 +1134,14 @@ def run_paired(
     max_rollout_cost_usd: float | None = None,
     max_rollout_metered_tokens: int | None = None,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-    if (
-        not math.isfinite(budget_used_cost_usd)
-        or budget_used_cost_usd < 0
-        or budget_used_tokens < 0
-    ):
-        raise ValidationError("budget usage offsets must be non-negative")
-    # A per-rollout allowance is the scored analogue of a harness kill: the
-    # binary stops with stop_reason=budget and exits 0, so the rollout stays
-    # valid and its workspace is graded as it stands. Both caps travel
-    # together (the runtime refuses one without the other) and are sealed
-    # into the evaluation metadata fd by run_e2e.sh, never into the model's
-    # environment.
-    if (max_rollout_cost_usd is None) != (max_rollout_metered_tokens is None):
-        raise ValidationError("per-rollout budget requires both cost and token caps")
-    if max_rollout_cost_usd is not None and (
-        not math.isfinite(float(max_rollout_cost_usd)) or float(max_rollout_cost_usd) <= 0
-    ):
-        raise ValidationError("per-rollout max cost must be finite and > 0")
-    if max_rollout_metered_tokens is not None and max_rollout_metered_tokens <= 0:
-        raise ValidationError("per-rollout max metered tokens must be > 0")
-    if (
-        max_rollout_cost_usd is not None
-        and max_cumulative_cost_usd is not None
-        and float(max_rollout_cost_usd) > max_cumulative_cost_usd
-    ):
-        raise ValidationError("per-rollout max cost exceeds the cumulative cap")
-    if (
-        max_rollout_metered_tokens is not None
-        and max_cumulative_tokens is not None
-        and max_rollout_metered_tokens > max_cumulative_tokens
-    ):
-        raise ValidationError("per-rollout max metered tokens exceeds the cumulative cap")
-    if max_cumulative_cost_usd is not None and (
-        not math.isfinite(max_cumulative_cost_usd) or max_cumulative_cost_usd <= 0
-    ):
-        raise ValidationError("max cumulative cost must be > 0")
-    if max_cumulative_tokens is not None and max_cumulative_tokens <= 0:
-        raise ValidationError("max cumulative tokens must be > 0")
+    _validate_budget_caps(
+        budget_used_cost_usd=budget_used_cost_usd,
+        budget_used_tokens=budget_used_tokens,
+        max_cumulative_cost_usd=max_cumulative_cost_usd,
+        max_cumulative_tokens=max_cumulative_tokens,
+        max_rollout_cost_usd=max_rollout_cost_usd,
+        max_rollout_metered_tokens=max_rollout_metered_tokens,
+    )
     for binary in (baseline_binary, candidate_binary):
         if not binary.is_file() or not os.access(binary, os.X_OK):
             raise ValidationError(f"binary is not executable: {binary}")
@@ -1273,6 +1258,57 @@ def run_paired(
                 max_cumulative_tokens=max_cumulative_tokens,
             )
     return collected["baseline"], collected["candidate"]
+
+
+def _validate_budget_caps(
+    *,
+    budget_used_cost_usd: float,
+    budget_used_tokens: int,
+    max_cumulative_cost_usd: float | None,
+    max_cumulative_tokens: int | None,
+    max_rollout_cost_usd: float | None,
+    max_rollout_metered_tokens: int | None,
+) -> None:
+    """The cap and offset rules of `run-paired`, shared with `run-chained`
+    so the two runners cannot accept different budgets."""
+    if (
+        not math.isfinite(budget_used_cost_usd)
+        or budget_used_cost_usd < 0
+        or budget_used_tokens < 0
+    ):
+        raise ValidationError("budget usage offsets must be non-negative")
+    # A per-rollout allowance is the scored analogue of a harness kill: the
+    # binary stops with stop_reason=budget and exits 0, so the rollout stays
+    # valid and its workspace is graded as it stands. Both caps travel
+    # together (the runtime refuses one without the other) and are sealed
+    # into the evaluation metadata fd by run_e2e.sh, never into the model's
+    # environment.
+    if (max_rollout_cost_usd is None) != (max_rollout_metered_tokens is None):
+        raise ValidationError("per-rollout budget requires both cost and token caps")
+    if max_rollout_cost_usd is not None and (
+        not math.isfinite(float(max_rollout_cost_usd)) or float(max_rollout_cost_usd) <= 0
+    ):
+        raise ValidationError("per-rollout max cost must be finite and > 0")
+    if max_rollout_metered_tokens is not None and max_rollout_metered_tokens <= 0:
+        raise ValidationError("per-rollout max metered tokens must be > 0")
+    if (
+        max_rollout_cost_usd is not None
+        and max_cumulative_cost_usd is not None
+        and float(max_rollout_cost_usd) > max_cumulative_cost_usd
+    ):
+        raise ValidationError("per-rollout max cost exceeds the cumulative cap")
+    if (
+        max_rollout_metered_tokens is not None
+        and max_cumulative_tokens is not None
+        and max_rollout_metered_tokens > max_cumulative_tokens
+    ):
+        raise ValidationError("per-rollout max metered tokens exceeds the cumulative cap")
+    if max_cumulative_cost_usd is not None and (
+        not math.isfinite(max_cumulative_cost_usd) or max_cumulative_cost_usd <= 0
+    ):
+        raise ValidationError("max cumulative cost must be > 0")
+    if max_cumulative_tokens is not None and max_cumulative_tokens <= 0:
+        raise ValidationError("max cumulative tokens must be > 0")
 
 
 def run_multi_arm(

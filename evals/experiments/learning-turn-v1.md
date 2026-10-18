@@ -37,7 +37,10 @@ reported on its own.
   One ReleaseSafe binary through two `#!/bin/sh` wrappers that differ only by
   that flag. Observe mode makes the same decision at the same boundary and
   records it (`metacodes-learning-turn-v1`, `enforced=false`), so the baseline
-  measures how often the treatment would have acted.
+  measures how often the treatment would have acted. The binary needs its
+  TinyKG pair (`tinykg` and `tinykgd`) beside it, as in the release layout
+  or after `zig build tinykg:stage`: without the daemon a session's TinyKG
+  is degraded and stores nothing.
 - **Verdict source.** Both wrappers pass `--host-check <cmd>
   --check-gate-observe`: the check runs at every boundary after a
   delivery-capable action, never continues the run, and leaves the verdict the
@@ -53,7 +56,11 @@ reported on its own.
 - **Chains.** A chain is K = 3 sequential attempts at one task in one arm, on
   one TinyKG store that starts empty at attempt 1 and persists across the
   chain, run by `scripts/eval/cli.py run-chained` with
-  `METACODES_TASK_HINT=<task id>` on every attempt. Attempt 1 runs with no
+  `METACODES_TASK_HINT=<task id>` and one TinyKG domain per task
+  (`METACODES_KG_DOMAIN`, `chained_runner.chain_kg_domain`) on every
+  attempt: lessons are project-scoped, and the binary's default domain
+  follows the workspace's git root, which is a new run directory every
+  attempt. Attempt 1 runs with no
   lesson in either arm; the treatment can act only from attempt 2. Every
   attempt level advances for all chains before the next, and the arm that
   goes first alternates by task and replicate. The per-arm hash-chained store
@@ -149,8 +156,17 @@ the end-of-run form, external benchmarks or other models.
    (`scripts/eval/chained_runner.py`) runs the chains above;
    `scripts/eval/tests/test_chained_runner.py` proves the store carries
    across the attempts of a chain and never across chains, replicates or
-   arms, and that a broken ledger, a changed archive or a missing import
-   witness stops the run before another paid attempt.
+   arms, that every attempt at a task runs in one TinyKG domain, and that a
+   broken ledger, a changed archive or a missing import witness stops the
+   run before another paid attempt. Every attempt is reserved, authorized
+   and committed in the durable budget journal (`--budget-journal` and all
+   four caps are required); an attempt that fails after authorization is
+   recorded as failed, stays charged at its full allowance and is never
+   re-run. `scripts/eval/chained_memory_smoke.py` (wired into
+   `zig build test`, loopback provider, nothing paid) runs the real binary
+   through the real harness on `d1_cg3_cron` and shows the treatment's
+   attempt-1 lesson in attempt 2's first request, and not without the fixed
+   domain.
 2. **Offline grading for configuration H. Met.** The suite's success check
    already runs the full validator on each attempt's final workspace after
    the session; its output lands only in the rollout record, and the runner
