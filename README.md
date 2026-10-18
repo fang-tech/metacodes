@@ -85,9 +85,11 @@ Code number is an indication, not a ranking:
   cohort had been inspected before it, and 10 of 17 budget transactions did
   not close their post-run audit.
 - The run did not follow the official protocol: temperature 0, no
-  reasoning-effort setting, and a 400-turn cap where the leaderboard uses 256.
+  reasoning-effort setting, and WebSearch and AskUserQuestion left on.
+- Headless metacodes caps a run at 400 turns where both official harnesses
+  use 256; no trial in that run reached the cap.
 
-A protocol-aligned, three-run submission is being prepared in
+A protocol-aligned three-run evaluation is being prepared in
 [#316](https://github.com/metask-ai/metacodes/pull/316).
 
 The full audit is in

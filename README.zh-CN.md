@@ -58,9 +58,10 @@ Agent 正在离开终端。它们正在进入编辑器和桌面应用、CI 流�
 能直接对比的是由隐藏测试判分的 Code 列：metacodes 落在两个官方 harness 之间。Security 落后于早先一版榜单（当时 GLM-5.2 为 76.3 和 80.9）。即便是 Code 这个数，也只是参考，不是排名：
 
 - 我们的是单次自测的诊断性复测，对比的是 3 次均值；跑之前 sealed 题集已被分析过，17 笔预算交易中有 10 笔没有通过运行后审计。
-- 这次运行没有按官方口径：温度 0、未设 reasoning effort、轮数上限 400（官方为 256）。
+- 这次运行没有按官方口径：温度 0、未设 reasoning effort、WebSearch 和 AskUserQuestion 没有关闭。
+- headless 模式的 metacodes 每次运行最多 400 轮，两个官方 harness 是 256 轮；那次运行里没有任何一题触到上限。
 
-按官方口径的 3 次正式提交正在 [#316](https://github.com/metask-ai/metacodes/pull/316) 中准备。
+按官方口径的 3 次运行正在 [#316](https://github.com/metask-ai/metacodes/pull/316) 中准备。
 
 完整审计见 [evals/benchmarks/2026-09-12-metacodes-takeover-audit](evals/benchmarks/2026-09-12-metacodes-takeover-audit/report.md)。[Security 轨迹复核](evals/benchmarks/2026-09-12-security-trajectory-research/report.md)追查了差距来源，发现的评分器缺陷已提交上游（[Tencent/workbuddy-bench#20](https://github.com/Tencent/workbuddy-bench/issues/20)）。补上 Security 这块差距，是贡献者最能出力的地方之一。
 

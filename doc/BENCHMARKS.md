@@ -231,16 +231,21 @@ observation and not a ladder result or a leaderboard entry:
   `authorized_failure(post_run_evidence_audit)` after the runner finished, and
   their scores come from Harbor's `result.json`;
 - the run did not follow the official protocol: the job proxy set temperature
-  0.0 instead of provider defaults, no reasoning effort was requested, the
-  headless turn cap was 400 where both official harnesses use 256, and
+  0.0 instead of provider defaults, no reasoning effort was requested, and
   WebSearch and AskUserQuestion stayed visible although the official runs
   disable them;
+- a standing harness difference, not a protocol setting: headless metacodes
+  has no turn-cap option and stops a run at 400 turns, where both official
+  harnesses use 256 (no September trial reached the cap; the longest used
+  281 turns);
 - Office and Web were judged by gpt-5.6-sol at temperature 0.0 with a
   16,384-token output, while the leaderboard's judge is Kimi K2.7 Code
   (temperature 1.0, thinking; [Tencent/workbuddy-bench#3](https://github.com/Tencent/workbuddy-bench/issues/3)), so those
   two columns are not comparable across rows. These protocol facts come from
   the September job configurations as recorded in the alignment table of
-  [#316](https://github.com/metask-ai/metacodes/pull/316), which prepares a protocol-aligned three-run submission.
+  [#316](https://github.com/metask-ai/metacodes/pull/316), which prepares a protocol-aligned three-run
+  evaluation. WorkBuddy-Bench has no public submission process, so that run is
+  self-reported unless the maintainers list it.
 
 The README reads it as: on Code, which hidden tests score, metacodes lands
 between the two official harnesses; Security trails; Web and Office are not
