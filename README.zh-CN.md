@@ -4,7 +4,7 @@
 
 **可以嵌进任何地方的 agent harness。**
 
-WorkBuddy-Bench 跑分与 CodeBuddy Code、Claude Code 同档 · 5.5 MB 原生二进制 · 任何插件都绕不过的固定内核 · 图记忆 · 面向任何宿主的 C ABI
+在 WorkBuddy-Bench 上与 CodeBuddy Code、Claude Code 对照评测 · 5.5 MB 原生二进制 · 任何插件都绕不过的固定内核 · 图记忆 · 面向任何宿主的 C ABI
 
 [![CI](https://github.com/metask-ai/metacodes/actions/workflows/ci.yml/badge.svg)](https://github.com/metask-ai/metacodes/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/metask-ai/metacodes)](https://github.com/metask-ai/metacodes/releases)
@@ -43,21 +43,24 @@ Agent 正在离开终端。它们正在进入编辑器和桌面应用、CI 流�
 
 作为参照，同一台机器上 `--help` 的峰值 RSS：Codex CLI 0.163 为 20 MB，Claude Code 2.1.278 为 121 MB。测量方法和限定条件见 [doc/BENCHMARKS.md](doc/BENCHMARKS.md#footprint-snapshot)。
 
-## 质量：与一线 harness 同档
+## 质量：与一线 harness 对照
 
 [WorkBuddy-Bench](https://workbuddybench.com/)（腾讯）在真实的代码仓库、Web、办公和安全任务上端到端评测 coding agent。它的榜单显示，同一个模型换一个 harness，分数可能差很多。同一个模型 GLM-5.2 下：
 
-| Harness | Code | Web | Office | Security |
+| Harness | Code | Web\* | Office\* | Security |
 |---|---:|---:|---:|---:|
-| **metacodes 0.1.0**（自测，单次，260/260 题） | **72.7** | **81.1** | **78.8** | **59.0** |
+| **metacodes 0.1.0**（自测，单次，260/260 题） | **72.7** | 81.1 | 78.8 | 59.0 |
 | CodeBuddy Code 2.109.3（官方 v1.2，3 次均值） | 71.5 | 67.4 | 79.6 | — |
 | Claude Code 2.1.187（官方 v1.2，3 次均值） | 77.1 | 60.7 | 79.6 | — |
 
-metacodes 在 Code 上落在两个官方 harness 之间，Office 相差不到 1 分，Web 领先，Security 落后（早先一版榜单上 GLM-5.2 的 Security 为 76.3 和 80.9）。请把它读作"同档"，而不是排名：
+\* 不能跨行比较：我们的 Web 和 Office 用 gpt-5.6-sol（温度 0）判分，官方榜用的是 [Kimi K2.7 Code](https://github.com/Tencent/workbuddy-bench/issues/3)。
 
-- 我们的是单次自测的诊断性复测。跑之前 sealed 题集已被分析过，17 笔预算交易中有 10 笔没有通过运行后审计。
-- 官方数字是 3 次运行的均值。
-- Office 和 Web 的 judge 配置未确认与官方一致。
+能直接对比的是由隐藏测试判分的 Code 列：metacodes 落在两个官方 harness 之间。Security 落后于早先一版榜单（当时 GLM-5.2 为 76.3 和 80.9）。即便是 Code 这个数，也只是参考，不是排名：
+
+- 我们的是单次自测的诊断性复测，对比的是 3 次均值；跑之前 sealed 题集已被分析过，17 笔预算交易中有 10 笔没有通过运行后审计。
+- 这次运行没有按官方口径：温度 0、未设 reasoning effort、轮数上限 400（官方为 256）。
+
+按官方口径的 3 次正式提交正在 [#316](https://github.com/metask-ai/metacodes/pull/316) 中准备。
 
 完整审计见 [evals/benchmarks/2026-09-12-metacodes-takeover-audit](evals/benchmarks/2026-09-12-metacodes-takeover-audit/report.md)。[Security 轨迹复核](evals/benchmarks/2026-09-12-security-trajectory-research/report.md)追查了差距来源，发现的评分器缺陷已提交上游（[Tencent/workbuddy-bench#20](https://github.com/Tencent/workbuddy-bench/issues/20)）。补上 Security 这块差距，是贡献者最能出力的地方之一。
 

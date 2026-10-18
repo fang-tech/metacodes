@@ -230,15 +230,21 @@ observation and not a ladder result or a leaderboard entry:
 - 7 of 17 selected transactions committed their receipts; the other 10 ended
   `authorized_failure(post_run_evidence_audit)` after the runner finished, and
   their scores come from Harbor's `result.json`;
-- in the Security batches, the only ones whose request bodies were audited,
-  requests ran at temperature 0.0 rather than provider defaults, and WebSearch
-  and AskUserQuestion stayed visible although the official runs disable them;
-- the Office and Web judge configuration was not confirmed identical to the
-  official one.
+- the run did not follow the official protocol: the job proxy set temperature
+  0.0 instead of provider defaults, no reasoning effort was requested, the
+  headless turn cap was 400 where both official harnesses use 256, and
+  WebSearch and AskUserQuestion stayed visible although the official runs
+  disable them;
+- Office and Web were judged by gpt-5.6-sol at temperature 0.0 with a
+  16,384-token output, while the leaderboard's judge is Kimi K2.7 Code
+  (temperature 1.0, thinking; [Tencent/workbuddy-bench#3](https://github.com/Tencent/workbuddy-bench/issues/3)), so those
+  two columns are not comparable across rows. These protocol facts come from
+  the September job configurations as recorded in the alignment table of
+  [#316](https://github.com/metask-ai/metacodes/pull/316), which prepares a protocol-aligned three-run submission.
 
-The README summarizes this as "the same band as the leading harnesses: between
-them on Code, within a point on Office, ahead on Web, behind on Security"; no
-stronger claim is made.
+The README reads it as: on Code, which hidden tests score, metacodes lands
+between the two official harnesses; Security trails; Web and Office are not
+compared because the judges differ. No stronger claim is made.
 
 ## 5. Rules for running and reporting
 

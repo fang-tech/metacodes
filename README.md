@@ -4,7 +4,7 @@
 
 **The agent harness you can embed anywhere.**
 
-WorkBuddy-Bench scores alongside CodeBuddy Code and Claude Code · a 5.5 MB native binary · a fixed kernel no plugin can bypass · graph memory · a C ABI for every host
+Benchmarked on WorkBuddy-Bench against CodeBuddy Code and Claude Code · a 5.5 MB native binary · a fixed kernel no plugin can bypass · graph memory · a C ABI for every host
 
 [![CI](https://github.com/metask-ai/metacodes/actions/workflows/ci.yml/badge.svg)](https://github.com/metask-ai/metacodes/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/metask-ai/metacodes)](https://github.com/metask-ai/metacodes/releases)
@@ -59,30 +59,36 @@ For scale, on the same machine the `--help` peak RSS of Codex CLI 0.163 is
 20 MB and of Claude Code 2.1.278 is 121 MB. Method and caveats are in
 [doc/BENCHMARKS.md](doc/BENCHMARKS.md#footprint-snapshot).
 
-## Quality: in the same band as the leading harnesses
+## Quality: measured against the leading harnesses
 
 [WorkBuddy-Bench](https://workbuddybench.com/) (Tencent) scores coding agents
 end to end on real repository, web, office and security tasks. Its leaderboard
 shows the same model scoring very differently under different harnesses. With
 the same model, GLM-5.2:
 
-| Harness | Code | Web | Office | Security |
+| Harness | Code | Web\* | Office\* | Security |
 |---|---:|---:|---:|---:|
-| **metacodes 0.1.0** (self-run, 1 pass, 260/260 tasks) | **72.7** | **81.1** | **78.8** | **59.0** |
+| **metacodes 0.1.0** (self-run, 1 pass, 260/260 tasks) | **72.7** | 81.1 | 78.8 | 59.0 |
 | CodeBuddy Code 2.109.3 (official v1.2, 3-run mean) | 71.5 | 67.4 | 79.6 | — |
 | Claude Code 2.1.187 (official v1.2, 3-run mean) | 77.1 | 60.7 | 79.6 | — |
 
-metacodes lands between the two official harnesses on Code, within a point on
-Office, ahead on Web, and behind on Security, where an earlier leaderboard
-snapshot listed GLM-5.2 at 76.3 and 80.9. Read this as "same band", not as a
-ranking:
+\* Not comparable across rows: our Web and Office tasks were judged by
+gpt-5.6-sol at temperature 0, the leaderboard's by
+[Kimi K2.7 Code](https://github.com/Tencent/workbuddy-bench/issues/3).
 
-- Ours is one self-run diagnostic pass. The sealed cohort had been inspected
-  before it, and 10 of 17 budget transactions did not close their post-run
-  audit.
-- The official numbers average three runs.
-- The Office and Web judge configuration was not confirmed identical to the
-  official one.
+Code, which hidden tests score, is the like-for-like column, and there
+metacodes lands between the two official harnesses. Security trails an
+earlier leaderboard snapshot, which listed GLM-5.2 at 76.3 and 80.9. Even the
+Code number is an indication, not a ranking:
+
+- Ours is one self-run diagnostic pass against three-run means. The sealed
+  cohort had been inspected before it, and 10 of 17 budget transactions did
+  not close their post-run audit.
+- The run did not follow the official protocol: temperature 0, no
+  reasoning-effort setting, and a 400-turn cap where the leaderboard uses 256.
+
+A protocol-aligned, three-run submission is being prepared in
+[#316](https://github.com/metask-ai/metacodes/pull/316).
 
 The full audit is in
 [evals/benchmarks/2026-09-12-metacodes-takeover-audit](evals/benchmarks/2026-09-12-metacodes-takeover-audit/report.md).
