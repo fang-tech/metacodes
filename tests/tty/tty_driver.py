@@ -458,9 +458,11 @@ def _run_posix(bin_path, key_events, term_size, full_env,
     def stop_continue():
         import signal
         os.kill(pid, signal.SIGSTOP)
-        # Give the kernel time to stop the child before delivering SIGCONT;
-        # otherwise a fast PTY test can accidentally exercise no stop at all.
-        time.sleep(0.05)
+        # Wait for the kernel's stopped status before delivering SIGCONT; this
+        # keeps the regression deterministic even on a busy test host.
+        stopped, status = os.waitpid(pid, os.WUNTRACED)
+        if stopped != pid or not os.WIFSTOPPED(status):
+            raise RuntimeError("child did not stop for signal:stopcont")
         os.kill(pid, signal.SIGCONT)
 
     cap.drain(startup_drain)
