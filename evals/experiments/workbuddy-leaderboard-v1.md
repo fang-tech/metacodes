@@ -61,7 +61,7 @@ attempts, `timeout_multiplier: 2.0`, `context_window: 200000`,
 | 1 | Runs | mean of 3 | 1 pass | three run sets `r1..r3`; a paid launch binds one attempt, so each set is 16 frozen-cohort jobs (`leaderboard_jobs.py`) |
 | 2 | Reasoning | think mode, effort high | no effort flag; requests carried no thinking field (the provider thought by default) | `--reasoning-effort high`; upstream body carries `thinking: {type: adaptive}` and `output_config: {effort: high}`. Gateway acceptance is not yet observed (probe in §3) |
 | 3 | Sampling | provider defaults | `temperature: 0.0`, injected by the job proxy from `metacodes-glm52.yaml` | `metacodes-glm52-leaderboard.yaml` injects only `max_tokens`; no temperature, top_p or top_k in the upstream body |
-| 4 | Context window | 200k, one threshold | 200,000 only as metacodes' fallback: the adapter recorded the window but did not pass it; a route slug can substring-match the bundled `models.toml` table | the adapter writes `models.toml` in the fresh HOME for the exact route. metacodes compacts at window − output reserve − 13,000 = 154,232 tokens, 92.2% of the 167,232 left after the 32,768-token reserve. The 92% knob has no metacodes equivalent and is recorded; the official harnesses also apply it differently (Claude Code as a percentage override, CodeBuddy 2.109.3 on the bare window) |
+| 4 | Context window | 200k, one threshold | 200,000 only as metacodes' fallback: the adapter recorded the window but did not pass it; a route slug can substring-match the bundled `models.toml` table | the adapter writes `models.toml` in the fresh HOME for the exact route. metacodes compacts at window − output reserve − 13,000 = 154,232 tokens, 92.2% of the 167,232 left after the full 32,768-token output reserve. Claude Code under the same knobs compacts at min(⌊92% × (200,000 − 20,000)⌋, 180,000 − 13,000) = 165,600, so metacodes compacts about 11k tokens earlier; CodeBuddy 2.109.3 uses the bare window. The 92% knob has no metacodes equivalent and is recorded |
 | 5 | Tools | WebSearch, AskUserQuestion disabled | both visible (WebSearch called 6 times in Security) | both disabled. WebFetch stays, as in both official harnesses. Agent/Task, teams and plan mode stay disabled as before: delegation is a separate treatment for this harness, and Claude Code's official preset does allow Task |
 | 6 | Web/Office judge | Kimi K2.7 Code: temperature 1.0, top_p 0.95, thinking, effort low, JSON object, 32,768 output | `gpt-5.6-sol`, temperature 0.0, 16,384 output | `judge-kimi-k27.yaml` copies the published configuration; the gateway's model id must be confirmed |
 | 7 | Turn cap | 256 (both harnesses) | metacodes headless default 400 | unchanged and disclosed: headless has no turn knob, and no September trial stopped on the cap (largest: 281 turns) |
@@ -132,3 +132,12 @@ journals (each launch passes the earlier transactions' exposure as
 September), and **US$150 judge** on its own gateway key with a hard quota,
 because judge spend does not pass through the launch gate's journal. Total
 US$1,650, under the gate's US$2,000 per-authority ceiling.
+
+A journal's exposure is its committed actual cost plus the maximum of every
+transaction not yet committed, and an `authorized_failure` keeps its maximum
+exposed. With US$4 per task, one run's sixteen maxima add up to US$1,040
+(Code US$64/32/32/192, Office US$40/20/20/120, Security US$48/24/24/144,
+Web US$56/28/28/168 for dev/promotion A/promotion B/sealed), so the operator
+launches a transaction only when committed cost plus open maxima stays under
+the cap; with about US$1.2 actual per task this leaves room for six or seven
+transactions in flight until the last run's sealed cohorts.
