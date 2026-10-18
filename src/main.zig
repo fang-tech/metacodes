@@ -995,8 +995,8 @@ pub fn main(init: std.process.Init) !void {
     try repl.run(app, gpa);
 }
 
-/// 打印组装好的 system prompt + 工具 defs(name + 完整 description),然后退出。
-/// 走 std.c.write(1,...) 直出 stdout——不经日志(避免 8192 截断),不发网络。
+/// Write pipeable command output directly to stdout, without routing it through
+/// stderr-oriented diagnostics or a buffered logger.
 fn dumpWrite(bytes: []const u8) void {
     var pos: usize = 0;
     while (pos < bytes.len) {
@@ -1265,6 +1265,9 @@ fn runDoctor(args: *std.process.Args.Iterator, allocator: std.mem.Allocator, io:
             strict = true;
         } else if (std.mem.eql(u8, arg, "--plain")) {
             plain = true;
+        } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
+            dumpWrite("usage: metacodes doctor [--json | --plain] [--strict]\n");
+            return 0;
         } else {
             std.debug.print("usage: metacodes doctor [--json | --plain] [--strict]\n", .{});
             return 2;
@@ -1449,7 +1452,7 @@ fn runInstall(args: *std.process.Args.Iterator, allocator: std.mem.Allocator, io
         } else if (std.mem.eql(u8, arg, "--force")) {
             options.force = true;
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
-            std.debug.print("{s}", .{install_usage});
+            dumpWrite(install_usage);
             return 0;
         } else {
             std.debug.print("error: unknown install argument '{s}'\n{s}", .{ arg, install_usage });
@@ -1775,7 +1778,7 @@ fn maybeRunAuthCommand(init: std.process.Init, allocator: std.mem.Allocator, lea
 }
 
 fn printLoginHelp() void {
-    std.debug.print(
+    dumpWrite(
         \\Usage:
         \\  metacodes login
         \\  metacodes login --no-browser
@@ -1800,7 +1803,7 @@ fn printLoginHelp() void {
         \\the non-interactive path for CI and recovery.
         \\Secrets are stored in <state root>/auth.json with 0600 permissions (see `metacodes doctor`).
         \\
-    , .{});
+    );
 }
 
 fn runLoginSelectionWizard(allocator: std.mem.Allocator, io: std.Io, stored: *auth.StoredCredentials) !void {
@@ -3138,7 +3141,7 @@ fn appendNulList(allocator: std.mem.Allocator, prev: ?[]const u8, item: []const 
 }
 
 fn printHelp() void {
-    std.debug.print(
+    dumpWrite(
         \\metacodes — embeddable agent core and coding CLI
         \\Usage: metacodes [options]
         \\  --version             Print version and build identity and exit (--json: one JSON document)
@@ -3235,7 +3238,7 @@ fn printHelp() void {
         \\  --teammate-mode <m>   Teammate spawn backend: "process" (out-of-process, worktree-isolated) or "thread" (default, in-process)
         \\  -h, --help            This help
         \\
-    , .{});
+    );
 }
 
 test "basic" {
