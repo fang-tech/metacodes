@@ -1,8 +1,13 @@
 # WorkBuddy-Bench under the leaderboard protocol (v1)
 
-Status: proposed 2026-10-18. No provider-backed request has been made under
-this protocol. Every paid step below needs explicit owner authorization, a
-dollar cap and the durable budget journals ([BENCHMARKS.md](../../doc/BENCHMARKS.md) §5).
+Status: proposed 2026-10-18. One paid step has run under this protocol: the
+W1 probe of 2026-10-18 (§5), authorized by the owner with a US$1 cap and
+journaled, sent two GLM-5.2 requests (an estimated US$0.048) and no judge
+request. No other provider-backed request has been made. Every paid step
+below needs explicit owner authorization, a dollar cap and the durable
+budget journals ([BENCHMARKS.md](../../doc/BENCHMARKS.md) §5); the Web and
+Office judge's spend enters the same journals through a per-transaction
+judge cap (§4).
 
 Goal: a metacodes result on WorkBuddy-Bench that a third party can cite,
 produced under the protocol of the official leaderboard
@@ -38,13 +43,23 @@ themselves from the overlay. Until they answer, the result is a self-reported
 run under the published protocol, labelled as such. The outreach draft is
 held outside the repository until the owner approves sending it.
 
-Two facts limit any comparison and go into the outreach as questions:
+Three facts limit any comparison and go into the outreach as questions:
 
 - the board's Code row is labelled `wb-bench-code-v2.3-lite` (80 tasks) while
   the Hugging Face dataset publishes only `wb-bench-*-v1.0`; how the public
   archives map to the board's task sets is not stated anywhere public;
 - GLM-5.2's Security score was withheld from v1.2 on 2026-10-17 ("pending
-  re-verification", site commit `be43b75`).
+  re-verification", site commit `be43b75`);
+- the Web judge's configuration is ambiguous. On
+  [#3](https://github.com/Tencent/workbuddy-bench/issues/3) the maintainers
+  published the Office judge (Kimi K2.7 Code, thinking on, reasoning effort
+  low) and said Web uses the same configuration, but the Web maintainer also
+  wrote "开启 thinking = high" there, and the pinned
+  `configs/bench/wb-bench-web-v1.0.yaml` defaults the Web judge to
+  `kimi-k2.7-think`. Which effort, and which model id, judged the board's Web
+  rows is not stated anywhere public. `judge-kimi-k27.yaml` keeps the
+  published Office configuration for both subsets until the maintainers
+  answer; a Web result is reported with this open (§2 row 6).
 
 ## 2. Protocol alignment
 
@@ -59,11 +74,11 @@ attempts, `timeout_multiplier: 2.0`, `context_window: 200000`,
 | # | Item | Official | September 2026 run | Now |
 |---|---|---|---|---|
 | 1 | Runs | mean of 3 | 1 pass | three run sets `r1..r3`; a paid launch binds one attempt, so each set is 16 frozen-cohort jobs (`leaderboard_jobs.py`) |
-| 2 | Reasoning | think mode, effort high | no effort flag; requests carried no thinking field (the provider thought by default) | `--reasoning-effort high`; upstream body carries `thinking: {type: adaptive}` and `output_config: {effort: high}`. Gateway acceptance is not yet observed (probe in §3) |
+| 2 | Reasoning | think mode, effort high | no effort flag; requests carried no thinking field (the provider thought by default) | `--reasoning-effort high`; upstream body carries `thinking: {type: adaptive}` and `output_config: {effort: high}`. The paid W1 probe (§5) saw the gateway accept both for GLM-5.2 (HTTP 200 on two requests); whether `effort` changes GLM-5.2's thinking depth is not observed |
 | 3 | Sampling | provider defaults | `temperature: 0.0`, injected by the job proxy from `metacodes-glm52.yaml` | `metacodes-glm52-leaderboard.yaml` injects only `max_tokens`; no temperature, top_p or top_k in the upstream body |
 | 4 | Context window | 200k, one threshold | 200,000 only as metacodes' fallback: the adapter recorded the window but did not pass it; a route slug can substring-match the bundled `models.toml` table | the adapter writes `models.toml` in the fresh HOME for the exact route. metacodes compacts at window − output reserve − 13,000 = 154,232 tokens, 92.2% of the 167,232 left after the full 32,768-token output reserve. Claude Code under the same knobs compacts at min(⌊92% × (200,000 − 20,000)⌋, 180,000 − 13,000) = 165,600, so metacodes compacts about 11k tokens earlier; CodeBuddy 2.109.3 uses the bare window. The 92% knob has no metacodes equivalent and is recorded |
 | 5 | Tools | WebSearch, AskUserQuestion disabled | both visible (WebSearch called 6 times in Security) | both disabled. WebFetch stays, as in both official harnesses. Agent/Task, teams and plan mode stay disabled as before: delegation is a separate treatment for this harness, and Claude Code's official preset does allow Task |
-| 6 | Web/Office judge | Kimi K2.7 Code: temperature 1.0, top_p 0.95, thinking, effort low, JSON object, 32,768 output | `gpt-5.6-sol`, temperature 0.0, 16,384 output | `judge-kimi-k27.yaml` copies the published configuration; the gateway's model id must be confirmed |
+| 6 | Web/Office judge | Kimi K2.7 Code: temperature 1.0, top_p 0.95, thinking, effort low, JSON object, 32,768 output, as published for Office; Web "the same configuration", but also stated as thinking high, and the Web bench config defaults to `kimi-k2.7-think` (§1) | `gpt-5.6-sol`, temperature 0.0, 16,384 output | `judge-kimi-k27.yaml` copies the published Office configuration for both subsets; the Web setting is an open outreach question; the gateway's model id must be confirmed |
 | 7 | Turn cap | 256 (both harnesses) | metacodes headless default 400 | unchanged and disclosed: headless has no turn knob, and no September trial stopped on the cap (largest: 281 turns) |
 | 8 | Output budget | per-model records unpublished ([#12](https://github.com/Tencent/workbuddy-bench/issues/12)) | 32,768 | unchanged, disclosed |
 | 9 | Timeouts, users, network | bench config; open network ([#9](https://github.com/Tencent/workbuddy-bench/issues/9)) | inherited | inherited unchanged; each task's declared network policy applies |
@@ -107,8 +122,8 @@ installed-proxy sequence test.
   plan three days with reviews.
 - **Order**:
   1. zero-cost: `run_lb_preflight` on each host; `environment_preflight` for
-     every cohort; `launch_gate create` for all 48 transactions (no provider
-     I/O);
+     every cohort; `launch_gate create` for all 48 transactions, the 24 Web
+     and Office ones with `--judge-budget-usd` (§4) (no provider I/O);
   2. W1 probe, paid, cap US$1 (done 2026-10-18, §5): two actor requests
      (one tool round) through the gateway with the leaderboard flags, to see
      the gateway accept `thinking: adaptive` and `output_config.effort`; one
@@ -144,23 +159,49 @@ Web about 23 judge requests per task at about 18k prompt tokens, Office about
 | Judge (Kimi K2.7 Code, Web + Office) | US$70–160 at US$0.6–1.2/M input and US$2.5–5/M output; the gateway price must be confirmed |
 | W1 probe | under US$1 |
 
-Requested caps: **US$1,500 actor** as cumulative exposure over all actor
-journals (each launch passes the earlier transactions' exposure as
-`prior_exposure_microusd`; per-transaction maximum US$4 per task, as in
-September), and **US$150 judge** on its own gateway key with a hard quota,
-because judge spend does not pass through the launch gate's journal. Total
-US$1,650, under the gate's US$2,000 per-authority ceiling.
+Requested caps: **US$1,500 actor** and **US$150 judge**, US$1,650 in all,
+as cumulative exposure over all the run's budget journals (each launch
+passes the earlier transactions' exposure as `prior_exposure_microusd`),
+under the gate's US$2,000 per-authority ceiling. The per-transaction actor
+maximum is US$4 per task, as in September.
+
+The judge spends inside the same journals. `launch_gate create` resolves a
+job's LLM judge the way the pinned runner does (`configs/bench/_default.yaml`
+< the dataset's bench file < the job's `llm_judge_override`; the Web bench
+enables a judge by default) and refuses a judged job unless
+`--judge-budget-usd` gives its judge cap. The cap is added to the
+transaction's maximum, so the journal reserves and authorizes it before the
+first request and counts it against the journal's authority and the
+cumulative exposure. Judge calls are not metered per call, so the commit
+charges the whole cap beside the actor's measured cost, and the receipt's
+`judge` row says so. The judge model must name
+`METACODES_WORKBUDDY_JUDGE_API_KEY` as its key; the runner's environment
+keeps that variable only for a judge-budgeted launch and has it removed for
+every other one, and a judged transaction cannot be resumed with
+`resume-trials` (a rerun would call the judge again past its cap). The
+operator sizes each Web or Office cap from the September judge load for its
+tasks, keeping the caps of all 24 judged transactions within the US$150. The
+judge key also keeps a hard gateway quota of US$150: the journal accounts the
+caps, and the quota stops the judge if its real spend outruns them. Evidence:
+`WorkBuddyJudgeBudgetTest` in `scripts/eval/tests/test_workbuddy_launch_gate.py`
+(the refusal without a cap, the cap in the reserved maximum, the failure
+exposure and the commit, and the runner's environment with and without the
+judge key).
 
 A journal's exposure is its committed actual cost plus the maximum of every
-transaction not yet committed, and an `authorized_failure` keeps its maximum
-exposed. With US$4 per task, one run's sixteen maxima add up to US$1,040
-(Code US$64/32/32/192, Office US$40/20/20/120, Security US$48/24/24/144,
-Web US$56/28/28/168 for dev/promotion A/promotion B/sealed), so the operator
-launches a transaction only when committed cost plus open maxima stays under
-the cap; with about US$1.2 actual per task this leaves room for six or seven
-transactions in flight until the last run's sealed cohorts.
+transaction not yet committed, and an `authorized_failure` keeps its maximum,
+judge cap included, exposed. With US$4 per task, one run's sixteen actor
+maxima add up to US$1,040 (Code US$64/32/32/192, Office US$40/20/20/120,
+Security US$48/24/24/144, Web US$56/28/28/168 for dev/promotion A/promotion
+B/sealed), plus that run's judge caps, so the operator launches a transaction
+only when committed cost plus open maxima stays under the cap; with about
+US$1.2 actual per task this leaves room for six or seven transactions in
+flight until the last run's sealed cohorts.
 
-## 5. Zero-cost evidence so far
+## 5. Evidence so far
+
+All zero-cost except the W1 probe, the one paid step.
+
 
 - **Containerized preflight** (`run_lb_preflight`, kunshan, 2026-10-18): the
   official runner, the job proxy and a fresh pinned checkout, with

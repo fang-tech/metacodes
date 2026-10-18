@@ -236,6 +236,8 @@ python3 -m scripts.eval.workbuddy.launch_gate create ... \
   --output launch.json
 # Real scored waves add both:
 #   --quality-evidence-on-commit --comparison-id <frozen-pair-id>
+# Jobs that run the LLM judge (Web, Office) add:
+#   --judge-budget-usd <cap>
 python3 -m scripts.eval.workbuddy.launch_gate run \
   --manifest launch.json --budget-journal /private/budget.json \
   --receipt /private/receipts/run.json --credential-fd 9
@@ -295,7 +297,23 @@ metacodes:
   route in the trial's fresh HOME (metacodes reads the window from there,
   not from the provider document);
 - the instruction reaches metacodes on stdin from an uploaded, hash-checked
-  file, never through argv, so a task's `pkill -f` cannot match the agent.
+  file, never through argv. What changed is that the task text is no
+  longer in the agent's argv, which is how September's `pkill -f <service>`
+  matched the agent; argv still carries `metacodes`, `/opt/metacodes` and
+  the route, so a pattern matching those still matches it.
+
+Web and Office jobs run an LLM judge (`judge-kimi-k27.yaml`), which spends
+through `METACODES_WORKBUDDY_JUDGE_API_KEY`. `launch_gate create` resolves a
+job's judge the way the runner does (the bench defaults under the job's
+`llm_judge_override`; the Web bench enables a judge even without one),
+requires a judge model to name that key, and refuses a judged job unless
+`--judge-budget-usd <cap>` is given. The cap is added to the transaction
+maximum the journal reserves and authorizes; judge calls are not metered per
+call, so the commit charges the whole cap beside the actor's measured cost,
+and the receipt's `judge` row says so. `run` keeps the judge key in the
+runner's environment only for such a launch, removes it for every other
+launch, and refuses a judged launch whose environment lacks it before any
+reservation; `resume-trials` refuses a judged arm.
 
 One run is sixteen jobs, the four subsets times the four frozen cohorts,
 because a paid launch binds one cohort, one attempt and one trial at a time.
