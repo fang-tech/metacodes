@@ -129,18 +129,7 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
     var msg_queue = msg_queue_mod.MsgQueue.init(allocator);
     defer msg_queue.deinit();
 
-    // MCP discovery is deliberately detached from App.init. The prompt is
-    // usable immediately; we only join before the first command can execute
-    // against the dynamic tool registry.
-    app.startMcpStartup() catch |err| {
-        @import("../util/log.zig").debug("mcp", "startup worker unavailable: {s}", .{@errorName(err)});
-    };
-
     while (true) {
-        // Publish completed MCP discovery only at a turn boundary. A pending
-        // network worker must not delay the prompt or make Esc/Ctrl+C inert.
-        if (app.mcpStartupReady()) app.waitForMcpStartup();
-
         // 检查到期的 cron 任务 —— 把它们的 prompt 作为 user message 注入并跑一轮
         try fireDueCrons(app, allocator, &aux_be);
 
@@ -286,7 +275,6 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
             continue;
         }
         if (std.mem.eql(u8, trimmed, "/tools")) {
-            app.waitForMcpStartup();
             for (tools.registry) |*t| std.debug.print("  \x1b[32m{s}\x1b[0m - {s}\n", .{ t.name, t.description });
             // 动态工具（Skill / MCP）
             for (app.dyn_registry.entries.items) |e| {
@@ -535,7 +523,6 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
             continue;
         }
         if (std.mem.eql(u8, trimmed, "/mcp")) {
-            app.waitForMcpStartup();
             try handleMcp(app);
             continue;
         }
@@ -801,17 +788,7 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
         }
         // U11:App 可导出字段统一走 canonical buildRunOptions(五处前端装配漂移的收敛点);
         // 宿主专属字段(eval gate/policy、run_control 三件套、预算、UI requester、心跳)在此补。
-        const mcp_startup_pending = !app.mcpStartupReady();
-        if (!mcp_startup_pending) app.waitForMcpStartup();
         var run_opts = session_service.buildRunOptions(app, scoped_recall);
-        // connectMcpServers publishes dyn_registry/mcp_sessions when its
-        // worker finishes. Keep those pointers out of an in-flight run while
-        // startup is pending; the next turn boundary joins and refreshes the
-        // immutable tool snapshot before exposing them.
-        if (mcp_startup_pending) {
-            run_opts.dyn_registry = null;
-            run_opts.mcp_sessions = null;
-        }
         run_opts.pending_input = .{ .ctx = @ptrCast(&msg_queue), .hasPendingFn = &hasPendingRunInput };
         // 宿主契约:主 REPL 是唯一消化 .backgrounded(下方尾声)并复位 flag 的宿主,
         // 故 background_request 在此接——canonical 不带(见 buildRunOptions 注)。
@@ -3567,7 +3544,6 @@ fn shouldRunLoopContinuation(app: *const app_mod.App, queued_count: usize) bool 
 }
 
 fn runLoopContinuation(app: *app_mod.App, allocator: std.mem.Allocator, backend: *const ui_backend_mod.UiBackend) !void {
-    app.waitForMcpStartup();
     const g = if (app.goal_state.current) |*g| g else return;
     if (app.loop_remaining > 0) app.loop_remaining -= 1;
     const prompt = try goal_mod.continuationPrompt(allocator, g);
@@ -4327,7 +4303,6 @@ fn fireDueCrons(app: *app_mod.App, allocator: std.mem.Allocator, backend: *const
 
 /// 把预置 prompt 注入为 user message 后触发一次 agent_loop 执行。
 fn runInjectedAgent(app: *app_mod.App, allocator: std.mem.Allocator, backend: *const ui_backend_mod.UiBackend) !void {
-    app.waitForMcpStartup();
     return runInjectedAgentWithSynthetic(app, allocator, backend, null);
 }
 
