@@ -61,9 +61,12 @@ reported on its own.
   attempt: lessons are project-scoped, and the binary's default domain
   follows the workspace's git root, which is a new run directory every
   attempt. Attempt 1 runs with no
-  lesson in either arm; the treatment can act only from attempt 2. Every
-  attempt level advances for all chains before the next, and the arm that
-  goes first alternates by task and replicate. The per-arm hash-chained store
+  lesson in either arm; the treatment can act only from attempt 2. Replicates
+  run one after another; within a replicate every task's attempt k runs, both
+  arms back to back, before any attempt k+1, and the arm that goes first
+  alternates by task and replicate. Attempt number is therefore confounded
+  with time within each arm, but never between the arms of a pair, which is
+  the comparison the primary metric makes. The per-arm hash-chained store
   ledger (`metacodes-chain-ledger-v1`) is part of the evidence.
 - **Model and limits.** glm-5.3-flash through the Metask route, as in
   check-gate v1–v3. `METACODES_MAX_TURNS=60` in both wrappers.

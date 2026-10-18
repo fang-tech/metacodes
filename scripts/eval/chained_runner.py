@@ -132,10 +132,12 @@ def chained_schedule(
 ) -> List[Tuple[int, int, str, str]]:
     """(replicate, attempt, task, variant) in run order.
 
-    Attempt levels advance together (every chain's attempt k before any
-    attempt k+1 of the same replicate), so the two arms of a task are never
-    more than one attempt apart in time. Within a (replicate, task) the arm
-    that goes first alternates with the task index and the replicate.
+    Replicates run one after another; within a replicate, attempt levels
+    advance together (every task's attempt k, both arms, before any attempt
+    k+1), so the attempts of one chain stay close in time and the two arms of
+    a (task, replicate, attempt) always run back to back, which keeps
+    provider drift out of the paired comparison. Within a (replicate, task)
+    the arm that goes first alternates with the task index and the replicate.
     """
     if replicates <= 0:
         raise ValidationError("replicates must be > 0")

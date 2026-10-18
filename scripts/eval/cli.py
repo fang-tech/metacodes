@@ -81,6 +81,7 @@ if __package__ in {None, ""}:
         summarize_runtime_query_plans,
     )
     from scripts.eval.memory_tinykg_local import run_local_tinykg_smoke  # type: ignore
+    from scripts.eval.chained_runner import run_chained  # type: ignore
     from scripts.eval.paired_runner import run_multi_arm, run_paired  # type: ignore
     from scripts.eval.promotion import (  # type: ignore
         build_promotion_receipt,

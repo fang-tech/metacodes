@@ -10,6 +10,7 @@ import math
 import os
 import shutil
 import subprocess
+import sys
 import tarfile
 import tempfile
 import unittest
@@ -314,8 +315,41 @@ class ChainedRunnerTest(unittest.TestCase):
         self.assertEqual(firsts[(0, 1, "b")], "candidate")
         self.assertEqual(firsts[(1, 1, "a")], "candidate")
         self.assertEqual(firsts[(1, 1, "b")], "baseline")
+        # Replicates run one after another: a chain's attempts stay close in time.
+        replicates_in_order = [r for r, _a, _t, _v in schedule]
+        self.assertEqual(replicates_in_order, sorted(replicates_in_order))
+        # Both arms of every (replicate, attempt, task) run back to back.
+        for index in range(0, len(schedule), 2):
+            self.assertEqual(schedule[index][:3], schedule[index + 1][:3])
+            self.assertNotEqual(schedule[index][3], schedule[index + 1][3])
         with self.assertRaises(ValidationError):
             chained_schedule(["a"], replicates=0, attempts=2)
+
+    def test_script_mode_cli_reaches_the_runner(self):
+        """`python3 scripts/eval/cli.py run-chained` (script mode, as the README
+        documents) imports the runner: a bad binary is a validation error, not
+        a NameError."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            completed = subprocess.run(
+                [
+                    sys.executable, "-I", str(REPO_ROOT / "scripts/eval/cli.py"), "run-chained",
+                    "--suite", str(REPO_ROOT / "evals/suites/check-gate-v3.json"),
+                    "--baseline-binary", str(root / "missing-b"),
+                    "--candidate-binary", str(root / "missing-c"),
+                    "--baseline-revision", "rb", "--candidate-revision", "rc",
+                    "--replicates", "1", "--attempts", "2",
+                    "--chain-dir", str(root / "chains"),
+                    "--baseline-output", str(root / "out" / "b.jsonl"),
+                    "--candidate-output", str(root / "out" / "c.jsonl"),
+                    "--budget-journal", str(root / "journal"),
+                    "--max-cumulative-cost-usd", "1", "--max-cumulative-tokens", "1000",
+                    "--max-rollout-cost-usd", "0.5", "--max-rollout-metered-tokens", "500",
+                ],
+                capture_output=True, text=True, timeout=120, check=False,
+            )
+        self.assertNotIn("NameError", completed.stderr)
+        self.assertEqual(completed.returncode, 2, completed.stderr)
 
     def test_store_carries_within_a_chain_and_never_across_chains_or_arms(self):
         baseline, candidate = self.run_chains(replicates=2, attempts=3)
