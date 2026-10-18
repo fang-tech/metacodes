@@ -393,7 +393,7 @@ AgentCore 面向不把 metacodes 源码加入构建图的原生 Host(C11 / C++17
 Rust:同一 C Header + 静态库 + bindings)。消费入口只有
 `metask_agentcore_get_api(uint32_t requested_abi)`。
 当前是实验性的 ABI v1 revision 24。Host 必须同时校验 abi version、精确
-revision、64 字节根表、五张必选 typed 子表、reserved fields 和 manifest hash;
+revision、80 字节根表、七张必选 typed 子表、reserved fields 和 manifest hash;
 不存在静默降级或旧 revision shim。
 revision 24 只有一个 `runtime->create`;它的 nullable `plugins` 参数、Host 流式
 工具、MCP 流式响应、journal profile,以及全部 ownership、回调重入、Session

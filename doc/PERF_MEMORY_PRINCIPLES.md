@@ -4,26 +4,34 @@
 > 基线实测(2026-06-05,ReleaseSmall,macOS):见 §1。任何改动不得显著回退基线。
 > 关联:TUI_STATE_ARCHITECTURE(UI 解耦)、UI 双向协议设计——它们必须遵守本文热路径零分配约束。
 
-## §1 实测基线(2026-06-05)
+## §1 实测基线
 
-| 维度 | 当前值 | 说明 |
-|------|--------|------|
-| 二进制体积(ReleaseSmall) | **1.29 MB** | metacodes;Debug 8.6 MB |
-| 启动时间(暖) | **<10 ms** | --help 路径;首次冷启 ~0.7s 是磁盘加载非代码 |
-| 常驻内存峰值 | **1.78 MB RSS / 1.08 MB footprint** | --help 路径(未含对话/工具/网络) |
-| 源码规模 | 127 文件 / 40K 行 | |
+| 维度 | 2026-06-05 | 2026-10-18(`main` @ `7efc170`) | 说明 |
+|------|--------|--------|------|
+| 二进制体积(ReleaseSmall) | **1.29 MB** | **5.50 MB**(strip 后 4.9 MB,gzip 2.6 MB) | metacodes 单体;06-05 时 Debug 8.6 MB |
+| 启动时间(暖) | **<10 ms** | **5.1–7.2 ms**(6 次) | --help 路径;首次冷启是磁盘加载非代码 |
+| 常驻内存峰值(空闲) | **1.78 MB RSS / 1.08 MB footprint** | **2.7 MB RSS / 1.7 MB footprint** | --help 路径(未含对话/工具/网络) |
+| 典型会话 | 未测 | **23 MB RSS / 13.9 MB footprint** | headless,20 轮 Glob 工具,本地 Anthropic-SSE mock;TinyKG 未 stage(降级)、Jev 关 |
+| 源码规模 | 127 文件 / 40K 行 | 460 文件 / 300K 行 | `src/**/*.zig` |
 
-对比 Claude Code(Node/TS):RSS 数百 MB、启动秒级。cc-zig 已是**数量级优势**——目标是**守住并扩大**,绝不因功能堆叠回退。
+两列都是 macOS Apple Silicon 上单机单次实测;10-18 一列的方法见
+[BENCHMARKS.md](BENCHMARKS.md#footprint-snapshot)。
+
+对比 Claude Code(Node/TS):同机 2026-10-18 实测 Claude Code 2.1.278 `--help` 峰值 RSS 121 MB(仅进程底座,非会话)。cc-zig 已是**数量级优势**——目标是**守住并扩大**,绝不因功能堆叠回退。
 
 ## §2 量化目标指标(后续对标)
 
-- **二进制**:ReleaseSmall ≤ 1.5 MB(留 0.2 MB 给新功能;超了要查 bloat)。
+- **二进制**:ReleaseSmall ≤ 6 MiB(2026-10-18 按实测 5.50 MB 重新标定,留约 14% 给新功能;超了要查 bloat)。初版红线 1.5 MB 是按 06-05 的 1.29 MB 定的。
 - **启动(暖)**:≤ 20 ms 到首个 prompt 可交互。
 - **常驻内存**:空闲(无对话) ≤ 3 MB RSS;典型会话(20 轮 + 工具)≤ 30 MB RSS。
 - **流式热路径**:每 token(text_chunk)**零堆分配**;spinner tick(100ms)单帧渲染 ≤ 单次 scratch 复用,无 per-tick alloc。
 - **工具并发**:每工具独立 arena,批结束整体释放(已有)。
 
 (指标是初版,实测校准。每次 release 跑基线脚本对比,回退 >10% 要查因。)
+
+> **重新标定(2026-10-18,owner 决定按实际情况)**:二进制已从 1.29 MB 长到 5.50 MB,超出初版
+> 1.5 MB 体积红线;体积红线改为 6 MiB,`scripts/perf_baseline.sh` 同步。启动(≤ 20 ms)、
+> 空闲 RSS(≤ 3 MB)与典型会话(≤ 30 MB)三条红线不变,实测均在线内。脚本仍未接入 CI。
 
 ## §3 设计原则(所有改动遵守)
 

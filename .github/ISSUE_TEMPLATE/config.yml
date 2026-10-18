@@ -1,5 +1,8 @@
 blank_issues_enabled: false
 contact_links:
+  - name: Questions and ideas
+    url: https://github.com/metask-ai/metacodes/discussions
+    about: Ask how to use or embed metacodes, or float an idea before writing a proposal.
   - name: Security report
     url: https://github.com/metask-ai/metacodes/security/advisories/new
     about: Report vulnerabilities privately; never open a public security issue.

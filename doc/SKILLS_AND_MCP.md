@@ -49,7 +49,7 @@ ignored.
 | Field | Meaning |
 |---|---|
 | `name` | display name (the invocation name is the directory name) |
-| `description` | listed to the model; when absent, the first body line (Claude Code) |
+| `description` | listed to the model; when absent, the first body line (Claude Code), and `/skills` reports the Skill |
 | `when_to_use` | appended to the description in listings |
 | `argument-hint` | shown beside the command in the `/` menu |
 | `arguments` | positional names for `$name` substitution |
@@ -88,8 +88,12 @@ so Skills that carry a virtualenv, `node_modules` or large assets work.
   matches come first, then substring matches; the window scrolls with the
   selection. Enter on a Skill that takes arguments fills `/name ` instead of
   submitting.
-- `/skills` lists each Skill with its tier and directory, the Skills that did
-  not load and why, and skipped roots.
+- `/skills` lists each Skill with its tier and directory, the Skills without
+  a `description` (listed with their first body line or with nothing), the
+  Skills that did not load and why, and skipped roots. The startup banner and
+  `/doctor` count these, together with hook and agent configuration problems
+  (`/hooks`, `/agents`), so a broken file is noticed without knowing where to
+  look.
 
 ### Sealed Skills
 

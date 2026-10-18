@@ -1,0 +1,5 @@
+dist/
+build/
+*.egg-info/
+src/metacodes/_lib/
+__pycache__/

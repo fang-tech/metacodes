@@ -435,6 +435,7 @@ const TestFixture = struct {
                 .arguments = &.{ "target", "depth" },
                 .disable_model_invocation = false,
                 .when_to_use = "",
+                .description_source = .frontmatter,
                 .argument_hint = "",
                 .user_invocable = true,
                 .context = .inline_ctx,

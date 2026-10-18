@@ -1,251 +1,355 @@
+<div align="center">
+
 # metacodes
 
-Metacodes is an embeddable, low-resource agent core and coding CLI written in Zig.
-It owns a fixed agent loop, deterministic provider projection, permission and
-sandbox enforcement, durable tool-result artifacts, Lean-backed governance, and
-optional TinyKG memory/task coordination. Hosts can extend tools, provider
-dialects, UI, MCP, and process plugins without replacing those kernel boundaries.
-The release unit is complete on every supported platform: the TUI, TinyKG (CLI
-and daemon) and both Lean governance kernels under `libexec/metacodes/`, each
-pinned into the executable (`release/LAYOUT.md`). Runtime resolution checks the
-environment-variable pair first, then the adjacent file with its compiled-in
-digest, and `metacodes doctor` reports every runtime asset and the state root.
+**The agent harness you can embed anywhere.**
 
-> Repository status: public review, pre-1.0 (version declared in
-> `build.zig.zon`). The repository currently includes an MIT license. Release
-> readiness is still tracked as milestones and remaining owner decisions in
-> [OPEN_SOURCE_READINESS.md](OPEN_SOURCE_READINESS.md) and [ROADMAP.md](ROADMAP.md).
+Benchmarked on WorkBuddy-Bench against CodeBuddy Code and Claude Code · a 5.5 MB native binary · a fixed kernel no plugin can bypass · graph memory · a C ABI for every host
 
-## Why metacodes
+[![CI](https://github.com/metask-ai/metacodes/actions/workflows/ci.yml/badge.svg)](https://github.com/metask-ai/metacodes/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/metask-ai/metacodes)](https://github.com/metask-ai/metacodes/releases)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Zig 0.16](https://img.shields.io/badge/zig-0.16-f7a41d.svg)](https://ziglang.org)
 
-- One native binary, no language runtime, fast startup, and explicit allocators.
-- A built-in coding agent loop rather than a framework that delegates correctness
-  to arbitrary hooks.
-- Immutable plugin generations and append-only provider context, preserving prompt
-  cache stability when the effective model-visible configuration is unchanged.
-- Tool results share one typed inline/artifact/error data plane across CLI,
-  plugins, MCP, and AgentCore embedding.
-- Formal decisions stay in the kernel; TinyKG stores governed memory, task DAGs,
-  receipts, and provenance but does not become the agent loop.
-- Source-level Zig embedding and a source-free C ABI bundle for C, C++, Zig, Rust,
-  Go, and other native hosts.
+**English** · [简体中文](README.zh-CN.md)
 
-## Install
+</div>
 
-macOS (aarch64) and Linux (x86_64), the latest release:
+metacodes is a coding-agent harness written from scratch in Zig. You can use
+it today as a terminal agent, but it is built as a library: one fixed agent
+loop, with permissions, budgets and formal checks that no plugin can bypass,
+inside surfaces that let any program host it. Those surfaces are a Zig module,
+a C ABI (callable from C, C++, Rust, Python, Node and anything else with an
+FFI), headless NDJSON, an HTTP/UDS daemon and a web UI.
+
+## Why another harness
+
+Agents are leaving the terminal. They are moving into editors and desktop apps,
+CI pipelines, browsers, games and edge devices, and into fleets of hundreds of
+workers splitting one job. There the harness is no longer an app you open. It
+is infrastructure you embed, and it runs many copies at once.
+
+Most harnesses today are applications: often a Node or Python runtime, tens
+to hundreds of megabytes of memory before the first token, and a loop you can
+configure but not link into your own program. metacodes takes the opposite
+position:
+
+- **The harness is a library.** The CLI is one host among many; your product
+  can be the next one.
+- **The kernel is fixed and checkable.** Extensions add capability. They never
+  get to loosen safety, budgets or verdicts.
+- **Every claim is measured.** Benchmarks are bound to receipts, paid runs to a
+  budget journal, and null results are published as nulls.
+
+## The numbers
+
+Measured 2026-10-18 on Apple Silicon (macOS), ReleaseSmall build of `main`:
+
+| | metacodes |
+|---|---|
+| Core binary | 5.5 MB (2.6 MB gzipped) |
+| Warm start (`--help`) | 5–7 ms |
+| Idle process, peak RSS | 2.7 MB |
+| One headless run, 20 tool rounds against a local mock model | 23 MB peak RSS |
+| Complete release unit: CLI, TinyKG CLI and daemon, two Lean kernels, ripgrep | 16–21 MB archive |
+| Sealed gateway, 64 concurrent clients, mock model | 1,835 agent steps/s; 1–3 ms gateway cost per step |
+| Native targets | Linux x86_64, macOS arm64, Windows x86_64 |
+
+For scale, on the same machine the `--help` peak RSS of Codex CLI 0.163 is
+20 MB and of Claude Code 2.1.278 is 121 MB. Method and caveats are in
+[doc/BENCHMARKS.md](doc/BENCHMARKS.md#footprint-snapshot).
+
+## Quality: measured against the leading harnesses
+
+[WorkBuddy-Bench](https://workbuddybench.com/) (Tencent) scores coding agents
+end to end on real repository, web, office and security tasks. Its leaderboard
+shows the same model scoring very differently under different harnesses. With
+the same model, GLM-5.2:
+
+| Harness | Code | Web\* | Office\* | Security |
+|---|---:|---:|---:|---:|
+| **metacodes 0.1.0** (self-run, 1 pass, 260/260 tasks) | **72.7** | 81.1 | 78.8 | 59.0 |
+| CodeBuddy Code 2.109.3 (official v1.2, 3-run mean) | 71.5 | 67.4 | 79.6 | — |
+| Claude Code 2.1.187 (official v1.2, 3-run mean) | 77.1 | 60.7 | 79.6 | — |
+
+\* Not comparable across rows: our Web and Office tasks were judged by
+gpt-5.6-sol at temperature 0, the leaderboard's by
+[Kimi K2.7 Code](https://github.com/Tencent/workbuddy-bench/issues/3).
+
+Code, which hidden tests score, is the like-for-like column, and there
+metacodes lands between the two official harnesses. Security trails an
+earlier leaderboard snapshot, which listed GLM-5.2 at 76.3 and 80.9. Even the
+Code number is an indication, not a ranking:
+
+- Ours is one self-run diagnostic pass against three-run means. The sealed
+  cohort had been inspected before it, and 10 of 17 budget transactions did
+  not close their post-run audit.
+- The run did not follow the official protocol: temperature 0, no
+  reasoning-effort setting, and WebSearch and AskUserQuestion left on.
+- Headless metacodes caps a run at 400 turns where both official harnesses
+  use 256; no trial in that run reached the cap.
+
+A protocol-aligned three-run evaluation is being prepared in
+[#316](https://github.com/metask-ai/metacodes/pull/316).
+
+The full audit is in
+[evals/benchmarks/2026-09-12-metacodes-takeover-audit](evals/benchmarks/2026-09-12-metacodes-takeover-audit/report.md).
+The [Security trajectory study](evals/benchmarks/2026-09-12-security-trajectory-research/report.md)
+traces the gap and found scorer defects that we reported upstream
+([Tencent/workbuddy-bench#20](https://github.com/Tencent/workbuddy-bench/issues/20)).
+Closing the Security gap is one of the most useful things a contributor can do.
+
+## What's inside
+
+### A fixed kernel, open everywhere else
+
+The kernel owns the agent loop and conversation ledger, tool ordering and
+cancellation, plus permissions, budgets, formal verdicts and memory admission.
+Everything else is an extension, and extensions can only narrow policy, never
+widen it. A misbehaving plugin cannot approve its own tool call, raise its own
+budget or fake a verdict.
+
+### Plugin flexibility on the DeepSeek Harness model, minus the replaceable loop
+
+metacodes adopted the strongest composition ideas of
+[DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)'s Cordis
+runtime:
+
+- stable service identities with declared dependencies;
+- plugin-owned effects that unwind in reverse order on failure;
+- ordered profiles and bundles.
+
+It implements them over immutable Runtime generations:
+
+- **Hot-swap.** Swap a whole capability profile (`minimal`, `offline-coding`,
+  `coding`, ...) in one transactional publish. Running sessions stay pinned to
+  the generation they started on.
+- **Four plugin kinds.**
+  - static trusted plugins with a typed service graph;
+  - data plugins (manifests, Skills);
+  - process plugins in any language: hash-pinned, with strict framing,
+    timeouts and output caps;
+  - provider-dialect plugins.
+- **Stable prompt cache.** The request the model sees is a deterministic
+  projection of tools, conversation and dialect. Plugin ids, load paths,
+  timestamps and journals never enter it, so an equivalent runtime swap keeps
+  the provider's prompt cache warm.
+
+See [PLUGIN_ARCHITECTURE](doc/PLUGIN_ARCHITECTURE.md),
+[CORE_PLUGIN_HOTSWAP](doc/CORE_PLUGIN_HOTSWAP.md) and
+[PLUGIN_PROCESS_PROTOCOL](doc/PLUGIN_PROCESS_PROTOCOL.md).
+
+### Embed it anywhere
+
+| Surface | Use it from |
+|---|---|
+| `metacodes-core` Zig module | Zig hosts on the same toolchain; `zig build example` runs [example/main.zig](example/main.zig) |
+| AgentCore C ABI v1 revision 24 | C, C++, Zig and Rust bindings ship in [sdk/](sdk/README.md); JNA, .NET P/Invoke and any other FFI load the shared library |
+| Python and Node packages | `import metacodes` / `require('metacodes')`: Runtime, Session, streaming events, tools written in Python or JavaScript ([sdk/python](sdk/python/README.md), [sdk/node](sdk/node/README.md); experimental) |
+| Headless `-p --json` / `--stream-json` | Any language that can spawn a process and read NDJSON |
+| `serve` daemon (HTTP and UDS, multi-session) and `--web` | Services, desktop apps, remote UIs |
+
+What a host gets:
+
+- sessions and runs, typed events, mid-run input;
+- checkpoints with restore, model switching;
+- permission rules and modes;
+- goals with token budgets;
+- MCP and Skills;
+- host-scheduled teams.
+
+Start at [doc/API.md](doc/API.md).
+
+### Built for many agents at once
+
+- **Host-scheduled teams (AgentCore).** A lead session records spawn requests,
+  and your host decides where each member session runs.
+- **CLI swarm (`--agent-teams`).** Teammates run as threads or as
+  worktree-isolated processes. They coordinate through file mailboxes and claim
+  work from a shared TinyKG task DAG under atomic leases.
+- **Small units.** The `serve` daemon hosts many sessions in one process under
+  a live-session cap. A busy headless agent process peaks around 23 MB, and
+  the sealed gateway adds 1–3 ms per step.
+- **Byte-stable prompts.** Thousands of parallel runs keep hitting the
+  provider's prompt cache.
+
+### TinyKG: graph memory agents can drive
+
+TinyKG is Metask Lab's own graph store, written in Zig. Its source is not
+public yet: metacodes ships its CLI and daemon as SHA-256-pinned binaries
+under the Apache-2.0 license, and the daemon starts on first use. It gives
+the CLI agent:
+
+- **Long-term memory.** `KgRemember`, `KgRecall` and `KgContext`, with each
+  memory linked to the task it came from.
+- **A persistent task DAG.** It has a frontier of ready work, atomic claim
+  leases and task packets. Swarm teammates claim their work from this same DAG.
+- **No embedding model and no vector database.** Retrieval is BM25 plus graph
+  traversal, with the model writing the lexical variants. Automatic recall
+  injects at most three short hits.
+
+When the daemon is unavailable the agent keeps working, and the memory tools
+report why. Evidence so far is internal and modest: memory beats no memory on
+tasks built to need it. Comparisons with Markdown memory and vector RAG have
+not been run yet. TinyKG is not yet exposed through the AgentCore ABI.
+
+### Formal rules with Lean 4 (experimental)
+
+Project rules can be decided at tool dispatch by a Lean-compiled, hash-pinned
+kernel that ships prebuilt in every release. It stays dormant until a project
+activates a rule bundle; see [control-plane/README.md](control-plane/README.md).
+
+### An ontology that evolves (experimental)
+
+`METACODES_SELF_EVOLUTION=1` closes the loop ontology → rules → behavior →
+observations → ontology:
+
+1. After a headless run, one isolated, budget-capped model call turns the
+   run's outcome into provisional rules and obligations stored in TinyKG.
+2. The next run enforces them through the same fixed kernel.
+3. A circuit breaker withdraws them all if they block too often.
+
+Separately, `--learning-turn` records conditioned lessons after a grounded
+verdict. Both features are off by default, and neither has shown a benefit yet.
+This is the research frontier of the project and an open invitation.
+
+### Works with what you already have
+
+- **Model-agnostic.** It speaks Anthropic Messages, OpenAI Chat Completions and
+  Responses, and Gemini, with model-family adapters for GLM, Kimi, DeepSeek,
+  Qwen and MiniMax. Custom OpenAI-compatible endpoints work too, including a
+  local server on loopback.
+- **Reads Claude Code and Codex configuration.** Skills, agents and MCP server
+  configs are picked up as they are. MCP 2026-07-28 is supported along with the
+  earlier handshakes.
+- **Language-server aware.** It has LSP diagnostics after edits, plus CodeMap
+  and FindSymbol.
+
+### Safety and observability
+
+- **Permissions.** Five modes; allow, ask and deny rules in the
+  `Tool(specifier)` syntax Claude Code users know; protected paths (`.git`,
+  `.env` files, `.ssh`, shell rc files and more) always ask.
+- **Sandbox.** An opt-in macOS Seatbelt sandbox. A Linux backend is wanted.
+- **Stall gate.** On by default in interactive sessions, it stops runs whose
+  tool rounds keep returning nothing new.
+- **Observable output.** Every file change is an event with a bounded diff, and
+  model output is classified as commentary, final, continued, partial or
+  discarded.
+
+> **Privacy note.** By default the CLI consults Jev, Metask's small decision
+> model, to re-rank automatic memory recall. Each consult sends the current
+> request (at most 400 bytes) and up to eight redacted memory excerpts over
+> plain HTTP to a Metask-hosted server. Set `METACODES_JEV_URL=off` or
+> `"jev": false` in the config to turn it off. Embedded AgentCore runtimes do
+> not use it unless the host opts in. See
+> [doc/JEV_SYSTEM_ONE.md](doc/JEV_SYSTEM_ONE.md).
+
+## Quick start
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/metask-ai/metacodes/main/scripts/install.sh | sh
 ```
 
-This installs into `~/.local/opt/metacodes` with a `metacodes` launcher in
-`~/.local/bin`, the AgentCore SDK included; rerunning it upgrades in place and
-keeps the state. `| sh -s -- --version X.Y.Z` picks a release, `--help` lists
-the rest. From a checkout, `scripts/install.sh --dev` builds the release unit
-from source and installs it beside the released one: the main checkout as
-`metacodes-dev` (`~/.local/opt/metacodes-dev`), a linked worktree as
-`metacodes-dev-<worktree directory>`, each with a state root of its own. An
-install is a copy, so rebuilding or removing the checkout leaves it running;
-`--dev --uninstall` removes it again. Nothing needs starting by hand: the first
-session of an install sets up and starts its TinyKG service in the background.
-A downloaded archive installs the same way:
+That installs the latest release on macOS (arm64) or Linux (x86_64). Windows
+uses `scripts\install.ps1` with the release zip. Then:
 
 ```sh
-sh scripts/install.sh metacodes-<version>-<target>.tar.gz
+metacodes login --provider metask          # or --api-key / --provider openai|gemini|zai-coding-plan
+metacodes                                  # interactive TUI
+metacodes -p "explain src/main.zig" --json # headless, one NDJSON result
+metacodes --web                            # browser UI on 127.0.0.1:7777
+metacodes doctor                           # where every runtime asset resolves from
 ```
 
-```powershell
-powershell -ExecutionPolicy Bypass -File scripts\install.ps1 metacodes-<version>-x86_64-windows-gnu.zip
-```
-
-Each install is self-contained and isolated: it keeps its state (config,
-credentials, TinyKG store, sessions, plans, Lean rules) in its own state root,
-`<prefix>/state` unless `--state-dir` says otherwise, recorded in
-`<prefix>/etc/metacodes/install.json`. Several installs coexist on one machine;
-give each its own `--prefix` and launcher name (`--link-name`). `--sdk` adds the
-AgentCore SDK under `<prefix>/sdk/agentcore/` (`include/metask/agentcore.h`,
-`lib/`, Zig and Rust bindings). The scripts only unpack (and refuse a
-downgrade for a release up to 0.5.0, whose own install does not); the install is
-`bin/metacodes install` (`--help` lists its options), which ends with the
-installed `doctor --strict`; `--upgrade` replaces another version of the same
-product (the scripts always pass it) but not a newer one with an older one
-unless `--allow-downgrade`, `--force` also foreign files and another launcher.
-A launcher name held by another install is refused with that install's prefix
-and version. A process picks its state root from `--state-dir`,
-then `METACODES_HOME`, then the install record, then `~/.metacodes`
-([doc/INSTALL_DESIGN.md](doc/INSTALL_DESIGN.md)).
-
-## Build
-
-The checked-in toolchain contract currently requires Zig 0.16.0 or newer within
-the 0.16 development line used by CI.
+To build from source you need Zig 0.16:
 
 ```sh
-git clone https://github.com/metask-ai/metacodes.git
-cd metacodes
-zig build
-./zig-out/bin/metacodes --help
+git clone https://github.com/metask-ai/metacodes.git && cd metacodes
+zig build && ./zig-out/bin/metacodes --help
+zig build example                          # embed the runtime from Zig
 ```
 
-The default build does not download or compile TinyKG. It selects one
-manifest-pinned CLI from the checked-in cross-platform binary bundle and stages
-it beside Metacodes. `highlight-zig` remains the only checked-in source
-dependency. See [TinyKG integration](doc/TINYKG_INTEGRATION.md) for the supported
-matrix, provenance contract, explicit override, and manual update procedure.
-
-Common gates:
-
-```sh
-zig build test
-zig build test:lib -Doptimize=ReleaseSafe
-```
-
-With a Lean toolchain (elan) on the machine, `zig build test` also builds both
-governance kernels from this checkout (`kernels:stage`, cached on the Lean
-sources) and runs every kernel-gated test against them; `-Dlean-kernels=on`
-turns a missing toolchain into a failure, `off` skips the kernels. On Windows
-the kernel scripts run under Git for Windows' bash, never WSL's. A release
-unit from source is `zig build kernels:stage --prefix <u>` followed by
-`zig build release:verify -Drelease-layout=true --prefix <u> $(python3
-scripts/kernel_pins.py <u>)`; `<u>/bin/metacodes install --prefix <dir>` then
-installs it. `scripts/install.sh --dev` does all three, plus the AgentCore SDK.
-
-The AgentCore bundle and its native consumption gates (`agentcore:test`,
-`agentcore:bundle`, `agentcore:gate`) are documented once, in
-[sdk/README.md](sdk/README.md).
-
-On Windows the same suite runs natively; keep the job count bounded because
-the default is one LLVM codegen per core and the test binaries are large:
-
-```sh
-zig build test -j6
-```
-
-The Python suites need Python >= 3.9 (the macOS system `python3` suffices) and
-PyYAML: `python3 -m pip install -r requirements-dev.txt`. `zig build test` runs
-`python3` (`python` on Windows) from PATH, and `scripts/tests/test_python_floor.py`
-keeps every script parseable at that floor.
-
-Line endings are pinned to LF by `.gitattributes` (embedded prompt templates
-take part in SHA-256 contracts), and a few gates are POSIX-only by design and
-skip with a stated reason: the paid budget journal, dir_fd-anchored artifact
-publication, and the anonymous-descriptor memory runtime smoke (see
-`scripts/eval/tests/posix_only.py`). CI runs this leg in the `windows-gates` job.
-To exercise the POSIX-only paths from a Windows box, clone the commit into a
-WSL ext4 home (not `/mnt/...`, where every file reports as executable) and run
-the Python suite there.
-
-Maintainers can audit a candidate binary instead of the bundled one:
-
-```sh
-tinykg_bin=/absolute/path/to/tinykg
-tinykg_sha=$(shasum -a 256 "$tinykg_bin" | awk '{print $1}')
-zig build test \
-  -Dtinykg-bin="$tinykg_bin" \
-  -Dtinykg-sha256="$tinykg_sha"
-```
-
-Normal tests use the native bundled artifact automatically. No build, test, or
-release gate searches `PATH`, downloads TinyKG, inspects a sibling checkout, or
-uses an old `zig-out` artifact.
-
-## Supported surfaces
-
-| Surface | Audience | Compatibility |
-|---|---|---|
-| CLI / headless / Web host | Operators and local products | Pre-1.0 command surface |
-| `metacodes-core` Zig module | Same-toolchain Zig hosts | Source API, experimental |
-| AgentCore C ABI v1 revision 24 | Source-free native hosts | Exact-revision bundle pinning |
-| Static and process plugins | Trusted in-process and isolated tools | Versioned plugin contracts |
-| Provider dialects | Model-family request/response adaptation | Deterministic, trusted plugins only |
-
-Start at [doc/API.md](doc/API.md). The normative AgentCore ABI contract is
-[doc/AGENTCORE_BINARY_ABI.md](doc/AGENTCORE_BINARY_ABI.md); the plugin contracts
-are indexed in [doc/README.md](doc/README.md).
-
-## Metask OAuth
-
-`metacodes login --provider metask` uses Metask's JSON device authorization
-flow. It prints `METASK_VERIFICATION_URI=...` and `METASK_USER_CODE=...` to
-stderr (use `--no-browser` on a headless machine), then stores the access and
-rotating refresh tokens plus gateway/model URLs in
-`$HOME/.metacodes/oauth/metask.json`. Set `METASK_SITE_URL` for a local control
-plane (`http://localhost:3000`); `METASK_GATEWAY_URL` overrides the gateway
-origin for local development. `METACODES_OAUTH_DIR` changes the OAuth store.
-
-Gateway requests use both Anthropic Messages and OpenAI Chat routes. A request
-that receives `401` with `code=token_expired` is refreshed once and replayed;
-`invalid_token`, `invalid_api_key`, and balance errors are never refresh-looped.
-Each request is recorded after completion in
-`$HOME/.metacodes/ledger/metask.ndjson` (override the directory with
-`METACODES_LEDGER_DIR`), and `metacodes ledger metask` prints those JSON lines.
-The ledger uses server-reported token usage only and includes both local and
-`X-Metask-Request-Id` request identifiers.
-Records are schema version 1 NDJSON with unix-millisecond `ts`; failed or
-interrupted responses use zero token counts rather than estimates.
-
-For compatibility, `--api-key` or an explicitly set `METASK_API_KEY` can still
-select the historical `napi.metask-ai.com` API-key route. A stored device-flow
-session supplies its authenticated gateway by default; use `--base-url` or
-`METASK_GATEWAY_URL` when deliberately testing a different gateway.
+[doc/GETTING_STARTED.md](doc/GETTING_STARTED.md) covers isolated installs,
+providers, Metask OAuth, Lean kernels and Windows.
 
 ## Architecture
 
-```text
-Host / CLI / Web / native SDK
-              |
-      immutable Runtime generation
-              |
-  +-----------+--------------------+
-  | fixed AgentLoop and Conversation|
-  | permission / sandbox / budget   |
-  | tool artifact and durable effect|
-  | Lean governance / TinyKG boundary|
-  +-----------+--------------------+
-              |
-  tools / MCP / plugins / provider dialects
+```mermaid
+flowchart TB
+    hosts["Hosts: CLI / TUI · web UI · daemon · your app (C ABI or Zig)"]
+    runtime["Immutable Runtime generation (hot-swappable)"]
+    subgraph kernel["Fixed kernel"]
+        loop["AgentLoop and conversation ledger"]
+        guard["Permissions · sandbox · budgets"]
+        lean["Lean verdicts"]
+        effects["Tool artifacts · file-change events"]
+    end
+    ext["Extensions: tools · MCP · Skills · process plugins · provider dialects"]
+    kg[("TinyKG: memory and task DAG")]
+    model["Any model provider"]
+    hosts --> runtime --> kernel
+    kernel --> ext
+    kernel <--> kg
+    kernel --> model
 ```
 
-The model-visible request is a deterministic projection of effective tools,
-conversation state, and provider dialect. Plugin ids, load paths, generations,
-timestamps, journals, and TinyKG receipts do not enter the prompt. An equivalent
-runtime replacement therefore keeps provider-visible bytes stable; only a real
-capability or context change invalidates the cache prefix.
+## Project status
 
-## TinyKG boundary
+metacodes is pre-1.0. The version is declared in `build.zig.zon`, and releases
+ship for three platforms with checksums.
 
-TinyKG is a separately maintained executable and storage engine. Metacodes owns:
+| Area | Status |
+|---|---|
+| CLI, headless, web UI, daemon | Used daily; flags may still change before 1.0 |
+| AgentCore C ABI | Experimental; hosts pin the exact revision |
+| `metacodes-core` Zig module | Experimental source API |
+| TinyKG memory and task DAG | On by default in the CLI; not yet in AgentCore |
+| Lean project rules | Experimental; dormant until a project activates them |
+| Self-evolution, learning turn, check gate | Experimental, off by default |
+| Sandbox | macOS only, opt-in |
 
-- when memory or task evidence is proposed;
-- Lean/policy admission and re-observation;
-- commit, rollback, budget, and user-visible receipts;
-- runtime transport selection and degraded behavior.
+Milestones are tracked in [ROADMAP.md](ROADMAP.md) and launch readiness in
+[OPEN_SOURCE_READINESS.md](OPEN_SOURCE_READINESS.md).
 
-TinyKG owns its binary/storage implementation, authenticated daemon protocol,
-generation/CAS primitives, and graph persistence. Metacodes never imports TinyKG
-source and never silently falls back from the daemon to a shared raw store.
+## Who builds it
 
-## Benchmarks
+metacodes is developed by Metask Lab, the team behind
+[Metask](https://app.metask-ai.com) (杭州元任务科技). Every Metask product's
+agent engine is built on it, including MetaCode, MetaWork and Metask Bot. A
+full-time team therefore keeps it running in production and in step with new
+models. This repository is that engine, released under the MIT license.
 
-[doc/BENCHMARKS.md](doc/BENCHMARKS.md) indexes how metacodes is measured: local
-performance gates, the internal paired-evaluation control plane and its
-receipt-bound results so far, and the external WorkBuddy-Bench mainline
-(pinned framework, anti-contamination cohorts, W0–W10 ladder with current
-status). No external quality score is claimed until the corresponding ladder
-stage has actually run; paid evaluation runs are never part of the default
-development loop.
+## Contributing
 
-## Contributing and security
+We want contributors, and the most useful work right now is:
 
-Read [AGENTS.md](AGENTS.md) before changing code, then
-[CONTRIBUTING.md](CONTRIBUTING.md). Security reports must follow
-[SECURITY.md](SECURITY.md), not public issues. Paid benchmark runs require explicit
-authorization and are never part of the default development loop.
+- **Bindings.** A Go binding, the Windows port of the Node addon, publishing
+  the Python and Node packages, and a 30-line "hello agent" in C.
+- **Quality.** Closing the WorkBuddy Security gap, and offline regression
+  fixtures for real failures.
+- **Memory research.** A Markdown-memory or vector-RAG comparison arm against
+  TinyKG.
+- **Platforms.** A Linux sandbox backend (bubblewrap or Landlock), and
+  aarch64 Linux and Intel macOS releases.
 
-## 中文简介
+[CONTRIBUTING.md](CONTRIBUTING.md) maps each area to a starting point and
+explains how changes get accepted. Read [AGENTS.md](AGENTS.md) before your
+first pull request; it is short. Questions go to
+[Discussions](https://github.com/metask-ai/metacodes/discussions), and
+vulnerabilities go through [SECURITY.md](SECURITY.md), never public issues.
 
-metacodes 是一个可嵌入、极低资源占用、内置 coding agent loop 的 Zig agent core。
-插件可以扩展工具、MCP、provider 方言和宿主形态，但不能绕过权限、预算、形式化判定、
-TinyKG 治理与因果边界。TinyKG 采用独立维护、跨平台、哈希锁定的二进制 bundle，
-不再把源码复制进本仓库，也不会在构建时下载或隐式寻找开发目录。
-项目目前处于 public review、pre-1.0 阶段；仓库已包含 MIT 许可证，但开源发布门禁仍未全部完成，详见 [OPEN_SOURCE_READINESS.md](OPEN_SOURCE_READINESS.md)。
+## Documentation
+
+| | |
+|---|---|
+| [doc/GETTING_STARTED.md](doc/GETTING_STARTED.md) | Install, providers, build from source |
+| [doc/API.md](doc/API.md) | Every supported entry point and its compatibility |
+| [doc/AGENTCORE_BINARY_ABI.md](doc/AGENTCORE_BINARY_ABI.md) | The normative C ABI contract |
+| [doc/BENCHMARKS.md](doc/BENCHMARKS.md) | How metacodes is measured, and every result so far |
+| [doc/README.md](doc/README.md) | Index of all design documents |
+
+## License
+
+[MIT](LICENSE). Bundled third-party components keep their own licenses; see
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

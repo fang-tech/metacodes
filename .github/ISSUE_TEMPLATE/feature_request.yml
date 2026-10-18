@@ -1,0 +1,36 @@
+name: Feature or proposal
+description: Propose a capability, binding, integration or design change
+title: "proposal: "
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Open-ended ideas fit better in Discussions; use this form when you can
+        describe the outcome and the boundary. Changes to the kernel boundary,
+        a public API/ABI or prompt bytes need agreement here before code.
+  - type: textarea
+    id: outcome
+    attributes:
+      label: Outcome
+      description: What should a user, host or contributor be able to do afterwards?
+    validations:
+      required: true
+  - type: textarea
+    id: boundary
+    attributes:
+      label: Where it lives
+      description: Plugin, host surface, kernel, SDK binding, eval, docs? Which files or documents?
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: How we will know it works
+      description: The test or measurement that would show the change taking effect.
+  - type: checkboxes
+    id: contribute
+    attributes:
+      label: Contribution
+      options:
+        - label: I would like to implement this myself
