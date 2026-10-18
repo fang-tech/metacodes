@@ -3,9 +3,9 @@
 `ci.yml` runs the AGENTS.md pre-submit checklist on three platforms plus the
 offline TTY suites. One run takes about 25 minutes of wall time. The gates
 take 20 to 25 minutes per platform, TTY (Linux) about 13 and TTY (Windows)
-about 23. This document covers three things: which of that work a change has
-to pay for (§2), and how a batch of approved PRs is tested and merged once
-instead of once per PR (§3).
+about 23. This document covers how a required job skips work (§1), which of
+that work a change has to pay for (§2), and how a batch of approved PRs lands
+without every PR merging `main` in and starting over (§3).
 
 ## 1. Required checks and how a job skips work
 
@@ -44,7 +44,7 @@ plus an add, so moving a file out of `doc/` is a code change.
 
 | Scope | Every changed path is | What runs |
 |---|---|---|
-| `docs` | `doc/**`, or a top-level `*.md` other than `README.md` and `CHANGELOG.md` | Documentation link and fact checks, their unit tests, the gate-manifest test, the version state gate and the diff check |
+| `docs` | `doc/**`, or a top-level `*.md` other than the three the release layout installs, added or edited (not removed) | Documentation link and fact checks, their unit tests, the gate-manifest test, the version state gate and the diff check |
 | `eval` | documentation, `scripts/eval/**` or `evals/**` | All three gates in full; the TTY jobs report success without running |
 | `full` | anything else | Everything |
 
@@ -53,8 +53,14 @@ error.
 
 The boundaries are deliberately narrow:
 
-- **`README.md` and `CHANGELOG.md` are not documentation for this purpose.**
-  `build.zig` installs both into the release layout.
+- **`README.md`, `CHANGELOG.md` and `THIRD_PARTY_NOTICES.md` are not
+  documentation for this purpose.** `build.zig` installs all three into the
+  release layout, and `gen_third_party_notices.py --check` regenerates the
+  notices. A test checks the list against `build.zig`.
+- **Removing or moving a documentation file is a code change.** Other files
+  pin doc paths: `evals/plugin-v1/protocol.json` lists some in
+  `implementation_paths`, which `zig build test` resolves. Adding or editing
+  a doc file is harmless, because that fingerprint is stale by design.
 - **Markdown outside `doc/` and the top level is an input.** Prompt templates
   are `@embedFile`'d, and agent and Skill fixtures are read by tests.
 - **The evaluation harness keeps the gates.** `zig build test` runs its suites
@@ -72,14 +78,18 @@ another. With N PRs ready, that is close to N²/2 runs in series.
 The merge queue removes the up-to-date requirement and tests what will
 actually land:
 
-- An approved PR joins the queue. The queue builds a temporary branch,
-  `gh-readonly-queue/main/pr-<n>-<sha>`, with `main` plus the PRs ahead of it
-  and the PR itself merged in order.
-- The workflow runs on that branch through the `merge_group` event, and a
-  group of several PRs is tested in one run.
-- When the group passes, its PRs merge together, and `main` becomes exactly
-  the tested tree. When it fails, the queue drops the failing PR and retests
-  the rest without it.
+- An approved PR joins the queue. The queue builds a temporary branch for it,
+  `gh-readonly-queue/main/pr-<n>-<sha>`, with `main` plus every PR ahead of
+  it and the PR itself merged in order. The workflow runs on that branch
+  through the `merge_group` event.
+- Each entry is tested once, on top of the entries ahead of it. Up to the
+  build concurrency of these runs go in parallel. N queued PRs therefore
+  take about one run's wall time and N runs, instead of N runs in series
+  plus a merge-`main`-and-rerun round for each PR still waiting.
+- When an entry's run passes, the queue merges it together with the entries
+  ahead of it that passed, up to the maximum group size, and `main` becomes
+  exactly a tested tree. When it fails, the queue drops that PR and rebuilds
+  the entries behind it without it.
 
 `ci.yml` and `agentcore-windows.yml` run on `merge_group`. In a group:
 
@@ -88,13 +98,16 @@ actually land:
 - **Release fast path** also diffs against `base_sha`. Only a group whose
   whole diff is the generated bump takes the fast path, which in practice
   means the bump queued alone.
-- **Version state gate.** The event carries no pull request, so the gate
-  takes the PR number from the group's ref and checks that PR's head branch,
-  title and labels. The release PR therefore passes only at the top of its
-  group. A PR queued behind it sees the bare released version and is dropped
-  from the queue, exactly as it would be refused on `main`, until the reopen
-  PR has merged
+- **Version state gate.** The event carries no pull request. The group's ref
+  names the PR at its head, the newest entry, so the gate checks that PR's
+  head branch, title and labels. The release PR therefore passes only as its
+  group's head. A PR queued behind it sees the bare released version and is
+  dropped from the queue, exactly as it would be refused on `main`, until
+  the reopen PR has merged
   ([RELEASE_AUTOMATION_DESIGN.md](RELEASE_AUTOMATION_DESIGN.md) stage D).
+  This relies on every entry having to pass its own run. Under "only the
+  head must pass" (HEADGREEN), a PR queued just ahead of the reopen PR would
+  merge with it although its own run was refused.
 
 ### Switching it on
 
@@ -106,20 +119,27 @@ ruleset can be switched in one edit. A maintainer makes it in `Protect main`:
   guarantee.
 - **Add "require merge queue"** with these settings:
   - merge method: merge commit (the repository's history convention);
-  - maximum group size 5 and minimum 1, waiting up to 5 minutes to fill a
-    group;
-  - build concurrency 5;
-  - every entry must pass the required checks;
-  - status check timeout 60 minutes, since TTY (Windows) takes about 25 and
-    a cold runner more.
+  - build concurrency 5: up to five entries tested at once, about eight
+    hosted jobs each;
+  - maximum group size 5 and minimum 1. With a minimum of 1 the wait time
+    setting has no effect;
+  - only merge non-failing pull requests (ALLGREEN), which the release
+    ordering above relies on;
+  - status check timeout 120 minutes. The long pole is a version-bump entry:
+    `Release fast path` can wait up to 45 minutes for the base's push run
+    before the gates start, and then they run in full if that run was not
+    green.
 
 ### What stays the same
 
-Every push to `main` still runs the full workflow. The release fast path
-needs that run: its base check is the base commit's push run
-(`release_fast_path.py`). Once the queue merges every PR, that run repeats
-the group's run on the same tree. Replacing it, for instance with a nightly
-full run plus a fast-path base check that accepts the merge group run, is
-the next step and is not designed here. The per-PR `pull_request` run also
-stays full for now; with the queue as the final gate it could shrink to a
-subset.
+Pushes to `main` still run the full workflow. The release fast path needs
+that run, because its base check is the base commit's push run
+(`release_fast_path.py`). When merges land back to back, the concurrency
+group cancels the older push run. A release or reopen PR whose base run was
+cancelled then takes the full path, which costs one run and never coverage.
+
+Once the queue merges every PR, the push run repeats an entry's run on the
+same tree. Replacing it, for instance with a nightly full run plus a
+fast-path base check that accepts the merge group run, is the next step and
+is not designed here. The per-PR `pull_request` run also stays full for now;
+with the queue as the final gate it could shrink to a subset.

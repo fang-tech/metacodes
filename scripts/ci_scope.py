@@ -11,10 +11,13 @@ the same way).
 Scopes, narrowest first:
 
 - `docs`: every changed path is documentation that no build, test or release
-  layout reads: `doc/**`, and the top-level Markdown files other than
-  README.md and CHANGELOG.md (build.zig installs those two into the release
-  layout). Only the documentation, version-state and gate-manifest checks
-  run; `suites=false` and `tty=false`.
+  layout reads: `doc/**`, and the top-level Markdown files other than the
+  ones build.zig installs into the release layout (README.md, CHANGELOG.md,
+  THIRD_PARTY_NOTICES.md). Only the documentation, version-state and
+  gate-manifest checks run; `suites=false` and `tty=false`. A *deleted*
+  documentation file is not documentation-only: pins elsewhere name doc
+  paths (evals/plugin-v1/protocol.json `implementation_paths`, which
+  `zig build test` resolves), so removing or moving one is the full scope.
 - `eval`: every changed path is documentation or the Python evaluation
   harness (`scripts/eval/**`, `evals/**`). The gates run in full, since
   `zig build test` runs the harness's suites and smokes against the built
@@ -42,8 +45,10 @@ ROOT = Path(__file__).resolve().parents[1]
 # The events whose diff against a base decides the scope; every other event
 # (push to main, workflow_dispatch) runs in full.
 DIFF_EVENTS = ("pull_request", "merge_group")
-# Top-level Markdown that the release layout installs (build.zig, share/doc).
-RELEASE_DOCS = ("README.md", "CHANGELOG.md")
+# Top-level Markdown that the release layout installs (build.zig, share/doc
+# and share/licenses); scripts/tests/test_ci_scope.py checks the list against
+# build.zig.
+RELEASE_DOCS = ("README.md", "CHANGELOG.md", "THIRD_PARTY_NOTICES.md")
 EVAL_PREFIXES = ("scripts/eval/", "evals/")
 SHOWN = 5
 
@@ -63,10 +68,14 @@ def _shown(paths: Sequence[str]) -> str:
     return listed + (f" and {len(paths) - SHOWN} more" if len(paths) > SHOWN else "")
 
 
-def classify(paths: Sequence[str]) -> Tuple[str, str]:
-    """(scope, reason) for the changed `paths`."""
+def classify(paths: Sequence[str], deleted: Sequence[str] = ()) -> Tuple[str, str]:
+    """(scope, reason) for the changed `paths`, of which `deleted` were
+    removed (a rename is a removal plus an addition)."""
     if not paths:
         return "full", "full scope: the change has no paths"
+    removed_docs = [path for path in deleted if is_docs(path)]
+    if removed_docs:
+        return "full", f"full scope: {_shown(removed_docs)} removed; pins and links elsewhere can name a documentation path"
     if all(is_docs(path) for path in paths):
         return "docs", f"docs scope: only documentation changed ({_shown(paths)})"
     outside = [path for path in paths if not (is_docs(path) or is_eval(path))]
@@ -75,30 +84,37 @@ def classify(paths: Sequence[str]) -> Tuple[str, str]:
     return "full", f"full scope: {_shown(outside)} can affect every suite"
 
 
-def changed_paths(root: Path, base: str, candidate: str) -> Tuple[str, ...]:
+Change = Tuple[str, str]  # (git status letter, path)
+
+
+def changed_paths(root: Path, base: str, candidate: str) -> Tuple[Change, ...]:
     proc = subprocess.run(
-        ["git", "diff", "--name-only", "--no-renames", "-z", base, candidate],
+        ["git", "diff", "--name-status", "--no-renames", "-z", base, candidate],
         cwd=str(root),
         capture_output=True,
         check=False,
     )
     if proc.returncode != 0:
         raise RuntimeError(f"git diff failed: {proc.stderr.decode('utf-8', 'replace').strip()}")
-    return tuple(path for path in proc.stdout.decode("utf-8").split("\0") if path)
+    fields = [field for field in proc.stdout.decode("utf-8").split("\0") if field]
+    if len(fields) % 2:
+        raise RuntimeError("git diff --name-status output is not status/path pairs")
+    return tuple((fields[i][:1], fields[i + 1]) for i in range(0, len(fields), 2))
 
 
 def decide(
     event: str,
     base: str,
     candidate: str,
-    paths: Callable[[str, str], Sequence[str]],
+    changes: Callable[[str, str], Sequence[Change]],
 ) -> Tuple[str, str]:
     if event not in DIFF_EVENTS:
         return "full", f"full scope: {event or 'unknown'} run"
     if not base:
         return "full", f"full scope: no base for the {event} run"
     try:
-        return classify(list(paths(base, candidate)))
+        found = list(changes(base, candidate))
+        return classify([path for _, path in found], [path for status, path in found if status == "D"])
     except Exception as exc:  # any doubt is the full scope, never a red job
         return "full", f"full scope: the scope check failed: {exc}"
 

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import io
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -21,6 +22,9 @@ sys.path.insert(0, str(ROOT / "scripts"))
 import ci_scope  # noqa: E402
 
 WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
+AGENTCORE_WORKFLOW = ROOT / ".github" / "workflows" / "agentcore-windows.yml"
+# The runner's own bash invocation for `run:` steps.
+BASH = ["bash", "--noprofile", "--norc", "-eo", "pipefail", "-c"]
 CHECKOUT = "actions/checkout@11d5960a326750d5838078e36cf38b85af677262"
 # The `gates` steps that also run on a documentation-only change. A new step
 # must either read SUITES or be added here on purpose.
@@ -46,11 +50,27 @@ class ClassifyTest(unittest.TestCase):
                 self.assertEqual(ci_scope.classify(paths)[0], "docs")
 
     def test_markdown_the_release_layout_installs_is_not_documentation(self) -> None:
-        # build.zig installs README.md and CHANGELOG.md into share/doc.
-        for path in ("README.md", "CHANGELOG.md"):
+        # build.zig installs these into share/doc and share/licenses, and
+        # gen_third_party_notices.py --check regenerates the notices.
+        for path in ("README.md", "CHANGELOG.md", "THIRD_PARTY_NOTICES.md"):
             with self.subTest(path=path):
                 self.assertEqual(ci_scope.classify([path])[0], "full")
                 self.assertEqual(ci_scope.classify(["doc/API.md", path])[0], "full")
+
+    def test_every_top_level_file_build_zig_installs_is_excluded(self) -> None:
+        build = (ROOT / "build.zig").read_text(encoding="utf-8")
+        installed = set(re.findall(r'\.source = "([^"/]+\.md)"', build))
+        self.assertIn("THIRD_PARTY_NOTICES.md", installed)  # the pattern still finds them
+        self.assertEqual(installed - set(ci_scope.RELEASE_DOCS), set())
+
+    def test_a_removed_documentation_file_is_the_full_scope(self) -> None:
+        # evals/plugin-v1/protocol.json pins doc paths that zig build test resolves.
+        scope, reason = ci_scope.classify(["doc/CORE_REFERENCE.md", "doc/history/CORE_REFERENCE.md"],
+                                          deleted=["doc/CORE_REFERENCE.md"])
+        self.assertEqual(scope, "full")
+        self.assertIn("doc/CORE_REFERENCE.md removed", reason)
+        # Removing harness files keeps the eval scope; only doc removals widen it.
+        self.assertEqual(ci_scope.classify(["scripts/eval/old.py"], deleted=["scripts/eval/old.py"])[0], "eval")
 
     def test_markdown_outside_doc_and_the_top_level_is_an_input(self) -> None:
         # Prompt templates are @embedFile'd; agent and Skill fixtures are read by tests.
@@ -96,7 +116,7 @@ class DecideTest(unittest.TestCase):
 
         def diff(base: str, candidate: str):
             seen.append((base, candidate))
-            return ["doc/API.md"]
+            return [("M", "doc/API.md")]
 
         self.assertEqual(ci_scope.decide("pull_request", "HEAD^1", "HEAD", diff)[0], "docs")
         self.assertEqual(ci_scope.decide("merge_group", "a" * 40, "HEAD", diff)[0], "docs")
@@ -156,6 +176,19 @@ class MainTest(unittest.TestCase):
         self.commit("rename")
         got = self.run_main("merge_group", self.git("rev-parse", "HEAD^1").strip())
         self.assertEqual((got["scope"], got["suites"], got["tty"]), ("full", "true", "true"))
+
+    def test_a_move_within_doc_is_the_full_scope(self) -> None:
+        (self.repo / "doc" / "history").mkdir()
+        self.git("mv", "doc/A.md", "doc/history/A.md")
+        self.commit("retire")
+        got = self.run_main("pull_request", "HEAD^1")
+        self.assertEqual((got["scope"], got["suites"], got["tty"]), ("full", "true", "true"))
+        self.assertIn("doc/A.md removed", got["reason"])
+
+    def test_an_added_documentation_file_keeps_the_docs_scope(self) -> None:
+        (self.repo / "doc" / "B.md").write_text("b\n", encoding="utf-8")
+        self.commit("add")
+        self.assertEqual(self.run_main("pull_request", "HEAD^1")["scope"], "docs")
 
     def test_an_unknown_base_is_the_full_scope_and_exits_zero(self) -> None:
         got = self.run_main("merge_group", "0" * 40)
@@ -229,7 +262,7 @@ class WorkflowTest(unittest.TestCase):
             env = dict(os.environ, PATH=f"{bindir}{os.pathsep}{os.environ['PATH']}", FAKE_LOG=str(log),
                        GITHUB_EVENT_NAME=event, GITHUB_OUTPUT=str(output), GITHUB_REPOSITORY="o/r",
                        MERGE_GROUP_BASE_SHA="b" * 40 if event == "merge_group" else "")
-            proc = subprocess.run(["bash", "-e", "-c", step["run"]], env=env, capture_output=True, text=True)
+            proc = subprocess.run([*BASH, step["run"]], env=env, capture_output=True, text=True)
             calls = log.read_text(encoding="utf-8").splitlines() if log.exists() else []
             return proc, calls, output.read_text(encoding="utf-8")
 
@@ -258,6 +291,71 @@ class WorkflowTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(len(calls), 1, calls)
         self.assertTrue(calls[0].startswith("python3 scripts/ci_scope.py --event push --base  --candidate HEAD "), calls)
+
+
+
+class AgentCoreWorkflowTest(unittest.TestCase):
+    """agentcore-windows.yml's scope step, with its `${{ }}` expressions
+    rendered the way the runner renders them."""
+
+    def setUp(self) -> None:
+        try:
+            import yaml
+        except ImportError:  # requirements-dev.txt
+            self.skipTest("PyYAML is not installed")
+        workflow = yaml.safe_load(AGENTCORE_WORKFLOW.read_text(encoding="utf-8"))
+        self.workflow = workflow
+        self.step = next(s for s in workflow["jobs"]["native-windows-gate"]["steps"] if s.get("id") == "scope")
+
+    def test_the_merge_queue_runs_the_workflow(self) -> None:
+        self.assertIn("merge_group", self.workflow.get("on", self.workflow.get(True)))
+
+    def render(self, event: str) -> str:
+        values = {
+            "github.event_name": event,
+            "github.event.pull_request.base.sha": "p" * 40 if event == "pull_request" else "",
+            "github.event.merge_group.base_sha": "m" * 40 if event == "merge_group" else "",
+        }
+        rendered = re.sub(r"\$\{\{\s*([^}]+?)\s*\}\}", lambda m: values[m.group(1)], self.step["run"])
+        self.assertNotIn("${{", rendered)
+        return rendered
+
+    def run_step(self, event: str, changed: str) -> tuple:
+        with tempfile.TemporaryDirectory() as tmp:
+            bindir = Path(tmp) / "bin"
+            bindir.mkdir()
+            log = Path(tmp) / "calls.log"
+            fake = bindir / "git"
+            fake.write_text('#!/bin/sh\necho "git $*" >> "$FAKE_LOG"\n'
+                            'case "$1" in diff) printf "%s\\n" "$FAKE_CHANGED" ;; esac\n', encoding="utf-8")
+            fake.chmod(0o755)
+            output = Path(tmp) / "github-output"
+            output.write_text("", encoding="utf-8")
+            env = dict(os.environ, PATH=f"{bindir}{os.pathsep}{os.environ['PATH']}", FAKE_LOG=str(log),
+                       FAKE_CHANGED=changed, GITHUB_OUTPUT=str(output))
+            proc = subprocess.run([*BASH, self.render(event)], env=env, capture_output=True, text=True)
+            calls = log.read_text(encoding="utf-8").splitlines() if log.exists() else []
+            return proc, calls, output.read_text(encoding="utf-8")
+
+    @unittest.skipIf(os.name == "nt", "POSIX executable fixture")
+    def test_a_merge_group_is_judged_by_its_diff_against_the_group_base(self) -> None:
+        proc, calls, output = self.run_step("merge_group", "doc/API.md")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(calls, ["git fetch -q --depth=1 origin " + "m" * 40, "git diff --name-only %s HEAD" % ("m" * 40)])
+        self.assertIn("relevant=false", output)
+        proc, _, output = self.run_step("merge_group", "src/agentcore/abi_v1.zig")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("relevant=true", output)
+
+    @unittest.skipIf(os.name == "nt", "POSIX executable fixture")
+    def test_a_pull_request_diffs_against_its_base_and_a_push_runs_everything(self) -> None:
+        proc, calls, _ = self.run_step("pull_request", "doc/API.md")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(calls[0], "git fetch -q --depth=1 origin " + "p" * 40)
+        proc, calls, output = self.run_step("push", "")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(calls, [])
+        self.assertIn("relevant=true", output)
 
 
 if __name__ == "__main__":

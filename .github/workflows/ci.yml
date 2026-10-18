@@ -250,11 +250,12 @@ jobs:
       # payload of release: 0.2.1 (#176) carried none, so the gate refused
       # its own release PR. On the release fast path this and the checkout are
       # the only steps that run, so the gate skips the rehearsal tag. A merge
-      # queue group carries no PR in its event: it is named after the PR at
-      # its top (gh-readonly-queue/<base>/pr-<n>-<sha>), and the gate judges
-      # that PR's head branch, title and labels. So the release PR passes only
-      # at the top of its group, and a PR queued behind it sees the bare
-      # version and is refused, exactly as it would be on main.
+      # queue group carries no PR in its event: its ref names the PR at its
+      # head, the newest entry (gh-readonly-queue/<base>/pr-<n>-<sha>), and
+      # the gate judges that PR's head branch, title and labels. So the
+      # release PR passes only as its group's head, and a PR queued behind it
+      # sees the bare version and is refused, exactly as it would be on main
+      # (doc/CI_DESIGN.md §3; it relies on the queue's ALLGREEN setting).
       - name: Version state gate and release rehearsal
         env:
           GH_TOKEN: ${{ github.token }}
@@ -597,7 +598,7 @@ jobs:
           zig test src/platform/net.zig -lc &&
           zig test src/platform/dir.zig -lc &&
           zig test src/platform/exe_lookup.zig -lc
-      # Current labels and the merge queue's top PR, as in the `gates` job;
+      # Current labels and the merge queue's head PR, as in the `gates` job;
       # bash for the same script.
       - name: Version state gate and release rehearsal
         if: env.FAST_PATH != 'true' && env.SUITES != 'false'

@@ -603,7 +603,9 @@ class VersionGateStepTest(unittest.TestCase):
                        MERGE_GROUP_HEAD_REF=merge_group_ref)
             env.pop("RELEASE_PR_LABELS", None)
             env.pop("GITHUB_HEAD_REF", None)
-            proc = subprocess.run(["bash", "-e", "-c", step["run"]], env=env, capture_output=True, text=True)
+            # The runner's own invocation for a `run:` step.
+            proc = subprocess.run(["bash", "--noprofile", "--norc", "-eo", "pipefail", "-c", step["run"]],
+                                  env=env, capture_output=True, text=True)
             calls = log.read_text(encoding="utf-8").splitlines() if log.exists() else []
         return proc, calls
 
@@ -615,9 +617,9 @@ class VersionGateStepTest(unittest.TestCase):
             self.assertEqual(len(calls), 1, job)
             self.assertTrue(calls[0].startswith("api repos/o/r/issues/176/labels "), calls[0])
 
-    def test_a_merge_queue_run_judges_the_pr_at_the_top_of_its_group(self):
+    def test_a_merge_queue_run_judges_the_pr_at_the_head_of_its_group(self):
         """A merge_group event carries no PR: the group's ref names the PR at
-        its top, and the gate gets that PR's head branch, title and labels."""
+        its head (the newest entry), and the gate gets that PR's head branch, title and labels."""
         for job in ("gates", "windows-gates"):
             proc, calls = self.run_step(job, "", self.QUEUE_REF, title="")
             self.assertEqual(proc.returncode, 0, proc.stderr)
@@ -627,6 +629,14 @@ class VersionGateStepTest(unittest.TestCase):
             self.assertTrue(calls[0].startswith("api repos/o/r/pulls/176 "), calls[0])
             self.assertTrue(calls[1].startswith("api repos/o/r/pulls/176 "), calls[1])
             self.assertTrue(calls[2].startswith("api repos/o/r/issues/176/labels "), calls[2])
+
+    def test_a_merge_queue_run_fails_closed_when_the_pr_cannot_be_read(self):
+        self.GH = '#!/bin/sh\necho "$*" >> "$FAKE_GH_LOG"\necho "HTTP 404" >&2\nexit 1\n'
+        for job in ("gates", "windows-gates"):
+            proc, calls = self.run_step(job, "", self.QUEUE_REF, title="")
+            self.assertNotEqual(proc.returncode, 0, job)
+            self.assertNotIn("argv=scripts/check_version_state.py", proc.stdout, job)
+            self.assertEqual(len(calls), 1, (job, calls))
 
     def test_a_merge_group_ref_without_a_pr_is_refused(self):
         for job in ("gates", "windows-gates"):
