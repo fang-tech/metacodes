@@ -3,8 +3,11 @@
 //! `decide` is the gate (pure, so every reason to stay quiet is testable);
 //! `play` paces frames on the region below the cursor, lets any key jump to
 //! the settled wordmark, and always ends with the cursor shown and SGR reset.
-//! The key that skips is consumed: before the prompt exists there is nowhere
-//! for it to go, and the input box's own raw-mode entry flushes type-ahead.
+//! The key that skips is consumed, without blocking even when it types
+//! nothing (a bare modifier on Windows): before the prompt exists there is
+//! nowhere for it to go, and the input box's own raw-mode entry flushes
+//! type-ahead. The size is checked before every frame, the settled one
+//! included, so no frame is drawn at a size the terminal no longer has.
 
 const std = @import("std");
 const platform = @import("platform");
@@ -97,6 +100,10 @@ pub fn play(gpa: std.mem.Allocator, plan: Plan, style: splash.Style, seed: u64) 
     const outcome: Outcome = run: while (true) {
         const t = secondsSince(start);
         if (t >= splash.duration) break :run .completed;
+        // Before every write: a frame drawn at the old width wraps every row
+        // on a narrowed terminal, and the next cursor-up redraw lands on the
+        // wrong rows.
+        if (!sameSize(plan.size)) break :run .resized;
         sp.advanceTo(t);
         sp.compose(t, frames);
         buf.clearRetainingCapacity();
@@ -104,19 +111,24 @@ pub fn play(gpa: std.mem.Allocator, plan: Plan, style: splash.Style, seed: u64) 
         // Count the frame before writing: a short write may already have hidden the cursor.
         frames += 1;
         if (!writeAll(buf.items)) break :run .write_failed;
-        if (!sameSize(plan.size)) break :run .resized;
         const deadline = start + @as(util_time.Nanos, frames) * splash.frame_ns;
         if (platform_term.waitReadable(0, msUntil(deadline)) > 0) {
-            drainInput();
+            platform_term.discardPendingInput(0);
             break :run .skipped_by_key;
         }
     };
 
+    var final = outcome;
     if (frames > 0) {
-        const settle = switch (outcome) {
+        var settle = switch (outcome) {
             .completed, .skipped_by_key, .out_of_memory => true,
             .resized, .write_failed, .no_raw_mode => false,
         };
+        // The settled frame is a write like any other.
+        if (settle and !sameSize(plan.size)) {
+            settle = false;
+            final = .resized;
+        }
         var settled = false;
         if (settle) {
             sp.composeFinal();
@@ -127,7 +139,7 @@ pub fn play(gpa: std.mem.Allocator, plan: Plan, style: splash.Style, seed: u64) 
         }
         if (!settled) _ = writeAll("\x1b[0m\x1b[?2026l\x1b[?25h");
     }
-    return outcome;
+    return final;
 }
 
 fn secondsSince(start: util_time.Nanos) f32 {
@@ -144,14 +156,6 @@ fn msUntil(deadline: util_time.Nanos) i32 {
 fn sameSize(size: term.TermSize) bool {
     const now = term.getSize(1) orelse return false;
     return now.cols == size.cols and now.rows == size.rows;
-}
-
-fn drainInput() void {
-    var scratch: [64]u8 = undefined;
-    var rounds: u8 = 0;
-    while (rounds < 16 and platform_term.waitReadable(0, 0) > 0) : (rounds += 1) {
-        if (platform_term.readInput(0, &scratch) <= 0) break;
-    }
 }
 
 fn writeAll(bytes: []const u8) bool {

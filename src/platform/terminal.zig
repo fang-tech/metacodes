@@ -60,6 +60,7 @@ extern "kernel32" fn WaitForSingleObject(hHandle: win.HANDLE, dwMilliseconds: wi
 extern "kernel32" fn GetNumberOfConsoleInputEvents(hConsoleInput: win.HANDLE, lpcNumberOfEvents: *win.DWORD) callconv(.winapi) c_int;
 extern "kernel32" fn PeekConsoleInputW(hConsoleInput: win.HANDLE, lpBuffer: *INPUT_RECORD, nLength: win.DWORD, lpNumberOfEventsRead: *win.DWORD) callconv(.winapi) c_int;
 extern "kernel32" fn ReadConsoleInputW(hConsoleInput: win.HANDLE, lpBuffer: *INPUT_RECORD, nLength: win.DWORD, lpNumberOfEventsRead: *win.DWORD) callconv(.winapi) c_int;
+extern "kernel32" fn FlushConsoleInputBuffer(hConsoleInput: win.HANDLE) callconv(.winapi) c_int;
 const KEY_EVENT: u16 = 0x0001;
 const KEY_EVENT_RECORD = extern struct {
     bKeyDown: c_int,
@@ -194,6 +195,32 @@ pub fn waitReadable(fd: c_int, timeout_ms: i32) i32 {
     }
     var pfd = [_]std.c.pollfd{.{ .fd = fd, .events = std.c.POLL.IN, .revents = 0 }};
     return std.c.poll(&pfd, 1, timeout_ms);
+}
+
+/// Throw away every pending input event without ever blocking.
+///
+/// Windows console: the whole input queue goes, together with what
+/// `readInput` has already decoded. That includes key records that carry no
+/// character, such as a bare Shift, Ctrl, Alt, Win or CapsLock: `waitReadable`
+/// reports those as readable, and `ReadConsoleW` would then block until the
+/// next key that types something. POSIX, or a non-console fd: the bytes
+/// already readable, a bounded number of reads that never wait.
+pub fn discardPendingInput(fd: c_int) void {
+    if (is_windows and fd == 0) {
+        const h = GetStdHandle(STD_INPUT_HANDLE);
+        var mode: win.DWORD = 0;
+        if (GetConsoleMode(h, &mode) != 0) {
+            _ = FlushConsoleInputBuffer(h);
+            g_conin_len = 0;
+            g_conin_pos = 0;
+            return;
+        }
+    }
+    var scratch: [64]u8 = undefined;
+    var rounds: u8 = 0;
+    while (rounds < 16 and waitReadable(fd, 0) > 0) : (rounds += 1) {
+        if (readInput(fd, &scratch) <= 0) break;
+    }
 }
 
 pub const TermSize = struct { rows: u16, cols: u16 };
@@ -331,4 +358,19 @@ test "windowSize 非 tty 返 null 不 crash" {
     const fd = std.c.open("/dev/null", .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
     defer _ = std.c.close(fd);
     try std.testing.expectEqual(@as(?TermSize, null), windowSize(fd));
+}
+
+test "discardPendingInput drops readable bytes and never waits" {
+    if (is_windows) return;
+    var fds: [2]c_int = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.pipe(&fds));
+    defer _ = std.c.close(fds[0]);
+    defer _ = std.c.close(fds[1]);
+    try std.testing.expectEqual(@as(isize, 5), std.c.write(fds[1], "hello", 5));
+    try std.testing.expect(waitReadable(fds[0], 0) > 0);
+    discardPendingInput(fds[0]);
+    try std.testing.expectEqual(@as(i32, 0), waitReadable(fds[0], 0));
+    // Nothing pending: it returns at once instead of blocking on the read end.
+    discardPendingInput(fds[0]);
+    try std.testing.expectEqual(@as(i32, 0), waitReadable(fds[0], 0));
 }

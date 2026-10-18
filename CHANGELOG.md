@@ -18,8 +18,10 @@ status, compatibility boundaries, and entry points are defined by
   ASCII), then stays above the welcome box. It adapts to the terminal's colour
   depth and light or dark background, plays only when stdin and stdout are both
   terminals and the wordmark fits, and any key jumps to the settled frame.
-  `METACODES_NO_STARTUP_ANIMATION=1` or `"startupAnimation": false` in
-  `<state root>/config.json` turns it off.
+  `METACODES_NO_STARTUP_ANIMATION` set to any value, or `"startupAnimation":
+  false` in `<state root>/config.json`, turns it off. On Windows a bare
+  modifier key (Shift, Ctrl, Alt) skips it without blocking, and no frame is
+  drawn after the terminal changes size.
 
 - Python and Node packages over the AgentCore shared library (`sdk/python`,
   `sdk/node`; experimental, not yet published). Both offer a Runtime/Session
