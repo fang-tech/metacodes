@@ -208,6 +208,40 @@ def test_T24_esc_interrupts_then_resends_queue(bin_path):
         a._fail("中断后队列消息未自动续发提交")
 
 
+def test_esc_with_draft_interrupts_then_resends_draft(bin_path):
+    """生成期 Esc 即使框里有字也立即中断当前推理;已打的字先入队,中断后自动续发。
+    T22/T24 的离线版(慢 mock 流保证 Esc 落在生成窗口内,不依赖真模型时序)。"""
+    from slow_mock_server import SlowMockServer, simple_text, slow_text_then_end
+
+    with SlowMockServer([
+        # 首轮流 40×0.3s 远长于按键序列:Esc 必然落在生成期,自然结束不会掩盖"没中断"。
+        slow_text_then_end(n_chunks=40, delay=0.3),
+        simple_text("RESENT_OK"),
+    ]) as srv:
+        raw = run(bin_path, [
+            "sleep:0.8", "type:first", "key:enter", "sleep:0.8",
+            "type:DRAFTED", "sleep:0.3", "key:esc", "sleep:4.0",
+        ], base_url=srv.url, startup_drain=0.8, per_key_drain=0.05)
+
+    assert b"cancelled" in raw.lower(), "带 draft 的 Esc 没有中断当前推理"
+    assert len(srv.requests) >= 2, "Esc 中断后草稿没有自动续发"
+    assert b"DRAFTED" in srv.requests[1], "续发请求不含 Esc 前已打的草稿"
+    assert b"RESENT_OK" in raw, "续发轮的响应没有显示"
+
+
+def test_empty_esc_and_ctrl_c_interrupt_generation(bin_path):
+    """空输入框的 Esc/Ctrl+C 都必须唤醒并中断慢请求。"""
+    from slow_mock_server import SlowMockServer, slow_text_then_end
+
+    for key in ("esc", "ctrl_c"):
+        with SlowMockServer([slow_text_then_end(n_chunks=40, delay=0.3)]) as srv:
+            raw = run(bin_path, [
+                "sleep:0.8", "type:interrupt-me", "key:enter", "sleep:0.8",
+                f"key:{key}", "sleep:2.0",
+            ], base_url=srv.url, startup_drain=0.8, per_key_drain=0.05)
+        assert b"cancelled" in raw.lower(), f"空框 {key} 没有中断慢请求"
+
+
 def test_completion_spinner_never_commits_to_history(bin_path):
     # 用户实测 bug:每次回答完,spinner 的完成态词("✻ Hatched for 1s" / "Cooked for 1s" / "Drafted
     # for 2s")被 commit 进**历史消息区**,多轮后一行行堆噪声。产品决策:**spinner 根本不该进历史区**
@@ -487,4 +521,57 @@ def test_generation_frames_are_synchronized(bin_path):
     nb = raw.count(b"\x1b[?2026h")
     ne = raw.count(b"\x1b[?2026l")
     assert nb > 0 and nb == ne, f"生成期重画帧应被 DEC2026 同步输出成对包裹: begin={nb} end={ne}"
+
+    # 提交的用户行进入 scrollback 后，旧输入框的上边线不能一起泄露；
+    # 生成期的新输入框应独立出现在提交行下方。
+    a = TTYAssert(raw)
+    for sc in a.frame_screens:
+        prompt_rows = [
+            r for r in range(sc.rows) if sc.line_text(r).strip() == "❯ hi"
+        ]
+        has_active_box = sum(
+            1 for r in range(sc.rows) if sc.line_text(r).strip().startswith("❯")
+        ) >= 2
+        if prompt_rows and has_active_box:
+            assert not any(
+                r > 0 and a._is_rule_row(sc, r - 1) for r in prompt_rows
+            ), "提交的用户行上方不应残留输入框上边线"
+
+
+def test_first_cjk_turn_does_not_leave_generation_border(bin_path):
+    # 首轮没有助手正文时，生成区仍会先画 spinner/input box，再在退出时擦掉。
+    # 这个时序是 Windows ConPTY 最容易把生成区顶边留在首条用户消息上方的路径。
+    from slow_mock_server import SlowMockServer, slow_text_then_end
+
+    first = "你是谁"
+    second = "你有什么功能"
+    turns = [
+        slow_text_then_end(n_chunks=0, delay=0.4),
+        slow_text_then_end(n_chunks=0, delay=0.4),
+    ]
+    with SlowMockServer(turns) as srv:
+        raw = run(
+            bin_path,
+            [
+                "sleep:0.8",
+                "type:" + first,
+                "key:enter",
+                "sleep:1.2",
+                "type:" + second,
+                "sleep:0.8",
+            ],
+            base_url=srv.url,
+            startup_drain=0.8,
+            per_key_drain=0.06,
+            term_size=(24, 120),
+        )
+
+    a = TTYAssert(raw, cols=120)
+    for sc in a.frame_screens:
+        first_rows = [r for r in range(sc.rows) if sc.line_text(r).strip() == "❯ " + first]
+        second_rows = [r for r in range(sc.rows) if sc.line_text(r).strip() == "❯ " + second]
+        if first_rows and second_rows:
+            assert not any(
+                r > 0 and a._is_rule_row(sc, r - 1) for r in first_rows
+            ), "首轮提交消息上方不应残留生成区顶边"
 

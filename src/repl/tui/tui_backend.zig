@@ -648,6 +648,22 @@ pub const TuiBackend = struct {
         }
     }
 
+    /// 中断当前推理(Esc / 原始字节 Ctrl+C 共用):置 abort + 真的 shutdown 在飞连接 + 停 agent job。
+    fn interruptCurrentRun(self: *TuiBackend, app: *app_mod.App) void {
+        if (self.input_abort) |ab| {
+            ab.abort(.user_ctrl_c);
+            // 标志之外还要真的 shutdown 连接:对端沉默时主线程卡在 readv,标志永远没人看。
+            app.provider().cancel(ab);
+            self.cancel_sent = true;
+        }
+        // 多 agent:esc 还要 abort 所有 running agent job——前台 Task 的 subagent 走 app.abort
+        // 已被打断,但**后台/嵌套** agent job 持自己的 entry.abort,app.abort 不触达,否则 esc 后
+        // 它们继续跑(用户实测 bug:启动多 agent 后 esc 不终止)。非阻塞 abort,不 join。
+        if (app.agent_jobs) |*reg| {
+            _ = reg.abortAllRunningForSession(app.session_id);
+        }
+    }
+
     /// 处理一个已解析出的 Key(feed 出的 or flushEsc 出的孤立 ESC)。
     ///
     /// 统一分流:所有键先走 applyGenKey→dispatch(复用输入期 `?`/help/Ctrl+O/transcript 滚动
@@ -760,19 +776,13 @@ pub const TuiBackend = struct {
                     if (self.queue) |qq| _ = qq.push(v);
                 }
                 ed.clear();
-                if (self.input_abort) |ab| {
-                    ab.abort(.user_ctrl_c);
-                    // 标志之外还要真的 shutdown 连接:对端沉默时主线程卡在 readv,标志永远没人看。
-                    app.provider().cancel(ab);
-                    self.cancel_sent = true;
-                }
-                // 多 agent:esc 还要 abort 所有 running agent job——前台 Task 的 subagent 走 app.abort
-                // 已被打断,但**后台/嵌套** agent job 持自己的 entry.abort,app.abort 不触达,否则 esc 后
-                // 它们继续跑(用户实测 bug:启动多 agent 后 esc 不终止)。非阻塞 abort,不 join。
-                if (app.agent_jobs) |*reg| {
-                    _ = reg.abortAllRunningForSession(app.session_id);
-                }
+                self.interruptCurrentRun(app);
                 return; // 中断不重画(主线程很快收尾)
+            },
+            .ctrl_c => {
+                ed.clear();
+                self.interruptCurrentRun(app);
+                return;
             },
             else => {
                 // 普通编辑键 → 喂 LineEditor,重画生成区输入框。
