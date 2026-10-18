@@ -460,6 +460,11 @@ jobs:
   # Windows port.
   sdk-bindings:
     name: SDK bindings (${{ matrix.os }})
+    # A change confined to documentation or the evaluation harness (scope
+    # docs or eval, tty=false) cannot affect the packages, so the job is
+    # skipped; an empty scope output (the decision failed) runs it.
+    needs: scope
+    if: ${{ !cancelled() && needs.scope.outputs.tty != 'false' }}
     timeout-minutes: 45
     strategy:
       fail-fast: false
