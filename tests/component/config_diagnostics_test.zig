@@ -131,8 +131,11 @@ const Fixture = struct {
         self.tmp.cleanup();
     }
 
+    /// A settings or agent file as the product names it: `App.loadHooks` and
+    /// `AgentSet` append `/<rel>` to the directory, so on Windows the name
+    /// mixes `\` (from the cwd) with `/`. `std.fs.path.join` would not match.
     fn path(self: *Fixture, base: []const u8, rel: []const u8) ![]const u8 {
-        return std.fs.path.join(self.arena.allocator(), &.{ base, rel });
+        return std.fmt.allocPrint(self.arena.allocator(), "{s}/{s}", .{ base, rel });
     }
 
     /// What `/hooks`, `/skills` or `/agents` prints.
