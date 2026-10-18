@@ -322,8 +322,10 @@ def _build_env(base_url, env):
     return full_env, ephemeral_home
 
 
-def _drive(key_events, write, cap, set_size, per_key_drain):
+def _drive(key_events, write, cap, set_size, per_key_drain, signal_child=None):
     """按 key_events 驱动(两后端共用)。write 收 bytes;set_size 收 (rows, cols)。"""
+    # signal:stopcont is a POSIX-only regression hook that stops and continues
+    # the child through the real PTY.
     for ev in key_events:
         if ev.startswith("type:"):
             text = ev[5:]
@@ -355,6 +357,11 @@ def _drive(key_events, write, cap, set_size, per_key_drain):
         elif ev.startswith("raw:"):
             write(ev[4:].encode("latin-1", "ignore").decode("unicode_escape").encode("latin-1"))
             cap.drain_settle(per_key_drain, QUIET_KEY)
+        elif ev == "signal:stopcont":
+            if signal_child is None:
+                raise RuntimeError("signal:stopcont is only supported by the POSIX PTY driver")
+            signal_child()
+            cap.drain_settle(per_key_drain, QUIET_KEY)
 
 
 def run(bin_path, key_events, term_size=(24, 80), env=None,
@@ -378,6 +385,7 @@ def run(bin_path, key_events, term_size=(24, 80), env=None,
                          (等命令输出用:回显行 `❯ !echo X` 含 X 但整行不等于 X)
       "resize:RxC"       运行中改窗口(触 SIGWINCH / ConPTY resize)
       "raw:..."          原样字节(用 \\xNN 转义)
+      "signal:stopcont"  POSIX-only: stop and continue the child process
     """
     rows, cols = term_size
     # bin_path 转绝对路径:cwd 非 None 时子进程会 chdir,相对 bin_path 会失效。
@@ -447,8 +455,16 @@ def _run_posix(bin_path, key_events, term_size, full_env,
         except OSError:
             pass
 
+    def stop_continue():
+        import signal
+        os.kill(pid, signal.SIGSTOP)
+        # Give the kernel time to stop the child before delivering SIGCONT;
+        # otherwise a fast PTY test can accidentally exercise no stop at all.
+        time.sleep(0.05)
+        os.kill(pid, signal.SIGCONT)
+
     cap.drain(startup_drain)
-    _drive(key_events, write, cap, set_size, per_key_drain)
+    _drive(key_events, write, cap, set_size, per_key_drain, signal_child=stop_continue)
 
     cap.finish()
     try:

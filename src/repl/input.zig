@@ -12,6 +12,7 @@ const std = @import("std");
 const ppaths = @import("platform").paths;
 const pfs = @import("platform").fs;
 const platform_term = @import("platform").terminal;
+const platform_signal = @import("platform").signal;
 const process = @import("platform").process;
 
 // ============================================================================
@@ -281,6 +282,56 @@ fn byteToKey(b: u8) Key {
 // Raw mode（termios）
 // ============================================================================
 
+/// SIGCONT is handled asynchronously by publishing this bit.  The next
+/// foreground input poll performs the actual terminal IO in normal context.
+var g_resume_requested = std.atomic.Value(bool).init(false);
+
+fn onContinue() void {
+    g_resume_requested.store(true, .release);
+}
+
+/// Install the process-wide resume hook used by both input phases.
+pub fn installResumeHandler() void {
+    platform_signal.installContinue(onContinue);
+}
+
+/// Consume a pending SIGCONT and restore the intended raw/escape state.
+/// Re-entering raw mode is idempotent; the saved cooked mode belongs to the
+/// surrounding input phase and is never replaced by this reconciliation.
+pub fn reconcileAfterResume(fd: c_int) bool {
+    if (!g_resume_requested.swap(false, .acquire)) return false;
+    if (reconcileModes(fd)) return true;
+    // Keep the request pending if the descriptor was transiently unavailable;
+    // the next poll gets another chance to restore the interactive state.
+    g_resume_requested.store(true, .release);
+    return false;
+}
+
+/// Reconcile all terminal mode families with the intended interactive state.
+/// This is deliberately shared by initial entry and SIGCONT recovery so a new
+/// mode cannot be enabled in one path and forgotten in the other.
+pub fn reconcileModes(fd: c_int) bool {
+    if (platform_term.enterRaw(fd) == null) return false;
+    emitEnableSequences(fd);
+    return true;
+}
+
+fn emitEnableSequences(fd: c_int) void {
+    // Dumb terminals do not understand private modes; keep their output clean.
+    const term = std.c.getenv("TERM");
+    const dumb = term == null or std.mem.eql(u8, std.mem.span(term.?), "dumb") or std.mem.span(term.?).len == 0;
+    if (dumb) return;
+
+    // Kitty keyboard + modifyOtherKeys are enabled only for the terminals that
+    // are known to parse them.  The sequence starts by popping stale Kitty
+    // state, making repeated reconciliation safe even after shell changes.
+    if (shouldEnableKittyKeyboard()) {
+        _ = pfs.write(fd, kbd_enable_seq[0..kbd_enable_seq.len]);
+    }
+    const enable_paste = "\x1b[?2004h";
+    _ = pfs.write(fd, enable_paste[0..enable_paste.len]);
+}
+
 /// 切 raw 模式，返回旧 termios；非 tty 或失败返 null。
 /// 进 raw mode。返回原 termios(供 restoreMode 复原);非 tty 返 null。
 /// 仅对**白名单终端**(shouldEnableKittyKeyboard)启用 Kitty 键盘协议 / xterm modifyOtherKeys,
@@ -337,20 +388,7 @@ pub fn newlineHint() []const u8 {
 pub fn enterRawMode(fd: c_int) ?platform_term.SavedMode {
     // 模式切换走可移植 platform/terminal(POSIX termios / Windows console mode)。
     const orig = platform_term.enterRaw(fd) orelse return null;
-
-    // 哑终端(TERM=dumb 或空)不发任何键盘协议/粘贴序列,避免乱码回显。
-    const term = std.c.getenv("TERM");
-    const dumb = term == null or std.mem.eql(u8, std.mem.span(term.?), "dumb") or std.mem.span(term.?).len == 0;
-    if (!dumb) {
-        // Kitty 键盘协议 + modifyOtherKeys 仅对白名单终端发(非白名单会乱码/键失常)。
-        if (shouldEnableKittyKeyboard()) {
-            _ = pfs.write(fd, kbd_enable_seq[0..kbd_enable_seq.len]);
-        }
-        // bracketed paste 兼容性好,所有非 dumb 终端都发(粘贴内容被 ESC[200~ ... ESC[201~ 包裹)。
-        const enable_paste = "\x1b[?2004h";
-        _ = pfs.write(fd, enable_paste[0..enable_paste.len]);
-    }
-
+    emitEnableSequences(fd);
     return orig;
 }
 
@@ -1331,6 +1369,13 @@ test "LineEditor: multi-key stream through KeyParser" {
 test "enterRawMode on non-tty returns null or restores cleanly" {
     const orig = enterRawMode(0);
     if (orig) |o| restoreMode(0, o);
+}
+
+test "reconcileModes on a non-tty is a no-op" {
+    if (@import("builtin").os.tag == .windows) return;
+    const fd = pfs.openZ("/dev/null", .{ .ACCMODE = .RDONLY }, 0) catch unreachable;
+    defer _ = pfs.close(fd);
+    try testing.expect(!reconcileModes(fd));
 }
 
 test "键盘协议序列字节(接线:enter/restore 发的就是这些)" {

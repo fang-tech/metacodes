@@ -611,7 +611,10 @@ pub fn run(
 
         var buf: [8]u8 = undefined;
         const n = pfs.read(in_fd, &buf);
-        if (n <= 0) return error.InputAborted;
+        if (n <= 0) {
+            if (n < 0 and input_mod.reconcileAfterResume(in_fd)) continue;
+            return error.InputAborted;
+        }
         const b = buf[0];
 
         // ── Submit 视图键处理。──────────────────────────────────────────
