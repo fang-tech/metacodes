@@ -12,6 +12,19 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Added
 
+- A startup animation in the interactive TUI: the wordmark "Metask Lab"
+  condenses out of a particle brightness field and is drawn only with the
+  letters of its own name (after chenglou.me/pretext's variable typographic
+  ASCII), then stays above the welcome box. It adapts to the terminal's colour
+  depth and light or dark background, plays only when stdin and stdout are both
+  terminals and the wordmark fits, and any key jumps to the settled frame.
+  `METACODES_NO_STARTUP_ANIMATION` set to any value, or `"startupAnimation":
+  false` in `<state root>/config.json`, turns it off. On Windows a bare
+  modifier key (Shift, Ctrl, Alt) skips it without blocking, and no frame is
+  drawn after the terminal changes size. The REPL's post-reply input drain
+  uses the same non-blocking discard, so a bare modifier pressed during a
+  reply no longer holds the next prompt on Windows.
+
 - Python and Node packages over the AgentCore shared library (`sdk/python`,
   `sdk/node`; experimental, not yet published). Both offer a Runtime/Session
   API, streaming events, the final answer rebuilt from output segments, tools

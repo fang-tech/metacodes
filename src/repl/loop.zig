@@ -85,7 +85,7 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
     else
         null;
 
-    printStartupBanner(app);
+    printStartupBanner(app, allocator);
 
     // 启动 prompt 建议:基于 git 最近改动的文件给一条灰色提示(对齐 Claude Code)
     printStartupSuggestion(allocator);
@@ -1086,15 +1086,12 @@ fn firstUserLine(conv: *const Conversation) []const u8 {
     return "main session";
 }
 
-/// Drain stdin buffer: 非阻塞读尽剩余字节。生成结束后调用，避免用户在 LLM 输出时
-/// 误按的字符进入下一轮输入缓冲。
+/// Drain stdin buffer: 非阻塞丢弃剩余输入。生成结束后调用，避免用户在 LLM 输出时
+/// 误按的字符进入下一轮输入缓冲。Through discardPendingInput: on Windows a bare
+/// modifier pressed during the reply is a readable key-down that ReadConsoleW
+/// would block on, holding the next prompt until a printable key.
 fn drainStdin(fd: c_int) void {
-    while (true) {
-        if (platform_term.waitReadable(fd, 0) <= 0) return; // 可移植:timeout=0 立即返回
-        var buf: [256]u8 = undefined;
-        const n = platform_term.readInput(fd, buf[0..buf.len]);
-        if (n <= 0) return;
-    }
+    platform_term.discardPendingInput(fd);
 }
 
 /// 非 tty / 管道模式下的朴素逐字节行读（保留 M0 行为）。
@@ -4243,7 +4240,8 @@ fn shellQuoteSingle(allocator: std.mem.Allocator, s: []const u8) ![]u8 {
 
 /// 启动 banner:圆角 box(对齐 cc 2.1.x)。版本 + 模型 + cwd 三行。
 /// 非 TTY 退化为纯文本两行(pipe 友好)。box 内宽固定取 min(cols-2, 64)。
-fn printStartupBanner(app: *const app_mod.App) void {
+/// TTY 下先播启动动画(tui/splash.zig),定格的 "Metask Lab" 字标留在 box 上方。
+fn printStartupBanner(app: *const app_mod.App, allocator: std.mem.Allocator) void {
     const th = app.theme;
     var problems_buf: [160]u8 = undefined;
     const problems = formatConfigProblems(&problems_buf, app.configProblems());
@@ -4253,6 +4251,7 @@ fn printStartupBanner(app: *const app_mod.App) void {
         std.debug.print("\n", .{});
         return;
     }
+    playStartupSplash(app, allocator);
     const cols: usize = blk: {
         if (platform_term.windowSize(1)) |sz| {
             if (sz.cols > 0) break :blk sz.cols;
@@ -4287,6 +4286,26 @@ fn printStartupBanner(app: *const app_mod.App) void {
     var k: usize = 0;
     while (k < inner) : (k += 1) std.debug.print("{s}", .{th.box_h});
     std.debug.print("{s}{s}\n\n", .{ th.box_br, th.reset });
+}
+
+/// 启动动画:门控(TTY 两端/METACODES_NO_STARTUP_ANIMATION/config.json startupAnimation/
+/// TERM=dumb/终端太小)由 splash_player.decide 判定;任意键跳到定格帧。结果只进 debug 日志。
+fn playStartupSplash(app: *const app_mod.App, allocator: std.mem.Allocator) void {
+    const splash_player = @import("tui/splash_player.zig");
+    const log = @import("../util/log.zig");
+    const config = if (app.stateRoot().len > 0)
+        @import("tui/config.zig").loadStartupAnimation(allocator, app.stateRoot())
+    else
+        null;
+    switch (splash_player.decide(splash_player.gateFromEnv(config))) {
+        .skip => |why| log.debug("splash", "skipped: {s}", .{@tagName(why)}),
+        .play => |plan| {
+            const style = splash_player.styleFor(app.theme_variant, tui_term_root.detectFromEnv(1));
+            const seed: u64 = @truncate(@as(u128, @bitCast(util_time.nowNs())));
+            const outcome = splash_player.play(allocator, plan, style, seed);
+            log.debug("splash", "{s} ({d}x{d}, {s})", .{ @tagName(outcome), plan.layout.cols, plan.layout.rows, @tagName(style.mode) });
+        },
+    }
 }
 
 /// banner 一行内容:│ + inner 列(2 空格缩进 + text + 右补空格)+ │。
