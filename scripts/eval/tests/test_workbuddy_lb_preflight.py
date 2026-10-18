@@ -134,6 +134,16 @@ class LeaderboardPreflightAuditTest(unittest.TestCase):
                 preflight.output_assertions(events)
 
 
+class LeaderboardPreflightEnvironmentTest(unittest.TestCase):
+    def test_runner_environment_drops_the_judge_key(self):
+        from scripts.eval.workbuddy import WORKBUDDY_JUDGE_KEY_ENV
+
+        environment = preflight._clean_environment(
+            {"PATH": "/fixture", WORKBUDDY_JUDGE_KEY_ENV: "judge-secret"}
+        )
+        self.assertEqual({"PATH": "/fixture"}, environment)
+
+
 class LeaderboardPreflightOverlayTest(unittest.TestCase):
     def test_preflight_job_is_the_protocol_on_the_synthetic_task(self):
         committed = (OVERLAY / "configs/jobs/metacodes-lb-protocol-preflight.yaml").read_text(

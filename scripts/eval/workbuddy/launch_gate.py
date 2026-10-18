@@ -42,7 +42,7 @@ from ..memory_budget_journal import (
     usd_to_microusd_ceiling,
 )
 from ..model import O_BINARY, ValidationError, mode_violation, open_nofollow, stable_json
-from . import WORKBUDDY_PINNED_COMMIT
+from . import WORKBUDDY_JUDGE_KEY_ENV, WORKBUDDY_PINNED_COMMIT
 from .environment_preflight import (
     EnvironmentPreflightError,
     validate_receipt as validate_environment_preflight,
@@ -91,7 +91,7 @@ PROVIDER_KEY_ENV = "METACODES_WORKBUDDY_PROVIDER_KEY_FD_REF"
 # proxy reads from this variable.  A judge model must name it, and the runner's
 # environment keeps it only for a launch whose manifest froze a judge budget;
 # every other launch has it removed, so an unbudgeted judge cannot spend.
-JUDGE_KEY_ENV = "METACODES_WORKBUDDY_JUDGE_API_KEY"
+JUDGE_KEY_ENV = WORKBUDDY_JUDGE_KEY_ENV
 JUDGE_MODES = ("host_side", "in_container")
 # Judge calls are not metered per call, so a judged transaction commits its
 # whole judge cap beside the actor's measured cost.
@@ -229,8 +229,11 @@ def _comparison_covariates(
                 erase_paths(child)
 
     erase_paths(stable_artifacts)
-    stable_judge = json.loads(json.dumps(judge))
-    erase_paths(stable_judge)
+    # Only a judged job adds the judge covariate, so unjudged arms planned
+    # before judge budgets existed keep pairing with unjudged arms after.
+    stable_judge = json.loads(json.dumps(judge)) if judge.get("enabled") else None
+    if stable_judge is not None:
+        erase_paths(stable_judge)
     stable_host = {
         name: {key: value for key, value in row.items() if key != "path"}
         for name, row in host_control_plane.items()
@@ -239,7 +242,7 @@ def _comparison_covariates(
         name: {key: value for key, value in row.items() if key != "path"}
         for name, row in runner_tools.items()
     }
-    return {
+    covariates: Dict[str, object] = {
         "workbuddy_commit": workbuddy_commit,
         "overlay_sha256": overlay_sha256,
         "cohort": {
@@ -269,11 +272,13 @@ def _comparison_covariates(
                 "max_metered_tokens",
             )
         },
-        "judge": stable_judge,
         "actor_prompt_changed": False,
         "tool_schema_changed": False,
         "provider_cache_prefix_changed_by_control_plane": False,
     }
+    if stable_judge is not None:
+        covariates["judge"] = stable_judge
+    return covariates
 
 
 def _read_regular(path: Path, *, maximum: int = 16 * 1024 * 1024) -> bytes:
@@ -763,6 +768,10 @@ def _validate_judge_contract(manifest: Mapping[str, Any]) -> None:
         if set(judge) != {"enabled", "bench_configs"} or cost != 0:
             raise LaunchError("paid launch judge budget contract is incomplete")
         return
+    if manifest.get("comparison") is not None:
+        raise LaunchError(
+            "a judged paid launch cannot be a paired-comparison arm"
+        )
     if (
         judge.get("enabled") is not True
         or set(judge) != JUDGE_CONTRACT_KEYS
@@ -932,6 +941,22 @@ def build_launch_manifest(
         raise LaunchError("paid WorkBuddy job requires full request audit and n_attempts=1")
     if (job.get("orchestrator_override") or {}).get("n_concurrent_trials") != 1:
         raise LaunchError("paid WorkBuddy job requires one concurrent trial")
+    # The runner merges a job's ``verifier`` block into the verifier runtime and
+    # copies every ``orchestrator_override`` key onto the top-level runtime, so
+    # either could set WORKBUDDY_VERIFIER_LLM_* and call an LLM outside the
+    # judge budget.  No job this repository writes uses them beyond the one
+    # concurrency key.
+    if "verifier" in job:
+        raise LaunchError(
+            "paid WorkBuddy job must not carry a verifier block: it reaches the "
+            "verifier's environment, where it can route an LLM outside the "
+            "judge budget"
+        )
+    if job.get("orchestrator_override") != {"n_concurrent_trials": 1}:
+        raise LaunchError(
+            "paid WorkBuddy job orchestrator_override may only set "
+            "n_concurrent_trials: 1; other keys reach the top-level runtime"
+        )
     project_control = artifact_row.get("project_control")
     project_overrides = job.get("harness_params_override") or {}
     if not isinstance(project_overrides, dict):
@@ -1146,6 +1171,12 @@ def build_launch_manifest(
         raise LaunchError("quality_evidence_on_commit must be boolean")
     if comparison_id is not None and not RUN_ID_RE.fullmatch(comparison_id):
         raise LaunchError("comparison id must be a safe 3-128 character component")
+    if judge["enabled"] and comparison_id is not None:
+        raise LaunchError(
+            "a job that runs the LLM judge cannot be a paired-comparison arm: "
+            "paired analysis does not admit receipts whose commit includes a "
+            "judge cap; plan it without --comparison-id"
+        )
     if quality_evidence_on_commit and comparison_id is None:
         raise LaunchError("quality evidence requires an explicit paired comparison id")
 

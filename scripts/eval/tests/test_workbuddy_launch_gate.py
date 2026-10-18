@@ -3031,6 +3031,7 @@ class WorkBuddyJudgeBudgetTest(unittest.TestCase):
         *,
         judge_budget_microusd=None,
         total_cost_microusd=1_000_000,
+        comparison_id=None,
     ) -> dict:
         workbuddy = root / "workbuddy"
         job_path = workbuddy / "configs/jobs/judge-l2.yaml"
@@ -3118,6 +3119,7 @@ class WorkBuddyJudgeBudgetTest(unittest.TestCase):
                 max_cost_microusd=500_000,
                 max_metered_tokens=50_000,
                 judge_budget_microusd=judge_budget_microusd,
+                comparison_id=comparison_id,
             )
 
     def test_create_refuses_a_judged_leaderboard_job_without_a_judge_cap(self):
@@ -3217,6 +3219,155 @@ class WorkBuddyJudgeBudgetTest(unittest.TestCase):
             )
             with self.assertRaisesRegex(LaunchError, "backend_key_env"):
                 self._build(root, self._job("office"), judge_budget_microusd=150_000)
+
+    def test_judged_job_cannot_be_a_paired_comparison_arm(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            self._checkout(root)
+            with self.assertRaisesRegex(LaunchError, "paired-comparison arm"):
+                self._build(
+                    root,
+                    self._job("office"),
+                    judge_budget_microusd=150_000,
+                    comparison_id="judged-pair-l2",
+                )
+            # An unjudged job still pairs.
+            unjudged = self._build(
+                root, self._job("code"), comparison_id="unjudged-pair-l2"
+            )
+            self.assertEqual("unjudged-pair-l2", unjudged["comparison"]["comparison_id"])
+        # A hand-built judged manifest with a comparison is refused before any
+        # reservation (validation is the first thing run does).
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            os.chmod(root, 0o700)
+            manifest = self._manifest(
+                root, quality_evidence_on_commit=True, judge_cost_microusd=150_000
+            )
+            journal = root / "budget.json"
+            with mock.patch.dict(
+                os.environ, {launch_gate.JUDGE_KEY_ENV: self.JUDGE_KEY}
+            ), self.assertRaisesRegex(LaunchError, "paired-comparison arm"):
+                execute_launch(
+                    manifest_path=manifest,
+                    journal_path=journal,
+                    receipt_path=root / "receipt.json",
+                    credential_fd=-1,
+                    runner_argv=[sys.executable, "-c", "raise SystemExit(0)"],
+                )
+            self.assertFalse(journal.exists())
+
+    def test_unjudged_covariates_pair_across_the_judge_budget_change(self):
+        from scripts.eval.workbuddy import paired_analysis
+
+        launch_gate_sha = hashlib.sha256(
+            HOST_CONTROL_PLANE_MODULES["launch_gate"].read_bytes()
+        ).hexdigest()
+
+        def host(sha):
+            return {
+                "launch_gate": {"path": f"{FIXTURE}/launch_gate.py", "bytes": 1, "sha256": sha},
+                "model": {"path": f"{FIXTURE}/model.py", "bytes": 1, "sha256": digest("model")},
+            }
+
+        def covariates(judge, launch_gate_sha256):
+            return launch_gate._comparison_covariates(
+                workbuddy_commit=WORKBUDDY_PINNED_COMMIT,
+                overlay_sha256=digest("overlay"),
+                cohort={
+                    "subset": "code", "cohort": "dev", "take": 1,
+                    "dataset": "datasets/wb-bench-code-v1.0/tasks",
+                    "selected_tasks": ["code-task-a"],
+                    "selected_tasks_sha256": digest("tasks"),
+                },
+                artifacts={"manifest": {"path": f"{FIXTURE}/a.json", "sha256": digest("a")}},
+                environment_preflight_sha256=digest("preflight"),
+                job={"model": "m", "harness_params_override": {}},
+                model_fingerprint=digest("model-fp"),
+                backend_url_sha256=digest("url"),
+                runner_tools={"uv": {"path": f"{FIXTURE}/uv", "sha256": digest("uv")}},
+                host_control_plane=host(launch_gate_sha256),
+                budget={
+                    "total_cost_microusd": 1, "total_metered_tokens": 1,
+                    "max_cost_microusd": 1, "max_metered_tokens": 1,
+                },
+                judge=judge,
+            )
+
+        unjudged = {"enabled": False, "bench_configs": []}
+        # The covariate keys of an arm planned before judge budgets existed.
+        old_keys = {
+            "workbuddy_commit", "overlay_sha256", "cohort", "artifacts",
+            "environment_preflight_sha256", "job_without_treatment_or_result_root",
+            "model_fingerprint", "backend_url_sha256", "runner_tools",
+            "host_control_plane", "budget", "actor_prompt_changed",
+            "tool_schema_changed", "provider_cache_prefix_changed_by_control_plane",
+        }
+        baseline = covariates(unjudged, digest("launch-gate-before-judge-budgets"))
+        treatment = covariates(unjudged, launch_gate_sha)
+        self.assertEqual(old_keys, set(baseline))
+        self.assertEqual(old_keys, set(treatment))
+        with tempfile.TemporaryDirectory() as directory:
+            receipt = Path(directory) / "baseline-receipt.json"
+            receipt.write_text(
+                json.dumps({"resume_audit": {"auditor": {"launch_gate": launch_gate_sha}}}),
+                encoding="utf-8",
+            )
+            os.chmod(receipt, 0o600)
+            # Only the auditor differs, which instrument succession admits.
+            succession = paired_analysis._verify_instrument_succession(
+                {"covariates": baseline}, {"covariates": treatment}, {}, receipt
+            )
+            self.assertEqual(["launch_gate"], sorted(succession["modules"]))
+            # A judge covariate on one side (the 33c6f6ab shape) never pairs.
+            drifted = dict(treatment, judge=unjudged)
+            with self.assertRaisesRegex(LaunchError, "covariates differ"):
+                paired_analysis._verify_instrument_succession(
+                    {"covariates": baseline}, {"covariates": drifted}, {}, receipt
+                )
+        judged = {
+            "enabled": True,
+            "model_config": {"path": f"{FIXTURE}/j.yaml", "sha256": digest("j")},
+        }
+        self.assertEqual(
+            {"enabled": True, "model_config": {"sha256": digest("j")}},
+            covariates(judged, launch_gate_sha)["judge"],
+        )
+
+    def test_paid_job_cannot_route_its_own_verifier_llm(self):
+        route = {"env": {"WORKBUDDY_VERIFIER_LLM_BASE_URL": "https://llm.invalid/v1"}}
+        cases = {
+            "verifier block": lambda job: job.update(verifier=route),
+            "verifier through orchestrator_override": lambda job: job[
+                "orchestrator_override"
+            ].update(verifier=route),
+            "other runtime key through orchestrator_override": lambda job: job[
+                "orchestrator_override"
+            ].update(retry={"max_retries": 3}),
+        }
+        for label, change in cases.items():
+            with self.subTest(label), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory).resolve()
+                self._checkout(root)
+                job = self._job("code")
+                change(job)
+                with self.assertRaisesRegex(LaunchError, "verifier|orchestrator_override"):
+                    self._build(root, job)
+        # No job this repository writes carries either.
+        overlay_jobs = sorted((self.OVERLAY / "configs/jobs").glob("*.yaml"))
+        self.assertTrue(overlay_jobs)
+        from scripts.eval.workbuddy import leaderboard_jobs
+
+        written = [
+            yaml.safe_load(path.read_text(encoding="utf-8")) for path in overlay_jobs
+        ] + list(
+            leaderboard_jobs.run_jobs(
+                json.loads(leaderboard_jobs.COHORT_MANIFEST.read_text(encoding="utf-8")), 1
+            ).values()
+        )
+        for job in written:
+            self.assertNotIn("verifier", job)
+            self.assertEqual({"n_concurrent_trials": 1}, job["orchestrator_override"])
 
     def test_judge_budget_flag_is_a_positive_finite_dollar_amount(self):
         self.assertEqual(1_500_000, launch_gate._judge_budget_usd("1.5"))

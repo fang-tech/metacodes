@@ -23,6 +23,8 @@ from scripts.eval.workbuddy.run_w05 import (
     _stable_evidence,
     _wire_json_sha256,
 )
+from scripts.eval.workbuddy import WORKBUDDY_JUDGE_KEY_ENV
+from scripts.eval.workbuddy.run_w0 import _runner_environment as w0_environment
 from scripts.eval.tests.posix_only import POSIX, requires_symlinks
 from scripts.eval.tests.textio import write_text_lf
 
@@ -184,9 +186,18 @@ class WorkBuddyW05RunnerTest(unittest.TestCase):
                 "METACODES_KG_EXPECTED_BUILD_ID": "sha256:" + "f" * 64,
                 "METACODES_KG_EXPECTED_SCHEMA_DIGEST": "e" * 64,
                 "METASK_API_KEY": "secret",
+                WORKBUDDY_JUDGE_KEY_ENV: "judge-secret",
             }
         )
         self.assertEqual(environment, {"PATH": "/fixture"})
+
+    def test_w0_runner_environment_drops_the_judge_key(self):
+        environment = w0_environment(
+            {"PATH": "/fixture", WORKBUDDY_JUDGE_KEY_ENV: "judge-secret"}
+        )
+        self.assertNotIn(WORKBUDDY_JUDGE_KEY_ENV, environment)
+        self.assertEqual("/fixture", environment["PATH"])
+        self.assertEqual("0", environment["WBBENCH_PROXY_MAX_RETRIES"])
 
     @requires_symlinks
     def test_private_publication_is_0600_atomic_and_refuses_existing_or_symlink(self):
