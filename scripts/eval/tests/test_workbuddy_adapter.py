@@ -1886,6 +1886,95 @@ class WorkBuddyArtifactStageTest(unittest.TestCase):
                     allow_synthetic_fixtures=True,
                 )
 
+    @staticmethod
+    def _elf_needing(*versions: str) -> bytes:
+        """An x86_64 ELF whose .gnu.version_r needs libc.so.6 at `versions`."""
+        strings = bytearray(b"\x00libc.so.6\x00")
+        offsets = []
+        for version in versions:
+            offsets.append(len(strings))
+            strings += version.encode("ascii") + b"\x00"
+        need = bytearray()
+        need += (1).to_bytes(2, "little") + len(versions).to_bytes(2, "little")
+        need += (1).to_bytes(4, "little") + (16).to_bytes(4, "little") + (0).to_bytes(4, "little")
+        for index, name_at in enumerate(offsets):
+            last = index == len(offsets) - 1
+            need += (0).to_bytes(4, "little") + (0).to_bytes(2, "little")
+            need += (2 + index).to_bytes(2, "little") + name_at.to_bytes(4, "little")
+            need += (0 if last else 16).to_bytes(4, "little")
+        strings_at = 64
+        need_at = strings_at + len(strings)
+        sections_at = need_at + len(need)
+        header = bytearray(64)
+        header[:7] = b"\x7fELF\x02\x01\x01"
+        header[18:20] = (62).to_bytes(2, "little")
+        header[40:48] = sections_at.to_bytes(8, "little")
+        header[58:60] = (64).to_bytes(2, "little")
+        header[60:62] = (3).to_bytes(2, "little")
+
+        def section(sh_type, offset, size, link=0):
+            row = bytearray(64)
+            row[4:8] = sh_type.to_bytes(4, "little")
+            row[24:32] = offset.to_bytes(8, "little")
+            row[32:40] = size.to_bytes(8, "little")
+            row[40:44] = link.to_bytes(4, "little")
+            return bytes(row)
+
+        return (
+            bytes(header) + bytes(strings) + bytes(need)
+            + section(0, 0, 0)
+            + section(3, strings_at, len(strings))
+            + section(0x6FFFFFFE, need_at, len(need), link=1)
+        )
+
+    def test_production_stage_refuses_a_binary_newer_than_the_oldest_task_glibc(self):
+        from scripts.eval.workbuddy.stage_artifacts import _elf_glibc_requirement
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            license_file = root / "LICENSE"
+            license_file.write_text("license\n", encoding="utf-8")
+            licenses = (
+                ("metacodes", "MIT", license_file),
+                ("tinykg", "Apache-2.0", license_file),
+                ("lean4", "Apache-2.0", license_file),
+            )
+            floor = root / "floor"
+            floor.write_bytes(self._elf_needing("GLIBC_2.2.5", "GLIBC_2.28", "GLIBC_2.17"))
+            recent = root / "recent"
+            recent.write_bytes(self._elf_needing("GLIBC_2.2.5", "GLIBC_2.36", "GLIBC_2.34"))
+            static = root / "static"
+            static.write_bytes(self._elf(62))
+            self.assertEqual(_elf_glibc_requirement(floor), (2, 28))
+            self.assertEqual(_elf_glibc_requirement(recent), (2, 36))
+            self.assertIsNone(_elf_glibc_requirement(static))
+            stage(
+                output=root / "ok",
+                metacodes=floor,
+                tinykg=static,
+                formal_kernel=floor,
+                metacodes_commit=ZERO_COMMIT,
+                tinykg_commit=ONE_COMMIT,
+                licenses=licenses,
+            )
+            # The default release build: GLIBC_2.36 cannot start in the two
+            # Security task images that ship glibc 2.35.
+            with self.assertRaisesRegex(StageError, "needs GLIBC_2.36.*2.35"):
+                stage(
+                    output=root / "recent-stage",
+                    metacodes=recent,
+                    tinykg=static,
+                    formal_kernel=floor,
+                    metacodes_commit=ZERO_COMMIT,
+                    tinykg_commit=ONE_COMMIT,
+                    licenses=licenses,
+                )
+            self.assertFalse((root / "recent-stage").exists())
+            truncated = root / "truncated"
+            truncated.write_bytes(self._elf_needing("GLIBC_2.28")[:-40])
+            with self.assertRaisesRegex(StageError, "unreadable"):
+                _elf_glibc_requirement(truncated)
+
     def test_production_stage_requires_x86_64_and_records_elf_machine(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
