@@ -77,8 +77,15 @@ class PinnedValidatorTest(unittest.TestCase):
             (0, "3 failed, 9 passed\n", None),
             (0, "0 failed, 0 passed\n", None),
             (0, "tests timed out\n", None),
-            # A count line that is not the last line, or no line at all.
-            (1, "2 failed, 1 passed\nTraceback (most recent call last):\n", None),
+            # The tests' stderr follows the count line: the last verdict
+            # line decides, not the last line.
+            (1, "2 failed, 1 passed\nTraceback (most recent call last):\n", failed),
+            (0, "0 failed, 12 passed\ndebug: parsed 5 fields\n", pinned.EXIT_PASSED),
+            # A count line forged after the real one can only disagree with
+            # the status, which is no verdict, never a pass.
+            (1, "3 failed, 9 passed\n0 failed, 12 passed\n", None),
+            # No verdict line at all.
+            (1, "Traceback (most recent call last):\nOSError: boom\n", None),
             (1, "", None),
             (2, "1 failed, 0 passed\n", None),
         )
@@ -130,6 +137,20 @@ class PinnedValidatorTest(unittest.TestCase):
         lines = completed.stdout.strip().splitlines()
         self.assertRegex(lines[-1], r"^\d+ failed, 0 passed$")
         self.assertTrue(any(re.match(r"FAILED tests/test_hidden_cron\.py::", line) for line in lines))
+
+    def test_the_candidates_stderr_does_not_cost_the_verdict(self):
+        """The real d1 validator prints the test run's stderr after its count
+        line, so a candidate that logs to stderr ends the output on its own
+        lines. The verdict is still the count line's."""
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            noisy = "import sys\nprint('debug: cronexpr loaded', file=sys.stderr)\n" + STUB
+            (workspace / "cronexpr.py").write_text(noisy, encoding="utf-8")
+            completed = _dispatch(workspace)
+        self.assertEqual(completed.returncode, pinned.EXIT_FAILED, completed.stderr)
+        lines = [line for line in completed.stdout.strip().splitlines() if line.strip()]
+        self.assertEqual(lines[-1].strip(), "debug: cronexpr loaded")
+        self.assertTrue(any(re.fullmatch(r"\d+ failed, 0 passed", line.strip()) for line in lines))
 
 
 if __name__ == "__main__":

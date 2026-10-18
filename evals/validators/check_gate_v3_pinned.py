@@ -18,13 +18,18 @@ lesson about the candidate.
 
 A validator's exit status alone is not a verdict: an exception escaping the
 validator (say, a dangling symlink its workspace copy cannot follow) exits 1
-exactly like a failing test run. So 0 and 1 are passed on only when the
-validator's last output line is one of its own verdict lines and its status
-agrees with it: the count line with no failures and exit 0, the count line
-with failures and exit 1, or `tests timed out` (the validator's line for a
-test run that hung, a failure of the candidate) with exit 1. Everything else
-is 127: no or an unknown task hint, a missing validator, a validator that
-crashed, hung past the dispatcher's limit, or ended on any other line.
+exactly like a failing test run. So 0 and 1 are passed on only when the last
+of the validator's own verdict lines in its output agrees with its status:
+the count line with no failures and exit 0, the count line with failures and
+exit 1, or `tests timed out` (the validator's line for a test run that hung,
+a failure of the candidate) with exit 1. The last verdict line, not the last
+line: a validator prints the test run's stdout, which ends on the count line,
+and then its stderr, where the candidate's own code may write anything. A
+crashed validator prints no verdict line at all. A line the candidate forges
+on stderr can only disagree with the real status, which gives no verdict;
+it cannot turn a failure into a pass. Everything else is 127: no or an
+unknown task hint, a missing validator, a validator that crashed or hung
+past the dispatcher's limit, or output without a verdict line.
 
 Wrapper usage (both arms of configuration D):
 
@@ -68,20 +73,21 @@ def resolve(task_hint, validators_dir=None):
 
 def verdict(returncode, stdout):
     """EXIT_PASSED or EXIT_FAILED when the validator reported a verdict,
-    else None: its last non-empty output line must be one of its verdict
-    lines and its exit status must agree with that line."""
-    lines = [line.strip() for line in stdout.splitlines() if line.strip()]
-    last = lines[-1] if lines else ""
-    if last == TIMEOUT_LINE:
-        return EXIT_FAILED if returncode == 1 else None
-    match = SUMMARY_LINE.fullmatch(last)
-    if match is None:
+    else None: the last of its verdict lines in the output decides, and its
+    exit status must agree with that line."""
+    for raw in reversed(stdout.splitlines()):
+        line = raw.strip()
+        if line == TIMEOUT_LINE:
+            return EXIT_FAILED if returncode == 1 else None
+        match = SUMMARY_LINE.fullmatch(line)
+        if match is None:
+            continue
+        failed, passed = int(match.group(1)), int(match.group(2))
+        if returncode == 0 and failed == 0 and passed > 0:
+            return EXIT_PASSED
+        if returncode == 1 and failed > 0:
+            return EXIT_FAILED
         return None
-    failed, passed = int(match.group(1)), int(match.group(2))
-    if returncode == 0 and failed == 0 and passed > 0:
-        return EXIT_PASSED
-    if returncode == 1 and failed > 0:
-        return EXIT_FAILED
     return None
 
 
