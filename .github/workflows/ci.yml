@@ -373,6 +373,63 @@ jobs:
         if: env.FAST_PATH != 'true'
         run: git diff --check
 
+  # The Python and Node packages over the AgentCore shared library (sdk/python,
+  # sdk/node). Not a required check yet: it builds a ReleaseSafe bundle, which
+  # the required gates do not, then runs both packages' end-to-end suites
+  # against a loopback mock provider (no network, no key), including the
+  # installed wheel in a clean virtualenv. Windows waits for the Node addon's
+  # Windows port.
+  sdk-bindings:
+    name: SDK bindings (${{ matrix.os }})
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: Linux
+            runner: ubuntu-latest
+            target: x86_64-linux-gnu
+          - os: macOS
+            runner: macos-latest
+            target: aarch64-macos
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: 0.16.0
+          use-cache: true
+          cache-size-limit: 4096
+      - name: Build the AgentCore bundle
+        run: |
+          zig build agentcore:bundle -Dtarget=${{ matrix.target }} -Doptimize=ReleaseSafe --prefix "$RUNNER_TEMP/sdk"
+          bundle=$(ls -d "$RUNNER_TEMP"/sdk/agentcore/*/ | head -n 1)
+          echo "BUNDLE=$bundle" >> "$GITHUB_ENV"
+          echo "AGENTCORE_LIB=$(python3 -c 'import json,os,sys; b=sys.argv[1]; print(os.path.join(b, json.load(open(os.path.join(b, "manifest.json")))["shared_library"]["path"]))' "$bundle")" >> "$GITHUB_ENV"
+      - name: Python package end-to-end suite
+        env:
+          METACODES_PY_SDK_REQUIRE_LIB: "1"
+        run: METACODES_AGENTCORE_LIB="$AGENTCORE_LIB" python3 -m unittest discover -s sdk/python/tests -v
+      - name: Python wheel installs and passes the suite from site-packages
+        env:
+          METACODES_PY_SDK_REQUIRE_LIB: "1"
+          METACODES_PY_SDK_TEST_INSTALLED: "1"
+        run: |
+          python3 sdk/python/build_wheel.py --bundle "$BUNDLE" --out "$RUNNER_TEMP/wheels"
+          python3 -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/python" -m pip install --no-index "$RUNNER_TEMP"/wheels/*.whl
+          mkdir -p "$RUNNER_TEMP/empty-home"
+          cd "$RUNNER_TEMP"
+          HOME="$RUNNER_TEMP/empty-home" "$RUNNER_TEMP/venv/bin/python" -m unittest discover -s "$GITHUB_WORKSPACE/sdk/python/tests" -v
+      - name: Node addon builds against this Node's headers
+        run: |
+          node --version
+          node sdk/node/scripts/build.js --bundle "$BUNDLE"
+      - name: Node package end-to-end suite
+        env:
+          METACODES_NODE_SDK_REQUIRE_LIB: "1"
+        run: node --test sdk/node/test/metacodes.test.js
+
   # The offline TTY suite (tests/tty) drives the debug binary in a pseudo
   # terminal and asserts the screen a person would see. No workflow ran it
   # before #222: twelve agent-tree cases stayed red for weeks (#218), and a
