@@ -286,10 +286,20 @@ pub const SuspendInfo = struct {
     }
 };
 
+/// Whether every successful provider response in a Run supplied readable usage.
+/// `unknown` is intentionally separate from zero counters: a provider may
+/// explicitly report four zero counters, while an omitted or unreadable usage
+/// object must not be presented as a free run to consumers.
+pub const UsageStatus = enum {
+    known,
+    unknown,
+};
+
 pub const RunResult = struct {
     stop_reason: StopReason,
     turns: u32,
     tool_calls: u32,
+    usage_status: UsageStatus = .known,
     /// L3:仅 stop_reason==.suspended 时非空。调用方据此落盘 suspend.json + 投递 UI 请求,
     /// 响应到达后 resumeRun 注入。用后 deinit。
     suspend_info: ?SuspendInfo = null,
@@ -1188,6 +1198,10 @@ pub fn run(
     var result = try runCounted(conversation, provider, tool_defs, permission_ctx, opts, backend, allocator, &counters);
     result.continuations = counters.continuations;
     result.learning = counters.learning;
+    result.usage_status = if (counters.saw_successful_provider_response and !counters.usage_unknown)
+        .known
+    else
+        .unknown;
     return result;
 }
 
@@ -1197,6 +1211,12 @@ const RunCounters = struct {
     /// The learning turn's report once it decided (RunResult.learning), set by a
     /// defer in runCounted so an abort inside a pass still reports it.
     learning: ?learning_turn_mod.Report = null,
+    /// A successful provider response without a readable usage sample makes
+    /// the whole Run's consumer-facing usage status unknown. Failed attempts
+    /// are already journaled independently and do not change a later
+    /// successful response's result status.
+    saw_successful_provider_response: bool = false,
+    usage_unknown: bool = false,
 };
 
 fn runCounted(
@@ -2510,6 +2530,10 @@ fn runCounted(
                 .stream_error
             else
                 .succeeded;
+            if (provider_outcome == .succeeded) {
+                counters.saw_successful_provider_response = true;
+                if (!response_usage.reported) counters.usage_unknown = true;
+            }
             ledger_outcome = if (aborted_during_stream) "client_disconnect" else if (stream_error) "failed" else "completed";
             if (!retry_ui.finishAttempt(provider_outcome, provider_metering))
                 return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .api_error, .turns = turns, .tool_calls = total_tool_calls });
