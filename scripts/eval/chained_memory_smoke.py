@@ -377,9 +377,13 @@ def main() -> int:
     )
     os.environ["HOME"] = str(host_home)
     results: Dict[str, Any] = {}
+    # Each temporary tree is registered before its run starts, so one whose
+    # run raises (a failed `_require` included) is still removed.
+    roots: List[Path] = []
     try:
         for name, fixed in (("fixed", True), ("control", False)):
             root = Path(tempfile.mkdtemp(prefix=f"metacodes-chain-smoke-{name}-"))
+            roots.append(root)
             results[name] = (root, _run(binary, tinykg, tinykgd, root, fixed_domain=fixed))
         _fixed_root, fixed = results["fixed"]
         _control_root, control = results["control"]
@@ -413,8 +417,9 @@ def main() -> int:
         return 0
     finally:
         if not args.keep:
-            for root, result in results.values():
+            for _root, result in results.values():
                 _remove_runs(result)
+            for root in roots:
                 shutil.rmtree(root, ignore_errors=True)
             shutil.rmtree(host_home, ignore_errors=True)
 

@@ -150,6 +150,19 @@ status, compatibility boundaries, and entry points are defined by
   as met except a pinned full-validator command for configuration D, and an
   amendment: the REPL harness files no outcome rows, so the baseline is the
   accumulating store without lessons.
+- `evals/validators/check_gate_v3_pinned.py`: the fixed check-gate command
+  for learning-turn-v1 configuration D. It runs the full validator of the
+  task named by `METACODES_TASK_HINT` against the workspace and exits 0/1
+  with the validator's verdict only when the last of its count (or timeout)
+  lines agrees with its exit status - the last verdict line, not the last
+  line, since the tests' stderr follows the count line and the candidate's
+  code may write there; anything else, including a validator that crashed
+  with exit 1 and printed no verdict line, is 127 (`unavailable` to
+  the check gate), so a broken check never becomes a lesson. The protocol
+  records the command line and the exposure it implies (hidden test names in
+  the verdict, the validators readable at the quoted path); prerequisite 3
+  stays open until tool calls naming `evals/validators` are counted per arm,
+  which is not implemented yet.
 - Sealed Skills: the §8.5 disclosure screen keeps two corpora under their
   own policies — the Skill's instructions and its `sealed/` references —
   so `egress.disclosure` is one word for both or
