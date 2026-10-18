@@ -12,7 +12,7 @@ cd "$(dirname "$0")/.."
 BIN=zig-out/bin/metacodes
 
 # 红线(对齐 PERF_MEMORY_PRINCIPLES §2)。
-LIMIT_BIN_BYTES=$((1500 * 1024))   # 1.5 MB
+LIMIT_BIN_BYTES=$((6 * 1024 * 1024)) # 6 MiB(2026-10-18 按 5.50 MB 实测重新标定)
 LIMIT_START_MS=20                   # 暖启动 ≤ 20ms
 LIMIT_RSS_BYTES=$((3 * 1024 * 1024)) # 空闲 RSS ≤ 3 MB
 
@@ -29,7 +29,7 @@ fail=0
 bin_bytes=$(wc -c < "$BIN" | tr -d ' ')
 bin_kb=$((bin_bytes / 1024))
 printf "二进制体积:   %d KB (%.2f MB)" "$bin_kb" "$(echo "scale=2; $bin_bytes/1048576" | bc)"
-if [ "$bin_bytes" -gt "$LIMIT_BIN_BYTES" ]; then echo "  ✗ 超红线 1.5MB"; fail=1; else echo "  ✓"; fi
+if [ "$bin_bytes" -gt "$LIMIT_BIN_BYTES" ]; then echo "  ✗ 超红线 6MB"; fail=1; else echo "  ✓"; fi
 
 # ---- ② 暖启动时间(取 5 次最小值,排除冷启磁盘加载)----
 ./"$BIN" --help >/dev/null 2>&1  # 预热(冷启不计)

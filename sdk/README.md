@@ -6,6 +6,11 @@ C ABI v1 revision 24:
 - `metask/agentcore.h` — normative C11/C++17 layout declarations;
 - `zig/` — typed Zig consumer bindings;
 - `rust/` — Rust sys bindings and build integration;
+- `python/` — the `metacodes` Python package: a ctypes binding over the shared
+  library with a high-level Runtime/Session API, Python tools, events and
+  permission handling ([python/README.md](python/README.md));
+- `node/` — the `metacodes` Node package: a Node-API addon over the shared
+  library with the same API shape for JavaScript ([node/README.md](node/README.md));
 - `VERSION` — SDK package version, distinct from ABI revision.
 
 Do not copy individual files into a release. Consume the complete generated bundle

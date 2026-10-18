@@ -75,6 +75,35 @@
       ]
     },
     {
+      "id": "abi_root_bytes",
+      "source": {
+        "file": "sdk/zig/types.zig",
+        "regex": "expectEqual\\(@as\\(usize, (\\d+)\\), @sizeOf\\(ApiV1\\)\\)"
+      },
+      "assert_in": [
+        {
+          "file": "sdk/README.md",
+          "regex": "exact (\\d+)-byte root"
+        },
+        {
+          "file": "doc/API.md",
+          "regex": "the exact (\\d+)-byte root"
+        },
+        {
+          "file": "doc/AGENTCORE_BINARY_ABI.md",
+          "regex": "It is an (\\d+)-byte exact layout"
+        },
+        {
+          "file": "doc/AGENTCORE_BINARY_ABI.md",
+          "regex": "`metask_agentcore_api_v1` is (\\d+) bytes"
+        },
+        {
+          "file": "doc/LIB_API.md",
+          "regex": "(\\d+) 字节根表"
+        }
+      ]
+    },
+    {
       "id": "cli_version",
       "source": {
         "file": "build.zig.zon",
