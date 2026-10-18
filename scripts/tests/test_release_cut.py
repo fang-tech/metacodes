@@ -574,10 +574,16 @@ class VersionGateStepTest(unittest.TestCase):
     the gate refused its own release PR; the step reads the labels itself."""
 
     STEP = "Version state gate and release rehearsal"
-    ECHO = '#!/bin/sh\necho "labels=[${RELEASE_PR_LABELS-unset}] argv=$*"\n'
-    GH = '#!/bin/sh\necho "$*" >> "$FAKE_GH_LOG"\necho "bug,release"\n'
+    ECHO = ('#!/bin/sh\necho "labels=[${RELEASE_PR_LABELS-unset}] argv=$* '
+            'head=[${GITHUB_HEAD_REF-unset}] title=[${RELEASE_PR_TITLE-unset}]"\n')
+    # The merge queue path asks for the top PR's head branch and title.
+    GH = ('#!/bin/sh\necho "$*" >> "$FAKE_GH_LOG"\ncase "$*" in\n'
+          '  *pulls/176*.head.ref*) echo "release/0.2.1" ;;\n'
+          '  *pulls/176*.title*) echo "release: 0.2.1" ;;\n'
+          '  *) echo "bug,release" ;;\nesac\n')
+    QUEUE_REF = "refs/heads/gh-readonly-queue/main/pr-176-" + "e" * 40
 
-    def run_step(self, job: str, pr_number: str):
+    def run_step(self, job: str, pr_number: str, merge_group_ref: str = "", title: str = "release: 0.2.1"):
         try:
             import yaml
         except ImportError:  # requirements-dev.txt
@@ -593,9 +599,13 @@ class VersionGateStepTest(unittest.TestCase):
                 (bindir / name).chmod(0o755)
             log = Path(tmp) / "gh.log"
             env = dict(os.environ, PATH=f"{bindir}{os.pathsep}{os.environ['PATH']}", FAKE_GH_LOG=str(log),
-                       GITHUB_REPOSITORY="o/r", RELEASE_PR_NUMBER=pr_number, RELEASE_PR_TITLE="release: 0.2.1")
+                       GITHUB_REPOSITORY="o/r", RELEASE_PR_NUMBER=pr_number, RELEASE_PR_TITLE=title,
+                       MERGE_GROUP_HEAD_REF=merge_group_ref)
             env.pop("RELEASE_PR_LABELS", None)
-            proc = subprocess.run(["bash", "-e", "-c", step["run"]], env=env, capture_output=True, text=True)
+            env.pop("GITHUB_HEAD_REF", None)
+            # The runner's own invocation for a `run:` step.
+            proc = subprocess.run(["bash", "--noprofile", "--norc", "-eo", "pipefail", "-c", step["run"]],
+                                  env=env, capture_output=True, text=True)
             calls = log.read_text(encoding="utf-8").splitlines() if log.exists() else []
         return proc, calls
 
@@ -606,6 +616,34 @@ class VersionGateStepTest(unittest.TestCase):
             self.assertIn("labels=[bug,release] argv=scripts/check_version_state.py --rehearse", proc.stdout, job)
             self.assertEqual(len(calls), 1, job)
             self.assertTrue(calls[0].startswith("api repos/o/r/issues/176/labels "), calls[0])
+
+    def test_a_merge_queue_run_judges_the_pr_at_the_head_of_its_group(self):
+        """A merge_group event carries no PR: the group's ref names the PR at
+        its head (the newest entry), and the gate gets that PR's head branch, title and labels."""
+        for job in ("gates", "windows-gates"):
+            proc, calls = self.run_step(job, "", self.QUEUE_REF, title="")
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn("labels=[bug,release] argv=scripts/check_version_state.py --rehearse "
+                          "head=[release/0.2.1] title=[release: 0.2.1]", proc.stdout, job)
+            self.assertEqual(len(calls), 3, (job, calls))
+            self.assertTrue(calls[0].startswith("api repos/o/r/pulls/176 "), calls[0])
+            self.assertTrue(calls[1].startswith("api repos/o/r/pulls/176 "), calls[1])
+            self.assertTrue(calls[2].startswith("api repos/o/r/issues/176/labels "), calls[2])
+
+    def test_a_merge_queue_run_fails_closed_when_the_pr_cannot_be_read(self):
+        self.GH = '#!/bin/sh\necho "$*" >> "$FAKE_GH_LOG"\necho "HTTP 404" >&2\nexit 1\n'
+        for job in ("gates", "windows-gates"):
+            proc, calls = self.run_step(job, "", self.QUEUE_REF, title="")
+            self.assertNotEqual(proc.returncode, 0, job)
+            self.assertNotIn("argv=scripts/check_version_state.py", proc.stdout, job)
+            self.assertEqual(len(calls), 1, (job, calls))
+
+    def test_a_merge_group_ref_without_a_pr_is_refused(self):
+        for job in ("gates", "windows-gates"):
+            proc, calls = self.run_step(job, "", "refs/heads/gh-readonly-queue/main/unexpected")
+            self.assertEqual(proc.returncode, 1, job)
+            self.assertIn("not a merge queue ref", proc.stderr)
+            self.assertEqual(calls, [], job)
 
     def test_a_push_run_asks_for_no_labels(self):
         for job in ("gates", "windows-gates"):
