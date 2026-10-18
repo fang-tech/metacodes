@@ -70,6 +70,23 @@ tests). Deliberately contaminated, in the sense of RSIAgent's DRS practising
 on the target itself: it measures whether a FAIL lesson helps the next attempt
 at *this* task, and it is never a held-out claim.
 
+Both wrappers pass `--host-check 'python3 -I <repo>/evals/validators/check_gate_v3_pinned.py'
+--check-gate-observe`. The dispatcher runs the validator of the task named by
+`METACODES_TASK_HINT` against the workspace; with no verdict (unknown hint,
+validator crash or timeout) it exits 127, which the check gate records as
+`unavailable`, so a broken check never becomes a lesson. Two consequences are
+part of the design:
+
+- the verdict a learning turn quotes names hidden tests and their failure
+  reasons, and the quoted command is an absolute path whose directory holds the
+  validators' hidden test source, which the model's read tools can reach; any
+  tool call whose input names `evals/validators` is counted per arm and the
+  rollout is flagged;
+- the check gate's taint rules still apply: a run that edited a visible test
+  file is graded `tainted` when the check passes, or when a failing result
+  names that file, and learns nothing, even though the validator restores the
+  pristine tests before it runs them.
+
 - **Cohort.** check-gate v3's four specifications (`evals/suites/check-gate-v3.json`,
   snapshot commit 7a860ef558c45a9342e937c9ad7e37a8a4b9476e): the only tasks on
   record where the full validator failed for this model.
@@ -155,10 +172,12 @@ the end-of-run form, external benchmarks or other models.
    already runs the full validator on each attempt's final workspace after
    the session; its output lands only in the rollout record, and the runner
    exports the store before that check runs.
-3. **A pinned full-validator command for configuration D. Not met.** The
-   check command is fixed per wrapper, so it needs a dispatcher that runs the
-   validator of the task named by `METACODES_TASK_HINT` against the
-   workspace.
+3. **A pinned full-validator command for configuration D. Met (2026-10-18).**
+   `evals/validators/check_gate_v3_pinned.py` (command line in configuration
+   D above); `scripts/eval/tests/test_check_gate_v3_pinned.py` proves its
+   mapping is the suite's own validators, that a failing workspace gets the
+   real validator's FAILED lines and count line with exit 1, and that every
+   path without a verdict exits 127.
 4. **Owner authorization** with a dollar cap and the durable budget journal
    (AGENTS.md). Until then nothing here runs.
 
