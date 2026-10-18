@@ -509,6 +509,15 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- `ToolSearch` misses no longer read as "the core tools are missing"
+  (issue #287). A miss says that ToolSearch only searches deferred tools,
+  names the loaded tools whose names match the query's keywords (`file read
+  write edit bash` points at Read, Write, Edit and Bash), and lists the other
+  loaded tools and the deferred ones still to fetch. Every name it reports or
+  returns a schema for passes the filters the request applied (execution
+  policy, the active Skill's tool pool, the provider's web-search capability,
+  the TinyKG and Swarm gates), so it never calls a hidden tool callable, and
+  `select:` no longer hands out a hidden tool's schema.
 - `SessionHost`: an interrupt or close of a Run waiting on a UI prompt could
   fail to stop it. The prompt was released before the kernel abort was
   requested, so the Run took the cancelled prompt as a denied tool, sent its

@@ -11,6 +11,7 @@ const std = @import("std");
 const common = @import("common.zig");
 const tools = @import("../tools.zig");
 const json_mod = @import("../json.zig");
+const capability = @import("../api/capability.zig");
 const DynRegistry = @import("dynamic.zig").DynRegistry;
 const ToolContext = @import("context.zig").ToolContext;
 
@@ -35,31 +36,24 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         while (it.next()) |raw| {
             const name = std.mem.trim(u8, raw, " \t");
             if (name.len == 0) continue;
-            if (ctx.execution_policy) |policy| {
-                if (!policy.allowsTool(name)) continue;
-            }
-            if (tools.getTool(name) != null) {
-                try matched.append(allocator, name);
+            if (tools.getTool(name)) |t| {
+                if (staticVisible(ctx, t)) try matched.append(allocator, name);
             } else if (ctx.dyn_registry) |dr| {
-                if (dr.find(name) != null) try matched.append(allocator, name);
+                if (dr.find(name) != null and visibleToModel(ctx, name)) try matched.append(allocator, name);
             }
         }
     } else {
         // 关键字匹配:扫 deferred 工具(静态 deferred + dyn/MCP deferred)的 name/description。
         for (tools.registry) |*t| {
             if (!t.deferred) continue;
-            if (ctx.execution_policy) |policy| {
-                if (!policy.allowsTool(t.name)) continue;
-            }
+            if (!staticVisible(ctx, t)) continue;
             if (matched.items.len >= max_results) break;
             if (matchesKeywords(query, t.name, t.description)) try matched.append(allocator, t.name);
         }
         if (ctx.dyn_registry) |dr| {
             for (dr.entries.items) |*e| {
                 if (!e.deferred) continue;
-                if (ctx.execution_policy) |policy| {
-                    if (!policy.allowsTool(e.name)) continue;
-                }
+                if (!visibleToModel(ctx, e.name)) continue;
                 if (matched.items.len >= max_results) break;
                 if (matchesKeywords(query, e.name, e.description)) try matched.append(allocator, e.name);
             }
@@ -67,25 +61,7 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     }
 
     if (matched.items.len == 0) {
-        // 落空时把现在真能激活的 deferred 名单直接给模型:比"去 system prompt 找"有用——
-        // 动态(MCP)工具的名字模型未必记得,关键字匹配又是 AND 语义,一次猜错就该有出路。
-        const available = try availableDeferredNames(ctx, allocator);
-        defer allocator.free(available);
-        const resident = try availableResidentNames(ctx, allocator);
-        defer allocator.free(resident);
-        if (available.len > 0) {
-            if (resident.len > 0) {
-                setDetail(ctx, allocator, "No deferred tool matched query \"{s}\". ToolSearch only searches deferred tools. Resident tools already in your tool list are directly callable; use them without ToolSearch (available directly: {s}). Deferred tools available right now: {s}. Use select:<exact_name> to fetch one, or fewer keywords (every keyword must appear in one tool's name or description).", .{ query, resident, available });
-            } else {
-                setDetail(ctx, allocator, "No deferred tool matched query \"{s}\". Deferred tools available right now: {s}. Use select:<exact_name> to fetch one, or fewer keywords (every keyword must appear in one tool's name or description).", .{ query, available });
-            }
-        } else {
-            if (resident.len > 0) {
-                setDetail(ctx, allocator, "No deferred tool matched query \"{s}\": no deferred tools are registered in this session (no MCP server or plugin tool is connected). ToolSearch only searches deferred tools; resident tools already in your tool list are directly callable without ToolSearch (available directly: {s}).", .{ query, resident });
-            } else {
-                setDetail(ctx, allocator, "No deferred tool matched query \"{s}\": no deferred tools are registered in this session (no MCP server or plugin tool is connected). Use the tools already in your tool list.", .{query});
-            }
-        }
+        try setMissDetail(ctx, allocator, query);
         return error.NoToolMatch;
     }
 
@@ -120,45 +96,107 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     return try out.toOwnedSlice();
 }
 
+/// Whether the request this call answers shows `name` to the model: the
+/// execution policy, the active Skill's tool pool and the provider capability
+/// gate, the same filters `agent_loop.buildEffectiveToolSet` applies before
+/// the request. Every name ToolSearch returns or reports as callable passes
+/// it, so a miss never names a tool the request hid (#287). Without a provider
+/// no capability can be confirmed, so a capability-gated tool is not claimed.
+fn visibleToModel(ctx: *const ToolContext, name: []const u8) bool {
+    if (ctx.execution_policy) |policy| if (!policy.allowsTool(name)) return false;
+    if (ctx.permission_ctx) |perm| if (perm.active_skill) |skill| if (!skill.allowsTool(name)) return false;
+    if (capability.requiredCapability(name)) |cap| {
+        const provider = ctx.provider orelse return false;
+        if (!provider.supports(cap)) return false;
+    }
+    return true;
+}
+
+/// `visibleToModel` plus the registry gates `tools.toToolDefinitionsFull`
+/// applies to built-ins (TinyKG and Swarm tools exist only with their host).
+fn staticVisible(ctx: *const ToolContext, t: *const tools.ToolEntry) bool {
+    if (t.tinykg_gated and ctx.kg == null) return false;
+    if (t.swarm_gated and ctx.swarm == null) return false;
+    return visibleToModel(ctx, t.name);
+}
+
 /// 本 session 当前可激活的 deferred 工具名(静态 deferred 受执行策略/TinyKG 门控;动态
 /// deferred = MCP/插件)。逗号分隔,超过 `MAX_LISTED_NAMES` 个只给前面的加计数。owned。
 pub const MAX_LISTED_NAMES: usize = 40;
 
-fn availableDeferredNames(ctx: *const ToolContext, allocator: std.mem.Allocator) ![]u8 {
-    return availableNames(ctx, allocator, true);
-}
+const Listing = union(enum) {
+    deferred,
+    /// Tools already in the request: callable without ToolSearch.
+    resident,
+    /// Resident tools whose name contains one of the query's keywords.
+    resident_named: []const u8,
 
-/// Names of resident tools that can be called without ToolSearch. Keeping this
-/// in the no-match diagnostic prevents a failed deferred lookup from being
-/// misread as a lack of core tools such as Read, Write, or Bash.
-fn availableResidentNames(ctx: *const ToolContext, allocator: std.mem.Allocator) ![]u8 {
-    return availableNames(ctx, allocator, false);
-}
+    fn admits(self: Listing, deferred: bool, name: []const u8) bool {
+        // ToolSearch itself is the discovery mechanism, not a resident tool
+        // the model should retry after a failed search.
+        const resident = !deferred and !std.mem.eql(u8, name, "ToolSearch");
+        return switch (self) {
+            .deferred => deferred,
+            .resident => resident,
+            .resident_named => |query| resident and nameHasKeyword(query, name),
+        };
+    }
+};
 
-fn availableNames(ctx: *const ToolContext, allocator: std.mem.Allocator, comptime want_deferred: bool) ![]u8 {
+fn listNames(ctx: *const ToolContext, allocator: std.mem.Allocator, listing: Listing) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
     var count: usize = 0;
     var omitted: usize = 0;
     for (tools.registry) |*t| {
-        if (t.deferred != want_deferred) continue;
-        // ToolSearch itself is the discovery mechanism, not a resident tool
-        // the model should retry after a failed search.
-        if (!want_deferred and std.mem.eql(u8, t.name, "ToolSearch")) continue;
-        if (t.tinykg_gated and ctx.kg == null) continue;
-        if (t.swarm_gated and ctx.swarm == null) continue;
-        if (ctx.execution_policy) |policy| if (!policy.allowsTool(t.name)) continue;
+        if (!listing.admits(t.deferred, t.name)) continue;
+        if (!staticVisible(ctx, t)) continue;
         try appendName(allocator, &out, t.name, &count, &omitted);
     }
     if (ctx.dyn_registry) |dr| {
         for (dr.entries.items) |*e| {
-            if (e.deferred != want_deferred) continue;
-            if (ctx.execution_policy) |policy| if (!policy.allowsTool(e.name)) continue;
+            if (!listing.admits(e.deferred, e.name)) continue;
+            if (!visibleToModel(ctx, e.name)) continue;
             try appendName(allocator, &out, e.name, &count, &omitted);
         }
     }
     if (omitted > 0) try out.print(allocator, ", … ({d} more)", .{omitted});
     return try out.toOwnedSlice(allocator);
+}
+
+/// The miss diagnostic. A tool-search-first model reads a bare miss as "these
+/// tools do not exist" (#287), so it says that ToolSearch only covers deferred
+/// tools, names the loaded tools the keywords were after, and lists the loaded
+/// tools and the deferred ones it can still fetch.
+fn setMissDetail(ctx: *const ToolContext, allocator: std.mem.Allocator, query: []const u8) !void {
+    const slot = ctx.error_detail orelse return;
+    // 落空时把现在真能激活的 deferred 名单直接给模型:动态(MCP)工具的名字模型未必记得,
+    // 关键字匹配又是 AND 语义,一次猜错就该有出路。
+    const deferred = try listNames(ctx, allocator, .deferred);
+    defer allocator.free(deferred);
+    const resident = try listNames(ctx, allocator, .resident);
+    defer allocator.free(resident);
+    const named = try listNames(ctx, allocator, .{ .resident_named = query });
+    defer allocator.free(named);
+
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    const w = &out.writer;
+    try w.print("No deferred tool matched query \"{s}\"", .{query});
+    if (deferred.len == 0) {
+        try w.writeAll(": no deferred tools are registered in this session (no MCP server or plugin tool is connected).");
+    } else {
+        try w.writeAll(".");
+    }
+    if (resident.len > 0) {
+        try w.writeAll(" ToolSearch only searches deferred tools; the tools already in your tool list are directly callable without it.");
+        if (named.len > 0) try w.print(" Already in your tool list and matching your keywords: {s}. Call them directly.", .{named});
+        try w.print(" Available directly: {s}.", .{resident});
+    } else if (deferred.len == 0) {
+        try w.writeAll(" Use the tools already in your tool list.");
+    }
+    if (deferred.len > 0) try w.print(" Deferred tools available right now: {s}. Use select:<exact_name> to fetch one, or fewer keywords (every keyword must appear in one tool's name or description).", .{deferred});
+    slot.* = try out.toOwnedSlice();
 }
 
 fn appendName(allocator: std.mem.Allocator, out: *std.ArrayList(u8), name: []const u8, count: *usize, omitted: *usize) !void {
@@ -185,9 +223,19 @@ fn matchesKeywords(query: []const u8, name: []const u8, description: []const u8)
     return any;
 }
 
-fn setDetail(ctx: *const ToolContext, allocator: std.mem.Allocator, comptime fmt: []const u8, a: anytype) void {
-    const slot = ctx.error_detail orelse return;
-    slot.* = std.fmt.allocPrint(allocator, fmt, a) catch null;
+/// Some keyword of `query` (a `select:` list included) of at least three bytes
+/// appears in `name`, ignoring case. Unlike `matchesKeywords` this is OR over
+/// names only: "read write bash" should point at Read, Write and Bash, and a
+/// one- or two-letter token would point at nearly every tool.
+fn nameHasKeyword(query: []const u8, name: []const u8) bool {
+    const select_prefix = "select:";
+    const terms = if (std.mem.startsWith(u8, query, select_prefix)) query[select_prefix.len..] else query;
+    var it = std.mem.tokenizeAny(u8, terms, " \t,");
+    while (it.next()) |tok| {
+        if (tok.len < 3) continue;
+        if (std.ascii.indexOfIgnoreCase(name, tok) != null) return true;
+    }
+    return false;
 }
 
 // ============================================================================
@@ -355,4 +403,123 @@ test "ToolSearch: 关键字不命中常驻内置工具(它们非 deferred)" {
     try testing.expect(std.mem.indexOf(u8, d, "Read") != null);
     try testing.expect(std.mem.indexOf(u8, d, "Write") != null);
     try testing.expect(std.mem.indexOf(u8, d, "Bash") != null);
+}
+
+/// The text of `detail` between `start` and the next `end`; "" when absent.
+fn segment(detail: []const u8, start: []const u8, end: []const u8) []const u8 {
+    const from = (std.mem.indexOf(u8, detail, start) orelse return "") + start.len;
+    const to = std.mem.indexOfPos(u8, detail, from, end) orelse return "";
+    return detail[from..to];
+}
+
+fn listHas(list: []const u8, name: []const u8) bool {
+    var it = std.mem.tokenizeSequence(u8, list, ", ");
+    while (it.next()) |entry| if (std.mem.eql(u8, entry, name)) return true;
+    return false;
+}
+
+const NAMED_START = "matching your keywords: ";
+const NAMED_END = ". Call them directly.";
+const LOADED_START = "Available directly: ";
+
+test "ToolSearch: a miss names the loaded tools its keywords were after (#287)" {
+    const a = testing.allocator;
+    var dyn = DynRegistry.init(a);
+    defer dyn.deinit();
+    try dyn.register("knowforge__search", "Search the knowledge base", &.{}, dynExec, null, true);
+    var detail: ?[]const u8 = null;
+    defer if (detail) |d| a.free(d);
+    const ctx = ToolContext{ .allocator = a, .dyn_registry = &dyn, .error_detail = &detail };
+    // The query from the issue's transcript. Keywords are ANDed over the
+    // deferred pool, so it misses there.
+    try testing.expectError(error.NoToolMatch, execute(&ctx, "{\"query\":\"file read write edit bash glob grep search\",\"max_results\":10}"));
+    const d = detail orelse return error.TestExpectedDetail;
+    const named = segment(d, NAMED_START, NAMED_END);
+    for ([_][]const u8{ "Read", "Write", "Edit", "Bash", "Glob", "Grep" }) |name| {
+        try testing.expect(listHas(named, name));
+    }
+    try testing.expect(!listHas(named, "TaskCreate"));
+    try testing.expect(!listHas(named, "ToolSearch"));
+    try testing.expect(!listHas(named, "knowforge__search"));
+    try testing.expect(listHas(segment(d, "Deferred tools available right now: ", ". Use select:"), "knowforge__search"));
+    // No provider confirms web search, so WebSearch is not called loaded
+    // although "search" is in its name.
+    try testing.expect(std.mem.indexOf(u8, d, "WebSearch") == null);
+}
+
+test "ToolSearch: only tools the active Skill leaves in the request are reported or selected" {
+    const a = testing.allocator;
+    const PolicyFrame = @import("../skills/runtime/policy_frame.zig").PolicyFrame;
+    const session_tools = [_][]const u8{ "Read", "Write", "Bash" };
+    const root = try PolicyFrame.createRoot(a, &session_tools, .unrestricted, .default, .{ .alloc = a });
+    defer root.release();
+    const child = try PolicyFrame.derive(root, &.{"Read"}, &.{});
+    defer child.release();
+    const active = @import("../skills/active.zig").ActiveSkillState.borrowFromPolicyFrame("read-only", child);
+    var perm = @import("../permission.zig").PermissionContext{ .allocator = a, .active_skill = &active };
+
+    var detail: ?[]const u8 = null;
+    defer if (detail) |d| a.free(d);
+    const ctx = ToolContext{ .allocator = a, .permission_ctx = &perm, .error_detail = &detail };
+    try testing.expectError(error.NoToolMatch, execute(&ctx, "{\"query\":\"read write bash\"}"));
+    const d = detail orelse return error.TestExpectedDetail;
+    const named = segment(d, NAMED_START, NAMED_END);
+    try testing.expect(listHas(named, "Read"));
+    try testing.expect(!listHas(named, "Write"));
+    try testing.expect(!listHas(named, "Bash"));
+    const loaded = segment(d, LOADED_START, ".");
+    try testing.expect(listHas(loaded, "Read"));
+    try testing.expect(!listHas(loaded, "Write"));
+    try testing.expect(!listHas(loaded, "Bash"));
+
+    // select: hands out no schema for a tool the Skill hid from the request.
+    var select_detail: ?[]const u8 = null;
+    defer if (select_detail) |sd| a.free(sd);
+    const select_ctx = ToolContext{ .allocator = a, .permission_ctx = &perm, .error_detail = &select_detail };
+    try testing.expectError(error.NoToolMatch, execute(&select_ctx, "{\"query\":\"select:Bash\"}"));
+    const out = try execute(&select_ctx, "{\"query\":\"select:Read\"}");
+    defer a.free(out);
+    try testing.expect(std.mem.indexOf(u8, out, "\"name\":\"Read\"") != null);
+}
+
+test "ToolSearch: WebSearch is reported as loaded only when the provider can search" {
+    const a = testing.allocator;
+    const provider_mod = @import("../api/provider.zig");
+    const Fake = struct {
+        fn model(_: *anyopaque) []const u8 {
+            return "fake";
+        }
+        fn maxTokens(_: *anyopaque) u32 {
+            return 1024;
+        }
+        fn reasoningEffort(_: *anyopaque) ?@import("../types.zig").ReasoningEffort {
+            return null;
+        }
+        fn supports(state: *anyopaque, cap: provider_mod.Capability) bool {
+            const web_search: *const bool = @ptrCast(state);
+            return cap == .web_search and web_search.*;
+        }
+    };
+    var web_search = false;
+    const provider = provider_mod.Provider{
+        .ctx = @ptrCast(&web_search),
+        .modelFn = Fake.model,
+        .sendStreamFn = undefined,
+        .sendStreamRetryFn = undefined,
+        .sendFn = undefined,
+        .maxTokensFn = Fake.maxTokens,
+        .maxInputTokensFn = Fake.maxTokens,
+        .reasoningEffortFn = Fake.reasoningEffort,
+        .supportsFn = Fake.supports,
+    };
+    for ([_]bool{ false, true }) |supported| {
+        web_search = supported;
+        var detail: ?[]const u8 = null;
+        defer if (detail) |d| a.free(d);
+        const ctx = ToolContext{ .allocator = a, .provider = provider, .error_detail = &detail };
+        try testing.expectError(error.NoToolMatch, execute(&ctx, "{\"query\":\"web search\"}"));
+        const d = detail orelse return error.TestExpectedDetail;
+        try testing.expectEqual(supported, listHas(segment(d, NAMED_START, NAMED_END), "WebSearch"));
+        try testing.expectEqual(supported, std.mem.indexOf(u8, d, "WebSearch") != null);
+    }
 }
