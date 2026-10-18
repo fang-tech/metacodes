@@ -101,6 +101,17 @@ def tool_response(index: int, name: str, arguments: dict) -> bytes:
     )
 
 
+def openai_text_response(text: str) -> bytes:
+    """OpenAI Chat Completions SSE: one content delta, `stop`, then usage."""
+    chunks = [
+        {"choices": [{"index": 0, "delta": {"role": "assistant", "content": ""}}]},
+        {"choices": [{"index": 0, "delta": {"content": text}}]},
+        {"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]},
+        {"choices": [], "usage": {"prompt_tokens": 11, "completion_tokens": 7}},
+    ]
+    return ("".join("data: %s\n\n" % json.dumps(chunk) for chunk in chunks) + "data: [DONE]\n\n").encode("utf-8")
+
+
 def last_tool_result(body: dict) -> str:
     for message in reversed(body.get("messages", [])):
         content = message.get("content")
@@ -133,7 +144,10 @@ class MockProvider:
                     provider.requests.append(body)
                     index = len(provider.requests)
                     step = provider.script.pop(0) if provider.script else ("text", "script exhausted")
-                if step[0] == "tool":
+                if self.path.endswith("/chat/completions"):
+                    # OpenAI protocol: text steps only.
+                    payload = openai_text_response(step[1] if step[0] == "text" else "unsupported step")
+                elif step[0] == "tool":
                     payload = tool_response(index, step[1], step[2])
                 elif step[0] == "echo":
                     payload = text_response(index, "saw: " + last_tool_result(body))
@@ -153,6 +167,10 @@ class MockProvider:
     @property
     def base_url(self) -> str:
         return "http://127.0.0.1:%d/v1/messages" % self._server.server_port
+
+    @property
+    def openai_url(self) -> str:
+        return "http://127.0.0.1:%d/v1/chat/completions" % self._server.server_port
 
     def __enter__(self) -> "MockProvider":
         self._thread.start()

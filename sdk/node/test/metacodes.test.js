@@ -210,3 +210,167 @@ test('describe and setModel', { skip }, async (t) => {
 test('unknown built-in tools are rejected', { skip }, () => {
   assert.throws(() => new metacodes.Runtime({ tools: ['Telepathy'] }), /unknown built-in tools/);
 });
+
+// A regression of the tests below hangs instead of failing (AgentCore waits
+// for a call that never completes), so each carries a timeout.
+const TIMEOUT = 30_000;
+
+// -- results a handler cannot serialize ------------------------------------
+
+test('a tool result JSON.stringify throws on is a model-visible error, not a crash', { skip, timeout: TIMEOUT }, async (t) => {
+  const provider = await withProvider(t, [['tool', 'big', {}], ['echo']]);
+  const big = metacodes.tool({ name: 'big', description: 'Returns a BigInt.', handler: () => ({ n: 1n }) });
+  const { session } = open(t, { tools: [], hostTools: [big] }, provider, workspace(t), { permissionMode: 'full_access' });
+  const result = await session.run('go');
+  assert.match(result.text, /TypeError/);
+  assert.equal(result.stopReason, 'end_turn');
+});
+
+test('a tool result JSON.stringify drops is a model-visible error', { skip, timeout: TIMEOUT }, async (t) => {
+  const provider = await withProvider(t, [['tool', 'fn', {}], ['echo']]);
+  const fn = metacodes.tool({ name: 'fn', description: 'Returns a function.', handler: () => () => 1 });
+  const { session } = open(t, { tools: [], hostTools: [fn] }, provider, workspace(t), { permissionMode: 'full_access' });
+  const result = await session.run('go');
+  assert.match(result.text, /fn result is not JSON-serializable/);
+});
+
+test('a UI answer JSON.stringify throws on rejects the Run and the session survives', { skip, timeout: TIMEOUT }, async (t) => {
+  const root = workspace(t);
+  const target = path.join(root, 'out.txt');
+  const provider = await withProvider(t, [
+    ['tool', 'Write', { file_path: target, content: 'x' }], ['text', 'unused'], ['text', 'second'],
+  ]);
+  const { session } = open(t, { tools: ['Write'] }, provider, root, { onUiRequest: () => ({ bad: 1n }) });
+  await assert.rejects(session.run('write'), TypeError);
+  assert.equal(fs.existsSync(target), false);
+  const again = await session.run('hi');
+  assert.equal(again.text, 'second');
+});
+
+// -- an active Run: submit, abort, close -----------------------------------
+
+function blockingTool() {
+  let release;
+  let started;
+  const startedPromise = new Promise((resolve) => { started = resolve; });
+  const released = new Promise((resolve) => { release = resolve; });
+  const wait = metacodes.tool({
+    name: 'wait',
+    description: 'Waits for the test.',
+    handler: async () => { started(); await released; return 'waited'; },
+  });
+  return { wait, started: startedPromise, release };
+}
+
+test('submit hands the active Run more input', { skip, timeout: TIMEOUT }, async (t) => {
+  const provider = await withProvider(t, [['tool', 'wait', {}], ['text', 'done']]);
+  const { wait, started, release } = blockingTool();
+  const { session } = open(t, { tools: [], hostTools: [wait] }, provider, workspace(t), { permissionMode: 'full_access' });
+  const run = session.run('start');
+  await started;
+  session.submit('and mention the weather');
+  release();
+  const result = await run;
+  assert.equal(result.inputAccepted, 1);
+  assert.equal(result.inputAdopted, 1);
+  assert.match(JSON.stringify(provider.requests[1].messages), /and mention the weather/);
+});
+
+test('abort stops the active Run', { skip, timeout: TIMEOUT }, async (t) => {
+  const provider = await withProvider(t, [['tool', 'wait', {}], ['text', 'never asked']]);
+  const { wait, started, release } = blockingTool();
+  const { session } = open(t, { tools: [], hostTools: [wait] }, provider, workspace(t), { permissionMode: 'full_access' });
+  const run = session.run('start');
+  await started;
+  session.abort();
+  release();
+  const result = await run;
+  assert.equal(result.stopReason, 'aborted');
+  assert.equal(provider.requests.length, 1);
+});
+
+test('close during a Run is refused and keeps the handle', { skip, timeout: TIMEOUT }, async (t) => {
+  const provider = await withProvider(t, [['tool', 'wait', {}], ['text', 'done']]);
+  const { wait, started, release } = blockingTool();
+  const { runtime, session } = open(t, { tools: [], hostTools: [wait] }, provider, workspace(t), { permissionMode: 'full_access' });
+  const run = session.run('start');
+  await started;
+  assert.throws(() => session.close());
+  assert.ok(session._handle);
+  release();
+  assert.equal((await run).text, 'done');
+  session.close();
+  assert.equal(session._handle, null);
+  assert.equal(runtime.sessions.has(session), false);
+});
+
+// -- permissions ---------------------------------------------------------
+
+function writeScript(root, ...names) {
+  return [...names.map((name) => ['tool', 'Write', { file_path: path.join(root, name), content: name }]), ['text', 'done']];
+}
+
+test('allow and deny rules decide without asking', { skip, timeout: TIMEOUT }, async (t) => {
+  const root = workspace(t);
+  const asked = [];
+  const onUiRequest = (request) => { asked.push(request); return request.allowOnce(); };
+  const denied = await withProvider(t, writeScript(root, 'denied.txt'));
+  await open(t, { tools: ['Write'] }, denied, root, { deny: ['Write'], onUiRequest }).session.run('write');
+  const allowed = await withProvider(t, writeScript(root, 'allowed.txt'));
+  await open(t, { tools: ['Write'] }, allowed, root, { allow: ['Write'], onUiRequest }).session.run('write');
+  assert.equal(fs.existsSync(path.join(root, 'denied.txt')), false);
+  assert.equal(fs.existsSync(path.join(root, 'allowed.txt')), true);
+  assert.deepEqual(asked, []);
+});
+
+test('setPermissionMode applies to the next Run', { skip, timeout: TIMEOUT }, async (t) => {
+  const root = workspace(t);
+  const provider = await withProvider(t, [...writeScript(root, 'first.txt'), ...writeScript(root, 'second.txt')]);
+  const { session } = open(t, { tools: ['Write'] }, provider, root);
+  await session.run('write one');
+  session.setPermissionMode('full_access');
+  await session.run('write two');
+  assert.equal(fs.existsSync(path.join(root, 'first.txt')), false);
+  assert.equal(fs.existsSync(path.join(root, 'second.txt')), true);
+});
+
+test('allowSession is asked once per target', { skip, timeout: TIMEOUT }, async (t) => {
+  const root = workspace(t);
+  const asked = [];
+  const provider = await withProvider(t, writeScript(root, 'a.txt', 'a.txt', 'b.txt'));
+  const { session } = open(t, { tools: ['Write'] }, provider, root, {
+    onUiRequest: (request) => { asked.push(request.data.candidate.target); return request.allowSession(); },
+  });
+  await session.run('write three times');
+  assert.deepEqual(asked, [path.join(root, 'a.txt'), path.join(root, 'b.txt')]);
+});
+
+test('an ask_question answer reaches the model', { skip, timeout: TIMEOUT }, async (t) => {
+  const question = {
+    question: 'Which colour?', header: 'Colour', multiSelect: false,
+    options: [{ label: 'Red', description: 'warm' }, { label: 'Blue', description: 'cool' }],
+  };
+  const provider = await withProvider(t, [['tool', 'AskUserQuestion', { questions: [question] }], ['echo']]);
+  const kinds = [];
+  const { session } = open(t, { tools: ['AskUserQuestion'] }, provider, workspace(t), {
+    onUiRequest: (request) => { kinds.push(request.kind); return request.answer(['Blue']); },
+  });
+  const result = await session.run('ask me');
+  assert.deepEqual(kinds, ['ask_question']);
+  assert.match(result.text, /Blue/);
+});
+
+// -- providers -----------------------------------------------------------
+
+test('the openai provider speaks chat completions', { skip, timeout: TIMEOUT }, async (t) => {
+  const provider = await withProvider(t, [['text', 'hello over chat completions']]);
+  const runtime = new metacodes.Runtime({ tools: [] });
+  t.after(() => runtime.close());
+  const session = runtime.session('mock-model', {
+    provider: 'openai', baseUrl: provider.openaiUrl, apiKey: 'test-key', workspace: workspace(t),
+  });
+  const result = await session.run('say hello');
+  assert.equal(result.text, 'hello over chat completions');
+  assert.equal(result.stopReason, 'end_turn');
+  assert.match(JSON.stringify(provider.requests[0].messages), /say hello/);
+});

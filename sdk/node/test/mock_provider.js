@@ -48,6 +48,17 @@ function toolResponse(index, name, input) {
   ]);
 }
 
+// OpenAI Chat Completions SSE: one content delta, `stop`, then usage.
+function openaiTextResponse(text) {
+  const chunks = [
+    { choices: [{ index: 0, delta: { role: 'assistant', content: '' } }] },
+    { choices: [{ index: 0, delta: { content: text } }] },
+    { choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] },
+    { choices: [], usage: { prompt_tokens: 11, completion_tokens: 7 } },
+  ];
+  return `${chunks.map((chunk) => `data: ${JSON.stringify(chunk)}\n\n`).join('')}data: [DONE]\n\n`;
+}
+
 function lastToolResult(body) {
   for (const message of [...(body.messages || [])].reverse()) {
     if (!Array.isArray(message.content)) continue;
@@ -73,7 +84,8 @@ async function startMockProvider(script) {
       const index = requests.length;
       const step = steps.shift() || ['text', 'script exhausted'];
       let payload;
-      if (step[0] === 'tool') payload = toolResponse(index, step[1], step[2]);
+      if (request.url.endsWith('/chat/completions')) payload = openaiTextResponse(step[0] === 'text' ? step[1] : 'unsupported step');
+      else if (step[0] === 'tool') payload = toolResponse(index, step[1], step[2]);
       else if (step[0] === 'echo') payload = textResponse(index, `saw: ${lastToolResult(body)}`);
       else payload = textResponse(index, step[1]);
       response.writeHead(200, { 'Content-Type': 'text/event-stream', 'Content-Length': Buffer.byteLength(payload) });
@@ -84,6 +96,7 @@ async function startMockProvider(script) {
   return {
     requests,
     baseUrl: `http://127.0.0.1:${server.address().port}/v1/messages`,
+    openaiUrl: `http://127.0.0.1:${server.address().port}/v1/chat/completions`,
     close: () => new Promise((resolve) => server.close(resolve)),
   };
 }

@@ -583,6 +583,33 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- Python and Node SDK packages (from #315), before their first publication:
+  - **Python `Session.close()` lost the handle when the destroy failed.**
+    Leaving a `with` block during a `stream()` the loop stopped with `break`
+    returned BUSY, dropped the handle, made `abort()` a no-op and leaked both
+    the Session and the Runtime. `close()` now aborts a run that is still
+    going and waits for it, and keeps the handle (and the Runtime's) whenever
+    AgentCore refuses. Called from one of the Session's own callbacks, it
+    raises RuntimeError instead of deadlocking.
+  - **Node: a tool result `JSON.stringify` cannot encode crashed the host.**
+    A BigInt, a cycle or a function raised an unhandled rejection that exited
+    the process, or, with an `unhandledRejection` handler installed, left
+    AgentCore waiting forever. It is now a model-visible tool error. An
+    `onUiRequest` answer that cannot be encoded is not answered, and the run
+    rejects with the error.
+  - **Node** names status codes 11–25 and 27 instead of `STATUS_ERROR`.
+  - **L2 tests against the real library** for `submit`, `abort`,
+    `close()` during a run, allow and deny rules, `set_permission_mode`,
+    `allow_session` (asked once per file target), `ask_question` answers and
+    the OpenAI Chat Completions provider, in both packages.
+    `scripts/tests/test_sdk_package_versions.py` checks the package versions
+    against `sdk/VERSION`.
+  - **CI:** the `SDK bindings` jobs report under their names on every run
+    and skip their steps on a docs or eval scope (doc/CI_DESIGN.md §1).
+  - **README:** the gateway row is the 2026-10-16 Windows 11 ReleaseFast run.
+    At 64 clients the overhead is 3 ms p50 / 9 ms p99; "1–3 ms" was the
+    8-client row. The release unit row cites the 0.5.0 assets. The Code
+    column no longer bolds a score that is not the highest.
 - Configuration written wrong is reported instead of silently ineffective.
   Loading is unchanged - the broken piece is still skipped - but a malformed
   hook never fails, it just never fires, and until now each case left only a

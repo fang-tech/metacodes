@@ -56,6 +56,14 @@ event vocabulary is listed in
 `session.abort()` stops the active run and `session.submit(text)` adds user
 input to it; both may be called from another thread.
 
+`session.close()`, and leaving a `with` block, aborts a run that is still going
+and waits for it first. That includes a `stream()` the loop stopped early with
+`break`. The handle is dropped only once AgentCore has destroyed the Session;
+if it refuses, `close()` raises and the Session stays usable. A callback of
+the Session (an event listener, `on_ui_request`, a tool) cannot close it,
+since that callback's run could never return: `close()` raises RuntimeError
+there.
+
 ## Permissions
 
 Sessions start in `permission_mode="default"` with the shell disabled. A tool

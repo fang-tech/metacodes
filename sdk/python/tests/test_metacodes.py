@@ -11,6 +11,7 @@ import os
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -228,6 +229,194 @@ class PythonSdkTest(unittest.TestCase):
                 session.set_model("mock-model-2")
                 self.assertIn("mock-model-2", str(session.describe()))
         self.assertIn("mock-model", str(description))
+
+    # -- Session lifecycle -------------------------------------------------
+
+    def blocking_tool(self, name="wait"):
+        """A host tool that signals `started` and holds its Run until `release`."""
+        started, release = threading.Event(), threading.Event()
+
+        @metacodes.tool(name=name, description="Waits for the test.")
+        def wait(_arguments):
+            started.set()
+            release.wait(10)
+            return "waited"
+
+        return wait, started, release
+
+    def test_leaving_a_stream_early_aborts_the_run_and_closes(self) -> None:
+        # `with session: for event in stream: break` leaves the Run going
+        # while __exit__ closes the Session: close() aborts it, waits for it
+        # and destroys the Session, instead of failing BUSY and dropping the
+        # handle (which leaked the Session and made abort() a no-op).
+        started = threading.Event()
+
+        @metacodes.tool(description="Takes a moment.")
+        def slow(_arguments):
+            started.set()
+            time.sleep(0.3)
+            return "slow done"
+
+        script = [("tool", "slow", {}), ("echo",)]
+        with MockProvider(script) as provider:
+            runtime = metacodes.Runtime(tools=(), host_tools=[slow])
+            with self.session(runtime, provider, permission_mode="full_access") as session:
+                for _event in session.stream("go"):
+                    if started.is_set():
+                        break
+                self.assertTrue(started.wait(5))
+            self.assertFalse(session._handle)
+            self.assertNotIn(session, runtime._sessions)
+            runtime.close()
+            self.assertFalse(runtime._handle)
+
+    def test_close_from_a_callback_is_refused_and_the_session_survives(self) -> None:
+        refused = []
+
+        def listener(_event):
+            if not refused:
+                try:
+                    session.close()
+                except RuntimeError as error:
+                    refused.append(error)
+
+        with MockProvider([("text", "one"), ("text", "two")]) as provider:
+            with metacodes.Runtime(tools=()) as runtime:
+                session = self.session(runtime, provider)
+                self.assertEqual(session.run("first", on_event=listener).text, "one")
+                self.assertEqual(len(refused), 1)
+                self.assertTrue(session._handle)
+                self.assertEqual(session.run("second").text, "two")
+
+    def run_in_background(self, session, prompt):
+        box = {}
+
+        def work():
+            try:
+                box["result"] = session.run(prompt)
+            except BaseException as error:  # surfaced by the test
+                box["error"] = error
+
+        thread = threading.Thread(target=work)
+        thread.start()
+        return thread, box
+
+    def test_submit_hands_the_active_run_more_input(self) -> None:
+        wait, started, release = self.blocking_tool()
+        with MockProvider([("tool", "wait", {}), ("text", "done")]) as provider:
+            with metacodes.Runtime(tools=(), host_tools=[wait]) as runtime:
+                session = self.session(runtime, provider, permission_mode="full_access")
+                thread, box = self.run_in_background(session, "start")
+                self.assertTrue(started.wait(10))
+                session.submit("and mention the weather")
+                release.set()
+                thread.join(10)
+        self.assertNotIn("error", box)
+        result = box["result"]
+        self.assertEqual((result.input_accepted, result.input_adopted), (1, 1))
+        self.assertIn("and mention the weather", str(provider.requests[1]["messages"]))
+
+    def test_abort_stops_the_active_run(self) -> None:
+        wait, started, release = self.blocking_tool()
+        with MockProvider([("tool", "wait", {}), ("text", "never asked")]) as provider:
+            with metacodes.Runtime(tools=(), host_tools=[wait]) as runtime:
+                session = self.session(runtime, provider, permission_mode="full_access")
+                thread, box = self.run_in_background(session, "start")
+                self.assertTrue(started.wait(10))
+                session.abort()
+                release.set()
+                thread.join(10)
+        self.assertNotIn("error", box)
+        self.assertEqual(box["result"].stop_reason, "aborted")
+        self.assertEqual(len(provider.requests), 1)
+
+    # -- Permissions -------------------------------------------------------
+
+    def write_script(self, *names):
+        return [("tool", "Write", {"file_path": str(self.root / name), "content": name}) for name in names] + [
+            ("text", "done")
+        ]
+
+    def test_allow_and_deny_rules_decide_without_asking(self) -> None:
+        asked = []
+
+        def on_ui_request(request):
+            asked.append(request)
+            return request.allow_once()
+
+        with MockProvider(self.write_script("denied.txt")) as provider:
+            with metacodes.Runtime(tools=["Write"]) as runtime:
+                session = self.session(runtime, provider, deny=["Write"], on_ui_request=on_ui_request)
+                session.run("write")
+        self.assertFalse((self.root / "denied.txt").exists())
+        with MockProvider(self.write_script("allowed.txt")) as provider:
+            with metacodes.Runtime(tools=["Write"]) as runtime:
+                session = self.session(runtime, provider, allow=["Write"], on_ui_request=on_ui_request)
+                session.run("write")
+        self.assertTrue((self.root / "allowed.txt").exists())
+        self.assertEqual(asked, [])
+
+    def test_set_permission_mode_applies_to_the_next_run(self) -> None:
+        with MockProvider(self.write_script("first.txt") + self.write_script("second.txt")) as provider:
+            with metacodes.Runtime(tools=["Write"]) as runtime:
+                session = self.session(runtime, provider)
+                session.run("write one")
+                session.set_permission_mode("full_access")
+                session.run("write two")
+        self.assertFalse((self.root / "first.txt").exists())
+        self.assertTrue((self.root / "second.txt").exists())
+
+    def test_allow_session_is_asked_once_per_target(self) -> None:
+        # The session-scoped candidate is the file target: writing a.txt
+        # again is not asked, a new file is.
+        asked = []
+
+        def on_ui_request(request):
+            asked.append(request.data["candidate"]["target"])
+            return request.allow_session()
+
+        with MockProvider(self.write_script("a.txt", "a.txt", "b.txt")) as provider:
+            with metacodes.Runtime(tools=["Write"]) as runtime:
+                session = self.session(runtime, provider, on_ui_request=on_ui_request)
+                session.run("write three times")
+        self.assertEqual(asked, [str(self.root / "a.txt"), str(self.root / "b.txt")])
+        self.assertTrue((self.root / "a.txt").exists())
+        self.assertTrue((self.root / "b.txt").exists())
+
+    def test_an_ask_question_answer_reaches_the_model(self) -> None:
+        asked = []
+        question = {
+            "question": "Which colour?",
+            "header": "Colour",
+            "options": [{"label": "Red", "description": "warm"}, {"label": "Blue", "description": "cool"}],
+            "multiSelect": False,
+        }
+
+        def on_ui_request(request):
+            asked.append(request)
+            return request.answer(["Blue"])
+
+        script = [("tool", "AskUserQuestion", {"questions": [question]}), ("echo",)]
+        with MockProvider(script) as provider:
+            with metacodes.Runtime(tools=["AskUserQuestion"]) as runtime:
+                session = self.session(runtime, provider, on_ui_request=on_ui_request)
+                result = session.run("ask me")
+        self.assertEqual([request.kind for request in asked], ["ask_question"])
+        self.assertIn("Blue", result.text)
+
+    # -- Providers ---------------------------------------------------------
+
+    def test_the_openai_provider_speaks_chat_completions(self) -> None:
+        with MockProvider([("text", "hello over chat completions")]) as provider:
+            with metacodes.Runtime(tools=()) as runtime:
+                session = runtime.session(
+                    "mock-model", provider="openai", base_url=provider.openai_url,
+                    api_key="test-key", workspace=str(self.root),
+                )
+                result = session.run("say hello")
+        self.assertEqual(result.text, "hello over chat completions")
+        self.assertEqual(result.stop_reason, "end_turn")
+        self.assertIn("say hello", str(provider.requests[0]["messages"]))
 
     def test_unknown_builtin_tool_is_rejected_before_loading(self) -> None:
         with self.assertRaises(ValueError):
