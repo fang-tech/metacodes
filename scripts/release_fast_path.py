@@ -23,7 +23,9 @@ Two facts decide it, both checked here:
    `--wait-seconds`; anything else is the full path.
 
 ci.yml: `release_fast_path.py --base HEAD^1 --candidate HEAD --repository
-owner/repo --github-output "$GITHUB_OUTPUT"`. It writes `fast=true|false` and
+owner/repo --github-output "$GITHUB_OUTPUT"`; in a merge queue group the base
+is the group's `base_sha` (doc/CI_DESIGN.md §3), so only a group whose whole
+diff is the bump qualifies. It writes `fast=true|false` and
 `reason=...` and always exits 0: an error is reported and decides the full
 path. Python 3.9, stdlib only; tests in scripts/tests/test_release_fast_path.py.
 """

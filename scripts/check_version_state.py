@@ -16,8 +16,13 @@ RELEASE_PR_TITLE == `release: <version>` and `release` in RELEASE_PR_LABELS
 (ci.yml passes the title from the event payload and the labels the PR has
 when the step runs: `gh pr create --label` adds the label after creating the
 PR, so the `opened` payload can lack it); the merge-subject exception is
-honoured only on push runs. Tags: `actions/checkout` with `fetch-depth: 0`
-fetches every branch and tag, so no fetch is needed here.
+honoured only on push runs. A merge queue group (doc/CI_DESIGN.md §3)
+carries no PR in its event: ci.yml takes the PR at the group's head (the
+newest entry) from its ref and passes that PR's head branch as
+GITHUB_HEAD_REF, with its title and labels, so the release PR passes only
+as its group's head and a PR queued behind it is refused. Tags:
+`actions/checkout` with `fetch-depth: 0` fetches every branch and tag, so no
+fetch is needed here.
 
 `--rehearse` (CI only): on a release PR head or on main's run of the release
 merge commit, tag HEAD locally so `release:verify` / `release:archive` can run
