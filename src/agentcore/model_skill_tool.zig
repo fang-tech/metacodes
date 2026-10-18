@@ -880,6 +880,7 @@ test "init refuses a base surface that already advertises the Skill tool name" {
             .arguments = &.{},
             .disable_model_invocation = false,
             .when_to_use = "",
+            .description_source = .frontmatter,
             .argument_hint = "",
             .user_invocable = true,
             .model_activation = .required_first,

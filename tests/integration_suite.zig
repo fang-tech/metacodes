@@ -123,6 +123,7 @@ test {
     _ = @import("component/swarm_kg_degraded_test.zig");
     _ = @import("component/add_dir_test.zig");
     _ = @import("component/session_api_parity_test.zig");
+    _ = @import("component/config_diagnostics_test.zig");
     _ = @import("component/workspace_root_refresh_test.zig");
     _ = @import("component/worktree_root_test.zig");
     _ = @import("component/environment_fault_stop_test.zig");

@@ -1188,6 +1188,7 @@ fn cloneSkillRecord(arena: std.mem.Allocator, source: SkillRecord) error{OutOfMe
         .definition = .{
             .name = try arena.dupe(u8, source.definition.name),
             .description = try arena.dupe(u8, source.definition.description),
+            .description_source = source.definition.description_source,
             .when_to_use = try arena.dupe(u8, source.definition.when_to_use),
             .argument_hint = try arena.dupe(u8, source.definition.argument_hint),
             .body = try arena.dupe(u8, source.definition.body),
@@ -2045,6 +2046,7 @@ test "catalog identity validation rejects duplicates and preserves allocation fa
         .arguments = &.{},
         .disable_model_invocation = false,
         .when_to_use = "",
+        .description_source = .missing,
         .argument_hint = "",
         .user_invocable = true,
         .context = .inline_ctx,
