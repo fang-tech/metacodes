@@ -831,7 +831,8 @@ pub fn build(b: *std.Build) void {
         .name = "metacodes",
         .root_module = release_mod,
     });
-    b.installArtifact(exe);
+    const install_cli = b.addInstallArtifact(exe, .{});
+    b.getInstallStep().dependOn(&install_cli.step);
 
     // E3 causal evaluation only: same product root/provider/agent/tool path,
     // but formal blocks are observed rather than actuated.  There is no env or
@@ -2722,7 +2723,9 @@ pub fn build(b: *std.Build) void {
         run_shard.has_side_effects = true;
         run_shard.setEnvironmentVariable("METACODES_TEST_SHARD_COUNT", b.fmt("{}", .{integration_test_shards}));
         run_shard.setEnvironmentVariable("METACODES_TEST_SHARD_INDEX", b.fmt("{}", .{shard_index}));
+        run_shard.setEnvironmentVariable("METACODES_TEST_CLI_BIN", b.getInstallPath(.bin, exe.out_filename));
         run_shard.expectExitCode(0);
+        run_shard.step.dependOn(&install_cli.step);
         run_shard.step.dependOn(&install_mock_mcp.step);
         run_shard.step.dependOn(&install_selfexe_probe.step);
         wireTinyKgTestInput(run_shard, staged_tinykg);
@@ -2739,6 +2742,8 @@ pub fn build(b: *std.Build) void {
     const integration_monolithic_run = addTestRunArtifact(b, integration_suite_test);
     integration_monolithic_run.setEnvironmentVariable("METACODES_TEST_SHARD_COUNT", "1");
     integration_monolithic_run.setEnvironmentVariable("METACODES_TEST_SHARD_INDEX", "0");
+    integration_monolithic_run.setEnvironmentVariable("METACODES_TEST_CLI_BIN", b.getInstallPath(.bin, exe.out_filename));
+    integration_monolithic_run.step.dependOn(&install_cli.step);
     integration_monolithic_run.step.dependOn(&install_mock_mcp.step);
     integration_monolithic_run.step.dependOn(&install_selfexe_probe.step);
     wireTinyKgTestInput(integration_monolithic_run, staged_tinykg);
@@ -2757,6 +2762,8 @@ pub fn build(b: *std.Build) void {
         },
     });
     const integration_timed_run = addTestRunArtifact(b, integration_timed_test);
+    integration_timed_run.setEnvironmentVariable("METACODES_TEST_CLI_BIN", b.getInstallPath(.bin, exe.out_filename));
+    integration_timed_run.step.dependOn(&install_cli.step);
     integration_timed_run.step.dependOn(&install_mock_mcp.step);
     integration_timed_run.step.dependOn(&install_selfexe_probe.step);
     wireTinyKgTestInput(integration_timed_run, staged_tinykg);
