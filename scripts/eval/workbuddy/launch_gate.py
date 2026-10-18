@@ -957,6 +957,14 @@ def build_launch_manifest(
             "paid WorkBuddy job orchestrator_override may only set "
             "n_concurrent_trials: 1; other keys reach the top-level runtime"
         )
+    # ``environment_override`` deep-merges into Harbor's environment config,
+    # whose container-wide ``env`` reaches the task container and its verifier.
+    if "environment_override" in job:
+        raise LaunchError(
+            "paid WorkBuddy job must not carry environment_override: its env "
+            "reaches the task container, where it can route an LLM or carry a "
+            "credential outside the budget"
+        )
     project_control = artifact_row.get("project_control")
     project_overrides = job.get("harness_params_override") or {}
     if not isinstance(project_overrides, dict):

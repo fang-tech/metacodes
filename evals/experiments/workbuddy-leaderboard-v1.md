@@ -179,10 +179,13 @@ charges the whole cap beside the actor's measured cost, and the receipt's
 keeps that variable only for a judge-budgeted launch and has it removed for
 every other one, and a judged transaction cannot be resumed with
 `resume-trials` (a rerun would call the judge again past its cap). A judged
-job cannot be a paired-comparison arm (`--comparison-id` is refused), and a
-paid job may not carry its own `verifier` block or any
-`orchestrator_override` key besides `n_concurrent_trials`, either of which
-could route a verifier LLM around the judge budget. The operator sizes each
+job cannot be a paired-comparison arm (`--comparison-id` is refused). Since
+quality evidence needs a comparison id, a judged receipt can never be quality
+evidence: every Web and Office receipt is `quality_evidence=false` by
+construction. A paid job may not carry its own `verifier`
+block, an `environment_override`, or any `orchestrator_override` key besides
+`n_concurrent_trials`, any of which could route an LLM or a credential
+around the judge budget. The operator sizes each
 Web or Office cap from the September judge load for its tasks, keeping the
 caps of all 24 judged transactions within the US$150.
 

@@ -3344,6 +3344,9 @@ class WorkBuddyJudgeBudgetTest(unittest.TestCase):
             "other runtime key through orchestrator_override": lambda job: job[
                 "orchestrator_override"
             ].update(retry={"max_retries": 3}),
+            "container env through environment_override": lambda job: job.update(
+                environment_override=route
+            ),
         }
         for label, change in cases.items():
             with self.subTest(label), tempfile.TemporaryDirectory() as directory:
@@ -3351,7 +3354,9 @@ class WorkBuddyJudgeBudgetTest(unittest.TestCase):
                 self._checkout(root)
                 job = self._job("code")
                 change(job)
-                with self.assertRaisesRegex(LaunchError, "verifier|orchestrator_override"):
+                with self.assertRaisesRegex(
+                    LaunchError, "verifier|orchestrator_override|environment_override"
+                ):
                     self._build(root, job)
         # No job this repository writes carries either.
         overlay_jobs = sorted((self.OVERLAY / "configs/jobs").glob("*.yaml"))
@@ -3367,6 +3372,7 @@ class WorkBuddyJudgeBudgetTest(unittest.TestCase):
         )
         for job in written:
             self.assertNotIn("verifier", job)
+            self.assertNotIn("environment_override", job)
             self.assertEqual({"n_concurrent_trials": 1}, job["orchestrator_override"])
 
     def test_judge_budget_flag_is_a_positive_finite_dollar_amount(self):

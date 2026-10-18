@@ -169,7 +169,9 @@ runs; their committed receipts remain `quality_evidence=false` even though
 they use the official runner. Pass it only for a preregistered real-provider
 wave whose official task outcomes are intended to count as quality evidence.
 Every such wave must also carry an explicit `--comparison-id`; a single arm is
-not sufficient quality evidence for a harness change.
+not sufficient quality evidence for a harness change. A job that runs the LLM
+judge (Web, Office) refuses `--comparison-id`, so its receipts are
+`quality_evidence=false` by construction.
 
 Paired outcome studies use two independently created launch manifests
 with the same comparison id and frozen covariate digest. The baseline job uses
@@ -318,9 +320,10 @@ launch, removes it for every other launch (as W0, W0.5 and the leaderboard
 preflight do), and refuses a judged launch whose environment lacks it before
 any reservation; `resume-trials` refuses a judged arm, and `create` refuses
 a judged job as a paired-comparison arm. A paid job may not carry a
-`verifier` block or `orchestrator_override` keys besides
-`n_concurrent_trials`: the runner merges either into its runtime config,
-where it could set the verifier's LLM route outside the judge budget.
+`verifier` block, an `environment_override` or `orchestrator_override` keys
+besides `n_concurrent_trials`: the runner merges each into its runtime
+config, where it could set the verifier's LLM route or a container-wide
+credential outside the judge budget.
 
 One run is sixteen jobs, the four subsets times the four frozen cohorts,
 because a paid launch binds one cohort, one attempt and one trial at a time.
