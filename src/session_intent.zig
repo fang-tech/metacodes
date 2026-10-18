@@ -57,6 +57,7 @@ pub const BUILTIN_VERBS = [_]VerbSpec{
     .{ .name = "btw", .class = .local },
     .{ .name = "recap", .class = .local },
     .{ .name = "agents", .class = .local },
+    .{ .name = "hooks", .class = .local },
     .{ .name = "permissions", .class = .local },
     .{ .name = "memory", .class = .local }, // edit 走 $EDITOR(tty),终端宏
     // 离线渲染测试钩子(终端专属)

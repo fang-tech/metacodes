@@ -13,10 +13,24 @@ pub const ModelActivation = enum {
     required_first,
 };
 
+/// Where a Skill's `description` came from. Listings - the model's and the
+/// `/` menu's - are built from it, so a Skill without one is reported by
+/// `/skills` instead of being listed silently with a guess or with nothing.
+pub const DescriptionSource = enum {
+    /// The frontmatter's own `description`.
+    frontmatter,
+    /// Absent from the frontmatter; the first non-empty body line stands in
+    /// (Claude Code's fallback, `ParseOptions.description_fallback`).
+    body_first_line,
+    /// Absent or blank, and nothing stands in: listings show no description.
+    missing,
+};
+
 /// Canonical parsed SKILL.md definition shared by every product adapter.
 pub const Skill = struct {
     name: []const u8,
     description: []const u8,
+    description_source: DescriptionSource,
     /// Claude Code `when_to_use`: appended to the description in listings.
     when_to_use: []const u8,
     /// Claude Code `argument-hint`: shown beside the command in the `/` menu.
@@ -162,7 +176,13 @@ pub fn parseSkillMdWithOptions(
 
     if (name == null or name.?.len == 0) name = dir_name;
     if (name.?.len == 0) return error.MissingSkillName;
-    if (description == null and options.description_fallback) description = firstBodyLine(body);
+    var description_source: DescriptionSource = .frontmatter;
+    if (description == null and options.description_fallback) {
+        description = firstBodyLine(body);
+        description_source = .body_first_line;
+    }
+    if (description == null or std.mem.trim(u8, description.?, " \t\r\n").len == 0)
+        description_source = .missing;
 
     const allowed_tools = try optionalList(allocator, root, &.{ "allowed-tools", "allowed_tools" });
     errdefer freeStringList(allocator, allowed_tools);
@@ -199,6 +219,7 @@ pub fn parseSkillMdWithOptions(
     return .{
         .name = owned_name,
         .description = owned_description,
+        .description_source = description_source,
         .when_to_use = owned_when_to_use,
         .argument_hint = owned_argument_hint,
         .body = owned_body,
@@ -632,6 +653,26 @@ test "description falls back to the first body line only when asked" {
     const fallback = try parseSkillMdWithOptions(std.testing.allocator, md, "/x", "x", .{ .description_fallback = true });
     defer fallback.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("# Title line", fallback.description);
+}
+
+test "description source records the frontmatter, the fallback, or nothing" {
+    const a = std.testing.allocator;
+    const Case = struct { md: []const u8, fallback: bool, source: DescriptionSource, description: []const u8 };
+    const cases = [_]Case{
+        .{ .md = "---\nname: x\ndescription: Review diffs\n---\nbody\n", .fallback = true, .source = .frontmatter, .description = "Review diffs" },
+        .{ .md = "---\nname: x\ndescription: Review diffs\n---\nbody\n", .fallback = false, .source = .frontmatter, .description = "Review diffs" },
+        .{ .md = "---\nname: x\n---\n\nFirst line\n", .fallback = true, .source = .body_first_line, .description = "First line" },
+        .{ .md = "---\nname: x\n---\n\nFirst line\n", .fallback = false, .source = .missing, .description = "" },
+        .{ .md = "---\nname: x\n---\n \n", .fallback = true, .source = .missing, .description = "" },
+        .{ .md = "---\nname: x\ndescription: \"  \"\n---\nbody\n", .fallback = true, .source = .missing, .description = "  " },
+        .{ .md = "No frontmatter at all\n", .fallback = true, .source = .body_first_line, .description = "No frontmatter at all" },
+    };
+    for (cases) |case| {
+        const skill = try parseSkillMdWithOptions(a, case.md, "/x", "x", .{ .description_fallback = case.fallback });
+        defer skill.deinit(a);
+        try std.testing.expectEqual(case.source, skill.description_source);
+        try std.testing.expectEqualStrings(case.description, skill.description);
+    }
 }
 
 test "Codex sidecar: implicit invocation policy, fail-open on malformed YAML" {

@@ -583,6 +583,27 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- Configuration written wrong is reported instead of silently ineffective.
+  Loading is unchanged - the broken piece is still skipped - but a malformed
+  hook never fails, it just never fires, and until now each case left only a
+  `warn` log line below the default log level.
+  - **Hooks.** The new `/hooks` lists the hooks in effect per event and every
+    problem the last load found, with its file and JSON path: a settings file
+    that is not JSON, `hooks` that is not an object, a Claude Code event
+    metacodes does not run (`SessionStart`, `UserPromptSubmit`, ...), a key
+    that is no event at all (`PostToolUSE`, with a suggestion), an entry or
+    hook of the wrong shape, a `type` other than `command`, a missing
+    `command`, a `timeout` that is not a positive number or exceeds 600 s,
+    and hooks written in `.claude/settings.local.json` or a `--settings`
+    file, which metacodes does not read hooks from.
+  - **Skills.** `/skills` lists each Skill whose `SKILL.md` has no
+    `description`: listings show its first body line (Claude Code's
+    fallback) or nothing, and the model picks Skills by that line.
+  - **Agents.** `/agents` lists agents without a `description` (the Task tool
+    lists them with nothing) and agent files that did not load, with the
+    reason.
+  - The startup banner and `/doctor` count these and name the command that
+    lists them (`config issues: 2 hooks, 1 skill · see /hooks /skills`).
 - `ToolSearch` misses no longer read as "the core tools are missing"
   (issue #287). A miss says that ToolSearch only searches deferred tools,
   names the loaded tools whose names match the query's keywords (`file read
