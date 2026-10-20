@@ -6096,8 +6096,6 @@ fn withArtifactRecoveryTool(
     return effective;
 }
 
-/// Construct a facade only from canonical, already-bounded inputs. The caller
-/// retains `skill_binding` on failure and transfers it on success.
 /// Restore health is a function of what was lost, nothing else. A changed
 /// policy fingerprint, an unavailable or changed Skill catalog: each one
 /// already counts every grant it takes away, and each counted grant gets an
@@ -6114,6 +6112,8 @@ fn restoreHealth(
         .complete;
 }
 
+/// Construct a facade only from canonical, already-bounded inputs. The caller
+/// retains `skill_binding` on failure and transfers it on success.
 fn buildAbiSession(
     runtime: *AbiRuntime,
     config: SessionBuildConfig,
