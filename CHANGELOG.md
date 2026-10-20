@@ -10,6 +10,8 @@ status, compatibility boundaries, and entry points are defined by
 
 ## Unreleased
 
+## 0.6.0 — 2026-10-20
+
 ### Added
 
 - A startup animation in the interactive TUI: the wordmark "Metask Lab"
