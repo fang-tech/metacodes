@@ -223,6 +223,8 @@ pub const RenderRegion = struct {
             // (游标列不还原、偶尔行偏 1),旧版"假设恢复干净直接重画"→ 旧固定区行残留。
             // 修复点不在这里特判,而在 drawGenRegion 开头的 `ESC[0J`(每次区重画都把区下方主动清净)——
             // 单一机制、不依赖 ?1049/DECRC 的恢复精度(DSR 证明 Warp 对 DECSC/DECRC 也不还原列,已删那条死路)。
+            // drawGenRegion 不自测尺寸:overlay 期间的 resize 在这里量。
+            self.observeResize();
             self.drawGenRegion(app);
         }
         self.unlock();
@@ -408,7 +410,11 @@ pub const RenderRegion = struct {
         if (had_pending) {
             self.text_pending_newline = false;
             self.pending_col = 0;
-            self.resize_seal_pending = true;
+            // A drawn region sits on the row after the half-line, and erasing
+            // it without the snapshot leaves the cursor at that row's start:
+            // the line is already sealed. Only a cursor still parked at the
+            // half-line's end needs the deferred newline.
+            self.resize_seal_pending = !self.region_drawn;
         }
     }
 
@@ -2650,10 +2656,16 @@ test "generation erase walks up from the edit row, clears with ED0, returns to t
 test "a generation resize invalidates the saved half-line cursor before erase" {
     var r = RenderRegion.init(std.testing.allocator, 2, theme_mod.select(.dark, .none), .none);
     defer r.deinit();
+    // Region drawn below a half-line: the snapshot is dropped, so erase
+    // returns to the start of the region's top row, which is already a fresh
+    // line. No forward move to the stale column, and no extra newline.
     r.text_pending_newline = true;
     r.pending_col = 37;
+    r.region_drawn = true;
     r.region_drawn_pending_nl = true;
     r.region_drawn_pending_col = 37;
+    r.prev_rows = 2;
+    r.cursor_in_region_row = 1;
 
     r.invalidateContinuationForResize();
 
@@ -2661,21 +2673,40 @@ test "a generation resize invalidates the saved half-line cursor before erase" {
     try std.testing.expectEqual(@as(u16, 0), r.pending_col);
     try std.testing.expect(!r.region_drawn_pending_nl);
     try std.testing.expectEqual(@as(u16, 0), r.region_drawn_pending_col);
-    try std.testing.expect(r.resize_seal_pending);
+    try std.testing.expect(!r.resize_seal_pending);
 
-    // The deferred newline is consumed exactly once after erase has returned
-    // the cursor to the text stream.
-    r.region_drawn = true;
-    r.prev_rows = 2;
-    r.cursor_in_region_row = 1;
     r.frame_active = true;
     r.eraseRegion();
     var nb: [16]u8 = undefined;
     try std.testing.expect(std.mem.indexOf(u8, r.scratch.written(), ansi.cursor.forward(37, &nb)) == null);
+    try std.testing.expect(std.mem.indexOf(u8, r.scratch.written(), ansi.cursor.up(1, &nb)) != null);
+    const after_erase = r.scratch.written().len;
+    r.sealResizedLine();
+    try std.testing.expectEqual(after_erase, r.scratch.written().len);
+}
+
+test "a generation resize with the cursor on the half-line seals it exactly once" {
+    var r = RenderRegion.init(std.testing.allocator, 2, theme_mod.select(.dark, .none), .none);
+    defer r.deinit();
+    // Region not on screen: the cursor still sits at the half-line's end, so
+    // the next write must start on a new line instead of the stale column.
+    r.text_pending_newline = true;
+    r.pending_col = 37;
+
+    r.invalidateContinuationForResize();
+
+    try std.testing.expect(!r.text_pending_newline);
+    try std.testing.expectEqual(@as(u16, 0), r.pending_col);
+    try std.testing.expect(r.resize_seal_pending);
+
+    r.frame_active = true;
     const before_seal = r.scratch.written().len;
     r.sealResizedLine();
     try std.testing.expect(!r.resize_seal_pending);
     try std.testing.expectEqualStrings("\n", r.scratch.written()[before_seal..]);
+    const after_seal = r.scratch.written().len;
+    r.sealResizedLine();
+    try std.testing.expectEqual(after_seal, r.scratch.written().len);
 }
 
 test "leaveGenerating is idempotent so a deferred fallback cannot double-finish" {

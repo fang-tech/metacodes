@@ -60,7 +60,7 @@ def test_T13_resize_during_generation_keeps_stream_and_region_aligned(bin_path):
                 "key:enter",
                 wait_for("esc to interrupt"),
                 "strictsleep:0.35",
-                "resize:24x40",
+                "resize:24x60",
                 wait_for("tok17", 20),
                 "sleep:1.0",
             ],
@@ -70,8 +70,19 @@ def test_T13_resize_during_generation_keeps_stream_and_region_aligned(bin_path):
             per_key_drain=0.05,
         )
 
-    a = TTYAssert(raw, rows=24, cols=40)
+    a = TTYAssert(raw, rows=24, cols=60)
     if a.final.find_last_row("tok17") is None:
         a._fail("resize 后流式输出尾部 tok17 丢失或落入固定区")
+    # The final screen is the input phase, which always re-measures. The
+    # generation region is drawn by a different path: its last frame (the
+    # spinner still says "esc to interrupt") must use the new width too.
+    import re
+    from asserts import split_frames
+    gen_frames = [c for k, c in split_frames(raw) if k == "frame" and b"esc to interrupt" in c]
+    if not gen_frames:
+        a._fail("没有捕获到生成期固定区帧")
+    runs = [len(m.group(0)) // 3 for m in re.finditer(rb"(?:\xe2\x94\x80)+", gen_frames[-1])]
+    if not runs or max(runs) > 60 or max(runs) < 50:
+        a._fail(f"resize 后生成期固定区边框未按新宽度(60)重画:横线长度 {runs}")
     a.assert_box_present()
     a.assert_box_at_bottom()
