@@ -171,6 +171,24 @@ pub fn installResize(comptime callback: fn () void) void {
     std.posix.sigaction(std.posix.SIG.WINCH, &act, null);
 }
 
+/// Install the POSIX continue hook.  SIGCONT is delivered after a stopped
+/// foreground process resumes; the callback must only publish an atomic flag
+/// because terminal IO is not async-signal-safe.  Windows has no equivalent.
+pub fn installContinue(comptime callback: fn () void) void {
+    if (is_windows) return;
+    const P = struct {
+        fn h(_: std.posix.SIG) callconv(.c) void {
+            callback();
+        }
+    };
+    var act: std.posix.Sigaction = .{
+        .handler = .{ .handler = P.h },
+        .mask = std.posix.sigemptyset(),
+        .flags = 0,
+    };
+    std.posix.sigaction(std.posix.SIG.CONT, &act, null);
+}
+
 // ── 测试 ─────────────────────────────────────────────────────────────────────────
 
 const testing = std.testing;

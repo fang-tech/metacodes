@@ -30,6 +30,7 @@ const ansi = @import("../ansi.zig");
 const theme_mod = @import("../theme.zig");
 const term = @import("../term.zig");
 const overlay_mod = @import("../overlay.zig");
+const input_mod = @import("../../input.zig");
 const Theme = theme_mod.Theme;
 
 pub const PageOptions = struct {
@@ -151,7 +152,10 @@ pub fn page(alloc: std.mem.Allocator, th: Theme, content: []const u8, opts: Page
         // 读键
         var buf: [8]u8 = undefined;
         const n = pfs.read(in_fd, &buf);
-        if (n <= 0) break;
+        if (n <= 0) {
+            if (n < 0 and input_mod.reconcileAfterResume(in_fd)) continue;
+            break;
+        }
         const b = buf[0];
 
         switch (b) {
