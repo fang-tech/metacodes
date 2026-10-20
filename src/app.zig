@@ -430,6 +430,9 @@ pub const App = struct {
     sandbox_settings: ?@import("sandbox/config.zig").SandboxSettings = null,
     /// PreToolUse hooks(从 settings.hooks.PreToolUse 解析)。
     hooks: ?@import("permission/hooks.zig").HookSet = null,
+    /// 最近一次 loadHooks 发现的坏配置(每处被跳过的文件/事件/entry/hook 一条)。
+    /// 坏 hook 不报错只是永不触发——`/hooks` 列出,启动横幅与 `/doctor` 计数。
+    hook_diagnostics: ?@import("permission/hooks.zig").Diagnostics = null,
     /// 会话根目录:启动时对进程 cwd 拍的字符串快照。读它的有七处(Bash 子进程 chdir、
     /// Read/Write/Edit/Glob 的 base_dir、权限 match_ctx.cwd、沙箱 profile、系统提示词、
     /// project_dir、KG 项目目录),而 agent 的工作本身就会改名/搬走目录。写它的只有两条路:
@@ -1157,6 +1160,7 @@ pub const App = struct {
         if (app.snapshot_cache) |*c| c.deinit(); // U5 B1
         if (app.sandbox_settings) |*s| s.deinit();
         if (app.hooks) |*h| h.deinit();
+        if (app.hook_diagnostics) |*d| d.deinit();
         if (app.cwd_abs) |c| app.allocator.free(c);
         for (app.retired_workspace_strings.items) |s| app.allocator.free(s);
         app.retired_workspace_strings.deinit(app.allocator);
@@ -3083,6 +3087,36 @@ pub const App = struct {
         return app.additional_dirs_abs orelse &.{};
     }
 
+    /// Configuration that loaded with problems, counted by the command that
+    /// lists the details. The startup banner and `/doctor` show the counts, so
+    /// a broken hook, Skill or agent file is noticed without knowing where to
+    /// look: a malformed one does not fail, it is skipped or silently degraded.
+    pub const ConfigProblems = struct {
+        /// `/hooks`: each skipped file, event, entry or hook.
+        hooks: usize = 0,
+        /// `/skills`: Skills that did not load, skipped roots, and Skills
+        /// without a `description`.
+        skills: usize = 0,
+        /// `/agents`: agent files that did not load, and agents without a
+        /// `description`.
+        agents: usize = 0,
+
+        pub fn total(self: ConfigProblems) usize {
+            return self.hooks + self.skills + self.agents;
+        }
+    };
+
+    pub fn configProblems(app: *const App) ConfigProblems {
+        var problems = ConfigProblems{};
+        if (app.hook_diagnostics) |*diag| problems.hooks = diag.items().len;
+        if (app.skill_runtime.snapshot) |snapshot| {
+            problems.skills = snapshot.issues.len + snapshot.skipped_sources.len;
+            for (snapshot.skills) |record| problems.skills += @intFromBool(record.definition.description_source != .frontmatter);
+        }
+        problems.agents = app.agents.load_failures.items.len + app.agents.missingDescriptionCount();
+        return problems;
+    }
+
     /// **配置变更事件 sink 装配(U4)**:driver(TUI/web)在 session 装配时调。同步设 App 的
     /// sink(model/dirs/reasoning emit)+ permission_ctx.event_sink(mode emit),两者一致。
     /// null 清除(deinit / 无 UI)。
@@ -3131,37 +3165,68 @@ pub const App = struct {
         return .{ .model = m, .dirs = d };
     }
 
-    /// 收集 project + user settings 的 hooks(Pre+Post),**跨层合并**成一个 HookSet(不再首个覆盖)。
+    /// 收集 project + user settings 的 hooks(5 类事件),**跨层合并**成一个 HookSet(不再首个覆盖)。
     /// 合并语义:各层 matcher entry 全部并入(project 与 user 的 hook 并存,org 全局 hook 不被项目覆盖)。
+    /// 坏配置照旧跳过,但每处跳过记进 `hook_diagnostics`(整份替换:reload 时反映文件现状),
+    /// 再按 warn 打日志。`.claude/settings.local.json` 与 `--settings` 不读 hook,其中写了
+    /// `hooks` 也报告,而不是静默不生效。
     fn loadHooks(app: *App, home: ?[]const u8) !void {
         const hooks_mod = @import("permission/hooks.zig");
+        const log = @import("util/log.zig");
+        var diag = hooks_mod.Diagnostics.init(app.allocator);
+        errdefer diag.deinit();
+
         const candidates = [_]?[]const u8{
             if (app.project_dir) |r| (std.fmt.allocPrint(app.allocator, "{s}/.claude/settings.json", .{r}) catch null) else null,
             if (home) |h| (std.fmt.allocPrint(app.allocator, "{s}/.claude/settings.json", .{h}) catch null) else null,
         };
         defer for (candidates) |p| if (p) |x| app.allocator.free(x);
 
-        // 读各层文件内容 → 交给可测 seam parseAndMerge(5 类事件跨层合并)。
-        var contents: std.ArrayList([]const u8) = .empty;
+        // 读各层文件内容 → 交给可测 seam parseAndMerge(5 类事件跨层合并 + 诊断)。
+        var layers: std.ArrayList(hooks_mod.Layer) = .empty;
         defer {
-            for (contents.items) |c| app.allocator.free(c);
-            contents.deinit(app.allocator);
+            for (layers.items) |layer| app.allocator.free(layer.content);
+            layers.deinit(app.allocator);
         }
         for (candidates) |maybe_path| {
             const path = maybe_path orelse continue;
             const content = readFileAlloc(app.allocator, path) catch continue;
-            contents.append(app.allocator, content) catch app.allocator.free(content);
+            layers.append(app.allocator, .{ .path = path, .content = content }) catch app.allocator.free(content);
         }
-        if (contents.items.len == 0) return;
 
-        var hs = try hooks_mod.parseAndMerge(app.allocator, contents.items);
+        // metacodes 读权限、但不读 hook 的 settings 文件。
+        const project_local = if (app.project_dir) |r| (std.fmt.allocPrint(app.allocator, "{s}/.claude/settings.local.json", .{r}) catch null) else null;
+        defer if (project_local) |p| app.allocator.free(p);
+        for ([_]?[]const u8{ project_local, app.config.settings_path }) |maybe_path| {
+            const path = maybe_path orelse continue;
+            const loaded = for (layers.items) |layer| {
+                if (std.mem.eql(u8, layer.path, path)) break true;
+            } else false;
+            if (loaded) continue;
+            const content = readFileAlloc(app.allocator, path) catch continue;
+            defer app.allocator.free(content);
+            try hooks_mod.reportUnreadFile(app.allocator, &diag, path, content);
+        }
+
+        var hs = try hooks_mod.parseAndMerge(app.allocator, layers.items, &diag);
+        for (diag.items()) |problem| {
+            log.warn("hook", "{s}{s}{s}: {s}", .{
+                problem.source,
+                if (problem.location.len != 0) " " else "",
+                problem.location,
+                problem.message,
+            });
+        }
+        if (app.hook_diagnostics) |*old| old.deinit();
+        app.hook_diagnostics = diag;
+
         if (hs.isEmpty()) {
             hs.deinit();
             return;
         }
         app.hooks = hs;
         app.permission_ctx.hooks = &app.hooks.?;
-        @import("util/log.zig").info("hook", "loaded hooks: Pre={d} Post={d} Stop={d} PreCompact={d} PostCompact={d} (merged across layers)", .{ app.hooks.?.pre_tool_use.len, app.hooks.?.post_tool_use.len, app.hooks.?.stop.len, app.hooks.?.pre_compact.len, app.hooks.?.post_compact.len });
+        log.info("hook", "loaded hooks: Pre={d} Post={d} Stop={d} PreCompact={d} PostCompact={d} (merged across layers)", .{ app.hooks.?.pre_tool_use.len, app.hooks.?.post_tool_use.len, app.hooks.?.stop.len, app.hooks.?.pre_compact.len, app.hooks.?.post_compact.len });
     }
 
     /// 读 project/.claude/settings.json + ~/.claude/settings.json 的 sandbox 段,

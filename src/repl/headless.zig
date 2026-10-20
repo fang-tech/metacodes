@@ -937,7 +937,7 @@ pub fn buildResultLine(
     var aw: std.Io.Writer.Allocating = .init(allocator);
     defer aw.deinit();
     try aw.writer.print(
-        \\{{"type":"result","stop_reason":"{s}","turns":{d},"tool_calls":{d},"continuations":{d},"input_tokens":{d},"output_tokens":{d},"cache_read_input_tokens":{d},"cache_creation_input_tokens":{d},"cost_usd":{d:.6},"text":
+        \\{{"type":"result","stop_reason":"{s}","turns":{d},"tool_calls":{d},"continuations":{d},"input_tokens":{d},"output_tokens":{d},"cache_read_input_tokens":{d},"cache_creation_input_tokens":{d},"cost_usd":{d:.6},"usage_status":"{s}","text":
     , .{
         stop,
         result.turns,
@@ -949,6 +949,7 @@ pub fn buildResultLine(
         usage.cache_read_input_tokens,
         usage.cache_creation_input_tokens,
         cost,
+        @tagName(result.usage_status),
     });
     // 规范编码器(util/json.zig):非法 UTF-8 字节 → U+FFFD。std.json 的 encodeJsonString 默认
     // 原样透传 0x80..0xFF,二进制工具输出混进最终文本会让整行无法严格解码。

@@ -42,6 +42,28 @@ test "L2 headless --json: result 行字段完整 + 合法 JSON + text 转义" {
     const obj = parsed.value.object;
     try std.testing.expectEqualStrings("hi \"there\"\nline2", obj.get("text").?.string);
     try std.testing.expectEqual(@as(i64, 3), obj.get("turns").?.integer);
+    try std.testing.expectEqualStrings("known", obj.get("usage_status").?.string);
+}
+
+test "L2 headless --json: unknown usage is explicit and does not look like known zero" {
+    const a = std.testing.allocator;
+    const usage = UsageTotals{};
+    const result = RunResult{
+        .stop_reason = .end_turn,
+        .turns = 1,
+        .tool_calls = 0,
+        .usage_status = .unknown,
+    };
+    const line = try headless.buildResultLine(a, "HELLO", "final", null, null, result, &usage, "gpt-4o");
+    defer a.free(line);
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, std.mem.trimEnd(u8, line, "\n"), .{});
+    defer parsed.deinit();
+    const obj = parsed.value.object;
+    try std.testing.expectEqualStrings("unknown", obj.get("usage_status").?.string);
+    // Numeric fields remain backwards-compatible, while the status prevents
+    // consumers from treating those placeholders as a free/known response.
+    try std.testing.expectEqual(@as(i64, 0), obj.get("input_tokens").?.integer);
+    try std.testing.expectEqual(@as(i64, 0), obj.get("output_tokens").?.integer);
 }
 
 test "L2 headless --json: stop_reason 各值都能序列化(含 tool_loop、stalled)" {

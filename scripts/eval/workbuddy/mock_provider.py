@@ -46,6 +46,7 @@ SCENARIOS = (
     "control-plane-v1",
     "headless-permission-v1",
     "guessed-disabled-tool-v1",
+    "leaderboard-protocol-v1",
 )
 CONTROL_MEMORY = (
     "workbuddy-w05-control-marker: real local TinyKG and project Lean gate "
@@ -136,7 +137,14 @@ def _final_sse(request_number: int, text: str) -> bytes:
     return _events_sse(events)
 
 
-def _tool_sse(request_number: int, call_id: str, name: str, value: Mapping[str, Any]) -> bytes:
+def _tool_sse(
+    request_number: int,
+    call_id: str,
+    name: str,
+    value: Mapping[str, Any],
+    *,
+    input_tokens: int = 100,
+) -> bytes:
     message_id = f"msg_workbuddy_mock_{request_number}"
     compact = json.dumps(dict(value), separators=(",", ":"), ensure_ascii=False)
     return _events_sse(
@@ -148,7 +156,7 @@ def _tool_sse(request_number: int, call_id: str, name: str, value: Mapping[str, 
                     "role": "assistant",
                     "model": "glm-5.2",
                     "usage": {
-                        "input_tokens": 100,
+                        "input_tokens": input_tokens,
                         "output_tokens": 0,
                         "cache_read_input_tokens": 64,
                         "cache_creation_input_tokens": 8,
@@ -391,6 +399,59 @@ def _control_plane_sse(request_number: int, request: Mapping[str, Any]) -> bytes
     raise ScenarioError("control-plane-v1 received more than eight requests")
 
 
+# leaderboard-protocol-v1: what the WorkBuddy leaderboard protocol requires of
+# every request metacodes sends through the job proxy.  The body checked here
+# is the upstream body, after the proxy injected the model's params.
+LEADERBOARD_STDIN_MARKER = "metacodes-lb-stdin-marker-5c1e"
+LEADERBOARD_RESULT = "metacodes workbuddy leaderboard protocol ok\n"
+LEADERBOARD_DISABLED_TOOLS = ("WebSearch", "AskUserQuestion", "Agent", "Task")
+LEADERBOARD_MAX_TOKENS = 32768
+# Reported for the tool round so that the next request's context estimate lands
+# between metacodes' warning and auto-compact thresholds for a declared 200K
+# window and a 32768-token output reserve (147,232 <= x < 154,232).
+LEADERBOARD_ANCHOR_INPUT_TOKENS = 150_000
+_SAMPLING_OVERRIDES = ("temperature", "top_p", "top_k")
+
+
+def _leaderboard_request_checks(request: Mapping[str, Any]) -> None:
+    present = [key for key in _SAMPLING_OVERRIDES if key in request]
+    if present:
+        raise ScenarioError(f"sampling overrides reached the provider: {present}")
+    if request.get("thinking") != {"type": "adaptive"}:
+        raise ScenarioError(f"thinking is not adaptive: {request.get('thinking')!r}")
+    if request.get("output_config") != {"effort": "high"}:
+        raise ScenarioError(f"effort is not high: {request.get('output_config')!r}")
+    if request.get("max_tokens") != LEADERBOARD_MAX_TOKENS:
+        raise ScenarioError(f"max_tokens drifted: {request.get('max_tokens')!r}")
+    names = _tool_names(request)
+    visible = sorted(set(LEADERBOARD_DISABLED_TOOLS) & names)
+    if visible:
+        raise ScenarioError(f"protocol-disabled tools are visible: {visible}")
+    _require_tools(request, "Write", "Bash", "WebFetch")
+
+
+def _leaderboard_sse(request_number: int, request: Mapping[str, Any]) -> bytes:
+    _leaderboard_request_checks(request)
+    if request_number == 1:
+        messages = request.get("messages")
+        first = messages[0] if isinstance(messages, list) and messages else {}
+        if LEADERBOARD_STDIN_MARKER not in json.dumps(first, ensure_ascii=False):
+            raise ScenarioError("the task instruction did not reach the first request")
+        return _tool_sse(
+            request_number,
+            "leaderboard-write-result",
+            "Write",
+            {"file_path": "result.txt", "content": LEADERBOARD_RESULT},
+            input_tokens=LEADERBOARD_ANCHOR_INPUT_TOKENS,
+        )
+    if request_number == 2:
+        _content, is_error = _result_text(request, "leaderboard-write-result")
+        if is_error:
+            raise ScenarioError("the scripted Write failed")
+        return _final_sse(request_number, "leaderboard protocol preflight done")
+    raise ScenarioError("leaderboard-protocol-v1 received more than two requests")
+
+
 def _scenario_sse(scenario: str, request_number: int, request: Mapping[str, Any]) -> bytes:
     if scenario == "final-v1":
         return _final_sse(
@@ -414,6 +475,8 @@ def _scenario_sse(scenario: str, request_number: int, request: Mapping[str, Any]
                 raise ScenarioError("headless protected Write was not denied")
             return _final_sse(request_number, "protected write was denied safely")
         raise ScenarioError("headless-permission-v1 received more than two requests")
+    if scenario == "leaderboard-protocol-v1":
+        return _leaderboard_sse(request_number, request)
     if scenario == "guessed-disabled-tool-v1":
         pair = (request_number + 1) // 2
         call_id = f"guessed-disabled-task-{pair}"

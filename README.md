@@ -43,7 +43,8 @@ position:
 
 ## The numbers
 
-Measured 2026-10-18 on Apple Silicon (macOS), ReleaseSmall build of `main`:
+Measured 2026-10-18 on Apple Silicon (macOS), ReleaseSmall build of `main`,
+except the two rows that name another source:
 
 | | metacodes |
 |---|---|
@@ -51,8 +52,8 @@ Measured 2026-10-18 on Apple Silicon (macOS), ReleaseSmall build of `main`:
 | Warm start (`--help`) | 5–7 ms |
 | Idle process, peak RSS | 2.7 MB |
 | One headless run, 20 tool rounds against a local mock model | 23 MB peak RSS |
-| Complete release unit: CLI, TinyKG CLI and daemon, two Lean kernels, ripgrep | 16–21 MB archive |
-| Sealed gateway, 64 concurrent clients, mock model | 1,835 agent steps/s; 1–3 ms gateway cost per step |
+| Complete release unit: CLI, TinyKG CLI and daemon, two Lean kernels, ripgrep | 16.5–20.8 MB archive (0.5.0 release assets) |
+| Sealed gateway, 64 concurrent clients, mock model (2026-10-16, Windows 11, ReleaseFast) | 1,835 agent steps/s; 3 ms p50 / 9 ms p99 gateway cost per step |
 | Native targets | Linux x86_64, macOS arm64, Windows x86_64 |
 
 For scale, on the same machine the `--help` peak RSS of Codex CLI 0.163 is
@@ -68,7 +69,7 @@ the same model, GLM-5.2:
 
 | Harness | Code | Web\* | Office\* | Security |
 |---|---:|---:|---:|---:|
-| **metacodes 0.1.0** (self-run, 1 pass, 260/260 tasks) | **72.7** | 81.1 | 78.8 | 59.0 |
+| **metacodes 0.1.0** (self-run, 1 pass, 260/260 tasks) | 72.7 | 81.1 | 78.8 | 59.0 |
 | CodeBuddy Code 2.109.3 (official v1.2, 3-run mean) | 71.5 | 67.4 | 79.6 | — |
 | Claude Code 2.1.187 (official v1.2, 3-run mean) | 77.1 | 60.7 | 79.6 | — |
 
@@ -169,7 +170,8 @@ Start at [doc/API.md](doc/API.md).
   work from a shared TinyKG task DAG under atomic leases.
 - **Small units.** The `serve` daemon hosts many sessions in one process under
   a live-session cap. A busy headless agent process peaks around 23 MB, and
-  the sealed gateway adds 1–3 ms per step.
+  the sealed gateway adds 3 ms per step at the median with 64 concurrent
+  clients (9 ms at p99).
 - **Byte-stable prompts.** Thousands of parallel runs keep hitting the
   provider's prompt cache.
 

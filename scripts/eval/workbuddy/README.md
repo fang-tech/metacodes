@@ -24,7 +24,12 @@ instead of GitHub.
 
 Stage production `linux/amd64` artifacts with explicit source and license
 provenance. The stager parses every ELF header and rejects ARM64 or mixed-arch
-inputs before creating the output directory:
+inputs before creating the output directory. It also rejects an executable
+that needs a newer glibc than the oldest task image ships (2.35): the split
+mount carries no C library, and the default `x86_64-linux-gnu` release build
+needs 2.36, so build the staged metacodes with
+`zig build -Doptimize=ReleaseSafe -Dtarget=x86_64-linux-gnu.2.31 -Dlean-kernels=off $(python3 scripts/kernel_pins.py <release prefix>)`
+and take the kernels from the same release:
 
 ```bash
 python3 -m scripts.eval.workbuddy.stage_artifacts \
@@ -38,11 +43,11 @@ python3 -m scripts.eval.workbuddy.stage_artifacts \
   --lean-license /path/to/lean4/LICENSE
 ```
 
-The repository currently has no repository-wide metacodes license.  Until that
-changes, production staging must use
-`scripts/eval/workbuddy/licenses/METACODES-NOASSERTION.txt` together with
-`--metacodes-license-spdx NOASSERTION`; the artifact manifest preserves that
-fact instead of implying a license grant.
+metacodes is MIT-licensed: production staging passes the repository's
+`LICENSE` with `--metacodes-license-spdx MIT`, and the artifact manifest
+records it.  `scripts/eval/workbuddy/licenses/METACODES-NOASSERTION.txt` with
+`--metacodes-license-spdx NOASSERTION` describes artifacts staged before the
+license existed and is kept only to reproduce those receipts.
 
 Run the zero-provider W0 vertical slice:
 
@@ -164,7 +169,9 @@ runs; their committed receipts remain `quality_evidence=false` even though
 they use the official runner. Pass it only for a preregistered real-provider
 wave whose official task outcomes are intended to count as quality evidence.
 Every such wave must also carry an explicit `--comparison-id`; a single arm is
-not sufficient quality evidence for a harness change.
+not sufficient quality evidence for a harness change. A job that runs the LLM
+judge (Web, Office) refuses `--comparison-id`, so its receipts are
+`quality_evidence=false` by construction.
 
 Paired outcome studies use two independently created launch manifests
 with the same comparison id and frozen covariate digest. The baseline job uses
@@ -231,6 +238,8 @@ python3 -m scripts.eval.workbuddy.launch_gate create ... \
   --output launch.json
 # Real scored waves add both:
 #   --quality-evidence-on-commit --comparison-id <frozen-pair-id>
+# Jobs that run the LLM judge (Web, Office) add:
+#   --judge-budget-usd <cap>
 python3 -m scripts.eval.workbuddy.launch_gate run \
   --manifest launch.json --budget-journal /private/budget.json \
   --receipt /private/receipts/run.json --credential-fd 9
@@ -271,3 +280,82 @@ anonymous-FD route authority, fresh HOME, isolated local TinyKG, cleared remote
 TinyKG configuration, artifact/verifier I/O, ATIF conversion and cache metrics.
 It is always marked `quality_evidence=false` and must never be reported as a
 memory or task-success result.
+
+## Leaderboard protocol
+
+The official leaderboard runs every task three times in think mode with
+reasoning effort high, a 200k window, WebSearch and AskUserQuestion disabled
+and provider-default sampling; Web and Office are judged by Kimi K2.7 Code.
+The plan, the alignment table and the budget are in
+[evals/experiments/workbuddy-leaderboard-v1.md](../../../evals/experiments/workbuddy-leaderboard-v1.md).
+The overlay carries the protocol as configuration the adapter passes to
+metacodes:
+
+- `configs/models/metacodes-glm52-leaderboard.yaml` injects only the output
+  budget, never a sampling parameter; `judge-kimi-k27.yaml` is the published
+  judge configuration;
+- `METACODES_REASONING_EFFORT` becomes `--reasoning-effort`;
+- the bench `context_window` becomes a `models.toml` entry for the exact
+  route in the trial's fresh HOME (metacodes reads the window from there,
+  not from the provider document);
+- the instruction reaches metacodes on stdin from an uploaded, hash-checked
+  file, never through argv. What changed is that the task text is no
+  longer in the agent's argv, which is how September's `pkill -f <service>`
+  matched the agent; argv still carries `metacodes`, `/opt/metacodes` and
+  the route, so a pattern matching those still matches it.
+
+Web and Office jobs run an LLM judge (`judge-kimi-k27.yaml`), which spends
+through `METACODES_WORKBUDDY_JUDGE_API_KEY`. `launch_gate create` resolves a
+job's judge the way the runner does (the bench defaults under the job's
+`llm_judge_override`; the Web bench enables a judge even without one),
+requires a judge model to name that key, and refuses a judged job unless
+`--judge-budget-usd <cap>` is given. The cap is added to the transaction
+maximum the journal reserves and authorizes; judge calls are not metered per
+call, so the commit charges the whole cap beside the actor's measured cost,
+and the receipt's `judge` row says so. The cap is a reservation the journal
+counts, not a measurement: the gate does not meter the judge's real usage,
+and the judge key's hard gateway quota is the only enforced limit on it.
+`run` keeps the judge key in the runner's environment only for such a
+launch, removes it for every other launch (as W0, W0.5 and the leaderboard
+preflight do), and refuses a judged launch whose environment lacks it before
+any reservation; `resume-trials` refuses a judged arm, and `create` refuses
+a judged job as a paired-comparison arm. A paid job may not carry a
+`verifier` block, an `environment_override` or `orchestrator_override` keys
+besides `n_concurrent_trials`: the runner merges each into its runtime
+config, where it could set the verifier's LLM route or a container-wide
+credential outside the judge budget.
+
+One run is sixteen jobs, the four subsets times the four frozen cohorts,
+because a paid launch binds one cohort, one attempt and one trial at a time.
+Write a run's jobs into the checkout:
+
+```bash
+python3 -m scripts.eval.workbuddy.leaderboard_jobs \
+  --run 1 --output /path/to/workbuddy-bench/configs/jobs
+```
+
+Before any paid launch, run the zero-provider preflight on the host that will
+run the jobs, with a fresh checkout and the Linux artifacts to be staged. It
+sends the leaderboard job shape through the official runner and job proxy to
+a loopback scripted provider that refuses any request off protocol, then
+audits the proxy's record of the upstream bodies, the request sequence, the
+runtime contract and the compaction thresholds metacodes derived:
+
+```bash
+python3 -m scripts.eval.workbuddy.run_lb_preflight /path/to/fresh-workbuddy-bench \
+  --metacodes /path/to/linux-amd64/metacodes \
+  --tinykg /path/to/linux-amd64/tinykg \
+  --ripgrep /path/to/linux-amd64/rg \
+  --formal-kernel /path/to/linux-amd64/metacodes-formal-kernel \
+  --metacodes-commit <40-hex> --tinykg-commit <40-hex> \
+  --metacodes-license /path/to/metacodes/LICENSE \
+  --tinykg-license /path/to/tinykg/LICENSE \
+  --lean-license /path/to/lean4/LICENSE
+```
+
+Its receipt is `quality_evidence=false` and does not exercise the judge
+route.
+
+The proxy numbers each log file on its own: the job proxy also serves the
+in-container judge, whose records go to the shared file, and one counter
+across both left holes in every run's request wave.

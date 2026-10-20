@@ -33,7 +33,10 @@ const runtime = new metacodes.Runtime({ tools: ['Read'], hostTools: [lookupOrder
 ```
 
 Handlers may be async. A thrown error or rejected promise is returned to the
-model as an ordinary tool error; the run goes on.
+model as an ordinary tool error, and the run goes on. So is a result
+`JSON.stringify` cannot encode, such as a BigInt, a cycle or a function. An
+`onUiRequest` answer that cannot be encoded is not answered: the run's promise
+rejects with that error.
 
 ## Events and streaming
 
@@ -52,7 +55,8 @@ final answer rebuilt from the `output_segment_*` events. The event vocabulary
 is listed in [doc/AGENTCORE_BINARY_ABI.md](../../doc/AGENTCORE_BINARY_ABI.md).
 `session.abort()` stops the active run; `session.submit(text)` adds user input
 to it. Separate sessions run concurrently; one session runs one prompt at a
-time.
+time. `session.close()` throws while a run is active, and the session stays
+open; await the run, or `abort()` it, first.
 
 ## Permissions
 

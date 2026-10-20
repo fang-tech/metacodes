@@ -227,8 +227,16 @@ class WorkBuddyPaidLaunchGateL2Test(unittest.TestCase):
                 _artifact_contract(manifest)
 
     def _manifest(
-        self, root: Path, *, quality_evidence_on_commit: bool = False
+        self,
+        root: Path,
+        *,
+        quality_evidence_on_commit: bool = False,
+        judge_cost_microusd: "int | None" = None,
     ) -> Path:
+        """A hand-built launch manifest.  ``judge_cost_microusd`` None keeps
+        the shape created before judge budgets (no judge row); 0 freezes an
+        unjudged job; a positive cap freezes a judged one, its cap added to
+        the 500,000 micro-USD actor maximum."""
         workbuddy = root / "workbuddy"
         workbuddy.mkdir(mode=0o700)
         manifest = {
@@ -330,6 +338,36 @@ class WorkBuddyPaidLaunchGateL2Test(unittest.TestCase):
                 "paid_rollouts_authorized": False,
             },
         }
+        if judge_cost_microusd is not None:
+            bench = [
+                {
+                    "path": f"{FIXTURE}/configs/bench/_default.yaml",
+                    "bytes": 1,
+                    "sha256": digest("bench-default"),
+                }
+            ]
+            manifest["budget"]["judge_cost_microusd"] = judge_cost_microusd
+            manifest["budget"]["max_cost_microusd"] += judge_cost_microusd
+            manifest["judge"] = (
+                {
+                    "enabled": True,
+                    "mode": "in_container",
+                    "model_slug": "judge-l2",
+                    "backend_model_name": "kimi-k2.7-code",
+                    "model_config": {
+                        "path": f"{FIXTURE}/configs/models/judge-l2.yaml",
+                        "bytes": 1,
+                        "sha256": digest("judge-model"),
+                    },
+                    "backend_key_env": launch_gate.JUDGE_KEY_ENV,
+                    "backend_url_env": "TEST_WORKBUDDY_JUDGE_BASE_URL",
+                    "backend_url_sha256": digest("judge-url"),
+                    "cost_accounting": "cap_committed_in_full",
+                    "bench_configs": bench,
+                }
+                if judge_cost_microusd
+                else {"enabled": False, "bench_configs": bench}
+            )
         covariates = {"fixture": "workbuddy-paid-launch-l2"}
         manifest["comparison"] = (
             {
@@ -445,6 +483,12 @@ class WorkBuddyPaidLaunchGateL2Test(unittest.TestCase):
             overlay_path = workbuddy / "configs/harnesses/metacodes/OVERLAY.json"
             overlay_path.parent.mkdir(parents=True, exist_ok=True)
             overlay_path.write_text("{}\n", encoding="utf-8")
+            bench_default = workbuddy / "configs/bench/_default.yaml"
+            bench_default.parent.mkdir(parents=True)
+            bench_default.write_text(
+                "llm_judge:\n  enabled: false\n  model: <model-slug>\n",
+                encoding="utf-8",
+            )
             with mock.patch.dict(
                 os.environ,
                 {"TEST_WORKBUDDY_BASE_URL": "https://provider.invalid/v1/messages"},
@@ -495,6 +539,13 @@ class WorkBuddyPaidLaunchGateL2Test(unittest.TestCase):
                 "glm-5.2",
                 _validate_launch_manifest(dict(manifest))["model"]["backend_model_name"],
             )
+            # A Code job runs no judge: nothing joins the actor maximum.
+            self.assertEqual(
+                {"enabled": False, "bench_configs": [file_identity(bench_default)]},
+                manifest["judge"],
+            )
+            self.assertEqual(0, manifest["budget"]["judge_cost_microusd"])
+            self.assertEqual(500_000, manifest["budget"]["max_cost_microusd"])
 
             missing = dict(manifest)
             missing["model"] = dict(manifest["model"])
@@ -507,6 +558,10 @@ class WorkBuddyPaidLaunchGateL2Test(unittest.TestCase):
 
             previous = dict(missing)
             previous["schema_version"] = PAIRED_SCHEMA_VERSION
+            # A v2 manifest predates judge budgets.
+            previous.pop("judge")
+            previous["budget"] = dict(previous["budget"])
+            previous["budget"].pop("judge_cost_microusd")
             previous["content_sha256"] = hashlib.sha256(
                 stable_json(
                     {
@@ -2658,6 +2713,711 @@ class WorkBuddyResumeAuditTest(WorkBuddyPaidLaunchGateL2Test):
 
 
 
+class WorkBuddyJudgeBudgetTest(unittest.TestCase):
+    """The Web/Office LLM judge spends inside the budget journal.
+
+    A job whose resolved judge is enabled cannot be planned without an
+    explicit judge cap; the cap joins the transaction maximum the journal
+    reserves and authorizes and is committed in full beside the actor's
+    measured cost; every launch without a frozen judge budget runs with the
+    judge credential removed from the runner's environment.
+    """
+
+    JUDGE_KEY = "judge-l2-key-must-not-enter-receipt"
+    OVERLAY = Path(__file__).parents[1] / "workbuddy/overlay"
+    _manifest = WorkBuddyPaidLaunchGateL2Test._manifest
+    _credential_fd = staticmethod(WorkBuddyPaidLaunchGateL2Test._credential_fd)
+
+    @staticmethod
+    def _runner(*, expect_judge_key: bool) -> str:
+        """The usage-producing fake runner, asserting first what the real child
+        process sees of the judge credential."""
+        check = (
+            "import os\n"
+            f"_judge = os.environ.get({launch_gate.JUDGE_KEY_ENV!r})\n"
+            + (
+                f"assert _judge == {WorkBuddyJudgeBudgetTest.JUDGE_KEY!r}, _judge\n"
+                if expect_judge_key
+                else "assert _judge is None, 'judge key reached an unjudged runner'\n"
+            )
+        )
+        return check + WorkBuddyPaidLaunchGateL2Test._runner_code()
+
+    def _argv(self, root: Path, provider_url: str, *, expect_judge_key: bool):
+        return [
+            sys.executable,
+            "-c",
+            self._runner(expect_judge_key=expect_judge_key),
+            str(Path(__file__).resolve().parents[3]),
+            provider_url,
+            str(root / "workbuddy"),
+        ]
+
+    @staticmethod
+    def _transaction(journal: Path) -> dict:
+        (transaction,) = validate_checkpoint_payload(journal.read_bytes())[
+            "transactions"
+        ].values()
+        return transaction
+
+    @requires_posix_dir_fd
+    def test_judged_launch_reserves_and_commits_the_judge_cap(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            os.chmod(root, 0o700)
+            manifest = self._manifest(root, judge_cost_microusd=150_000)
+            journal = root / "budget.json"
+            receipt = root / "receipt.json"
+            with mock.patch.dict(
+                os.environ, {launch_gate.JUDGE_KEY_ENV: self.JUDGE_KEY}
+            ), _Server(journal) as provider:
+                result = execute_launch(
+                    manifest_path=manifest,
+                    journal_path=journal,
+                    receipt_path=receipt,
+                    credential_fd=self._credential_fd(),
+                    runner_argv=self._argv(
+                        root, provider.url, expect_judge_key=True
+                    ),
+                )
+            self.assertEqual(1, provider.requests)
+            self.assertFalse(provider.errors)
+            transaction = self._transaction(journal)
+            # Reserved and authorized: the actor's 500,000 plus the judge cap.
+            self.assertEqual(650_000, transaction["identity"]["max_cost_microusd"])
+            self.assertEqual("committed", transaction["state"])
+            # Committed: the actor's measured 10,000 plus the whole judge cap.
+            self.assertEqual(160_000, transaction["actual_cost_microusd"])
+            self.assertEqual(10_000, result["usage"]["cost_microusd"])
+            self.assertEqual(
+                160_000, result["budget_transaction"]["actual_cost_microusd"]
+            )
+            self.assertEqual(
+                {
+                    "model_slug": "judge-l2",
+                    "mode": "in_container",
+                    "cost_microusd": 150_000,
+                    "accounting": "cap_committed_in_full",
+                },
+                result["judge"],
+            )
+            self.assertNotIn(self.JUDGE_KEY, receipt.read_text(encoding="utf-8"))
+
+    @requires_posix_dir_fd
+    def test_unjudged_launch_runs_without_the_judge_credential(self):
+        # 0: an unjudged manifest; None: one created before judge budgets.
+        for judge_cost in (0, None):
+            with self.subTest(judge_cost=judge_cost), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                os.chmod(root, 0o700)
+                manifest = self._manifest(root, judge_cost_microusd=judge_cost)
+                journal = root / "budget.json"
+                with mock.patch.dict(
+                    os.environ, {launch_gate.JUDGE_KEY_ENV: self.JUDGE_KEY}
+                ), _Server(journal) as provider:
+                    result = execute_launch(
+                        manifest_path=manifest,
+                        journal_path=journal,
+                        receipt_path=root / "receipt.json",
+                        credential_fd=self._credential_fd(),
+                        runner_argv=self._argv(
+                            root, provider.url, expect_judge_key=False
+                        ),
+                    )
+                transaction = self._transaction(journal)
+                self.assertEqual(
+                    500_000, transaction["identity"]["max_cost_microusd"]
+                )
+                self.assertEqual(10_000, transaction["actual_cost_microusd"])
+                self.assertNotIn("judge", result)
+
+    @requires_posix_dir_fd
+    def test_judged_launch_without_the_judge_credential_refuses_before_reservation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            os.chmod(root, 0o700)
+            manifest = self._manifest(root, judge_cost_microusd=150_000)
+            journal = root / "budget.json"
+            marker = root / "runner-started"
+            credential_fd = self._credential_fd()
+            try:
+                with mock.patch.dict(os.environ):
+                    os.environ.pop(launch_gate.JUDGE_KEY_ENV, None)
+                    with self.assertRaisesRegex(
+                        LaunchError, launch_gate.JUDGE_KEY_ENV
+                    ):
+                        execute_launch(
+                            manifest_path=manifest,
+                            journal_path=journal,
+                            receipt_path=root / "receipt.json",
+                            credential_fd=credential_fd,
+                            runner_argv=[
+                                sys.executable,
+                                "-c",
+                                f"open({str(marker)!r}, 'w').close()",
+                            ],
+                        )
+            finally:
+                os.close(credential_fd)
+            self.assertFalse(journal.exists())
+            self.assertFalse(marker.exists())
+
+    @requires_posix_dir_fd
+    def test_judged_failure_keeps_the_cap_exposed_and_resume_audit_commits_it(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            os.chmod(root, 0o700)
+            manifest = self._manifest(root, judge_cost_microusd=150_000)
+            journal = root / "budget.json"
+            failure_receipt = root / "audit-failure.json"
+            started_ns = time.time_ns()
+            with mock.patch.dict(
+                os.environ, {launch_gate.JUDGE_KEY_ENV: self.JUDGE_KEY}
+            ), _Server(journal) as provider:
+                with mock.patch.object(launch_gate, "MAX_REQUEST_LOG_BYTES", 8):
+                    with self.assertRaisesRegex(
+                        LaunchError,
+                        "post-run evidence audit failed after runner exit 0",
+                    ):
+                        execute_launch(
+                            manifest_path=manifest,
+                            journal_path=journal,
+                            receipt_path=failure_receipt,
+                            credential_fd=self._credential_fd(),
+                            runner_argv=self._argv(
+                                root, provider.url, expect_judge_key=True
+                            ),
+                        )
+            failure = validate_authorized_failure_receipt(
+                failure_receipt, journal_path=journal
+            )
+            # Unknown actuals leave the whole maximum, judge cap included, exposed.
+            self.assertEqual(650_000, failure["journal"]["exposure_cost_microusd"])
+            result = launch_gate.resume_post_run_audit(
+                manifest_path=manifest,
+                journal_path=journal,
+                failure_receipt_path=failure_receipt,
+                receipt_path=root / "receipt.json",
+                started_ns=started_ns,
+            )
+            self.assertEqual(
+                160_000, result["budget_transaction"]["actual_cost_microusd"]
+            )
+            self.assertEqual(150_000, result["judge"]["cost_microusd"])
+            self.assertEqual(160_000, self._transaction(journal)["actual_cost_microusd"])
+
+    def test_judged_arm_is_never_resumed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            os.chmod(root, 0o700)
+            manifest = self._manifest(root, judge_cost_microusd=150_000)
+            journal = root / "budget.json"
+            with self.assertRaisesRegex(LaunchError, "cannot be resumed"):
+                launch_gate.resume_trials(
+                    manifest_path=manifest,
+                    journal_path=journal,
+                    failure_receipt_path=root / "authorized-failure.json",
+                    receipt_path=root / "receipt.json",
+                    credential_fd=None,
+                    started_ns=time.time_ns(),
+                )
+            self.assertFalse(journal.exists())
+
+    def test_manifest_judge_contract_is_validated(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            judged = json.loads(
+                self._manifest(root, judge_cost_microusd=150_000).read_text()
+            )
+        self.assertEqual(150_000, launch_gate._judge_cost_microusd(
+            _validate_launch_manifest(json.loads(json.dumps(judged)))
+        ))
+
+        def rehash(value):
+            value.pop("content_sha256", None)
+            value["content_sha256"] = hashlib.sha256(
+                stable_json(value).encode("utf-8")
+            ).hexdigest()
+            return value
+
+        def mutated(change):
+            value = json.loads(json.dumps(judged))
+            change(value)
+            return rehash(value)
+
+        cases = {
+            "enabled judge with a zero cap": lambda m: m["budget"].update(
+                judge_cost_microusd=0
+            ),
+            "judge row without a budget": lambda m: m["budget"].pop(
+                "judge_cost_microusd"
+            ),
+            "budget without a judge row": lambda m: m.pop("judge"),
+            "disabled judge with a cap": lambda m: m.update(
+                judge={"enabled": False, "bench_configs": m["judge"]["bench_configs"]}
+            ),
+            "judge on the actor credential": lambda m: m["judge"].update(
+                backend_key_env=PROVIDER_KEY_ENV
+            ),
+            "judge cap swallowing the actor maximum": lambda m: m["budget"].update(
+                judge_cost_microusd=m["budget"]["max_cost_microusd"]
+            ),
+            "per-call judge accounting": lambda m: m["judge"].update(
+                cost_accounting="metered"
+            ),
+            "older schema with a judge": lambda m: m.update(
+                schema_version=PAIRED_SCHEMA_VERSION
+            ),
+        }
+        for label, change in cases.items():
+            with self.subTest(label), self.assertRaisesRegex(
+                LaunchError, "judge budget contract is incomplete"
+            ):
+                _validate_launch_manifest(mutated(change))
+
+    # --- create: the judge is resolved the way the pinned runner does --------
+
+    def _checkout(self, root: Path) -> Path:
+        workbuddy = root / "workbuddy"
+        models = workbuddy / "configs/models"
+        models.mkdir(parents=True)
+        for name in ("metacodes-glm52-leaderboard.yaml", "judge-kimi-k27.yaml"):
+            shutil.copyfile(self.OVERLAY / "configs/models" / name, models / name)
+        bench = workbuddy / "configs/bench"
+        bench.mkdir(parents=True)
+        # The judge layers of the pinned bench configs: the Web bench enables
+        # a judge by default, the Office bench leaves it to the job.
+        (bench / "_default.yaml").write_text(
+            "llm_judge:\n  enabled: false\n  mode: host_side\n  model: <model-slug>\n",
+            encoding="utf-8",
+        )
+        (bench / "wb-bench-web-v1.0.yaml").write_text(
+            "llm_judge:\n  enabled: true\n  mode: in_container\n  model: judge-kimi-k27\n",
+            encoding="utf-8",
+        )
+        (bench / "wb-bench-office-v1.0.yaml").write_text(
+            "llm_judge:\n  enabled: false\n  mode: in_container\n  model: <model-slug>\n",
+            encoding="utf-8",
+        )
+        for dataset in ("wb-bench-web-v1.0", "wb-bench-office-v1.0", "wb-bench-code-v1.0"):
+            toml = workbuddy / "datasets" / dataset / "dataset.toml"
+            toml.parent.mkdir(parents=True)
+            toml.write_text(f'[dataset]\nid = "{dataset}"\n', encoding="utf-8")
+        overlay = workbuddy / "configs/harnesses/metacodes/OVERLAY.json"
+        overlay.parent.mkdir(parents=True)
+        overlay.write_text("{}\n", encoding="utf-8")
+        split = (
+            workbuddy
+            / "configs/harnesses/metacodes/docker/artifacts/share/metacodes/artifact-manifest.json"
+        )
+        split.parent.mkdir(parents=True)
+        split.write_text("fixture\n", encoding="utf-8")
+        (root / "preflight.json").write_text("fixture\n", encoding="utf-8")
+        return workbuddy
+
+    @staticmethod
+    def _job(subset: str) -> dict:
+        from scripts.eval.workbuddy import leaderboard_jobs
+
+        cohorts = json.loads(
+            leaderboard_jobs.COHORT_MANIFEST.read_text(encoding="utf-8")
+        )
+        return leaderboard_jobs.job_document(cohorts, subset, "dev", 1)
+
+    def _build(
+        self,
+        root: Path,
+        job: dict,
+        *,
+        judge_budget_microusd=None,
+        total_cost_microusd=1_000_000,
+        comparison_id=None,
+    ) -> dict:
+        workbuddy = root / "workbuddy"
+        job_path = workbuddy / "configs/jobs/judge-l2.yaml"
+        job_path.parent.mkdir(parents=True, exist_ok=True)
+        job_path.write_text(yaml.safe_dump(job), encoding="utf-8")
+        names = job["task_selection"]["names"]
+        cohort = {
+            "subset": "web",
+            "cohort": "dev",
+            "dataset": job["dataset"],
+            "take": len(names),
+            "selected_tasks": names,
+            "selected_tasks_sha256": digest("selected"),
+        }
+        file_identity = lambda path, **_: {
+            "path": str(Path(path).resolve()),
+            "bytes": Path(path).stat().st_size,
+            "sha256": hashlib.sha256(Path(path).read_bytes()).hexdigest(),
+        }
+        tool = lambda path, _args, bash=False: {
+            "path": str(path),
+            "bytes": 1,
+            "sha256": digest(str(path)),
+            "version_first_line": "bash" if bash else "uv",
+            "version_sha256": digest(f"{path}-version"),
+        }
+        host = {
+            name: {"path": f"{FIXTURE}/{name}.py", "bytes": 1, "sha256": digest(name)}
+            for name in HOST_CONTROL_PLANE_MODULES
+        }
+        git = lambda _repo, *args: (
+            WORKBUDDY_PINNED_COMMIT
+            if args[0] == "rev-parse"
+            else "https://github.com/Tencent/workbuddy-bench"
+        )
+        with mock.patch.dict(
+            os.environ,
+            {
+                "METACODES_WORKBUDDY_PROVIDER_BASE_URL": "https://provider.invalid/v1",
+                "METACODES_WORKBUDDY_JUDGE_BASE_URL": "https://judge.invalid/v1",
+            },
+        ), mock.patch(
+            "scripts.eval.workbuddy.launch_gate._git", side_effect=git
+        ), mock.patch(
+            "scripts.eval.workbuddy.launch_gate.validate_installed_overlay",
+            return_value={"overlay_sha256": digest("overlay"), "quality_evidence": False},
+        ), mock.patch(
+            "scripts.eval.workbuddy.launch_gate._cohort", return_value=cohort
+        ), mock.patch(
+            "scripts.eval.workbuddy.launch_gate._artifact_contract",
+            return_value={"manifest": {"sha256": digest("artifact")}},
+        ), mock.patch(
+            "scripts.eval.workbuddy.launch_gate.validate_environment_preflight",
+            return_value={
+                "content_sha256": digest("preflight"),
+                "target_platform": "linux/amd64",
+            },
+        ), mock.patch(
+            "scripts.eval.workbuddy.launch_gate._runner_tool", side_effect=tool
+        ), mock.patch(
+            "scripts.eval.workbuddy.launch_gate._host_control_plane",
+            return_value=host,
+        ), mock.patch(
+            "scripts.eval.workbuddy.launch_gate._identity", side_effect=file_identity
+        ):
+            return build_launch_manifest(
+                run_id="workbuddy-judge-l2",
+                workbuddy_checkout=workbuddy,
+                cohort_manifest=root / "cohorts.json",
+                subset="web",
+                cohort="dev",
+                take=len(names),
+                split_mount_manifest=(
+                    workbuddy
+                    / "configs/harnesses/metacodes/docker/artifacts/share/metacodes/artifact-manifest.json"
+                ),
+                environment_preflight_receipt=root / "preflight.json",
+                job_config=job_path,
+                model_config=workbuddy / f"configs/models/{job['model']}.yaml",
+                runner_bash=Path(f"{FIXTURE}/bash"),
+                runner_uv=Path(f"{FIXTURE}/uv"),
+                provider_identity="provider-l2",
+                total_cost_microusd=total_cost_microusd,
+                total_metered_tokens=100_000,
+                max_cost_microusd=500_000,
+                max_metered_tokens=50_000,
+                judge_budget_microusd=judge_budget_microusd,
+                comparison_id=comparison_id,
+            )
+
+    def test_create_refuses_a_judged_leaderboard_job_without_a_judge_cap(self):
+        # Office and Web jobs as leaderboard_jobs writes them, and a Web job
+        # without an override, which still runs the Web bench's default judge.
+        web_without_override = self._job("web")
+        web_without_override.pop("llm_judge_override")
+        for label, job in (
+            ("office", self._job("office")),
+            ("web", self._job("web")),
+            ("web bench default", web_without_override),
+        ):
+            with self.subTest(label), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory).resolve()
+                self._checkout(root)
+                with self.assertRaisesRegex(LaunchError, "--judge-budget-usd"):
+                    self._build(root, job)
+
+    def test_create_adds_the_judge_cap_to_the_transaction_maximum(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            workbuddy = self._checkout(root)
+            manifest = self._build(
+                root, self._job("office"), judge_budget_microusd=150_000
+            )
+            self.assertEqual(650_000, manifest["budget"]["max_cost_microusd"])
+            self.assertEqual(150_000, manifest["budget"]["judge_cost_microusd"])
+            judge = manifest["judge"]
+            self.assertEqual(
+                (True, "in_container", "judge-kimi-k27", "kimi-k2.7-code"),
+                (
+                    judge["enabled"],
+                    judge["mode"],
+                    judge["model_slug"],
+                    judge["backend_model_name"],
+                ),
+            )
+            self.assertEqual(launch_gate.JUDGE_KEY_ENV, judge["backend_key_env"])
+            self.assertEqual(
+                [
+                    str(workbuddy / "configs/bench/_default.yaml"),
+                    str(workbuddy / "configs/bench/wb-bench-office-v1.0.yaml"),
+                ],
+                [row["path"] for row in judge["bench_configs"]],
+            )
+            # The paired-study covariates bind the judge too.
+            self.assertTrue(
+                manifest["comparison"] is None
+                or "judge" in manifest["comparison"]["covariates"]
+            )
+            validated = _validate_launch_manifest(json.loads(json.dumps(manifest)))
+            self.assertEqual(150_000, launch_gate._judge_cost_microusd(validated))
+            # The same files re-resolve to the same judge; an edit is refused.
+            job = yaml.safe_load(
+                (workbuddy / "configs/jobs/judge-l2.yaml").read_text(encoding="utf-8")
+            )
+            with mock.patch.dict(
+                os.environ,
+                {"METACODES_WORKBUDDY_JUDGE_BASE_URL": "https://judge.invalid/v1"},
+            ):
+                launch_gate._reobserve_judge(validated, workbuddy, job)
+                legacy = dict(validated)
+                legacy.pop("judge")
+                with self.assertRaisesRegex(LaunchError, "no judge budget"):
+                    launch_gate._reobserve_judge(legacy, workbuddy, job)
+                judge_model = workbuddy / "configs/models/judge-kimi-k27.yaml"
+                judge_model.write_text(
+                    judge_model.read_text(encoding="utf-8").replace(
+                        "reasoning_effort: low", "reasoning_effort: high"
+                    ),
+                    encoding="utf-8",
+                )
+                with self.assertRaisesRegex(LaunchError, "judge configuration changed"):
+                    launch_gate._reobserve_judge(validated, workbuddy, job)
+
+    def test_create_refuses_inconsistent_judge_budgets(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            workbuddy = self._checkout(root)
+            with self.assertRaisesRegex(LaunchError, "runs no LLM judge"):
+                self._build(root, self._job("code"), judge_budget_microusd=150_000)
+            with self.assertRaisesRegex(LaunchError, "judge budget must be positive"):
+                self._build(root, self._job("office"), judge_budget_microusd=0)
+            with self.assertRaisesRegex(LaunchError, "actor plus judge cap"):
+                self._build(
+                    root,
+                    self._job("office"),
+                    judge_budget_microusd=600_000,
+                    total_cost_microusd=1_000_000,
+                )
+            judge_model = workbuddy / "configs/models/judge-kimi-k27.yaml"
+            judge_model.write_text(
+                judge_model.read_text(encoding="utf-8").replace(
+                    launch_gate.JUDGE_KEY_ENV, "OPENAI_API_KEY"
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(LaunchError, "backend_key_env"):
+                self._build(root, self._job("office"), judge_budget_microusd=150_000)
+
+    def test_judged_job_cannot_be_a_paired_comparison_arm(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            self._checkout(root)
+            with self.assertRaisesRegex(LaunchError, "paired-comparison arm"):
+                self._build(
+                    root,
+                    self._job("office"),
+                    judge_budget_microusd=150_000,
+                    comparison_id="judged-pair-l2",
+                )
+            # An unjudged job still pairs.
+            unjudged = self._build(
+                root, self._job("code"), comparison_id="unjudged-pair-l2"
+            )
+            self.assertEqual("unjudged-pair-l2", unjudged["comparison"]["comparison_id"])
+        # A hand-built judged manifest with a comparison is refused before any
+        # reservation (validation is the first thing run does).
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            os.chmod(root, 0o700)
+            manifest = self._manifest(
+                root, quality_evidence_on_commit=True, judge_cost_microusd=150_000
+            )
+            journal = root / "budget.json"
+            with mock.patch.dict(
+                os.environ, {launch_gate.JUDGE_KEY_ENV: self.JUDGE_KEY}
+            ), self.assertRaisesRegex(LaunchError, "paired-comparison arm"):
+                execute_launch(
+                    manifest_path=manifest,
+                    journal_path=journal,
+                    receipt_path=root / "receipt.json",
+                    credential_fd=-1,
+                    runner_argv=[sys.executable, "-c", "raise SystemExit(0)"],
+                )
+            self.assertFalse(journal.exists())
+
+    def test_unjudged_covariates_pair_across_the_judge_budget_change(self):
+        from scripts.eval.workbuddy import paired_analysis
+
+        launch_gate_sha = hashlib.sha256(
+            HOST_CONTROL_PLANE_MODULES["launch_gate"].read_bytes()
+        ).hexdigest()
+
+        def host(sha):
+            return {
+                "launch_gate": {"path": f"{FIXTURE}/launch_gate.py", "bytes": 1, "sha256": sha},
+                "model": {"path": f"{FIXTURE}/model.py", "bytes": 1, "sha256": digest("model")},
+            }
+
+        def covariates(judge, launch_gate_sha256):
+            return launch_gate._comparison_covariates(
+                workbuddy_commit=WORKBUDDY_PINNED_COMMIT,
+                overlay_sha256=digest("overlay"),
+                cohort={
+                    "subset": "code", "cohort": "dev", "take": 1,
+                    "dataset": "datasets/wb-bench-code-v1.0/tasks",
+                    "selected_tasks": ["code-task-a"],
+                    "selected_tasks_sha256": digest("tasks"),
+                },
+                artifacts={"manifest": {"path": f"{FIXTURE}/a.json", "sha256": digest("a")}},
+                environment_preflight_sha256=digest("preflight"),
+                job={"model": "m", "harness_params_override": {}},
+                model_fingerprint=digest("model-fp"),
+                backend_url_sha256=digest("url"),
+                runner_tools={"uv": {"path": f"{FIXTURE}/uv", "sha256": digest("uv")}},
+                host_control_plane=host(launch_gate_sha256),
+                budget={
+                    "total_cost_microusd": 1, "total_metered_tokens": 1,
+                    "max_cost_microusd": 1, "max_metered_tokens": 1,
+                },
+                judge=judge,
+            )
+
+        unjudged = {"enabled": False, "bench_configs": []}
+        # The covariate keys of an arm planned before judge budgets existed.
+        old_keys = {
+            "workbuddy_commit", "overlay_sha256", "cohort", "artifacts",
+            "environment_preflight_sha256", "job_without_treatment_or_result_root",
+            "model_fingerprint", "backend_url_sha256", "runner_tools",
+            "host_control_plane", "budget", "actor_prompt_changed",
+            "tool_schema_changed", "provider_cache_prefix_changed_by_control_plane",
+        }
+        baseline = covariates(unjudged, digest("launch-gate-before-judge-budgets"))
+        treatment = covariates(unjudged, launch_gate_sha)
+        self.assertEqual(old_keys, set(baseline))
+        self.assertEqual(old_keys, set(treatment))
+        with tempfile.TemporaryDirectory() as directory:
+            receipt = Path(directory) / "baseline-receipt.json"
+            receipt.write_text(
+                json.dumps({"resume_audit": {"auditor": {"launch_gate": launch_gate_sha}}}),
+                encoding="utf-8",
+            )
+            os.chmod(receipt, 0o600)
+            # Only the auditor differs, which instrument succession admits.
+            succession = paired_analysis._verify_instrument_succession(
+                {"covariates": baseline}, {"covariates": treatment}, {}, receipt
+            )
+            self.assertEqual(["launch_gate"], sorted(succession["modules"]))
+            # A judge covariate on one side (the 33c6f6ab shape) never pairs.
+            drifted = dict(treatment, judge=unjudged)
+            with self.assertRaisesRegex(LaunchError, "covariates differ"):
+                paired_analysis._verify_instrument_succession(
+                    {"covariates": baseline}, {"covariates": drifted}, {}, receipt
+                )
+        judged = {
+            "enabled": True,
+            "model_config": {"path": f"{FIXTURE}/j.yaml", "sha256": digest("j")},
+        }
+        self.assertEqual(
+            {"enabled": True, "model_config": {"sha256": digest("j")}},
+            covariates(judged, launch_gate_sha)["judge"],
+        )
+
+    def test_paid_job_cannot_route_its_own_verifier_llm(self):
+        route = {"env": {"WORKBUDDY_VERIFIER_LLM_BASE_URL": "https://llm.invalid/v1"}}
+        cases = {
+            "verifier block": lambda job: job.update(verifier=route),
+            "verifier through orchestrator_override": lambda job: job[
+                "orchestrator_override"
+            ].update(verifier=route),
+            "other runtime key through orchestrator_override": lambda job: job[
+                "orchestrator_override"
+            ].update(retry={"max_retries": 3}),
+            "container env through environment_override": lambda job: job.update(
+                environment_override=route
+            ),
+        }
+        for label, change in cases.items():
+            with self.subTest(label), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory).resolve()
+                self._checkout(root)
+                job = self._job("code")
+                change(job)
+                with self.assertRaisesRegex(
+                    LaunchError, "verifier|orchestrator_override|environment_override"
+                ):
+                    self._build(root, job)
+        # No job this repository writes carries either.
+        overlay_jobs = sorted((self.OVERLAY / "configs/jobs").glob("*.yaml"))
+        self.assertTrue(overlay_jobs)
+        from scripts.eval.workbuddy import leaderboard_jobs
+
+        written = [
+            yaml.safe_load(path.read_text(encoding="utf-8")) for path in overlay_jobs
+        ] + list(
+            leaderboard_jobs.run_jobs(
+                json.loads(leaderboard_jobs.COHORT_MANIFEST.read_text(encoding="utf-8")), 1
+            ).values()
+        )
+        for job in written:
+            self.assertNotIn("verifier", job)
+            self.assertNotIn("environment_override", job)
+            self.assertEqual({"n_concurrent_trials": 1}, job["orchestrator_override"])
+
+    def test_judge_budget_flag_is_a_positive_finite_dollar_amount(self):
+        self.assertEqual(1_500_000, launch_gate._judge_budget_usd("1.5"))
+        for bad in ("0", "-1", "nan", "inf", "0.0000001", "one"):
+            with self.subTest(bad), self.assertRaises(
+                launch_gate.argparse.ArgumentTypeError
+            ):
+                launch_gate._judge_budget_usd(bad)
+
+    # `create` writes its manifest through a private directory fd
+    # (_open_private_artifact_parent), which Windows cannot open.
+    @requires_posix_dir_fd
+    def test_create_passes_the_judge_budget_flag_to_the_manifest(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            os.chmod(root, 0o700)
+            argv = [
+                "create", "--run-id", "judge-cli-l2", "--workbuddy-checkout", str(root),
+                "--cohort-manifest", str(root), "--subset", "web", "--cohort", "dev",
+                "--split-mount-manifest", str(root),
+                "--environment-preflight-receipt", str(root),
+                "--job-config", str(root), "--model-config", str(root),
+                "--runner-bash", str(root), "--runner-uv", str(root),
+                "--provider-identity", "provider-l2",
+                "--total-cost-microusd", "1", "--total-metered-tokens", "1",
+                "--max-cost-microusd", "1", "--max-metered-tokens", "1",
+                "--output", str(root / "launch.json"),
+            ]
+            with mock.patch.object(
+                launch_gate, "build_launch_manifest", return_value={"dry_run": {}}
+            ) as build, mock.patch("builtins.print"):
+                self.assertEqual(
+                    0, launch_gate.main(argv + ["--judge-budget-usd", "2.25"])
+                )
+                self.assertEqual(
+                    2_250_000, build.call_args.kwargs["judge_budget_microusd"]
+                )
+                (root / "launch.json").unlink()
+                self.assertEqual(0, launch_gate.main(argv))
+                self.assertIsNone(build.call_args.kwargs["judge_budget_microusd"])
+                with mock.patch("sys.stderr"), self.assertRaises(SystemExit):
+                    launch_gate.main(argv + ["--judge-budget-usd", "nan"])
+
+
 class WorkBuddyRequestAuditRetryTest(unittest.TestCase):
     """The provider request ledger legitimately contains failed attempts the
     runtime retried; the REAL _collect_usage predicate must accept them,
@@ -3666,6 +4426,8 @@ sys.path.insert(0, sys.argv[1])
 from scripts.eval.workbuddy.trace import OBSERVATION_JOURNAL_SCHEMA, load_control_metrics
 assert os.environ["INSTANCE_ID"] == "workbuddy-l2-run-1-a2", os.environ["INSTANCE_ID"]
 assert os.environ["METACODES_WB_RESUME_TASKS"] == "code-task-a"
+# An unjudged arm's rerun never holds the judge credential.
+assert "METACODES_WORKBUDDY_JUDGE_API_KEY" not in os.environ
 trial = Path(sys.argv[2]) / "results/metacodes-code-l2/run2/code-task-a__2"
 agent = trial / "agent"
 agent.mkdir(parents=True)
@@ -3787,12 +4549,15 @@ result = {
             (manifest_path, journal_path, failure_receipt,
              started_ns, authority) = self._armed(root)
             repo = Path(__file__).resolve().parents[3]
-            receipt = self._resume(
-                root, manifest_path, journal_path, failure_receipt,
-                started_ns,
-                [sys.executable, "-c", self._attempt2_runner_code(),
-                 str(repo), str(root / "workbuddy")],
-            )
+            with mock.patch.dict(
+                os.environ, {launch_gate.JUDGE_KEY_ENV: "judge-l2-key"}
+            ):
+                receipt = self._resume(
+                    root, manifest_path, journal_path, failure_receipt,
+                    started_ns,
+                    [sys.executable, "-c", self._attempt2_runner_code(),
+                     str(repo), str(root / "workbuddy")],
+                )
             self.assertEqual(receipt["budget_transaction"]["state"], "committed")
             self.assertEqual(len(receipt["resumes"]), 1)
             row = receipt["resumes"][0]

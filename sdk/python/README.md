@@ -56,6 +56,23 @@ event vocabulary is listed in
 `session.abort()` stops the active run and `session.submit(text)` adds user
 input to it; both may be called from another thread.
 
+`session.close()`, and leaving a `with` block, aborts a run that is still going
+and waits for it first. That includes a `stream()` the loop stopped early with
+`break`.
+
+Abort is cooperative, so a tool or `on_ui_request` that blocks keeps
+`close()` waiting too. An `on_ui_request` waiting for the thread that is
+closing never returns. `close(timeout=seconds)` raises TimeoutError instead,
+and leaves the Session open. The abort has been requested by then, so the run
+still ends `aborted` once the blocking call returns.
+
+The handle is dropped only once AgentCore has destroyed the Session. If
+AgentCore refuses, `close()` raises and the Session stays usable. One of the
+Session's own callbacks (its event listener, `on_ui_request`, or a tool
+running in its run) cannot close it, since that run could never return:
+`close()` raises RuntimeError there. Opening and closing a different Session
+from a tool is fine.
+
 ## Permissions
 
 Sessions start in `permission_mode="default"` with the shell disabled. A tool

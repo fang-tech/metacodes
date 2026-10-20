@@ -448,6 +448,9 @@ jobs:
       - name: Change scope unit tests
         if: env.FAST_PATH != 'true' && env.SUITES != 'false'
         run: python3 -m unittest scripts.tests.test_ci_scope -v
+      - name: SDK package version unit tests
+        if: env.FAST_PATH != 'true' && env.SUITES != 'false'
+        run: python3 -m unittest scripts.tests.test_sdk_package_versions -v
       - name: Diff whitespace check
         if: env.FAST_PATH != 'true'
         run: git diff --check
@@ -461,10 +464,13 @@ jobs:
   sdk-bindings:
     name: SDK bindings (${{ matrix.os }})
     # A change confined to documentation or the evaluation harness (scope
-    # docs or eval, tty=false) cannot affect the packages, so the job is
-    # skipped; an empty scope output (the decision failed) runs it.
+    # docs or eval, tty=false) cannot affect the packages, so the steps are
+    # skipped; an empty scope output (the decision failed) runs them. The
+    # job itself always runs and reports under its own name, like the
+    # required jobs (doc/CI_DESIGN.md §1), so it can be made required
+    # without holding documentation-only PRs.
     needs: scope
-    if: ${{ !cancelled() && needs.scope.outputs.tty != 'false' }}
+    if: ${{ !cancelled() }}
     timeout-minutes: 45
     strategy:
       fail-fast: false
@@ -477,24 +483,35 @@ jobs:
             runner: macos-latest
             target: aarch64-macos
     runs-on: ${{ matrix.runner }}
+    env:
+      SDK: ${{ needs.scope.outputs.tty }}
     steps:
+      - name: Change scope
+        env:
+          REASON: ${{ needs.scope.outputs.reason }}
+        run: echo "$REASON"
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        if: env.SDK != 'false'
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        if: env.SDK != 'false'
         with:
           version: 0.16.0
           use-cache: true
           cache-size-limit: 4096
       - name: Build the AgentCore bundle
+        if: env.SDK != 'false'
         run: |
           zig build agentcore:bundle -Dtarget=${{ matrix.target }} -Doptimize=ReleaseSafe --prefix "$RUNNER_TEMP/sdk"
           bundle=$(ls -d "$RUNNER_TEMP"/sdk/agentcore/*/ | head -n 1)
           echo "BUNDLE=$bundle" >> "$GITHUB_ENV"
           echo "AGENTCORE_LIB=$(python3 -c 'import json,os,sys; b=sys.argv[1]; print(os.path.join(b, json.load(open(os.path.join(b, "manifest.json")))["shared_library"]["path"]))' "$bundle")" >> "$GITHUB_ENV"
       - name: Python package end-to-end suite
+        if: env.SDK != 'false'
         env:
           METACODES_PY_SDK_REQUIRE_LIB: "1"
         run: METACODES_AGENTCORE_LIB="$AGENTCORE_LIB" python3 -m unittest discover -s sdk/python/tests -v
       - name: Python wheel installs and passes the suite from site-packages
+        if: env.SDK != 'false'
         env:
           METACODES_PY_SDK_REQUIRE_LIB: "1"
           METACODES_PY_SDK_TEST_INSTALLED: "1"
@@ -506,10 +523,12 @@ jobs:
           cd "$RUNNER_TEMP"
           HOME="$RUNNER_TEMP/empty-home" "$RUNNER_TEMP/venv/bin/python" -m unittest discover -s "$GITHUB_WORKSPACE/sdk/python/tests" -v
       - name: Node addon builds against this Node's headers
+        if: env.SDK != 'false'
         run: |
           node --version
           node sdk/node/scripts/build.js --bundle "$BUNDLE"
       - name: Node package end-to-end suite
+        if: env.SDK != 'false'
         env:
           METACODES_NODE_SDK_REQUIRE_LIB: "1"
         run: node --test sdk/node/test/metacodes.test.js
