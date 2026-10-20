@@ -6096,6 +6096,22 @@ fn withArtifactRecoveryTool(
     return effective;
 }
 
+/// Restore health is a function of what was lost, nothing else. A changed
+/// policy fingerprint, an unavailable or changed Skill catalog: each one
+/// already counts every grant it takes away, and each counted grant gets an
+/// issue. When the counts are all zero nothing was lost, and `degraded`
+/// with no invalidation and no issue is a summary the SDK rejects (#334).
+fn restoreHealth(
+    invalidated_skill: u32,
+    invalidated_permission: u32,
+    invalidated_mcp: u32,
+) session_authority.RestoreHealth {
+    return if (invalidated_skill != 0 or invalidated_permission != 0 or invalidated_mcp != 0)
+        .degraded
+    else
+        .complete;
+}
+
 /// Construct a facade only from canonical, already-bounded inputs. The caller
 /// retains `skill_binding` on failure and transfers it on success.
 fn buildAbiSession(
@@ -6146,6 +6162,10 @@ fn buildAbiSession(
     else
         1;
     if (policy_generation == 0) return error.PermissionStateUnsupported;
+    const invalidated_permission_rules: u32 = if (config.permission_reconciliation) |value|
+        value.invalidated
+    else
+        0;
     var permission_state = if (config.permission_reconciliation) |value|
         value.takeState()
     else
@@ -6192,21 +6212,13 @@ fn buildAbiSession(
         else
             0,
         .logical_origin = if (config.restored == null) .fresh else .restored,
-        .restore_health = if ((switch (config.skill_summary.disposition) {
-            .not_bound, .restored => false,
-            .narrowed, .unavailable, .changed => true,
-        }) or (config.permission_reconciliation != null and
-            (config.permission_reconciliation.?.invalidated != 0 or
-                !config.permission_reconciliation.?.fingerprint_compatible)) or
-            mcp_invalidated != 0)
-            .degraded
-        else
-            .complete,
+        .restore_health = restoreHealth(
+            config.skill_summary.invalidated,
+            invalidated_permission_rules,
+            mcp_invalidated,
+        ),
         .invalidated_skill_authority = config.skill_summary.invalidated,
-        .invalidated_permission_rules = if (config.permission_reconciliation) |value|
-            value.invalidated
-        else
-            0,
+        .invalidated_permission_rules = invalidated_permission_rules,
         .invalidated_mcp_bindings = mcp_invalidated,
         .authority_issues = authority_issues,
         .permission_state = permission_state,
@@ -11735,13 +11747,22 @@ test "Revision 12 AgentCore restore uses execution identity and degrades unavail
         checkpoint.source(),
         limits,
     );
+    // Degraded by the unavailable Skill, not by the mode: the checkpoint has
+    // no Session rule for the new policy generation to invalidate (#334).
     try std.testing.expectEqual(
         session_authority.RestoreHealth.degraded,
         narrowed_permission.report.health,
     );
+    try std.testing.expectEqual(@as(u32, 1), narrowed_permission.report.skill.invalidated);
     try std.testing.expectEqual(
         @as(u64, 2),
         narrowed_permission.report.policy_generation,
+    );
+    try std.testing.expectEqual(@as(u32, 0), narrowed_permission.report.permission_rules_invalidated);
+    try std.testing.expectEqual(@as(usize, 1), narrowed_permission.report.issues.len);
+    try std.testing.expectEqual(
+        session_authority.AuthoritySubsystem.skill,
+        narrowed_permission.report.issues[0].subsystem,
     );
     var diagnostic = std.mem.zeroes(wire.OwnedBytesV1);
     try std.testing.expectEqual(
@@ -11832,6 +11853,121 @@ test "Revision 12 AgentCore restore uses execution identity and degrades unavail
     try std.testing.expectEqual(
         wire.STATUS_OK,
         sessionDestroy(changed.session.handle(), &diagnostic),
+    );
+    bufferRelease(&diagnostic);
+
+    // A checkpoint whose Skill selection enabled nothing loses nothing when
+    // the catalog is unavailable or changed: the disposition still says
+    // what happened, but the health is complete with no issue (#334).
+    var none_enabled = try skill_availability.Selection.init(
+        std.testing.allocator,
+        &snapshot,
+        .{ .default_state = .disabled, .exceptions = &.{} },
+    );
+    defer none_enabled.deinit();
+    const idle_skill_state = try session_authority.encodeSkillState(
+        std.testing.allocator,
+        &snapshot,
+        &none_enabled,
+    );
+    defer std.testing.allocator.free(idle_skill_state);
+    var idle_checkpoint = TestCheckpointBuffer{ .allocator = std.testing.allocator };
+    defer idle_checkpoint.deinit();
+    _ = try session_checkpoint.exportToSink(.{
+        .session_id = logical_id,
+        .checkpoint_generation = 1,
+        .last_run_id = 0,
+        .last_compact_id = 0,
+        .terminal_kind = .none,
+        .terminal_id = 0,
+        .model = "checkpoint-model",
+        .conversation = &conversation,
+        .policy_generation = 1,
+        .authority = .{
+            .skill = idle_skill_state,
+            .permission = permission_state,
+        },
+    }, limits, idle_checkpoint.sink());
+    const idle_unavailable = try restoreCheckpoint(
+        &runtime,
+        base_config,
+        &no_binding,
+        idle_checkpoint.source(),
+        limits,
+    );
+    try std.testing.expectEqual(
+        session_authority.SkillDisposition.unavailable,
+        idle_unavailable.report.skill.disposition,
+    );
+    try std.testing.expectEqual(@as(u32, 0), idle_unavailable.report.skill.invalidated);
+    try std.testing.expectEqual(
+        session_authority.RestoreHealth.complete,
+        idle_unavailable.report.health,
+    );
+    try std.testing.expectEqual(@as(usize, 0), idle_unavailable.report.issues.len);
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        sessionDestroy(idle_unavailable.session.handle(), &diagnostic),
+    );
+    bufferRelease(&diagnostic);
+
+    // A different mode still moves the Session to a fresh policy generation,
+    // but with no Session rule in the checkpoint nothing is lost.
+    const idle_new_mode = try restoreCheckpoint(
+        &runtime,
+        mismatched_mode,
+        &no_binding,
+        idle_checkpoint.source(),
+        limits,
+    );
+    try std.testing.expectEqual(@as(u64, 2), idle_new_mode.report.policy_generation);
+    try std.testing.expectEqual(@as(u32, 0), idle_new_mode.report.permission_rules_invalidated);
+    try std.testing.expectEqual(
+        session_authority.RestoreHealth.complete,
+        idle_new_mode.report.health,
+    );
+    try std.testing.expectEqual(@as(usize, 0), idle_new_mode.report.issues.len);
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        sessionDestroy(idle_new_mode.session.handle(), &diagnostic),
+    );
+    bufferRelease(&diagnostic);
+
+    const idle_changed_host = try runtime.catalogs.query(
+        std.testing.io,
+        &workspace,
+        "idle-changed-epoch",
+        &.{},
+        .{},
+    );
+    var idle_changed_binding = try createInitialSkillBinding(
+        &runtime,
+        &scope_id,
+        idle_changed_host,
+        &all_enabled,
+    );
+    try idle_changed_host.release();
+    const idle_changed = try restoreCheckpoint(
+        &runtime,
+        base_config,
+        &idle_changed_binding,
+        idle_checkpoint.source(),
+        limits,
+    );
+    try std.testing.expect(idle_changed_binding == null);
+    try std.testing.expectEqual(
+        session_authority.SkillDisposition.changed,
+        idle_changed.report.skill.disposition,
+    );
+    try std.testing.expectEqual(@as(u32, 0), idle_changed.report.skill.invalidated);
+    try std.testing.expectEqual(
+        session_authority.RestoreHealth.complete,
+        idle_changed.report.health,
+    );
+    try std.testing.expectEqual(@as(usize, 0), idle_changed.report.issues.len);
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        sessionDestroy(idle_changed.session.handle(), &diagnostic),
     );
     bufferRelease(&diagnostic);
 
