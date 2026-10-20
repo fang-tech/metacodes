@@ -19,6 +19,7 @@ const ansi = @import("../ansi.zig");
 const theme_mod = @import("../theme.zig");
 const layout = @import("../layout.zig");
 const term = @import("../term.zig");
+const input_mod = @import("../../input.zig");
 const Theme = theme_mod.Theme;
 
 /// PermissionChoice 已移到中立协议位置(core/protocol/);此处 re-export 保 UI 端引用兼容。
@@ -91,13 +92,12 @@ pub fn render(alloc: std.mem.Allocator, th: Theme, tool_name: []const u8, args: 
 ///
 /// input.zig 的 enterRawMode/restoreMode 复用。fd 默认 stdin(0),输出 fd 默认 stdout(1)。
 pub fn prompt(alloc: std.mem.Allocator, th: Theme, tool_name: []const u8, args: []const u8) ?PermissionChoice {
-    const input = @import("../../input.zig");
     const in_fd: c_int = 0;
 
     if (!term.isatty(in_fd)) return null;
 
-    const orig = input.enterRawMode(in_fd) orelse return null;
-    defer input.restoreMode(in_fd, orig);
+    const orig = input_mod.enterRawMode(in_fd) orelse return null;
+    defer input_mod.restoreMode(in_fd, orig);
 
     return promptLoop(alloc, th, in_fd, 1, tool_name, args);
 }
@@ -122,7 +122,10 @@ pub fn promptLoop(alloc: std.mem.Allocator, th: Theme, in_fd: c_int, out_fd: c_i
 
         var buf: [8]u8 = undefined;
         const n = pfs.read(in_fd, &buf);
-        if (n <= 0) return .deny_once;
+        if (n <= 0) {
+            if (n < 0 and input_mod.reconcileAfterResume(in_fd)) continue;
+            return .deny_once;
+        }
         const b = buf[0];
 
         switch (b) {

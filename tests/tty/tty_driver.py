@@ -337,8 +337,10 @@ def _build_env(base_url, env):
     return full_env, ephemeral_home
 
 
-def _drive(key_events, write, cap, set_size, per_key_drain):
+def _drive(key_events, write, cap, set_size, per_key_drain, signal_child=None):
     """按 key_events 驱动(两后端共用)。write 收 bytes;set_size 收 (rows, cols)。"""
+    # signal:stopcont is a POSIX-only regression hook that stops and continues
+    # the child through the real PTY.
     for ev in key_events:
         if ev.startswith("type:"):
             text = ev[5:]
@@ -375,6 +377,11 @@ def _drive(key_events, write, cap, set_size, per_key_drain):
         elif ev.startswith("raw:"):
             write(ev[4:].encode("latin-1", "ignore").decode("unicode_escape").encode("latin-1"))
             cap.drain_settle(per_key_drain, QUIET_KEY)
+        elif ev in ("signal:stopcont", "signal:stopcont:cooked"):
+            if signal_child is None:
+                raise RuntimeError("signal:stopcont is only supported by the POSIX PTY driver")
+            signal_child(cooked=ev.endswith(":cooked"))
+            cap.drain_settle(per_key_drain, QUIET_KEY)
 
 
 def run(bin_path, key_events, term_size=(24, 80), env=None,
@@ -400,6 +407,8 @@ def run(bin_path, key_events, term_size=(24, 80), env=None,
                          (等命令输出用:回显行 `❯ !echo X` 含 X 但整行不等于 X)
       "resize:RxC"       运行中改窗口(触 SIGWINCH / ConPTY resize)
       "raw:..."          原样字节(用 \\xNN 转义)
+      "signal:stopcont"  POSIX-only: stop and continue the child process
+      "signal:stopcont:cooked"  同上,停住期间把 pty 改回 canonical(像 shell 那样)
     """
     rows, cols = term_size
     # bin_path 转绝对路径:cwd 非 None 时子进程会 chdir,相对 bin_path 会失效。
@@ -415,6 +424,27 @@ def run(bin_path, key_events, term_size=(24, 80), env=None,
         # ephemeral home 无凭证(live 用例都显式传播种 HOME),删失败无害,尽力而为。
         if ephemeral_home:
             shutil.rmtree(ephemeral_home, ignore_errors=True)
+
+
+def _set_child_canonical(pid):
+    """What a job-control shell may leave behind while the child is stopped:
+    canonical input with signals, but no echo (so a test cannot mistake the
+    line discipline's own echo for the application's redraw)."""
+    import subprocess
+    import termios
+    name = subprocess.run(["ps", "-o", "tty=", "-p", str(pid)],
+                          capture_output=True, text=True, check=True).stdout.strip()
+    if not name or name in ("?", "??"):
+        raise RuntimeError(f"child {pid} has no controlling terminal")
+    slave = os.open("/dev/" + name, os.O_RDWR | os.O_NOCTTY)
+    try:
+        attrs = termios.tcgetattr(slave)
+        attrs[0] |= termios.ICRNL
+        attrs[3] |= termios.ICANON | termios.ISIG | termios.IEXTEN
+        attrs[3] &= ~termios.ECHO
+        termios.tcsetattr(slave, termios.TCSANOW, attrs)
+    finally:
+        os.close(slave)
 
 
 def _run_posix(bin_path, key_events, term_size, full_env,
@@ -469,8 +499,20 @@ def _run_posix(bin_path, key_events, term_size, full_env,
         except OSError:
             pass
 
+    def stop_continue(cooked=False):
+        import signal
+        os.kill(pid, signal.SIGSTOP)
+        # Wait for the kernel's stopped status before delivering SIGCONT; this
+        # keeps the regression deterministic even on a busy test host.
+        stopped, status = os.waitpid(pid, os.WUNTRACED)
+        if stopped != pid or not os.WIFSTOPPED(status):
+            raise RuntimeError("child did not stop for signal:stopcont")
+        if cooked:
+            _set_child_canonical(pid)
+        os.kill(pid, signal.SIGCONT)
+
     cap.drain(startup_drain)
-    _drive(key_events, write, cap, set_size, per_key_drain)
+    _drive(key_events, write, cap, set_size, per_key_drain, signal_child=stop_continue)
 
     cap.finish()
     try:

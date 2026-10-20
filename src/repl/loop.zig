@@ -108,6 +108,7 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
 
     const stdin_fd: c_int = 0;
     const tty = platform_term.isatty(stdin_fd);
+    if (tty) input.installResumeHandler();
 
     // TTY 会话只拥有一个 Renderer。输入期、生成期和队列续发共享同一份固定区状态
     // (区高、光标所在区内行、UiState),各期之间不再新建 region。
@@ -1332,6 +1333,7 @@ fn readLineRaw(
         // 用 poll 带超时读,而非阻塞 read:超时时检查 SIGWINCH(终端 resize)→ 立即重画
         // 输入框自适应新宽度(否则要等下次按键才更新,真机 resize 卡旧宽)。
         if (synthetic_key == null) while (true) {
+            _ = input.reconcileAfterResume(fd);
             if (g_winch.swap(false, .acquire)) {
                 redraw(region, &editor, app); // resize → 重测宽度重画
             }
@@ -1377,7 +1379,10 @@ fn readLineRaw(
         // parser.feed 返 null = 序列未完成(如刚收 ESC / CSI 中段)→ 回头继续读。
         const key = if (synthetic_key) |sk| sk else blk: {
             const n = platform_term.readInput(fd, &b);
-            if (n < 0) return error.ReadError;
+            if (n < 0) {
+                if (input.reconcileAfterResume(fd)) continue;
+                return error.ReadError;
+            }
             if (n == 0) return error.Eof;
 
             // vim 模式 + NORMAL/VISUAL:字节路由到 vim 状态机(Enter/Esc 例外)
