@@ -1298,14 +1298,30 @@ fn chatUsageObject(data: []const u8) ?[]const u8 {
 /// (prompt_tokens_details 下,经 cache.parseOpenAICacheUsage),中立 UsageDelta 约定
 /// input_tokens 不含 cache。消费方(usage 锚点/成本累计)按 in+cache_r+cache_w 求和——
 /// 不减会把缓存双计。`"prompt_tokens":` 含闭引号+冒号,不会命中 `prompt_tokens_details`。
-fn chatUsageDelta(usage_obj: []const u8) UsageDelta {
+/// Read a required non-negative integer from a usage object without collapsing
+/// a missing or non-numeric value to zero. Optional cache counters keep their
+/// historical absent-is-zero behavior; prompt/completion counters are the
+/// contract's required pair, so an unreadable one makes the whole sample
+/// unavailable and lets the caller preserve `metering:unknown`.
+fn chatUsageDelta(usage_obj: []const u8) ?UsageDelta {
+    const prompt_tokens = usageIntField(usage_obj, "prompt_tokens") orelse return null;
+    const completion_tokens = usageIntField(usage_obj, "completion_tokens") orelse return null;
     const cu = cache.parseOpenAICacheUsage(usage_obj);
     return .{
-        .input_tokens = util_json.extractIntField(usage_obj, "prompt_tokens") -| cu.read_tokens,
-        .output_tokens = util_json.extractIntField(usage_obj, "completion_tokens"),
+        .input_tokens = prompt_tokens -| cu.read_tokens,
+        .output_tokens = completion_tokens,
         .cache_read_input_tokens = cu.read_tokens,
         .cache_creation_input_tokens = cu.creation_tokens, // OpenAI 无写区分 → 0
     };
+}
+
+/// `extractIntField` intentionally returns zero for missing/unreadable values,
+/// which is useful for tolerant metadata but loses the accounting distinction
+/// between an explicit zero and an unavailable counter. OpenAI chat usage needs
+/// that distinction at its provider boundary.
+fn usageIntField(usage_obj: []const u8, field: []const u8) ?u64 {
+    const raw = util_json.topLevelField(usage_obj, field) orelse return null;
+    return std.fmt.parseInt(u64, raw, 10) catch null;
 }
 
 /// Responses 终止事件的 `response.usage` 对象(含两端花括号,借用 data);缺失或非 object
@@ -2941,6 +2957,54 @@ test "issue #269 chat: finish_reason then EOF without [DONE] keeps the answer an
     defer got.deinit(a);
     try std.testing.expectEqualStrings("cut", got.text.items);
     try std.testing.expectEqual(StopReason.max_tokens, got.stop);
+}
+
+test "issue #317 chat: successful stream without usage stays accepted and emits no zero sample" {
+    const a = std.testing.allocator;
+    var got = try replaySse(a, "gpt-4o", .chat_completions, "data: {\"choices\":[{\"delta\":{\"content\":\"HELLO\"}}]}\n\n" ++
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n" ++
+        "data: [DONE]\n\n");
+    defer got.deinit(a);
+    try std.testing.expectEqualSlices(std.meta.Tag(StreamEvent), &.{ .text, .done }, got.kinds.items);
+    try std.testing.expectEqualStrings("HELLO", got.text.items);
+    try std.testing.expectEqual(StopReason.end_turn, got.stop);
+    try std.testing.expectEqual(@as(usize, 0), got.usages.items.len);
+}
+
+test "issue #317 chat: accepted tail loss keeps answer and marks usage unavailable" {
+    const a = std.testing.allocator;
+    // The provider reported how the answer stopped, then the clean EOF lost
+    // both the optional usage tail and [DONE]. The existing acceptance rule is
+    // deliberate: answer bytes and stop status remain usable.
+    var got = try replaySse(a, "gpt-4o", .chat_completions, "data: {\"choices\":[{\"delta\":{\"content\":\"TAIL\"}}]}\n\n" ++
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n");
+    defer got.deinit(a);
+    try std.testing.expectEqualStrings("TAIL", got.text.items);
+    try std.testing.expectEqual(StopReason.end_turn, got.stop);
+    // A clean EOF after the stop marker is accepted, but there is no trailing
+    // [DONE] frame from which to synthesize a separate done event.
+    try std.testing.expectEqualSlices(std.meta.Tag(StreamEvent), &.{.text}, got.kinds.items);
+    try std.testing.expectEqual(@as(usize, 0), got.usages.items.len);
+}
+
+test "issue #317 chat: unreadable usage counters do not become known zero" {
+    const a = std.testing.allocator;
+    var unreadable = try replaySse(a, "gpt-4o", .chat_completions, "data: {\"choices\":[{\"delta\":{\"content\":\"OK\"}}]}\n\n" ++
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":\"11\",\"completion_tokens\":\"7\"}}\n\n" ++
+        "data: [DONE]\n\n");
+    defer unreadable.deinit(a);
+    try std.testing.expectEqualStrings("OK", unreadable.text.items);
+    try std.testing.expectEqual(StopReason.end_turn, unreadable.stop);
+    try std.testing.expectEqualSlices(std.meta.Tag(StreamEvent), &.{ .text, .done }, unreadable.kinds.items);
+    try std.testing.expectEqual(@as(usize, 0), unreadable.usages.items.len);
+
+    // Explicit numeric zero is a real report and must remain distinguishable
+    // from the unavailable cases above.
+    var known_zero = try replaySse(a, "gpt-4o", .chat_completions, "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":0}}\n\n" ++
+        "data: [DONE]\n\n");
+    defer known_zero.deinit(a);
+    try std.testing.expectEqualSlices(std.meta.Tag(StreamEvent), &.{ .usage, .done }, known_zero.kinds.items);
+    try std.testing.expectEqualSlices(UsageDelta, &.{.{}}, known_zero.usages.items);
 }
 
 test "issue #269 chat: an empty finish_reason on an intermediate chunk is not a stop report" {

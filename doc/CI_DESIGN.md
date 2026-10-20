@@ -26,7 +26,7 @@ meaning its decision job failed, runs the step.
 |---|---|---|
 | `FAST_PATH` | `Release fast path` job (`scripts/release_fast_path.py`) | `true` for a generated release or reopen bump over a green base: only the checkout and the version state gate run ([RELEASE_AUTOMATION_DESIGN.md](RELEASE_AUTOMATION_DESIGN.md) §3). |
 | `SUITES` | `Change scope` job (`scripts/ci_scope.py`) | `false` for a documentation-only change: `Gates` runs only the documentation, version-state and gate-manifest checks, and `Gates (Windows)` runs nothing. |
-| `TTY` | `Change scope` job | `false` for a change confined to documentation and the evaluation harness: the TTY jobs run nothing. |
+| `TTY` | `Change scope` job | `false` for a change confined to documentation and the evaluation harness: the TTY jobs run nothing. The `SDK bindings` jobs read the same output as `SDK`. They are not required, but they report the same way, so they can become required without holding such PRs. |
 
 `scripts/tests/test_ci_scope.py` pins the wiring:
 

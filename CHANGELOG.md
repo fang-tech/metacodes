@@ -12,6 +12,19 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Added
 
+- A startup animation in the interactive TUI: the wordmark "Metask Lab"
+  condenses out of a particle brightness field and is drawn only with the
+  letters of its own name (after chenglou.me/pretext's variable typographic
+  ASCII), then stays above the welcome box. It adapts to the terminal's colour
+  depth and light or dark background, plays only when stdin and stdout are both
+  terminals and the wordmark fits, and any key jumps to the settled frame.
+  `METACODES_NO_STARTUP_ANIMATION` set to any value, or `"startupAnimation":
+  false` in `<state root>/config.json`, turns it off. On Windows a bare
+  modifier key (Shift, Ctrl, Alt) skips it without blocking, and no frame is
+  drawn after the terminal changes size. The REPL's post-reply input drain
+  uses the same non-blocking discard, so a bare modifier pressed during a
+  reply no longer holds the next prompt on Windows.
+
 - Python and Node packages over the AgentCore shared library (`sdk/python`,
   `sdk/node`; experimental, not yet published). Both offer a Runtime/Session
   API, streaming events, the final answer rebuilt from output segments, tools
@@ -583,6 +596,57 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- Python and Node SDK packages (from #315), before their first publication:
+  - **Python `Session.close()` lost the handle when the destroy failed.**
+    Leaving a `with` block during a `stream()` the loop stopped with `break`
+    returned BUSY, dropped the handle, made `abort()` a no-op and leaked both
+    the Session and the Runtime. `close()` now aborts a run that is still
+    going and waits for it (`close(timeout=…)` raises TimeoutError and
+    keeps the Session open), and keeps the handle (and the Runtime's)
+    whenever AgentCore refuses. Called from one of that Session's own
+    callbacks, it raises RuntimeError instead of deadlocking; closing another
+    Session from a callback still works.
+  - **Node: a tool result `JSON.stringify` cannot encode crashed the host.**
+    A BigInt, a cycle or a function raised an unhandled rejection that exited
+    the process, or, with an `unhandledRejection` handler installed, left
+    AgentCore waiting forever. It is now a model-visible tool error. An
+    `onUiRequest` answer that cannot be encoded is not answered, and the run
+    rejects with the error. A rejection value with no string form, such as
+    `Object.create(null)`, still answers the call.
+  - **Node** names status codes 11–25 and 27 instead of `STATUS_ERROR`.
+  - **L2 tests against the real library** for `submit`, `abort`,
+    `close()` during a run, allow and deny rules, `set_permission_mode`,
+    `allow_session` (asked once per file target), `ask_question` answers and
+    the OpenAI Chat Completions provider, in both packages.
+    `scripts/tests/test_sdk_package_versions.py` checks the package versions
+    against `sdk/VERSION`.
+  - **CI:** the `SDK bindings` jobs report under their names on every run
+    and skip their steps on a docs or eval scope (doc/CI_DESIGN.md §1).
+  - **README:** the gateway row is the 2026-10-16 Windows 11 ReleaseFast run.
+    At 64 clients the overhead is 3 ms p50 / 9 ms p99; "1–3 ms" was the
+    8-client row. The release unit row cites the 0.5.0 assets. The Code
+    column no longer bolds a score that is not the highest.
+- Configuration written wrong is reported instead of silently ineffective.
+  Loading is unchanged - the broken piece is still skipped - but a malformed
+  hook never fails, it just never fires, and until now each case left only a
+  `warn` log line below the default log level.
+  - **Hooks.** The new `/hooks` lists the hooks in effect per event and every
+    problem the last load found, with its file and JSON path: a settings file
+    that is not JSON, `hooks` that is not an object, a Claude Code event
+    metacodes does not run (`SessionStart`, `UserPromptSubmit`, ...), a key
+    that is no event at all (`PostToolUSE`, with a suggestion), an entry or
+    hook of the wrong shape, a `type` other than `command`, a missing
+    `command`, a `timeout` that is not a positive number or exceeds 600 s,
+    and hooks written in `.claude/settings.local.json` or a `--settings`
+    file, which metacodes does not read hooks from.
+  - **Skills.** `/skills` lists each Skill whose `SKILL.md` has no
+    `description`: listings show its first body line (Claude Code's
+    fallback) or nothing, and the model picks Skills by that line.
+  - **Agents.** `/agents` lists agents without a `description` (the Task tool
+    lists them with nothing) and agent files that did not load, with the
+    reason.
+  - The startup banner and `/doctor` count these and name the command that
+    lists them (`config issues: 2 hooks, 1 skill · see /hooks /skills`).
 - `ToolSearch` misses no longer read as "the core tools are missing"
   (issue #287). A miss says that ToolSearch only searches deferred tools,
   names the loaded tools whose names match the query's keywords (`file read

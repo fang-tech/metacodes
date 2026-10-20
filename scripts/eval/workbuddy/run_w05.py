@@ -22,7 +22,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict, Iterable, Mapping, Sequence
 
-from . import WORKBUDDY_PINNED_COMMIT
+from . import WORKBUDDY_JUDGE_KEY_ENV, WORKBUDDY_PINNED_COMMIT
 from .install_overlay import install
 from .mock_provider import MOCK_CREDENTIAL, READY_DEADLINE_S
 from .stage_artifacts import stage
@@ -56,6 +56,8 @@ PROVIDER_CREDENTIAL_ENV = (
     "ZAI_API_KEY",
     "GLM_API_KEY",
     "METACODES_WORKBUDDY_PROVIDER_KEY_FD_REF",
+    # W0.5 and the leaderboard preflight have no judge; neither may reach one.
+    WORKBUDDY_JUDGE_KEY_ENV,
 )
 EXPECTED_RUNTIME_CONTRACT = {
     "schema_version": "metacodes-workbuddy-runtime-contract-v2",

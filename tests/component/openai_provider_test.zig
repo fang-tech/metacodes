@@ -45,15 +45,25 @@ test "P3: 同一 agent_loop 喂 OpenAI provider(异协议)跑通到 end_turn" {
 
     var render = writer_backend.WriterBackend.initNull();
     const be = render.backend();
+    var goal_state = cc.core_goal.State.init(a);
+    defer goal_state.deinit();
+    try goal_state.setNew("account this run", 1);
+    var goal_meter = cc.core_goal.Meter.init(&goal_state);
 
     // ★ 同一个 agent_loop.run(),喂 OpenAI provider。core 一行没改。
-    const result = agent_loop.run(&conv, client.provider(), empty_defs, &perm, .{ .max_turns = 3 }, &be, a) catch |e| {
+    const result = agent_loop.run(&conv, client.provider(), empty_defs, &perm, .{ .max_turns = 3, .goal_meter = &goal_meter }, &be, a) catch |e| {
         std.debug.print("OpenAI run failed: {s}\n", .{@errorName(e)});
         return error.SkipZigTest;
     };
 
     // 跑通到 end_turn(OpenAI finish_reason:"stop" → 中立 .end_turn)。
     try std.testing.expectEqual(agent_loop.StopReason.end_turn, result.stop_reason);
+    // include_usage is requested by the serializer, but this legal fixture
+    // omits it. The answer still succeeds while consumer-facing accounting is
+    // explicitly unavailable rather than a known zero.
+    try std.testing.expectEqual(agent_loop.UsageStatus.unknown, result.usage_status);
+    // Unknown usage is never silently turned into a zero-token budget charge.
+    try std.testing.expectEqual(@as(u64, 0), goal_state.current.?.tokens_used);
 
     // assistant 文本是 OpenAI delta.content 拼接(经中立 StreamEvent.text)。
     var got: std.ArrayList(u8) = .empty;

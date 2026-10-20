@@ -19,9 +19,20 @@ const plugin_contract = @import("../plugin/contract.zig");
 pub const AgentDef = def_mod.AgentDef;
 pub const Origin = def_mod.Origin;
 
+/// An agent file under a personal or project directory that did not load. Such
+/// a file is skipped so the others still load; `/agents` lists it so the skip
+/// is not silent. (A plugin agent that fails aborts the plugin generation.)
+pub const LoadFailure = struct {
+    /// The agent file. Owned.
+    path: []const u8,
+    /// `@errorName` of the read or parse failure (static).
+    reason: []const u8,
+};
+
 pub const AgentSet = struct {
     allocator: std.mem.Allocator,
     agents: std.ArrayList(AgentDef),
+    load_failures: std.ArrayList(LoadFailure) = .empty,
 
     pub fn init(allocator: std.mem.Allocator) AgentSet {
         return .{ .allocator = allocator, .agents = .empty };
@@ -30,6 +41,21 @@ pub const AgentSet = struct {
     pub fn deinit(self: *AgentSet) void {
         for (self.agents.items) |a| a.deinit(self.allocator);
         self.agents.deinit(self.allocator);
+        for (self.load_failures.items) |failure| self.allocator.free(failure.path);
+        self.load_failures.deinit(self.allocator);
+    }
+
+    /// Loaded agents without a `description`. The Task tool lists each agent by
+    /// its description, so the model cannot tell when to delegate to these.
+    /// Built-ins always carry one.
+    pub fn missingDescription(agent: *const AgentDef) bool {
+        return agent.origin != .builtin and std.mem.trim(u8, agent.description, " \t\r\n").len == 0;
+    }
+
+    pub fn missingDescriptionCount(self: *const AgentSet) usize {
+        var count: usize = 0;
+        for (self.agents.items) |*agent| count += @intFromBool(missingDescription(agent));
+        return count;
     }
 
     /// 只装内置三件(Explore / Plan / general-purpose),不碰任何目录:给需要
@@ -151,6 +177,7 @@ pub const AgentSet = struct {
                 } else {
                     self.loadAgentFile(child_path, origin, namespace) catch |err| {
                         @import("../util/log.zig").warn("agent", "load failed {s}: {s}", .{ child_path, @errorName(err) });
+                        try self.recordLoadFailure(child_path, err);
                     };
                 }
             } else {
@@ -166,7 +193,15 @@ pub const AgentSet = struct {
         var a = try def_mod.parseAgentMd(self.allocator, md, path, origin);
         errdefer a.deinit(self.allocator);
         if (namespace.len != 0) try self.namespacePluginAgent(&a, namespace);
+        if (missingDescription(&a))
+            @import("../util/log.zig").warn("agent", "{s}: no `description`; the model cannot tell when to delegate to '{s}'", .{ path, a.name });
         try self.upsert(a);
+    }
+
+    fn recordLoadFailure(self: *AgentSet, path: []const u8, err: anyerror) error{OutOfMemory}!void {
+        const owned = try self.allocator.dupe(u8, path);
+        errdefer self.allocator.free(owned);
+        try self.load_failures.append(self.allocator, .{ .path = owned, .reason = @errorName(err) });
     }
 
     fn namespacePluginAgent(self: *AgentSet, agent: *AgentDef, namespace: []const u8) !void {

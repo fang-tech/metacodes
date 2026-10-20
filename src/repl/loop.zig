@@ -85,7 +85,7 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
     else
         null;
 
-    printStartupBanner(app);
+    printStartupBanner(app, allocator);
 
     // 启动 prompt 建议:基于 git 最近改动的文件给一条灰色提示(对齐 Claude Code)
     printStartupSuggestion(allocator);
@@ -219,6 +219,7 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
                 \\  /init            Analyze the codebase and write CLAUDE.md (model-driven)
                 \\  /mcp             List configured MCP servers
                 \\  /agents          List available sub-agent capabilities
+                \\  /hooks           List configured hooks and hook configuration problems
                 \\  /permissions     Show permission mode + loaded rules
                 \\  /theme [variant] Show/switch TUI theme (auto/dark/light/mono)
                 \\  /add-dir <path>  Add a working directory (accept-edits auto-accept + sandbox write)
@@ -380,7 +381,11 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
             continue;
         }
         if (std.mem.eql(u8, trimmed, "/skills")) {
-            printSkills(app);
+            printReport(app, writeSkillsReport);
+            continue;
+        }
+        if (std.mem.eql(u8, trimmed, "/hooks")) {
+            printReport(app, writeHooksReport);
             continue;
         }
         if (std.mem.eql(u8, trimmed, "/history")) {
@@ -544,7 +549,7 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
             continue;
         }
         if (std.mem.eql(u8, trimmed, "/agents")) {
-            try handleAgents(app);
+            printReport(app, writeAgentsReport);
             continue;
         }
         if (std.mem.eql(u8, trimmed, "/permissions")) {
@@ -1082,15 +1087,12 @@ fn firstUserLine(conv: *const Conversation) []const u8 {
     return "main session";
 }
 
-/// Drain stdin buffer: 非阻塞读尽剩余字节。生成结束后调用，避免用户在 LLM 输出时
-/// 误按的字符进入下一轮输入缓冲。
+/// Drain stdin buffer: 非阻塞丢弃剩余输入。生成结束后调用，避免用户在 LLM 输出时
+/// 误按的字符进入下一轮输入缓冲。Through discardPendingInput: on Windows a bare
+/// modifier pressed during the reply is a readable key-down that ReadConsoleW
+/// would block on, holding the next prompt until a printable key.
 fn drainStdin(fd: c_int) void {
-    while (true) {
-        if (platform_term.waitReadable(fd, 0) <= 0) return; // 可移植:timeout=0 立即返回
-        var buf: [256]u8 = undefined;
-        const n = platform_term.readInput(fd, buf[0..buf.len]);
-        if (n <= 0) return;
-    }
+    platform_term.discardPendingInput(fd);
 }
 
 /// 非 tty / 管道模式下的朴素逐字节行读（保留 M0 行为）。
@@ -2825,6 +2827,9 @@ fn handleDoctor(app: *app_mod.App, allocator: std.mem.Allocator) !void {
     std.debug.print("  conversation:     {d} messages\n", .{app.conversation.len()});
     std.debug.print("  tasks:            {d} in store\n", .{app.tasks.tasks.items.len});
     std.debug.print("  rules loaded:     {d}\n", .{if (app.rule_set) |r| r.rules.items.len else 0});
+    var problems_buf: [160]u8 = undefined;
+    const problems = formatConfigProblems(&problems_buf, app.configProblems());
+    std.debug.print("  config issues:    {s}\n", .{if (problems.len != 0) problems[CONFIG_PROBLEMS_PREFIX.len..] else "none"});
 
     // HOME + CWD + config file 检查
     const home_c = @import("platform").paths.homeDir();
@@ -3685,16 +3690,29 @@ fn handleRecap(app: *app_mod.App, allocator: std.mem.Allocator) !void {
     std.debug.print("\x1b[36m↻ {s}\x1b[0m\n", .{std.mem.trim(u8, recap, " \n")});
 }
 
-/// /skills:列出已加载 skill(来源 scope + 根目录)、加载失败的 skill(issue)与被跳过的根目录。
-/// 失败与跳过必须可见——静默丢 skill 正是兼容问题最难排查的形态。
-fn printSkills(app: *app_mod.App) void {
+/// Render a `/command` report to the terminal. The report itself is written
+/// to a `*std.Io.Writer` so tests read exactly what the user sees.
+fn printReport(app: *const app_mod.App, comptime write: fn (*std.Io.Writer, *const app_mod.App) std.Io.Writer.Error!void) void {
+    var out: std.Io.Writer.Allocating = .init(app.allocator);
+    defer out.deinit();
+    write(&out.writer, app) catch {
+        std.debug.print("\x1b[31m(out of memory rendering the report)\x1b[0m\n", .{});
+        return;
+    };
+    std.debug.print("{s}", .{out.written()});
+}
+
+/// /skills:列出已加载 skill(来源 scope + 根目录)、加载失败的 skill(issue)、被跳过的根目录,
+/// 以及缺 `description` 的 skill(列给模型的是首行正文或空)。失败、跳过与缺描述都必须可见——
+/// 静默丢 skill 或静默降级正是兼容问题最难排查的形态。
+pub fn writeSkillsReport(w: *std.Io.Writer, app: *const app_mod.App) std.Io.Writer.Error!void {
     const catalog = @import("../skills/runtime/catalog.zig");
     const snapshot = app.skill_runtime.snapshot orelse {
-        std.debug.print("Skills unavailable (catalog not loaded; run with METACODES_LOG=warn for the reason)\n", .{});
+        try w.writeAll("Skills unavailable (catalog not loaded; run with METACODES_LOG=warn for the reason)\n");
         return;
     };
     if (snapshot.skills.len == 0 and snapshot.issues.len == 0 and snapshot.skipped_sources.len == 0) {
-        std.debug.print(
+        try w.print(
             \\No skills installed. Put <name>/SKILL.md under any of:
             \\  {s}/skills  ~/.agents/skills  ~/.claude/skills  ~/.codex/skills
             \\  <project>/.metacodes/skills  .agents/skills  .claude/skills  .codex/skills
@@ -3702,7 +3720,7 @@ fn printSkills(app: *app_mod.App) void {
         , .{app.stateRoot()});
         return;
     }
-    std.debug.print("Skills ({d}):\n", .{snapshot.skills.len});
+    try w.print("Skills ({d}):\n", .{snapshot.skills.len});
     for (snapshot.skills) |record| {
         const scope = switch (record.source_scope) {
             .enterprise => "enterprise",
@@ -3717,18 +3735,34 @@ fn printSkills(app: *app_mod.App) void {
         else
             "";
         var line_buf: [96]u8 = undefined;
-        std.debug.print("  \x1b[36m/{s}\x1b[0m \x1b[2m({s}{s})\x1b[0m {s}\n", .{
+        try w.print("  \x1b[36m/{s}\x1b[0m \x1b[2m({s}{s})\x1b[0m {s}\n", .{
             record.invocation_name,
             scope,
             flags,
             oneLine(&line_buf, record.definition.description),
         });
-        std.debug.print("    \x1b[2m{s}\x1b[0m\n", .{record.live_dir orelse record.source_root});
+        try w.print("    \x1b[2m{s}\x1b[0m\n", .{record.live_dir orelse record.source_root});
+    }
+    var undescribed: usize = 0;
+    for (snapshot.skills) |record| undescribed += @intFromBool(record.definition.description_source != .frontmatter);
+    if (undescribed != 0) {
+        try w.print("\x1b[33mNo description ({d}):\x1b[0m\n", .{undescribed});
+        for (snapshot.skills) |record| {
+            var line_buf: [96]u8 = undefined;
+            switch (record.definition.description_source) {
+                .frontmatter => {},
+                .body_first_line => try w.print("  /{s}: SKILL.md has no `description`; listings show its first line instead: \"{s}\"\n", .{
+                    record.invocation_name,
+                    oneLine(&line_buf, record.definition.description),
+                }),
+                .missing => try w.print("  /{s}: SKILL.md has no `description`; listings say nothing about when to use it\n", .{record.invocation_name}),
+            }
+        }
     }
     if (snapshot.issues.len != 0) {
-        std.debug.print("\x1b[33mNot loaded ({d}):\x1b[0m\n", .{snapshot.issues.len});
+        try w.print("\x1b[33mNot loaded ({d}):\x1b[0m\n", .{snapshot.issues.len});
         for (snapshot.issues) |issue| {
-            std.debug.print("  {s}: {s}{s}{s}\n", .{
+            try w.print("  {s}: {s}{s}{s}\n", .{
                 issue.invocation_name orelse "(invalid name)",
                 @tagName(issue.code),
                 if (issue.reason != null) " / " else "",
@@ -3737,7 +3771,7 @@ fn printSkills(app: *app_mod.App) void {
         }
     }
     for (snapshot.skipped_sources) |skipped| {
-        std.debug.print("\x1b[33mSkipped skills root\x1b[0m {s} ({s})\n", .{
+        try w.print("\x1b[33mSkipped skills root\x1b[0m {s} ({s})\n", .{
             skipped.root,
             switch (skipped.reason) {
                 catalog.SkipReason.unreadable => "unreadable",
@@ -3745,6 +3779,87 @@ fn printSkills(app: *app_mod.App) void {
             },
         });
     }
+}
+
+/// /hooks:生效的 hook(按事件)与最近一次加载发现的每一处坏配置。格式错的 hook 不会报错,
+/// 只会永不触发——这里是用户看见"为什么没触发"的地方。
+pub fn writeHooksReport(w: *std.Io.Writer, app: *const app_mod.App) std.Io.Writer.Error!void {
+    const hooks_mod = @import("../permission/hooks.zig");
+    const problems: []const hooks_mod.Problem = if (app.hook_diagnostics) |*diag| diag.items() else &.{};
+    const sources = "<project>/.claude/settings.json and ~/.claude/settings.json";
+    if (app.hooks == null and problems.len == 0) {
+        try w.print("No hooks configured. metacodes reads \"hooks\" from {s}.\n", .{sources});
+        try w.print("Events: {s}\n", .{hooks_mod.EVENT_LIST});
+        return;
+    }
+    if (app.hooks) |*set| {
+        try w.print("Hooks (from {s}):\n", .{sources});
+        for (std.enums.values(hooks_mod.Event)) |event| {
+            const entries = set.entries(event);
+            if (entries.len == 0) continue;
+            try w.print("  \x1b[36m{s}\x1b[0m\n", .{@tagName(event)});
+            for (entries) |entry| {
+                const tool_event = event == .PreToolUse or event == .PostToolUse;
+                for (entry.commands, 0..) |command, index| {
+                    try w.print("    {s}{s}{s}{s}", .{
+                        if (tool_event) "[" else "",
+                        if (tool_event) entry.matcher else "",
+                        if (tool_event) "] " else "",
+                        command,
+                    });
+                    const timeout_ms = entry.timeoutMs(index);
+                    if (index < entry.timeouts_ms.len and entry.timeouts_ms[index] > 0)
+                        try w.print(" \x1b[2m(timeout {d} s)\x1b[0m", .{@divTrunc(timeout_ms, 1000)});
+                    try w.writeByte('\n');
+                }
+                if (entry.commands.len == 0) try w.print("    {s}{s}{s}\x1b[2m(no commands)\x1b[0m\n", .{
+                    if (tool_event) "[" else "",
+                    if (tool_event) entry.matcher else "",
+                    if (tool_event) "] " else "",
+                });
+            }
+        }
+    } else {
+        try w.writeAll("No hooks loaded.\n");
+    }
+    if (problems.len != 0) {
+        try w.print("\x1b[33mProblems ({d}):\x1b[0m\n", .{problems.len});
+        for (problems) |problem| {
+            try w.print("  \x1b[33m!\x1b[0m {s}{s}{s}: {s}\n", .{
+                problem.source,
+                if (problem.location.len != 0) " " else "",
+                problem.location,
+                problem.message,
+            });
+        }
+    }
+}
+
+const CONFIG_PROBLEMS_PREFIX = "config issues: ";
+
+/// "config issues: 2 hooks, 1 skill · see /hooks /skills" for the startup banner
+/// and `/doctor`; "" when there is nothing to report.
+pub fn formatConfigProblems(buf: []u8, problems: app_mod.App.ConfigProblems) []const u8 {
+    if (problems.total() == 0) return "";
+    const Part = struct { count: usize, noun: []const u8, command: []const u8 };
+    const parts = [_]Part{
+        .{ .count = problems.hooks, .noun = "hook", .command = "/hooks" },
+        .{ .count = problems.skills, .noun = "skill", .command = "/skills" },
+        .{ .count = problems.agents, .noun = "agent", .command = "/agents" },
+    };
+    var w: std.Io.Writer = .fixed(buf);
+    w.writeAll(CONFIG_PROBLEMS_PREFIX) catch {};
+    var first = true;
+    for (parts) |part| {
+        if (part.count == 0) continue;
+        w.print("{s}{d} {s}{s}", .{ if (first) "" else ", ", part.count, part.noun, if (part.count == 1) "" else "s" }) catch {};
+        first = false;
+    }
+    w.writeAll(" · see") catch {};
+    for (parts) |part| {
+        if (part.count != 0) w.print(" {s}", .{part.command}) catch {};
+    }
+    return w.buffered();
 }
 
 /// Collapse whitespace and cut at a UTF-8 boundary to fit `buf` (display only).
@@ -3834,10 +3949,13 @@ fn handleMcp(app: *app_mod.App) !void {
     }
 }
 
-/// /agents:列出已加载的 subagent 定义(builtin / personal / project / plugin)。
-fn handleAgents(app: *app_mod.App) !void {
-    if (app.agents.len() == 0) {
-        std.debug.print("(no subagents loaded)\n", .{});
+/// /agents:列出已加载的 subagent 定义(builtin / personal / project / plugin),缺 `description`
+/// 的 agent(Task 工具按描述列出,模型据此决定委托),以及没加载成的 agent 文件。
+pub fn writeAgentsReport(w: *std.Io.Writer, app: *const app_mod.App) std.Io.Writer.Error!void {
+    const agent_set = @import("../agents/set.zig");
+    const failures = app.agents.load_failures.items;
+    if (app.agents.len() == 0 and failures.len == 0) {
+        try w.writeAll("(no subagents loaded)\n");
         return;
     }
 
@@ -3851,66 +3969,79 @@ fn handleAgents(app: *app_mod.App) !void {
         .{ .tag = .cli, .label = "CLI", .color = "\x1b[34m" },
     };
 
-    std.debug.print("\x1b[1mAvailable subagents ({d})\x1b[0m\n", .{app.agents.len()});
+    try w.print("\x1b[1mAvailable subagents ({d})\x1b[0m\n", .{app.agents.len()});
     for (origins) |og| {
         var first = true;
         for (app.agents.agents.items) |*a| {
             if (a.origin != og.tag) continue;
             if (first) {
-                std.debug.print("\n{s}{s}\x1b[0m:\n", .{ og.color, og.label });
+                try w.print("\n{s}{s}\x1b[0m:\n", .{ og.color, og.label });
                 first = false;
             }
             // tools 提示
             const tools_label = if (a.tools.len == 0) "(inherits parent tools)" else "";
-            std.debug.print("  \x1b[1m{s}\x1b[0m — {s}\n", .{ a.name, a.description });
+            try w.print("  \x1b[1m{s}\x1b[0m — {s}\n", .{ a.name, a.description });
             if (a.tools.len > 0) {
-                std.debug.print("    tools: ", .{});
+                try w.writeAll("    tools: ");
                 for (a.tools, 0..) |t, i| {
-                    if (i > 0) std.debug.print(", ", .{});
-                    std.debug.print("{s}", .{t});
+                    if (i > 0) try w.writeAll(", ");
+                    try w.writeAll(t);
                 }
-                std.debug.print("\n", .{});
+                try w.writeByte('\n');
             } else {
-                std.debug.print("    {s}\n", .{tools_label});
+                try w.print("    {s}\n", .{tools_label});
             }
             if (a.disallowed_tools.len > 0) {
-                std.debug.print("    disallowed: ", .{});
+                try w.writeAll("    disallowed: ");
                 for (a.disallowed_tools, 0..) |t, i| {
-                    if (i > 0) std.debug.print(", ", .{});
-                    std.debug.print("{s}", .{t});
+                    if (i > 0) try w.writeAll(", ");
+                    try w.writeAll(t);
                 }
-                std.debug.print("\n", .{});
+                try w.writeByte('\n');
             }
             if (!std.mem.eql(u8, a.model, "inherit") and a.model.len > 0) {
-                std.debug.print("    model: {s}\n", .{a.model});
+                try w.print("    model: {s}\n", .{a.model});
             }
             if (a.permission_mode) |m| {
                 const agent_tool = @import("../tools/agent.zig");
                 const refused = !app.permission_ctx.modeAllowed(agent_tool.mapPermissionMode(m));
-                std.debug.print("    permissionMode: {s}{s}\n", .{
+                try w.print("    permissionMode: {s}{s}\n", .{
                     @tagName(m),
                     if (refused) " \x1b[33m(disabled by settings; runs as default)\x1b[0m" else "",
                 });
             }
             if (a.preload_skills.len > 0) {
-                std.debug.print("    preloaded skills: ", .{});
+                try w.writeAll("    preloaded skills: ");
                 for (a.preload_skills, 0..) |s, i| {
-                    if (i > 0) std.debug.print(", ", .{});
-                    std.debug.print("{s}", .{s});
+                    if (i > 0) try w.writeAll(", ");
+                    try w.writeAll(s);
                 }
-                std.debug.print("\n", .{});
+                try w.writeByte('\n');
             }
             if (a.source_path.len > 0) {
-                std.debug.print("    \x1b[2msource: {s}\x1b[0m\n", .{a.source_path});
+                try w.print("    \x1b[2msource: {s}\x1b[0m\n", .{a.source_path});
             }
         }
     }
 
-    std.debug.print(
+    const undescribed = app.agents.missingDescriptionCount();
+    if (undescribed != 0) {
+        try w.print("\n\x1b[33mNo description ({d}):\x1b[0m\n", .{undescribed});
+        for (app.agents.agents.items) |*a| {
+            if (!agent_set.AgentSet.missingDescription(a)) continue;
+            try w.print("  {s}: no `description` in {s}; the model cannot tell when to delegate to it\n", .{ a.name, a.source_path });
+        }
+    }
+    if (failures.len != 0) {
+        try w.print("\n\x1b[33mNot loaded ({d}):\x1b[0m\n", .{failures.len});
+        for (failures) |failure| try w.print("  {s}: {s}\n", .{ failure.path, failure.reason });
+    }
+
+    try w.writeAll(
         \\
         \\Use via the `Task` tool: `Task(subagent_type="<name>", description="...", prompt="...")`.
         \\
-    , .{});
+    );
 }
 
 /// /permissions：显示当前权限模式 + 已从 config.json 加载的细粒度规则。
@@ -4114,12 +4245,18 @@ fn shellQuoteSingle(allocator: std.mem.Allocator, s: []const u8) ![]u8 {
 
 /// 启动 banner:圆角 box(对齐 cc 2.1.x)。版本 + 模型 + cwd 三行。
 /// 非 TTY 退化为纯文本两行(pipe 友好)。box 内宽固定取 min(cols-2, 64)。
-fn printStartupBanner(app: *const app_mod.App) void {
+/// TTY 下先播启动动画(tui/splash.zig),定格的 "Metask Lab" 字标留在 box 上方。
+fn printStartupBanner(app: *const app_mod.App, allocator: std.mem.Allocator) void {
     const th = app.theme;
+    var problems_buf: [160]u8 = undefined;
+    const problems = formatConfigProblems(&problems_buf, app.configProblems());
     if (!platform_term.isatty(1)) {
-        std.debug.print("metacodes\nType your message or /help for commands\n\n", .{});
+        std.debug.print("metacodes\nType your message or /help for commands\n", .{});
+        if (problems.len != 0) std.debug.print("{s}\n", .{problems});
+        std.debug.print("\n", .{});
         return;
     }
+    playStartupSplash(app, allocator);
     const cols: usize = blk: {
         if (platform_term.windowSize(1)) |sz| {
             if (sz.cols > 0) break :blk sz.cols;
@@ -4147,12 +4284,33 @@ fn printStartupBanner(app: *const app_mod.App) void {
         const text = std.fmt.bufPrint(&kg_line, "KG unavailable: {s} · metacodes doctor", .{kind}) catch "KG unavailable: unconfigured · metacodes doctor";
         printBannerLine(th, inner, text);
     }
+    if (problems.len != 0) printBannerLine(th, inner, problems);
 
     // 底边框。
     std.debug.print("{s}{s}", .{ th.accent, th.box_bl });
     var k: usize = 0;
     while (k < inner) : (k += 1) std.debug.print("{s}", .{th.box_h});
     std.debug.print("{s}{s}\n\n", .{ th.box_br, th.reset });
+}
+
+/// 启动动画:门控(TTY 两端/METACODES_NO_STARTUP_ANIMATION/config.json startupAnimation/
+/// TERM=dumb/终端太小)由 splash_player.decide 判定;任意键跳到定格帧。结果只进 debug 日志。
+fn playStartupSplash(app: *const app_mod.App, allocator: std.mem.Allocator) void {
+    const splash_player = @import("tui/splash_player.zig");
+    const log = @import("../util/log.zig");
+    const config = if (app.stateRoot().len > 0)
+        @import("tui/config.zig").loadStartupAnimation(allocator, app.stateRoot())
+    else
+        null;
+    switch (splash_player.decide(splash_player.gateFromEnv(config))) {
+        .skip => |why| log.debug("splash", "skipped: {s}", .{@tagName(why)}),
+        .play => |plan| {
+            const style = splash_player.styleFor(app.theme_variant, tui_term_root.detectFromEnv(1));
+            const seed: u64 = @truncate(@as(u128, @bitCast(util_time.nowNs())));
+            const outcome = splash_player.play(allocator, plan, style, seed);
+            log.debug("splash", "{s} ({d}x{d}, {s})", .{ @tagName(outcome), plan.layout.cols, plan.layout.rows, @tagName(style.mode) });
+        },
+    }
 }
 
 /// banner 一行内容:│ + inner 列(2 空格缩进 + text + 右补空格)+ │。

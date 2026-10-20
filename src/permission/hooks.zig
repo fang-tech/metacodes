@@ -41,6 +41,11 @@
 //! **诚实登记——未做**:①PreToolUse 不支持 `permissionDecision:"allow"` 覆盖放行(只能 block 或落后续链);
 //! ②PostToolUse block 不回喂模型 blocking error(只 advisory additionalContext);③`continue:false` 停整轮未建模;
 //! ④UserPromptSubmit/SessionStart/SubagentStop/Notification 等事件仍未做(cc 有 ~30);⑤配置加载见 app.loadHooks。
+//!
+//! **坏配置可见**:解析仍跳过坏掉的部分(加载语义不变),但每一处跳过都记一条 `Problem`
+//! (非法 JSON、`hooks` 非对象、未分发/拼错的事件名、entry/hook 形状、非 command 的 `type`、
+//! 缺 `command`、越界 `timeout`、写在 metacodes 不读 hook 的 settings 文件里)——格式错的 hook
+//! 不会报错,只会永不触发,所以要在作者看得见的地方说出来:`/hooks` 列出,启动横幅与 `/doctor` 计数。
 
 const std = @import("std");
 const process = @import("platform").process;
@@ -140,6 +145,15 @@ pub const HookSet = struct {
         return self.pre_tool_use.len == 0 and self.post_tool_use.len == 0 and
             self.stop.len == 0 and self.pre_compact.len == 0 and self.post_compact.len == 0;
     }
+    pub fn entries(self: *const HookSet, event: Event) []const HookEntry {
+        return switch (event) {
+            .PreToolUse => self.pre_tool_use,
+            .PostToolUse => self.post_tool_use,
+            .Stop => self.stop,
+            .PreCompact => self.pre_compact,
+            .PostCompact => self.post_compact,
+        };
+    }
     pub fn hasPre(self: *const HookSet) bool {
         return self.pre_tool_use.len != 0;
     }
@@ -162,46 +176,232 @@ fn freeEntries(alloc: std.mem.Allocator, entries: []const HookEntry) void {
     alloc.free(entries);
 }
 
-/// 从 settings JSON root 解析 hooks.PreToolUse + hooks.PostToolUse。无则返回空 set。
-pub fn parse(alloc: std.mem.Allocator, root: std.json.Value) !HookSet {
-    var pre: []const HookEntry = &.{};
-    errdefer freeEntries(alloc, pre);
-    var post: []const HookEntry = &.{};
-    errdefer freeEntries(alloc, post);
+/// The hook events metacodes dispatches. `parse` reads exactly these keys, so
+/// the dispatch list and the "not a hook event" diagnostic cannot drift apart.
+pub const Event = enum {
+    PreToolUse,
+    PostToolUse,
+    Stop,
+    PreCompact,
+    PostCompact,
 
-    var stop: []const HookEntry = &.{};
-    errdefer freeEntries(alloc, stop);
-    var pre_compact: []const HookEntry = &.{};
-    errdefer freeEntries(alloc, pre_compact);
-    var post_compact: []const HookEntry = &.{};
-    errdefer freeEntries(alloc, post_compact);
+    /// Tool events filter entries by `matcher`; lifecycle events run them all.
+    fn filtersByMatcher(self: Event) bool {
+        return self == .PreToolUse or self == .PostToolUse;
+    }
+};
 
-    if (root == .object) {
-        if (root.object.get("hooks")) |hooks_v| {
-            if (hooks_v == .object) {
-                pre = try parseEventArray(alloc, hooks_v.object.get("PreToolUse"));
-                post = try parseEventArray(alloc, hooks_v.object.get("PostToolUse"));
-                stop = try parseEventArray(alloc, hooks_v.object.get("Stop"));
-                pre_compact = try parseEventArray(alloc, hooks_v.object.get("PreCompact"));
-                post_compact = try parseEventArray(alloc, hooks_v.object.get("PostCompact"));
-            }
-        }
+const EVENT_COUNT = @typeInfo(Event).@"enum".fields.len;
+
+/// "PreToolUse, PostToolUse, Stop, PreCompact, PostCompact".
+pub const EVENT_LIST = blk: {
+    var list: []const u8 = "";
+    for (std.meta.fieldNames(Event), 0..) |name, i| list = list ++ (if (i == 0) "" else ", ") ++ name;
+    break :blk list;
+};
+
+/// Claude Code hook events (cc `HOOK_EVENTS`) metacodes does not dispatch. A
+/// settings file written for Claude Code, or migrated from Codex or Harness²
+/// (`SessionStart`, `UserPromptSubmit`), parses cleanly and then never fires;
+/// knowing these names lets the diagnostic say "not run by metacodes" rather
+/// than "not a hook event".
+const UNDISPATCHED_EVENTS = [_][]const u8{
+    "PostToolUseFailure", "Notification",     "UserPromptSubmit", "SessionStart",
+    "SessionEnd",         "StopFailure",      "SubagentStart",    "SubagentStop",
+    "PermissionRequest",  "PermissionDenied", "Setup",            "TeammateIdle",
+    "TaskCreated",        "TaskCompleted",    "Elicitation",      "ElicitationResult",
+    "ConfigChange",       "WorktreeCreate",   "WorktreeRemove",   "InstructionsLoaded",
+    "CwdChanged",         "FileChanged",
+};
+
+/// What is wrong with a piece of hook configuration. Loading does not change
+/// because of a problem - the broken piece is skipped as it always was - but
+/// each skip is reported: a malformed hook never fails, it just never fires.
+pub const ProblemKind = enum {
+    /// The settings file is not valid JSON; none of its hooks load.
+    invalid_json,
+    /// `hooks` is not an object; none of the file's hooks load.
+    hooks_not_object,
+    /// A Claude Code event metacodes does not dispatch (`SessionStart`, ...).
+    unsupported_event,
+    /// A key that names no hook event at all (`PostToolUSE`).
+    unknown_event,
+    /// An event's value is not an array of entries; none of them load.
+    event_not_array,
+    /// An entry is not an object; skipped.
+    entry_not_object,
+    /// A tool event's `matcher` is not a string; the entry matches every tool.
+    matcher_not_string,
+    /// An entry's `hooks` is missing or not an array; the entry runs nothing.
+    entry_hooks_not_array,
+    /// An element of an entry's `hooks` is not an object; skipped.
+    hook_not_object,
+    /// `type` is not "command" (prompt, http and agent hooks are Claude Code's).
+    unsupported_type,
+    /// `command` is missing or not a string; the hook is skipped.
+    missing_command,
+    /// `timeout` is not a positive number of seconds, or exceeds the cap.
+    invalid_timeout,
+    /// A settings file metacodes reads, but not for hooks
+    /// (`.claude/settings.local.json`, `--settings`), declares `hooks`.
+    unread_settings_file,
+};
+
+pub const Problem = struct {
+    kind: ProblemKind,
+    /// The settings file.
+    source: []const u8,
+    /// JSON path of the offending value (`hooks.PreToolUse[0].hooks[1]`);
+    /// "" when the problem concerns the whole file.
+    location: []const u8,
+    /// What is wrong and what happens because of it.
+    message: []const u8,
+};
+
+/// Problems found while loading hooks: files in layer order; within a file,
+/// undispatched event keys first, then each event in dispatch order. Owns every
+/// string; the App keeps the latest load's report for `/hooks`.
+pub const Diagnostics = struct {
+    arena: std.heap.ArenaAllocator,
+    problems: std.ArrayList(Problem) = .empty,
+
+    pub fn init(child: std.mem.Allocator) Diagnostics {
+        return .{ .arena = std.heap.ArenaAllocator.init(child) };
     }
 
+    pub fn deinit(self: *Diagnostics) void {
+        self.arena.deinit();
+        self.* = undefined;
+    }
+
+    pub fn items(self: *const Diagnostics) []const Problem {
+        return self.problems.items;
+    }
+
+    /// The first problem of `kind`, if any.
+    pub fn find(self: *const Diagnostics, kind: ProblemKind) ?*const Problem {
+        for (self.problems.items) |*problem| {
+            if (problem.kind == kind) return problem;
+        }
+        return null;
+    }
+};
+
+/// Where parsing reports: one settings file of a Diagnostics.
+const Reporter = struct {
+    diag: *Diagnostics,
+    source: []const u8,
+
+    fn add(
+        self: Reporter,
+        kind: ProblemKind,
+        comptime location_fmt: []const u8,
+        location_args: anytype,
+        comptime fmt: []const u8,
+        args: anytype,
+    ) error{OutOfMemory}!void {
+        const a = self.diag.arena.allocator();
+        try self.diag.problems.append(a, .{
+            .kind = kind,
+            .source = try a.dupe(u8, self.source),
+            .location = try std.fmt.allocPrint(a, location_fmt, location_args),
+            .message = try std.fmt.allocPrint(a, fmt, args),
+        });
+    }
+};
+
+/// One settings file's bytes, labelled for diagnostics.
+pub const Layer = struct {
+    path: []const u8,
+    content: []const u8,
+};
+
+/// 从 settings JSON root 解析五类 hook 事件。无则返回空 set。
+pub fn parse(alloc: std.mem.Allocator, root: std.json.Value) !HookSet {
+    return parseReported(alloc, root, null);
+}
+
+fn parseReported(alloc: std.mem.Allocator, root: std.json.Value, rep: ?Reporter) !HookSet {
+    var lists = [_][]const HookEntry{&.{}} ** EVENT_COUNT;
+    errdefer for (lists) |list| freeEntries(alloc, list);
+
+    if (root == .object) if (root.object.get("hooks")) |hooks_v| {
+        if (hooks_v != .object) {
+            if (rep) |r| try r.add(.hooks_not_object, "hooks", .{}, "`hooks` is not an object keyed by event name; none of this file's hooks load", .{});
+        } else {
+            if (rep) |r| try reportUnreadEvents(r, hooks_v.object);
+            for (std.enums.values(Event)) |event| {
+                lists[@intFromEnum(event)] = try parseEventArray(alloc, hooks_v.object.get(@tagName(event)), event, rep);
+            }
+        }
+    };
+
     return HookSet{
-        .pre_tool_use = pre,
-        .post_tool_use = post,
-        .stop = stop,
-        .pre_compact = pre_compact,
-        .post_compact = post_compact,
+        .pre_tool_use = lists[@intFromEnum(Event.PreToolUse)],
+        .post_tool_use = lists[@intFromEnum(Event.PostToolUse)],
+        .stop = lists[@intFromEnum(Event.Stop)],
+        .pre_compact = lists[@intFromEnum(Event.PreCompact)],
+        .post_compact = lists[@intFromEnum(Event.PostCompact)],
         .allocator = alloc,
     };
+}
+
+/// Every key of `hooks` that is not a dispatched event: its entries never run.
+fn reportUnreadEvents(rep: Reporter, hooks: std.json.ObjectMap) error{OutOfMemory}!void {
+    var it = hooks.iterator();
+    while (it.next()) |kv| {
+        const name = kv.key_ptr.*;
+        if (std.meta.stringToEnum(Event, name) != null) continue;
+        if (isUndispatchedEvent(name)) {
+            try rep.add(.unsupported_event, "hooks.{s}", .{name}, "{s} is a Claude Code event metacodes does not run; these hooks never fire (metacodes runs {s})", .{ name, EVENT_LIST });
+        } else if (eventIgnoringCase(name)) |event| {
+            try rep.add(.unknown_event, "hooks.{s}", .{name}, "\"{s}\" is not a hook event (did you mean {s}?); these hooks never fire", .{ name, @tagName(event) });
+        } else {
+            try rep.add(.unknown_event, "hooks.{s}", .{name}, "\"{s}\" is not a hook event; these hooks never fire (metacodes runs {s})", .{ name, EVENT_LIST });
+        }
+    }
+}
+
+fn isUndispatchedEvent(name: []const u8) bool {
+    for (UNDISPATCHED_EVENTS) |known| {
+        if (std.mem.eql(u8, known, name)) return true;
+    }
+    return false;
+}
+
+fn eventIgnoringCase(name: []const u8) ?Event {
+    for (std.enums.values(Event)) |event| {
+        if (std.ascii.eqlIgnoreCase(@tagName(event), name)) return event;
+    }
+    return null;
+}
+
+/// metacodes loads hooks from `<project>/.claude/settings.json` and
+/// `~/.claude/settings.json` only. A settings file it reads for permissions but
+/// not for hooks (`.claude/settings.local.json`, `--settings`) that declares
+/// `hooks` is reported instead of ignored silently. A file that is not valid
+/// JSON is the settings loader's to report.
+pub fn reportUnreadFile(
+    alloc: std.mem.Allocator,
+    diag: *Diagnostics,
+    path: []const u8,
+    content: []const u8,
+) error{OutOfMemory}!void {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, content, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return,
+    };
+    defer parsed.deinit();
+    if (parsed.value != .object or parsed.value.object.get("hooks") == null) return;
+    const rep = Reporter{ .diag = diag, .source = path };
+    try rep.add(.unread_settings_file, "hooks", .{}, "metacodes loads hooks only from <project>/.claude/settings.json and ~/.claude/settings.json; these hooks never run", .{});
 }
 
 /// 跨层合并:把多层 settings JSON 文本各自 parse 后,5 类事件的 entry 全部并入一个 HookSet
 /// (project 与 user 的 hook 并存,不互相覆盖)。解析失败的层跳过。owned,调用方 deinit。
 /// 这是 app.loadHooks 的可测 seam——避免"parse 支持但 loadHooks 漏合并某类事件"静默失效。
-pub fn parseAndMerge(alloc: std.mem.Allocator, layer_contents: []const []const u8) !HookSet {
+/// `diag` 非 null 时,每个被跳过的层/事件/entry/hook 都记一条 Problem(加载语义不变)。
+pub fn parseAndMerge(alloc: std.mem.Allocator, layers: []const Layer, diag: ?*Diagnostics) !HookSet {
     var pre: std.ArrayList(HookEntry) = .empty;
     var post: std.ArrayList(HookEntry) = .empty;
     var stop_l: std.ArrayList(HookEntry) = .empty;
@@ -219,10 +419,15 @@ pub fn parseAndMerge(alloc: std.mem.Allocator, layer_contents: []const []const u
         for (post_c.items) |e| freeOneEntry(alloc, e);
         post_c.deinit(alloc);
     }
-    for (layer_contents) |content| {
-        var parsed = std.json.parseFromSlice(std.json.Value, alloc, content, .{}) catch continue;
+    for (layers) |layer| {
+        const rep: ?Reporter = if (diag) |d| .{ .diag = d, .source = layer.path } else null;
+        var parsed = std.json.parseFromSlice(std.json.Value, alloc, layer.content, .{}) catch |err| {
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            if (rep) |r| try r.add(.invalid_json, "", .{}, "not valid JSON ({s}); none of this file's hooks load", .{@errorName(err)});
+            continue;
+        };
         defer parsed.deinit();
-        var hs = parse(alloc, parsed.value) catch continue;
+        var hs = try parseReported(alloc, parsed.value, rep);
         // **先预留容量(唯一可失败步),在任何 move 之前**——若 OOM,此时 hs 仍完整未移动,整份 deinit
         // 干净返回(不留"半移动"态致泄漏)。之后 appendSliceAssumeCapacity 不会失败。
         pre.ensureUnusedCapacity(alloc, hs.pre_tool_use.len) catch {
@@ -275,17 +480,28 @@ fn freeOneEntry(alloc: std.mem.Allocator, e: HookEntry) void {
 }
 
 /// 解析一个 hook 事件数组([{matcher, hooks:[{command}]}])为 HookEntry 切片。null/非数组 → 空。
-fn parseEventArray(alloc: std.mem.Allocator, arr_v: ?std.json.Value) ![]const HookEntry {
+/// 跳过的每一处经 `rep` 报告(非数组事件、非对象 entry、缺 hooks、缺 command……)。
+fn parseEventArray(alloc: std.mem.Allocator, arr_v: ?std.json.Value, event: Event, rep: ?Reporter) ![]const HookEntry {
     var entries: std.ArrayList(HookEntry) = .empty;
     errdefer {
         for (entries.items) |e| freeOneEntry(alloc, e);
         entries.deinit(alloc);
     }
+    const name = @tagName(event);
     const arr = arr_v orelse return entries.toOwnedSlice(alloc);
-    if (arr != .array) return entries.toOwnedSlice(alloc);
-    for (arr.array.items) |item| {
-        if (item != .object) continue;
+    if (arr != .array) {
+        if (rep) |r| try r.add(.event_not_array, "hooks.{s}", .{name}, "not an array of {{\"matcher\", \"hooks\"}} entries; none of these hooks load", .{});
+        return entries.toOwnedSlice(alloc);
+    }
+    for (arr.array.items, 0..) |item, ei| {
+        if (item != .object) {
+            if (rep) |r| try r.add(.entry_not_object, "hooks.{s}[{d}]", .{ name, ei }, "entry is not an object; skipped", .{});
+            continue;
+        }
         const matcher_v = item.object.get("matcher");
+        if (rep) |r| if (matcher_v) |m| if (m != .string and event.filtersByMatcher()) {
+            try r.add(.matcher_not_string, "hooks.{s}[{d}].matcher", .{ name, ei }, "matcher is not a string; the entry runs for every tool", .{});
+        };
         const matcher = if (matcher_v) |m|
             (if (m == .string) try alloc.dupe(u8, m.string) else try alloc.dupe(u8, "*"))
         else
@@ -299,20 +515,26 @@ fn parseEventArray(alloc: std.mem.Allocator, arr_v: ?std.json.Value) ![]const Ho
         }
         var timeouts: std.ArrayList(u32) = .empty;
         defer timeouts.deinit(alloc);
-        if (item.object.get("hooks")) |hk| {
-            if (hk == .array) {
-                for (hk.array.items) |h| {
-                    if (h != .object) continue;
-                    const cmd_v = h.object.get("command") orelse continue;
-                    if (cmd_v != .string) continue;
-                    try timeouts.append(alloc, parseTimeoutMs(h.object.get("timeout")));
-                    const cmd = try alloc.dupe(u8, cmd_v.string);
-                    cmds.append(alloc, cmd) catch |err| {
-                        alloc.free(cmd);
-                        return err;
-                    };
+        const hooks_v = item.object.get("hooks");
+        if (hooks_v != null and hooks_v.? == .array) {
+            for (hooks_v.?.array.items, 0..) |h, hi| {
+                if (h != .object) {
+                    if (rep) |r| try r.add(.hook_not_object, "hooks.{s}[{d}].hooks[{d}]", .{ name, ei, hi }, "hook is not an object; skipped", .{});
+                    continue;
                 }
+                if (rep) |r| try reportHookShape(r, h.object, name, ei, hi);
+                const cmd_v = h.object.get("command") orelse continue;
+                if (cmd_v != .string) continue;
+                try timeouts.append(alloc, parseTimeoutMs(h.object.get("timeout")));
+                const cmd = try alloc.dupe(u8, cmd_v.string);
+                cmds.append(alloc, cmd) catch |err| {
+                    alloc.free(cmd);
+                    return err;
+                };
             }
+        } else if (rep) |r| {
+            const what = if (hooks_v == null) "missing" else "not an array";
+            try r.add(.entry_hooks_not_array, "hooks.{s}[{d}].hooks", .{ name, ei }, "`hooks` is {s}; the entry runs nothing", .{what});
         }
         const owned_timeouts = try timeouts.toOwnedSlice(alloc);
         errdefer alloc.free(owned_timeouts);
@@ -324,6 +546,44 @@ fn parseEventArray(alloc: std.mem.Allocator, arr_v: ?std.json.Value) ![]const Ho
         };
     }
     return entries.toOwnedSlice(alloc);
+}
+
+/// `type`, `command` and `timeout` of one hook object. One problem per field;
+/// a hook skipped for its type is not reported again for its missing command.
+fn reportHookShape(rep: Reporter, hook: std.json.ObjectMap, event: []const u8, entry: usize, index: usize) error{OutOfMemory}!void {
+    const command_v = hook.get("command");
+    const has_command = command_v != null and command_v.? == .string;
+    if (hook.get("type")) |type_v| {
+        if (type_v != .string or !std.mem.eql(u8, type_v.string, "command")) {
+            const shown = if (type_v == .string) type_v.string else @tagName(type_v);
+            const consequence = if (has_command) "its command still runs as a command hook" else "skipped";
+            try rep.add(.unsupported_type, "hooks.{s}[{d}].hooks[{d}].type", .{ event, entry, index }, "type \"{s}\" is not supported (metacodes runs only \"command\" hooks); {s}", .{ shown, consequence });
+            if (!has_command) return;
+        }
+    }
+    if (command_v) |value| {
+        if (value != .string) {
+            try rep.add(.missing_command, "hooks.{s}[{d}].hooks[{d}].command", .{ event, entry, index }, "command is not a string; skipped", .{});
+            return;
+        }
+    } else {
+        try rep.add(.missing_command, "hooks.{s}[{d}].hooks[{d}]", .{ event, entry, index }, "no `command`; skipped", .{});
+        return;
+    }
+    const timeout_v = hook.get("timeout") orelse return;
+    const seconds: f64 = switch (timeout_v) {
+        .integer => |i| @floatFromInt(i),
+        .float => |f| f,
+        else => {
+            try rep.add(.invalid_timeout, "hooks.{s}[{d}].hooks[{d}].timeout", .{ event, entry, index }, "timeout is not a number of seconds; the default {d} s applies", .{@divExact(HOOK_TIMEOUT_MS, 1000)});
+            return;
+        },
+    };
+    if (!(seconds > 0)) {
+        try rep.add(.invalid_timeout, "hooks.{s}[{d}].hooks[{d}].timeout", .{ event, entry, index }, "timeout is not positive; the default {d} s applies", .{@divExact(HOOK_TIMEOUT_MS, 1000)});
+    } else if (seconds > @as(f64, @floatFromInt(MAX_HOOK_TIMEOUT_S))) {
+        try rep.add(.invalid_timeout, "hooks.{s}[{d}].hooks[{d}].timeout", .{ event, entry, index }, "timeout {d} s exceeds the {d} s cap; {d} s applies", .{ seconds, MAX_HOOK_TIMEOUT_S, MAX_HOOK_TIMEOUT_S });
+    }
 }
 
 /// `"timeout"`(秒,Claude Code 语义):正数 → ms,封顶 MAX_HOOK_TIMEOUT_S;缺省/非法 → 0(默认)。
@@ -948,9 +1208,15 @@ test "parseAndMerge: 跨层合并 5 类事件不丢生命周期 hook(loadHooks �
         \\{"hooks":{"PreCompact":[{"hooks":[{"type":"command","command":"snap.sh"}]}],
         \\          "PostCompact":[{"hooks":[{"type":"command","command":"reinject.sh"}]}]}}
     ;
-    const layers = [_][]const u8{ layer_project, layer_user };
-    var set = try parseAndMerge(alloc, &layers);
+    const layers = [_]Layer{
+        .{ .path = "/p/.claude/settings.json", .content = layer_project },
+        .{ .path = "/u/.claude/settings.json", .content = layer_user },
+    };
+    var diag = Diagnostics.init(alloc);
+    defer diag.deinit();
+    var set = try parseAndMerge(alloc, &layers, &diag);
     defer set.deinit();
+    try testing.expectEqual(@as(usize, 0), diag.items().len);
     try testing.expect(set.hasPre());
     try testing.expect(set.hasStop());
     try testing.expect(set.hasPreCompact());
@@ -1030,4 +1296,204 @@ test "runStopHooks: every hook runs; a block without a reason has none" {
     defer r.deinit(alloc);
     try testing.expect(r.blocked);
     try testing.expect(r.reason == null);
+}
+
+/// parseAndMerge over one file, reporting into `diag`.
+fn parseOneReported(alloc: std.mem.Allocator, content: []const u8, diag: *Diagnostics) !HookSet {
+    const layers = [_]Layer{.{ .path = "/p/.claude/settings.json", .content = content }};
+    return parseAndMerge(alloc, &layers, diag);
+}
+
+test "diagnostics: a well-formed file reports nothing" {
+    const alloc = testing.allocator;
+    var diag = Diagnostics.init(alloc);
+    defer diag.deinit();
+    var set = try parseOneReported(alloc,
+        \\{"permissions":{"allow":[]},"hooks":{
+        \\  "PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"pre.sh","timeout":30}]}],
+        \\  "PostToolUse":[{"hooks":[{"command":"post.sh"}]}],
+        \\  "Stop":[{"matcher":7,"hooks":[{"type":"command","command":"stop.sh","timeout":0.5}]}],
+        \\  "PreCompact":[],
+        \\  "PostCompact":[{"hooks":[]}]
+        \\}}
+    , &diag);
+    defer set.deinit();
+    // A lifecycle entry's matcher is never consulted, so a non-string one is harmless.
+    try testing.expectEqual(@as(usize, 0), diag.items().len);
+    try testing.expectEqualStrings("pre.sh", set.pre_tool_use[0].commands[0]);
+    try testing.expectEqualStrings("post.sh", set.post_tool_use[0].commands[0]);
+    try testing.expectEqualStrings("stop.sh", set.stop[0].commands[0]);
+}
+
+test "diagnostics: invalid JSON names the file and keeps the other layers" {
+    const alloc = testing.allocator;
+    var diag = Diagnostics.init(alloc);
+    defer diag.deinit();
+    const layers = [_]Layer{
+        .{ .path = "/p/.claude/settings.json", .content = "{\"hooks\":{\"PreToolUse\":[}" },
+        .{ .path = "/u/.claude/settings.json", .content = "{\"hooks\":{\"Stop\":[{\"hooks\":[{\"command\":\"mem.sh\"}]}]}}" },
+    };
+    var set = try parseAndMerge(alloc, &layers, &diag);
+    defer set.deinit();
+    try testing.expectEqual(@as(usize, 1), diag.items().len);
+    const problem = diag.find(.invalid_json).?;
+    try testing.expectEqualStrings("/p/.claude/settings.json", problem.source);
+    try testing.expectEqualStrings("", problem.location);
+    try testing.expectEqualStrings("mem.sh", set.stop[0].commands[0]);
+    try testing.expect(!set.hasPre());
+}
+
+test "diagnostics: hooks that is not an object" {
+    const alloc = testing.allocator;
+    var diag = Diagnostics.init(alloc);
+    defer diag.deinit();
+    var set = try parseOneReported(alloc, "{\"hooks\":[{\"PreToolUse\":[]}]}", &diag);
+    defer set.deinit();
+    try testing.expect(set.isEmpty());
+    try testing.expectEqual(@as(usize, 1), diag.items().len);
+    try testing.expectEqualStrings("hooks", diag.find(.hooks_not_object).?.location);
+}
+
+test "diagnostics: undispatched, misspelt and unknown events never fire and are named" {
+    const alloc = testing.allocator;
+    var diag = Diagnostics.init(alloc);
+    defer diag.deinit();
+    var set = try parseOneReported(alloc,
+        \\{"hooks":{
+        \\  "SessionStart":[{"hooks":[{"type":"command","command":"boot.sh"}]}],
+        \\  "PostToolUSE":[{"hooks":[{"type":"command","command":"lint.sh"}]}],
+        \\  "OnSave":[],
+        \\  "PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"pre.sh"}]}]
+        \\}}
+    , &diag);
+    defer set.deinit();
+    try testing.expectEqual(@as(usize, 3), diag.items().len);
+    const items = diag.items();
+    try testing.expectEqual(ProblemKind.unsupported_event, items[0].kind);
+    try testing.expectEqualStrings("hooks.SessionStart", items[0].location);
+    try testing.expectEqual(ProblemKind.unknown_event, items[1].kind);
+    try testing.expect(std.mem.indexOf(u8, items[1].message, "did you mean PostToolUse?") != null);
+    try testing.expectEqual(ProblemKind.unknown_event, items[2].kind);
+    try testing.expectEqualStrings("hooks.OnSave", items[2].location);
+    try testing.expect(std.mem.indexOf(u8, items[2].message, "did you mean") == null);
+    // The dispatched event next to them loads as before; the others load nothing.
+    try testing.expectEqual(@as(usize, 1), set.pre_tool_use.len);
+    try testing.expectEqualStrings("pre.sh", set.pre_tool_use[0].commands[0]);
+    try testing.expect(!set.hasPost());
+}
+
+test "diagnostics: entry and hook shapes are reported with their JSON path" {
+    const alloc = testing.allocator;
+    var diag = Diagnostics.init(alloc);
+    defer diag.deinit();
+    var set = try parseOneReported(alloc,
+        \\{"hooks":{
+        \\  "Stop":{"hooks":[{"command":"never.sh"}]},
+        \\  "PreToolUse":[
+        \\    "Bash",
+        \\    {"matcher":["Bash"],"hooks":[{"type":"command","command":"wide.sh"}]},
+        \\    {"matcher":"Edit"},
+        \\    {"matcher":"Write","hooks":{"command":"x.sh"}},
+        \\    {"matcher":"Read","hooks":[
+        \\      "ok.sh",
+        \\      {"type":"prompt","prompt":"is this safe?"},
+        \\      {"type":"http","command":"curl.sh"},
+        \\      {"type":"command"},
+        \\      {"type":"command","command":["a","b"]},
+        \\      {"type":"command","command":"slow.sh","timeout":"soon"},
+        \\      {"type":"command","command":"huge.sh","timeout":3600},
+        \\      {"type":"command","command":"neg.sh","timeout":-1},
+        \\      {"type":"command","command":"good.sh"}
+        \\    ]}
+        \\  ]
+        \\}}
+    , &diag);
+    defer set.deinit();
+
+    const Expect = struct { kind: ProblemKind, location: []const u8 };
+    // Files in layer order; within a file, undispatched keys first, then the
+    // events in dispatch order (PreToolUse before Stop), each in JSON order.
+    const expected = [_]Expect{
+        .{ .kind = .entry_not_object, .location = "hooks.PreToolUse[0]" },
+        .{ .kind = .matcher_not_string, .location = "hooks.PreToolUse[1].matcher" },
+        .{ .kind = .entry_hooks_not_array, .location = "hooks.PreToolUse[2].hooks" },
+        .{ .kind = .entry_hooks_not_array, .location = "hooks.PreToolUse[3].hooks" },
+        .{ .kind = .hook_not_object, .location = "hooks.PreToolUse[4].hooks[0]" },
+        .{ .kind = .unsupported_type, .location = "hooks.PreToolUse[4].hooks[1].type" },
+        .{ .kind = .unsupported_type, .location = "hooks.PreToolUse[4].hooks[2].type" },
+        .{ .kind = .missing_command, .location = "hooks.PreToolUse[4].hooks[3]" },
+        .{ .kind = .missing_command, .location = "hooks.PreToolUse[4].hooks[4].command" },
+        .{ .kind = .invalid_timeout, .location = "hooks.PreToolUse[4].hooks[5].timeout" },
+        .{ .kind = .invalid_timeout, .location = "hooks.PreToolUse[4].hooks[6].timeout" },
+        .{ .kind = .invalid_timeout, .location = "hooks.PreToolUse[4].hooks[7].timeout" },
+        .{ .kind = .event_not_array, .location = "hooks.Stop" },
+    };
+    const items = diag.items();
+    try testing.expectEqual(expected.len, items.len);
+    for (expected, items) |want, got| {
+        try testing.expectEqual(want.kind, got.kind);
+        try testing.expectEqualStrings(want.location, got.location);
+        try testing.expectEqualStrings("/p/.claude/settings.json", got.source);
+    }
+    // The prompt hook (no command) is skipped; the http one still runs its command.
+    try testing.expect(std.mem.endsWith(u8, items[5].message, "skipped"));
+    try testing.expect(std.mem.endsWith(u8, items[6].message, "its command still runs as a command hook"));
+    try testing.expect(std.mem.indexOf(u8, items[10].message, "600 s cap") != null);
+
+    // Loading is what it always was: the reports change nothing.
+    try testing.expect(!set.hasStop());
+    try testing.expectEqual(@as(usize, 4), set.pre_tool_use.len);
+    try testing.expectEqualStrings("*", set.pre_tool_use[0].matcher);
+    try testing.expectEqualStrings("wide.sh", set.pre_tool_use[0].commands[0]);
+    try testing.expectEqual(@as(usize, 0), set.pre_tool_use[1].commands.len);
+    try testing.expectEqual(@as(usize, 0), set.pre_tool_use[2].commands.len);
+    const read = set.pre_tool_use[3];
+    try testing.expectEqualStrings("Read", read.matcher);
+    const commands = [_][]const u8{ "curl.sh", "slow.sh", "huge.sh", "neg.sh", "good.sh" };
+    try testing.expectEqual(commands.len, read.commands.len);
+    for (commands, read.commands) |want, got| try testing.expectEqualStrings(want, got);
+    try testing.expectEqual(HOOK_TIMEOUT_MS, read.timeoutMs(1));
+    try testing.expectEqual(@as(i64, MAX_HOOK_TIMEOUT_S) * 1000, read.timeoutMs(2));
+}
+
+test "diagnostics: parse without a report and parseAndMerge without one agree" {
+    const alloc = testing.allocator;
+    const src = "{\"hooks\":{\"PreToolUse\":[\"x\",{\"matcher\":\"Bash\",\"hooks\":[{\"command\":\"pre.sh\"},{}]}],\"SessionStart\":[]}}";
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, src, .{});
+    defer parsed.deinit();
+    var plain = try parse(alloc, parsed.value);
+    defer plain.deinit();
+    const layers = [_]Layer{.{ .path = "p", .content = src }};
+    var merged = try parseAndMerge(alloc, &layers, null);
+    defer merged.deinit();
+    try testing.expectEqual(plain.pre_tool_use.len, merged.pre_tool_use.len);
+    try testing.expectEqualStrings(plain.pre_tool_use[0].commands[0], merged.pre_tool_use[0].commands[0]);
+    try testing.expectEqual(@as(usize, 1), merged.pre_tool_use[0].commands.len);
+}
+
+test "diagnostics: hooks in a file metacodes does not read for hooks" {
+    const alloc = testing.allocator;
+    var diag = Diagnostics.init(alloc);
+    defer diag.deinit();
+    try reportUnreadFile(alloc, &diag, "/p/.claude/settings.local.json", "{\"permissions\":{}}");
+    try reportUnreadFile(alloc, &diag, "/p/.claude/settings.local.json", "not json");
+    try testing.expectEqual(@as(usize, 0), diag.items().len);
+    try reportUnreadFile(alloc, &diag, "/p/.claude/settings.local.json", "{\"hooks\":{\"Stop\":[]}}");
+    try testing.expectEqual(@as(usize, 1), diag.items().len);
+    try testing.expectEqual(ProblemKind.unread_settings_file, diag.items()[0].kind);
+    try testing.expectEqualStrings("/p/.claude/settings.local.json", diag.items()[0].source);
+}
+
+test "diagnostics: OOM while reporting leaks nothing" {
+    const src =
+        \\{"hooks":{"SessionStart":[],"PreToolUse":["x",{"matcher":"Bash","hooks":[{"type":"prompt"},{"command":"a.sh","timeout":-1}]}]}}
+    ;
+    try testing.checkAllAllocationFailures(testing.allocator, struct {
+        fn run(alloc: std.mem.Allocator, content: []const u8) !void {
+            var diag = Diagnostics.init(alloc);
+            defer diag.deinit();
+            var set = try parseOneReported(alloc, content, &diag);
+            set.deinit();
+        }
+    }.run, .{src});
 }

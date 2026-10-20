@@ -33,6 +33,7 @@ EXTERNAL_ONLY_TEST_IDS = frozenset(
         "scripts.eval.tests.test_workbuddy_adapter.WorkBuddyOverlayUpgradeTest.test_installed_adapter_tolerates_killed_agent_missing_result_event",
         "scripts.eval.tests.test_workbuddy_adapter.WorkBuddyOverlayUpgradeTest.test_installed_prepare_job_preserves_route_and_injects_backend_identity",
         "scripts.eval.tests.test_workbuddy_adapter.WorkBuddyOverlayUpgradeTest.test_installed_proxy_persists_terminal_stream_when_client_closes",
+        "scripts.eval.tests.test_workbuddy_adapter.WorkBuddyOverlayUpgradeTest.test_installed_proxy_numbers_each_log_file_without_judge_holes",
         "scripts.eval.tests.test_workbuddy_adapter.WorkBuddyRequirementLedgerTreatmentTest.test_ledger_enforce_and_observe_are_exclusive_in_the_real_adapter",
     }
 )

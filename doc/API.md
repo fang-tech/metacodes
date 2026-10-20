@@ -181,8 +181,12 @@ such as a PDF read with `Read`) with U+FFFD while `content_bytes` and
 `input_bytes` keep counting the raw payload; a `text`/`thinking` delta cut
 inside a multi-byte character is held back and rejoined with the next delta of
 the same kind, and a character the block ends without completing is emitted
-as one U+FFFD line rather than dropped. Flag removals or semantic changes
-require a changelog entry.
+as one U+FFFD line rather than dropped. The terminal `type:"result"` line
+includes `usage_status:"known"|"unknown"`: `unknown` means the successful
+provider response supplied no readable usage object (including a usage tail
+lost after a reported stop), so its numeric usage and cost fields are
+placeholders rather than a claim of free work. Explicit numeric zero usage is
+`known`. Flag removals or semantic changes require a changelog entry.
 
 ### System-One memory advisor (optional)
 

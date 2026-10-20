@@ -29,7 +29,7 @@ Agent 正在离开终端。它们正在进入编辑器和桌面应用、CI 流�
 
 ## 关键数字
 
-2026-10-18 在 Apple Silicon（macOS）上实测，`main` 的 ReleaseSmall 构建：
+2026-10-18 在 Apple Silicon（macOS）上实测，`main` 的 ReleaseSmall 构建；注明了其他来源的两行除外：
 
 | | metacodes |
 |---|---|
@@ -37,8 +37,8 @@ Agent 正在离开终端。它们正在进入编辑器和桌面应用、CI 流�
 | 暖启动（`--help`） | 5–7 ms |
 | 空闲进程峰值 RSS | 2.7 MB |
 | 一次 headless 运行，20 轮工具调用，本地 mock 模型 | 峰值 RSS 23 MB |
-| 完整发布单元：CLI、TinyKG CLI 与守护进程、两个 Lean 内核、ripgrep | 归档 16–21 MB |
-| Sealed gateway，64 个并发客户端，mock 模型 | 每秒 1,835 个 agent step；网关自身每步 1–3 ms |
+| 完整发布单元：CLI、TinyKG CLI 与守护进程、两个 Lean 内核、ripgrep | 归档 16.5–20.8 MB（0.5.0 版发布资产） |
+| Sealed gateway，64 个并发客户端，mock 模型（2026-10-16，Windows 11，ReleaseFast） | 每秒 1,835 个 agent step；网关自身每步 p50 3 ms / p99 9 ms |
 | 原生平台 | Linux x86_64、macOS arm64、Windows x86_64 |
 
 作为参照，同一台机器上 `--help` 的峰值 RSS：Codex CLI 0.163 为 20 MB，Claude Code 2.1.278 为 121 MB。测量方法和限定条件见 [doc/BENCHMARKS.md](doc/BENCHMARKS.md#footprint-snapshot)。
@@ -49,7 +49,7 @@ Agent 正在离开终端。它们正在进入编辑器和桌面应用、CI 流�
 
 | Harness | Code | Web\* | Office\* | Security |
 |---|---:|---:|---:|---:|
-| **metacodes 0.1.0**（自测，单次，260/260 题） | **72.7** | 81.1 | 78.8 | 59.0 |
+| **metacodes 0.1.0**（自测，单次，260/260 题） | 72.7 | 81.1 | 78.8 | 59.0 |
 | CodeBuddy Code 2.109.3（官方 v1.2，3 次均值） | 71.5 | 67.4 | 79.6 | — |
 | Claude Code 2.1.187（官方 v1.2，3 次均值） | 77.1 | 60.7 | 79.6 | — |
 
@@ -116,7 +116,7 @@ metacodes 吸收了 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-h
 
 - **宿主调度的团队（AgentCore）。** lead 会话只记录派生请求，每个成员会话在哪里跑由你的宿主决定。
 - **CLI swarm（`--agent-teams`）。** 队友以线程或 worktree 隔离的进程运行，通过文件邮箱通信，并以原子租约从共享的 TinyKG 任务 DAG 里认领工作。
-- **单元足够小。** `serve` 守护进程在一个进程里承载多个会话，并有活跃会话上限。一个忙碌的 headless agent 进程峰值约 23 MB，sealed gateway 每步只增加 1–3 ms。
+- **单元足够小。** `serve` 守护进程在一个进程里承载多个会话，并有活跃会话上限。一个忙碌的 headless agent 进程峰值约 23 MB，sealed gateway 在 64 个并发客户端下每步只增加 3 ms（中位数，p99 为 9 ms）。
 - **字节稳定的 prompt。** 成千上万个并行运行持续命中 provider 的 prompt cache。
 
 ### TinyKG：agent 自己驾驭的图记忆

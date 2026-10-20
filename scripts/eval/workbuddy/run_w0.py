@@ -17,8 +17,9 @@ import subprocess
 import tempfile
 import time
 from pathlib import Path
-from typing import Dict, Iterable, List
+from typing import Dict, Iterable, List, Mapping
 
+from . import WORKBUDDY_JUDGE_KEY_ENV
 from .install_overlay import install
 from .stage_artifacts import stage
 from .trace import CONTROL_METRICS_SCHEMA
@@ -32,6 +33,25 @@ def _run(args: List[str], *, cwd: Path, env: Dict[str, str]) -> None:
     completed = subprocess.run(args, cwd=cwd, env=env, check=False)
     if completed.returncode != 0:
         raise W0Error(f"command failed ({completed.returncode}): {' '.join(args)}")
+
+
+def _runner_environment(source: Mapping[str, str]) -> Dict[str, str]:
+    """The W0 runner's environment: the caller's, without the LLM judge key
+    (W0 has no judge and must never reach one), plus the zero-provider knobs."""
+    environment = dict(source)
+    environment.pop(WORKBUDDY_JUDGE_KEY_ENV, None)
+    environment.update(
+        {
+            "METACODES_W0_FAKE_BASE_URL": "http://127.0.0.1:9/v1/messages",
+            "METACODES_W0_FAKE_API_KEY": "w0-non-secret-never-contacted",
+            "WBBENCH_PROXY_MAX_RETRIES": "0",
+            "WBBENCH_PROXY_RETRY_DELAY_MS": "1",
+            "SHARDS": "1",
+            "SHARD_CONCURRENCY": "1",
+            "AUTO_BUILD_HARNESS_MOUNT": "0",
+        }
+    )
+    return environment
 
 
 def _sha256(path: Path) -> str:
@@ -106,18 +126,7 @@ def run_w0(workbuddy: Path, zig: Path, bash: Path, uv: Path) -> Dict[str, object
             allow_synthetic_fixtures=True,
         )
 
-    environment = dict(os.environ)
-    environment.update(
-        {
-            "METACODES_W0_FAKE_BASE_URL": "http://127.0.0.1:9/v1/messages",
-            "METACODES_W0_FAKE_API_KEY": "w0-non-secret-never-contacted",
-            "WBBENCH_PROXY_MAX_RETRIES": "0",
-            "WBBENCH_PROXY_RETRY_DELAY_MS": "1",
-            "SHARDS": "1",
-            "SHARD_CONCURRENCY": "1",
-            "AUTO_BUILD_HARNESS_MOUNT": "0",
-        }
-    )
+    environment = _runner_environment(os.environ)
     _run(
         [
             str(uv),

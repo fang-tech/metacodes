@@ -1564,6 +1564,10 @@ def _parse_result(stdout: str) -> Mapping[str, Any]:
         "text",
     }
     cache_fields = {"cache_read_input_tokens", "cache_creation_input_tokens"}
+    # The result line keeps numeric fields backwards-compatible while making
+    # unavailable provider metering explicit. Historical rows predate this
+    # marker and are treated as known for replay compatibility.
+    usage_status_fields = {"usage_status"}
     # Output semantics (text_kind) and the file-change contract are emitted by
     # every current build. Older receipts predate them, so replay fills the
     # defaults rather than rejecting the row -- same rule as cache telemetry.
@@ -1588,21 +1592,28 @@ def _parse_result(stdout: str) -> Mapping[str, Any]:
         }
 
     observed_fields = set(result)
-    current_fields = legacy_fields | cache_fields | semantic_fields | continuation_fields
-    if observed_fields in (legacy_fields, legacy_fields | cache_fields):
+    current_fields = legacy_fields | cache_fields | semantic_fields | continuation_fields | usage_status_fields
+    observed_without_status = observed_fields - usage_status_fields
+    if observed_without_status in (legacy_fields, legacy_fields | cache_fields):
         # Historical receipts predate public cache telemetry. Preserve replay
         # compatibility without accepting a partially upgraded schema.
         result = dict(result)
         result.update({key: 0 for key in cache_fields if key not in result})
         result.update(_semantic_defaults(result))
         result.update({key: 0 for key in continuation_fields})
-    elif observed_fields == legacy_fields | semantic_fields:
+        result.setdefault("usage_status", "known")
+    elif observed_without_status == legacy_fields | semantic_fields:
         result = dict(result)
         result.update({key: 0 for key in cache_fields})
         result.update({key: 0 for key in continuation_fields})
-    elif observed_fields == legacy_fields | cache_fields | semantic_fields:
+        result.setdefault("usage_status", "known")
+    elif observed_without_status == legacy_fields | cache_fields | semantic_fields:
         result = dict(result)
         result.update({key: 0 for key in continuation_fields})
+        result.setdefault("usage_status", "known")
+    elif observed_without_status == legacy_fields | cache_fields | semantic_fields | continuation_fields:
+        result = dict(result)
+        result.setdefault("usage_status", "known")
     elif observed_fields != current_fields:
         _fail(
             "native metacodes result",
@@ -1659,6 +1670,8 @@ def _parse_result(stdout: str) -> Mapping[str, Any]:
         or float(cost) < 0
     ):
         _fail("native metacodes result.cost_usd", "expected finite non-negative number")
+    if result["usage_status"] not in ("known", "unknown"):
+        _fail("native metacodes result.usage_status", "expected known or unknown")
     if not isinstance(result["text"], str):
         _fail("native metacodes result.text", "expected string")
     return result

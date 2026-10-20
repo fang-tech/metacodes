@@ -59,6 +59,7 @@ pub const SLASH_COMMAND_TABLE = [_]SlashCmd{
     .{ .name = "/init", .desc = "Initialize project memory (CLAUDE.md)" },
     .{ .name = "/mcp", .desc = "Manage MCP servers" },
     .{ .name = "/agents", .desc = "List subagents" },
+    .{ .name = "/hooks", .desc = "List hooks and hook config problems" },
     .{ .name = "/permissions", .desc = "Show permission rules and mode" },
     .{ .name = "/memory", .desc = "Edit persistent memory" },
     .{ .name = "/kg", .desc = "Knowledge graph: status, mem, plan, forget" },
@@ -387,6 +388,7 @@ test "slash catalog: skills join the built-ins, collisions and model-only skills
     const base = definition.Skill{
         .name = "deploy",
         .description = "Deploy\n  the service",
+        .description_source = .frontmatter,
         .when_to_use = "",
         .argument_hint = "[env]",
         .body = "",
