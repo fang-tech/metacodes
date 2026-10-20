@@ -596,6 +596,27 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- **AgentCore restore reported `degraded` with nothing lost** (issue #334).
+  Restoring a checkpoint without Session permission rules under a different
+  policy fingerprint (a newly selected Host Tool, another mode) reported
+  `degraded` with zero invalidations and no issue. The official SDK rejects
+  that summary with `InvalidPayload`, so restore and `describe` failed for
+  SDK Hosts. Health is now `degraded` exactly when a Skill, Permission or MCP
+  grant was invalidated; the policy generation still advances and the new
+  tool still asks for approval. A checkpoint whose Skill selection enabled
+  nothing had the same fault when the catalog was unavailable or changed. The
+  ABI revision and the checkpoint format are unchanged.
+- **TUI: a resize while a reply streams** (issue #325). The generation region
+  no longer restores the cursor to a half-line column measured before the
+  resize (a reflowing terminal has moved that text): the continuation is
+  dropped and the line sealed. The region is redrawn at the new width, also
+  when the resize happened while an overlay was open.
+- **TUI: stopped and continued** (issue #326). After SIGSTOP/SIGTSTP and
+  `fg`, the next input poll re-enters raw mode and re-sends the Kitty
+  keyboard / modifyOtherKeys and bracketed-paste enables, so input typed
+  after a shell left the terminal in canonical mode reaches the prompt. A
+  read interrupted by the resume no longer ends a permission or question
+  dialog or the pager.
 - Python and Node SDK packages (from #315), before their first publication:
   - **Python `Session.close()` lost the handle when the destroy failed.**
     Leaving a `with` block during a `stream()` the loop stopped with `break`

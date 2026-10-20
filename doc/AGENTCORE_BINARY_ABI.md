@@ -1874,7 +1874,11 @@ needed.
   the new mode, fingerprint and generation and holds no revoked grant, so no
   restore can bring one back. A restore under the same mode and authority
   keeps the generation; a restore under a different policy advances it and
-  discards the grants, as for any restore.
+  discards the grants, as for any restore. The restore report and `describe`
+  count each discarded grant as invalidated, with an issue for it. Restore
+  health is `degraded` exactly when some Skill, Permission or MCP grant was
+  invalidated: a different policy over a checkpoint without Session rules
+  advances the generation and restores `complete` (#334).
 - **Other layers.** Explicit rules, Core safety (protected paths), an active
   Skill's narrowing, `allowed_tools` and the Workspace sandbox are separate
   from the mode and keep applying after a change.

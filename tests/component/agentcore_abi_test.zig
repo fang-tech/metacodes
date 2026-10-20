@@ -10606,6 +10606,347 @@ test "L2 Revision 19 permission mode update governs the next Run in place and re
     try expectDescribedPermission(api, session, .dont_ask, 3);
 }
 
+/// Answers Write with `allow_session` (so a checkpoint carries a Session
+/// rule) and HostEcho with `allow_once`; counts both and executes HostEcho.
+const RestoreToolSetProbe = struct {
+    session: ?*wire.SessionHandle = null,
+    expected_run_id: u64 = 0,
+    write_asks: u32 = 0,
+    host_asks: u32 = 0,
+    ui_releases: u32 = 0,
+    host_calls: u32 = 0,
+    host_releases: u32 = 0,
+    last_ask_generation: u64 = 0,
+
+    fn validRun(self: *@This(), run_ptr: ?*const wire.RunContextV1) bool {
+        const run = sdk.validateRunContext(run_ptr) catch return false;
+        return run.session == self.session and run.run_id == self.expected_run_id;
+    }
+
+    fn event(
+        raw: ?*anyopaque,
+        run_ptr: ?*const wire.RunContextV1,
+        event_json: wire.BytesViewV1,
+    ) callconv(.c) u32 {
+        const self: *@This() = @ptrCast(@alignCast(raw orelse return wire.EVENT_FATAL));
+        if (!self.validRun(run_ptr)) return wire.EVENT_FATAL;
+        _ = sdk.borrowedBytes(event_json) catch return wire.EVENT_FATAL;
+        return wire.EVENT_CONTINUE;
+    }
+
+    fn ui(
+        raw: ?*anyopaque,
+        run_ptr: ?*const wire.RunContextV1,
+        request_json: wire.BytesViewV1,
+        out_response: ?*wire.OwnedBytesV1,
+    ) callconv(.c) u32 {
+        const self: *@This() = @ptrCast(@alignCast(raw orelse return wire.UI_FATAL));
+        if (!self.validRun(run_ptr)) return wire.UI_FATAL;
+        const encoded = sdk.borrowedBytes(request_json) catch return wire.UI_FATAL;
+        const parsed = sdk.decodeUiRequest(std.heap.c_allocator, encoded) catch return wire.UI_FATAL;
+        defer parsed.deinit();
+        const request = switch (parsed.value) {
+            .permission => |value| value,
+            else => return wire.UI_FATAL,
+        };
+        self.last_ask_generation = request.policy_generation;
+        const response: sdk.protocol.PermissionResponse = if (std.mem.eql(u8, request.tool.name, "Write")) blk: {
+            const candidate = request.candidate orelse return wire.UI_FATAL;
+            self.write_asks += 1;
+            break :blk .{
+                .permission = .allow_session,
+                .request_id = request.request_id,
+                .policy_generation = request.policy_generation,
+                .rule_id = candidate.rule_id,
+            };
+        } else if (std.mem.eql(u8, request.tool.name, "HostEcho")) blk: {
+            self.host_asks += 1;
+            break :blk .{
+                .permission = .allow_once,
+                .request_id = request.request_id,
+                .policy_generation = request.policy_generation,
+            };
+        } else return wire.UI_FATAL;
+        const response_json = sdk.encodeUiResponse(
+            std.heap.c_allocator,
+            parsed.value,
+            .{ .permission = response },
+        ) catch return wire.UI_FATAL;
+        const out = out_response orelse {
+            std.heap.c_allocator.free(response_json);
+            return wire.UI_FATAL;
+        };
+        out.* = .{ .ptr = response_json.ptr, .len = response_json.len };
+        return wire.UI_ANSWERED;
+    }
+
+    fn releaseUi(raw: ?*anyopaque, response: ?*wire.OwnedBytesV1) callconv(.c) void {
+        const self: *@This() = @ptrCast(@alignCast(raw orelse return));
+        const out = response orelse return;
+        if (out.ptr) |ptr| {
+            const len = std.math.cast(usize, out.len) orelse return;
+            std.heap.c_allocator.free(ptr[0..len]);
+            self.ui_releases += 1;
+        }
+        out.* = .{ .ptr = null, .len = 0 };
+    }
+
+    fn host(
+        raw: ?*anyopaque,
+        run_ptr: ?*const wire.RunContextV1,
+        arguments_json: wire.BytesViewV1,
+        out_result: ?*wire.OwnedBytesV1,
+    ) callconv(.c) u32 {
+        const self: *@This() = @ptrCast(@alignCast(raw orelse return wire.HOST_FATAL));
+        if (!self.validRun(run_ptr)) return wire.HOST_FATAL;
+        _ = sdk.borrowedBytes(arguments_json) catch return wire.HOST_FATAL;
+        const result = "host-ok";
+        (out_result orelse return wire.HOST_FATAL).* = .{
+            .ptr = @constCast(result.ptr),
+            .len = result.len,
+        };
+        self.host_calls += 1;
+        return wire.HOST_OK;
+    }
+
+    fn releaseHost(raw: ?*anyopaque, result: ?*wire.OwnedBytesV1) callconv(.c) void {
+        const self: *@This() = @ptrCast(@alignCast(raw orelse return));
+        if (result) |out| {
+            if (out.ptr != null) self.host_releases += 1;
+            out.* = .{ .ptr = null, .len = 0 };
+        }
+    }
+};
+
+fn restoreForToolSet(
+    api: sdk.Api,
+    runtime: ?*wire.RuntimeHandle,
+    host: *const wire.SessionHostConfigV1,
+    checkpoint: *PublicCheckpointBuffer,
+    callbacks: *const wire.SessionCallbacksV1,
+    session: *?*wire.SessionHandle,
+) !sdk.ParsedRestoreReport {
+    var limits = publicCheckpointLimits();
+    var source = checkpoint.source();
+    var restore_config = std.mem.zeroes(wire.SessionRestoreConfigV1);
+    restore_config.struct_size = @sizeOf(wire.SessionRestoreConfigV1);
+    restore_config.host = host;
+    restore_config.source = &source;
+    restore_config.limits = &limits;
+    var report = std.mem.zeroes(wire.OwnedBytesV1);
+    defer api.bufferRelease()(&report);
+    var diagnostic = std.mem.zeroes(wire.OwnedBytesV1);
+    defer api.bufferRelease()(&diagnostic);
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.sessionControl().restore()(runtime, &restore_config, callbacks, session, &report, &diagnostic),
+    );
+    // The official SDK decoder validates health against counts and issues.
+    return sdk.decodeRestoreReport(std.testing.allocator, try sdk.borrowedBytes(.{
+        .ptr = report.ptr,
+        .len = report.len,
+    }));
+}
+
+test "L2 restore under a grown tool set is complete without Session rules and degraded by the rules it loses (#334)" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try rootPath(&tmp, &root_buf);
+    // Run 1 talks; run 2 writes under an allow_session grant; the run after
+    // the first restore calls the newly selected Host Tool.
+    const bodies = [_][]const u8{ FINAL_SSE, WRITE_SSE, FINAL_SSE, HOST_SSE, FINAL_SSE };
+    var server = try harness.MockServer.startCassette(&bodies, 0);
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+
+    const raw_api = abi.metask_agentcore_get_api(wire.ABI_VERSION_V1) orelse
+        return error.MissingApi;
+    const api = try sdk.Api.validate(@ptrCast(@alignCast(raw_api)));
+    var diagnostic = std.mem.zeroes(wire.OwnedBytesV1);
+    defer api.bufferRelease()(&diagnostic);
+
+    var probe = RestoreToolSetProbe{};
+    var callbacks = std.mem.zeroes(wire.SessionCallbacksV1);
+    callbacks.struct_size = @sizeOf(wire.SessionCallbacksV1);
+    callbacks.ctx = &probe;
+    callbacks.on_event = RestoreToolSetProbe.event;
+    callbacks.on_ui_request = RestoreToolSetProbe.ui;
+    callbacks.release_response = RestoreToolSetProbe.releaseUi;
+
+    const builtins = [_]wire.BytesViewV1{sdk.bytesView("Write")};
+    var original_config = std.mem.zeroes(wire.RuntimeConfigV1);
+    original_config.struct_size = @sizeOf(wire.RuntimeConfigV1);
+    original_config.builtin_tools = &builtins;
+    original_config.builtin_tool_count = builtins.len;
+    var original: ?*wire.RuntimeHandle = null;
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.runtime().create()(&original_config, null, &original, &diagnostic),
+    );
+    defer if (original) |handle| {
+        _ = api.runtime().destroy()(handle, &diagnostic);
+    };
+
+    var host_tool = std.mem.zeroes(wire.HostToolV1);
+    host_tool.struct_size = @sizeOf(wire.HostToolV1);
+    host_tool.ctx = &probe;
+    host_tool.name = sdk.bytesView("HostEcho");
+    host_tool.description = sdk.bytesView("Echo a value through the Host");
+    host_tool.input_schema_json = sdk.bytesView(
+        "{\"type\":\"object\",\"properties\":{\"text\":{\"type\":\"string\"}},\"required\":[\"text\"]}",
+    );
+    host_tool.execute = RestoreToolSetProbe.host;
+    host_tool.release_result = RestoreToolSetProbe.releaseHost;
+    const host_tools = [_]wire.HostToolV1{host_tool};
+    var grown_config = original_config;
+    grown_config.host_tools = &host_tools;
+    grown_config.host_tool_count = host_tools.len;
+    var grown: ?*wire.RuntimeHandle = null;
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.runtime().create()(&grown_config, null, &grown, &diagnostic),
+    );
+    defer if (grown) |handle| {
+        _ = api.runtime().destroy()(handle, &diagnostic);
+    };
+
+    var host = std.mem.zeroes(wire.SessionHostConfigV1);
+    host.struct_size = @sizeOf(wire.SessionHostConfigV1);
+    host.provider_kind_code = wire.PROVIDER_ANTHROPIC;
+    host.permission_mode_code = wire.PERMISSION_DEFAULT;
+    host.shell_policy_code = wire.SHELL_DISABLED;
+    host.api_key = sdk.bytesView("test-key");
+    host.base_url = sdk.bytesView(url);
+    host.workspace_root = sdk.bytesView(root);
+    host.workspace_home = sdk.bytesView(root);
+    host.allowed_tools = &builtins;
+    host.allowed_tool_count = builtins.len;
+    const grown_tools = [_]wire.BytesViewV1{ sdk.bytesView("Write"), sdk.bytesView("HostEcho") };
+    var grown_host = host;
+    grown_host.allowed_tools = &grown_tools;
+    grown_host.allowed_tool_count = grown_tools.len;
+
+    var session: ?*wire.SessionHandle = null;
+    defer if (session) |handle| {
+        _ = api.session().destroy()(handle, &diagnostic);
+    };
+    var create_config = sessionCreateConfig(&host, "test-model");
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.session().create()(original, &create_config, &callbacks, &session, &diagnostic),
+    );
+    probe.session = session;
+
+    var options = std.mem.zeroes(wire.RunOptionsV1);
+    options.struct_size = @sizeOf(wire.RunOptionsV1);
+    options.max_turns = 3;
+    var result = std.mem.zeroes(wire.RunResultV1);
+    var limits = publicCheckpointLimits();
+
+    probe.expected_run_id = 1;
+    try std.testing.expectEqual(wire.STATUS_OK, api.session().runText(session, 1, sdk.bytesView("hello"), &options, &result, &diagnostic));
+    var without_rules = PublicCheckpointBuffer{};
+    defer without_rules.deinit();
+    {
+        var sink = without_rules.sink();
+        var export_config = std.mem.zeroes(wire.CheckpointExportConfigV1);
+        export_config.struct_size = @sizeOf(wire.CheckpointExportConfigV1);
+        export_config.limits = &limits;
+        export_config.sink = &sink;
+        var export_result = std.mem.zeroes(wire.CheckpointExportResultV1);
+        try std.testing.expectEqual(wire.STATUS_OK, api.sessionControl().exportCheckpoint()(session, &export_config, &export_result, &diagnostic));
+    }
+
+    probe.expected_run_id = 2;
+    try std.testing.expectEqual(wire.STATUS_OK, api.session().runText(session, 2, sdk.bytesView("write it"), &options, &result, &diagnostic));
+    try std.testing.expectEqual(@as(u32, 1), probe.write_asks);
+    var with_rule = PublicCheckpointBuffer{};
+    defer with_rule.deinit();
+    {
+        var sink = with_rule.sink();
+        var export_config = std.mem.zeroes(wire.CheckpointExportConfigV1);
+        export_config.struct_size = @sizeOf(wire.CheckpointExportConfigV1);
+        export_config.limits = &limits;
+        export_config.sink = &sink;
+        var export_result = std.mem.zeroes(wire.CheckpointExportResultV1);
+        try std.testing.expectEqual(wire.STATUS_OK, api.sessionControl().exportCheckpoint()(session, &export_config, &export_result, &diagnostic));
+    }
+    try std.testing.expectEqual(wire.STATUS_OK, api.session().destroy()(session, &diagnostic));
+    session = null;
+
+    // No Session rule and a newly selected Host Tool: the policy generation
+    // moves, nothing is lost, and the SDK accepts both report and
+    // description as complete.
+    {
+        const report = try restoreForToolSet(api, grown, &grown_host, &without_rules, &callbacks, &session);
+        defer report.deinit();
+        try std.testing.expectEqual(sdk.protocol.RestoreHealth.complete, report.value.health);
+        try std.testing.expectEqual(@as(u64, 2), report.value.policy_generation);
+        try std.testing.expectEqual(@as(u32, 0), report.value.permission.restored_rules);
+        try std.testing.expectEqual(@as(u32, 0), report.value.permission.invalidated_rules);
+        try std.testing.expectEqual(@as(usize, 0), report.value.issues.len);
+    }
+    probe.session = session;
+    {
+        const described = try decodeDescription(api, session);
+        defer described.deinit();
+        try std.testing.expectEqual(sdk.protocol.RestoreHealth.complete, described.value.restore.health);
+        try std.testing.expectEqual(@as(u64, 2), described.value.policy_generation);
+    }
+    // The Conversation stays usable, and the new tool still needs approval
+    // under `default`: there is no rule that would allow it.
+    probe.expected_run_id = 2;
+    try std.testing.expectEqual(wire.STATUS_OK, api.session().runText(session, 2, sdk.bytesView("invoke the Host echo"), &options, &result, &diagnostic));
+    try std.testing.expectEqual(wire.STOP_END_TURN, result.stop_reason_code);
+    try std.testing.expectEqual(@as(u32, 1), probe.host_asks);
+    try std.testing.expectEqual(@as(u64, 2), probe.last_ask_generation);
+    try std.testing.expectEqual(@as(u32, 1), probe.host_calls);
+    try std.testing.expectEqual(@as(u32, 1), probe.host_releases);
+    try std.testing.expectEqual(wire.STATUS_OK, api.session().destroy()(session, &diagnostic));
+    session = null;
+
+    // The same growth with an allow_session rule: the rule is lost, and the
+    // report says so consistently, in counts and in one issue.
+    {
+        const report = try restoreForToolSet(api, grown, &grown_host, &with_rule, &callbacks, &session);
+        defer report.deinit();
+        try std.testing.expectEqual(sdk.protocol.RestoreHealth.degraded, report.value.health);
+        try std.testing.expectEqual(@as(u64, 2), report.value.policy_generation);
+        try std.testing.expectEqual(@as(u32, 0), report.value.permission.restored_rules);
+        try std.testing.expectEqual(@as(u32, 1), report.value.permission.invalidated_rules);
+        try std.testing.expectEqual(@as(usize, 1), report.value.issues.len);
+        const issue = report.value.issues[0];
+        try std.testing.expectEqual(sdk.protocol.AuthoritySubsystem.permission, issue.subsystem);
+        try std.testing.expectEqual(sdk.protocol.AuthorityIssueReason.policy_changed, issue.reason);
+        try std.testing.expect(issue.permission_rule_id != null);
+        try std.testing.expectEqualStrings("Write", issue.canonical_name.?);
+    }
+    probe.session = session;
+    {
+        const described = try decodeDescription(api, session);
+        defer described.deinit();
+        try std.testing.expectEqual(sdk.protocol.RestoreHealth.degraded, described.value.restore.health);
+        try std.testing.expectEqual(@as(u32, 1), described.value.restore.invalidated_permission_rules);
+        try std.testing.expectEqual(@as(usize, 1), described.value.restore.issues.len);
+    }
+    try std.testing.expectEqual(wire.STATUS_OK, api.session().destroy()(session, &diagnostic));
+    session = null;
+
+    // An unchanged tool set keeps the rule and the generation, as before.
+    {
+        const report = try restoreForToolSet(api, original, &host, &with_rule, &callbacks, &session);
+        defer report.deinit();
+        try std.testing.expectEqual(sdk.protocol.RestoreHealth.complete, report.value.health);
+        try std.testing.expectEqual(@as(u64, 1), report.value.policy_generation);
+        try std.testing.expectEqual(@as(u32, 1), report.value.permission.restored_rules);
+        try std.testing.expectEqual(@as(u32, 0), report.value.permission.invalidated_rules);
+        try std.testing.expectEqual(@as(usize, 0), report.value.issues.len);
+    }
+}
+
 // ── Revision 20: Host input submitted to an active Run (#270) ───────────────
 
 const RunInputSubmission = struct {
