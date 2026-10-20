@@ -62,6 +62,20 @@ def test_sigstop_sigcont_reapplies_terminal_modes(bin_path):
     assert raw.count(b"\x1b[?2004h") >= 2, "SIGCONT should re-enable bracketed paste"
 
 
+def test_sigcont_restores_raw_input_after_shell_cooked_the_tty(bin_path):
+    _skip_if_conpty()
+    # While stopped, the tty goes back to canonical mode (no echo). Without the
+    # SIGCONT reconciliation the typed bytes wait in the line discipline for a
+    # newline and the input box stays empty.
+    raw = run(
+        bin_path,
+        ["sleep:0.8", "signal:stopcont:cooked", "sleep:0.5", "type:ab", "sleep:0.6"],
+    )
+    a = TTYAssert(raw)
+    a.assert_input_echo("ab")
+    a.assert_box_at_bottom()
+
+
 def test_apple_terminal_backslash_newline_no_exit(bin_path):
     # Apple Terminal 无 Kitty 协议,Shift+Enter 发裸 \r 无法区分 → 换行靠 backslash+return:
     # 行尾 \ + 回车 → 删 \ 插 \n,留在输入框(不提交、不退出)。用 raw:\x0d 发裸回车。
