@@ -14,6 +14,7 @@ const pfs = @import("platform").fs;
 const platform_term = @import("platform").terminal;
 const platform_signal = @import("platform").signal;
 const process = @import("platform").process;
+const shutdown = @import("../core/shutdown.zig");
 
 // ============================================================================
 // Key 抽象
@@ -305,6 +306,23 @@ pub fn reconcileAfterResume(fd: c_int) bool {
     // the next poll gets another chance to restore the interactive state.
     g_resume_requested.store(true, .release);
     return false;
+}
+
+/// Whether a raw-mode key read that returned < 0 only lost a race with a
+/// signal: a terminal resize (SIGWINCH) or a resume (SIGCONT) interrupts a
+/// blocked read with EINTR and carries no input, so the reader retries
+/// (redrawing if it redraws per iteration) instead of taking the failure as
+/// an answer. That is how a resize used to become "user declined" in the
+/// permission dialog. A pending resume is reconciled first. A requested
+/// process shutdown (SIGINT) still ends the reader. Call it right after the
+/// failed read, before another call can overwrite errno. Windows has neither
+/// signal, and its console read does not set errno, so a stale value there
+/// is never taken for an interruption.
+pub fn retryInterruptedRead(fd: c_int) bool {
+    const interrupted = @import("builtin").os.tag != .windows and pfs.lastErrnoIs(.INTR);
+    const resumed = reconcileAfterResume(fd);
+    if (shutdown.requested()) return false;
+    return interrupted or resumed;
 }
 
 /// Reconcile all terminal mode families with the intended interactive state.
@@ -1369,6 +1387,21 @@ test "LineEditor: multi-key stream through KeyParser" {
 test "enterRawMode on non-tty returns null or restores cleanly" {
     const orig = enterRawMode(0);
     if (orig) |o| restoreMode(0, o);
+}
+
+test "an interrupted key read is retried unless the process is shutting down" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    defer shutdown.resetForTesting();
+    // No resume is pending, so the fd is never touched.
+    std.c._errno().* = @intFromEnum(std.c.E.INTR);
+    try testing.expect(retryInterruptedRead(-1));
+    // A real read failure still ends the reader.
+    std.c._errno().* = @intFromEnum(std.c.E.IO);
+    try testing.expect(!retryInterruptedRead(-1));
+    // SIGINT asked the process to stop: the interrupted dialog ends as before.
+    shutdown.request();
+    std.c._errno().* = @intFromEnum(std.c.E.INTR);
+    try testing.expect(!retryInterruptedRead(-1));
 }
 
 test "reconcileModes on a non-tty is a no-op" {

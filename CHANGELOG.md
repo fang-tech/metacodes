@@ -10,6 +10,17 @@ status, compatibility boundaries, and entry points are defined by
 
 ## Unreleased
 
+### Fixed
+
+- **TUI: a terminal resize no longer answers an open dialog.** A resize
+  interrupts a blocked key read (SIGWINCH has no `SA_RESTART`), and the
+  permission dialog took the interrupted read for "No": the tool was denied
+  (`user declined 'Write' via prompt`) before any key was pressed.
+  AskUserQuestion failed with `InputAborted`, and the pager, the Ctrl+O
+  transcript viewer, reverse search and a paste in progress ended the same
+  way. An interrupted read is now retried and the dialog is drawn again; a
+  SIGINT that asks the process to stop still ends it.
+
 ## 0.6.0 — 2026-10-20
 
 ### Added

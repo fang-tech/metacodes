@@ -1141,6 +1141,7 @@ fn handlePaste(
     while (true) {
         var b: [1]u8 = undefined;
         const n = platform_term.readInput(fd, &b);
+        if (n < 0 and input.retryInterruptedRead(fd)) continue;
         if (n <= 0) break;
         const key = parser.feed(b[0]) orelse {
             // parser 处于 CSI 中间态——字节已被吞，等下一个
@@ -1380,7 +1381,7 @@ fn readLineRaw(
         const key = if (synthetic_key) |sk| sk else blk: {
             const n = platform_term.readInput(fd, &b);
             if (n < 0) {
-                if (input.reconcileAfterResume(fd)) continue;
+                if (input.retryInterruptedRead(fd)) continue;
                 return error.ReadError;
             }
             if (n == 0) return error.Eof;
@@ -1846,6 +1847,7 @@ fn handleReverseSearch(
 
         var b: [1]u8 = undefined;
         const n = platform_term.readInput(fd, &b);
+        if (n < 0 and input.retryInterruptedRead(fd)) continue;
         if (n <= 0) return;
         const c = b[0];
 

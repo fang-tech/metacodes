@@ -153,7 +153,7 @@ pub fn page(alloc: std.mem.Allocator, th: Theme, content: []const u8, opts: Page
         var buf: [8]u8 = undefined;
         const n = pfs.read(in_fd, &buf);
         if (n <= 0) {
-            if (n < 0 and input_mod.reconcileAfterResume(in_fd)) continue;
+            if (n < 0 and input_mod.retryInterruptedRead(in_fd)) continue;
             break;
         }
         const b = buf[0];

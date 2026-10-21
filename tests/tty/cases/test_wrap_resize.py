@@ -86,3 +86,111 @@ def test_T13_resize_during_generation_keeps_stream_and_region_aligned(bin_path):
         a._fail(f"resize 后生成期固定区边框未按新宽度(60)重画:横线长度 {runs}")
     a.assert_box_present()
     a.assert_box_at_bottom()
+
+
+
+def _resize_during_dialog(bin_path, tool, tool_input, dialog_marker, answer_events):
+    """Drive one tool call whose dialog is open while the terminal resizes.
+
+    A resize interrupts the dialog's blocked key read with EINTR (SIGWINCH has
+    no SA_RESTART). The dialog must keep waiting for a key instead of reading
+    the interruption as an answer. Returns the final screen and the
+    tool_result the next provider request carried.
+    """
+    import json
+    from tty_driver import READY, wait_for
+    from slow_mock_server import SlowMockServer, slow_text_then_tooluse, slow_text_then_end
+
+    turns = [
+        slow_text_then_tooluse(n_chunks=1, delay=0.1, tool=tool, tool_input=tool_input),
+        slow_text_then_end(n_chunks=1, delay=0.1),
+    ]
+    with SlowMockServer(turns) as srv:
+        raw = run(
+            bin_path,
+            [
+                READY,
+                "type:go",
+                "key:enter",
+                wait_for(dialog_marker, 15),
+                "strictsleep:0.8",
+                "resize:24x70",
+                "strictsleep:1.0",
+                "resize:24x80",
+                "strictsleep:1.0",
+            ] + answer_events,
+            term_size=(24, 80),
+            base_url=srv.url,
+            permission="default",
+            startup_drain=0.8,
+            per_key_drain=0.05,
+        )
+        requests = list(srv.requests)
+    a = TTYAssert(raw, rows=24, cols=80)
+    if len(requests) < 2:
+        a._fail(f"工具结果没有发回模型(只收到 {len(requests)} 个请求)")
+    result = None
+    for message in json.loads(requests[1])["messages"]:
+        content = message.get("content")
+        if isinstance(content, list):
+            for block in content:
+                if block.get("type") == "tool_result" and block.get("tool_use_id") == "t1":
+                    result = block
+    if result is None:
+        a._fail("第二个请求里没有 t1 的 tool_result")
+    return a, result
+
+
+def _tool_result_text(result):
+    content = result.get("content")
+    if isinstance(content, list):
+        return "".join(part.get("text", "") for part in content if isinstance(part, dict))
+    return str(content)
+
+
+def test_T14_resize_during_permission_prompt_keeps_waiting(bin_path):
+    import json
+    import os
+    from tty_driver import case_tmpdir
+
+    target = os.path.join(case_tmpdir("cc-tty-winch-perm-"), "winch.txt")
+    a, result = _resize_during_dialog(
+        bin_path,
+        "Write",
+        json.dumps({"file_path": target, "content": "x"}),
+        "Permission required",
+        ["type:y", "sleep:1.5"],
+    )
+    text = _tool_result_text(result)
+    if result.get("is_error") or "declined" in text:
+        a._fail(f"resize 被当成了拒绝:tool_result={text!r}")
+    if not os.path.exists(target):
+        a._fail("resize 之后按 y 没有写出文件:对话框没有在等按键")
+    a.assert_box_at_bottom()
+
+
+def test_T15_resize_during_ask_question_keeps_waiting(bin_path):
+    import json
+
+    question = {
+        "questions": [{
+            "question": "Which colour?",
+            "header": "Colour",
+            "multiSelect": False,
+            "options": [
+                {"label": "Teal", "description": "the first"},
+                {"label": "Amber", "description": "the second"},
+            ],
+        }],
+    }
+    a, result = _resize_during_dialog(
+        bin_path,
+        "AskUserQuestion",
+        json.dumps(question),
+        "Which colour?",
+        ["key:enter", "sleep:1.5"],
+    )
+    text = _tool_result_text(result)
+    if result.get("is_error") or "Teal" not in text:
+        a._fail(f"resize 之后按 Enter 没有选中第一个选项:tool_result={text!r}")
+    a.assert_box_at_bottom()
