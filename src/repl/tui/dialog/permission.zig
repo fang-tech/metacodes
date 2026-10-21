@@ -123,7 +123,7 @@ pub fn promptLoop(alloc: std.mem.Allocator, th: Theme, in_fd: c_int, out_fd: c_i
         var buf: [8]u8 = undefined;
         const n = pfs.read(in_fd, &buf);
         if (n <= 0) {
-            if (n < 0 and input_mod.reconcileAfterResume(in_fd)) continue;
+            if (n < 0 and input_mod.retryInterruptedRead(in_fd)) continue;
             return .deny_once;
         }
         const b = buf[0];

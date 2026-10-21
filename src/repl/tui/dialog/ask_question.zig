@@ -612,7 +612,7 @@ pub fn run(
         var buf: [8]u8 = undefined;
         const n = pfs.read(in_fd, &buf);
         if (n <= 0) {
-            if (n < 0 and input_mod.reconcileAfterResume(in_fd)) continue;
+            if (n < 0 and input_mod.retryInterruptedRead(in_fd)) continue;
             return error.InputAborted;
         }
         const b = buf[0];

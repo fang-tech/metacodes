@@ -622,7 +622,7 @@ pub const TuiBackend = struct {
             var b: [1]u8 = undefined;
             const n = platform_term.readInput(fd, &b); // console 宽读统一入口(review-2 F4)
             if (n <= 0) {
-                if (n < 0 and input.reconcileAfterResume(fd)) continue;
+                if (n < 0 and input.retryInterruptedRead(fd)) continue;
                 // poll 报可读却无字节:stdin EOF(pty master 已关,n==0)或死终端读错误
                 // (Linux EIO,n<0)。continue 会让 poll 立即再报可读 → 忙转:终端已死,
                 // 进程整核空转且 agent 继续烧 turn(SIGHUP 被忽略的环境——nohup/CI 驱动

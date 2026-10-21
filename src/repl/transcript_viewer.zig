@@ -20,6 +20,7 @@ const std = @import("std");
 const host_injection_meter = @import("../core/host_injection_meter.zig");
 const pfs = @import("platform").fs;
 const platform_term = @import("platform").terminal; // console 宽读统一入口(review-2 F4)
+const input = @import("input.zig");
 const Conversation = @import("../core/conversation.zig").Conversation;
 const Overlay = @import("tui/overlay.zig").Overlay;
 
@@ -257,6 +258,7 @@ pub fn runWithThemeAnchor(fd: c_int, allocator: std.mem.Allocator, conv: *const 
         drawScreen(lines, top, view_rows, rows, cols, th);
         var b: [1]u8 = undefined;
         const n = platform_term.readInput(fd, &b);
+        if (n < 0 and input.retryInterruptedRead(fd)) continue;
         if (n <= 0) break;
         const c = b[0];
         if (c == 0x1b) {
