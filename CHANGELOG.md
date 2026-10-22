@@ -20,6 +20,16 @@ status, compatibility boundaries, and entry points are defined by
   transcript viewer, reverse search and a paste in progress ended the same
   way. An interrupted read is now retried and the dialog is drawn again; a
   SIGINT that asks the process to stop still ends it.
+- `zig build test` no longer leaves TinyKG services from the WorkBuddy replay
+  tests. `WorkBuddyLeaderboardProtocolTest`'s window replay and
+  `LeaderboardPreflightBinaryTest` arrived after the earlier fix. They run the
+  real binary in a throwaway HOME with the adapter's environment, which keeps
+  the trial's local TinyKG. Each run left three
+  `metacodes --state-dir <deleted temp dir> kgd` processes with their
+  `tinykgd` children (a developer machine had 48 pairs after four days). The
+  replay now stops the service it started, and it fails if one is still
+  running under its temporary directory. Autostart stays on, so the replay
+  still runs the trial's configuration.
 
 ## 0.6.0 — 2026-10-20
 

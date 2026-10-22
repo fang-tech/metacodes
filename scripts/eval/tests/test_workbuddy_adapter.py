@@ -26,6 +26,7 @@ except ImportError as error:  # pragma: no cover - environment, not logic
         "PyYAML is required here: python3 -m pip install -r requirements-dev.txt"
     ) from error
 
+from scripts.eval.kgd_processes import stop_kgd_under, temporary_directory_without_kgd
 from scripts.eval.workbuddy import WORKBUDDY_PINNED_COMMIT
 from scripts.eval.workbuddy.cohort_manifest import (
     CohortError,
@@ -5383,7 +5384,7 @@ def _replay_adapter(binary, instruction, **overrides):
     """Run what the adapter would run in the container, on this host: its
     fresh-HOME files, its flags and environment, and the uploaded instruction
     on stdin, against the installed binary.  Returns (process, events)."""
-    with _stubbed_adapter() as adapter, tempfile.TemporaryDirectory() as root:
+    with _stubbed_adapter() as adapter, temporary_directory_without_kgd() as root:
         logs = Path(root) / "trial__l2" / "agent"
         logs.mkdir(parents=True)
         agent = _bare_agent(adapter, logs, **overrides)
@@ -5411,15 +5412,21 @@ def _replay_adapter(binary, instruction, **overrides):
             "METACODES_LOG": "*:error",
         })
         ((_target, uploaded),) = environment.uploads
-        done = subprocess.run(
-            [binary, *flags, "-", "--json", "--stream-json"],
-            cwd=workspace,
-            env=env,
-            input=uploaded,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=120,
-        )
+        try:
+            done = subprocess.run(
+                [binary, *flags, "-", "--json", "--stream-json"],
+                cwd=workspace,
+                env=env,
+                input=uploaded,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=120,
+            )
+        finally:
+            # The trial keeps its local TinyKG, as in the container, so the
+            # session starts the service in this HOME, and the service
+            # outlives the session.
+            stop_kgd_under(home)
         events = [
             json.loads(line)
             for line in done.stdout.decode("utf-8").splitlines()
