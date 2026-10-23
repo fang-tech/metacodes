@@ -67,6 +67,17 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- **MCP over HTTP: one kept-alive connection per server, and no more
+  dropped requests.** Every message used to open its own TLS connection with
+  `Connection: close`, so a server cost about four handshakes at startup
+  (2–2.7 s per server for the imported Codex / Claude Code servers measured),
+  and Vercel-hosted servers such as developers.openai.com dropped those
+  requests unanswered most of the time (`could not connect to the server
+  URL`).
+  Requests in quick succession now share one connection; an answered SSE
+  stream is read to its end first, an idle connection is reused only within
+  4 s, and a request that meets a reused connection the server already
+  closed is sent again on a new one.
 - **TUI: a terminal resize no longer answers an open dialog.** A resize
   interrupts a blocked key read (SIGWINCH has no `SA_RESTART`), and the
   permission dialog took the interrupted read for "No": the tool was denied

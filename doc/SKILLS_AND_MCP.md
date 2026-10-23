@@ -282,6 +282,15 @@ revisions 2025-11-25, 2025-06-18, 2025-03-26 and 2024-11-05:
   and `Mcp-Param-*` (from `x-mcp-header`; a tool with an invalid annotation is
   dropped) on 2026-07-28. OAuth login is not implemented: authenticate with
   `bearerTokenEnvVar` or headers.
+- A server's requests share one kept-alive connection while they come in quick
+  succession (the handshake, a burst of tool calls), so startup costs one TLS
+  handshake rather than one per message, and `Connection: close` is never
+  sent (Vercel-hosted servers such as developers.openai.com drop such
+  requests). A connection is reused only after its response was read to the
+  end — an answered SSE stream is finished before the next request, waiting
+  at most 250 ms of silence — and only within 4 s of its last use; a request
+  that finds a reused connection already closed by the server, before any
+  response byte, is sent again on a new connection.
 
 ### `/mcp`
 

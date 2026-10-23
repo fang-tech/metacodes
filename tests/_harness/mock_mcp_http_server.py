@@ -9,11 +9,20 @@ Paths select the server:
             Mcp-Method / _meta, paginated tools/list (empty-string cursor),
             x-mcp-header tools.
   /auth     always 401.
+  /keepalive  a Classic server that answers initialize and tools/list over
+            chunked SSE on a kept-alive connection and, like a Vercel edge,
+            drops a request that asks for `Connection: close` unanswered.
+  /idleclose  /keepalive whose connections close 50 ms after each response,
+            the way a server ends an idle keep-alive connection.
+Every observation records the client port (`conn`: one TCP connection each)
+and the request's `Connection` header.
 GET /log returns every observation as JSON lines (for assertions).
 """
 import json
+import socket
 import sys
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 LOG = []
@@ -66,7 +75,10 @@ class Handler(BaseHTTPRequestHandler):
         method = message.get("method")
         rid = message.get("id")
         params = message.get("params") or {}
-        record(path=self.path, method=method, id=rid, headers=headers, has_meta="_meta" in params)
+        record(path=self.path, method=method, id=rid, headers=headers, has_meta="_meta" in params,
+               conn=self.client_address[1], connection=headers.get("connection"))
+        if mode in ("keepalive", "idleclose"):
+            return self.keepalive(mode, method, rid)
         if mode == "auth":
             return self.reply(401, {"error": "unauthorized"})
         if method is None:
@@ -111,6 +123,52 @@ class Handler(BaseHTTPRequestHandler):
             text = "classic:" + params.get("name", "")
             return self.reply(200, {"jsonrpc": "2.0", "id": rid, "result": {"content": [{"type": "text", "text": text}]}})
         return self.reply(200, {"jsonrpc": "2.0", "id": rid, "error": {"code": -32601, "message": "Method not found"}})
+
+    def sse_chunked(self, message):
+        """One `message` event as a chunked SSE body that ends at once, so
+        the connection can carry the next request."""
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Transfer-Encoding", "chunked")
+        self.end_headers()
+        data = b"event: message\ndata: " + json.dumps(message).encode() + b"\n\n"
+        self.wfile.write(b"%x\r\n%s\r\n0\r\n\r\n" % (len(data), data))
+        self.wfile.flush()
+
+    def close_soon(self):
+        connection = self.connection
+
+        def later():
+            time.sleep(0.05)
+            try:
+                connection.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+
+        threading.Thread(target=later, daemon=True).start()
+
+    def keepalive(self, mode, method, rid):
+        if (self.headers.get("Connection") or "").lower() == "close":
+            # Vercel drops these intermittently; here always, so a client that
+            # sends it cannot pass by luck.
+            self.close_connection = True
+            return
+        if method is None or method.startswith("notifications/"):
+            self.reply(202)
+        elif method == "server/discover":
+            # As developers.openai.com answers it: 400, and an error without id.
+            self.reply(400, {"jsonrpc": "2.0", "id": None, "error": {"code": -32000, "message": "Bad Request: Unsupported protocol version: 2026-07-28"}})
+        elif method == "initialize":
+            self.sse_chunked({"jsonrpc": "2.0", "id": rid, "result": {"protocolVersion": "2025-11-25", "capabilities": {"tools": {}}, "serverInfo": {"name": mode, "version": "1"}}})
+        elif method == "tools/list":
+            self.sse_chunked({"jsonrpc": "2.0", "id": rid, "result": {"tools": [{"name": "kept", "inputSchema": {"type": "object"}}]}})
+        elif method == "tools/call":
+            self.reply(200, {"jsonrpc": "2.0", "id": rid, "result": {"content": [{"type": "text", "text": "kept-call"}]}})
+        else:
+            self.reply(200, {"jsonrpc": "2.0", "id": rid, "error": {"code": -32601, "message": "Method not found"}})
+        if mode == "idleclose":
+            self.close_soon()
 
     def modern(self, method, rid, params, headers):
         meta = params.get("_meta") or {}

@@ -35,6 +35,16 @@ pub const Transport = union(enum) {
         };
     }
 
+    /// The awaited response has been read. Over HTTP the rest of its SSE
+    /// stream is then finished before the next request, so the connection
+    /// can be reused; stdio has nothing to do.
+    pub fn markAnswered(self: *Transport) void {
+        switch (self.*) {
+            .stdio => {},
+            .http => |transport| transport.markAnswered(),
+        }
+    }
+
     pub fn setDeadline(self: *Transport, deadline_ms: ?i64) void {
         switch (self.*) {
             .stdio => |*stdio| stdio.deadline_ms = deadline_ms,

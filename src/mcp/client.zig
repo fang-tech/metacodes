@@ -261,6 +261,7 @@ pub const McpClient = struct {
             if (is_http) return err;
             return .restart;
         };
+        defer self.transport.markAnswered();
         while (true) {
             const line = self.transport.recvLine() catch |err| {
                 if (is_http) return if (err == error.Eof) .classic else err;
@@ -388,6 +389,7 @@ pub const McpClient = struct {
         var meta_scratch = std.heap.ArenaAllocator.init(self.allocator);
         defer meta_scratch.deinit();
         self.transport.send(req, try sendMeta(meta_scratch.allocator(), method, params_json)) catch |err| return sendFailure(err);
+        defer self.transport.markAnswered();
 
         while (true) {
             const line = self.transport.recvLine() catch |err| return self.failInFlight(id, err);
@@ -610,6 +612,7 @@ pub const McpClient = struct {
         var meta = try sendMeta(meta_scratch.allocator(), method, params_json);
         meta.param_headers = self.param_headers;
         self.transport.send(req, meta) catch |err| return sendFailure(err);
+        defer self.transport.markAnswered();
 
         while (true) {
             var capture = try artifact_store.Capture.begin(
