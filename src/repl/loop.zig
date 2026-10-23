@@ -29,6 +29,8 @@ const complete = @import("complete.zig");
 const paste_mod = @import("paste.zig");
 const history_mod = @import("history.zig");
 const user_echo = @import("user_echo.zig");
+const cmd_output = @import("cmd_output.zig");
+const dialogs = @import("dialogs.zig");
 const multiline_mod = @import("multiline.zig");
 const render_mod = @import("render.zig");
 const transcript_mod = @import("../core/transcript.zig");
@@ -56,6 +58,7 @@ const request_overrides = @import("../api/request_overrides.zig");
 const util_time = @import("../util/time.zig");
 const model_command = @import("model_command.zig");
 const session_service = @import("../session_service.zig");
+const replay = @import("replay.zig");
 const skill_cli_adapter = @import("../skills/cli_adapter.zig");
 
 fn hasPendingRunInput(ctx: *anyopaque) bool {
@@ -63,10 +66,10 @@ fn hasPendingRunInput(ctx: *anyopaque) bool {
     return queue.len() > 0;
 }
 
-/// 把 CoreEvent 的字节写到 std.debug.print(stderr)——非 TTY 交互 / cron / skill 等场景。
+/// 把 CoreEvent 的字节写到 stderr——非 TTY 的生成期 backend。
 /// 对齐旧 DebugWriter.print 行为。
 fn debugSink(_: *anyopaque, bytes: []const u8) void {
-    std.debug.print("{s}", .{bytes});
+    cmd_output.print("{s}", .{bytes});
 }
 
 /// 建一个走 std.debug.print 的 WriterBackend(colorize=true 复刻旧 DebugWriter 继承的默认)。
@@ -74,7 +77,13 @@ fn debugBackend(verbose: bool, show_retry: bool, usage_acc: ?*@import("../core/u
     return .{ .sink_ctx = undefined, .sink = debugSink, .colorize = true, .verbose = verbose, .show_retry = show_retry, .usage_acc = usage_acc };
 }
 
-pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
+/// How the REPL starts.
+pub const Startup = struct {
+    /// `--resume <id>`: what src/main.zig restored before the REPL started.
+    resumed: ?app_mod.App.ResumedConversation = null,
+};
+
+pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, startup: Startup) !void {
     // Evaluation is opt-in and fail-closed: without METACODES_EVAL_METADATA no
     // object is created; when set, malformed/incomplete grounding aborts before
     // any rollout can be mistaken for comparable evidence.
@@ -87,13 +96,10 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
 
     printStartupBanner(app, allocator);
 
-    // 启动 prompt 建议:基于 git 最近改动的文件给一条灰色提示(对齐 Claude Code)
-    printStartupSuggestion(allocator);
+    // 启动 prompt 建议:基于 git 最近改动的文件给一条灰色提示(对齐 Claude Code)。
+    // A resumed session goes on with its conversation; the suggestion is for a new one.
+    if (startup.resumed == null) printStartupSuggestion(allocator);
 
-    // 顶层 REPL 的辅助 backend(cron/skill/retry 等非主对话路径用):走 std.debug.print。
-    // 主对话路径在生成期单独构造 TuiBackend/WriterBackend(见下)。
-    var aux_wb = debugBackend(app.config.verbose, true, &app.usage);
-    const aux_be = aux_wb.backend();
     // U11(issue #3):config/会话 mutation 统一走 SessionService(web/daemon 同一命令面);
     // 渲染仍留 TUI。借 *App、不持 backend,方法只在本(driver)线程调。
     var svc = session_service.SessionService.init(app);
@@ -118,6 +124,13 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
         null;
     defer if (tui_region) |*r| r.deinit();
 
+    // `--resume <id>`: the conversation under the banner, as Claude Code shows
+    // a resumed session, then what was restored.
+    if (startup.resumed) |resumed| {
+        if (tui_region) |*r| replayConversation(app, allocator, r);
+        printResumed(app, resumed);
+    }
+
     // 终端 tab 标题反映 session 状态(idle/working/需要输入)。仅 tty;退出时清空。
     if (tty) terminal_title.setFromApp(app, .idle);
     defer if (tty) terminal_title.clear();
@@ -131,9 +144,22 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
     var msg_queue = msg_queue_mod.MsgQueue.init(allocator);
     defer msg_queue.deinit();
 
+    const turn_host: TurnHost = .{
+        .app = app,
+        .allocator = allocator,
+        .tty = tty,
+        .stdin_fd = stdin_fd,
+        .region = if (tui_region) |*r| r else null,
+        .msg_queue = &msg_queue,
+        .history = &history,
+        .eval_runtime = &eval_runtime,
+        .eval_execution_policy = eval_execution_policy,
+        .spawn_tick = spawn_tick,
+    };
+
     while (true) {
         // 检查到期的 cron 任务 —— 把它们的 prompt 作为 user message 注入并跑一轮
-        try fireDueCrons(app, allocator, &aux_be);
+        try fireDueCrons(&turn_host);
 
         // Swarm lead 邮箱轮询(turn 边界):teammate 的回复/idle 通知在两轮之间拉进来,
         // 入队当作下一轮 user input(idle→立即;有 draft→排在队尾)。**SW5 债**:idle 阻塞在
@@ -146,14 +172,14 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
         }
 
         if (shouldRunLoopContinuation(app, msg_queue.len())) {
-            try runLoopContinuation(app, allocator, &aux_be);
+            try runLoopContinuation(&turn_host);
             continue;
         }
 
         // tty:输入框(含状态/footer)由 readLineRaw 内的 RenderRegion 自画(钉底)。
         // 非 tty:保留裸 "> " prompt 供 pipe 模式可读。
         const has_queued = msg_queue.len() > 0;
-        if (!tty and !has_queued) std.debug.print("> ", .{});
+        if (!tty and !has_queued) cmd_output.print("> ", .{});
 
         const line = if (msg_queue.popAllJoined("\n\n")) |q| blk: {
             // 待发送队列消费:上一轮生成期入队的(可能多条)消息一次性合并 → 本轮 input,
@@ -162,23 +188,14 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
             break :blk q; // q owned,与 readLine 返回所有权一致
         } else if (tty)
             readLineRaw(stdin_fd, allocator, &history, app, &tui_region.?) catch |err| switch (err) {
-                error.Eof => {
-                    std.debug.print("Goodbye!\n", .{});
-                    break;
-                },
-                error.ExitRequested => {
-                    std.debug.print("\nGoodbye!\n", .{});
-                    break;
-                },
-                error.Cancelled => {
-                    std.debug.print("^C\n", .{});
-                    continue;
-                },
+                // The double-press exits leave quietly, as Claude Code does;
+                // only `/exit` says goodbye.
+                error.Eof, error.ExitRequested => break,
                 else => return err,
             }
         else
             readLineBuffered(allocator) catch {
-                std.debug.print("Goodbye!\n", .{});
+                cmd_output.print("Goodbye!\n", .{});
                 break;
             };
         defer allocator.free(line);
@@ -192,52 +209,30 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
             continue;
         }
 
+        // A `/command` answers under `⎿` (Claude Code). Its echo is held back
+        // until it prints, so an unknown command is reported in place of the
+        // echo; anything that hands the turn to the model flushes and closes
+        // the block first (`runTurn`).
+        const shaped = tty and isSlashCommandLine(trimmed);
+        if (shaped) beginCommandBlock(app, trimmed);
+        defer if (shaped) cmd_output.end();
+
         // 命令派发（不走多行累加）
         if (std.mem.eql(u8, trimmed, "/exit") or std.mem.eql(u8, trimmed, "exit")) {
-            std.debug.print("Goodbye!\n", .{});
+            cmd_output.print("Goodbye!\n", .{});
             break;
         }
         if (std.mem.eql(u8, trimmed, "/help")) {
-            std.debug.print(
-                \\Commands:
-                \\  /help            Show this help
-                \\  /clear           Clear screen
-                \\  /tools           List available tools
-                \\  /skills          List available skills
-                \\  /history         Show recent commands
-                \\  /model [name]    Show or switch the active model
-                \\  /login <id>      Sign in to a provider with OAuth (flags: /login)
-                \\  /mode [name]     Cycle or set permission mode (default|accept-edits|auto|dont-ask|bypass)
-                \\  /effort [level]  Show or set reasoning effort (none|minimal|low|medium|high|xhigh)
-                \\  /resume [id]     List recent sessions, or resume one by id
-                \\  /retry           Resend the last user message
-                \\  /compact         Compact oldest messages when over threshold
-                \\  /goal [cmd]      View/manage the session goal
-                \\  /loop [cmd]      View/control automatic continuation
-                \\  /doctor          Show environment/config diagnostics
-                \\  /config [show|path]  Inspect config (<state root>/config.json)
-                \\  /init            Analyze the codebase and write CLAUDE.md (model-driven)
-                \\  /mcp             List configured MCP servers
-                \\  /agents          List available sub-agent capabilities
-                \\  /hooks           List configured hooks and hook configuration problems
-                \\  /permissions     Show permission mode + loaded rules
-                \\  /theme [variant] Show/switch TUI theme (auto/dark/light/mono)
-                \\  /add-dir <path>  Add a working directory (accept-edits auto-accept + sandbox write)
-                \\  /memory [edit <slot>]  List memory files; edit user|project|local|auto in $EDITOR
-                \\  /commit          Draft a git commit using the model
-                \\  /btw <q>         Side question (uses context, not added to history)
-                \\  /recap           One-line summary of this session
-                \\  /vim             Toggle vim editor mode
-                \\  /review          Ask the model to review the current diff
-                \\  /exit            Exit REPL
-                \\
-                \\Multi-line input:
-                \\  Shift+Enter / Ctrl+Enter   insert a newline (requires CSI u capable terminal:
-                \\                             kitty, WezTerm, foot, iTerm2 latest, xterm)
-                \\  Enter                      submit the whole buffer
-                \\  (non-tty fallback: end line with \ or wrap with """ on its own line)
-                \\
-            , .{});
+            if (shaped) {
+                var arena = std.heap.ArenaAllocator.init(allocator);
+                defer arena.deinit();
+                const catalog = slashCatalog(arena.allocator(), app);
+                var help: dialogs.HelpDialog = .{ .catalog = catalog, .term_rows = terminalRows() };
+                runDialog(dialogs.HelpDialog, &help, app);
+                printDismissed(app, "Help dialog dismissed");
+            } else {
+                printReport(app, writeHelpReport);
+            }
             continue;
         }
         // 行首单独 `?` → 快捷键帮助(对齐 CC `?` for shortcuts)。仅整行 trim 后 == "?" 触发,
@@ -245,43 +240,33 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
         // 注:tty 下 `?` 由 dispatch 即时拦截 → 非模态 footer 区展开(help_open,见 ui.zig),
         // 永不提交到这;此分支是 headless/非-tty fallback(headless 无 footer 区,`?` 提交后打帮助文本)。
         if (std.mem.eql(u8, trimmed, "?")) {
-            std.debug.print(
-                \\Keyboard shortcuts:
-                \\  Enter              Submit
-                \\  Shift+Enter        Insert newline (CSI-u terminals)
-                \\  Ctrl+A / Ctrl+E    Start / end of line
-                \\  Alt+B / Alt+F      Word back / forward
-                \\  Ctrl+U / Ctrl+K    Kill to start / end of line
-                \\  Ctrl+W             Delete previous word
-                \\  Ctrl+Y             Yank (paste last kill)
-                \\  Ctrl+_             Undo
-                \\  Ctrl+R             Reverse history search
-                \\  Up / Down          History prev / next
-                \\  Ctrl+L             Clear screen
-                \\  Ctrl+T             Toggle task list
-                \\  Ctrl+O             Open transcript viewer
-                \\  Ctrl+G             Edit buffer in $EDITOR
-                \\  Shift+Tab          Cycle permission mode
-                \\  Ctrl+X Ctrl+K      Kill background tasks
-                \\  Esc                Interrupt current task
-                \\  Esc Esc            Clear draft (when idle)
-                \\  Ctrl+C             Cancel / exit (twice when empty)
-                \\  Ctrl+D             EOF / exit when empty
-                \\  !<cmd>             Run shell command
-                \\  /help              List commands
-                \\
-            , .{});
+            printReport(app, writeShortcutsReport);
             continue;
         }
         if (std.mem.eql(u8, trimmed, "/clear")) {
-            std.debug.print("\x1b[2J\x1b[H", .{});
+            // Claude Code: a new session with empty context. The old one stays
+            // on disk under its id (/resume); background work keeps running.
+            app.clearConversation();
+            if (shaped) {
+                // The screen restarts at the banner with the command under it.
+                cmd_output.dropEcho();
+                cmd_output.end();
+                std.debug.print("\x1b[2J\x1b[H", .{});
+                printBanner(app);
+                if (renderEcho(app, trimmed)) |echo| {
+                    defer std.heap.c_allocator.free(echo);
+                    std.debug.print("{s}", .{echo});
+                }
+            } else {
+                cmd_output.print("Started a new session with empty context.\n", .{});
+            }
             continue;
         }
         if (std.mem.eql(u8, trimmed, "/tools")) {
-            for (tools.registry) |*t| std.debug.print("  \x1b[32m{s}\x1b[0m - {s}\n", .{ t.name, t.description });
+            for (tools.registry) |*t| cmd_output.print("  \x1b[32m{s}\x1b[0m - {s}\n", .{ t.name, t.description });
             // 动态工具（Skill / MCP）
             for (app.dyn_registry.entries.items) |e| {
-                std.debug.print("  \x1b[36m{s}\x1b[0m - {s}\n", .{ e.name, e.description });
+                cmd_output.print("  \x1b[36m{s}\x1b[0m - {s}\n", .{ e.name, e.description });
             }
             continue;
         }
@@ -290,7 +275,7 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
         if (std.mem.eql(u8, trimmed, "/task-test") or std.mem.startsWith(u8, trimmed, "/task-test:")) {
             const label = if (trimmed.len > 11) trimmed[11..] else "test task running";
             const t = app.tasks.create(label, "test", label) catch {
-                std.debug.print("[task-test] create failed\n", .{});
+                cmd_output.print("[task-test] create failed\n", .{});
                 continue;
             };
             app.tasks.updateStatus(t.id, .in_progress) catch {};
@@ -300,7 +285,7 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
         if (std.mem.eql(u8, trimmed, "/task-test-done") or std.mem.startsWith(u8, trimmed, "/task-test-done:")) {
             const label = if (trimmed.len > 16) trimmed[16..] else "test task done";
             const t = app.tasks.create(label, "test", label) catch {
-                std.debug.print("[task-test-done] create failed\n", .{});
+                cmd_output.print("[task-test-done] create failed\n", .{});
                 continue;
             };
             app.tasks.updateStatus(t.id, .completed) catch {};
@@ -312,7 +297,7 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
             const desc = if (trimmed.len > 12) trimmed[12..] else "inspect repo";
             if (app.agent_jobs) |*aj| {
                 aj.pushTestEntryFull(app.session_id, "Explore", desc, 1, 17300, "Read", "{\"file_path\":\"/Users/x/mod0.py\"}", .running) catch {
-                    std.debug.print("[agent-test] push failed\n", .{});
+                    cmd_output.print("[agent-test] push failed\n", .{});
                 };
             }
             continue;
@@ -365,23 +350,33 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
                 // 清掉测试 agent(不污染后续)。
                 aj.clearTestEntries();
             }
-            std.debug.print("\x1b[2m[agent-churn-test] done\x1b[0m\n", .{});
+            cmd_output.print("\x1b[2m[agent-churn-test] done\x1b[0m\n", .{});
             continue;
         }
         // 供离线 tty 验证 Ctrl+O transcript 渲染等效(markdown 渲染、无 ▶/◀ 角色头、进出无源码残留)。
         if (std.mem.eql(u8, trimmed, "/md-test")) {
             app.conversation.appendText(.user, "你是谁") catch {};
             app.conversation.appendText(.assistant, "我是 **MetaCode**,一个本地 `CLI` 编程助手。\n- 阅读代码\n- 调试 bug") catch {};
-            std.debug.print("\x1b[2m[md-test] 注入 1 user + 1 assistant(含 markdown)\x1b[0m\n", .{});
+            cmd_output.print("\x1b[2m[md-test] injected 1 user + 1 assistant message (markdown)\x1b[0m\n", .{});
             continue;
         }
         if (std.c.getenv("METACODES_TEST_HOOKS") != null and std.mem.eql(u8, trimmed, "/compact-stress-test")) {
             try injectCompactStressHistory(app, allocator);
-            std.debug.print("\x1b[2m[compact-stress-test] injected large history\x1b[0m\n", .{});
+            cmd_output.print("\x1b[2m[compact-stress-test] injected large history\x1b[0m\n", .{});
             continue;
         }
         if (std.mem.eql(u8, trimmed, "/skills")) {
-            printReport(app, writeSkillsReport);
+            if (shaped) {
+                var dialog = dialogs.SkillsDialog.init(app.allocator, app.skill_runtime.snapshot, &app.skill_overrides, terminalRows()) catch |err| {
+                    cmd_output.print("{s}The dialog failed: {s}{s}\n", .{ app.theme.danger, @errorName(err), app.theme.reset });
+                    continue;
+                };
+                defer dialog.deinit();
+                runDialog(dialogs.SkillsDialog, &dialog, app);
+                saveSkillOverrides(app, &dialog);
+            } else {
+                printReport(app, writeSkillsReport);
+            }
             continue;
         }
         if (std.mem.eql(u8, trimmed, "/hooks")) {
@@ -396,7 +391,11 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
             // U11:经 SessionService.compact(canonical 命令面),渲染留此。
             // 投影:len() 不变(原始不删),真正收缩的是活跃窗口 → 显示活跃计数,否则 N→N 误导用户。
             const r = svc.compact().data.compact;
-            std.debug.print("Compacted {d} old messages ({d} → {d} active).\n", .{ r.dropped, r.before, r.after });
+            if (r.dropped == 0) {
+                cmd_output.print("Nothing to compact: {d} messages, under the threshold.\n", .{r.after});
+            } else {
+                cmd_output.print("Compacted {d} old messages; {d} remain in context.\n", .{ r.dropped, r.after });
+            }
             continue;
         }
         if (std.mem.eql(u8, trimmed, "/goal") or std.mem.startsWith(u8, trimmed, "/goal ")) {
@@ -412,9 +411,9 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
         if (std.mem.eql(u8, trimmed, "/retry")) {
             // U11:回卷(丢弃最后 user 之后的回合)经 service;run 提交留宿主。
             if (svc.prepareRetry().run != null) {
-                try runInjectedAgent(app, allocator, &aux_be);
+                try runTurn(&turn_host, .macro, null);
             } else {
-                std.debug.print("\x1b[33mNo user message to retry\x1b[0m\n", .{});
+                cmd_output.print("\x1b[33mNo user message to retry\x1b[0m\n", .{});
             }
             continue;
         }
@@ -425,23 +424,19 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
         }
         if (std.mem.eql(u8, trimmed, "/cost")) {
             const u = app.usage;
-            const cost = u.costUsd(app.activeModel());
-            std.debug.print(
-                \\Usage ({s}):
-                \\  input         {d} tokens
-                \\  output        {d} tokens
-                \\  cache read    {d} tokens
-                \\  cache create  {d} tokens
-                \\  total cost    ${d:.6} USD
+            cmd_output.print(
+                \\Total cost:  ${d:.4}
+                \\Usage:       {d} input, {d} output, {d} cache read, {d} cache write
+                \\Model:       {s}
                 \\
-            , .{ app.activeModel(), u.input_tokens, u.output_tokens, u.cache_read_input_tokens, u.cache_creation_input_tokens, cost });
+            , .{ u.costUsd(app.activeModel()), u.input_tokens, u.output_tokens, u.cache_read_input_tokens, u.cache_creation_input_tokens, app.activeModel() });
             continue;
         }
         // issue #16:`/models` 选的是**凭证**(账号 API key),不是路由。路由选择归
         // `/model` / Ctrl+O 的跨 UI picker;两者是不同的问题,合并会让"换账号"和
         // "换模型"互相顶掉。picker 的 credential 阶段尚未落地(见架构文档未实现清单)。
         if (std.mem.eql(u8, trimmed, "/models")) {
-            std.debug.print("/models is an interactive account-key picker: type it and use the menu. Use /model (or Ctrl+O) to choose a provider, model, and channel.\n", .{});
+            cmd_output.print("/models is an interactive account-key picker: type it and use the menu. Use /model (or Ctrl+O) to choose a provider, model, and channel.\n", .{});
             continue;
         }
         // /model [name] —— 无参开 picker;有参走文本选择器(向后兼容)
@@ -461,7 +456,7 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
         // 与 CLI 阻塞终端一样。
         if (std.mem.eql(u8, trimmed, "/login") or std.mem.startsWith(u8, trimmed, "/login ")) {
             const rest = std.mem.trim(u8, trimmed[6..], " \t");
-            try handleLogin(app, allocator, rest);
+            if (shaped) try handleLoginDialog(app, rest) else try handleLogin(app, allocator, rest);
             continue;
         }
         // issue #16:`/providers` 列出当前所有路由;`/providers refresh` 重新拉取
@@ -494,7 +489,7 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
             const rest = std.mem.trim(u8, trimmed[5..], " \t");
             const o = if (rest.len == 0) svc.cyclePermMode() else svc.setPermModeNamed(rest);
             var obuf: [128]u8 = undefined;
-            std.debug.print("{s}\n", .{o.render(&obuf)});
+            cmd_output.print("{s}\n", .{o.render(&obuf)});
             continue;
         }
         // /overrides [field value | clear] —— 查看/清/单字段设方言覆盖
@@ -506,7 +501,20 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
         // /resume [id] —— 无参列最近 10 个 session；有参加载
         if (std.mem.startsWith(u8, trimmed, "/resume")) {
             const rest = std.mem.trim(u8, trimmed[7..], " \t");
-            try handleResume(app, allocator, rest);
+            if (try handleResume(app, allocator, rest)) |resumed| {
+                if (shaped) {
+                    // Claude Code redraws the screen as the resumed session:
+                    // the banner and its conversation, then this command and
+                    // what it restored.
+                    cmd_output.dropEcho();
+                    cmd_output.end();
+                    std.debug.print("\x1b[2J\x1b[H", .{});
+                    printBanner(app);
+                    replayConversation(app, allocator, turn_host.region.?);
+                    beginCommandBlock(app, trimmed);
+                }
+                printResumed(app, resumed);
+            }
             continue;
         }
         if (std.mem.eql(u8, trimmed, "/doctor")) {
@@ -522,10 +530,10 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
             // 对齐 cc:prompt 型命令——注入指令让模型扫码库写 CLAUDE.md(走正常 agent_loop)。
             const d = svc.submitMacro(session_service.INIT_PROMPT);
             if (d.run != null) {
-                try runInjectedAgent(app, allocator, &aux_be);
+                try runTurn(&turn_host, .macro, null);
             } else {
                 var obuf: [96]u8 = undefined;
-                std.debug.print("\x1b[31m/init failed: {s}\x1b[0m\n", .{d.outcome.render(&obuf)});
+                cmd_output.print("\x1b[31m/init failed: {s}\x1b[0m\n", .{d.outcome.render(&obuf)});
             }
             continue;
         }
@@ -545,7 +553,7 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
         }
         if (std.mem.eql(u8, trimmed, "/vim")) {
             const o = svc.toggleVim(); // U11:经 service,渲染留此
-            std.debug.print("editor mode: \x1b[36m{s}\x1b[0m\n", .{if (o.data.vim) "vim" else "emacs"});
+            cmd_output.print("Editor mode: {s}\n", .{if (o.data.vim) "vim" else "emacs"});
             continue;
         }
         if (std.mem.eql(u8, trimmed, "/agents")) {
@@ -564,13 +572,13 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
         if (std.mem.startsWith(u8, trimmed, "/add-dir")) {
             const rest = std.mem.trim(u8, trimmed[8..], " \t");
             if (rest.len == 0) {
-                std.debug.print("usage: /add-dir <path>\n", .{});
+                cmd_output.print("Usage: /add-dir <path>\n", .{});
             } else {
                 const o = svc.addDirectory(rest); // U11:经 service
                 if (o.ok) {
-                    std.debug.print("added directory: {s}\n", .{rest});
+                    cmd_output.print("Added working directory {s}\n", .{rest});
                 } else {
-                    std.debug.print("/add-dir failed: {s}\n", .{o.data.err_name});
+                    cmd_output.print("{s}Could not add {s}: {s}{s}\n", .{ app.theme.danger, rest, o.data.err_name, app.theme.reset });
                 }
             }
             continue;
@@ -583,6 +591,10 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
 
         // ! shell mode:直接执行 shell 命令,输出加入对话上下文(不走模型)
         if (trimmed.len > 1 and trimmed[0] == '!') {
+            // The command's output hangs off `⎿` under its echo, as Claude
+            // Code shows bash mode.
+            if (tty) beginCommandBlock(app, "");
+            defer if (tty) cmd_output.end();
             try handleShellMode(app, allocator, std.mem.trim(u8, trimmed[1..], " \t"));
             continue;
         }
@@ -591,35 +603,63 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
         if (std.mem.eql(u8, trimmed, "/commit")) {
             const d = svc.submitMacro(session_service.COMMIT_PROMPT);
             if (d.run != null) {
-                try runInjectedAgent(app, allocator, &aux_be);
+                try runTurn(&turn_host, .macro, null);
             } else {
                 var obuf: [96]u8 = undefined;
-                std.debug.print("\x1b[31m/commit failed: {s}\x1b[0m\n", .{d.outcome.render(&obuf)});
+                cmd_output.print("\x1b[31m/commit failed: {s}\x1b[0m\n", .{d.outcome.render(&obuf)});
             }
             continue;
         }
         if (std.mem.eql(u8, trimmed, "/review")) {
             const d = svc.submitMacro(session_service.REVIEW_PROMPT);
             if (d.run != null) {
-                try runInjectedAgent(app, allocator, &aux_be);
+                try runTurn(&turn_host, .macro, null);
             } else {
                 var obuf: [96]u8 = undefined;
-                std.debug.print("\x1b[31m/review failed: {s}\x1b[0m\n", .{d.outcome.render(&obuf)});
+                cmd_output.print("\x1b[31m/review failed: {s}\x1b[0m\n", .{d.outcome.render(&obuf)});
             }
             continue;
         }
         // 用户显式 /<skill-name> [args] 触发。所有内建 Command 已先消费，
         // 因而同名 Skill 不会劫持 /review、/commit 等产品路由。
         if (trimmed.len > 0 and trimmed[0] == '/') {
+            // A Skill run streams the model's reply straight to the terminal:
+            // the echo goes first and the block closes. An unknown name gets
+            // the unknown-command report in place of the echo.
+            if (shaped) {
+                const head = switch (skill_cli_adapter.parseSlashSyntax(trimmed[1..])) {
+                    .command => |value| value,
+                    .not_a_command => unreachable, // `shaped` checked the syntax
+                };
+                if (app.skill_runtime.findRecord(head) == null and app.skill_runtime.findIssue(head) == null) {
+                    reportUnknownCommand(app, trimmed);
+                    continue;
+                }
+                if (!app.skill_runtime.overrideState(head).userInvocable()) {
+                    reportSkillDisabled(app, trimmed, tty);
+                    continue;
+                }
+                cmd_output.end();
+            }
             switch (try skill_cli_adapter.handleSlash(app, allocator, trimmed[1..])) {
                 .handled => continue,
+                .disabled => {
+                    reportSkillDisabled(app, trimmed, tty);
+                    continue;
+                },
+                .run => {
+                    try runTurn(&turn_host, .skill, null);
+                    continue;
+                },
                 .unknown_command => {
-                    std.debug.print("Unknown command or unavailable Skill: {s}\n", .{trimmed});
+                    reportUnknownCommand(app, trimmed);
                     continue;
                 },
                 .not_a_command => {},
             }
         }
+        // Not a command after all: the block (if any) closes before the turn.
+        cmd_output.end();
 
         // tty 模式：LineEditor 已经在 buffer 里保存换行（Shift+Enter / Ctrl+Enter），一次提交
         // 非 tty 模式：保留 Accumulator fallback（行尾 `\` 续行 / 独占 `"""` 块）
@@ -653,166 +693,213 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
         defer if (expanded) |e| allocator.free(e);
         try app.conversation.appendText(.user, expanded orelse final_input);
 
-        // 生成期间底部状态栏(spinner + 实时 token/cost)。仅 tty。
-        // RenderRegion 在生成期维护一个底部 spinner 行;agent_loop 的文本输出经
-        // RegionWriter 与 spinner 协调(文本来时擦 spinner,tick 在文本下方重画)。
-        const gen_region: ?*render_region_mod.RenderRegion = if (tui_region) |*r| r else null;
-        if (gen_region) |r| {
-            r.enterGenerating(app, &msg_queue);
-            // A queued message starts this reply without an input phase in
-            // between, so the picker the last reply left open comes here.
-            if (app.pending_overlay == .model_picker_kept) {
-                app.pending_overlay = .none;
-                picker_host.keep(app, &r.ui);
-            }
+        try runTurn(&turn_host, .prompt, null);
+    }
+    // Every way out of the prompt (/exit, Ctrl+C or Ctrl+D twice, EOF) ends here.
+    if (tty) printResumeHint(app);
+}
+
+/// What the generation path needs from the REPL loop that owns it.
+const TurnHost = struct {
+    app: *app_mod.App,
+    allocator: std.mem.Allocator,
+    tty: bool,
+    stdin_fd: c_int,
+    region: ?*render_region_mod.RenderRegion,
+    msg_queue: *msg_queue_mod.MsgQueue,
+    history: *history_mod.History,
+    eval_runtime: *?evaluation_backend_mod.RuntimeConfig,
+    eval_execution_policy: ?@import("../tools.zig").ToolExecutionPolicy,
+    spawn_tick: ?*const fn (u64, []const u8) void,
+};
+
+/// Who handed this turn to the model. Every kind renders the same way —
+/// spinner, tool cards, Esc to interrupt, queued input — as a Claude Code
+/// turn does whether it began as a prompt, `/init`, or a Skill. They differ
+/// in the host contracts layered on top:
+///   - `prompt`: a typed submission; the evaluation record, scoped recall,
+///     project-rule run control and the primary-run obligations (delivery
+///     cadence, progress updates, stall/check gates, learning turn, test
+///     integrity) apply;
+///   - `skill`: a user-invoked Skill; project-rule run control applies, as it
+///     always did for Skill runs;
+///   - `macro`: a prompt the host injected (`/init`, `/commit`, `/review`,
+///     `/retry`, cron, loop continuation); none of the above, as before.
+const TurnKind = enum { prompt, skill, macro };
+
+/// Run one model turn on the conversation as it stands (the caller appended
+/// the user side) through the interactive generation path.
+fn runTurn(host: *const TurnHost, kind: TurnKind, synthetic_user_input: ?[]const u8) !void {
+    const app = host.app;
+    const allocator = host.allocator;
+    // The model streams to the terminal unshaped; a command that started the
+    // turn has its echo written first.
+    cmd_output.end();
+    // 生成期间底部状态栏(spinner + 实时 token/cost)。仅 tty。
+    // RenderRegion 在生成期维护一个底部 spinner 行;agent_loop 的文本输出经
+    // RegionWriter 与 spinner 协调(文本来时擦 spinner,tick 在文本下方重画)。
+    const gen_region = host.region;
+    if (gen_region) |r| {
+        r.enterGenerating(app, host.msg_queue);
+        // A queued message starts this reply without an input phase in
+        // between, so the picker the last reply left open comes here.
+        if (app.pending_overlay == .model_picker_kept) {
+            app.pending_overlay = .none;
+            picker_host.keep(app, &r.ui);
         }
-        // The region is shared by the whole session: an exit from this
-        // iteration that skips leaveGenerating (a refused run's `continue`,
-        // an error before the run) would leave it generating and the input
-        // box would never draw again. The explicit calls after stopInput
-        // below keep their ordering; this fallback is a no-op after them.
-        defer if (gen_region) |r| leaveGenerationRegion(app, r);
-        if (tty) terminal_title.setFromApp(app, .working); // tab:生成中
+    }
+    // The region is shared by the whole session: an exit from this
+    // iteration that skips leaveGenerating (a refused run's `continue`,
+    // an error before the run) would leave it generating and the input
+    // box would never draw again. The explicit calls after stopInput
+    // below keep their ordering; this fallback is a no-op after them.
+    defer if (gen_region) |r| leaveGenerationRegion(app, r);
+    if (host.tty) terminal_title.setFromApp(app, .working); // tab:生成中
 
-        var region_writer: ?render_region_mod.RegionWriter =
-            if (gen_region) |r| .{ .region = r } else null;
+    var region_writer: ?render_region_mod.RegionWriter =
+        if (gen_region) |r| .{ .region = r } else null;
 
-        // 生成期间也要 raw mode:readLineRaw 返回时已 restoreMode(回 cooked),
-        // cooked 下内核按行缓冲,未按 Enter 的键不会被 watcher 的 read 读到 → 边等边打字被吞。
-        // 重进 raw 让 watcher 能逐字节读到输入(编辑 / 回车入队 / Esc 中断)。
-        const gen_raw_orig = if (tty) input.enterRawMode(stdin_fd) else null; // ?platform.terminal.SavedMode
-        defer if (gen_raw_orig) |o| input.restoreMode(stdin_fd, o);
+    // 生成期间也要 raw mode:readLineRaw 返回时已 restoreMode(回 cooked),
+    // cooked 下内核按行缓冲,未按 Enter 的键不会被 watcher 的 read 读到 → 边等边打字被吞。
+    // 重进 raw 让 watcher 能逐字节读到输入(编辑 / 回车入队 / Esc 中断)。
+    const gen_raw_orig = if (host.tty) input.enterRawMode(host.stdin_fd) else null; // ?platform.terminal.SavedMode
+    defer if (gen_raw_orig) |o| input.restoreMode(host.stdin_fd, o);
 
-        // UI backend:TUI 路径用 TuiBackend(包 region,渲染工具卡 + 颜色 + owns 生成期键盘输入);
-        // 非 TTY 用 WriterBackend(走 std.debug.print)。两者实现同一 UiBackend vtable。
-        // 阶段 C:生成期 stdin watcher 线程归 TuiBackend(startInput/stopInput),loop 不再硬编码。
-        //
-        // 生命周期约束(隐式但必须守):`tui_be` 必须在整个生成期(直到 stopInput 返回)保持
-        // 栈存活且**地址不被移动**。`ui_be.ctx` = `@ptrCast(&tui_be.?)`(经 `if(tui_be)|*tb|`
-        // capture,指向 optional payload 在 tui_be 内部的稳定地址),watcher 线程的 `self` 也是
-        // 同一地址——agent_loop(emit)与 watcher(键盘)共享这一个 TuiBackend 实例。
-        // 不要把 tui_be 重新赋值 / 搬移 / 放进会 realloc 的容器,否则两个指针指向坟墓。
-        var tui_be: ?tui_backend_mod.TuiBackend = if (region_writer) |*rw|
-            .{ .region = rw.region, .theme = &app.theme, .alloc = allocator, .edit_hl_cache = &app.edit_hl_cache, .colorize = true, .verbose = app.config.verbose, .show_retry = true, .usage_acc = &app.usage, .queue = &msg_queue, .history = &history, .abort_signal = &app.abort, .input_abort = &app.abort }
-        else
-            null;
-        var fallback_be = debugBackend(app.config.verbose, true, &app.usage);
-        const ui_be: ui_backend_mod.UiBackend = if (tui_be) |*tb| tb.backend() else fallback_be.backend();
+    // UI backend:TUI 路径用 TuiBackend(包 region,渲染工具卡 + 颜色 + owns 生成期键盘输入);
+    // 非 TTY 用 WriterBackend(走 std.debug.print)。两者实现同一 UiBackend vtable。
+    // 阶段 C:生成期 stdin watcher 线程归 TuiBackend(startInput/stopInput),loop 不再硬编码。
+    //
+    // 生命周期约束(隐式但必须守):`tui_be` 必须在整个生成期(直到 stopInput 返回)保持
+    // 栈存活且**地址不被移动**。`ui_be.ctx` = `@ptrCast(&tui_be.?)`(经 `if(tui_be)|*tb|`
+    // capture,指向 optional payload 在 tui_be 内部的稳定地址),watcher 线程的 `self` 也是
+    // 同一地址——agent_loop(emit)与 watcher(键盘)共享这一个 TuiBackend 实例。
+    // 不要把 tui_be 重新赋值 / 搬移 / 放进会 realloc 的容器,否则两个指针指向坟墓。
+    var tui_be: ?tui_backend_mod.TuiBackend = if (region_writer) |*rw|
+        .{ .region = rw.region, .theme = &app.theme, .alloc = allocator, .edit_hl_cache = &app.edit_hl_cache, .colorize = true, .verbose = app.config.verbose, .show_retry = true, .usage_acc = &app.usage, .queue = host.msg_queue, .history = host.history, .abort_signal = &app.abort, .input_abort = &app.abort }
+    else
+        null;
+    var fallback_be = debugBackend(app.config.verbose, true, &app.usage);
+    const ui_be: ui_backend_mod.UiBackend = if (tui_be) |*tb| tb.backend() else fallback_be.backend();
 
-        // L4:METACODES_TRACE 开启时,旁挂 DiagnosticsBackend(经 TeeBackend 转发)收集结构化
-        // trace,run 结束后 dump 成 NDJSON 到 stderr。关闭时直接用 ui_be,零开销。
-        const trace_on = std.c.getenv("METACODES_TRACE") != null;
-        var diag_be = diagnostics_backend_mod.DiagnosticsBackend.init(allocator);
-        defer diag_be.deinit();
-        var diag_ui = diag_be.backend();
-        var tee = tee_backend_mod.TeeBackend{ .primary = &ui_be, .secondary = &diag_ui };
-        const tee_ui = tee.backend();
-        const traced_be: *const ui_backend_mod.UiBackend = if (trace_on) &tee_ui else &ui_be;
-        defer if (trace_on) {
-            const jsonl = diag_be.toJsonl(allocator) catch null;
-            if (jsonl) |j| {
-                defer allocator.free(j);
-                std.debug.print("{s}", .{j});
-            }
-        };
-
-        // Actual dispatch evidence is a product-level session artifact, not a
-        // UI projection and not an evaluation-only stream. Open and validate it
-        // before the provider can run; corruption or durability failure ends
-        // the run fail-closed.
-        const run_control: ?*project_activation.RunControl = if (app.sessionDir()) |dir|
-            try project_activation.RunControl.init(
-                allocator,
-                dir,
-                app.session_id,
-                if (app.project_dir_or_empty().len > 0) app.project_dir_or_empty() else app.cwdAbs(),
-                &app.abort,
-            )
-        else
-            null;
-        defer if (run_control) |control| control.deinit();
-        if (run_control) |control| control.requireDetachedIdle(
-            (if (app.jobs) |*jobs| jobs.runningCountForOwner(app.session_id) else 0) +|
-                (if (app.agent_jobs) |*jobs| jobs.runningCountForSession(app.session_id) else 0),
-            app.swarm.hasTeam(),
-        ) catch |err| {
-            try control.finishRun(@errorName(err));
-            std.debug.print("\x1b[31m项目形式化规则拒绝启动本轮: {s}\x1b[0m\n", .{@errorName(err)});
-            continue;
-        };
-
-        // Native evaluation events are a second decorator over the normal UI
-        // (and optional diagnostics decorator). Each user submission is one
-        // invocation inside the execution-grounded scenario rollout.
-        var eval_be: ?evaluation_backend_mod.EvaluationBackend = if (eval_runtime) |*runtime| blk: {
-            const active_provider = app.provider();
-            runtime.configureBudgetReserve(
-                active_provider.maxInputTokens(),
-                active_provider.maxTokens(),
-                app.activeModel(),
-            );
-            const evaluation = try runtime.initEvaluation(allocator, runtime.nextMetadata(
-                @tagName(app.config.provider_kind),
-                app.activeModel(),
-                @tagName(app.permission_ctx.modeValue()),
-            ));
-            break :blk evaluation;
-        } else null;
-        const eval_request_gate = if (eval_runtime) |*runtime|
-            runtime.requestGate(&app.abort)
-        else
-            null;
-        defer if (eval_be) |*evaluation| {
-            if (eval_runtime) |*runtime| {
-                runtime.appendEvaluation(evaluation) catch |err| {
-                    std.debug.print("evaluation artifact write failed: {s}\n", .{@errorName(err)});
-                };
-            }
-            evaluation.deinit();
-        };
-        var eval_ui: ui_backend_mod.UiBackend = if (eval_be) |*evaluation| evaluation.backend() else ui_be;
-        var eval_tee = tee_backend_mod.TeeBackend{ .primary = traced_be, .secondary = &eval_ui };
-        const eval_tee_ui = eval_tee.backend();
-        const effective_be: *const ui_backend_mod.UiBackend = if (eval_be != null) &eval_tee_ui else traced_be;
-
-        // 生成期键盘监听:仅 tty + 有 TuiBackend 时启动(回车入队 / Esc 中断 / 超时 tickSpinner)。
-        if (tty) {
-            if (tui_be) |*tb| try tb.startInput(stdin_fd, app, allocator);
+    // L4:METACODES_TRACE 开启时,旁挂 DiagnosticsBackend(经 TeeBackend 转发)收集结构化
+    // trace,run 结束后 dump 成 NDJSON 到 stderr。关闭时直接用 ui_be,零开销。
+    const trace_on = std.c.getenv("METACODES_TRACE") != null;
+    var diag_be = diagnostics_backend_mod.DiagnosticsBackend.init(allocator);
+    defer diag_be.deinit();
+    var diag_ui = diag_be.backend();
+    var tee = tee_backend_mod.TeeBackend{ .primary = &ui_be, .secondary = &diag_ui };
+    const tee_ui = tee.backend();
+    const traced_be: *const ui_backend_mod.UiBackend = if (trace_on) &tee_ui else &ui_be;
+    defer if (trace_on) {
+        const jsonl = diag_be.toJsonl(allocator) catch null;
+        if (jsonl) |j| {
+            defer allocator.free(j);
+            cmd_output.print("{s}", .{j});
         }
-        // 权限弹窗 UI runner:有 TuiBackend 时注入到 per-session permission_ctx(终端接管路径:
-        // 停 watcher+持锁,不抢 fd0)。生成期结束统一清(defer),避免悬垂指向 tui_be 栈实例。
-        if (tui_be) |*tb| {
-            app.permission_ctx.ui_requester = .{ .ctx = @ptrCast(tb), .requestFn = &tui_backend_mod.TuiBackend.uiRequestTrampoline };
+    };
+
+    // Actual dispatch evidence is a product-level session artifact, not a
+    // UI projection and not an evaluation-only stream. Open and validate it
+    // before the provider can run; corruption or durability failure ends
+    // the run fail-closed.
+    const run_control: ?*project_activation.RunControl = if (kind == .macro)
+        null
+    else if (app.sessionDir()) |dir|
+        try project_activation.RunControl.init(
+            allocator,
+            dir,
+            app.session_id,
+            if (app.project_dir_or_empty().len > 0) app.project_dir_or_empty() else app.cwdAbs(),
+            &app.abort,
+        )
+    else
+        null;
+    defer if (run_control) |control| control.deinit();
+    if (run_control) |control| control.requireDetachedIdle(
+        (if (app.jobs) |*jobs| jobs.runningCountForOwner(app.session_id) else 0) +|
+            (if (app.agent_jobs) |*jobs| jobs.runningCountForSession(app.session_id) else 0),
+        app.swarm.hasTeam(),
+    ) catch |err| {
+        try control.finishRun(@errorName(err));
+        cmd_output.print("\x1b[31mThe project rules refused to start this turn: {s}\x1b[0m\n", .{@errorName(err)});
+        return;
+    };
+
+    // Native evaluation events are a second decorator over the normal UI
+    // (and optional diagnostics decorator). Each user submission is one
+    // invocation inside the execution-grounded scenario rollout.
+    var eval_be: ?evaluation_backend_mod.EvaluationBackend = if (kind != .prompt) null else if (host.eval_runtime.*) |*runtime| blk: {
+        const active_provider = app.provider();
+        runtime.configureBudgetReserve(
+            active_provider.maxInputTokens(),
+            active_provider.maxTokens(),
+            app.activeModel(),
+        );
+        const evaluation = try runtime.initEvaluation(allocator, runtime.nextMetadata(
+            @tagName(app.config.provider_kind),
+            app.activeModel(),
+            @tagName(app.permission_ctx.modeValue()),
+        ));
+        break :blk evaluation;
+    } else null;
+    const eval_request_gate = if (kind != .prompt) null else if (host.eval_runtime.*) |*runtime|
+        runtime.requestGate(&app.abort)
+    else
+        null;
+    defer if (eval_be) |*evaluation| {
+        if (host.eval_runtime.*) |*runtime| {
+            runtime.appendEvaluation(evaluation) catch |err| {
+                cmd_output.print("evaluation artifact write failed: {s}\n", .{@errorName(err)});
+            };
         }
-        defer if (tui_be != null) {
-            app.permission_ctx.ui_requester = null;
-        };
-        // scoped 自动召回(一等公民 P1):按用户请求自动装配相关记忆到尾部(cache-safe,有命中才注入)。
-        const scoped_recall = if (app.kg) |*k| (scoped_recall_mod.build(allocator, k, &app.conversation, &app.abort, .{ .advisor = app.jevAdvisor() }) catch null) else null;
-        defer if (scoped_recall) |s| allocator.free(s);
-        // 会话根目录跟着改名走:这里是唯一向用户说一句的地方(buildRunOptions 里的再次调用是 no-op)。
-        switch (app.refreshWorkspaceRoot()) {
-            .unchanged => {},
-            .renamed => |now| std.debug.print("working directory was renamed; now {s}\n", .{now}),
-            .missing => if (!app.root_missing_warned) {
-                app.root_missing_warned = true;
-                std.debug.print("working directory {s} no longer exists; shell commands will fail until it is restored\n", .{app.cwdAbs()});
-            },
-        }
-        // U11:App 可导出字段统一走 canonical buildRunOptions(五处前端装配漂移的收敛点);
-        // 宿主专属字段(eval gate/policy、run_control 三件套、预算、UI requester、心跳)在此补。
-        var run_opts = session_service.buildRunOptions(app, scoped_recall);
-        run_opts.pending_input = .{ .ctx = @ptrCast(&msg_queue), .hasPendingFn = &hasPendingRunInput };
-        // 宿主契约:主 REPL 是唯一消化 .backgrounded(下方尾声)并复位 flag 的宿主,
-        // 故 background_request 在此接——canonical 不带(见 buildRunOptions 注)。
-        run_opts.background_request = &app.background_request;
-        run_opts.request_gate = eval_request_gate;
-        run_opts.execution_boundary = if (run_control) |control| control.executionBoundary() else null;
-        run_opts.max_turns = maxTurnsFromEnv();
-        run_opts.cost_budget_usd = costBudgetFromEnv();
-        run_opts.execution_policy = eval_execution_policy;
-        run_opts.tool_observer = if (run_control) |control| control.observer() else null;
-        run_opts.project_rule_gate = if (run_control) |control| control.formalGate() else null;
+        evaluation.deinit();
+    };
+    var eval_ui: ui_backend_mod.UiBackend = if (eval_be) |*evaluation| evaluation.backend() else ui_be;
+    var eval_tee = tee_backend_mod.TeeBackend{ .primary = traced_be, .secondary = &eval_ui };
+    const eval_tee_ui = eval_tee.backend();
+    const effective_be: *const ui_backend_mod.UiBackend = if (eval_be != null) &eval_tee_ui else traced_be;
+
+    // 生成期键盘监听:仅 tty + 有 TuiBackend 时启动(回车入队 / Esc 中断 / 超时 tickSpinner)。
+    if (host.tty) {
+        if (tui_be) |*tb| try tb.startInput(host.stdin_fd, app, allocator);
+    }
+    // 权限弹窗 UI runner:有 TuiBackend 时注入到 per-session permission_ctx(终端接管路径:
+    // 停 watcher+持锁,不抢 fd0)。生成期结束统一清(defer),避免悬垂指向 tui_be 栈实例。
+    if (tui_be) |*tb| {
+        app.permission_ctx.ui_requester = .{ .ctx = @ptrCast(tb), .requestFn = &tui_backend_mod.TuiBackend.uiRequestTrampoline };
+    }
+    defer if (tui_be != null) {
+        app.permission_ctx.ui_requester = null;
+    };
+    // scoped 自动召回(一等公民 P1):按用户请求自动装配相关记忆到尾部(cache-safe,有命中才注入)。
+    const scoped_recall = if (kind != .prompt) null else if (app.kg) |*k| (scoped_recall_mod.build(allocator, k, &app.conversation, &app.abort, .{ .advisor = app.jevAdvisor() }) catch null) else null;
+    defer if (scoped_recall) |s| allocator.free(s);
+    // 会话根目录跟着改名走:这里是唯一向用户说一句的地方(buildRunOptions 里的再次调用是 no-op)。
+    switch (app.refreshWorkspaceRoot()) {
+        .unchanged => {},
+        .renamed => |now| cmd_output.print("working directory was renamed; now {s}\n", .{now}),
+        .missing => if (!app.root_missing_warned) {
+            app.root_missing_warned = true;
+            cmd_output.print("working directory {s} no longer exists; shell commands will fail until it is restored\n", .{app.cwdAbs()});
+        },
+    }
+    // U11:App 可导出字段统一走 canonical buildRunOptions(五处前端装配漂移的收敛点);
+    // 宿主专属字段(eval gate/policy、run_control 三件套、预算、UI requester、心跳)在此补。
+    var run_opts = session_service.buildRunOptions(app, if (kind == .prompt) scoped_recall else synthetic_user_input);
+    run_opts.pending_input = .{ .ctx = @ptrCast(host.msg_queue), .hasPendingFn = &hasPendingRunInput };
+    // 宿主契约:主 REPL 是唯一消化 .backgrounded(下方尾声)并复位 flag 的宿主,
+    // 故 background_request 在此接——canonical 不带(见 buildRunOptions 注)。
+    run_opts.background_request = &app.background_request;
+    run_opts.request_gate = eval_request_gate;
+    run_opts.execution_boundary = if (run_control) |control| control.executionBoundary() else null;
+    run_opts.max_turns = maxTurnsFromEnv();
+    run_opts.cost_budget_usd = costBudgetFromEnv();
+    run_opts.execution_policy = if (kind == .prompt) host.eval_execution_policy else null;
+    run_opts.tool_observer = if (run_control) |control| control.observer() else null;
+    run_opts.project_rule_gate = if (run_control) |control| control.formalGate() else null;
+    var integrity_report = test_integrity_mod.Report.init(allocator);
+    defer integrity_report.deinit();
+    if (kind == .prompt) {
         // Delivery-cadence obligation: the REPL honours the same flags as
         // headless so a scripted (non-tty) session measures what a print-mode
         // run measures. Primary run only: canonical buildRunOptions excludes
@@ -848,155 +935,151 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
         };
         // Test integrity: primary run only, same host-contract shape. The end
         // state is printed after the run whatever the model did.
-        var integrity_report = test_integrity_mod.Report.init(allocator);
-        defer integrity_report.deinit();
         run_opts.test_integrity = test_integrity_mod.optionsFromFlags(app.config.test_integrity, app.config.test_integrity_observe);
         if (run_opts.test_integrity) |*integrity| integrity.report = &integrity_report;
-        run_opts.ui_requester = if (tui_be) |*tb| .{ .ctx = @as(*anyopaque, @ptrCast(tb)), .requestFn = &tui_backend_mod.TuiBackend.uiRequestTrampoline } else null;
-        run_opts.spawn_tick_fn = spawn_tick;
-        // issue #16:turn 边界刷新 OAuth access token。commit 时拷的是当时有效的
-        // 那个;会话跑过期后继续用它就会开始 401——看起来像密钥坏了。单飞在
-        // provider/oauth.zig 里,并发 turn 仍只换一次。
-        _ = app.refreshRouteCredential() catch |err| blk: {
-            if (err == error.RefreshRejected and
-                std.ascii.eqlIgnoreCase(app.config.provider_profile orelse "", "metask"))
-            {
-                std.debug.print(
-                    "\x1b[33mwarning: the provider OAuth refresh was rejected; " ++
-                        "run `metacodes login --provider metask` to log in again\x1b[0m\n",
-                    .{},
-                );
-            } else {
-                std.debug.print(
-                    "\x1b[33mwarning: could not refresh the provider credential ({s}); " ++
-                        "continuing with the current one\x1b[0m\n",
-                    .{@errorName(err)},
-                );
-            }
-            break :blk false;
-        };
+    }
+    run_opts.ui_requester = if (tui_be) |*tb| .{ .ctx = @as(*anyopaque, @ptrCast(tb)), .requestFn = &tui_backend_mod.TuiBackend.uiRequestTrampoline } else null;
+    run_opts.spawn_tick_fn = host.spawn_tick;
+    // issue #16:turn 边界刷新 OAuth access token。commit 时拷的是当时有效的
+    // 那个;会话跑过期后继续用它就会开始 401——看起来像密钥坏了。单飞在
+    // provider/oauth.zig 里,并发 turn 仍只换一次。
+    _ = app.refreshRouteCredential() catch |err| blk: {
+        if (err == error.RefreshRejected and
+            std.ascii.eqlIgnoreCase(app.config.provider_profile orelse "", "metask"))
+        {
+            cmd_output.print(
+                "\x1b[33mwarning: the provider OAuth refresh was rejected; " ++
+                    "run `metacodes login --provider metask` to log in again\x1b[0m\n",
+                .{},
+            );
+        } else {
+            cmd_output.print(
+                "\x1b[33mwarning: could not refresh the provider credential ({s}); " ++
+                    "continuing with the current one\x1b[0m\n",
+                .{@errorName(err)},
+            );
+        }
+        break :blk false;
+    };
 
-        const result = agent_loop.run(
-            &app.conversation,
-            app.provider(),
-            app.tool_defs,
-            &app.permission_ctx,
-            run_opts,
-            effective_be,
-            allocator,
-        ) catch |err| {
-            if (run_control) |control| try control.finishRun(@errorName(err));
-            // 停 watcher + 清 stdin 缓冲
-            if (tui_be) |*tb| tb.stopInput();
-            if (gen_region) |r| leaveGenerationRegion(app, r);
-            if (tty) terminal_title.setFromApp(app, .idle); // tab:回空闲
-            if (tty) drainStdin(stdin_fd);
-            app.clearPendingModelSwitchCompact();
-            std.debug.print("\x1b[31mError: {s}\x1b[0m\n", .{@errorName(err)});
-            continue;
-        };
-        if (run_control) |control| try control.finishRun(@tagName(result.stop_reason));
-        app.clearPendingModelSwitchCompact();
-        stopLoopIfGoalLimited(app);
-        // 停 watcher + 清 stdin 缓冲（生成期间用户可能误按的键，别污染下一轮）
+    const result = agent_loop.run(
+        &app.conversation,
+        app.provider(),
+        app.tool_defs,
+        &app.permission_ctx,
+        run_opts,
+        effective_be,
+        allocator,
+    ) catch |err| {
+        if (run_control) |control| try control.finishRun(@errorName(err));
+        // 停 watcher + 清 stdin 缓冲
         if (tui_be) |*tb| tb.stopInput();
         if (gen_region) |r| leaveGenerationRegion(app, r);
-        if (tty) terminal_title.setFromApp(app, .idle); // tab:回空闲
-        if (tty) drainStdin(stdin_fd);
+        if (host.tty) terminal_title.setFromApp(app, .idle); // tab:回空闲
+        if (host.tty) drainStdin(host.stdin_fd);
+        app.clearPendingModelSwitchCompact();
+        cmd_output.print("\x1b[31mError: {s}\x1b[0m\n", .{@errorName(err)});
+        return;
+    };
+    if (run_control) |control| try control.finishRun(@tagName(result.stop_reason));
+    app.clearPendingModelSwitchCompact();
+    stopLoopIfGoalLimited(app);
+    // 停 watcher + 清 stdin 缓冲（生成期间用户可能误按的键，别污染下一轮）
+    if (tui_be) |*tb| tb.stopInput();
+    if (gen_region) |r| leaveGenerationRegion(app, r);
+    if (host.tty) terminal_title.setFromApp(app, .idle); // tab:回空闲
+    if (host.tty) drainStdin(host.stdin_fd);
 
-        // 每轮结束 flush transcript（含错误 / abort 路径；只要有变动都想落盘）
-        app.persistTranscript();
+    // 每轮结束 flush transcript（含错误 / abort 路径；只要有变动都想落盘）
+    app.persistTranscript();
 
-        // Test integrity: tests that existed before the run were rewritten,
-        // deleted or disabled — the user hears it from the host, not only
-        // from the model's own account.
-        if (integrity_report.renderNotice(allocator) catch null) |notice| {
+    // Test integrity: tests that existed before the run were rewritten,
+    // deleted or disabled — the user hears it from the host, not only
+    // from the model's own account.
+    if (integrity_report.renderNotice(allocator) catch null) |notice| {
+        defer allocator.free(notice);
+        cmd_output.print("\x1b[33m{s}\x1b[0m\n", .{notice});
+    }
+
+    // issue #16:把本轮新增的控制面**决策**投影进 TinyKG 审计面。turn 边界,
+    // 不在请求路径上;审计面不可用只记账,不影响路由。
+    _ = app.auditProviderDecisions();
+
+    // L3:挂起 → 落 suspend.json + 提示恢复方式。释放 suspend_info(owned)。
+    if (result.suspend_info) |si| {
+        defer si.deinit();
+        if (app.sessionDir()) |dir| {
+            const suspend_state = @import("../core/suspend_state.zig");
+            suspend_state.writeFromSuspendInfo(dir, si, allocator) catch {};
+            cmd_output.print("\x1b[36m⏸ Suspended (kind={s}) — resume from: {s}\x1b[0m\n", .{ si.kind, dir });
+        }
+    }
+
+    // U2 S2:删掉 config←ctx sync-back hack。permission_mode 单一源=permission_ctx.mode,
+    // footer/border/statusline 都读 app.permMode()(=ctx),工具改 ctx 即时反映,无需回同步。
+    // (旧版双存储靠此 hack 补,web 侧漏了它→/state 陈旧 bug task#14;单一源后根治。)
+
+    if (app.abort.reason() == .evaluation_budget)
+        return error.EvaluationBudgetExhausted;
+
+    if (result.stop_reason == .aborted) printInterrupted(app);
+    // 无条件复位,不看 stop_reason:标志由 SIGINT/Esc 在生成期置位,run 一结束就该清。
+    // 只在 .aborted 时复位的旧逻辑在"^C 被归为 api_error"时留下残留标志,下一次 run
+    // (排队消息)开跑即被吞掉。evaluation_budget 在上面已经 return,不会走到这里。
+    app.abort.reset();
+
+    // 撞 backstop(防呆兜底,非防跑飞主闸):非静默 + 续接出口,不自动续(把"是否失控"
+    // 交给唯一持全局意图的人——对齐 codex 只在有 pending 输入才续)。
+    if (result.stop_reason == .max_turns) {
+        const bd = toolCallBreakdown(app, allocator);
+        defer if (bd) |b| allocator.free(b);
+        cmd_output.print("\x1b[33mStopped after {d} turns ({d} tool calls); the task may be unfinished.\x1b[0m\n", .{ result.turns, result.tool_calls });
+        if (bd) |b| cmd_output.print("\x1b[33m  Tool calls: {s}\x1b[0m\n", .{b});
+        cmd_output.print("\x1b[33mType your next step to continue, or change direction.\x1b[0m\n", .{});
+    }
+    // 熔断停止(环境故障累计达 MAX_ENVIRONMENT_FAULTS,或插件契约 fail-closed):原因已在
+    // 上方逐条打印,这里只说明"为什么停、怎么续",不再复述。
+    if (result.stop_reason == .tool_loop) {
+        cmd_output.print("\x1b[33mStopped: repeated tool failures (see above). Fix the cause, then type your next step.\x1b[0m\n", .{});
+    }
+    // 无进展停止(stall gate):连续几轮工具调用没带回任何新结果。说清证据和续接方式;
+    // 对话完整保留,下一句输入即续接。
+    if (result.stall) |report| {
+        if (stall_gate_mod.renderStopNotice(allocator, report)) |notice| {
             defer allocator.free(notice);
-            std.debug.print("\x1b[33m{s}\x1b[0m\n", .{notice});
+            cmd_output.print("\x1b[33m{s}\x1b[0m\n", .{notice});
+        } else |_| cmd_output.print("\x1b[33mStopped: several turns of tool calls brought back nothing new. Type your next step to continue.\x1b[0m\n", .{});
+    }
+    // 模型 API 撞墙:带真实错误现场告知(HTTP 状态 + body 摘要),不许塌缩成猜谜文案——
+    // 2026-07-12 NUL 字节 bug 排障靠抓包才看到 "Failed to parse request body" 的教训。
+    if (result.stop_reason == .api_error) {
+        const last_error = @import("../api/last_error.zig");
+        var detail_buf: [last_error.SUMMARY_BUF_LEN]u8 = undefined;
+        if (last_error.take(&detail_buf)) |detail| {
+            cmd_output.print("\x1b[31mAPI request failed; the turn stopped.\n  {s}\nRetry with /retry, or switch models or compact the context first.\x1b[0m\n", .{detail});
+        } else {
+            cmd_output.print("\x1b[31mAPI request failed (retries exhausted, server error, or context too long); the turn stopped.\nRetry with /retry, or switch models or compact the context first.\x1b[0m\n", .{});
         }
+    }
+    // 工具不可恢复错误撞墙:明确告知,非静默。
+    if (result.stop_reason == .tool_error) {
+        cmd_output.print("\x1b[31mA tool failed in a way that cannot be retried; the turn stopped. See the error above.\x1b[0m\n", .{});
+    }
+    // 成本预算撞墙(次闸):明确告知累计成本,非静默,不自动续——由用户决定是否继续烧钱。
+    if (result.stop_reason == .budget) {
+        cmd_output.print("\x1b[33mCost budget reached (${d:.4} this session); the turn stopped.\nType your next step to continue, or raise METACODES_COST_BUDGET.\x1b[0m\n", .{app.usage.costUsd(app.activeModel())});
+    }
 
-        // issue #16:把本轮新增的控制面**决策**投影进 TinyKG 审计面。turn 边界,
-        // 不在请求路径上;审计面不可用只记账,不影响路由。
-        _ = app.auditProviderDecisions();
-
-        // L3:挂起 → 落 suspend.json + 提示恢复方式。释放 suspend_info(owned)。
-        if (result.suspend_info) |si| {
-            defer si.deinit();
-            if (app.sessionDir()) |dir| {
-                const suspend_state = @import("../core/suspend_state.zig");
-                suspend_state.writeFromSuspendInfo(dir, si, allocator) catch {};
-                std.debug.print("\x1b[36m⏸ Suspended (kind={s}) — resume from: {s}\x1b[0m\n", .{ si.kind, dir });
-            }
-        }
-
-        // U2 S2:删掉 config←ctx sync-back hack。permission_mode 单一源=permission_ctx.mode,
-        // footer/border/statusline 都读 app.permMode()(=ctx),工具改 ctx 即时反映,无需回同步。
-        // (旧版双存储靠此 hack 补,web 侧漏了它→/state 陈旧 bug task#14;单一源后根治。)
-
-        if (app.abort.reason() == .evaluation_budget)
-            return error.EvaluationBudgetExhausted;
-
-        if (result.stop_reason == .aborted) {
-            std.debug.print("\x1b[33m^C (cancelled)\x1b[0m\n", .{});
-        }
-        // 无条件复位,不看 stop_reason:标志由 SIGINT/Esc 在生成期置位,run 一结束就该清。
-        // 只在 .aborted 时复位的旧逻辑在"^C 被归为 api_error"时留下残留标志,下一次 run
-        // (排队消息)开跑即被吞掉。evaluation_budget 在上面已经 return,不会走到这里。
-        app.abort.reset();
-
-        // 撞 backstop(防呆兜底,非防跑飞主闸):非静默 + 续接出口,不自动续(把"是否失控"
-        // 交给唯一持全局意图的人——对齐 codex 只在有 pending 输入才续)。
-        if (result.stop_reason == .max_turns) {
-            const bd = toolCallBreakdown(app, allocator);
-            defer if (bd) |b| allocator.free(b);
-            std.debug.print("\x1b[33m已达 {d} 轮上限(共 {d} 次工具调用)。任务可能未完成——这可能是合法长任务,也可能在原地打转。\x1b[0m\n", .{ result.turns, result.tool_calls });
-            if (bd) |b| std.debug.print("\x1b[33m  动作分布:{s}\x1b[0m\n", .{b});
-            std.debug.print("\x1b[33m直接输入你的下一步(如\"继续\")续接对话,或调整方向。\x1b[0m\n", .{});
-        }
-        // 熔断停止(环境故障累计达 MAX_ENVIRONMENT_FAULTS,或插件契约 fail-closed):原因已在
-        // 上方逐条打印,这里只说明"为什么停、怎么续",不再复述。
-        if (result.stop_reason == .tool_loop) {
-            std.debug.print("\x1b[33m运行已被熔断停止(tool_loop):原因见上方各条提示。处理好之后直接输入下一步续接。\x1b[0m\n", .{});
-        }
-        // 无进展停止(stall gate):连续几轮工具调用没带回任何新结果。说清证据和续接方式;
-        // 对话完整保留,下一句输入即续接。
-        if (result.stall) |report| {
-            if (stall_gate_mod.renderStopNotice(allocator, report)) |notice| {
-                defer allocator.free(notice);
-                std.debug.print("\x1b[33m{s}\x1b[0m\n", .{notice});
-            } else |_| std.debug.print("\x1b[33m运行已停止(stalled):连续多轮工具调用没有带回任何新结果。直接输入下一步续接。\x1b[0m\n", .{});
-        }
-        // 模型 API 撞墙:带真实错误现场告知(HTTP 状态 + body 摘要),不许塌缩成猜谜文案——
-        // 2026-07-12 NUL 字节 bug 排障靠抓包才看到 "Failed to parse request body" 的教训。
-        if (result.stop_reason == .api_error) {
-            const last_error = @import("../api/last_error.zig");
-            var detail_buf: [last_error.SUMMARY_BUF_LEN]u8 = undefined;
-            if (last_error.take(&detail_buf)) |detail| {
-                std.debug.print("\x1b[31m模型 API 请求失败,本轮中止。\n  {s}\n可直接重试,或换模型 / 精简上下文后继续。\x1b[0m\n", .{detail});
-            } else {
-                std.debug.print("\x1b[31m模型 API 请求失败(重试耗尽 / 后端错误 / 上下文超限),本轮中止。\n可直接重试,或换模型 / 精简上下文后继续。\x1b[0m\n", .{});
-            }
-        }
-        // 工具不可恢复错误撞墙:明确告知,非静默。
-        if (result.stop_reason == .tool_error) {
-            std.debug.print("\x1b[31m工具执行遇到不可恢复的错误,本轮中止。\n查看上方错误现场,调整后输入下一步可继续。\x1b[0m\n", .{});
-        }
-        // 成本预算撞墙(次闸):明确告知累计成本,非静默,不自动续——由用户决定是否继续烧钱。
-        if (result.stop_reason == .budget) {
-            std.debug.print("\x1b[33m已达成本预算上限(本会话累计 ${d:.4})。本轮中止——由你决定是否继续。\n直接输入\"继续\"可续接,或调高 METACODES_COST_BUDGET / 调整方向。\x1b[0m\n", .{app.usage.costUsd(app.activeModel())});
-        }
-
-        // Ctrl+B 转后台:turn 边界返回 .backgrounded。深拷贝当前对话 → spawnBackground 续跑 →
-        // 成功才 reset 前台开新会话。顺序铁律:先 clone 再 spawn 再 reset(失败不 reset,保留对话重试)。
-        if (result.stop_reason == .backgrounded) {
-            app.background_request.store(false, .monotonic); // 复位信号(否则下一轮 run 立即又转后台)
-            if (run_control != null and run_control.?.project_gate != null) {
-                std.debug.print("\x1b[33m项目形式化规则已启用；当前版本拒绝把受治理 Run 转为脱离 journal 生命周期的后台任务。\x1b[0m\n", .{});
-            } else {
-                backgroundCurrentSession(app) catch |err| {
-                    std.debug.print("\x1b[31m转后台失败: {s}(对话保留前台)\x1b[0m\n", .{@errorName(err)});
-                };
-            }
+    // Ctrl+B 转后台:turn 边界返回 .backgrounded。深拷贝当前对话 → spawnBackground 续跑 →
+    // 成功才 reset 前台开新会话。顺序铁律:先 clone 再 spawn 再 reset(失败不 reset,保留对话重试)。
+    if (result.stop_reason == .backgrounded) {
+        app.background_request.store(false, .monotonic); // 复位信号(否则下一轮 run 立即又转后台)
+        if (run_control != null and run_control.?.project_gate != null) {
+            cmd_output.print("\x1b[33mProject rules are active; a governed turn cannot move to the background.\x1b[0m\n", .{});
+        } else {
+            backgroundCurrentSession(app) catch |err| {
+                cmd_output.print("\x1b[31mCould not move to the background: {s}. The conversation stays here.\x1b[0m\n", .{@errorName(err)});
+            };
         }
     }
 }
@@ -1068,7 +1151,7 @@ fn backgroundCurrentSession(app: *app_mod.App) !void {
     // The job stays in the old session; the new foreground keeps it in its
     // agent scope (App.completeHandOff, #219).
     app.completeHandOff();
-    std.debug.print("\x1b[36m⤳ 已转后台续跑(agent tree 可见进度);前台开新会话\x1b[0m\n", .{});
+    cmd_output.print("\x1b[36m⤳ Running in the background (see the agent list); this is a new session.\x1b[0m\n", .{});
 }
 
 /// 取对话首个 user text block 首句(截断 80),供 agent tree 标题。空对话返 "main session"。
@@ -1117,12 +1200,6 @@ fn readLineBuffered(allocator: std.mem.Allocator) ![]u8 {
     return r;
 }
 
-/// tty raw mode 下的行编辑器主循环：按键驱动 LineEditor，支持历史 ↑↓。
-/// 返回提交的行（owned，caller free）。
-/// - Ctrl+C (buffer 非空) → error.Cancelled（清 buffer 回 prompt）
-/// - Ctrl+C (buffer 空，首次) → 打印提示，留在同一行继续等输入
-/// - Ctrl+C (buffer 空，连续第二次) → error.ExitRequested（退出 REPL）
-/// - Ctrl+D (buffer 空) → error.Eof（退出 REPL）
 /// 处理一次括号粘贴：从 paste_begin 之后读到 paste_end，累积原始文本。
 /// 小粘贴内联插入；大粘贴存 ~/.metacodes/pastes/<N>.txt 并插入占位符。
 fn handlePaste(
@@ -1226,21 +1303,127 @@ fn leaveGenerationRegion(app: *app_mod.App, region: *render_region_mod.RenderReg
 
 /// 把提交的输入回显到 scrollback(复刻 Claude Code:提交后历史里留 "❯ <内容>")。
 /// 多行内容续行对齐 2 空格;空输入只打一个换行。commit 路径 + carryover 自动提交共用。
+/// A `/command` line is not echoed here: the command's result block holds the
+/// echo back (`beginCommandBlock`) so an unknown command can replace it.
 fn echoUserSubmission(app: *app_mod.App, submitted: []const u8, region: ?*render_region_mod.RenderRegion) void {
+    if (isSlashCommandLine(submitted)) return;
+    const echo = renderEcho(app, submitted) orelse return;
+    defer std.heap.c_allocator.free(echo);
+    if (region) |r| r.emitScrollback(echo) else cmd_output.print("{s}", .{echo});
+}
+
+/// The `❯ <text>` scrollback line for a submission (owned by c_allocator).
+fn renderEcho(app: *const app_mod.App, submitted: []const u8) ?[]u8 {
     // 排版(软折 + 2 列悬挂缩进)在 user_echo.zig,与 TuiBackend 在 turn 边界消费队列时的回显同源。
     const th = app.theme;
     const cols: usize = if (tui_term_root.getSize(1)) |s| s.cols else 80;
     var out = std.ArrayList(u8).empty;
-    defer out.deinit(std.heap.c_allocator);
     user_echo.render(&out, std.heap.c_allocator, th.accent, th.reset, cols, submitted) catch {
-        const fallback = std.fmt.allocPrint(std.heap.c_allocator, "{s}❯{s} {s}\n", .{ th.accent, th.reset, submitted }) catch return;
-        defer std.heap.c_allocator.free(fallback);
-        if (region) |r| r.emitScrollback(fallback) else std.debug.print("{s}", .{fallback});
-        return;
+        out.deinit(std.heap.c_allocator);
+        return std.fmt.allocPrint(std.heap.c_allocator, "{s}❯{s} {s}\n", .{ th.accent, th.reset, submitted }) catch null;
     };
-    if (region) |r| r.emitScrollback(out.items) else std.debug.print("{s}", .{out.items});
+    return out.toOwnedSlice(std.heap.c_allocator) catch {
+        out.deinit(std.heap.c_allocator);
+        return null;
+    };
 }
 
+/// A submission the REPL treats as a `/command` (built-in or Skill) rather
+/// than a prompt: `/` then a valid invocation name. `/usr/bin/env` is a prompt.
+fn isSlashCommandLine(line: []const u8) bool {
+    const trimmed = std.mem.trim(u8, line, " \t\r\n");
+    if (trimmed.len < 2 or trimmed[0] != '/') return false;
+    return switch (skill_cli_adapter.parseSlashSyntax(trimmed[1..])) {
+        .command => true,
+        .not_a_command => false,
+    };
+}
+
+/// The `/` catalog for this session: built-ins, then user-invocable Skills
+/// labelled with their tier. Entries live in `arena`.
+fn slashCatalog(arena: std.mem.Allocator, app: *const app_mod.App) complete.SlashCatalog {
+    const base = complete.buildSlashCatalog(arena, app.skills.skills.items) catch return .builtin;
+    var entries = std.ArrayList(complete.SlashCmd).initCapacity(arena, base.entries.len) catch return base;
+    for (base.entries) |cmd| {
+        var entry = cmd;
+        if (entry.kind == .skill) {
+            const name = entry.name[1..];
+            // A Skill `skillOverrides` turns off leaves the menu (Claude Code).
+            if (!app.skill_runtime.overrideState(name).userInvocable()) continue;
+            if (app.skill_runtime.findRecord(name)) |record| entry.source = dialogs.scopeName(record.source_scope);
+        }
+        entries.appendAssumeCapacity(entry);
+    }
+    return .{ .entries = entries.items };
+}
+
+/// Open the result block of a `/command`. A built-in's echo is written at
+/// once (a command that waits on the model or a subprocess must not leave the
+/// screen blank); any other name's echo is held until it proves to be a Skill,
+/// since an unknown command is reported in its place.
+fn beginCommandBlock(app: *const app_mod.App, line: []const u8) void {
+    const cols: usize = if (tui_term_root.getSize(1)) |s| s.cols else 80;
+    // An empty line: the echo is already on screen (bash mode).
+    const echo = if (line.len == 0) null else renderEcho(app, line);
+    defer if (echo) |bytes| std.heap.c_allocator.free(bytes);
+    cmd_output.begin(cols, app.theme.dim, app.theme.reset, app.theme.gutter, echo orelse "");
+    const trimmed = std.mem.trim(u8, line, " \t\r\n");
+    const head_end = std.mem.indexOfAny(u8, trimmed, " \t") orelse trimmed.len;
+    if (complete.isBuiltinCommand(trimmed[0..head_end])) cmd_output.flushEcho();
+}
+
+/// `⏺ Unknown command: /foo. Did you mean /loop?` in place of the command's
+/// echo (Claude Code).
+fn reportUnknownCommand(app: *const app_mod.App, line: []const u8) void {
+    const th = app.theme;
+    const trimmed = std.mem.trim(u8, line, " \t\r\n");
+    const head_end = std.mem.indexOfAny(u8, trimmed, " \t") orelse trimmed.len;
+    const head = trimmed[0..head_end];
+    cmd_output.dropEcho();
+    cmd_output.end();
+    var arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+    defer arena.deinit();
+    const catalog = slashCatalog(arena.allocator(), app);
+    const text = if (complete.closestCommand(catalog, head)) |suggestion|
+        std.fmt.allocPrint(arena.allocator(), "Unknown command: {s}. Did you mean {s}?", .{ head, suggestion })
+    else
+        std.fmt.allocPrint(arena.allocator(), "Unknown command: {s}", .{head});
+    printNotice(app, th.warn, text catch head);
+}
+
+/// `/name` of a Skill `skillOverrides` turns off, in place of the echo, in
+/// Claude Code's words (interactive and non-interactive).
+fn reportSkillDisabled(app: *const app_mod.App, line: []const u8, interactive: bool) void {
+    const trimmed = std.mem.trim(u8, line, " \t\r\n");
+    const head_end = std.mem.indexOfAny(u8, trimmed, " \t") orelse trimmed.len;
+    const name = std.mem.trimStart(u8, trimmed[0..head_end], "/");
+    cmd_output.dropEcho();
+    cmd_output.end();
+    var buf: [512]u8 = undefined;
+    const text = std.fmt.bufPrint(&buf, "Skill \"{s}\" is disabled via skillOverrides. {s}", .{
+        name,
+        if (interactive)
+            "Re-enable it in /skills or remove the override from your settings to run it."
+        else
+            "Remove the override from your settings to run it.",
+    }) catch "Skill is disabled via skillOverrides.";
+    printNotice(app, app.theme.warn, text);
+}
+
+fn printNotice(app: *const app_mod.App, color: []const u8, text: []const u8) void {
+    const th = app.theme;
+    var marker_buf: [96]u8 = undefined;
+    const marker = std.fmt.bufPrint(&marker_buf, "{s}{s}{s}", .{ color, th.icon_act, th.reset }) catch th.icon_act;
+    const cols: usize = if (tui_term_root.getSize(1)) |size| size.cols else 80;
+    cmd_output.notice(cols, marker, text);
+}
+
+/// tty raw mode 下的行编辑器主循环：按键驱动 LineEditor，支持历史 ↑↓。
+/// 返回提交的行（owned，caller free）。Exit and clear keys follow Claude
+/// Code's double press (`ui.dispatch`, `UiState.press`): Ctrl+C, or Ctrl+D on
+/// an empty prompt, twice inside 800 ms → error.ExitRequested; the first
+/// Ctrl+C also discards the draft; Esc twice clears the draft into history.
+/// The first press only shows a hint, and nothing reaches the scrollback.
 fn readLineRaw(
     fd: c_int,
     allocator: std.mem.Allocator,
@@ -1275,7 +1458,7 @@ fn readLineRaw(
     // 出命令与 skill)。每次读取重建:skill catalog 可能已重载,构建成本只是几十个借用切片。
     var slash_arena = std.heap.ArenaAllocator.init(allocator);
     defer slash_arena.deinit();
-    region.ui.slash_catalog = complete.buildSlashCatalog(slash_arena.allocator(), app.skills.skills.items) catch .builtin;
+    region.ui.slash_catalog = slashCatalog(slash_arena.allocator(), app);
     // 终端 resize 监听:SIGWINCH → 下次 poll 超时时重画自适应。
     g_winch.store(false, .release);
     installSigwinch();
@@ -1311,6 +1494,8 @@ fn readLineRaw(
         },
     }
 
+    // Sign-ins cancelled mid-request have usually settled by now.
+    app.reapLoginWorkers();
     // 初始画一个空输入框。
     region.setInput(editor.view(), editor.cursor);
     region.render(app);
@@ -1341,6 +1526,8 @@ fn readLineRaw(
             const rc = platform_term.waitReadable(fd, 200); // 可移植:200ms 超时等可读
             // 一个周期没有输入 = 输入静默过:此后的 Ctrl+O 不再算上一串的连发(Ctrl+O 去抖)。
             if (rc == 0) region.noteInputIdle();
+            // A double-press window that ran out takes its hint with it.
+            if (rc <= 0 and region.expirePress(util_time.nowMs())) redraw(region, &editor, app);
             if (rc <= 0) {
                 // 超时/EINTR:若 parser 卡在 esc_seen(收到孤立 ESC 等后续字节),
                 // 此时无后续字节到来 → 兑现为 .esc(否则 Esc 永远到不了 dispatch/editor)。
@@ -1419,12 +1606,26 @@ fn readLineRaw(
 
         // 阶段1:overlay 分流(? help / Ctrl+O transcript)。非 vim 模式才介入。
         // dispatch 判断"空 buffer + ?"依赖 editor 投影,调前同步。
-        if (!app.config.vim_mode) {
+        // vim mode keeps its own keymap, but the exit keys go through the same
+        // double-press state as everywhere else.
+        if (!app.config.vim_mode or key == .ctrl_c or key == .ctrl_d) {
             region.ui.editor = .{ .view = editor.view(), .cursor = editor.cursor };
-            const eff = region.applyEvent(app, &app.conversation, .{ .key = .{ .key = key } });
+            const eff = region.applyEvent(app, &app.conversation, .{ .key = .{ .key = key, .now_ms = util_time.nowMs() } });
             switch (eff.action) {
                 .pass_to_editor => {}, // 落到下面正常编辑
                 .none, .commit, .cancel, .exit => continue, // overlay 消费了(已重画),不喂 editor
+                .exit_prompt => return error.ExitRequested,
+                .discard_draft => {
+                    editor.reset();
+                    redraw(region, &editor, app);
+                    continue;
+                },
+                .clear_draft => {
+                    if (std.mem.trim(u8, editor.view(), " \t\r\n").len > 0) history.append(editor.view()) catch {};
+                    editor.reset();
+                    redraw(region, &editor, app);
+                    continue;
+                },
                 // ── 全局快捷键:dispatch 上抛 → 在此执行 IO 体(单一真相源:键解析全在 dispatch)──
                 // up/down:先试多行/软折【可视行】竖移(经 RenderRegion,它持 cols 算 inner_w);
                 // moved=false(光标已在首/末可视行)才回退历史导航。对齐真 cc v2.1.172。
@@ -1744,29 +1945,16 @@ fn readLineRaw(
         switch (action) {
             .redraw => redraw(region, &editor, app),
             .commit => {
+                // Enter on a blank prompt does nothing (Claude Code): no echo,
+                // no empty line in the scrollback, the draft stays.
+                if (std.mem.trim(u8, editor.view(), " \t\r\n").len == 0) continue;
                 region.setInput("", 0);
                 region.clear();
                 // 提交回显 ❯ <内容> 到 scrollback(否则提交后输入凭空消失)。
                 echoUserSubmission(app, editor.view(), region);
                 return try allocator.dupe(u8, editor.view());
             },
-            .cancel => return error.Cancelled,
-            .cancel_hint => {
-                // 第一次 Ctrl+C 且 buffer 空 — 提示再按一次退出(打到 scrollback,夹在 clear/render 间)
-                region.clear();
-                region.emitTerminal("\x1b[2m(再次按 Ctrl+C 退出 REPL)\x1b[0m\n");
-                redraw(region, &editor, app);
-            },
-            .exit_repl => return error.ExitRequested,
             .eof => return error.Eof,
-            .clear_draft => {
-                // 把当前 draft 存入历史(Up 可恢复),然后清空
-                if (editor.view().len > 0) {
-                    history.append(editor.view()) catch {};
-                }
-                editor.reset();
-                redraw(region, &editor, app);
-            },
             .none => {},
         }
     }
@@ -2069,10 +2257,10 @@ test "shellQuoteSingle: 元字符被单引号包死,不被 shell 拆(Linus #1)" 
 }
 
 fn printHistory(history: *const history_mod.History) void {
-    std.debug.print("History ({d} entries):\n", .{history.entries.items.len});
+    cmd_output.print("History ({d} entries):\n", .{history.entries.items.len});
     const start: usize = if (history.entries.items.len > 20) history.entries.items.len - 20 else 0;
     for (history.entries.items[start..], start..) |entry, i| {
-        std.debug.print("  {d}  {s}\n", .{ i + 1, entry });
+        cmd_output.print("  {d}  {s}\n", .{ i + 1, entry });
     }
 }
 
@@ -2094,22 +2282,22 @@ fn handleEffort(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u
         // 无参:显示当前
         const cur = app.provider().reasoningEffort();
         const cur_str = if (cur) |e| @tagName(e) else "default (none)";
-        std.debug.print("Current reasoning effort: {s}\n", .{cur_str});
-        std.debug.print("Usage: /effort <none|minimal|low|medium|high|xhigh>\n", .{});
+        cmd_output.print("Current reasoning effort: {s}\n", .{cur_str});
+        cmd_output.print("Usage: /effort <none|minimal|low|medium|high|xhigh>\n", .{});
         return;
     }
     const effort = types_mod.ReasoningEffort.parse(rest) orelse {
-        std.debug.print("\x1b[31minvalid effort '{s}'. Valid: none|minimal|low|medium|high|xhigh\x1b[0m\n", .{rest});
+        cmd_output.print("\x1b[31minvalid effort '{s}'. Valid: none|minimal|low|medium|high|xhigh\x1b[0m\n", .{rest});
         return;
     };
     // U11:设置经 service,渲染留此。
     var svc = session_service.SessionService.init(app);
     const o = svc.setReasoningEffort(effort);
     if (!o.ok) {
-        std.debug.print("\x1b[31m/effort failed: {s}\x1b[0m\n", .{o.data.err_name});
+        cmd_output.print("\x1b[31m/effort failed: {s}\x1b[0m\n", .{o.data.err_name});
         return;
     }
-    std.debug.print("reasoning effort set to {s}\n", .{@tagName(effort)});
+    cmd_output.print("reasoning effort set to {s}\n", .{@tagName(effort)});
 }
 
 fn handleOverridesCmd(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u8) !void {
@@ -2117,29 +2305,29 @@ fn handleOverridesCmd(app: *app_mod.App, allocator: std.mem.Allocator, rest: []c
     if (rest.len == 0) {
         // 无参:显示当前所有 overrides
         const o = app.provider().requestOverrides();
-        std.debug.print("Request overrides:\n", .{});
-        std.debug.print("  temperature: {s}\n", .{fmtOptF32(o.temperature)});
-        std.debug.print("  top_p:       {s}\n", .{fmtOptF32(o.top_p)});
-        std.debug.print("  prompt_cache_key: {s}\n", .{fmtOptStr(o.prompt_cache_key)});
-        std.debug.print("  parallel_tool_calls: {s}\n", .{fmtOptBool(o.parallel_tool_calls)});
+        cmd_output.print("Request overrides:\n", .{});
+        cmd_output.print("  temperature: {s}\n", .{fmtOptF32(o.temperature)});
+        cmd_output.print("  top_p:       {s}\n", .{fmtOptF32(o.top_p)});
+        cmd_output.print("  prompt_cache_key: {s}\n", .{fmtOptStr(o.prompt_cache_key)});
+        cmd_output.print("  parallel_tool_calls: {s}\n", .{fmtOptBool(o.parallel_tool_calls)});
         const rf_str = if (o.response_format) |rf| switch (rf.kind) {
             .json_object => "json_object",
             .json_schema => "json_schema",
             .none => "none",
         } else "(none)";
-        std.debug.print("  response_format: {s}\n", .{rf_str});
-        std.debug.print("Usage: /overrides <field> <value> | clear\n", .{});
-        std.debug.print("  fields: temperature, top_p, prompt_cache_key, parallel_tool_calls, response_format\n", .{});
+        cmd_output.print("  response_format: {s}\n", .{rf_str});
+        cmd_output.print("Usage: /overrides <field> <value> | clear\n", .{});
+        cmd_output.print("  fields: temperature, top_p, prompt_cache_key, parallel_tool_calls, response_format\n", .{});
         return;
     }
     if (std.mem.eql(u8, rest, "clear")) {
         app.clearRequestOverrides();
-        std.debug.print("All overrides cleared.\n", .{});
+        cmd_output.print("All overrides cleared.\n", .{});
         return;
     }
     // /overrides <field> <value>
     const space = std.mem.indexOfScalar(u8, rest, ' ') orelse {
-        std.debug.print("\x1b[31musage: /overrides <field> <value>\x1b[0m\n", .{});
+        cmd_output.print("\x1b[31musage: /overrides <field> <value>\x1b[0m\n", .{});
         return;
     };
     const field = rest[0..space];
@@ -2147,12 +2335,12 @@ fn handleOverridesCmd(app: *app_mod.App, allocator: std.mem.Allocator, rest: []c
     var ov = app.provider().requestOverrides();
     if (std.mem.eql(u8, field, "temperature")) {
         ov.temperature = std.fmt.parseFloat(f32, value) catch {
-            std.debug.print("\x1b[31minvalid float: {s}\x1b[0m\n", .{value});
+            cmd_output.print("\x1b[31minvalid float: {s}\x1b[0m\n", .{value});
             return;
         };
     } else if (std.mem.eql(u8, field, "top_p")) {
         ov.top_p = std.fmt.parseFloat(f32, value) catch {
-            std.debug.print("\x1b[31minvalid float: {s}\x1b[0m\n", .{value});
+            cmd_output.print("\x1b[31minvalid float: {s}\x1b[0m\n", .{value});
             return;
         };
     } else if (std.mem.eql(u8, field, "prompt_cache_key")) {
@@ -2163,7 +2351,7 @@ fn handleOverridesCmd(app: *app_mod.App, allocator: std.mem.Allocator, rest: []c
         } else if (std.mem.eql(u8, value, "false") or std.mem.eql(u8, value, "0")) {
             ov.parallel_tool_calls = false;
         } else {
-            std.debug.print("\x1b[31minvalid bool: {s} (true|false)\x1b[0m\n", .{value});
+            cmd_output.print("\x1b[31minvalid bool: {s} (true|false)\x1b[0m\n", .{value});
             return;
         }
     } else if (std.mem.eql(u8, field, "response_format")) {
@@ -2172,19 +2360,19 @@ fn handleOverridesCmd(app: *app_mod.App, allocator: std.mem.Allocator, rest: []c
         else if (std.mem.eql(u8, value, "json_schema"))
             .{ .kind = .json_schema, .schema = null }
         else {
-            std.debug.print("\x1b[31minvalid response_format: {s} (json_object|json_schema)\x1b[0m\n", .{value});
+            cmd_output.print("\x1b[31minvalid response_format: {s} (json_object|json_schema)\x1b[0m\n", .{value});
             return;
         };
         ov.response_format = rf;
     } else {
-        std.debug.print("\x1b[31munknown field: {s}. Valid: temperature, top_p, prompt_cache_key, parallel_tool_calls, response_format\x1b[0m\n", .{field});
+        cmd_output.print("\x1b[31munknown field: {s}. Valid: temperature, top_p, prompt_cache_key, parallel_tool_calls, response_format\x1b[0m\n", .{field});
         return;
     }
     app.setRequestOverrides(ov) catch |err| {
-        std.debug.print("\x1b[31m/overrides failed (provider may not support dialect fields): {s}\x1b[0m\n", .{@errorName(err)});
+        cmd_output.print("\x1b[31m/overrides failed (provider may not support dialect fields): {s}\x1b[0m\n", .{@errorName(err)});
         return;
     };
-    std.debug.print("{s} set to {s}\n", .{ field, value });
+    cmd_output.print("{s} set to {s}\n", .{ field, value });
 }
 
 fn fmtOptF32(v: ?f32) []const u8 {
@@ -2214,7 +2402,7 @@ fn handleModel(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u8
         },
         .group => |group| {
             if (group.len == 0) {
-                std.debug.print("usage: /model group <anthropic|opus|sonnet|haiku|openai|gemini>\n", .{});
+                cmd_output.print("usage: /model group <anthropic|opus|sonnet|haiku|openai|gemini>\n", .{});
                 return;
             }
             printModelList(app, candidates, group, null);
@@ -2225,13 +2413,13 @@ fn handleModel(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u8
             return;
         },
         .unknown => |value| {
-            std.debug.print("\x1b[31munknown /model selector: {s}\x1b[0m\n", .{value});
+            cmd_output.print("\x1b[31munknown /model selector: {s}\x1b[0m\n", .{value});
             printModelHelp();
             return;
         },
         .use_model => |target_raw| {
             if (target_raw.len == 0) {
-                std.debug.print("usage: /model use <model-id>\n", .{});
+                cmd_output.print("usage: /model use <model-id>\n", .{});
                 return;
             }
             const resolved = @import("../tools/agent.zig").resolveModelSelection(
@@ -2244,26 +2432,26 @@ fn handleModel(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u8
             // another region — and it refuses to guess between them.
             switch (picker_host.useSelector(app, resolved)) {
                 .switched => {
-                    std.debug.print("switched to \x1b[36m{s}\x1b[0m", .{app.activeModel()});
-                    if (app.config.reasoning_effort) |effort| std.debug.print(" reasoning={s}", .{app.api_client.catalog.effortLabelFor(app.activeModel(), effort)});
-                    std.debug.print(" (max_output={d})\n", .{app.provider().maxTokens()});
+                    cmd_output.print("switched to \x1b[36m{s}\x1b[0m", .{app.activeModel()});
+                    if (app.config.reasoning_effort) |effort| cmd_output.print(" reasoning={s}", .{app.api_client.catalog.effortLabelFor(app.activeModel(), effort)});
+                    cmd_output.print(" (max_output={d})\n", .{app.provider().maxTokens()});
                     return;
                 },
                 .ambiguous => |candidates_found| {
-                    std.debug.print(
+                    cmd_output.print(
                         "\x1b[33m'{s}' matches {d} routes; name one with /model use <offer-id> or pick it in /model:\x1b[0m\n",
                         .{ resolved, candidates_found.total },
                     );
                     for (candidates_found.ids[0..candidates_found.len]) |offer_id| {
-                        std.debug.print("  {s}\n", .{offer_id});
+                        cmd_output.print("  {s}\n", .{offer_id});
                     }
                     if (candidates_found.total > candidates_found.len) {
-                        std.debug.print("  … and {d} more\n", .{candidates_found.total - candidates_found.len});
+                        cmd_output.print("  … and {d} more\n", .{candidates_found.total - candidates_found.len});
                     }
                     return;
                 },
                 .failed => |why| {
-                    std.debug.print("\x1b[31mswitch refused: {s}\x1b[0m\n", .{why});
+                    cmd_output.print("\x1b[31mswitch refused: {s}\x1b[0m\n", .{why});
                     return;
                 },
                 // Not a declared offer: proxies and server-catalog models are
@@ -2277,7 +2465,7 @@ fn handleModel(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u8
 }
 
 fn printAliasHelp() void {
-    std.debug.print(
+    cmd_output.print(
         \\usage:
         \\  /alias                      list local aliases
         \\  /alias pin <name>           pin <name> to the route this session is on
@@ -2304,40 +2492,40 @@ fn handleAlias(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u8
     }
 
     var store = config_store.Store.initHome(allocator, app.stateRoot()) catch |err| {
-        std.debug.print("\x1b[31malias store unavailable: {s}\x1b[0m\n", .{@errorName(err)});
+        cmd_output.print("\x1b[31malias store unavailable: {s}\x1b[0m\n", .{@errorName(err)});
         return;
     };
     defer store.deinit();
 
     if (rest.len == 0) {
         var document = store.load() catch |err| {
-            std.debug.print("\x1b[31mcould not read the alias store: {s}\x1b[0m\n", .{@errorName(err)});
+            cmd_output.print("\x1b[31mcould not read the alias store: {s}\x1b[0m\n", .{@errorName(err)});
             return;
         };
         defer document.deinit();
         if (document.aliases.items.len == 0) {
-            std.debug.print("No aliases. `/alias pin <name>` names the route you are on.\n", .{});
+            cmd_output.print("No aliases. `/alias pin <name>` names the route you are on.\n", .{});
             return;
         }
         const host = app.providerHost() catch null;
         for (document.aliases.items) |entry| {
-            std.debug.print("  {s} [{s}]", .{ entry.name.slice(), @tagName(entry.policy) });
-            if (entry.selector) |selector| std.debug.print(" -> {s}", .{selector.slice()});
+            cmd_output.print("  {s} [{s}]", .{ entry.name.slice(), @tagName(entry.policy) });
+            if (entry.selector) |selector| cmd_output.print(" -> {s}", .{selector.slice()});
             if (host) |value| {
                 if (alias_mod.resolve(value.kernel.catalogSnapshot(), entry)) |resolution| {
                     const summary = value.kernel.modelDescribe(resolution.offer_id);
                     if (summary) |offer| {
-                        std.debug.print("  = {s}/{s} {s}", .{
+                        cmd_output.print("  = {s}/{s} {s}", .{
                             offer.provider_id.slice(),
                             offer.channel_id.slice(),
                             offer.request_model_id,
                         });
                     }
                 } else |err| {
-                    std.debug.print("  \x1b[33m({s})\x1b[0m", .{@errorName(err)});
+                    cmd_output.print("  \x1b[33m({s})\x1b[0m", .{@errorName(err)});
                 }
             }
-            std.debug.print("\n", .{});
+            cmd_output.print("\n", .{});
         }
         return;
     }
@@ -2350,15 +2538,15 @@ fn handleAlias(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u8
 
     if (std.mem.eql(u8, verb, "pin")) {
         const name = parts.next() orelse {
-            std.debug.print("usage: /alias pin <name>\n", .{});
+            cmd_output.print("usage: /alias pin <name>\n", .{});
             return;
         };
         const host = app.providerHost() catch |err| {
-            std.debug.print("\x1b[31mprovider control plane unavailable: {s}\x1b[0m\n", .{@errorName(err)});
+            cmd_output.print("\x1b[31mprovider control plane unavailable: {s}\x1b[0m\n", .{@errorName(err)});
             return;
         };
         const current = host.kernel.currentOfferId() orelse {
-            std.debug.print(
+            cmd_output.print(
                 "This session has no selected offer yet. Choose one with Ctrl+O, then pin it.\n",
                 .{},
             );
@@ -2366,7 +2554,7 @@ fn handleAlias(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u8
         };
         const summary = host.kernel.modelDescribe(current) orelse return;
         const pinned_name = config_doc.AliasName.parse(name) catch {
-            std.debug.print("\x1b[31malias name too long\x1b[0m\n", .{});
+            cmd_output.print("\x1b[31malias name too long\x1b[0m\n", .{});
             return;
         };
         _ = config_store.setAlias(&store, .{
@@ -2375,10 +2563,10 @@ fn handleAlias(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u8
             .offer_id = current,
             .offer_revision = summary.offer_revision,
         }, null, null) catch |err| {
-            std.debug.print("\x1b[31mcould not save the alias: {s}\x1b[0m\n", .{@errorName(err)});
+            cmd_output.print("\x1b[31mcould not save the alias: {s}\x1b[0m\n", .{@errorName(err)});
             return;
         };
-        std.debug.print("Pinned '{s}' to {s}/{s} {s}\n", .{
+        cmd_output.print("Pinned '{s}' to {s}/{s} {s}\n", .{
             name,
             summary.provider_id.slice(),
             summary.channel_id.slice(),
@@ -2389,19 +2577,19 @@ fn handleAlias(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u8
 
     if (std.mem.eql(u8, verb, "float")) {
         const name = parts.next() orelse {
-            std.debug.print("usage: /alias float <name> <model>\n", .{});
+            cmd_output.print("usage: /alias float <name> <model>\n", .{});
             return;
         };
         const selector = parts.next() orelse {
-            std.debug.print("usage: /alias float <name> <model>\n", .{});
+            cmd_output.print("usage: /alias float <name> <model>\n", .{});
             return;
         };
         const alias_name = config_doc.AliasName.parse(name) catch {
-            std.debug.print("\x1b[31malias name too long\x1b[0m\n", .{});
+            cmd_output.print("\x1b[31malias name too long\x1b[0m\n", .{});
             return;
         };
         const parsed_selector = @import("../provider/selection.zig").Selector.parse(selector) catch {
-            std.debug.print("\x1b[31mselector too long\x1b[0m\n", .{});
+            cmd_output.print("\x1b[31mselector too long\x1b[0m\n", .{});
             return;
         };
         _ = config_store.setAlias(&store, .{
@@ -2409,45 +2597,45 @@ fn handleAlias(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u8
             .policy = .floating,
             .selector = parsed_selector,
         }, null, null) catch |err| {
-            std.debug.print("\x1b[31mcould not save the alias: {s}\x1b[0m\n", .{@errorName(err)});
+            cmd_output.print("\x1b[31mcould not save the alias: {s}\x1b[0m\n", .{@errorName(err)});
             return;
         };
-        std.debug.print("'{s}' now floats to '{s}'.\n", .{ name, selector });
+        cmd_output.print("'{s}' now floats to '{s}'.\n", .{ name, selector });
         return;
     }
 
     if (std.mem.eql(u8, verb, "remove")) {
         const name = parts.next() orelse {
-            std.debug.print("usage: /alias remove <name>\n", .{});
+            cmd_output.print("usage: /alias remove <name>\n", .{});
             return;
         };
         _ = config_store.removeAlias(&store, name, null) catch |err| {
             // A silent return here reads as success: the user believes the
             // alias is gone and it is still there.
-            std.debug.print("\x1b[31mcould not remove '{s}': {s}\x1b[0m\n", .{ name, @errorName(err) });
+            cmd_output.print("\x1b[31mcould not remove '{s}': {s}\x1b[0m\n", .{ name, @errorName(err) });
             return;
         };
-        std.debug.print("Removed '{s}'.\n", .{name});
+        cmd_output.print("Removed '{s}'.\n", .{name});
         return;
     }
 
     if (std.mem.eql(u8, verb, "use")) {
         const name = parts.next() orelse {
-            std.debug.print("usage: /alias use <name>\n", .{});
+            cmd_output.print("usage: /alias use <name>\n", .{});
             return;
         };
         const used = app.useAlias(name) catch |err| {
-            std.debug.print("\x1b[31m'{s}' did not resolve: {s}\x1b[0m\n", .{ name, @errorName(err) });
+            cmd_output.print("\x1b[31m'{s}' did not resolve: {s}\x1b[0m\n", .{ name, @errorName(err) });
             // Naming the colliding routes is the difference between "it did not
             // work" and something the user can act on.
             if (err == error.AmbiguousSelector) reportAliasAmbiguity(app, &store, name);
             return;
         };
         if (!used) {
-            std.debug.print("No alias named '{s}'.\n", .{name});
+            cmd_output.print("No alias named '{s}'.\n", .{name});
             return;
         }
-        std.debug.print("switched to \x1b[36m{s}\x1b[0m via '{s}'\n", .{ app.activeModel(), name });
+        cmd_output.print("switched to \x1b[36m{s}\x1b[0m via '{s}'\n", .{ app.activeModel(), name });
         return;
     }
 
@@ -2468,9 +2656,9 @@ fn reportAliasAmbiguity(app: *app_mod.App, store: *const @import("../provider/co
     const candidates = alias_mod.candidatesFor(host.kernel.catalogSnapshot(), entry);
     if (candidates.match_count < 2) return;
 
-    std.debug.print("'{s}' matches {d} routes; pin one instead:\n", .{ name, candidates.match_count });
+    cmd_output.print("'{s}' matches {d} routes; pin one instead:\n", .{ name, candidates.match_count });
     for (candidates.samplesSlice()) |sample| {
-        std.debug.print("  {s}/{s} [{s}] {s}\n", .{
+        cmd_output.print("  {s}/{s} [{s}] {s}\n", .{
             sample.provider_id.slice(),
             sample.channel_id.slice(),
             sample.protocol,
@@ -2478,25 +2666,22 @@ fn reportAliasAmbiguity(app: *app_mod.App, store: *const @import("../provider/co
         });
     }
     if (candidates.match_count > candidates.samplesSlice().len) {
-        std.debug.print("  … and {d} more\n", .{candidates.match_count - candidates.samplesSlice().len});
+        cmd_output.print("  … and {d} more\n", .{candidates.match_count - candidates.samplesSlice().len});
     }
 }
 
 // ── `/login <provider>` (issue #33) ──────────────────────────────────────────
 
 fn printLoginUsage() void {
-    std.debug.print(
-        \\usage: /login <provider> [--device-code] [--no-browser] [--client-id <client>]
-        \\  Runs the provider's OAuth flow — loopback PKCE, or the device-code grant
-        \\  with --device-code — and stores the login where `metacodes login
-        \\  --provider <id>` stores it. The REPL waits until the flow finishes or
-        \\  times out (5 minutes). Metask signs in from the shell:
-        \\  `metacodes login --provider metask`.
+    cmd_output.print(
+        \\Usage: /login [<provider>] [--device-code] [--no-browser] [--client-id <id>]
+        \\With no provider, choose one from a list. The login is stored where
+        \\`metacodes login --provider <id>` stores it.
         \\
     , .{});
 }
 
-const LoginArgs = struct { provider: []const u8, options: provider_login.Options };
+const LoginArgs = struct { provider: ?[]const u8, options: provider_login.Options };
 const LoginParse = union(enum) { usage, unknown: []const u8, ok: LoginArgs };
 
 /// `/login` takes the CLI's flags with the CLI's rule: an argument it does not
@@ -2519,109 +2704,213 @@ fn parseLoginArgs(rest: []const u8, state_root: []const u8) LoginParse {
             provider_name = arg;
         }
     }
-    const provider = provider_name orelse return .usage;
-    return .{ .ok = .{ .provider = provider, .options = options } };
+    return .{ .ok = .{ .provider = provider_name, .options = options } };
 }
 
+/// Terminal rows, for sizing a dialog's lists.
+fn terminalRows() usize {
+    return if (tui_term_root.getSize(2)) |size| size.rows else 24;
+}
+
+/// Run a command dialog (`dialogs.zig`) on the terminal until it closes.
+fn runDialog(comptime D: type, dialog: *D, app: *const app_mod.App) void {
+    @import("tui/dialog/pane.zig").run(D, dialog, app.allocator, app.theme, 0, 2) catch |err| {
+        cmd_output.print("{s}The dialog failed: {s}{s}\n", .{ app.theme.danger, @errorName(err), app.theme.reset });
+    };
+}
+
+/// The line a dismissed dialog leaves under its command (Claude Code).
+fn printDismissed(app: *const app_mod.App, text: []const u8) void {
+    cmd_output.print("{s}{s}{s}\n", .{ app.theme.dim, text, app.theme.reset });
+}
+
+/// Save what `/skills` changed, then say so as Claude Code does:
+/// `Updated 2 skill overrides`, or `No changes`.
+fn saveSkillOverrides(app: *app_mod.App, dialog: *const dialogs.SkillsDialog) void {
+    const th = app.theme;
+    const changes = dialog.changes(app.allocator) catch {
+        cmd_output.print("{s}Skill overrides not saved: out of memory{s}\n", .{ th.danger, th.reset });
+        return;
+    };
+    defer app.allocator.free(changes);
+    if (changes.len == 0) return printDismissed(app, "No changes");
+    app.applySkillOverrides(changes) catch |err| {
+        const why: []const u8 = switch (err) {
+            error.NoProjectRoot => "no project directory for .claude/settings.local.json",
+            error.SettingsUnreadable => ".claude/settings.local.json could not be read",
+            error.MalformedSettings => ".claude/settings.local.json is not a valid settings file",
+            error.WriteFailed => ".claude/settings.local.json could not be written",
+            error.PathTooLong => "the settings path is too long",
+            error.OutOfMemory => "out of memory",
+        };
+        cmd_output.print("{s}Skill overrides not saved: {s}{s}\n", .{ th.danger, why, th.reset });
+        return;
+    };
+    var buf: [64]u8 = undefined;
+    printDismissed(app, std.fmt.bufPrint(&buf, "Updated {d} skill override{s}", .{
+        changes.len,
+        if (changes.len == 1) "" else "s",
+    }) catch "Updated skill overrides");
+}
+
+/// `/login` in the TUI: a provider picker, then the sign-in on a worker so
+/// Esc can end it (Claude Code's Login dialog). `/login <provider>` starts
+/// that provider's sign-in directly. Flags as in the CLI.
+fn handleLoginDialog(app: *app_mod.App, rest: []const u8) !void {
+    const th = app.theme;
+    var named: ?[]const u8 = null;
+    const options: provider_login.Options = switch (parseLoginArgs(rest, app.stateRoot())) {
+        .usage => return printLoginUsage(),
+        .unknown => |arg| {
+            cmd_output.print("{s}Unknown /login argument '{s}'{s}\n", .{ th.danger, arg, th.reset });
+            return printLoginUsage();
+        },
+        .ok => |value| blk: {
+            named = value.provider;
+            break :blk value.options;
+        },
+    };
+    const host = app.providerHost() catch |err| {
+        cmd_output.print("{s}The provider registry is unavailable: {s}{s}\n", .{ th.danger, @errorName(err), th.reset });
+        return;
+    };
+
+    var dialog: dialogs.LoginDialog = .{ .allocator = app.allocator, .io = app.io };
+    defer dialog.deinit();
+    var start_at: ?usize = null;
+    for (host.registry.profiles.items) |*profile| {
+        // `--client-id` names one provider's client; it is not offered to the rest.
+        var profile_options = options;
+        if (named == null or !profile.matchesName(named.?)) profile_options.client_id = null;
+        const flow = provider_login.prepareFlow(profile, profile_options, host.oauthClientIdFor(profile.id)) catch |err| {
+            if (named) |name| if (profile.matchesName(name)) {
+                cmd_output.print("{s}Cannot sign in to {s}: {s}{s}\n", .{ th.danger, profile.display_name, provider_login.refusalText(err, profile_options.method), th.reset });
+                return;
+            };
+            continue;
+        };
+        if (named) |name| if (profile.matchesName(name)) {
+            start_at = dialog.choices_len;
+        };
+        dialog.add(.{ .profile = profile, .flow = flow });
+    }
+    if (named) |name| if (start_at == null) {
+        cmd_output.print("{s}Unknown provider '{s}'{s}\n", .{ th.danger, name, th.reset });
+        return;
+    };
+    if (start_at) |index| dialog.startAt(index);
+
+    runDialog(dialogs.LoginDialog, &dialog, app);
+    if (dialog.takeDetached()) |worker| app.parkLoginWorker(worker);
+    switch (dialog.outcome) {
+        .interrupted => cmd_output.print("Login interrupted\n", .{}),
+        .failed => |why| cmd_output.print("{s}Login failed: {s}{s}\n", .{ th.danger, why, th.reset }),
+        .signed_in => |label| {
+            cmd_output.print("Signed in to {s} · /model to choose a model\n", .{label});
+            // A route on this provider may have been unusable for want of a
+            // credential; the picker catalog is rebuilt so it reflects the login.
+            app.refreshModelPicker() catch |err| {
+                cmd_output.print("{s}The model list did not refresh ({s}); /providers refresh retries{s}\n", .{ th.warn, @errorName(err), th.reset });
+            };
+        },
+    }
+}
+
+/// `/login` without a terminal to draw a dialog on: the named provider's
+/// sign-in, blocking, with its instructions on stderr.
 fn handleLogin(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u8) !void {
     const args = switch (parseLoginArgs(rest, app.stateRoot())) {
         .usage => return printLoginUsage(),
         .unknown => |arg| {
-            std.debug.print("\x1b[31munknown /login argument '{s}'\x1b[0m\n", .{arg});
+            cmd_output.print("\x1b[31mUnknown /login argument '{s}'\x1b[0m\n", .{arg});
             return printLoginUsage();
         },
         .ok => |value| value,
     };
-    const name = args.provider;
+    const name = args.provider orelse return printLoginUsage();
     const options = args.options;
-    if (std.ascii.eqlIgnoreCase(name, "metask")) {
-        // Metask's control plane uses its own JSON device grant, which the CLI
-        // runs; the generic RFC 8628 flow would violate that contract.
-        std.debug.print("Metask signs in from the shell: run `metacodes login --provider metask` (add --no-browser for a device code), then /providers refresh.\n", .{});
-        return;
-    }
     const host = app.providerHost() catch |err| {
-        std.debug.print("\x1b[31mprovider registry unavailable: {s}\x1b[0m\n", .{@errorName(err)});
+        cmd_output.print("\x1b[31mThe provider registry is unavailable: {s}\x1b[0m\n", .{@errorName(err)});
         return;
     };
     const built = host.registry.find(name) orelse {
-        std.debug.print("\x1b[31munknown provider '{s}'\x1b[0m\n", .{name});
+        cmd_output.print("\x1b[31mUnknown provider '{s}'\x1b[0m\n", .{name});
         return;
     };
-    const prepared = provider_login.prepareProfileWith(built, options, host.oauthClientIdFor(built.id)) catch |err| {
-        std.debug.print("\x1b[31m{s}\x1b[0m\n", .{provider_login.refusalText(err, options.method)});
+    const flow = provider_login.prepareFlow(built, options, host.oauthClientIdFor(built.id)) catch |err| {
+        cmd_output.print("\x1b[31mCannot sign in to {s}: {s}\x1b[0m\n", .{ built.display_name, provider_login.refusalText(err, options.method) });
         return;
     };
-    std.debug.print("Signing in to '{s}'; the REPL waits for the flow to finish.\n", .{built.id.slice()});
+    cmd_output.print("Signing in to {s}…\n", .{built.display_name});
     var diagnostic: provider_login.ImportDiagnostic = .{};
-    const outcome = prepared.run(allocator, app.io, oauth_login_mod.stderrNotify(), &diagnostic) catch |err| {
+    const outcome = flow.run(allocator, app.io, oauth_login_mod.stderrNotify(), &diagnostic) catch |err| {
         if (diagnostic.cause) |cause| {
-            std.debug.print("\x1b[31mlogin failed: {s} ({s})\x1b[0m\n", .{ @errorName(err), @errorName(cause) });
+            cmd_output.print("\x1b[31mLogin failed: {s} ({s})\x1b[0m\n", .{ @errorName(err), @errorName(cause) });
         } else {
-            std.debug.print("\x1b[31mlogin failed: {s}\x1b[0m\n", .{@errorName(err)});
+            cmd_output.print("\x1b[31mLogin failed: {s}\x1b[0m\n", .{@errorName(err)});
         }
         return;
     };
-    std.debug.print("Signed in to '{s}' (OAuth); pick a route with /model.\n", .{outcome.provider_id.slice()});
+    cmd_output.print("Signed in to {s} · /model to choose a model\n", .{outcome.provider_id.slice()});
     // A route on this provider may have been unusable for want of a
     // credential; the picker catalog is rebuilt so it reflects the login.
     app.refreshModelPicker() catch |err| {
-        std.debug.print("\x1b[33mthe model picker did not refresh ({s}); /providers refresh will\x1b[0m\n", .{@errorName(err)});
+        cmd_output.print("\x1b[33mThe model list did not refresh ({s}); /providers refresh retries\x1b[0m\n", .{@errorName(err)});
     };
 }
 
 fn handleProviders(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u8) !void {
     if (std.mem.eql(u8, rest, "refresh")) {
         const refreshed = app.refreshProviderCatalogs() catch |err| {
-            std.debug.print("\x1b[31mcatalog refresh failed: {s}\x1b[0m\n", .{@errorName(err)});
+            cmd_output.print("\x1b[31mcatalog refresh failed: {s}\x1b[0m\n", .{@errorName(err)});
             return;
         };
         if (app.last_catalog_refresh_error) |why| {
             // A per-catalog failure does not abort the others, so it has to be
             // reported here or it disappears entirely.
-            std.debug.print(
+            cmd_output.print(
                 "\x1b[33mone or more catalogs did not refresh ({s}); the previous " ++
                     "catalog is still in use\x1b[0m\n",
                 .{why},
             );
         }
         if (refreshed == 0) {
-            std.debug.print(
+            cmd_output.print(
                 "No provider catalogs are configured. Add `provider_catalogs` to " ++
                     "<state root>/config.json with a models_url (or models_file).\n",
                 .{},
             );
             return;
         }
-        std.debug.print("Refreshed {d} provider catalog(s).\n", .{refreshed});
+        cmd_output.print("Refreshed {d} provider catalog(s).\n", .{refreshed});
         return;
     }
     if (rest.len != 0) {
         var parts = std.mem.tokenizeScalar(u8, rest, ' ');
         const verb = parts.next().?;
         const target = parts.next() orelse {
-            std.debug.print("usage: /providers [refresh | enable <id> | disable <id> | remove <id>]\n", .{});
+            cmd_output.print("usage: /providers [refresh | enable <id> | disable <id> | remove <id>]\n", .{});
             return;
         };
         const id = @import("../provider/ids.zig").Slug.parse(target) catch {
-            std.debug.print("\x1b[31minvalid provider id '{s}'\x1b[0m\n", .{target});
+            cmd_output.print("\x1b[31minvalid provider id '{s}'\x1b[0m\n", .{target});
             return;
         };
         if (std.mem.eql(u8, verb, "enable") or std.mem.eql(u8, verb, "disable")) {
             const enabled = std.mem.eql(u8, verb, "enable");
             const in_use = !enabled and app.isRoutedThrough(id);
             app.setProviderEnabled(id, enabled) catch |err| {
-                std.debug.print("\x1b[31mcould not update '{s}': {s}\x1b[0m\n", .{ target, @errorName(err) });
+                cmd_output.print("\x1b[31mcould not update '{s}': {s}\x1b[0m\n", .{ target, @errorName(err) });
                 return;
             };
             // Disabling keeps the instance's configuration and credential
             // references; that is the difference from removing it.
-            std.debug.print("{s} '{s}'.\n", .{ if (enabled) "Enabled" else "Disabled", target });
+            cmd_output.print("{s} '{s}'.\n", .{ if (enabled) "Enabled" else "Disabled", target });
             if (in_use) {
                 // A session is not torn off the route it is running on — that
                 // would be the worse surprise — but reporting only "Disabled"
                 // would describe something other than what happened.
-                std.debug.print(
+                cmd_output.print(
                     "This session is still routed through it. Pick another route with " ++
                         "Ctrl+O; new sessions will not offer it.\n",
                     .{},
@@ -2632,27 +2921,27 @@ fn handleProviders(app: *app_mod.App, allocator: std.mem.Allocator, rest: []cons
         if (std.mem.eql(u8, verb, "remove")) {
             const in_use = app.isRoutedThrough(id);
             app.removeProviderConfiguration(id) catch |err| {
-                std.debug.print("\x1b[31mcould not remove '{s}': {s}\x1b[0m\n", .{ target, @errorName(err) });
+                cmd_output.print("\x1b[31mcould not remove '{s}': {s}\x1b[0m\n", .{ target, @errorName(err) });
                 return;
             };
-            std.debug.print("Removed the configuration for '{s}'.\n", .{target});
+            cmd_output.print("Removed the configuration for '{s}'.\n", .{target});
             if (in_use) {
-                std.debug.print("This session is still routed through it until you pick another route.\n", .{});
+                cmd_output.print("This session is still routed through it until you pick another route.\n", .{});
             }
             return;
         }
-        std.debug.print("usage: /providers [refresh | enable <id> | disable <id> | remove <id>]\n", .{});
+        cmd_output.print("usage: /providers [refresh | enable <id> | disable <id> | remove <id>]\n", .{});
         return;
     }
 
     const host = app.providerHost() catch |err| {
-        std.debug.print("\x1b[31mprovider control plane unavailable: {s}\x1b[0m\n", .{@errorName(err)});
+        cmd_output.print("\x1b[31mprovider control plane unavailable: {s}\x1b[0m\n", .{@errorName(err)});
         return;
     };
     var page: std.ArrayList(@import("../provider/control_plane.zig").OfferSummary) = .empty;
     defer page.deinit(allocator);
     const listed = host.kernel.modelList(.{}, .{}, allocator, &page) catch |err| {
-        std.debug.print("\x1b[31mmodel.list failed: {s}\x1b[0m\n", .{@errorName(err)});
+        cmd_output.print("\x1b[31mmodel.list failed: {s}\x1b[0m\n", .{@errorName(err)});
         return;
     };
 
@@ -2662,30 +2951,30 @@ fn handleProviders(app: *app_mod.App, allocator: std.mem.Allocator, rest: []cons
             current = summary.request_model_id;
             break :blk "*";
         } else " ";
-        std.debug.print("{s} {s}/{s} [{s}] {s}", .{
+        cmd_output.print("{s} {s}/{s} [{s}] {s}", .{
             marker,
             summary.provider_id.slice(),
             summary.channel_id.slice(),
             summary.protocol,
             summary.request_model_id,
         });
-        if (summary.credential_ref) |ref| std.debug.print(" account={s}", .{ref.slice()});
+        if (summary.credential_ref) |ref| cmd_output.print(" account={s}", .{ref.slice()});
         if (summary.limits.context_window) |window| {
-            std.debug.print(" ctx={d}", .{window});
+            cmd_output.print(" ctx={d}", .{window});
         } else {
-            std.debug.print(" ctx=?", .{});
+            cmd_output.print(" ctx=?", .{});
         }
-        if (summary.quote.priced() == null) std.debug.print(" price=?", .{});
-        std.debug.print("\n", .{});
+        if (summary.quote.priced() == null) cmd_output.print(" price=?", .{});
+        cmd_output.print("\n", .{});
     }
-    std.debug.print(
+    cmd_output.print(
         "{d} route(s), catalog revision {d}. Ctrl+O or /model to choose one.\n",
         .{ listed.total, listed.meta.catalog_revision.value() },
     );
 }
 
 fn printModelHelp() void {
-    std.debug.print(
+    cmd_output.print(
         \\usage:
         \\  /model                      open the picker (same as Ctrl+O)
         \\  /model group <anthropic|opus|sonnet|haiku|openai|gemini>
@@ -2708,9 +2997,9 @@ fn printModelList(
     group_filter: ?[]const u8,
     cap_filter: ?model_command.Capability,
 ) void {
-    std.debug.print("current model: \x1b[36m{s}\x1b[0m  provider={s}\n", .{ app.activeModel(), @tagName(app.config.provider_kind) });
-    if (group_filter) |g| std.debug.print("filter group: {s}\n", .{g});
-    if (cap_filter) |cap| std.debug.print("filter capability: {s}\n", .{model_command.capabilityLabel(cap)});
+    cmd_output.print("current model: \x1b[36m{s}\x1b[0m  provider={s}\n", .{ app.activeModel(), @tagName(app.config.provider_kind) });
+    if (group_filter) |g| cmd_output.print("filter group: {s}\n", .{g});
+    if (cap_filter) |cap| cmd_output.print("filter capability: {s}\n", .{model_command.capabilityLabel(cap)});
 
     var listed: usize = 0;
     var last_group: []const u8 = "";
@@ -2719,30 +3008,30 @@ fn printModelList(
         if (cap_filter) |cap| if (!model_command.supports(c.provider, c.id, cap)) continue;
         if (!std.mem.eql(u8, last_group, c.group)) {
             last_group = c.group;
-            std.debug.print("\n{s}:\n", .{c.group});
+            cmd_output.print("\n{s}:\n", .{c.group});
         }
         printModelCandidate(c, std.mem.eql(u8, c.id, app.activeModel()));
         listed += 1;
     }
 
     if (listed == 0) {
-        std.debug.print("  no models match this selector for provider {s}\n", .{@tagName(app.config.provider_kind)});
+        cmd_output.print("  no models match this selector for provider {s}\n", .{@tagName(app.config.provider_kind)});
     }
-    std.debug.print("\nusage: /model use <model-id>  |  /model group <name>  |  /model capability <name>\n", .{});
+    cmd_output.print("\nusage: /model use <model-id>  |  /model group <name>  |  /model capability <name>\n", .{});
 }
 
 fn printModelCandidate(c: model_command.Candidate, current: bool) void {
     if (current) {
-        std.debug.print("  \x1b[36m*{s}\x1b[0m", .{c.id});
+        cmd_output.print("  \x1b[36m*{s}\x1b[0m", .{c.id});
     } else {
-        std.debug.print("   {s}", .{c.id});
+        cmd_output.print("   {s}", .{c.id});
     }
-    std.debug.print("  [{s}/{s} {s}]", .{ @tagName(c.provider), c.group, @tagName(c.source) });
-    if (c.max_input_tokens) |v| std.debug.print(" context={d}", .{v});
-    if (c.max_tokens) |v| std.debug.print(" max_output={d}", .{v});
-    std.debug.print(" capabilities=", .{});
+    cmd_output.print("  [{s}/{s} {s}]", .{ @tagName(c.provider), c.group, @tagName(c.source) });
+    if (c.max_input_tokens) |v| cmd_output.print(" context={d}", .{v});
+    if (c.max_tokens) |v| cmd_output.print(" max_output={d}", .{v});
+    cmd_output.print(" capabilities=", .{});
     printCapabilities(c.provider, c.id);
-    std.debug.print("\n", .{});
+    cmd_output.print("\n", .{});
 }
 
 fn reasoningOptionsForMask(mask: u8, buf: *[5]types_mod.ReasoningEffort) []const types_mod.ReasoningEffort {
@@ -2771,11 +3060,11 @@ fn printCapabilities(provider: types_mod.ProviderKind, model: []const u8) void {
     var first = true;
     for (caps) |cap| {
         if (!model_command.supports(provider, model, cap)) continue;
-        if (!first) std.debug.print(",", .{});
-        std.debug.print("{s}", .{model_command.capabilityLabel(cap)});
+        if (!first) cmd_output.print(",", .{});
+        cmd_output.print("{s}", .{model_command.capabilityLabel(cap)});
         first = false;
     }
-    if (first) std.debug.print("none", .{});
+    if (first) cmd_output.print("none", .{});
 }
 
 fn switchModel(
@@ -2786,14 +3075,14 @@ fn switchModel(
 ) !void {
     if (!model_command.canUseInCurrentProvider(app.config.provider_kind, candidates, model)) {
         if (model_command.providerForModel(model)) |p| {
-            std.debug.print(
+            cmd_output.print(
                 "\x1b[31mrefused: {s} belongs to provider {s}, but this session is {s}\x1b[0m\n",
                 .{ model, @tagName(p), @tagName(app.config.provider_kind) },
             );
         } else {
-            std.debug.print("\x1b[31mrefused: unknown model id '{s}'\x1b[0m\n", .{model});
+            cmd_output.print("\x1b[31mrefused: unknown model id '{s}'\x1b[0m\n", .{model});
         }
-        std.debug.print("Start a new session with --model <id> to switch provider families.\n", .{});
+        cmd_output.print("Start a new session with --model <id> to switch provider families.\n", .{});
         return;
     }
 
@@ -2807,46 +3096,43 @@ fn switchModel(
             .text => |t| t,
             else => "unknown",
         };
-        std.debug.print("\x1b[33mwarn: model sync failed ({s})\x1b[0m\n", .{why});
+        cmd_output.print("\x1b[33mwarn: model sync failed ({s})\x1b[0m\n", .{why});
         return;
     }
 
-    std.debug.print("switched to \x1b[36m{s}\x1b[0m", .{app.activeModel()});
-    if (app.config.reasoning_effort) |effort| std.debug.print(" reasoning={s}", .{app.api_client.catalog.effortLabelFor(app.activeModel(), effort)});
-    std.debug.print(" (max_output={d})\n", .{app.provider().maxTokens()});
+    cmd_output.print("switched to \x1b[36m{s}\x1b[0m", .{app.activeModel()});
+    if (app.config.reasoning_effort) |effort| cmd_output.print(" reasoning={s}", .{app.api_client.catalog.effortLabelFor(app.activeModel(), effort)});
+    cmd_output.print(" (max_output={d})\n", .{app.provider().maxTokens()});
 }
 
 fn handleDoctor(app: *app_mod.App, allocator: std.mem.Allocator) !void {
-    std.debug.print("\x1b[1mmetacodes doctor\x1b[0m\n", .{});
-    std.debug.print("  model:            {s}\n", .{app.activeModel()});
-    std.debug.print("  permission mode:  {s}\n", .{@tagName(app.permission_ctx.modeValue())});
-    std.debug.print("  auth token:       {s}\n", .{if (app.api_key.len > 0) "set" else "MISSING"});
-    std.debug.print("  max_tokens cfg:   {any}\n", .{app.config.max_tokens});
-    std.debug.print("  verbose:          {}\n", .{app.config.verbose});
-    std.debug.print("  transcript:       {s}\n", .{if (app.transcript_writer != null) "on" else "OFF"});
-    std.debug.print("  job registry:     {s}\n", .{if (app.jobs != null) "on" else "OFF"});
-    std.debug.print("  skills loaded:    {d}\n", .{app.skills.len()});
-    std.debug.print("  conversation:     {d} messages\n", .{app.conversation.len()});
-    std.debug.print("  tasks:            {d} in store\n", .{app.tasks.tasks.items.len});
-    std.debug.print("  rules loaded:     {d}\n", .{if (app.rule_set) |r| r.rules.items.len else 0});
+    const th = app.theme;
     var problems_buf: [160]u8 = undefined;
     const problems = formatConfigProblems(&problems_buf, app.configProblems());
-    std.debug.print("  config issues:    {s}\n", .{if (problems.len != 0) problems[CONFIG_PROBLEMS_PREFIX.len..] else "none"});
-
-    // HOME + CWD + config file 检查
-    const home_c = @import("platform").paths.homeDir();
-    if (home_c) |h| {
-        std.debug.print("  HOME:             {s}\n", .{h});
+    cmd_output.print("Model:            {s}\n", .{app.activeModel()});
+    cmd_output.print("Permission mode:  {s}\n", .{modeName(app.permission_ctx.modeValue())});
+    if (app.api_key.len > 0) {
+        cmd_output.print("Credential:       set\n", .{});
     } else {
-        std.debug.print("  HOME:             UNSET\n", .{});
+        cmd_output.print("Credential:       {s}missing · /login or set an API key{s}\n", .{ th.danger, th.reset });
     }
-
+    cmd_output.print("Transcript:       {s}\n", .{if (app.transcript_writer != null) "on" else "off"});
+    cmd_output.print("Background jobs:  {s}\n", .{if (app.jobs != null) "on" else "off"});
+    cmd_output.print("Skills:           {d}\n", .{app.skills.len()});
+    cmd_output.print("Permission rules: {d}\n", .{if (app.rule_set) |r| r.rules.items.len else 0});
+    if (problems.len != 0) {
+        cmd_output.print("Config problems:  {s}{s}{s}\n", .{ th.warn, problems[CONFIG_PROBLEMS_PREFIX.len..], th.reset });
+    } else {
+        cmd_output.print("Config problems:  none\n", .{});
+    }
+    cmd_output.print("Home:             {s}\n", .{@import("platform").paths.homeDir() orelse "unset"});
     if (util_fs.getCwd(allocator)) |cwd| {
         defer allocator.free(cwd);
-        std.debug.print("  CWD:              {s}\n", .{cwd});
+        cmd_output.print("Working dir:      {s}\n", .{cwd});
     } else |_| {
-        std.debug.print("  CWD:              (unreadable)\n", .{});
+        cmd_output.print("Working dir:      unreadable\n", .{});
     }
+    cmd_output.print("{s}Run `metacodes doctor` in a shell for the full installation check.{s}\n", .{ th.dim, th.reset });
 }
 
 fn injectCompactStressHistory(app: *app_mod.App, allocator: std.mem.Allocator) !void {
@@ -2861,47 +3147,34 @@ fn injectCompactStressHistory(app: *app_mod.App, allocator: std.mem.Allocator) !
 
 fn handleConfigCmd(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u8) !void {
     if (app.stateRoot().len == 0) {
-        std.debug.print("no state root (HOME not set)\n", .{});
+        cmd_output.print("No state root: HOME is not set.\n", .{});
         return;
     }
     const cfg_path = try std.fs.path.join(allocator, &.{ app.stateRoot(), "config.json" });
     defer allocator.free(cfg_path);
 
     if (rest.len == 0 or std.mem.eql(u8, rest, "show")) {
-        // 当前生效配置(menu-style 摘要)
-        std.debug.print("\x1b[1mActive configuration\x1b[0m\n", .{});
-        std.debug.print("  model:           \x1b[36m{s}\x1b[0m\n", .{app.activeModel()});
-        std.debug.print("  permission mode: \x1b[36m{s}\x1b[0m  \x1b[2m(Shift+Tab to cycle)\x1b[0m\n", .{@tagName(app.permMode())});
-        std.debug.print("  verbose:         {}\n", .{app.config.verbose});
-        std.debug.print("  no_theme:        {}\n", .{app.config.no_theme});
-        std.debug.print("  skills loaded:   {d}\n", .{app.skills.len()});
-        std.debug.print("  subagents:       {d}\n", .{app.agents.len()});
-        std.debug.print("  MCP servers:     {d}\n", .{app.mcp_sessions.items.len});
-        std.debug.print("\x1b[2mconfig file: {s}\x1b[0m\n", .{cfg_path});
-        // 尝试读全文
-        const path_z = try std.fmt.allocPrintSentinel(allocator, "{s}", .{cfg_path}, 0);
-        defer allocator.free(path_z);
-        const fd = pfs.open(path_z.ptr, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
-        if (fd < 0) {
-            std.debug.print("(file does not exist — use /init to create one)\n", .{});
-            return;
-        }
-        defer _ = pfs.close(fd);
-        std.debug.print("\x1b[1mfile contents:\x1b[0m\n", .{});
-        var buf: [8192]u8 = undefined;
-        while (true) {
-            const n = pfs.read(fd, buf[0..buf.len]);
-            if (n <= 0) break;
-            std.debug.print("{s}", .{buf[0..@intCast(n)]});
-        }
-        std.debug.print("\n", .{});
+        // The summary only: the file itself is the user's to open, and a raw
+        // dump would echo whatever was hand-written into it.
+        const theme_mod = @import("tui/theme.zig");
+        cmd_output.print("Model:            {s}\n", .{app.activeModel()});
+        cmd_output.print("Permission mode:  {s}\n", .{modeName(app.permMode())});
+        cmd_output.print("Theme:            {s}\n", .{theme_mod.variantName(app.theme_variant)});
+        cmd_output.print("Verbose output:   {}\n", .{app.config.verbose});
+        cmd_output.print("Skills:           {d}\n", .{app.skills.len()});
+        cmd_output.print("Subagents:        {d}\n", .{app.agents.len()});
+        cmd_output.print("MCP servers:      {d}\n", .{app.mcp_sessions.items.len});
+        const cfg_z = try allocator.dupeZ(u8, cfg_path);
+        defer allocator.free(cfg_z);
+        const exists = pfs.exists(cfg_z.ptr);
+        cmd_output.print("Config file:      {s}{s}\n", .{ cfg_path, if (exists) "" else " (not created yet)" });
         return;
     }
     if (std.mem.eql(u8, rest, "path")) {
-        std.debug.print("{s}\n", .{cfg_path});
+        cmd_output.print("{s}\n", .{cfg_path});
         return;
     }
-    std.debug.print("usage: /config [show|path]\n", .{});
+    cmd_output.print("Usage: /config [show|path]\n", .{});
 }
 
 pub const GoalCommand = union(enum) {
@@ -2942,12 +3215,12 @@ pub fn parseGoalCommand(rest_raw: []const u8) GoalCommand {
 /// 无参=状态;`mem`=最近记忆;`forget <id>`=删除(投毒自救);`export`=导出 markdown。
 fn handleKg(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u8) !void {
     const kg = if (app.kg) |*k| k else {
-        std.debug.print("KG 已降级:unconfigured\n原因:KG 未配置\n修法:{s}\n", .{@import("../kg/client.zig").KgClient.hintFor(.unconfigured)});
+        cmd_output.print("KG unavailable: not configured\nFix: {s}\n", .{@import("../kg/client.zig").KgClient.hintFor(.unconfigured)});
         return;
     };
     // An explicit status request probes now; the backoff only paces the tools.
     if (!kg.retryReadyNow()) {
-        std.debug.print("KG 已降级:{s}\n原因:{s}\n修法:{s}\n", .{ @tagName(kg.degradedKind() orelse .unconfigured), kg.degradedMessage(), kg.degradedHint() });
+        cmd_output.print("KG unavailable: {s}\nReason: {s}\nFix: {s}\n", .{ @tagName(kg.degradedKind() orelse .unconfigured), kg.degradedMessage(), kg.degradedHint() });
         return;
     }
     const arg = std.mem.trim(u8, rest, " \t");
@@ -2955,16 +3228,16 @@ fn handleKg(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u8) !
     if (arg.len == 0) {
         // 状态:store 路径 + domain + frontier(有 kg_root 时)。
         // daemon 拥有 Store 时这里显示占位符而非路径——本进程确实没有本地 store 路径可报。
-        std.debug.print("KG store: {s}\ndomain:   {s}\n", .{ kg.store.argvSlot(), kg.domain });
+        cmd_output.print("KG store: {s}\ndomain:   {s}\n", .{ kg.store.argvSlot(), kg.domain });
         // 记忆同步检视面(PM P1:autosync 静默失败要可见)。
         if (kg.autosync_ok + kg.autosync_fail > 0) {
             if (kg.autosync_last_err) |e| {
-                std.debug.print("记忆同步(本 session): {d} ok / {d} fail(最近: {s})\n", .{ kg.autosync_ok, kg.autosync_fail, e });
+                cmd_output.print("Memory sync this session: {d} ok, {d} failed (last: {s})\n", .{ kg.autosync_ok, kg.autosync_fail, e });
             } else {
-                std.debug.print("记忆同步(本 session): {d} ok / {d} fail\n", .{ kg.autosync_ok, kg.autosync_fail });
+                cmd_output.print("Memory sync this session: {d} ok, {d} failed\n", .{ kg.autosync_ok, kg.autosync_fail });
             }
         }
-        if (app.memdir_abs.len > 0) std.debug.print("(手工编辑过记忆文件?/kg sync 重新同步入图)\n", .{});
+        if (app.memdir_abs.len > 0) cmd_output.print("Edited a memory file by hand? /kg sync re-imports it.\n", .{});
         // 分类结晶发现面(PM 终审:tentative 边无人知晓就永远不结晶)。本 session 有任务
         // 产出待确认分类 → 提示人类去审阅(concept id 只能从 /kg refs 取,这是唯一入口)。
         {
@@ -2972,15 +3245,15 @@ fn handleKg(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u8) !
             defer if (pend.len > 0) allocator.free(pend);
             if (pend.len > 0) {
                 const color = std.c.getenv("NO_COLOR") == null;
-                std.debug.print("{s}待确认分类:{d} 个任务产出了 tentative 分类投影(闭合时 agent 打的,待人类结晶)。{s}\n  审阅:", .{ if (color) "\x1b[36m" else "", pend.len, if (color) "\x1b[0m" else "" });
+                cmd_output.print("{s}{d} task(s) have tentative classifications awaiting review.{s}\n  Review:", .{ if (color) "\x1b[36m" else "", pend.len, if (color) "\x1b[0m" else "" });
                 for (pend, 0..) |t, i| {
                     if (i >= 8) {
-                        std.debug.print(" …(共 {d})", .{pend.len});
+                        cmd_output.print(" … ({d} total)", .{pend.len});
                         break;
                     }
-                    std.debug.print("{s}/kg refs {d}", .{ if (i == 0) "" else " · ", t });
+                    cmd_output.print("{s}/kg refs {d}", .{ if (i == 0) "" else " · ", t });
                 }
-                std.debug.print("\n", .{});
+                cmd_output.print("\n", .{});
             }
         }
         // 重复 project 检测(旧 bug 时代增殖的同名节点让一半记忆召回不可见,用户自己不可能发现)。
@@ -2988,7 +3261,7 @@ fn handleKg(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u8) !
             defer allocator.free(hint);
             // NO_COLOR 纪律(L1 血泪:Apple Terminal 系统级 NO_COLOR)。
             const color = std.c.getenv("NO_COLOR") == null;
-            std.debug.print("{s}检测到同名重复 project:{s} —— /kg projects 查看,/kg merge <输家> <赢家> 合并。{s}\n", .{ if (color) "\x1b[33m" else "", hint, if (color) "\x1b[0m" else "" });
+            cmd_output.print("{s}Duplicate project nodes: {s}. /kg projects lists them; /kg merge <from> <to> merges them.{s}\n", .{ if (color) "\x1b[33m" else "", hint, if (color) "\x1b[0m" else "" });
         }
         if (app.kg_projects_dir.len > 0) {
             // 12b 单入口:有 task 锚指针 → 一次深遍历看全(多计划+inbox,与模型侧
@@ -2996,12 +3269,12 @@ fn handleKg(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u8) !
             const inject_mod = @import("../kg/inject.zig");
             const has_anchor = inject_mod.readIdPointer(allocator, app.kg_projects_dir, "kg_task_anchor") != null;
             const shown_plan = if (has_anchor)
-                printKgRootFrontier(allocator, kg, app.kg_projects_dir, "kg_task_anchor", "任务面")
+                printKgRootFrontier(allocator, kg, app.kg_projects_dir, "kg_task_anchor", "Tasks")
             else
-                printKgRootFrontier(allocator, kg, app.kg_projects_dir, "kg_root", "计划");
-            const shown_inbox = if (has_anchor) false else printKgRootFrontier(allocator, kg, app.kg_projects_dir, "kg_inbox", "待办");
+                printKgRootFrontier(allocator, kg, app.kg_projects_dir, "kg_root", "Plan");
+            const shown_inbox = if (has_anchor) false else printKgRootFrontier(allocator, kg, app.kg_projects_dir, "kg_inbox", "Inbox");
             if (!shown_plan and !shown_inbox) {
-                std.debug.print("(本项目无活跃计划图/待办;计划批准或 TaskCreate 后从此恢复)\n", .{});
+                cmd_output.print("No active plan or inbox for this project. One appears after a plan is approved or a task is created.\n", .{});
             }
         }
         return;
@@ -3009,7 +3282,7 @@ fn handleKg(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u8) !
 
     if (std.mem.eql(u8, arg, "mem")) {
         const hits = kg.listRecentMemories(15) catch {
-            std.debug.print("(记忆列表查询失败)\n", .{});
+            cmd_output.print("Could not list memories.\n", .{});
             return;
         };
         defer {
@@ -3017,19 +3290,19 @@ fn handleKg(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u8) !
             allocator.free(hits);
         }
         if (hits.len == 0) {
-            std.debug.print("(暂无记忆)\n", .{});
+            cmd_output.print("No memories yet.\n", .{});
             return;
         }
-        std.debug.print("最近记忆({d} 条):\n", .{hits.len});
+        cmd_output.print("Recent memories ({d}):\n", .{hits.len});
         for (hits) |h| {
             // list-recent TSV 路径不带 source_label(PM P0-1:靠 struct 默认空判断是死代码)
             // —— document hit 现场补查(≤15 条列表,仅 document 才 spawn,成本可控)。
             const label: ?[]u8 = if (std.mem.eql(u8, h.kind, "document")) kg.nodeMemorySource(h.node_id).label else null;
             defer if (label) |l| allocator.free(l);
             if (label) |l| {
-                std.debug.print("  [{d}] {s}({s}): {s}\n", .{ h.node_id, h.kind, l, firstLine(h.text) });
+                cmd_output.print("  [{d}] {s}({s}): {s}\n", .{ h.node_id, h.kind, l, firstLine(h.text) });
             } else {
-                std.debug.print("  [{d}] {s}: {s}\n", .{ h.node_id, h.kind, firstLine(h.text) });
+                cmd_output.print("  [{d}] {s}: {s}\n", .{ h.node_id, h.kind, firstLine(h.text) });
             }
         }
         return;
@@ -3044,35 +3317,35 @@ fn handleKg(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u8) !
         else
             null;
         const root_id = root orelse {
-            std.debug.print("(本项目缺少 kg_root；无法从 TinyKG 生成计划投影)\n", .{});
+            cmd_output.print("This project has no kg_root, so there is no plan to show.\n", .{});
             return;
         };
         const md = @import("../kg/plan_view.zig").render(allocator, kg, root_id) catch |err| {
             const detail = kg.detail();
             if (detail.len > 0) {
-                std.debug.print("(TinyKG 计划投影失败:{s}: {s})\n", .{ @errorName(err), detail });
+                cmd_output.print("Could not render the plan: {s}: {s}\n", .{ @errorName(err), detail });
             } else {
-                std.debug.print("(TinyKG 计划投影失败:{s})\n", .{@errorName(err)});
+                cmd_output.print("Could not render the plan: {s}\n", .{@errorName(err)});
             }
             return;
         };
         defer allocator.free(md);
-        std.debug.print("{s}", .{md});
-        if (md.len == 0 or md[md.len - 1] != '\n') std.debug.print("\n", .{});
+        cmd_output.print("{s}", .{md});
+        if (md.len == 0 or md[md.len - 1] != '\n') cmd_output.print("\n", .{});
         return;
     }
 
     if (std.mem.eql(u8, arg, "projects")) {
         // PM P0-3:merge 的 <from>/<to> id 此前无处可查(mem 过滤 project kind)——本命令是唯一出口。
         const listing = kg.listProjects(allocator) catch {
-            std.debug.print("(project 列表查询失败)\n", .{});
+            cmd_output.print("Could not list projects.\n", .{});
             return;
         };
         defer allocator.free(listing);
         if (listing.len == 0) {
-            std.debug.print("(库中无 project 节点)\n", .{});
+            cmd_output.print("No project nodes in the store.\n", .{});
         } else {
-            std.debug.print("project 节点(id  名称):\n{s}同名重复可 /kg merge <输家id> <赢家id> 合并。\n", .{listing});
+            cmd_output.print("Project nodes (id  name):\n{s}Merge duplicates with /kg merge <from-id> <to-id>.\n", .{listing});
         }
         return;
     }
@@ -3081,7 +3354,7 @@ fn handleKg(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u8) !
         // PM P1:手工编辑(vim)不经 Write 钩子 → 图里旧版;sync 遍历 memdir 重跑幂等 upsert。
         const autosync = @import("../kg/autosync.zig");
         const stats = autosync.syncAll(allocator, kg, app.memdir_abs);
-        std.debug.print("记忆同步完成:{d} 个文件已入图,{d} 失败,{d} 跳过(索引/非法路径)。\n", .{ stats.synced, stats.failed, stats.skipped });
+        cmd_output.print("Memory sync done: {d} imported, {d} failed, {d} skipped (index or invalid path).\n", .{ stats.synced, stats.failed, stats.skipped });
         return;
     }
 
@@ -3090,17 +3363,17 @@ fn handleKg(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u8) !
         // 无预览直接删 + 裸机器输出,用户不敢按)。
         const apply = std.mem.eql(u8, arg, "gc!");
         const summary = kg.gcMdOrphans(apply) catch |e| {
-            std.debug.print("gc 失败({s}): {s}\n", .{ @errorName(e), kg.detail() });
+            cmd_output.print("gc failed ({s}): {s}\n", .{ @errorName(e), kg.detail() });
             return;
         };
         defer allocator.free(summary);
         const n = extractGcCount(summary, if (apply) "deleted=" else "candidates=");
         if (apply) {
-            std.debug.print("已清理 {d} 个孤儿节点。\n", .{n});
+            cmd_output.print("Removed {d} orphan node(s).\n", .{n});
         } else if (n == 0) {
-            std.debug.print("无孤儿节点,无需清理。\n", .{});
+            cmd_output.print("No orphan nodes.\n", .{});
         } else {
-            std.debug.print("发现 {d} 个孤儿节点(记忆文件更新/删除的残留,不在召回范围)。执行清理:/kg gc!\n", .{n});
+            cmd_output.print("{d} orphan node(s) left by edited or deleted memory files (not recalled). Remove them with /kg gc!\n", .{n});
         }
         return;
     }
@@ -3113,15 +3386,15 @@ fn handleKg(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u8) !
         const from = std.fmt.parseInt(u64, from_s, 10) catch 0;
         const to = std.fmt.parseInt(u64, to_s, 10) catch 0;
         if (from == 0 or to == 0) {
-            std.debug.print("用法:/kg merge <输家-project-id> <赢家-project-id>\n", .{});
+            cmd_output.print("Usage: /kg merge <from-project-id> <to-project-id>\n", .{});
             return;
         }
         const summary = kg.reparentContain(from, to) catch |e| {
-            std.debug.print("merge 失败({s}): {s}\n", .{ @errorName(e), kg.detail() });
+            cmd_output.print("merge failed ({s}): {s}\n", .{ @errorName(e), kg.detail() });
             return;
         };
         defer allocator.free(summary);
-        std.debug.print("{s}\n(输家 {d} 已空,可 /kg forget {d} 删除)\n", .{ summary, from, from });
+        cmd_output.print("{s}\nProject {d} is now empty; /kg forget {d} removes it.\n", .{ summary, from, from });
         return;
     }
 
@@ -3130,7 +3403,7 @@ fn handleKg(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u8) !
         const raw_id = if (force) arg["forget! ".len..] else arg["forget ".len..];
         const id_str = std.mem.trim(u8, raw_id, " \t");
         const id = std.fmt.parseInt(u64, id_str, 10) catch {
-            std.debug.print("用法:/kg forget <node-id>(md 派生节点强删用 forget!)\n", .{});
+            cmd_output.print("Usage: /kg forget <node-id> (forget! for nodes derived from memory files)\n", .{});
             return;
         };
         // md 派生节点假删除防护(PM P1 + Linus 次要5):document 根**与 section/正文**都会被
@@ -3152,23 +3425,23 @@ fn handleKg(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u8) !
                         break :blk pfs.exists(@ptrCast(&zbuf));
                     } else false;
                     if (exists) {
-                        std.debug.print("注意:node {d} 来自记忆文件 {s} —— 直接 forget 会在下次写该文件时复活。\n正确删法:清空该文件(Write 空内容,或 vim 清空后 /kg sync)。仍要强删:/kg forget! {d}\n", .{ id, full, id });
+                        cmd_output.print("Node {d} comes from the memory file {s}; forgetting it brings it back the next time the file is written.\nEmpty the file instead (then /kg sync). To remove it anyway: /kg forget! {d}\n", .{ id, full, id });
                         return;
                     }
                     // 源文件已不存在 → 放行删除。
                 } else {
                     // content: 前缀无法区分"md 文件正文"(会复活)与"KgRemember 投影节点"(不会)
                     // —— 文案不武断(Linus:安全闸给错误操作指引是半个 bug)。
-                    std.debug.print("注意:node {d} 是派生投影节点(记忆文件正文,或 KgRemember 投影)。\n若来自记忆文件:forget 会在下次写该文件时复活,应修改/清空源文件(/kg mem 查 document 来源)。\n确认无源文件或仍要强删:/kg forget! {d}\n", .{ id, id });
+                    cmd_output.print("Node {d} is derived (a memory file body or a KgRemember projection).\nIf it comes from a memory file, forgetting it brings it back on the next write; edit the source instead (/kg mem shows it).\nTo remove it anyway: /kg forget! {d}\n", .{ id, id });
                     return;
                 }
             }
         }
         kg.forget(id) catch |e| {
-            std.debug.print("删除失败({s}): {s}\n", .{ @errorName(e), kg.detail() });
+            cmd_output.print("Delete failed ({s}): {s}\n", .{ @errorName(e), kg.detail() });
             return;
         };
-        std.debug.print("已删除 node {d}。\n", .{id});
+        cmd_output.print("Deleted node {d}.\n", .{id});
         return;
     }
 
@@ -3177,11 +3450,11 @@ fn handleKg(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u8) !
         const pend = kg.pendingRefTasks(allocator);
         defer if (pend.len > 0) allocator.free(pend);
         if (pend.len == 0) {
-            std.debug.print("(本 session 无待确认分类;任务闭合填 acts_on/uses/produces 后在此出现)\n用法:/kg refs <task-id> 看单个任务的分类投影\n", .{});
+            cmd_output.print("No classifications awaiting review this session; they appear when a task closes with acts_on/uses/produces.\nUsage: /kg refs <task-id> shows one task's classifications\n", .{});
             return;
         }
-        std.debug.print("本 session 产出待确认分类的任务(/kg refs <id> 展开):\n", .{});
-        for (pend) |t| std.debug.print("  /kg refs {d}\n", .{t});
+        cmd_output.print("Tasks with classifications awaiting review (/kg refs <id> to open):\n", .{});
+        for (pend) |t| cmd_output.print("  /kg refs {d}\n", .{t});
         return;
     }
 
@@ -3191,22 +3464,22 @@ fn handleKg(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u8) !
         var id_str = std.mem.trim(u8, arg["refs ".len..], " \t");
         if (std.mem.startsWith(u8, id_str, "kg-")) id_str = id_str["kg-".len..]; // 容忍 TaskList 的 kg-<id> 形式
         const task = std.fmt.parseInt(u64, id_str, 10) catch {
-            std.debug.print("用法:/kg refs <task-id>(task id 从 /kg plan 或 TaskList 的 kg-<id> 取)\n", .{});
+            cmd_output.print("Usage: /kg refs <task-id> (the id from /kg plan, or kg-<id> in TaskList)\n", .{});
             return;
         };
         const nb = kg.neighborsJson(task, 200) catch |e| {
-            std.debug.print("查询失败({s}): {s}\n", .{ @errorName(e), kg.detail() });
+            cmd_output.print("Query failed ({s}): {s}\n", .{ @errorName(e), kg.detail() });
             return;
         };
         defer kg.allocator.free(nb); // neighborsJson 用 kg.allocator 分配(契约,勿依赖实例同一)
         const Edge = struct { rel: []const u8, dst: u64, props: struct { state: ?[]const u8 = null } = .{} };
         const Doc = struct { edges: []const Edge };
         const parsed = std.json.parseFromSlice(Doc, allocator, nb, .{ .ignore_unknown_fields = true }) catch {
-            std.debug.print("(neighbors 解析失败)\n", .{});
+            cmd_output.print("Could not parse the neighbors.\n", .{});
             return;
         };
         defer parsed.deinit();
-        std.debug.print("task {d} 的分类投影:\n", .{task});
+        cmd_output.print("Classifications of task {d}:\n", .{task});
         var any = false;
         for (parsed.value.edges) |e| {
             if (!isRefRel(e.rel)) continue;
@@ -3219,10 +3492,10 @@ fn handleKg(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u8) !
                 const nl = std.mem.indexOfScalar(u8, t, '\n');
                 subject = if (nl) |i| t[0..i] else t;
             }
-            std.debug.print("  {s:<9} concept {d} [{s}]  {s}\n", .{ e.rel, e.dst, state, subject });
+            cmd_output.print("  {s:<9} concept {d} [{s}]  {s}\n", .{ e.rel, e.dst, state, subject });
         }
-        if (!any) std.debug.print("(无——任务闭合时填 acts_on/uses/produces 才会产生)\n", .{});
-        std.debug.print("确认:/kg confirm {d} <rel> <concept-id>  |  纠正:/kg correct {d} <rel> <old-concept-id> <new-name>\n", .{ task, task });
+        if (!any) cmd_output.print("None; they appear when the task closes with acts_on/uses/produces.\n", .{});
+        cmd_output.print("Confirm: /kg confirm {d} <rel> <concept-id> · Correct: /kg correct {d} <rel> <old-concept-id> <new-name>\n", .{ task, task });
         return;
     }
 
@@ -3233,14 +3506,14 @@ fn handleKg(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u8) !
         const rel = it.next();
         const concept = if (it.next()) |c| (std.fmt.parseInt(u64, c, 10) catch null) else null;
         if (task == null or rel == null or concept == null or !isRefRel(rel.?)) {
-            std.debug.print("用法:/kg confirm <task-id> <acts_on|uses|produces|about> <concept-id>\n", .{});
+            cmd_output.print("Usage: /kg confirm <task-id> <acts_on|uses|produces|about> <concept-id>\n", .{});
             return;
         }
         kg.confirmClassification(task.?, rel.?, concept.?) catch |e| {
-            std.debug.print("确认失败({s}): {s}(该分类边不存在?先由任务闭合投影产生)\n", .{ @errorName(e), kg.detail() });
+            cmd_output.print("Confirm failed ({s}): {s}. The classification may not exist yet; it comes from a closed task.\n", .{ @errorName(e), kg.detail() });
             return;
         };
-        std.debug.print("已确认:task {d} {s} concept {d}(confirmed)。\n", .{ task.?, rel.?, concept.? });
+        cmd_output.print("Confirmed: task {d} {s} concept {d}.\n", .{ task.?, rel.?, concept.? });
         return;
     }
 
@@ -3252,18 +3525,18 @@ fn handleKg(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u8) !
         const old_concept = if (it.next()) |c| (std.fmt.parseInt(u64, c, 10) catch null) else null;
         const new_name = std.mem.trim(u8, it.rest(), " \t");
         if (task == null or rel == null or old_concept == null or new_name.len == 0 or !isRefRel(rel.?)) {
-            std.debug.print("用法:/kg correct <task-id> <acts_on|uses|produces|about> <old-concept-id> <new-name>\n", .{});
+            cmd_output.print("Usage: /kg correct <task-id> <acts_on|uses|produces|about> <old-concept-id> <new-name>\n", .{});
             return;
         }
         kg.correctClassification(task.?, rel.?, old_concept.?, new_name) catch |e| {
-            std.debug.print("纠正失败({s}): {s}\n", .{ @errorName(e), kg.detail() });
+            cmd_output.print("Correction failed ({s}): {s}\n", .{ @errorName(e), kg.detail() });
             return;
         };
-        std.debug.print("已纠正:task {d} {s} {d} → \"{s}\"(旧边删除+confirmed 新边+error_event/fix 留痕)。\n", .{ task.?, rel.?, old_concept.?, new_name });
+        cmd_output.print("Corrected: task {d} {s} {d} → \"{s}\" (old edge removed, confirmed edge added, fix recorded).\n", .{ task.?, rel.?, old_concept.?, new_name });
         return;
     }
 
-    std.debug.print("用法:/kg(状态)| /kg mem(记忆)| /kg plan(计划)| /kg projects(project 列表)| /kg sync(重同步记忆文件)| /kg gc(孤儿预览,gc! 清理)| /kg merge <from> <to>(合并重复 project)| /kg forget <id>(删除,md 派生强删用 forget!)| /kg refs <task>(看分类投影)| /kg confirm <task> <rel> <concept>(背书分类)| /kg correct <task> <rel> <old> <new-name>(纠正分类)\n", .{});
+    cmd_output.print("Usage: /kg [mem | plan | projects | sync | gc[!] | merge <from> <to> | forget[!] <id> | refs <task> | confirm <task> <rel> <concept> | correct <task> <rel> <old> <new-name>]\n", .{});
 }
 
 /// ref 关系白名单(改动二的 3+1)。confirm/correct 只作用于分类性引用边。
@@ -3357,7 +3630,7 @@ fn printKgRootFrontier(allocator: std.mem.Allocator, kg: anytype, projects_dir: 
     for (rows) |r| {
         if (r.role != .branch) actionable += 1;
     }
-    std.debug.print("{s} root {d} — {d} 个未完成/失败任务:\n", .{ label, root, actionable });
+    cmd_output.print("{s} (root {d}): {d} open or failed task(s)\n", .{ label, root, actionable });
     for (rows) |r| {
         // branch = 开放复合节点(等子树闭合)→ ▹;缩进按 depth 呈现树形。
         const mark = if (r.status == .failed)
@@ -3373,9 +3646,9 @@ fn printKgRootFrontier(allocator: std.mem.Allocator, kg: anytype, projects_dir: 
         var indent_buf: [16]u8 = undefined;
         const indent_n = @min(depth * 2, indent_buf.len);
         @memset(indent_buf[0..indent_n], ' ');
-        std.debug.print("  {s}{s} [{d}] {s}", .{ indent_buf[0..indent_n], mark, r.task_id, firstLine(r.text) });
-        if (r.claimed_by) |c| std.debug.print("(认领:{s})", .{c});
-        std.debug.print("\n", .{});
+        cmd_output.print("  {s}{s} [{d}] {s}", .{ indent_buf[0..indent_n], mark, r.task_id, firstLine(r.text) });
+        if (r.claimed_by) |c| cmd_output.print(" (claimed by {s})", .{c});
+        cmd_output.print("\n", .{});
     }
     return true;
 }
@@ -3393,7 +3666,7 @@ fn handleGoal(app: *app_mod.App, rest: []const u8) !void {
         .clear => {
             app.goal_state.clearInMemory();
             app.persistGoal();
-            std.debug.print("Goal cleared.\n", .{});
+            cmd_output.print("Goal cleared.\n", .{});
             return;
         },
         .set => |objective| {
@@ -3402,7 +3675,7 @@ fn handleGoal(app: *app_mod.App, rest: []const u8) !void {
                 return;
             };
             app.persistGoal();
-            std.debug.print("Goal set.\n", .{});
+            cmd_output.print("Goal set.\n", .{});
             printGoal(app);
             return;
         },
@@ -3412,7 +3685,7 @@ fn handleGoal(app: *app_mod.App, rest: []const u8) !void {
                 return;
             };
             app.persistGoal();
-            std.debug.print("Goal updated.\n", .{});
+            cmd_output.print("Goal updated.\n", .{});
             printGoal(app);
             return;
         },
@@ -3443,7 +3716,7 @@ fn handleGoal(app: *app_mod.App, rest: []const u8) !void {
         },
         .invalid => {},
     }
-    std.debug.print("usage: /goal [view|set <objective>|edit <objective>|budget <tokens|none>|pause|resume|complete|blocked|clear]\n", .{});
+    cmd_output.print("usage: /goal [view|set <objective>|edit <objective>|budget <tokens|none>|pause|resume|complete|blocked|clear]\n", .{});
 }
 
 fn applyGoalAction(app: *app_mod.App, action: goal_mod.Action) void {
@@ -3457,22 +3730,22 @@ fn applyGoalAction(app: *app_mod.App, action: goal_mod.Action) void {
 
 fn printGoal(app: *const app_mod.App) void {
     const g = app.goal_state.current orelse {
-        std.debug.print("No goal set. Use /goal set <objective>.\n", .{});
+        cmd_output.print("No goal set. Use /goal set <objective>.\n", .{});
         return;
     };
-    std.debug.print("\x1b[1mGoal\x1b[0m [{s}]\n", .{@tagName(g.status)});
-    std.debug.print("  id:      {s}\n", .{g.id[0..]});
-    std.debug.print("  target:  {s}\n", .{g.objective});
+    cmd_output.print("\x1b[1mGoal\x1b[0m [{s}]\n", .{@tagName(g.status)});
+    cmd_output.print("  id:      {s}\n", .{g.id[0..]});
+    cmd_output.print("  target:  {s}\n", .{g.objective});
     if (g.token_budget) |budget| {
         const remaining: u64 = if (g.tokens_used >= budget) 0 else budget - g.tokens_used;
-        std.debug.print("  budget:  {d} tokens ({d} used, {d} left)\n", .{ budget, g.tokens_used, remaining });
+        cmd_output.print("  budget:  {d} tokens ({d} used, {d} left)\n", .{ budget, g.tokens_used, remaining });
     } else {
-        std.debug.print("  budget:  none ({d} tokens used)\n", .{g.tokens_used});
+        cmd_output.print("  budget:  none ({d} tokens used)\n", .{g.tokens_used});
     }
 }
 
 fn printGoalHelp() void {
-    std.debug.print(
+    cmd_output.print(
         \\Goal commands:
         \\  /goal                         Show current goal
         \\  /goal set <objective>         Create or replace the session goal
@@ -3497,7 +3770,7 @@ fn printGoalError(err: anyerror) void {
         error.GoalComplete => "the goal is complete; /goal resume reopens it",
         else => @errorName(err),
     };
-    std.debug.print("\x1b[31m/goal failed: {s}\x1b[0m\n", .{msg});
+    cmd_output.print("\x1b[31m/goal failed: {s}\x1b[0m\n", .{msg});
 }
 
 pub const LoopCommand = union(enum) {
@@ -3529,16 +3802,16 @@ fn handleLoop(app: *app_mod.App, rest: []const u8) void {
         .off => {
             app.loop_enabled = false;
             app.loop_remaining = 0;
-            std.debug.print("Loop continuation stopped.\n", .{});
+            cmd_output.print("Loop continuation stopped.\n", .{});
             return;
         },
         .on => |n| {
             if (app.goal_state.current == null) {
-                std.debug.print("Set a goal first: /goal set <objective>\n", .{});
+                cmd_output.print("Set a goal first: /goal set <objective>\n", .{});
                 return;
             }
             if (app.goal_state.current.?.status != .active) {
-                std.debug.print("Goal must be active before loop continuation can start.\n", .{});
+                cmd_output.print("Goal must be active before loop continuation can start.\n", .{});
                 return;
             }
             app.loop_enabled = true;
@@ -3548,17 +3821,17 @@ fn handleLoop(app: *app_mod.App, rest: []const u8) void {
         },
         .invalid => {},
     }
-    std.debug.print("usage: /loop [status|on [max-continuations]|off]\n", .{});
+    cmd_output.print("usage: /loop [status|on [max-continuations]|off]\n", .{});
 }
 
 fn printLoopStatus(app: *const app_mod.App) void {
-    std.debug.print("Loop continuation: {s}", .{if (app.loop_enabled) "on" else "off"});
-    if (app.loop_enabled) std.debug.print(" ({d} remaining)", .{app.loop_remaining});
-    std.debug.print("\n", .{});
+    cmd_output.print("Loop continuation: {s}", .{if (app.loop_enabled) "on" else "off"});
+    if (app.loop_enabled) cmd_output.print(" ({d} remaining)", .{app.loop_remaining});
+    cmd_output.print("\n", .{});
     if (app.goal_state.current) |g| {
-        std.debug.print("Goal status: {s}\n", .{@tagName(g.status)});
+        cmd_output.print("Goal status: {s}\n", .{@tagName(g.status)});
     } else {
-        std.debug.print("No goal set.\n", .{});
+        cmd_output.print("No goal set.\n", .{});
     }
 }
 
@@ -3573,16 +3846,18 @@ fn shouldRunLoopContinuation(app: *const app_mod.App, queued_count: usize) bool 
     });
 }
 
-fn runLoopContinuation(app: *app_mod.App, allocator: std.mem.Allocator, backend: *const ui_backend_mod.UiBackend) !void {
+fn runLoopContinuation(host: *const TurnHost) !void {
+    const app = host.app;
+    const allocator = host.allocator;
     const g = if (app.goal_state.current) |*g| g else return;
     if (app.loop_remaining > 0) app.loop_remaining -= 1;
     const prompt = try goal_mod.continuationPrompt(allocator, g);
     defer allocator.free(prompt);
-    std.debug.print("\x1b[2m[loop continuation: {d} remaining]\x1b[0m\n", .{app.loop_remaining});
-    try runInjectedAgentWithSynthetic(app, allocator, backend, prompt);
+    cmd_output.print("\x1b[2m[loop continuation: {d} remaining]\x1b[0m\n", .{app.loop_remaining});
+    try runTurn(host, .macro, prompt);
     if (app.loop_remaining == 0) {
         app.loop_enabled = false;
-        std.debug.print("\x1b[2m[loop continuation stopped: limit reached]\x1b[0m\n", .{});
+        cmd_output.print("\x1b[2m[loop continuation stopped: limit reached]\x1b[0m\n", .{});
     }
 }
 
@@ -3610,7 +3885,7 @@ fn stopLoopIfGoalLimited(app: *app_mod.App) void {
     if (g.status != .budget_limited or !app.loop_enabled) return;
     app.loop_enabled = false;
     app.loop_remaining = 0;
-    std.debug.print("\x1b[2m[goal budget reached]\x1b[0m\n", .{});
+    cmd_output.print("\x1b[2m[goal budget reached]\x1b[0m\n", .{});
 }
 
 /// 把当前 conversation 拍平成纯文本(role: text),用于 /btw /recap 的上下文喂养。
@@ -3625,7 +3900,7 @@ fn flattenConversation(app: *app_mod.App, allocator: std.mem.Allocator) ![]u8 {
         for (m.blocks) |b| switch (b) {
             .text => |t| {
                 // host 注入的 user 记录(进度提醒等)不是用户说的话:标 Host,别让 /recap 当成用户诉求。
-                const label = if (m.role == .user and host_injection_meter.isHostInjectedText(t)) "Host" else role;
+                const label = if (m.role == .user and host_injection_meter.isHostText(m, t)) "Host" else role;
                 try out.appendSlice(allocator, label);
                 try out.appendSlice(allocator, ": ");
                 try out.appendSlice(allocator, t);
@@ -3657,7 +3932,7 @@ fn runEphemeral(app: *app_mod.App, allocator: std.mem.Allocator, prompt: []const
 /// /btw <question>:侧问。看当前对话上下文,但不进主历史。
 fn handleBtw(app: *app_mod.App, allocator: std.mem.Allocator, question: []const u8) !void {
     if (question.len == 0) {
-        std.debug.print("usage: /btw <question>\n", .{});
+        cmd_output.print("usage: /btw <question>\n", .{});
         return;
     }
     const ctx_text = try flattenConversation(app, allocator);
@@ -3666,17 +3941,17 @@ fn handleBtw(app: *app_mod.App, allocator: std.mem.Allocator, question: []const 
     defer allocator.free(prompt);
 
     const answer = runEphemeral(app, allocator, prompt) catch |err| {
-        std.debug.print("\x1b[31m/btw failed: {s}\x1b[0m\n", .{@errorName(err)});
+        cmd_output.print("\x1b[31m/btw failed: {s}\x1b[0m\n", .{@errorName(err)});
         return;
     };
     defer allocator.free(answer);
-    std.debug.print("\x1b[2m─── btw ───\x1b[0m\n{s}\n\x1b[2m───────────\x1b[0m\n", .{answer});
+    cmd_output.print("\x1b[2m─── btw ───\x1b[0m\n{s}\n\x1b[2m───────────\x1b[0m\n", .{answer});
 }
 
 /// /recap:一行会话总结(不进历史)。
 fn handleRecap(app: *app_mod.App, allocator: std.mem.Allocator) !void {
     if (app.conversation.len() < 2) {
-        std.debug.print("(not enough conversation to recap)\n", .{});
+        cmd_output.print("(not enough conversation to recap)\n", .{});
         return;
     }
     const ctx_text = try flattenConversation(app, allocator);
@@ -3685,11 +3960,11 @@ fn handleRecap(app: *app_mod.App, allocator: std.mem.Allocator) !void {
     defer allocator.free(prompt);
 
     const recap = runEphemeral(app, allocator, prompt) catch |err| {
-        std.debug.print("\x1b[31m/recap failed: {s}\x1b[0m\n", .{@errorName(err)});
+        cmd_output.print("\x1b[31m/recap failed: {s}\x1b[0m\n", .{@errorName(err)});
         return;
     };
     defer allocator.free(recap);
-    std.debug.print("\x1b[36m↻ {s}\x1b[0m\n", .{std.mem.trim(u8, recap, " \n")});
+    cmd_output.print("\x1b[36m↻ {s}\x1b[0m\n", .{std.mem.trim(u8, recap, " \n")});
 }
 
 /// Render a `/command` report to the terminal. The report itself is written
@@ -3698,10 +3973,87 @@ fn printReport(app: *const app_mod.App, comptime write: fn (*std.Io.Writer, *con
     var out: std.Io.Writer.Allocating = .init(app.allocator);
     defer out.deinit();
     write(&out.writer, app) catch {
-        std.debug.print("\x1b[31m(out of memory rendering the report)\x1b[0m\n", .{});
+        cmd_output.print("\x1b[31m(out of memory rendering the report)\x1b[0m\n", .{});
         return;
     };
-    std.debug.print("{s}", .{out.written()});
+    cmd_output.print("{s}", .{out.written()});
+}
+
+/// The official name of a permission mode (`acceptEdits`, …), with the
+/// historic aliases folded in.
+fn modeName(m: types_mod.PermissionMode) []const u8 {
+    return switch (@import("../permission/mode.zig").canonical(m)) {
+        .default, .prompt => "default",
+        .accept_edits => "acceptEdits",
+        .auto => "auto",
+        .dont_ask => "dontAsk",
+        .bypass_permissions, .bypass => "bypassPermissions",
+    };
+}
+
+/// `/help` as text (non-interactive sessions, and the source the dialog's
+/// lists come from): the built-in commands and Skills from the one slash
+/// catalog, then the shortcut grid.
+pub fn writeHelpReport(w: *std.Io.Writer, app: *const app_mod.App) std.Io.Writer.Error!void {
+    var arena = std.heap.ArenaAllocator.init(app.allocator);
+    defer arena.deinit();
+    const catalog = slashCatalog(arena.allocator(), app);
+    try w.writeAll("metacodes understands your codebase, makes edits with your permission, and runs commands from your terminal.\n\n");
+    try writeCommandList(w, catalog, .builtin, "Commands");
+    try writeCommandList(w, catalog, .skill, "Skills");
+    try w.writeAll("Shortcuts\n");
+    try writeShortcutsReport(w, app);
+}
+
+/// The shortcut grid of the `?` panel, as report text.
+pub fn writeShortcutsReport(w: *std.Io.Writer, app: *const app_mod.App) std.Io.Writer.Error!void {
+    _ = app;
+    const ui = @import("tui/ui.zig");
+    const cols: u16 = if (tui_term_root.getSize(1)) |size| size.cols else 80;
+    var plain: PlainLines = .{ .w = w };
+    _ = try ui.renderHelpLines(&plain, @import("tui/theme.zig").monochrome, cols);
+}
+
+/// Adapts `ui.renderHelpLines` (CRLF rows for the live region) to report text.
+const PlainLines = struct {
+    w: *std.Io.Writer,
+    pub fn writeAll(self: *PlainLines, bytes: []const u8) std.Io.Writer.Error!void {
+        var rest = bytes;
+        while (std.mem.indexOf(u8, rest, "\r\n")) |at| {
+            try self.w.writeAll(rest[0..at]);
+            try self.w.writeAll("\n");
+            rest = rest[at + 2 ..];
+        }
+        try self.w.writeAll(rest);
+    }
+    pub fn print(self: *PlainLines, comptime fmt: []const u8, args: anytype) std.Io.Writer.Error!void {
+        var buf: [256]u8 = undefined;
+        try self.writeAll(std.fmt.bufPrint(&buf, fmt, args) catch return error.WriteFailed);
+    }
+};
+
+fn writeCommandList(w: *std.Io.Writer, catalog: complete.SlashCatalog, kind: complete.SlashKind, title: []const u8) std.Io.Writer.Error!void {
+    var width: usize = 0;
+    var any = false;
+    for (catalog.entries) |cmd| {
+        if (cmd.kind != kind) continue;
+        any = true;
+        width = @max(width, tui_term_root.displayWidth(cmd.name) + (if (cmd.hint.len != 0) 1 + tui_term_root.displayWidth(cmd.hint) else 0));
+    }
+    if (!any) return;
+    try w.print("{s}\n", .{title});
+    for (catalog.entries) |cmd| {
+        if (cmd.kind != kind) continue;
+        try w.print("  {s}", .{cmd.name});
+        var used = tui_term_root.displayWidth(cmd.name);
+        if (cmd.hint.len != 0) {
+            try w.print(" {s}", .{cmd.hint});
+            used += 1 + tui_term_root.displayWidth(cmd.hint);
+        }
+        while (used < width + 2) : (used += 1) try w.writeAll(" ");
+        try w.print("{s}\n", .{cmd.desc});
+    }
+    try w.writeAll("\n");
 }
 
 /// /skills:列出已加载 skill(来源 scope + 根目录)、加载失败的 skill(issue)、被跳过的根目录,
@@ -3736,11 +4088,15 @@ pub fn writeSkillsReport(w: *std.Io.Writer, app: *const app_mod.App) std.Io.Writ
             " [model only]"
         else
             "";
+        // A `skillOverrides` state other than the default, as settings spell it.
+        const override = app.skill_runtime.overrideState(record.invocation_name);
         var line_buf: [96]u8 = undefined;
-        try w.print("  \x1b[36m/{s}\x1b[0m \x1b[2m({s}{s})\x1b[0m {s}\n", .{
+        try w.print("  \x1b[36m/{s}\x1b[0m \x1b[2m({s}{s}{s}{s})\x1b[0m {s}\n", .{
             record.invocation_name,
             scope,
             flags,
+            if (override == .on) "" else " · ",
+            if (override == .on) "" else override.wireName(),
             oneLine(&line_buf, record.definition.description),
         });
         try w.print("    \x1b[2m{s}\x1b[0m\n", .{record.live_dir orelse record.source_root});
@@ -3899,7 +4255,7 @@ fn oneLine(buf: []u8, text: []const u8) []const u8 {
 fn handleMcp(app: *app_mod.App) !void {
     const report = app.mcp_report;
     if (report.servers.len == 0 and report.pending.len == 0 and report.problems.len == 0) {
-        std.debug.print(
+        cmd_output.print(
             \\MCP servers: (none configured)
             \\
             \\metacodes reads, highest precedence first:
@@ -3910,17 +4266,17 @@ fn handleMcp(app: *app_mod.App) !void {
         , .{app.stateRoot()});
         return;
     }
-    std.debug.print("MCP servers ({d}):\n", .{report.servers.len});
+    cmd_output.print("MCP servers ({d}):\n", .{report.servers.len});
     for (report.servers) |server| {
         switch (server.state) {
-            .connected => std.debug.print("  \x1b[32m●\x1b[0m \x1b[36m{s}\x1b[0m  {d} tools as mcp__{s}__*  \x1b[2m(MCP {s}; {s})\x1b[0m\n", .{
+            .connected => cmd_output.print("  \x1b[32m●\x1b[0m \x1b[36m{s}\x1b[0m  {d} tools as mcp__{s}__*  \x1b[2m(MCP {s}; {s})\x1b[0m\n", .{
                 server.name, server.tool_count, server.name, server.protocol, server.origin.label(),
             }),
-            .failed => std.debug.print("  \x1b[31m✗\x1b[0m \x1b[36m{s}\x1b[0m  {s}  \x1b[2m({s})\x1b[0m\n", .{
+            .failed => cmd_output.print("  \x1b[31m✗\x1b[0m \x1b[36m{s}\x1b[0m  {s}  \x1b[2m({s})\x1b[0m\n", .{
                 server.name, server.detail, server.origin.label(),
             }),
         }
-        std.debug.print("      \x1b[2m{s}{s}{s}\x1b[0m\n", .{
+        cmd_output.print("      \x1b[2m{s}{s}{s}\x1b[0m\n", .{
             server.origin_path,
             if (server.log_path.len != 0) "  log: " else "",
             server.log_path,
@@ -3929,20 +4285,20 @@ fn handleMcp(app: *app_mod.App) !void {
         // of the cached prompt); a server-announced change applies on restart.
         for (app.mcp_sessions.items) |entry| {
             if (std.mem.eql(u8, entry.name, server.name) and entry.client.tools_changed.load(.acquire))
-                std.debug.print("      \x1b[33mthe server changed its tools; restart the session to use the new list\x1b[0m\n", .{});
+                cmd_output.print("      \x1b[33mthe server changed its tools; restart the session to use the new list\x1b[0m\n", .{});
         }
     }
     for (report.pending) |pending| {
         switch (pending.reason) {
-            .needs_approval => std.debug.print("  \x1b[33m○\x1b[0m \x1b[36m{s}\x1b[0m  awaiting approval (project {s}); add \"{s}\" to \"enabledMcpjsonServers\" in {s}/config.json\n", .{
+            .needs_approval => cmd_output.print("  \x1b[33m○\x1b[0m \x1b[36m{s}\x1b[0m  awaiting approval (project {s}); add \"{s}\" to \"enabledMcpjsonServers\" in {s}/config.json\n", .{
                 pending.name, pending.origin_path, pending.name, app.stateRoot(),
             }),
-            .rejected => std.debug.print("  \x1b[2m○ {s}  rejected (disabledMcpjsonServers)\x1b[0m\n", .{pending.name}),
+            .rejected => cmd_output.print("  \x1b[2m○ {s}  rejected (disabledMcpjsonServers)\x1b[0m\n", .{pending.name}),
         }
     }
-    for (report.disabled) |name| std.debug.print("  \x1b[2m○ {s}  disabled\x1b[0m\n", .{name});
+    for (report.disabled) |name| cmd_output.print("  \x1b[2m○ {s}  disabled\x1b[0m\n", .{name});
     for (report.problems) |problem| {
-        std.debug.print("  \x1b[33m!\x1b[0m {s}{s}{s}: {s}\n", .{
+        cmd_output.print("  \x1b[33m!\x1b[0m {s}{s}{s}: {s}\n", .{
             problem.origin_path,
             if (problem.server.len != 0) " / " else "",
             problem.server,
@@ -4048,42 +4404,42 @@ pub fn writeAgentsReport(w: *std.Io.Writer, app: *const app_mod.App) std.Io.Writ
 
 /// /permissions：显示当前权限模式 + 已从 config.json 加载的细粒度规则。
 fn handlePermissions(app: *app_mod.App) void {
-    std.debug.print("permission mode: \x1b[36m{s}\x1b[0m\n", .{@tagName(app.permission_ctx.modeValue())});
+    cmd_output.print("Permission mode: {s} · Shift+Tab to cycle\n", .{modeName(app.permission_ctx.modeValue())});
     if (app.rule_set) |rs| {
         if (rs.rules.items.len == 0) {
-            std.debug.print("rules: (none)\n", .{});
+            cmd_output.print("Rules: none\n", .{});
         } else {
-            std.debug.print("rules ({d}):\n", .{rs.rules.items.len});
+            cmd_output.print("Rules ({d}):\n", .{rs.rules.items.len});
             for (rs.rules.items) |r| {
                 const dec = switch (r.decision) {
                     .allow => "allow",
                     .deny => "deny",
                     .ask => "ask",
                 };
-                std.debug.print("  [{s}] tool={s}", .{ dec, r.tool });
-                if (r.command_prefix) |p| std.debug.print(" command_prefix=\"{s}\"", .{p});
-                if (r.path_glob) |g| std.debug.print(" path_glob=\"{s}\"", .{g});
-                std.debug.print("\n", .{});
+                cmd_output.print("  [{s}] tool={s}", .{ dec, r.tool });
+                if (r.command_prefix) |p| cmd_output.print(" command_prefix=\"{s}\"", .{p});
+                if (r.path_glob) |g| cmd_output.print(" path_glob=\"{s}\"", .{g});
+                cmd_output.print("\n", .{});
             }
         }
     } else {
-        std.debug.print("rules: (none loaded — add a permission_rules array to <state root>/config.json)\n", .{});
+        cmd_output.print("Rules: none · add permissions.allow/ask/deny to .claude/settings.json\n", .{});
     }
 
     // 新 schema settings 层(permissions.allow/ask/deny)
     if (app.settings) |*s| {
-        std.debug.print("\nsettings layers ({d}):\n", .{s.layers.len});
+        if (s.layers.len != 0) cmd_output.print("Settings layers ({d}):\n", .{s.layers.len});
         for (s.layers) |L| {
-            std.debug.print("  [{s}] allow={d} ask={d} deny={d}\n", .{
+            cmd_output.print("  [{s}] allow={d} ask={d} deny={d}\n", .{
                 @tagName(L.source), L.allow.len, L.ask.len, L.deny.len,
             });
-            for (L.allow) |r| std.debug.print("      allow: {s}\n", .{r.raw});
-            for (L.ask) |r| std.debug.print("      ask:   {s}\n", .{r.raw});
-            for (L.deny) |r| std.debug.print("      deny:  {s}\n", .{r.raw});
-            for (L.additional_directories) |d| std.debug.print("      +dir:  {s}\n", .{d});
+            for (L.allow) |r| cmd_output.print("      allow: {s}\n", .{r.raw});
+            for (L.ask) |r| cmd_output.print("      ask:   {s}\n", .{r.raw});
+            for (L.deny) |r| cmd_output.print("      deny:  {s}\n", .{r.raw});
+            for (L.additional_directories) |d| cmd_output.print("      +dir:  {s}\n", .{d});
         }
-        if (s.isBypassDisabled()) std.debug.print("  disableBypassPermissionsMode: true\n", .{});
-        if (s.isAutoModeDisabled()) std.debug.print("  disableAutoMode: true\n", .{});
+        if (s.isBypassDisabled()) cmd_output.print("  disableBypassPermissionsMode: true\n", .{});
+        if (s.isAutoModeDisabled()) cmd_output.print("  disableAutoMode: true\n", .{});
     }
 }
 
@@ -4091,26 +4447,20 @@ fn handlePermissions(app: *app_mod.App) void {
 fn handleTheme(app: *app_mod.App, rest: []const u8) void {
     const theme_mod = @import("tui/theme.zig");
     if (rest.len == 0) {
-        const variants = [_][]const u8{ "auto", "dark", "light", "mono" };
-        std.debug.print("current theme: \x1b[36m{s}\x1b[0m\n", .{theme_mod.variantName(app.theme_variant)});
-        std.debug.print("available: ", .{});
-        for (variants, 0..) |v, i| {
-            std.debug.print("{s}{s}", .{ v, if (i + 1 < variants.len) ", " else "" });
-        }
-        std.debug.print("\nusage: /theme <variant>\n", .{});
+        cmd_output.print("Theme: {s}\n", .{theme_mod.variantName(app.theme_variant)});
+        cmd_output.print("Available: auto, dark, light, mono · /theme <name> to switch\n", .{});
         return;
     }
     // U11:解析+设置经 SessionService.setTheme(canonical),渲染留此。
     var svc = session_service.SessionService.init(app);
     const o = svc.setTheme(rest);
     if (o.kind == .err) {
-        std.debug.print("unknown theme '{s}'. try: auto, dark, light, mono\n", .{rest});
+        cmd_output.print("Unknown theme '{s}'. Available: auto, dark, light, mono\n", .{rest});
         return;
     }
-    std.debug.print("theme switched to \x1b[36m{s}\x1b[0m\n", .{theme_mod.variantName(app.theme_variant)});
+    cmd_output.print("Theme set to {s}\n", .{theme_mod.variantName(app.theme_variant)});
     switch (o.data) {
-        .err_name => |e| std.debug.print("\x1b[2m(persist failed: {s})\x1b[0m\n", .{e}),
-        .theme => |t| if (t.persisted) std.debug.print("\x1b[2m(saved to <state root>/config.json)\x1b[0m\n", .{}),
+        .err_name => |e| cmd_output.print("{s}Not saved: {s}{s}\n", .{ app.theme.warn, e, app.theme.reset }),
         else => {},
     }
 }
@@ -4137,7 +4487,7 @@ fn handleMemory(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u
     }
 
     // 列出槽位
-    std.debug.print("Memory files (edit with: /memory edit <slot>):\n", .{});
+    cmd_output.print("Memory files (edit with: /memory edit <slot>):\n", .{});
     var pbuf: [std.fs.max_path_bytes]u8 = undefined;
 
     if (home.len > 0) {
@@ -4169,7 +4519,7 @@ fn printMemorySlot(slot: []const u8, path: []const u8, desc: []const u8) void {
         break :blk pfs.exists(@ptrCast(&buf));
     };
     const tag = if (exists) "        " else " (new)  ";
-    std.debug.print("  \x1b[36m{s: <8}\x1b[0m{s}{s}\n    \x1b[2m{s}\x1b[0m\n", .{ slot, tag, path, desc });
+    cmd_output.print("  \x1b[36m{s: <8}\x1b[0m{s}{s}\n    \x1b[2m{s}\x1b[0m\n", .{ slot, tag, path, desc });
 }
 
 /// 解析 slot → 路径,mkdir 父目录,$VISUAL/$EDITOR 打开(对齐 cc editFileInEditor)。
@@ -4177,19 +4527,19 @@ fn editMemorySlot(app: *app_mod.App, allocator: std.mem.Allocator, home: []const
     var pbuf: [std.fs.max_path_bytes]u8 = undefined;
     const path: []const u8 = blk: {
         if (std.mem.eql(u8, slot, "user")) {
-            if (home.len == 0) return std.debug.print("HOME not set\n", .{});
+            if (home.len == 0) return cmd_output.print("HOME not set\n", .{});
             break :blk std.fmt.bufPrint(&pbuf, "{s}/.claude/CLAUDE.md", .{home}) catch return;
         } else if (std.mem.eql(u8, slot, "project")) {
-            if (cwd.len == 0) return std.debug.print("no cwd\n", .{});
+            if (cwd.len == 0) return cmd_output.print("no cwd\n", .{});
             break :blk std.fmt.bufPrint(&pbuf, "{s}/CLAUDE.md", .{cwd}) catch return;
         } else if (std.mem.eql(u8, slot, "local")) {
-            if (cwd.len == 0) return std.debug.print("no cwd\n", .{});
+            if (cwd.len == 0) return cmd_output.print("no cwd\n", .{});
             break :blk std.fmt.bufPrint(&pbuf, "{s}/CLAUDE.local.md", .{cwd}) catch return;
         } else if (std.mem.eql(u8, slot, "auto")) {
-            if (app.memdir_abs.len == 0) return std.debug.print("auto-memory disabled\n", .{});
+            if (app.memdir_abs.len == 0) return cmd_output.print("auto-memory disabled\n", .{});
             break :blk std.fmt.bufPrint(&pbuf, "{s}/MEMORY.md", .{app.memdir_abs}) catch return;
         } else {
-            return std.debug.print("usage: /memory edit <user|project|local|auto>\n", .{});
+            return cmd_output.print("usage: /memory edit <user|project|local|auto>\n", .{});
         }
     };
 
@@ -4207,7 +4557,7 @@ fn editMemorySlot(app: *app_mod.App, allocator: std.mem.Allocator, home: []const
     }
 
     const editor = std.c.getenv("VISUAL") orelse std.c.getenv("EDITOR") orelse {
-        std.debug.print("$VISUAL/$EDITOR not set. File is at:\n  {s}\n", .{path});
+        cmd_output.print("$VISUAL/$EDITOR not set. File is at:\n  {s}\n", .{path});
         return;
     };
     const ed = std.mem.span(editor);
@@ -4221,10 +4571,10 @@ fn editMemorySlot(app: *app_mod.App, allocator: std.mem.Allocator, home: []const
     defer allocator.free(cmd);
     const rc = c_system(cmd.ptr);
     if (rc != 0) {
-        std.debug.print("editor exited non-zero (rc={d}); file is at:\n  {s}\n", .{ rc, path });
+        cmd_output.print("editor exited non-zero (rc={d}); file is at:\n  {s}\n", .{ rc, path });
         return;
     }
-    std.debug.print("\x1b[2medited {s} (restart or /model to reload into context)\x1b[0m\n", .{path});
+    cmd_output.print("\x1b[2medited {s} (restart or /model to reload into context)\x1b[0m\n", .{path});
 }
 
 /// POSIX shell 单引号转义:把 s 包成可安全嵌入 `/bin/sh -c` 的单引号字符串。
@@ -4249,16 +4599,24 @@ fn shellQuoteSingle(allocator: std.mem.Allocator, s: []const u8) ![]u8 {
 /// 非 TTY 退化为纯文本两行(pipe 友好)。box 内宽固定取 min(cols-2, 64)。
 /// TTY 下先播启动动画(tui/splash.zig),定格的 "Metask Lab" 字标留在 box 上方。
 fn printStartupBanner(app: *const app_mod.App, allocator: std.mem.Allocator) void {
-    const th = app.theme;
     var problems_buf: [160]u8 = undefined;
     const problems = formatConfigProblems(&problems_buf, app.configProblems());
     if (!platform_term.isatty(1)) {
-        std.debug.print("metacodes\nType your message or /help for commands\n", .{});
-        if (problems.len != 0) std.debug.print("{s}\n", .{problems});
-        std.debug.print("\n", .{});
+        cmd_output.print("metacodes\nType your message or /help for commands\n", .{});
+        if (problems.len != 0) cmd_output.print("{s}\n", .{problems});
+        cmd_output.print("\n", .{});
         return;
     }
     playStartupSplash(app, allocator);
+    printBanner(app);
+}
+
+/// The welcome box alone (no animation): startup draws it after the splash,
+/// `/clear` draws it again on a cleared screen.
+fn printBanner(app: *const app_mod.App) void {
+    const th = app.theme;
+    var problems_buf: [160]u8 = undefined;
+    const problems = formatConfigProblems(&problems_buf, app.configProblems());
     const cols: usize = blk: {
         if (platform_term.windowSize(1)) |sz| {
             if (sz.cols > 0) break :blk sz.cols;
@@ -4270,12 +4628,12 @@ fn printStartupBanner(app: *const app_mod.App, allocator: std.mem.Allocator) voi
     // 去掉旧的 64 封顶——宽窗口下旧版框 64 列、分隔线满宽,两条线不等长(用户实测割裂)。
     const inner: usize = if (cols > 3) cols - 3 else 60;
 
-    const title = " metacodes ";
+    const title = " metacodes v" ++ @import("../version.zig").semver ++ " ";
     // 顶边框:╭─ metacodes ───…──╮
-    std.debug.print("{s}{s}{s}{s}", .{ th.accent, th.box_tl, th.box_h, title });
+    cmd_output.print("{s}{s}{s}{s}", .{ th.accent, th.box_tl, th.box_h, title });
     var filled: usize = 1 + displayWidthAscii(title); // box_h(1) + title
-    while (filled < inner) : (filled += 1) std.debug.print("{s}", .{th.box_h});
-    std.debug.print("{s}{s}\n", .{ th.box_tr, th.reset });
+    while (filled < inner) : (filled += 1) cmd_output.print("{s}", .{th.box_h});
+    cmd_output.print("{s}{s}\n", .{ th.box_tr, th.reset });
 
     // 内容行:模型 + cwd。
     printBannerLine(th, inner, app.activeModel());
@@ -4289,10 +4647,10 @@ fn printStartupBanner(app: *const app_mod.App, allocator: std.mem.Allocator) voi
     if (problems.len != 0) printBannerLine(th, inner, problems);
 
     // 底边框。
-    std.debug.print("{s}{s}", .{ th.accent, th.box_bl });
+    cmd_output.print("{s}{s}", .{ th.accent, th.box_bl });
     var k: usize = 0;
-    while (k < inner) : (k += 1) std.debug.print("{s}", .{th.box_h});
-    std.debug.print("{s}{s}\n\n", .{ th.box_br, th.reset });
+    while (k < inner) : (k += 1) cmd_output.print("{s}", .{th.box_h});
+    cmd_output.print("{s}{s}\n\n", .{ th.box_br, th.reset });
 }
 
 /// 启动动画:门控(TTY 两端/METACODES_NO_STARTUP_ANIMATION/config.json startupAnimation/
@@ -4321,11 +4679,11 @@ fn printBannerLine(th: anytype, inner: usize, text: []const u8) void {
     const pad_left = 2;
     const avail = if (inner > pad_left) inner - pad_left else 0; // text 最多占 inner-2 列
     const shown = if (displayWidthAscii(text) > avail) prefixToDisplayWidth(text, avail) else text;
-    std.debug.print("{s}{s}{s}  {s}", .{ th.accent, th.box_v, th.reset, shown });
+    cmd_output.print("{s}{s}{s}  {s}", .{ th.accent, th.box_v, th.reset, shown });
     // 右补空格,使 pad_left + shown_width + fill == inner,再竖线。
     var w: usize = pad_left + displayWidthAscii(shown);
-    while (w < inner) : (w += 1) std.debug.print(" ", .{});
-    std.debug.print("{s}{s}{s}\n", .{ th.accent, th.box_v, th.reset });
+    while (w < inner) : (w += 1) cmd_output.print(" ", .{});
+    cmd_output.print("{s}{s}{s}\n", .{ th.accent, th.box_v, th.reset });
 }
 
 /// 粗略显示宽(ASCII 1/字;非 ASCII 字节按 UTF-8 估算——banner 文本多为路径/模型名,ASCII 为主)。
@@ -4361,7 +4719,7 @@ fn printStartupSuggestion(allocator: std.mem.Allocator) void {
     while (it.next()) |line| {
         const f = std.mem.trim(u8, line, " \t\r");
         if (f.len == 0) continue;
-        std.debug.print("\x1b[2m  suggestion: explain or improve {s}\x1b[0m\n\n", .{f});
+        cmd_output.print("\x1b[2m  suggestion: explain or improve {s}\x1b[0m\n\n", .{f});
         return;
     }
 }
@@ -4398,21 +4756,21 @@ fn stopSelectedAgent(app: *app_mod.App, region: *render_region_mod.RenderRegion)
     } else {
         reg.killInScope(snaps[sel - 1].id, scope) catch {};
     }
-    std.debug.print("\r\x1b[2K\x1b[33m[stopped agent {s}]\x1b[0m\n", .{snaps[sel - 1].desc});
+    cmd_output.print("\r\x1b[2K\x1b[33m[stopped agent {s}]\x1b[0m\n", .{snaps[sel - 1].desc});
 }
 
 fn printTaskList(app: *app_mod.App) void {
     const tasks = app.tasks.tasks.items;
-    std.debug.print("\r\x1b[2K", .{}); // 清当前行
+    cmd_output.print("\r\x1b[2K", .{}); // 清当前行
     if (tasks.len == 0) {
-        std.debug.print("\x1b[2m(no tasks)\x1b[0m\n", .{});
+        cmd_output.print("\x1b[2m(no tasks)\x1b[0m\n", .{});
     } else {
-        std.debug.print("\x1b[1mTasks ({d}):\x1b[0m\n", .{tasks.len});
+        cmd_output.print("\x1b[1mTasks ({d}):\x1b[0m\n", .{tasks.len});
         var shown: usize = 0;
         for (tasks) |t| {
             if (t.status == .deleted) continue;
             if (shown >= 5) {
-                std.debug.print("  \x1b[2m... more\x1b[0m\n", .{});
+                cmd_output.print("  \x1b[2m... more\x1b[0m\n", .{});
                 break;
             }
             const icon = switch (t.status) {
@@ -4421,7 +4779,7 @@ fn printTaskList(app: *app_mod.App) void {
                 .completed => "\x1b[32m✓\x1b[0m", // 绿勾:完成
                 .deleted => unreachable,
             };
-            std.debug.print("  {s} {s}\n", .{ icon, t.subject });
+            cmd_output.print("  {s} {s}\n", .{ icon, t.subject });
             shown += 1;
         }
     }
@@ -4431,7 +4789,7 @@ fn printTaskList(app: *app_mod.App) void {
         const snaps = reg.snapshotJobsInScope(app.allocator, app.agentJobScope()) catch return;
         defer @import("../core/agent_job_registry.zig").AgentJobRegistry.freeSnapshots(app.allocator, snaps);
         if (snaps.len == 0) return;
-        std.debug.print("\x1b[1mSubagents ({d}):\x1b[0m\n", .{snaps.len});
+        cmd_output.print("\x1b[1mSubagents ({d}):\x1b[0m\n", .{snaps.len});
         for (snaps) |s| {
             const icon = switch (s.status) {
                 .running => "\x1b[33m◐\x1b[0m", // 黄半:跑
@@ -4440,7 +4798,7 @@ fn printTaskList(app: *app_mod.App) void {
                 .killed => "\x1b[90m○\x1b[0m", // 灰:终止
             };
             const label = if (s.desc.len > 0) s.desc else s.id;
-            std.debug.print("  {s} {s} \x1b[2m({d} turns, {d} tool calls)\x1b[0m\n", .{ icon, label, s.turns, s.tool_calls });
+            cmd_output.print("  {s} {s} \x1b[2m({d} turns, {d} tool calls)\x1b[0m\n", .{ icon, label, s.turns, s.tool_calls });
         }
     }
 }
@@ -4452,113 +4810,82 @@ fn handleShellMode(app: *app_mod.App, allocator: std.mem.Allocator, command: []c
     // (用户显式 ! = 授权;web/daemon 同源),stdout/stderr 渲染留此。
     var svc = session_service.SessionService.init(app);
     const result = svc.shellExec(allocator, command) catch |err| {
-        std.debug.print("\x1b[31m! error: {s}\x1b[0m\n", .{@errorName(err)});
+        cmd_output.print("\x1b[31m! error: {s}\x1b[0m\n", .{@errorName(err)});
         return;
     };
     defer allocator.free(result);
 
-    // 显示 stdout/stderr(parity-correct 提取 + 一次解码,与 web shellCommandResult 同源;
-    // 旧 extractJsonArg 的闭引号扫描对结尾反斜杠的内容会误判边界)。
-    const json_util = @import("../util/json.zig");
-    if (json_util.extractAndUnescapeStringField(result, "stdout", allocator) catch null) |u| {
-        defer allocator.free(u);
-        if (u.len > 0) std.debug.print("{s}", .{u});
-    }
-    if (json_util.extractAndUnescapeStringField(result, "stderr", allocator) catch null) |u| {
-        defer allocator.free(u);
-        if (u.len > 0) std.debug.print("\x1b[33m{s}\x1b[0m", .{u});
-    }
+    // 显示 stdout/stderr(与回放的会话同一份排版,见 cmd_output.shellOutputText)。
+    const text = try cmd_output.shellOutputText(allocator, app.theme.dim, app.theme.reset, result);
+    defer allocator.free(text);
+    cmd_output.print("{s}", .{text});
 }
 
 /// 检查到期 cron,逐个把其 prompt 作为 user message 注入并跑一轮 agent_loop。
-fn fireDueCrons(app: *app_mod.App, allocator: std.mem.Allocator, backend: *const ui_backend_mod.UiBackend) !void {
+fn fireDueCrons(host: *const TurnHost) !void {
+    const app = host.app;
+    const allocator = host.allocator;
     const due = app.cron_registry.collectDue(allocator) catch return;
     defer {
         for (due) |p| allocator.free(p);
         allocator.free(due);
     }
     for (due) |prompt| {
-        std.debug.print("\x1b[2m[cron fired]\x1b[0m {s}\n", .{prompt});
+        cmd_output.print("\x1b[2m[cron fired]\x1b[0m {s}\n", .{prompt});
         try app.conversation.appendText(.user, prompt);
-        try runInjectedAgent(app, allocator, backend);
+        try runTurn(host, .macro, null);
     }
 }
 
-/// 把预置 prompt 注入为 user message 后触发一次 agent_loop 执行。
-fn runInjectedAgent(app: *app_mod.App, allocator: std.mem.Allocator, backend: *const ui_backend_mod.UiBackend) !void {
-    return runInjectedAgentWithSynthetic(app, allocator, backend, null);
-}
-
-fn runInjectedAgentWithSynthetic(app: *app_mod.App, allocator: std.mem.Allocator, backend: *const ui_backend_mod.UiBackend, synthetic_user_input: ?[]const u8) !void {
-    // 辅助路径(cron 注入 / retry / commit 等宏),非用户盯着的主交互循环 → 不接
-    // spawn_tick_fn(默认 null,Bash 长命令静默,故意不传非遗漏)。
-    // U11:字段装配走 canonical buildRunOptions(此前本路径缺 agents/skills_set/mcp/
-    // cron/host_services 等字段——注入 run 里模型能力被静默削弱的漂移在此修复);
-    // emit_tool_cards 维持本路径既有关闭状态(WriterBackend 文本流,卡片会刷屏)。
-    var run_opts = session_service.buildRunOptions(app, synthetic_user_input);
-    run_opts.emit_tool_cards = false;
-    const result = agent_loop.run(
-        &app.conversation,
-        app.provider(),
-        app.tool_defs,
-        &app.permission_ctx,
-        run_opts,
-        backend,
-        allocator,
-    ) catch |err| {
-        std.debug.print("\x1b[31mError: {s}\x1b[0m\n", .{@errorName(err)});
-        app.clearPendingModelSwitchCompact();
-        return;
-    };
-    app.clearPendingModelSwitchCompact();
-    stopLoopIfGoalLimited(app);
-    app.persistTranscript();
-    if (result.stop_reason == .aborted) {
-        std.debug.print("\x1b[33m^C (cancelled)\x1b[0m\n", .{});
-    }
-    app.abort.reset(); // 同主循环:run 边界无条件复位,不让残留标志毒化下一次 run
+/// An interrupted turn, as Claude Code marks it: `⎿  Interrupted · What
+/// should metacodes do instead?`, dim.
+fn printInterrupted(app: *const app_mod.App) void {
+    const th = app.theme;
+    cmd_output.print("  {s}{s}  Interrupted · What should metacodes do instead?{s}\n", .{ th.dim, th.gutter, th.reset });
 }
 
 /// /resume：rest == "" 时列出最近 session；rest 是 session id 时加载。
-fn handleResume(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u8) !void {
+/// Returns what a load restored, for the caller to report (and redraw); null
+/// after a listing or a failure, which it reports itself.
+fn handleResume(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u8) !?app_mod.App.ResumedConversation {
     const state_dir = app.stateRoot();
     if (state_dir.len == 0) {
-        std.debug.print("no state root (HOME not set)\n", .{});
-        return;
+        cmd_output.print("no state root (HOME not set)\n", .{});
+        return null;
     }
 
     const cwd = util_fs.getCwd(allocator) catch {
-        std.debug.print("getcwd failed\n", .{});
-        return;
+        cmd_output.print("getcwd failed\n", .{});
+        return null;
     };
     defer allocator.free(cwd);
 
     if (rest.len == 0) {
         const list = transcript_mod.listSessions(cwd, .{ .path = state_dir }, allocator) catch |err| {
-            std.debug.print("listSessions failed: {s}\n", .{@errorName(err)});
-            return;
+            cmd_output.print("listSessions failed: {s}\n", .{@errorName(err)});
+            return null;
         };
         defer transcript_mod.freeSessionList(list, allocator);
 
         if (list.len == 0) {
-            std.debug.print("No previous sessions in this project.\n", .{});
-            return;
+            cmd_output.print("No previous sessions in this project.\n", .{});
+            return null;
         }
 
         const show = @min(list.len, 10);
-        std.debug.print("Recent sessions (most recent first):\n", .{});
+        cmd_output.print("Recent sessions (most recent first):\n", .{});
         for (list[0..show], 0..) |e, i| {
             const title = if (e.title.len == 0) "(no title)" else e.title;
-            std.debug.print("  \x1b[36m{d})\x1b[0m \x1b[90m{s}\x1b[0m  {s}  ({d} msgs, model={s})\n", .{ i + 1, e.id, title, e.message_count, e.model });
+            cmd_output.print("  \x1b[36m{d})\x1b[0m \x1b[90m{s}\x1b[0m  {s}  ({d} msgs, model={s})\n", .{ i + 1, e.id, title, e.message_count, e.model });
         }
-        std.debug.print("\nUse /resume <id> (or /resume <N>) to load a session.\n", .{});
-        return;
+        cmd_output.print("\nUse /resume <id> (or /resume <N>) to load a session.\n", .{});
+        return null;
     }
 
     // rest 是 session id 或纯数字（对应列表位置 1..N）
     const list = transcript_mod.listSessions(cwd, .{ .path = state_dir }, allocator) catch |err| {
-        std.debug.print("listSessions failed: {s}\n", .{@errorName(err)});
-        return;
+        cmd_output.print("listSessions failed: {s}\n", .{@errorName(err)});
+        return null;
     };
     defer transcript_mod.freeSessionList(list, allocator);
 
@@ -4572,18 +4899,15 @@ fn handleResume(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u
         }
     }
     if (target_path == null) {
-        // 按 id 精确匹配 / 前缀匹配
-        for (list) |e| {
-            if (std.mem.eql(u8, e.id, rest) or std.mem.startsWith(u8, e.id, rest)) {
-                target_path = e.path;
-                target_id = e.id;
-                break;
-            }
+        // 按 id 精确匹配 / 前缀匹配(与 `--resume <id>` 同一规则)
+        if (transcript_mod.findSession(list, rest)) |e| {
+            target_path = e.path;
+            target_id = e.id;
         }
     }
     const path = target_path orelse {
-        std.debug.print("No session matching '{s}'\n", .{rest});
-        return;
+        cmd_output.print("No session matching '{s}'\n", .{rest});
+        return null;
     };
 
     // Validate the durable identity before staging or switching any runtime
@@ -4591,8 +4915,8 @@ fn handleResume(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u
     // leave the writer pointed at one session while routing/permissions still
     // use another.
     const target_sid = @import("../core/session_id.zig").SessionId.fromSlice(target_id orelse "") orelse {
-        std.debug.print("load failed: invalid session id (session state unchanged)\n", .{});
-        return;
+        cmd_output.print("load failed: invalid session id (session state unchanged)\n", .{});
+        return null;
     };
 
     // 事务性加载：先在临时 conversation 加载，成功后才 atomic 切换。
@@ -4605,21 +4929,11 @@ fn handleResume(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u
     errdefer if (staged_owned_here) staged.deinit();
 
     transcript_mod.loadTranscript(&staged, path, allocator) catch |err| {
-        // 明确区分"存档坏了"与"这个会话用了已撤回的特性":后者文件是好的,
-        // 让用户去查磁盘是误导。loadTranscript 是原子的,失败时 staged 为空。
-        if (err == error.WithdrawnDocumentBlock) {
-            std.debug.print(
-                "load failed: this session contains a PDF document block from the withdrawn " ++
-                    "first-class document input; it cannot be resumed faithfully by this build " ++
-                    "(session state unchanged)\n",
-                .{},
-            );
-        } else {
-            std.debug.print("load failed: {s} (session state unchanged)\n", .{@errorName(err)});
-        }
+        // loadTranscript 是原子的,失败时 staged 为空。
+        cmd_output.print("load failed: {s} (session state unchanged)\n", .{resumeLoadFailure(err)});
         staged.deinit();
         staged_owned_here = false;
-        return;
+        return null;
     };
 
     // 预构造新 writer（dup 可能 OOM，放在切换之前）
@@ -4666,30 +4980,107 @@ fn handleResume(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u
     // issue #16:恢复本 session 自己的路由选择。它比 global 窄,所以赢——resume
     // 回来的会话应该继续用它当时那条路由,而不是这期间变成 global 的那条。
     // 选择存在但已解析不出来时明说,绝不静默换成别家 provider。
-    if (app.restoreSessionSelection()) |restored| {
-        if (restored) {
-            // The writer was staged before the session-scoped route was
-            // restored. Keep metadata.model tied to the route that will
-            // actually serve the resumed conversation; otherwise the next
-            // flush silently records the previous session's model.
-            if (app.transcript_writer) |*writer| writer.model = app.activeModel();
-            std.debug.print("Restored this session's model route: {s}\n", .{app.activeModel()});
-        }
-    } else |err| {
-        std.debug.print(
+    return .{ .messages = app.conversation.len(), .route = app.restoreSessionRoute() };
+}
+
+/// The resumed conversation in the scrollback (`replay.zig`); a failure to
+/// lay it out leaves a dim line instead, the session itself is loaded.
+fn replayConversation(app: *app_mod.App, allocator: std.mem.Allocator, region: *render_region_mod.RenderRegion) void {
+    replay.replay(allocator, .{ .region = region, .theme = &app.theme, .verbose = app.config.verbose }, &app.conversation) catch |err| {
+        cmd_output.print("{s}(conversation not shown: {s}){s}\n", .{ app.theme.dim, @errorName(err), app.theme.reset });
+    };
+}
+
+/// Why a stored session could not be loaded (`/resume`, `--resume`). A
+/// session that used the withdrawn document input is intact on disk, so it is
+/// named as such: sending the user to check the disk would mislead.
+pub fn resumeLoadFailure(err: anyerror) []const u8 {
+    if (err == error.WithdrawnDocumentBlock) return "this session contains a PDF document block from the withdrawn " ++
+        "first-class document input; it cannot be resumed faithfully by this build";
+    return @errorName(err);
+}
+
+/// The report of a resumed session, after `/resume <id>` or at the start of
+/// `--resume <id>`: the session's own route when it changed the current one,
+/// then the message count.
+fn printResumed(app: *const app_mod.App, resumed: app_mod.App.ResumedConversation) void {
+    switch (resumed.route) {
+        .kept => {},
+        .restored => cmd_output.print("Restored this session's model route: {s}\n", .{app.activeModel()}),
+        .unavailable => |err| cmd_output.print(
             "\x1b[33mwarning: this session's stored model route is unavailable ({s}); " ++
                 "the current route is unchanged\x1b[0m\n",
             .{@errorName(err)},
-        );
+        ),
     }
+    cmd_output.print("Resumed session ({d} messages). Continue by sending a message.\n", .{resumed.messages});
+}
 
-    std.debug.print("Resumed session ({d} messages). Continue by sending a message.\n", .{app.conversation.len()});
+/// Claude Code's exit hint, dim, after an interactive session: the command
+/// that reopens it. Only for a session whose transcript is on disk; one that
+/// never persisted a turn has nothing to resume.
+fn printResumeHint(app: *app_mod.App) void {
+    if (!app.hasPersistedTranscript()) return;
+    // `--state-dir` is per invocation; the command must name the same root.
+    const state_dir: ?[]const u8 = if (app.config.state_dir != null) app.stateRoot() else null;
+    var buffer: [std.fs.max_path_bytes * 2 + 256]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buffer);
+    writeResumeHint(&writer, app.theme, app.session_id.asSlice(), state_dir) catch return;
+    std.debug.print("{s}", .{writer.buffered()});
+}
+
+fn writeResumeHint(w: *std.Io.Writer, th: anytype, session_id: []const u8, state_dir: ?[]const u8) std.Io.Writer.Error!void {
+    try w.print("\n{s}Resume this session with:{s}\n{s}metacodes ", .{ th.dim, th.reset, th.dim });
+    if (state_dir) |dir| {
+        try w.writeAll("--state-dir ");
+        try writeShellWord(w, dir);
+        try w.writeAll(" ");
+    }
+    try w.print("--resume {s}{s}\n", .{ session_id, th.reset });
+}
+
+/// `word` as one POSIX shell word: bare when every byte is plainly safe,
+/// single-quoted otherwise (each `'` becomes `'\''`).
+fn writeShellWord(w: *std.Io.Writer, word: []const u8) std.Io.Writer.Error!void {
+    const bare = word.len > 0 and for (word) |c| {
+        if (!(std.ascii.isAlphanumeric(c) or std.mem.indexOfScalar(u8, "/._-+,:@%=", c) != null)) break false;
+    } else true;
+    if (bare) return w.writeAll(word);
+    try w.writeByte('\'');
+    for (word) |c| {
+        if (c == '\'') try w.writeAll("'\\''") else try w.writeByte(c);
+    }
+    try w.writeByte('\'');
+}
+
+test "the exit hint: two dim lines naming the session, the state root only when --state-dir set it" {
+    const th = @import("tui/theme.zig").dark;
+    var buffer: [512]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buffer);
+    try writeResumeHint(&w, th, "019a2b3c4d5e6f7a8b9c0d1e", null);
+    try std.testing.expectEqualStrings(
+        "\n\x1b[2mResume this session with:\x1b[0m\n\x1b[2mmetacodes --resume 019a2b3c4d5e6f7a8b9c0d1e\x1b[0m\n",
+        w.buffered(),
+    );
+    w = .fixed(&buffer);
+    try writeResumeHint(&w, @import("tui/theme.zig").no_color, "019a2b3c4d5e6f7a8b9c0d1e", "/srv/state");
+    try std.testing.expectEqualStrings(
+        "\nResume this session with:\nmetacodes --state-dir /srv/state --resume 019a2b3c4d5e6f7a8b9c0d1e\n",
+        w.buffered(),
+    );
+    // A root the shell would split or expand is quoted, and a quote in it survives.
+    w = .fixed(&buffer);
+    try writeResumeHint(&w, @import("tui/theme.zig").no_color, "019a2b3c4d5e6f7a8b9c0d1e", "/Users/a b/it's $HOME");
+    try std.testing.expectEqualStrings(
+        "\nResume this session with:\nmetacodes --state-dir '/Users/a b/it'\\''s $HOME' --resume 019a2b3c4d5e6f7a8b9c0d1e\n",
+        w.buffered(),
+    );
 }
 
 test "/login parses the CLI's flags and fails closed on an argument it does not know" {
     const parsed = parseLoginArgs("relay --device-code --no-browser --client-id abc", "/state");
     try std.testing.expect(parsed == .ok);
-    try std.testing.expectEqualStrings("relay", parsed.ok.provider);
+    try std.testing.expectEqualStrings("relay", parsed.ok.provider.?);
     try std.testing.expect(parsed.ok.options.method == .device_code);
     try std.testing.expect(!parsed.ok.options.open_browser);
     try std.testing.expectEqualStrings("abc", parsed.ok.options.client_id.?);
@@ -4698,7 +5089,10 @@ test "/login parses the CLI's flags and fails closed on an argument it does not 
     // Flags may precede the name; a second bare word is refused, as is a typo.
     try std.testing.expect(parseLoginArgs("--no-browser relay", "/state") == .ok);
     try std.testing.expect(parseLoginArgs("relay extra", "/state") == .unknown);
-    try std.testing.expect(parseLoginArgs("", "/state") == .usage);
+    // No provider: the TUI opens its provider list; flags still apply.
+    const bare = parseLoginArgs("--no-browser", "/state");
+    try std.testing.expect(bare == .ok and bare.ok.provider == null and !bare.ok.options.open_browser);
+    try std.testing.expect(parseLoginArgs("", "/state").ok.provider == null);
     try std.testing.expect(parseLoginArgs("relay --client-id", "/state") == .usage);
     const typo = parseLoginArgs("relay --device-cod", "/state");
     try std.testing.expect(typo == .unknown);
@@ -4831,7 +5225,8 @@ test "L2 #16: /resume 切 app.session_id + permission_ctx.session(路由键随�
     // resume by id → 修复前 app.session_id 仍是 old_id(漂移);修复后切到 sid。
     // 传 app.allocator(生产同款:staged conversation 用 app.allocator,loadTranscript 须同源,否则
     // conversation 消息块 alloc/free 跨 allocator 泄漏)。
-    try handleResume(app, app_arena.allocator(), sid.asSlice());
+    const resumed = (try handleResume(app, app_arena.allocator(), sid.asSlice())).?;
+    try std.testing.expectEqual(app.conversation.len(), resumed.messages); // 报告的就是加载进来的
     try std.testing.expect(!std.mem.eql(u8, &old_id.bytes, &app.session_id.bytes)); // 变了
     try std.testing.expectEqualStrings(sid.asSlice(), app.session_id.asSlice()); // 切到 resumed
     try std.testing.expectEqualStrings(sid.asSlice(), app.permission_ctx.session.asSlice()); // 路由键同步

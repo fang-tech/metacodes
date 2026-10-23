@@ -90,6 +90,33 @@ def simple_text(text="SHOULD_NOT_REACH"):
     )
 
 
+def text_turn(text, stop_reason="end_turn"):
+    """One text block, ended with `stop_reason` (e.g. "max_tokens" to make the loop ask to continue)."""
+    return (
+        b'data: {"type":"message_start","message":{"id":"m3","role":"assistant","model":"x","usage":{"input_tokens":1,"output_tokens":1}}}\n\n'
+        b'data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n'
+        + ('data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":%s}}\n\n' % _json_str(text)).encode()
+        + b'data: {"type":"content_block_stop","index":0}\n\n'
+        + ('data: {"type":"message_delta","delta":{"stop_reason":"%s"},"usage":{"output_tokens":1}}\n\n' % stop_reason).encode()
+        + b'data: {"type":"message_stop"}\n\n'
+    )
+
+
+def text_then_tool(text, tool, tool_input):
+    """A text block, then one tool call (`tool_input` is the JSON input string), ending with tool_use."""
+    return (
+        b'data: {"type":"message_start","message":{"id":"m4","role":"assistant","model":"x","usage":{"input_tokens":1,"output_tokens":1}}}\n\n'
+        b'data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n'
+        + ('data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":%s}}\n\n' % _json_str(text)).encode()
+        + b'data: {"type":"content_block_stop","index":0}\n\n'
+        + ('data: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"t1","name":"%s","input":{}}}\n\n' % tool).encode()
+        + ('data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":%s}}\n\n' % _json_str(tool_input)).encode()
+        + b'data: {"type":"content_block_stop","index":1}\n\n'
+        b'data: {"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":5}}\n\n'
+        b'data: {"type":"message_stop"}\n\n'
+    )
+
+
 def _json_str(s):
     import json
     return json.dumps(s)

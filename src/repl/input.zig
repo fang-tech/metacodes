@@ -479,16 +479,10 @@ pub const Action = enum {
     redraw,
     /// 提交当前行（enter）
     commit,
-    /// 用户取消（Ctrl+C：空 buffer 第一次 → 提示；非空 buffer → 丢弃回 prompt）
-    cancel,
-    /// 第一次 Ctrl+C 空 buffer 时——调用方应打印"按 Ctrl+C 再次退出"提示
-    cancel_hint,
-    /// 第二次连续 Ctrl+C（中间无其他按键）→ 退出 REPL
-    exit_repl,
-    /// 空输入 Ctrl+D → 主动退出 REPL；非空输入 Ctrl+D → 丢弃
+    /// Ctrl+D on an empty buffer. The idle prompt confirms it with a second
+    /// press in `ui.dispatch` before it gets here; only paths without that
+    /// state (none today) would see it.
     eof,
-    /// Esc(非空 draft):清 draft + 保存到历史
-    clear_draft,
     /// 无语义变化（如 unknown 键）
     none,
 };
@@ -503,8 +497,6 @@ pub const LineEditor = struct {
     buf: std.ArrayList(u8),
     cursor: usize = 0,
     allocator: std.mem.Allocator,
-    /// 上一次按键是否是 Ctrl+C（用于"双击退出"语义）。任何其他按键重置为 false。
-    ctrl_c_armed: bool = false,
     /// yank ring:Ctrl+W/K/U 删除的内容存这,Ctrl+Y 粘回。
     yank_buf: std.ArrayList(u8),
     /// undo 栈:破坏性编辑前快照 buf+cursor。深度上限 undo_max_depth,超了丢最旧。
@@ -532,12 +524,6 @@ pub const LineEditor = struct {
     pub fn handle(self: *LineEditor, key: Key) !Action {
         // 任何经 editor 的键都是非竖移键(up/down 在 dispatch 截获,永不入此)→ 终结竖移流。
         self.goal_vcol = null;
-        // "双击 Ctrl+C 退出" 语义：只有连续两次 Ctrl+C（中间无其他按键）才触发 exit_repl。
-        // 非 ctrl_c 按键会重置 armed 标志。
-        const was_armed = self.ctrl_c_armed;
-        if (@as(std.meta.Tag(Key), key) != .ctrl_c) {
-            self.ctrl_c_armed = false;
-        }
 
         // undo 去抖:破坏性编辑前 push 当前状态。char 连打只在段首压一次(last_op != char);
         // 其它破坏性操作每次都压。导航键不压但更新 last_op(使 char→left→char 在第二个 char 重新压)。
@@ -549,6 +535,10 @@ pub const LineEditor = struct {
                 },
                 .backspace, .delete, .ctrl_u, .ctrl_w, .ctrl_y, .shift_enter => {
                     self.pushUndo();
+                },
+                .ctrl_d => {
+                    // Ctrl+D deletes forward on a non-empty buffer (see below).
+                    if (self.cursor < self.buf.items.len) self.pushUndo();
                 },
                 .ctrl_k => {
                     // Ctrl+K 单按 = kill-line(Ctrl+X Ctrl+K 序列已迁 dispatch,不到 editor)。
@@ -645,25 +635,17 @@ pub const LineEditor = struct {
                 self.buf.items.len = self.cursor; // 截断
                 return .redraw;
             },
-            .ctrl_c => {
-                if (self.buf.items.len > 0) {
-                    // buffer 非空 —— 清 buffer，不退出
-                    self.ctrl_c_armed = false;
-                    return .cancel;
-                }
-                // buffer 空
-                if (was_armed) {
-                    // 连续第二次 Ctrl+C —— 真的退出
-                    self.ctrl_c_armed = false;
-                    return .exit_repl;
-                }
-                // 第一次 Ctrl+C 且 buffer 空：arm + 提示
-                self.ctrl_c_armed = true;
-                return .cancel_hint;
-            },
+            // Ctrl+C belongs to the prompt's double-press state (`ui.dispatch`)
+            // and, during a reply, to the watcher's interrupt; the editor has
+            // nothing of its own to do with it.
+            .ctrl_c => return .none,
             .ctrl_d => {
                 if (self.buf.items.len == 0) return .eof;
-                return .none; // 非空时忽略（不删除字符，不像 delete）
+                // Non-empty: delete forward, as Claude Code (and iPython) do.
+                if (self.cursor >= self.buf.items.len) return .none;
+                const end = nextCharBoundary(self.buf.items, self.cursor);
+                self.buf.replaceRangeAssumeCapacity(self.cursor, end - self.cursor, &.{});
+                return .redraw;
             },
             // 全局快捷键(↑↓/Tab/Shift+Tab/Ctrl+R/T/O/G/X/L)已全部由 dispatch(ui.zig)拦截解析,
             // editor 永远收不到它们(dispatch 返回非 pass_to_editor)→ 此处不再处理,落 else=.none。
@@ -715,15 +697,9 @@ pub const LineEditor = struct {
             },
             // paste_begin/end 由驱动循环（loop.zig）直接处理，编辑器层忽略
             .paste_begin, .paste_end => return .none,
-            .esc => {
-                // Idle input follows Claude Code's draft behavior: one Esc
-                // clears a non-empty draft; an empty editor has nothing to
-                // cancel and is left alone. The generating-phase watcher
-                // handles Esc separately because it owns the session abort
-                // state machine.
-                if (self.buf.items.len > 0) return .clear_draft;
-                return .none;
-            },
+            // Esc is the prompt's double press (`ui.dispatch`: a second Esc
+            // clears the draft) or, during a reply, the watcher's interrupt.
+            .esc => return .none,
             // 全局快捷键(↑↓/Tab/Shift+Tab/Ctrl+R/T/O/G/X/L)由 dispatch(ui.zig)拦截,
             // editor 正常收不到;此处兜底返 .none(防御:vim/边界路径若漏到这不崩)。
             .up, .down, .tab, .shift_tab, .ctrl_r, .ctrl_t, .ctrl_o, .ctrl_b, .ctrl_g, .ctrl_x, .ctrl_l => return .none,
@@ -1023,39 +999,33 @@ test "LineEditor: enter -> commit" {
     try testing.expect(a == .commit);
 }
 
-test "LineEditor: ctrl_c with non-empty buffer cancels" {
+test "LineEditor: ctrl_c leaves the buffer to the prompt state" {
     var ed = LineEditor.init(testing.allocator);
     defer ed.deinit();
     _ = try ed.handle(Key{ .char = 'a' });
-    const a = try ed.handle(.ctrl_c);
-    try testing.expect(a == .cancel);
+    try testing.expect((try ed.handle(.ctrl_c)) == .none);
+    try testing.expectEqualStrings("a", ed.view());
 }
 
-test "LineEditor: first ctrl_c on empty buffer hints" {
+test "LineEditor: ctrl_d deletes forward on a non-empty buffer" {
     var ed = LineEditor.init(testing.allocator);
     defer ed.deinit();
-    const a = try ed.handle(.ctrl_c);
-    try testing.expect(a == .cancel_hint);
-    try testing.expect(ed.ctrl_c_armed);
+    try typeStr(&ed, "héllo");
+    _ = try ed.handle(.home);
+    _ = try ed.handle(.right); // after 'h'
+    try testing.expect((try ed.handle(.ctrl_d)) == .redraw);
+    try testing.expectEqualStrings("hllo", ed.view()); // the two-byte é is removed whole
+    _ = try ed.handle(.end);
+    try testing.expect((try ed.handle(.ctrl_d)) == .none); // nothing ahead of the cursor
+    try testing.expectEqualStrings("hllo", ed.view());
+    _ = try ed.handle(.ctrl_underscore); // undo restores the deleted char
+    try testing.expectEqualStrings("héllo", ed.view());
 }
 
-test "LineEditor: double ctrl_c on empty buffer exits" {
+test "LineEditor: ctrl_d on an empty buffer is eof" {
     var ed = LineEditor.init(testing.allocator);
     defer ed.deinit();
-    try testing.expect((try ed.handle(.ctrl_c)) == .cancel_hint);
-    try testing.expect((try ed.handle(.ctrl_c)) == .exit_repl);
-    try testing.expect(!ed.ctrl_c_armed);
-}
-
-test "LineEditor: ctrl_c armed is reset by any other key" {
-    var ed = LineEditor.init(testing.allocator);
-    defer ed.deinit();
-    _ = try ed.handle(.ctrl_c); // armed
-    try testing.expect(ed.ctrl_c_armed);
-    _ = try ed.handle(Key{ .char = 'x' });
-    try testing.expect(!ed.ctrl_c_armed);
-    // 再按 ctrl_c 应该回到 cancel_hint（因为 buffer 已经有 'x' 了，cancel buffer）
-    try testing.expect((try ed.handle(.ctrl_c)) == .cancel);
+    try testing.expect((try ed.handle(.ctrl_d)) == .eof);
 }
 
 test "LineEditor: ctrl_d empty -> eof" {
@@ -1263,28 +1233,14 @@ test "LineEditor: alt_b / alt_f word navigation" {
     try testing.expectEqual(@as(usize, 7), ed.cursor);
 }
 
-test "LineEditor: single Esc on non-empty buffer clears draft" {
-    var ed = LineEditor.init(testing.allocator);
-    defer ed.deinit();
-    try typeStr(&ed, "hello");
-    try testing.expect((try ed.handle(.esc)) == .clear_draft);
-}
-
-test "LineEditor: Esc after clear is harmless" {
-    var ed = LineEditor.init(testing.allocator);
-    defer ed.deinit();
-    try typeStr(&ed, "x");
-    try testing.expect((try ed.handle(.esc)) == .clear_draft);
-    ed.clear();
-    _ = try ed.handle(Key{ .char = 'y' });
-    try testing.expect((try ed.handle(.esc)) == .clear_draft);
-}
-
-test "LineEditor: Esc Esc on empty buffer does not clear" {
+test "LineEditor: Esc never edits the buffer (the prompt's double press clears)" {
     var ed = LineEditor.init(testing.allocator);
     defer ed.deinit();
     try testing.expect((try ed.handle(.esc)) == .none);
-    try testing.expect((try ed.handle(.esc)) == .none); // 空 buffer → 不触发 clear_draft
+    try typeStr(&ed, "hello");
+    try testing.expect((try ed.handle(.esc)) == .none);
+    try testing.expect((try ed.handle(.esc)) == .none);
+    try testing.expectEqualStrings("hello", ed.view());
 }
 
 test "KeyParser: ctrl_t byte" {

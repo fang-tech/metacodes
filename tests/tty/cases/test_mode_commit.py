@@ -1,10 +1,10 @@
 """T08/T10/T11:shift+tab 切模式 / 提交本地命令 / 退出清理。"""
-from tty_driver import run, submit
+from tty_driver import run, submit, READY, wait_for
 from asserts import TTYAssert
 
-# /help 的输出比一屏长,开头的 `Commands:` 在输出收尾时已滚出屏幕,等它会等满超时;
-# 等靠近末尾的段标题。
-HELP_TAIL = "Multi-line input:"
+# /help opens Claude Code's Help pane (tabs General / Commands / Custom
+# commands); Esc closes it and leaves `⎿  Help dialog dismissed` under the echo.
+HELP_PANE = "Esc to close"
 
 
 def test_T08_shift_tab_cycle(bin_path):
@@ -33,12 +33,17 @@ def test_T08b_shift_tab_cycle_closes_after_accept_edits(bin_path):
 
 
 def test_T10_submit_local_command(bin_path):
-    # 提交 /help(本地命令,不打模型):框清掉 → /help 文本进 scrollback → 新框回底部
-    raw = run(bin_path, submit("/help", HELP_TAIL))
+    # 提交 /help(本地命令,不打模型):帮助面板出现 → Esc 关闭 → 结果进 scrollback → 新框回底部
+    raw = run(bin_path, [READY, "type:/help", "key:enter", wait_for(HELP_PANE, 10),
+                         "key:esc", wait_for("Help dialog dismissed", 10)])
     a = TTYAssert(raw)
-    a.assert_prose_contains("Commands:")   # /help 输出
     a.assert_box_present()                 # 新输入框重新出现
     a.assert_box_at_bottom()
+    shown = a.screens_with("! for shell mode")
+    if not shown:
+        a._fail("/help should show the shortcuts on its General tab")
+    if a.final.find_row("! for shell mode") is not None:
+        a._fail("the Help pane should be erased after Esc")
 
 
 def test_T11_exit_clean(bin_path):
@@ -49,10 +54,11 @@ def test_T11_exit_clean(bin_path):
 
 
 def test_T13_commit_echoes_user_input(bin_path):
-    # 提交后用户输入应回显到 scrollback(❯ 行),否则打的东西凭空消失。
-    # 用 /help(本地命令不打模型);它的回显行应含 "❯" + "/help"。
-    raw = run(bin_path, submit("/help", HELP_TAIL))
+    # 提交后用户输入应回显到 scrollback(❯ 行),结果挂在 ⎿ 下(对齐 cc)。
+    raw = run(bin_path, [READY, "type:/help", "key:enter", wait_for(HELP_PANE, 10),
+                         "key:esc", wait_for("Help dialog dismissed", 10)])
     a = TTYAssert(raw)
-    # scrollback 里应能找到提交的 /help(回显)+ Commands(输出)
-    a.assert_prose_contains("/help")
-    a.assert_prose_contains("Commands:")
+    echo = a.final.find_row("❯ /help")
+    if echo is None:
+        a._fail("the /help echo is missing from the scrollback")
+    a.assert_line_contains(echo + 1, "⎿  Help dialog dismissed")

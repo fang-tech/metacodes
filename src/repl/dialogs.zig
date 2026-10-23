@@ -1,0 +1,1126 @@
+//! The REPL's command dialogs — `/help`, `/skills`, `/login` — drawn as
+//! Claude Code's bottom pane (`tui/dialog/pane.zig`).
+//!
+//! Each dialog is a small state machine: `draw` projects it onto a `Pane`,
+//! `key` and `tick` move it and say whether to redraw or close. None of them
+//! touches the terminal; `pane.run` owns that. When a dialog closes it leaves
+//! an `outcome` for the command to print under its echo (`⎿  Login
+//! interrupted`), the way Claude Code reports a dismissed dialog.
+
+const std = @import("std");
+const input = @import("input.zig");
+const complete = @import("complete.zig");
+const pane_mod = @import("tui/dialog/pane.zig");
+const ui = @import("tui/ui.zig");
+const term = @import("tui/term.zig");
+const ansi = @import("tui/ansi.zig");
+const Theme = @import("tui/theme.zig").Theme;
+const catalog_mod = @import("../skills/runtime/catalog.zig");
+const overrides_mod = @import("../skills/overrides.zig");
+const provider_login = @import("../api/provider_login.zig");
+const login_worker_mod = @import("../api/login_worker.zig");
+const provider_profile = @import("../provider/profile.zig");
+
+const Pane = pane_mod.Pane;
+const Step = pane_mod.Step;
+
+/// Rows a scrolling list may take, leaving the pane's chrome on screen.
+pub fn listRows(term_rows: usize, chrome: usize) usize {
+    return @max(3, term_rows -| chrome);
+}
+
+fn emphasis(th: Theme) []const u8 {
+    return if (th.reset.len != 0) ansi.sgr.bold else "";
+}
+
+// ── /help ───────────────────────────────────────────────────────────────────
+
+pub const HelpDialog = struct {
+    pub const Tab = enum { general, commands, custom };
+
+    catalog: complete.SlashCatalog,
+    term_rows: usize,
+    tab: Tab = .general,
+    /// First visible entry of the current list.
+    top: usize = 0,
+
+    pub fn draw(self: *HelpDialog, p: *Pane) !void {
+        try p.rule();
+        try self.drawTabs(p);
+        try p.blank();
+        switch (self.tab) {
+            .general => {
+                try p.paragraph("", "metacodes understands your codebase, makes edits with your permission, and runs commands, right from your terminal.");
+                try p.blank();
+                try p.title("Shortcuts");
+                var lines: std.ArrayList(u8) = .empty;
+                defer lines.deinit(p.allocator);
+                var sink: CrlfSink = .{ .out = &lines, .allocator = p.allocator };
+                // The pane keeps the last column free; lay the grid out for that.
+                _ = try ui.renderHelpLines(&sink, @import("tui/theme.zig").monochrome, @intCast(@min(p.cols -| 1, std.math.maxInt(u16))));
+                var it = std.mem.splitSequence(u8, lines.items, "\r\n");
+                while (it.next()) |line| {
+                    if (line.len == 0) continue;
+                    // renderHelpLines indents by two; the pane indents again.
+                    try p.text(std.mem.trimStart(u8, line, " "));
+                }
+            },
+            .commands => try self.drawList(p, .builtin, "Browse default commands", ""),
+            .custom => try self.drawList(p, .skill, "Browse custom commands", "No custom commands. Add a Skill at .claude/skills/<name>/SKILL.md."),
+        }
+        try p.blank();
+        try p.footer("←/→ or tab to switch · ↑/↓ to scroll · Esc to close");
+    }
+
+    fn drawTabs(self: *const HelpDialog, p: *Pane) !void {
+        const th = p.th;
+        const styled = th.reset.len != 0;
+        const active = if (styled) ansi.sgr.reverse else "";
+        const names = [_][]const u8{ "General", "Commands", "Custom commands" };
+        var parts: [8]Pane.Span = undefined;
+        var n: usize = 0;
+        parts[n] = .{ .style = emphasis(th), .text = "Help" };
+        n += 1;
+        for (names, 0..) |name, i| {
+            const on = @intFromEnum(self.tab) == i;
+            parts[n] = .{ .text = "  " };
+            n += 1;
+            parts[n] = .{
+                .style = if (on) active else th.dim,
+                .text = if (on and !styled) bracketed(name) else name,
+            };
+            n += 1;
+        }
+        try p.spans(parts[0..n]);
+    }
+
+    fn bracketed(name: []const u8) []const u8 {
+        if (std.mem.eql(u8, name, "General")) return "[General]";
+        if (std.mem.eql(u8, name, "Commands")) return "[Commands]";
+        return "[Custom commands]";
+    }
+
+    fn count(self: *const HelpDialog, kind: complete.SlashKind) usize {
+        var n: usize = 0;
+        for (self.catalog.entries) |cmd| n += @intFromBool(cmd.kind == kind);
+        return n;
+    }
+
+    /// Each entry takes two rows (name, description).
+    fn visibleEntries(self: *const HelpDialog) usize {
+        return @max(2, listRows(self.term_rows, 12) / 2);
+    }
+
+    fn drawList(self: *HelpDialog, p: *Pane, kind: complete.SlashKind, heading: []const u8, empty: []const u8) !void {
+        const total = self.count(kind);
+        if (total == 0) {
+            try p.dim(empty);
+            return;
+        }
+        try p.text(heading);
+        try p.blank();
+        const visible = self.visibleEntries();
+        self.top = @min(self.top, total -| visible);
+        var index: usize = 0;
+        var shown: usize = 0;
+        for (self.catalog.entries) |cmd| {
+            if (cmd.kind != kind) continue;
+            defer index += 1;
+            if (index < self.top or shown >= visible) continue;
+            shown += 1;
+            const more_below = shown == visible and self.top + visible < total;
+            const more_above = shown == 1 and self.top > 0;
+            const marker = if (more_below) "↓ " else if (more_above) "↑ " else "  ";
+            var name_buf: [96]u8 = undefined;
+            const name = std.fmt.bufPrint(&name_buf, "{s}{s}{s}{s}", .{
+                marker,
+                cmd.name,
+                if (cmd.hint.len != 0) " " else "",
+                cmd.hint,
+            }) catch cmd.name;
+            try p.text(name);
+            var desc_buf: [256]u8 = undefined;
+            const desc = if (cmd.source.len != 0)
+                std.fmt.bufPrint(&desc_buf, "    {s} ({s})", .{ cmd.desc, cmd.source }) catch cmd.desc
+            else
+                std.fmt.bufPrint(&desc_buf, "    {s}", .{cmd.desc}) catch cmd.desc;
+            try p.dim(desc);
+        }
+    }
+
+    pub fn key(self: *HelpDialog, k: input.Key) Step {
+        switch (k) {
+            .esc, .ctrl_c => return .done,
+            .tab, .right => {
+                self.tab = switch (self.tab) {
+                    .general => .commands,
+                    .commands => .custom,
+                    .custom => .general,
+                };
+                self.top = 0;
+                return .redraw;
+            },
+            .shift_tab, .left => {
+                self.tab = switch (self.tab) {
+                    .general => .custom,
+                    .commands => .general,
+                    .custom => .commands,
+                };
+                self.top = 0;
+                return .redraw;
+            },
+            .down => {
+                const kind: complete.SlashKind = switch (self.tab) {
+                    .general => return .none,
+                    .commands => .builtin,
+                    .custom => .skill,
+                };
+                const total = self.count(kind);
+                if (self.top + self.visibleEntries() >= total) return .none;
+                self.top += 1;
+                return .redraw;
+            },
+            .up => {
+                if (self.tab == .general or self.top == 0) return .none;
+                self.top -= 1;
+                return .redraw;
+            },
+            else => return .none,
+        }
+    }
+
+    pub fn tick(_: *HelpDialog) Step {
+        return .none;
+    }
+};
+
+/// Collects `ui.renderHelpLines` output.
+const CrlfSink = struct {
+    out: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    pub fn writeAll(self: *CrlfSink, bytes: []const u8) !void {
+        try self.out.appendSlice(self.allocator, bytes);
+    }
+};
+
+// ── /skills ─────────────────────────────────────────────────────────────────
+
+/// Claude Code's `/skills`: every Skill with its `skillOverrides` state.
+/// Enter or Space cycles the selected one through on → name-only →
+/// user-invocable-only → off; typing (or `/`) searches. Closing reports the
+/// Skills whose state changed (`changes`), which the command saves.
+pub const SkillsDialog = struct {
+    pub const State = overrides_mod.State;
+
+    /// A Skill whose state the dialog cannot change.
+    pub const Lock = enum {
+        none,
+        /// `disable-model-invocation: true`: the model never sees it.
+        author,
+    };
+
+    pub const Mode = enum { list, search };
+
+    allocator: std.mem.Allocator,
+    snapshot: ?*const catalog_mod.Snapshot,
+    term_rows: usize,
+    /// State per snapshot record when the dialog opened, and now.
+    initial: []State = &.{},
+    current: []State = &.{},
+    mode: Mode = .list,
+    query: [64]u8 = undefined,
+    query_len: usize = 0,
+    sel: usize = 0,
+    top: usize = 0,
+
+    pub fn init(
+        allocator: std.mem.Allocator,
+        snapshot: ?*const catalog_mod.Snapshot,
+        overrides: ?*overrides_mod.Overrides,
+        term_rows: usize,
+    ) !SkillsDialog {
+        var self = SkillsDialog{ .allocator = allocator, .snapshot = snapshot, .term_rows = term_rows };
+        const listed = self.records();
+        self.initial = try allocator.alloc(State, listed.len);
+        errdefer allocator.free(self.initial);
+        self.current = try allocator.alloc(State, listed.len);
+        errdefer allocator.free(self.current);
+        @memset(self.initial, .on);
+        if (overrides) |o| {
+            const names = try allocator.alloc([]const u8, listed.len);
+            defer allocator.free(names);
+            for (listed, names) |record, *name| name.* = record.invocation_name;
+            o.statesOf(names, self.initial);
+        }
+        @memcpy(self.current, self.initial);
+        return self;
+    }
+
+    pub fn deinit(self: *SkillsDialog) void {
+        self.allocator.free(self.initial);
+        self.allocator.free(self.current);
+        self.* = undefined;
+    }
+
+    /// The Skills whose state the user changed (names borrowed from the
+    /// snapshot), in catalog order.
+    pub fn changes(self: *const SkillsDialog, allocator: std.mem.Allocator) ![]overrides_mod.Change {
+        var out: std.ArrayList(overrides_mod.Change) = .empty;
+        errdefer out.deinit(allocator);
+        for (self.records(), self.initial, self.current) |record, before, after| {
+            if (before != after) try out.append(allocator, .{ .name = record.invocation_name, .state = after });
+        }
+        return out.toOwnedSlice(allocator);
+    }
+
+    pub fn lockOf(record: *const catalog_mod.SkillRecord) Lock {
+        return if (record.definition.disable_model_invocation) .author else .none;
+    }
+
+    fn queryText(self: *const SkillsDialog) []const u8 {
+        return self.query[0..self.query_len];
+    }
+
+    fn records(self: *const SkillsDialog) []const catalog_mod.SkillRecord {
+        return if (self.snapshot) |snap| snap.skills else &.{};
+    }
+
+    fn matches(self: *const SkillsDialog, record: *const catalog_mod.SkillRecord) bool {
+        const q = self.queryText();
+        if (q.len == 0) return true;
+        return containsFold(record.invocation_name, q) or containsFold(record.definition.description, q);
+    }
+
+    fn matchCount(self: *const SkillsDialog) usize {
+        var n: usize = 0;
+        for (self.records()) |*record| n += @intFromBool(self.matches(record));
+        return n;
+    }
+
+    /// Index in the snapshot of the `nth` Skill that matches the query.
+    fn nthMatch(self: *const SkillsDialog, nth: usize) ?usize {
+        var n: usize = 0;
+        for (self.records(), 0..) |*record, index| {
+            if (!self.matches(record)) continue;
+            if (n == nth) return index;
+            n += 1;
+        }
+        return null;
+    }
+
+    fn visibleRows(self: *const SkillsDialog) usize {
+        return listRows(self.term_rows, 12);
+    }
+
+    pub fn draw(self: *SkillsDialog, p: *Pane) !void {
+        const th = p.th;
+        try p.rule();
+        try p.title("Skills");
+        const total = self.records().len;
+        const matches_n = self.matchCount();
+        var count_buf: [48]u8 = undefined;
+        const count = (if (self.query_len == 0)
+            std.fmt.bufPrint(&count_buf, "{d} skill{s}", .{ total, if (total == 1) "" else "s" })
+        else
+            std.fmt.bufPrint(&count_buf, "{d}/{d} skills", .{ matches_n, total })) catch "";
+        var head_buf: [160]u8 = undefined;
+        try p.dim(std.fmt.bufPrint(&head_buf, "{s} · {s}", .{ count, switch (self.mode) {
+            .list => "enter/space to cycle, / to search, Esc to close",
+            .search => "type to filter · ↓/enter to select · esc to clear",
+        } }) catch count);
+        try p.blank();
+        try p.search(self.queryText(), "Search skills…");
+        // The cursor rests in the box only while it has the focus.
+        if (self.mode == .list) p.cursor = null;
+
+        if (self.snapshot == null) {
+            try p.text("The skill catalog did not load; run with METACODES_LOG=warn to see why.");
+            return;
+        }
+        if (total == 0) {
+            try p.text("No skills installed. Add one at .claude/skills/<name>/SKILL.md");
+            try p.dim("(also read: ~/.claude/skills, .agents/skills, .codex/skills, .metacodes/skills)");
+        } else if (matches_n == 0) {
+            var none_buf: [96]u8 = undefined;
+            try p.dim(std.fmt.bufPrint(&none_buf, "No skills match \"{s}\"", .{self.queryText()}) catch "No skills match");
+        } else {
+            const visible = self.visibleRows();
+            self.sel = @min(self.sel, matches_n - 1);
+            if (self.sel < self.top) self.top = self.sel;
+            if (self.sel >= self.top + visible) self.top = self.sel + 1 - visible;
+            var i = self.top;
+            while (i < matches_n and i < self.top + visible) : (i += 1) {
+                const index = self.nthMatch(i).?;
+                try self.drawRow(p, index, self.mode == .list and i == self.sel);
+            }
+            if (self.top + visible < matches_n) {
+                var more_buf: [32]u8 = undefined;
+                try p.dim(std.fmt.bufPrint(&more_buf, "  ↓ {d} more", .{matches_n - self.top - visible}) catch "  ↓ more");
+            }
+        }
+        if (self.snapshot.?.issues.len != 0) {
+            const issues = self.snapshot.?.issues.len;
+            try p.blank();
+            var issue_buf: [96]u8 = undefined;
+            try p.line(th.warn, std.fmt.bufPrint(&issue_buf, "{d} skill{s} did not load · /doctor", .{
+                issues,
+                if (issues == 1) "" else "s",
+            }) catch "Some skills did not load");
+        }
+    }
+
+    /// `❯ ✔ on         name · user · < 20 tok` (Claude Code's row).
+    fn drawRow(self: *const SkillsDialog, p: *Pane, index: usize, selected: bool) !void {
+        const th = p.th;
+        const record = &self.records()[index];
+        const lock = lockOf(record);
+        const state: State = switch (lock) {
+            .none => self.current[index],
+            .author => if (self.current[index] == .off) .off else .user_invocable_only,
+        };
+        const ascii = std.mem.eql(u8, th.box_h, "-");
+        const glyph: []const u8 = if (lock != .none)
+            (if (ascii) "#" else "🔒")
+        else switch (state) {
+            .on => if (ascii) "+" else "✔",
+            .name_only => if (ascii) "*" else "●",
+            .user_invocable_only => if (ascii) "o" else "◯",
+            .off => if (ascii) "x" else "✘",
+        };
+        const color: []const u8 = if (lock != .none) "" else switch (state) {
+            .on => th.success,
+            .name_only => "",
+            .user_invocable_only => th.warn,
+            .off => th.danger,
+        };
+        var label_buf: [16]u8 = undefined;
+        const label = std.fmt.bufPrint(&label_buf, "{s: <11}", .{stateLabel(state)}) catch stateLabel(state);
+        var tokens_buf: [24]u8 = undefined;
+        var detail_buf: [96]u8 = undefined;
+        const detail = std.fmt.bufPrint(&detail_buf, " · {s} · {s}{s}", .{
+            scopeName(record.source_scope),
+            tokenEstimate(record, &tokens_buf),
+            if (lock == .author) " · locked by author" else "",
+        }) catch "";
+        const pointer: []const u8 = if (!selected) "  " else if (ascii) "> " else "❯ ";
+        try p.spans(&.{
+            .{ .style = if (selected) th.accent else "", .text = pointer },
+            .{ .style = color, .text = glyph },
+            .{ .text = " " },
+            .{ .style = if (selected) emphasis(th) else "", .text = label },
+            .{ .style = if (selected) emphasis(th) else "", .text = record.invocation_name },
+            .{ .style = th.dim, .text = detail },
+        });
+    }
+
+    pub fn key(self: *SkillsDialog, k: input.Key) Step {
+        return switch (self.mode) {
+            .list => self.listKey(k),
+            .search => self.searchKey(k),
+        };
+    }
+
+    fn listKey(self: *SkillsDialog, k: input.Key) Step {
+        switch (k) {
+            .esc, .ctrl_c => return .done,
+            .up => {
+                if (self.sel == 0) return .none;
+                self.sel -= 1;
+                return .redraw;
+            },
+            .down => {
+                if (self.sel + 1 >= self.matchCount()) return .none;
+                self.sel += 1;
+                return .redraw;
+            },
+            .enter => return self.cycleSelected(),
+            .char => |c| {
+                if (c == ' ') return self.cycleSelected();
+                self.mode = .search;
+                if (c == '/') return .redraw;
+                return self.typeChar(c);
+            },
+            .backspace => {
+                self.mode = .search;
+                _ = self.deleteChar();
+                return .redraw;
+            },
+            else => return .none,
+        }
+    }
+
+    fn searchKey(self: *SkillsDialog, k: input.Key) Step {
+        switch (k) {
+            .ctrl_c => return .done,
+            .esc => {
+                // A query clears first; an empty one leaves the search.
+                if (self.query_len != 0) {
+                    self.query_len = 0;
+                    self.sel = 0;
+                    self.top = 0;
+                } else {
+                    self.mode = .list;
+                }
+                return .redraw;
+            },
+            .down, .enter => {
+                self.mode = .list;
+                return .redraw;
+            },
+            .backspace => return self.deleteChar(),
+            .char => |c| return self.typeChar(c),
+            else => return .none,
+        }
+    }
+
+    fn typeChar(self: *SkillsDialog, c: u8) Step {
+        if (c < 0x20 or self.query_len >= self.query.len) return .none;
+        self.query[self.query_len] = c;
+        self.query_len += 1;
+        self.sel = 0;
+        self.top = 0;
+        return .redraw;
+    }
+
+    fn deleteChar(self: *SkillsDialog) Step {
+        if (self.query_len == 0) return .none;
+        var end = self.query_len - 1;
+        while (end > 0 and (self.query[end] & 0xc0) == 0x80) end -= 1;
+        self.query_len = end;
+        self.sel = 0;
+        self.top = 0;
+        return .redraw;
+    }
+
+    fn cycleSelected(self: *SkillsDialog) Step {
+        const index = self.nthMatch(self.sel) orelse return .none;
+        if (lockOf(&self.records()[index]) != .none) return .none;
+        self.current[index] = self.current[index].next();
+        return .redraw;
+    }
+
+    pub fn tick(_: *SkillsDialog) Step {
+        return .none;
+    }
+};
+
+/// The state column of `/skills` (Claude Code shortens the third one).
+fn stateLabel(state: SkillsDialog.State) []const u8 {
+    return switch (state) {
+        .on => "on",
+        .name_only => "name-only",
+        .user_invocable_only => "user-only",
+        .off => "off",
+    };
+}
+
+/// What the Skill's listing line costs the model, roughly (4 bytes a token):
+/// `< 20 tok` or `~N tok`.
+fn tokenEstimate(record: *const catalog_mod.SkillRecord, buf: []u8) []const u8 {
+    const bytes = record.invocation_name.len + 4 + record.definition.description.len + record.definition.when_to_use.len;
+    const tokens = (bytes + 3) / 4;
+    if (tokens < 20) return "< 20 tok";
+    return std.fmt.bufPrint(buf, "~{d} tok", .{tokens}) catch "";
+}
+
+pub fn scopeName(scope: catalog_mod.SourceScope) []const u8 {
+    return switch (scope) {
+        .enterprise => "enterprise",
+        .personal => "user",
+        .project => "project",
+        .plugin => "plugin",
+    };
+}
+
+fn firstLine(text: []const u8) []const u8 {
+    const end = std.mem.indexOfScalar(u8, text, '\n') orelse text.len;
+    return text[0..end];
+}
+
+fn containsFold(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len > haystack.len) return false;
+    var i: usize = 0;
+    while (i + needle.len <= haystack.len) : (i += 1) {
+        if (std.ascii.eqlIgnoreCase(haystack[i .. i + needle.len], needle)) return true;
+    }
+    return false;
+}
+
+// ── /login ──────────────────────────────────────────────────────────────────
+
+pub const LoginDialog = struct {
+    pub const MAX_PROVIDERS = 12;
+
+    pub const Choice = struct {
+        profile: *const provider_profile.ProviderProfile,
+        flow: provider_login.Flow,
+    };
+
+    pub const Stage = enum { choose, signing_in, failed };
+
+    pub const Outcome = union(enum) {
+        interrupted,
+        signed_in: []const u8,
+        /// The sign-in could not start (no worker thread, out of memory).
+        failed: []const u8,
+    };
+
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    choices: [MAX_PROVIDERS]Choice = undefined,
+    choices_len: usize = 0,
+    sel: usize = 0,
+    stage: Stage = .choose,
+    worker: ?*login_worker_mod.LoginWorker = null,
+    /// A cancelled sign-in whose thread is still in a request; the host
+    /// takes it (`takeDetached`) so closing the dialog never waits on it.
+    detached: ?*login_worker_mod.LoginWorker = null,
+    failure: [96]u8 = undefined,
+    failure_len: usize = 0,
+    transcript: [login_worker_mod.TRANSCRIPT_CAPACITY]u8 = undefined,
+    transcript_len: usize = 0,
+    outcome: Outcome = .interrupted,
+
+    pub fn add(self: *LoginDialog, choice: Choice) void {
+        if (self.choices_len >= MAX_PROVIDERS) return;
+        self.choices[self.choices_len] = choice;
+        self.choices_len += 1;
+    }
+
+    /// Jump straight to signing in (`/login <provider>`).
+    pub fn startAt(self: *LoginDialog, index: usize) void {
+        self.sel = index;
+        self.begin();
+    }
+
+    /// Ends any sign-in still owned here, waiting for its thread.
+    pub fn deinit(self: *LoginDialog) void {
+        if (self.detached) |worker| join(self.allocator, worker);
+        self.detached = null;
+        if (self.worker) |worker| {
+            worker.cancel();
+            join(self.allocator, worker);
+        }
+        self.worker = null;
+    }
+
+    /// The cancelled sign-in left running, for the host to reap.
+    pub fn takeDetached(self: *LoginDialog) ?*login_worker_mod.LoginWorker {
+        defer self.detached = null;
+        return self.detached;
+    }
+
+    fn join(allocator: std.mem.Allocator, worker: *login_worker_mod.LoginWorker) void {
+        worker.join();
+        allocator.destroy(worker);
+    }
+
+    /// Cancel the sign-in. A settled thread is joined now; one still inside
+    /// a request is handed off (`detached`) instead of blocking the dialog.
+    fn stopWorker(self: *LoginDialog) void {
+        const worker = self.worker orelse return;
+        self.worker = null;
+        if (worker.isSettled()) return join(self.allocator, worker);
+        worker.cancel();
+        if (self.detached) |older| join(self.allocator, older);
+        self.detached = worker;
+    }
+
+    fn current(self: *const LoginDialog) *const Choice {
+        return &self.choices[self.sel];
+    }
+
+    fn begin(self: *LoginDialog) void {
+        self.stopWorker();
+        self.transcript_len = 0;
+        self.failure_len = 0;
+        const worker = self.allocator.create(login_worker_mod.LoginWorker) catch {
+            self.setFailure("out of memory");
+            return;
+        };
+        worker.* = login_worker_mod.LoginWorker.initFlow(self.allocator, self.io, self.current().flow);
+        worker.start() catch |err| {
+            self.allocator.destroy(worker);
+            self.setFailure(@errorName(err));
+            return;
+        };
+        self.worker = worker;
+        self.stage = .signing_in;
+    }
+
+    fn setFailure(self: *LoginDialog, why: []const u8) void {
+        const n = @min(why.len, self.failure.len);
+        @memcpy(self.failure[0..n], why[0..n]);
+        self.failure_len = n;
+        self.stage = .failed;
+    }
+
+    fn label(choice: *const Choice) []const u8 {
+        return choice.profile.display_name;
+    }
+
+    fn method(choice: *const Choice) []const u8 {
+        return switch (choice.flow) {
+            .metask => "device code",
+            .oauth => |prepared| switch (prepared.options.method) {
+                .loopback => "browser sign-in",
+                .device_code => "device code",
+            },
+        };
+    }
+
+    pub fn draw(self: *LoginDialog, p: *Pane) !void {
+        try p.rule();
+        try p.title("Login");
+        try p.blank();
+        switch (self.stage) {
+            .choose => {
+                if (self.choices_len == 0) {
+                    try p.paragraph("", "No configured provider supports signing in here. Providers that use an API key read it from the environment or from <state root>/config.json.");
+                    try p.blank();
+                    try p.footer("Esc to close");
+                    return;
+                }
+                try p.paragraph("", "Sign in to a provider; the login is stored on this machine and used by new sessions.");
+                try p.blank();
+                try p.text("Select a provider:");
+                try p.blank();
+                for (self.choices[0..self.choices_len], 0..) |*choice, i| {
+                    try p.option(i + 1, i == self.sel, label(choice), method(choice));
+                }
+                try p.blank();
+                try p.footer("↑/↓ to select · Enter to sign in · Esc to cancel");
+            },
+            .signing_in => {
+                var head_buf: [128]u8 = undefined;
+                try p.text(std.fmt.bufPrint(&head_buf, "Signing in to {s}…", .{label(self.current())}) catch "Signing in…");
+                try p.blank();
+                try self.drawTranscript(p);
+                try p.blank();
+                try p.footer("Esc to cancel");
+            },
+            .failed => {
+                const th = p.th;
+                var head_buf: [192]u8 = undefined;
+                try p.line(th.danger, std.fmt.bufPrint(&head_buf, "Sign-in to {s} failed: {s}", .{
+                    label(self.current()),
+                    self.failure[0..self.failure_len],
+                }) catch "Sign-in failed");
+                try p.blank();
+                try p.footer("Enter to retry · Esc to cancel");
+            },
+        }
+    }
+
+    /// What the flow asked the user to do. URLs are written whole at column
+    /// 0 so they can be copied; the rest is indented prose.
+    fn drawTranscript(self: *LoginDialog, p: *Pane) !void {
+        const text = self.transcript[0..self.transcript_len];
+        if (std.mem.trim(u8, text, " \r\n").len == 0) {
+            try p.dim("Waiting for the provider…");
+            return;
+        }
+        var lines = std.mem.splitScalar(u8, text, '\n');
+        var blank_pending = false;
+        while (lines.next()) |raw_line| {
+            const line = std.mem.trim(u8, raw_line, " \r");
+            if (line.len == 0) {
+                blank_pending = true;
+                continue;
+            }
+            if (blank_pending) try p.blank();
+            blank_pending = false;
+            if (std.mem.startsWith(u8, line, "http://") or std.mem.startsWith(u8, line, "https://")) {
+                try p.raw(line);
+            } else {
+                try p.paragraph("", line);
+            }
+        }
+    }
+
+    pub fn key(self: *LoginDialog, k: input.Key) Step {
+        switch (self.stage) {
+            .choose => switch (k) {
+                .esc, .ctrl_c => return .done,
+                .up => {
+                    if (self.choices_len == 0) return .none;
+                    self.sel = if (self.sel == 0) self.choices_len - 1 else self.sel - 1;
+                    return .redraw;
+                },
+                .down => {
+                    if (self.choices_len == 0) return .none;
+                    self.sel = (self.sel + 1) % self.choices_len;
+                    return .redraw;
+                },
+                .enter => {
+                    if (self.choices_len == 0) return .done;
+                    self.begin();
+                    return .redraw;
+                },
+                .char => |c| {
+                    // Number keys pick a provider, as in Claude Code's selects.
+                    if (c < '1' or c > '9') return .none;
+                    const index: usize = c - '1';
+                    if (index >= self.choices_len) return .none;
+                    self.sel = index;
+                    self.begin();
+                    return .redraw;
+                },
+                else => return .none,
+            },
+            .signing_in => switch (k) {
+                .esc, .ctrl_c => {
+                    self.stopWorker();
+                    self.outcome = .interrupted;
+                    return .done;
+                },
+                else => return .none,
+            },
+            .failed => switch (k) {
+                .esc, .ctrl_c => {
+                    self.outcome = .interrupted;
+                    return .done;
+                },
+                .enter => {
+                    self.begin();
+                    return .redraw;
+                },
+                else => return .none,
+            },
+        }
+    }
+
+    /// Follow the worker: new instructions redraw; a settled flow finishes
+    /// (success) or shows its failure with a retry.
+    pub fn tick(self: *LoginDialog) Step {
+        if (self.stage != .signing_in) return .none;
+        const worker = self.worker orelse return .none;
+        var buf: [login_worker_mod.TRANSCRIPT_CAPACITY]u8 = undefined;
+        const text = worker.copyTranscript(&buf);
+        const changed = !std.mem.eql(u8, text, self.transcript[0..self.transcript_len]);
+        if (changed) {
+            @memcpy(self.transcript[0..text.len], text);
+            self.transcript_len = text.len;
+        }
+        switch (worker.currentState()) {
+            .idle, .running => return if (changed) .redraw else .none,
+            .succeeded => {
+                self.stopWorker();
+                self.outcome = .{ .signed_in = label(self.current()) };
+                return .done;
+            },
+            .cancelled => {
+                self.stopWorker();
+                self.outcome = .interrupted;
+                return .done;
+            },
+            .failed => {
+                var why_buf: [96]u8 = undefined;
+                const why = if (worker.failureCause()) |cause|
+                    std.fmt.bufPrint(&why_buf, "{s} ({s})", .{ worker.failureName(), cause }) catch worker.failureName()
+                else
+                    worker.failureName();
+                self.setFailure(why);
+                self.stopWorker();
+                return .redraw;
+            },
+        }
+    }
+};
+
+// ── tests ───────────────────────────────────────────────────────────────────
+
+const testing = std.testing;
+const theme_mod = @import("tui/theme.zig");
+
+fn renderPlain(dialog: anytype, cols: usize) ![]u8 {
+    var p = Pane.init(testing.allocator, theme_mod.monochrome, cols);
+    defer p.deinit();
+    try dialog.draw(&p);
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(testing.allocator);
+    var i: usize = 0;
+    const bytes = p.bytes.items;
+    while (i < bytes.len) {
+        if (bytes[i] == 0x1b and i + 1 < bytes.len and bytes[i + 1] == '[') {
+            var j = i + 2;
+            while (j < bytes.len and !(bytes[j] >= 0x40 and bytes[j] <= 0x7e)) j += 1;
+            i = j + 1;
+            continue;
+        }
+        if (bytes[i] != '\r') try out.append(testing.allocator, bytes[i]);
+        i += 1;
+    }
+    return out.toOwnedSlice(testing.allocator);
+}
+
+test "help: tabs cycle both ways and Esc closes" {
+    var help = HelpDialog{ .catalog = .builtin, .term_rows = 40 };
+    try testing.expectEqual(Step.redraw, help.key(.tab));
+    try testing.expectEqual(HelpDialog.Tab.commands, help.tab);
+    try testing.expectEqual(Step.redraw, help.key(.right));
+    try testing.expectEqual(HelpDialog.Tab.custom, help.tab);
+    try testing.expectEqual(Step.redraw, help.key(.right));
+    try testing.expectEqual(HelpDialog.Tab.general, help.tab);
+    try testing.expectEqual(Step.redraw, help.key(.left));
+    try testing.expectEqual(HelpDialog.Tab.custom, help.tab);
+    try testing.expectEqual(Step.done, help.key(.esc));
+}
+
+test "help: the general tab shows the shortcuts, the commands tab the table" {
+    var help = HelpDialog{ .catalog = .builtin, .term_rows = 60 };
+    const general = try renderPlain(&help, 100);
+    defer testing.allocator.free(general);
+    try testing.expect(std.mem.indexOf(u8, general, "[General]") != null);
+    try testing.expect(std.mem.indexOf(u8, general, "! for shell mode") != null);
+    try testing.expect(std.mem.indexOf(u8, general, "Esc to close") != null);
+
+    _ = help.key(.tab);
+    const commands = try renderPlain(&help, 100);
+    defer testing.allocator.free(commands);
+    try testing.expect(std.mem.indexOf(u8, commands, "/add-dir <path>") != null);
+    try testing.expect(std.mem.indexOf(u8, commands, "Add a working directory") != null);
+
+    _ = help.key(.tab);
+    const custom = try renderPlain(&help, 100);
+    defer testing.allocator.free(custom);
+    try testing.expect(std.mem.indexOf(u8, custom, "No custom commands") != null);
+}
+
+test "help: the command list scrolls inside its window" {
+    var help = HelpDialog{ .catalog = .builtin, .term_rows = 20, .tab = .commands };
+    const visible = help.visibleEntries();
+    try testing.expect(visible < complete.SLASH_COMMAND_TABLE.len);
+    try testing.expectEqual(Step.none, help.key(.up));
+    var moved: usize = 0;
+    while (help.key(.down) == .redraw) moved += 1;
+    try testing.expectEqual(complete.SLASH_COMMAND_TABLE.len - visible, moved);
+    const tail = try renderPlain(&help, 100);
+    defer testing.allocator.free(tail);
+    try testing.expect(std.mem.indexOf(u8, tail, "/vim") != null);
+    try testing.expect(std.mem.indexOf(u8, tail, "/add-dir") == null);
+}
+
+test "skills: an unloaded catalog says so and Esc closes" {
+    var dialog = try SkillsDialog.init(testing.allocator, null, null, 30);
+    defer dialog.deinit();
+    const plain = try renderPlain(&dialog, 80);
+    defer testing.allocator.free(plain);
+    try testing.expect(std.mem.indexOf(u8, plain, "did not load") != null);
+    try testing.expectEqual(Step.done, dialog.key(.esc));
+    const changes = try dialog.changes(testing.allocator);
+    defer testing.allocator.free(changes);
+    try testing.expectEqual(@as(usize, 0), changes.len);
+}
+
+test "skills: typing searches, backspace removes whole codepoints" {
+    var dialog = try SkillsDialog.init(testing.allocator, null, null, 30);
+    defer dialog.deinit();
+    for ("ré") |c| _ = dialog.key(.{ .char = c });
+    try testing.expectEqual(SkillsDialog.Mode.search, dialog.mode);
+    try testing.expectEqualStrings("ré", dialog.queryText());
+    try testing.expectEqual(Step.redraw, dialog.key(.backspace));
+    try testing.expectEqualStrings("r", dialog.queryText());
+    _ = dialog.key(.backspace);
+    try testing.expectEqual(Step.none, dialog.key(.backspace));
+}
+
+fn testSkill(comptime id: u8, name: []const u8, scope: catalog_mod.SourceScope, author_locked: bool) catalog_mod.SkillRecord {
+    return .{
+        .skill_id = [_]u8{id} ** 64,
+        .invocation_name = name,
+        .source_scope = scope,
+        .definition = .{
+            .name = name,
+            .description = "does a thing",
+            .body = "body",
+            .allowed_tools = &.{},
+            .disallowed_tools = &.{},
+            .arguments = &.{},
+            .disable_model_invocation = author_locked,
+            .when_to_use = "",
+            .description_source = .frontmatter,
+            .argument_hint = "",
+            .user_invocable = true,
+            .model_activation = .advisory,
+            .context = .inline_ctx,
+            .agent = "",
+            .model = "",
+            .shell = "bash",
+            .source_path = "",
+        },
+        .directories = &.{},
+        .files = &.{},
+    };
+}
+
+const SkillsFixture = struct {
+    records: [3]catalog_mod.SkillRecord,
+    snapshot: catalog_mod.Snapshot,
+    overrides: overrides_mod.Overrides,
+
+    /// `alpha` (on), `beta` (name-only from the project layer), `locked`
+    /// (`disable-model-invocation`). Must be initialized in place.
+    fn init(self: *SkillsFixture) !void {
+        self.records = .{
+            testSkill('1', "alpha", .project, false),
+            testSkill('2', "beta", .personal, false),
+            testSkill('3', "locked", .project, true),
+        };
+        self.snapshot = .{
+            .owner_allocator = testing.allocator,
+            .arena = std.heap.ArenaAllocator.init(testing.allocator),
+            .scope_id = [_]u8{'a'} ** 64,
+            .revision = [_]u8{'b'} ** 64,
+            .health = .healthy,
+            .skills = &self.records,
+            .issues = &.{},
+            .descriptor_json = "",
+            .content_bytes = 0,
+            .resident_bytes = 0,
+        };
+        self.overrides = overrides_mod.Overrides.init(testing.allocator);
+        try self.overrides.layers[@intFromEnum(overrides_mod.Layer.project)].put(testing.allocator, try testing.allocator.dupe(u8, "beta"), .name_only);
+    }
+
+    fn deinit(self: *SkillsFixture) void {
+        self.overrides.deinit();
+        self.snapshot.arena.deinit();
+    }
+};
+
+test "skills: rows show each state, the author lock, the scope and the cost" {
+    var fx: SkillsFixture = undefined;
+    try fx.init();
+    defer fx.deinit();
+    var dialog = try SkillsDialog.init(testing.allocator, &fx.snapshot, &fx.overrides, 30);
+    defer dialog.deinit();
+    var p = Pane.init(testing.allocator, theme_mod.no_color, 100);
+    defer p.deinit();
+    try dialog.draw(&p);
+    const out = p.bytes.items;
+    try testing.expect(std.mem.indexOf(u8, out, "3 skills · enter/space to cycle, / to search, Esc to close") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "❯ ✔ on         alpha · project · < 20 tok") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "  ● name-only  beta · user · < 20 tok") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "  🔒 user-only  locked · project · < 20 tok · locked by author") != null);
+    // The search box has no cursor while the list has the focus.
+    try testing.expect(p.cursor == null);
+}
+
+test "skills: Enter and Space cycle on, name-only, user-only, off; a lock does not move" {
+    var fx: SkillsFixture = undefined;
+    try fx.init();
+    defer fx.deinit();
+    var dialog = try SkillsDialog.init(testing.allocator, &fx.snapshot, &fx.overrides, 30);
+    defer dialog.deinit();
+
+    try testing.expectEqual(Step.redraw, dialog.key(.enter));
+    try testing.expectEqual(SkillsDialog.State.name_only, dialog.current[0]);
+    try testing.expectEqual(Step.redraw, dialog.key(.{ .char = ' ' }));
+    try testing.expectEqual(SkillsDialog.State.user_invocable_only, dialog.current[0]);
+    _ = dialog.key(.enter);
+    try testing.expectEqual(SkillsDialog.State.off, dialog.current[0]);
+    _ = dialog.key(.enter);
+    try testing.expectEqual(SkillsDialog.State.on, dialog.current[0]);
+    {
+        // Back where it started: nothing to save (Claude Code: `No changes`).
+        const changes = try dialog.changes(testing.allocator);
+        defer testing.allocator.free(changes);
+        try testing.expectEqual(@as(usize, 0), changes.len);
+    }
+
+    _ = dialog.key(.down);
+    _ = dialog.key(.down);
+    try testing.expectEqual(Step.none, dialog.key(.enter));
+    try testing.expectEqual(Step.none, dialog.key(.{ .char = ' ' }));
+    try testing.expectEqual(SkillsDialog.State.on, dialog.current[2]);
+
+    // beta starts at its inherited name-only; three presses reach on.
+    _ = dialog.key(.up);
+    for (0..3) |_| _ = dialog.key(.enter);
+    _ = dialog.key(.up);
+    _ = dialog.key(.enter);
+    const changes = try dialog.changes(testing.allocator);
+    defer testing.allocator.free(changes);
+    try testing.expectEqual(@as(usize, 2), changes.len);
+    try testing.expectEqualStrings("alpha", changes[0].name);
+    try testing.expectEqual(SkillsDialog.State.name_only, changes[0].state);
+    try testing.expectEqualStrings("beta", changes[1].name);
+    try testing.expectEqual(SkillsDialog.State.on, changes[1].state);
+}
+
+test "skills: search takes Space as text; Esc clears, then leaves, then closes" {
+    var fx: SkillsFixture = undefined;
+    try fx.init();
+    defer fx.deinit();
+    var dialog = try SkillsDialog.init(testing.allocator, &fx.snapshot, &fx.overrides, 30);
+    defer dialog.deinit();
+
+    try testing.expectEqual(Step.redraw, dialog.key(.{ .char = '/' }));
+    try testing.expectEqual(SkillsDialog.Mode.search, dialog.mode);
+    try testing.expectEqualStrings("", dialog.queryText());
+    for ("be") |c| _ = dialog.key(.{ .char = c });
+    _ = dialog.key(.{ .char = ' ' });
+    try testing.expectEqualStrings("be ", dialog.queryText());
+    {
+        const plain = try renderPlain(&dialog, 100);
+        defer testing.allocator.free(plain);
+        try testing.expect(std.mem.indexOf(u8, plain, "0/3 skills · type to filter · ↓/enter to select · esc to clear") != null);
+        try testing.expect(std.mem.indexOf(u8, plain, "No skills match \"be \"") != null);
+    }
+    _ = dialog.key(.backspace);
+    // Down hands the focus to the list; the filtered row is the selection.
+    try testing.expectEqual(Step.redraw, dialog.key(.down));
+    try testing.expectEqual(SkillsDialog.Mode.list, dialog.mode);
+    _ = dialog.key(.enter);
+    try testing.expectEqual(SkillsDialog.State.user_invocable_only, dialog.current[1]);
+    try testing.expectEqual(SkillsDialog.State.on, dialog.current[0]);
+
+    _ = dialog.key(.{ .char = 'x' });
+    try testing.expectEqual(SkillsDialog.Mode.search, dialog.mode);
+    try testing.expectEqual(Step.redraw, dialog.key(.esc));
+    try testing.expectEqualStrings("", dialog.queryText());
+    try testing.expectEqual(SkillsDialog.Mode.search, dialog.mode);
+    try testing.expectEqual(Step.redraw, dialog.key(.esc));
+    try testing.expectEqual(SkillsDialog.Mode.list, dialog.mode);
+    try testing.expectEqual(Step.done, dialog.key(.esc));
+}
+
+test "login: no provider to sign in to says how keys are configured" {
+    var dialog = LoginDialog{ .allocator = testing.allocator, .io = undefined };
+    defer dialog.deinit();
+    const plain = try renderPlain(&dialog, 80);
+    defer testing.allocator.free(plain);
+    try testing.expect(std.mem.indexOf(u8, plain, "No configured provider supports signing in") != null);
+    try testing.expectEqual(Step.done, dialog.key(.enter));
+    try testing.expect(dialog.outcome == .interrupted);
+}
+
+test "login: the list wraps, numbers are shown, Esc interrupts" {
+    const kinds = [_]provider_profile.CredentialKind{.openai_oauth};
+    const profile = provider_profile.ProviderProfile{
+        .id = @import("../provider/ids.zig").Slug.lit("dialog-test"),
+        .implementation_id = @import("../provider/ids.zig").Slug.lit("dialog-test"),
+        .display_name = "Dialog Test",
+        .channels = &.{},
+        .accepted_credential_kinds = &kinds,
+        .oauth_token_url = "http://127.0.0.1:1/token",
+        .oauth_authorize_url = "http://127.0.0.1:1/authorize",
+        .oauth_client_id = "dialog-client",
+    };
+    var dialog = LoginDialog{ .allocator = testing.allocator, .io = undefined };
+    defer dialog.deinit();
+    const flow = try provider_login.prepareFlow(&profile, .{ .state_root = "", .open_browser = false, .port = 0 }, null);
+    dialog.add(.{ .profile = &profile, .flow = flow });
+    dialog.add(.{ .profile = &profile, .flow = flow });
+    const plain = try renderPlain(&dialog, 80);
+    defer testing.allocator.free(plain);
+    try testing.expect(std.mem.indexOf(u8, plain, "> 1. Dialog Test · browser sign-in") != null);
+    try testing.expect(std.mem.indexOf(u8, plain, "    2. Dialog Test") != null);
+    try testing.expectEqual(Step.redraw, dialog.key(.up));
+    try testing.expectEqual(@as(usize, 1), dialog.sel);
+    try testing.expectEqual(Step.redraw, dialog.key(.down));
+    try testing.expectEqual(@as(usize, 0), dialog.sel);
+    try testing.expectEqual(Step.done, dialog.key(.esc));
+    try testing.expect(dialog.outcome == .interrupted);
+}

@@ -1240,7 +1240,7 @@ fn runCounted(
     if (opts.time_announcer) |announcer| {
         if (try announcer.noticeFor(allocator, conversation.activeMessages())) |notice| {
             defer allocator.free(notice);
-            try conversation.appendText(.user, notice);
+            try conversation.appendHostText(notice);
         }
     }
     // L4:run 级 trace_id(整个 run 一个,跨所有 turn);诊断事件内联携带,DiagnosticsBackend
@@ -1586,7 +1586,7 @@ fn runCounted(
             // Issue #277: the goal's budget ran out during the last turn.
             if (opts.goal_meter) |meter| if (meter.takeBudgetNotice()) |notice| {
                 log.info("agent", "goal budget used up; wrap-up notice before turn {d}", .{turns + 1});
-                try conversation.appendText(.user, notice);
+                try conversation.appendHostText(notice);
             };
         }
 
@@ -1622,7 +1622,7 @@ fn runCounted(
                         break :notification_delivery;
                     };
                     defer allocator.free(text);
-                    conversation.appendText(.user, text) catch |err| {
+                    conversation.appendHostText(text) catch |err| {
                         log.warn("agent", "job notification skipped: {s} (events dropped)", .{@errorName(err)});
                         break :notification_delivery;
                     };
@@ -1651,7 +1651,7 @@ fn runCounted(
                     else
                         try std.fmt.allocPrint(allocator, delivery_cadence_mod.SECOND_NUDGE_FMT, .{delivery_cadence_state.exploration_calls});
                     defer allocator.free(nudge);
-                    try conversation.appendText(.user, nudge);
+                    try conversation.appendHostText(nudge);
                     log.info("agent", "delivery cadence nudge {d}/{d} exploration_calls={d}", .{ delivery_cadence_state.nudges, delivery_cadence_mod.MAX_CADENCE_NUDGES, delivery_cadence_state.exploration_calls });
                 } else {
                     log.info("agent", "delivery cadence observe level={d} exploration_calls={d}", .{ delivery_cadence_state.level, delivery_cadence_state.exploration_calls });
@@ -1677,7 +1677,7 @@ fn runCounted(
                     const nudge = try std.fmt.allocPrint(allocator, progress_updates_mod.NUDGE_FMT, .{progress_state.silent_rounds});
                     defer allocator.free(nudge);
                     progress_state.noteDecided(true, now_ns);
-                    try conversation.appendText(.user, nudge);
+                    try conversation.appendHostText(nudge);
                     log.info("agent", "progress update nudge {d}/{d}", .{ progress_state.nudges, progress_updates_mod.MAX_PROGRESS_NUDGES });
                 }
             }
@@ -2866,7 +2866,7 @@ fn runCounted(
                         learning_state.startPass(.reconcile);
                         learning_borrowed_turns +|= learning_turn_mod.PASS_MAX_TURNS;
                         log.infoId("agent", rid, "learning turn reconcile accepted={d} existing={d}", .{ learning_state.distill_accepted, learning_state.existing });
-                        try conversation.appendText(.user, text);
+                        try conversation.appendHostText(text);
                         continue;
                     }
                 }
@@ -2919,7 +2919,7 @@ fn runCounted(
                     .{ required_first_repairs, MAX_REQUIRED_FIRST_REPAIRS, route.tool_name },
                 );
                 backend.emitEvent(sess, .{ .diag_turn_end = .{ .trace_id = trace_id, .depth = depth, .turn = turns + 1, .tool_calls = total_tool_calls } });
-                try conversation.appendText(.user, repair);
+                try conversation.appendHostText(repair);
                 continue;
             }
             // max_tokens 续写:模型被 token 上限截断(非自然 end_turn),
@@ -2932,7 +2932,7 @@ fn runCounted(
                 log.infoId("agent", rid, "max_tokens truncation → continuation {d}/{d}", .{ continuations.*, MAX_CONTINUATIONS });
                 // L4 诊断:续写。
                 backend.emitEvent(sess, .{ .diag_continuation = .{ .trace_id = trace_id, .depth = depth, .n = continuations.*, .max = MAX_CONTINUATIONS } });
-                try conversation.appendText(.user, "Your previous response was cut off by the token limit. Continue exactly where you left off, without repeating.");
+                try conversation.appendHostText("Your previous response was cut off by the token limit. Continue exactly where you left off, without repeating.");
                 continuation_pending = true;
                 continue;
             }
@@ -2960,7 +2960,7 @@ fn runCounted(
                         .none => unreachable,
                     };
                     backend.emitEvent(sess, .{ .diag_turn_end = .{ .trace_id = trace_id, .depth = depth, .turn = turns + 1, .tool_calls = total_tool_calls } });
-                    try conversation.appendText(.user, switch (kg_pending) {
+                    try conversation.appendHostText(switch (kg_pending) {
                         .batch => kg_retrieval_protocol.ENUMERATION_COVERAGE_REPAIR,
                         .context => kg_retrieval_protocol.ENUMERATION_CONTEXT_REPAIR,
                         .none => unreachable,
@@ -2989,7 +2989,7 @@ fn runCounted(
                 output_channel.close(.commentary, assistant_text.items);
                 log.infoId("agent", rid, "verification final gate nudge {d}/{d}", .{ verification_nudges, MAX_VERIFICATION_NUDGES });
                 backend.emitEvent(sess, .{ .diag_turn_end = .{ .trace_id = trace_id, .depth = depth, .turn = turns + 1, .tool_calls = total_tool_calls } });
-                try conversation.appendText(.user, if (verification_progress.known_failing)
+                try conversation.appendHostText(if (verification_progress.known_failing)
                     verification_progress_mod.FINAL_GATE_KNOWN_FAILING_TEXT
                 else
                     verification_progress_mod.FINAL_GATE_TEXT);
@@ -3023,7 +3023,7 @@ fn runCounted(
                             .{counts.open},
                         );
                         defer allocator.free(nudge);
-                        try conversation.appendText(.user, nudge);
+                        try conversation.appendHostText(nudge);
                         continue;
                     },
                     .coverage => {
@@ -3033,7 +3033,7 @@ fn runCounted(
                         requirement_ledger_state.coverage_nudge_used = true;
                         log.infoId("agent", rid, "requirement ledger coverage nudge {d}/{d}", .{ requirement_ledger_state.nudges, requirement_ledger_mod.MAX_LEDGER_NUDGES });
                         backend.emitEvent(sess, .{ .diag_turn_end = .{ .trace_id = trace_id, .depth = depth, .turn = turns + 1, .tool_calls = total_tool_calls } });
-                        try conversation.appendText(.user, requirement_ledger_mod.COVERAGE_NUDGE_TEXT);
+                        try conversation.appendHostText(requirement_ledger_mod.COVERAGE_NUDGE_TEXT);
                         continue;
                     },
                     .shallow => {
@@ -3043,7 +3043,7 @@ fn runCounted(
                         requirement_ledger_state.shallow_nudge_used = true;
                         log.infoId("agent", rid, "requirement ledger shallow nudge {d}/{d} total={d}", .{ requirement_ledger_state.nudges, requirement_ledger_mod.MAX_LEDGER_NUDGES, counts.total });
                         backend.emitEvent(sess, .{ .diag_turn_end = .{ .trace_id = trace_id, .depth = depth, .turn = turns + 1, .tool_calls = total_tool_calls } });
-                        try conversation.appendText(.user, requirement_ledger_mod.SHALLOW_NUDGE_TEXT);
+                        try conversation.appendHostText(requirement_ledger_mod.SHALLOW_NUDGE_TEXT);
                         continue;
                     },
                 }
@@ -3068,7 +3068,7 @@ fn runCounted(
                         .{ envelope.reason, envelope.command_needle },
                     );
                     defer allocator.free(nudge);
-                    try conversation.appendText(.user, nudge);
+                    try conversation.appendHostText(nudge);
                     continue;
                 }
             }
@@ -3137,7 +3137,7 @@ fn runCounted(
                         // Persist first. Only a delivered notification turns the earlier text into
                         // commentary; on failure the segment stays open for the .final close below,
                         // so it is never closed twice.
-                        conversation.appendText(.user, text) catch |err| {
+                        conversation.appendHostText(text) catch |err| {
                             log.warn("agent", "job notification skipped: {s} (events dropped)", .{@errorName(err)});
                             break;
                         };
@@ -3174,7 +3174,7 @@ fn runCounted(
                         test_integrity_state.noteNudged();
                         // The host found weakened tests: this answer is not final.
                         output_channel.close(.commentary, assistant_text.items);
-                        try conversation.appendText(.user, text);
+                        try conversation.appendHostText(text);
                         continue :outer_turn;
                     }
                 }
@@ -3216,7 +3216,7 @@ fn runCounted(
                     defer allocator.free(text);
                     // 主机裁决没过 → 这段"结论"是过程信息,不是最终答案。
                     output_channel.close(.commentary, assistant_text.items);
-                    try conversation.appendText(.user, text);
+                    try conversation.appendHostText(text);
                     continue :outer_turn;
                 }
             };
@@ -3239,7 +3239,7 @@ fn runCounted(
                     const text = try check_gate_mod.renderStopFeedback(allocator, stop.reason);
                     defer allocator.free(text);
                     output_channel.close(.commentary, assistant_text.items);
-                    try conversation.appendText(.user, text);
+                    try conversation.appendHostText(text);
                     continue :outer_turn;
                 }
                 if (stop.blocked) log.warnId("agent", rid, "Stop hook asked to continue again; block budget {d} spent, finishing", .{check_gate_mod.MAX_STOP_HOOK_BLOCKS});
@@ -3269,7 +3269,7 @@ fn runCounted(
                     output_channel.final_sealed = true;
                     learning_state.startPass(.distill);
                     learning_borrowed_turns +|= learning_turn_mod.PASS_MAX_TURNS;
-                    try conversation.appendText(.user, text);
+                    try conversation.appendHostText(text);
                     continue :outer_turn;
                 }
             };
@@ -4304,7 +4304,7 @@ fn latestUserText(conversation: *const @import("conversation.zig").Conversation)
         if (m.role != .user) continue;
         for (m.blocks) |b| {
             // host 注入的记录(进度提醒等)不是用户原话:跳过,继续往前找。
-            if (b == .text and b.text.len > 0 and !@import("host_injection_meter.zig").isHostInjectedText(b.text)) return b.text;
+            if (b == .text and b.text.len > 0 and !@import("host_injection_meter.zig").isHostText(m, b.text)) return b.text;
         }
     }
     return "";

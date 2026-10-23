@@ -1178,12 +1178,18 @@ fn buildSkillsSection(allocator: std.mem.Allocator, set: *const @import("../skil
     // Claude Code: a `disable-model-invocation` Skill's description is not in
     // context; Codex: `allow_implicit_invocation: false` removes it from the
     // catalog. The catalog maps both onto `disable_model_invocation`.
+    // `skillOverrides`: a name-only Skill is listed without its description,
+    // a user-invocable-only or off Skill is not listed.
     const Entry = struct { name: []const u8, description: []const u8 };
     var entries: std.ArrayList(Entry) = .empty;
     var total: usize = 0;
     for (set.skills.items) |s| {
         if (s.disable_model_invocation) continue;
-        const description = try skill_listing.listingDescription(a, s.description, s.when_to_use);
+        const description = switch (set.listingOf(s.name)) {
+            .hidden => continue,
+            .name_only => "",
+            .full => try skill_listing.listingDescription(a, s.description, s.when_to_use),
+        };
         total += description.len;
         try entries.append(a, .{ .name = s.name, .description = description });
     }
@@ -1343,6 +1349,41 @@ test "buildWithSkills includes skill name + description" {
     try testing.expect(std.mem.indexOf(u8, s, "Review pending changes") != null);
     try testing.expect(std.mem.indexOf(u8, s, "activate it immediately") != null);
     try testing.expect(std.mem.indexOf(u8, s, "Do not activate a marginal match") != null);
+}
+
+test "buildWithSkills follows skillOverrides: name-only drops the description, hidden drops the Skill" {
+    const a = testing.allocator;
+    const skill_mod = @import("../skills/skill.zig");
+    const overrides_mod = @import("../skills/overrides.zig");
+    var set = skill_mod.SkillSet.init(a);
+    defer set.deinit();
+    for ([_][]const u8{ "alpha", "beta", "gamma", "delta" }) |name| {
+        const md = try std.fmt.allocPrint(a, "---\nname: {s}\ndescription: about {s}\n---\nbody\n", .{ name, name });
+        defer a.free(md);
+        try set.skills.append(a, try skill_mod.parseSkillMd(a, md, "/fake"));
+    }
+    var overrides = overrides_mod.Overrides.init(a);
+    defer overrides.deinit();
+    const local = &overrides.layers[@intFromEnum(overrides_mod.Layer.local)];
+    try local.put(a, try a.dupe(u8, "beta"), .name_only);
+    try local.put(a, try a.dupe(u8, "gamma"), .user_invocable_only);
+    try local.put(a, try a.dupe(u8, "delta"), .off);
+    set.overrides = &overrides;
+
+    const s = try buildWithSkills(a, "claude-opus-4-7", &set, "/tmp");
+    defer a.free(s);
+    try testing.expect(std.mem.indexOf(u8, s, "- **alpha** — about alpha\n") != null);
+    try testing.expect(std.mem.indexOf(u8, s, "- **beta**\n") != null);
+    try testing.expect(std.mem.indexOf(u8, s, "about beta") == null);
+    try testing.expect(std.mem.indexOf(u8, s, "gamma") == null);
+    try testing.expect(std.mem.indexOf(u8, s, "delta") == null);
+
+    // Every Skill hidden: no section at all.
+    try local.put(a, try a.dupe(u8, "alpha"), .off);
+    local.getPtr("beta").?.* = .off;
+    const none = try buildWithSkills(a, "claude-opus-4-7", &set, "/tmp");
+    defer a.free(none);
+    try testing.expect(std.mem.indexOf(u8, none, "# Available skills") == null);
 }
 
 test "capability sections follow visible tools at build and per-turn projection" {

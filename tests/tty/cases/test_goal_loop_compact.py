@@ -93,9 +93,9 @@ def test_tty_loop_requires_goal_then_enables_and_stops(bin_path):
 
 
 def test_tty_compact_command_recovers_input_box(bin_path):
-    raw = run(bin_path, submit("/compact", "Compacted"))
+    raw = run(bin_path, submit("/compact", "Nothing to compact"))
     a = TTYAssert(raw)
-    a.assert_prose_contains("Compacted")
+    a.assert_prose_contains("Nothing to compact")
     a.assert_box_present()
     a.assert_box_at_bottom()
 

@@ -97,10 +97,10 @@ def test_csi_u_ctrl_b_backgrounds_during_generation(bin_path):
     from slow_mock_server import SlowMockServer
     with SlowMockServer(_slow_turn()) as srv:
         raw = run(bin_path, ["sleep:0.8", "type:go", "key:enter", "wait:esc to interrupt:15", csi_u(98),
-                             "wait:已转后台续跑:30", "type:x", "sleep:0.5"],
+                             "wait:Running in the background:30", "type:x", "sleep:0.5"],
                   base_url=srv.url, startup_drain=0.8, per_key_drain=0.15)
     txt = _ANSI.sub(b"", raw).decode("utf-8", "replace")
-    assert "已转后台续跑" in txt, "生成期 CSI-u Ctrl+B 未触发转后台:\n" + txt[-1200:]
+    assert "Running in the background" in txt, "生成期 CSI-u Ctrl+B 未触发转后台:\n" + txt[-1200:]
 
 
 def test_csi_u_reverse_search_esc_enter(bin_path):

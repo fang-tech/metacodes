@@ -23,8 +23,8 @@ def test_help_inline_instant(bin_path):
     raw = run(bin_path, ["sleep:0.8", "type:?", "sleep:0.3"], per_key_drain=0.1)
     a = TTYAssert(raw)
     text = _screen_text(a)
-    assert "Open transcript" in text, text     # 快捷键已展开(issue #16 后标注 Ctrl+X Ctrl+O)
-    assert "Shift+Tab" in text, text
+    assert "for transcript" in text, text      # 快捷键已展开(cc 措辞:ctrl + x ctrl + o for transcript)
+    assert "shift + tab to cycle modes" in text, text
     # 非模态:输入框边框 + ❯ 行仍在(help 替换的是 footer 行,不是输入框)。
     assert a.box_top_row() is not None, "输入框上边框缺失(help 应非模态):\n" + text
     assert a.content_row() is not None, "❯ 输入行缺失(help 应非模态):\n" + text
@@ -40,7 +40,7 @@ def test_help_inline_dismiss_and_type(bin_path):
     a.assert_box_at_bottom()
     text = _screen_text(a)
     # 关闭后快捷键不应再在屏(已被收缩擦除),且 x 进了输入框。
-    assert "Open transcript" not in text, "help 关闭后仍残留:\n" + text
+    assert "for transcript" not in text, "help 关闭后仍残留:\n" + text
     assert "x" in text, "打字 x 应进输入框(非模态):\n" + text
 
 
@@ -60,7 +60,7 @@ def test_help_esc_dismiss_no_border_residue(bin_path):
     a = TTYAssert(raw)
     text = _screen_text(a)
     # help 已关:快捷键说明区不在屏。
-    assert "Open transcript" not in text, "Esc 未能关闭 help(flushEsc 接线缺失?):\n" + text
+    assert "for transcript" not in text, "Esc 未能关闭 help(flushEsc 接线缺失?):\n" + text
     # 输入框完整且钉底。
     a.assert_box_present()
     a.assert_box_at_bottom()
@@ -83,7 +83,7 @@ def test_help_esc_repeated_no_border_accumulation(bin_path):
     text = _screen_text(a)
     a.assert_box_present()
     a.assert_box_at_bottom()
-    assert "Open transcript" not in text, "末轮 Esc 未关 help:\n" + text
+    assert "for transcript" not in text, "末轮 Esc 未关 help:\n" + text
     # 三横线边框不可 count("─")(与 banner 通用);改 count ❯ == 1 验证无框累积。
     assert text.count("❯") == 1, "3 轮开关后输入框累积残留(应恰 1 个 ❯):\n" + text
 
@@ -103,7 +103,7 @@ def test_esc_then_char_not_swallowed(bin_path):
               per_key_drain=0.1)
     a = TTYAssert(raw)
     text = _screen_text(a)
-    assert "Open transcript" not in text, "ESC 未关 help:\n" + text
+    assert "for transcript" not in text, "ESC 未关 help:\n" + text
     a.assert_box_present()
     # 关键:'k' 必须出现在输入框内容行(没被吞)。content_row() 返回行号,取该行文本断言。
     crow = a.content_row()
@@ -215,7 +215,7 @@ def test_question_in_nonempty_buffer_is_literal(bin_path):
     a = TTYAssert(raw)
     text = _screen_text(a)
     # foo? 应在输入框里,不展开 help 快捷键。
-    assert "Open transcript" not in text, "非空 buffer 的 ? 误触发 help"
+    assert "for transcript" not in text, "非空 buffer 的 ? 误触发 help"
     assert "foo?" in text, text
 
 
@@ -238,12 +238,12 @@ def test_ctrl_o_box_top_idempotent(bin_path):
 
     # 2026-10-14 去 flake(Windows ConPTY):!cmd 在 Windows 走 PowerShell,每条起进程常要数秒,
     # 固定 sleep:0.5 时最后一屏可能停在命令执行中(框未回位)→ box_top 定位失败,box0 或 box2
-    # 哪个 None 随时序而定(CI 两次分别命中)。改为等每条命令的输出行(waitline:整行匹配,
-    # 回显行 `❯ !echo X` 不算)出现再发下一条,两 run 都在全部命令结束后才截屏。单 token
+    # 哪个 None 随时序而定(CI 两次分别命中)。改为等每条命令的输出行(waitline:整行匹配
+    # `⎿  X`,回显行 `❯ !echo X` 不算)出现再发下一条,两 run 都在全部命令结束后才截屏。单 token
     # 输出:PowerShell 的 echo 会把多个参数各占一行,单个 token 在 sh/PowerShell/cmd 都是一行。
     msgs = []
     for i in range(6):
-        msgs += ["type:!echo zigmsg%d" % i, "key:enter", "waitline:zigmsg%d:30" % i]
+        msgs += ["type:!echo zigmsg%d" % i, "key:enter", "waitline:⎿  zigmsg%d:30" % i]
 
     box0 = box_only(msgs)
     box2 = box_only(msgs + ["key:ctrl_x", "key:ctrl_o", "sleep:0.6", "key:ctrl_o", "sleep:0.6"])
@@ -341,7 +341,7 @@ def test_ctrlb_backgrounds_main_session_deterministic(bin_path):
 
     机制:慢 mock turn1 慢吐 ~7.5s text 后以 tool_use 收尾 → 必有 turn2。在 turn1 执行期间注入
     Ctrl+B(0x02)→ 信号置位 → turn2 **开头**被拦截,run 返回 .backgrounded → loop 深拷贝转后台。
-    断言:① 前台打出 "已转后台续跑";② 新前台的 agent tree 仍列出转后台的主会话(#219:job 留在
+    断言:① 前台打出 "Running in the background";② 新前台的 agent tree 仍列出转后台的主会话(#219:job 留在
     原会话,新前台须把它算进自己的视图);③ turn2 的哨兵 "SHOULD_NOT_REACH" 不出现(turn2 起点
     确实被拦,没继续跑)。
     """
@@ -365,11 +365,11 @@ def test_ctrlb_backgrounds_main_session_deterministic(bin_path):
             # 等生成态再按 Ctrl+B,再等转后台提示本身(turn1 约 7.5s 文本后才到 tool_use 边界),
             # 不睡固定秒数(同 test_kitty_csi_u_keys 的 Ctrl+B 用例)。
             [READY, "type:do it", "key:enter", wait_for("esc to interrupt"), "raw:\\x02",
-             wait_for("已转后台续跑", 30), "type:next", "sleep:0.5"],
+             wait_for("Running in the background", 30), wait_for("← for agents", 10), "type:next", "sleep:0.5"],
             base_url=srv.url, startup_drain=0.8, per_key_drain=0.15,
         )
     txt = re.compile(rb"\x1b\[[0-9;?>]*[A-Za-z]").sub(b"", raw).decode("utf-8", "replace")
-    assert "已转后台续跑" in txt, "Ctrl+B 未触发转后台(无 '已转后台续跑' 提示):\n" + txt[-1500:]
+    assert "Running in the background" in txt, "Ctrl+B 未触发转后台(无转后台提示):\n" + txt[-1500:]
     assert "SHOULD_NOT_REACH" not in txt, "turn2 被执行了(转后台未在 turn 边界拦截):\n" + txt[-1500:]
     # 最终屏(新前台空闲期):进度树标题 + 以首句 "do it" 命名的那一行 + footer 入口。
     # 后台 job 可能还在跑(Running 1 main agent…)或已跑完(1 subagent finished)。
@@ -379,7 +379,10 @@ def test_ctrlb_backgrounds_main_session_deterministic(bin_path):
         "新前台的 agent tree 未显示转后台的主会话(#219):\n" + final
     assert any(line.lstrip().startswith(("├", "└")) and "do it" in line for line in final.splitlines()), \
         "agent tree 缺少转后台主会话那一行(desc=首句 do it):\n" + final
-    assert "← for agents" in final, "footer 缺少 agent 入口,switcher 找不回转后台的主会话:\n" + final
+    # The entry shows on the idle prompt; typing `next` hides it (Claude Code), so
+    # look at the frames before the draft.
+    assert any(sc.find_row("← for agents") is not None for sc in a.frame_screens), \
+        "footer 缺少 agent 入口,switcher 找不回转后台的主会话:\n" + final
 
 
 def test_ctrl_o_multiagent_no_scroll_garbage(bin_path):

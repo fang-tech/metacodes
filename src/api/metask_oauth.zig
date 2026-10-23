@@ -12,6 +12,7 @@ const oauth = @import("../provider/oauth.zig");
 const http_status = @import("http_status.zig");
 const util_time = @import("../util/time.zig");
 const util_json = @import("../util/json.zig");
+const AbortSignal = @import("../util/abort.zig").AbortSignal;
 
 pub const DEFAULT_SITE_URL = "https://metask-ai.com";
 pub const CLIENT_ID = "metacodes";
@@ -122,6 +123,14 @@ pub fn parsePollError(body: []const u8) Error {
     return error.RequestFailed;
 }
 
+/// Where the device flow reports what the user must act on: the page to open
+/// and the code to enter there. `ctx` is the sink's own state (the TUI login
+/// worker's transcript); the CLI passes none.
+pub const DeviceNotify = struct {
+    ctx: ?*anyopaque = null,
+    show: *const fn (ctx: ?*anyopaque, uri: []const u8, code: []const u8) void,
+};
+
 /// Run the device flow and return the raw success token JSON.  The callback is
 /// called after the device response is parsed, before polling begins, so CLI
 /// output is stable even when the first poll blocks.
@@ -132,6 +141,30 @@ pub fn acquireDeviceToken(
     hostname: []const u8,
     open_browser: bool,
     notify: ?*const fn (uri: []const u8, code: []const u8) void,
+) ![]u8 {
+    const Write = *const fn (uri: []const u8, code: []const u8) void;
+    const Adapter = struct {
+        fn show(ctx: ?*anyopaque, uri: []const u8, code: []const u8) void {
+            const write: *const Write = @ptrCast(@alignCast(ctx.?));
+            write.*(uri, code);
+        }
+    };
+    var write = notify orelse return acquireDeviceTokenWith(allocator, io, site, hostname, open_browser, null, null);
+    return acquireDeviceTokenWith(allocator, io, site, hostname, open_browser, .{ .ctx = @ptrCast(&write), .show = Adapter.show }, null);
+}
+
+/// `acquireDeviceToken` with a sink that carries its own state (the TUI login
+/// worker's transcript) and an `abort_signal`, checked between polls (every
+/// 100 ms of the wait): an aborted flow returns `error.Aborted`, so a TUI can
+/// end it with Esc.
+pub fn acquireDeviceTokenWith(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    site: []const u8,
+    hostname: []const u8,
+    open_browser: bool,
+    notify: ?DeviceNotify,
+    abort_signal: ?*const AbortSignal,
 ) ![]u8 {
     var endpoint_buf: [1024]u8 = undefined;
     const device_url = try deviceCodeUrl(site, &endpoint_buf);
@@ -145,7 +178,7 @@ pub fn acquireDeviceToken(
     defer arena.deinit();
     const grant = try parseDeviceCode(arena.allocator(), initial.body);
     const verification = grant.verification_uri_complete orelse grant.verification_uri;
-    if (notify) |write| write(verification, grant.user_code);
+    if (notify) |sink| sink.show(sink.ctx, verification, grant.user_code);
     if (open_browser) auth.openBrowser(allocator, verification) catch {};
 
     const token_url = try tokenUrl(site, &endpoint_buf);
@@ -153,7 +186,7 @@ pub fn acquireDeviceToken(
     const deadline = grant.expires_at orelse started + grant.expires_in;
     var interval = @min(grant.interval, 60);
     while (util_time.nowUnix() < deadline) {
-        util_time.sleepMs(@as(u64, interval) * 1000);
+        try waitPollInterval(interval, abort_signal);
         const poll_body = try deviceTokenRequestBody(allocator, grant.device_code);
         defer allocator.free(poll_body);
         const response = try postJson(allocator, io, token_url, poll_body);
@@ -169,6 +202,18 @@ pub fn acquireDeviceToken(
         }
     }
     return error.TimedOut;
+}
+
+/// Sleep `seconds` in 100 ms steps, returning `error.Aborted` as soon as the
+/// signal fires.
+fn waitPollInterval(seconds: u32, abort_signal: ?*const AbortSignal) error{Aborted}!void {
+    const total_ms = @as(u64, seconds) * 1000;
+    var waited: u64 = 0;
+    while (waited < total_ms) : (waited += 100) {
+        if (abort_signal) |signal| try signal.throwIfAborted();
+        util_time.sleepMs(@min(100, total_ms - waited));
+    }
+    if (abort_signal) |signal| try signal.throwIfAborted();
 }
 
 const RawResponse = struct { ok: bool, status: u16, body: []u8 };
@@ -254,4 +299,13 @@ test "Metask device response and poll errors parse" {
     try std.testing.expectEqual(@as(u32, 7), grant.interval);
     try std.testing.expectEqual(error.AuthorizationPending, parsePollError("{\"error\":\"authorization_pending\"}"));
     try std.testing.expectEqual(error.InvalidGrant, parsePollError("{\"error\":\"invalid_grant\"}"));
+}
+
+test "the device poll wait ends early on abort" {
+    var signal = AbortSignal.init();
+    signal.abort(.user_interrupt);
+    const started = util_time.nowMs();
+    try std.testing.expectError(error.Aborted, waitPollInterval(5, &signal));
+    try std.testing.expect(util_time.nowMs() - started < 1000);
+    try waitPollInterval(0, null);
 }

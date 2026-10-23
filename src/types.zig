@@ -132,6 +132,11 @@ pub const Config = struct {
     /// 走 headless.resumeSuspended(read suspend.json→resumeRun→清/重写)。需同 session_id
     /// (--session / 持久化 transcript 目录一致)。null = 不启用。
     resume_response: ?[]const u8 = null,
+    /// `--resume <id>`: the interactive REPL starts with this stored session
+    /// of the working directory loaded (an id or an id prefix, as `/resume
+    /// <id>` takes). src/main.zig resolves it to `session_id` before
+    /// `App.init`, so the App starts as that session. null = a new session.
+    resume_session: ?[]const u8 = null,
     /// `--settings <path>`:显式 settings 文件(CLI 层,优先级仅次于 managed)。
     settings_path: ?[]const u8 = null,
     /// `--allowedTools "Tool,Tool(spec),..."`:逗号分隔,注入 CLI 层 allow。

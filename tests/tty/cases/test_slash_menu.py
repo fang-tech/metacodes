@@ -24,8 +24,8 @@ def test_T18_slash_menu_appears(bin_path):
     if len(menu_rows) < 3:
         a._fail(f"`/` 菜单候选过少(menu_rows={menu_rows})")
     joined = "\n".join(a.final.line_text(r) for r in menu_rows)
-    # 菜单最多列 10 项(/help.../cost),取前几个稳定项断言。
-    for needed in ("/help", "/clear", "/tools"):
+    # 菜单按字母序(对齐 cc),取前几个稳定项断言。
+    for needed in ("/add-dir", "/agents", "/clear"):
         if needed not in joined:
             a._fail(f"菜单缺命令 {needed}:\n{joined}")
     # footer 仍钉在菜单下方(底部锚定不变)
@@ -119,20 +119,20 @@ def _menu_rows_classes(raw):
 
 
 def test_T18d_down_moves_highlight(bin_path):
-    # 打 `/` → Down 一次 → 第 2 个候选(/clear)应高亮(accent),其余 dim(对齐 cc DIFF#4)。
+    # 打 `/` → Down 一次 → 第 2 个候选(字母序:/agents)应高亮(accent),其余 dim(对齐 cc DIFF#4)。
     raw = run(bin_path, ["sleep:0.8", "type:/", "sleep:0.2", "key:down", "sleep:0.2"], per_key_drain=0.06)
     rows = _menu_rows_classes(raw)
     accent = [name for name, cls in rows if cls == "accent"]
-    if accent != ["/clear"]:
+    if accent != ["/agents"]:
         a = TTYAssert(raw)
-        a._fail(f"Down 后应只 /clear 高亮(accent),实得 accent={accent},rows={rows}")
+        a._fail(f"Down 后应只 /agents 高亮(accent),实得 accent={accent},rows={rows}")
 
 
 def test_T18e_first_item_highlighted_by_default(bin_path):
-    # 打 `/` → 默认第 1 项(/help)高亮。
+    # 打 `/` → 默认第 1 项(字母序:/add-dir)高亮。
     raw = run(bin_path, ["sleep:0.8", "type:/", "sleep:0.3"], per_key_drain=0.06)
     rows = _menu_rows_classes(raw)
     accent = [name for name, cls in rows if cls == "accent"]
-    if accent != ["/help"]:
+    if accent != ["/add-dir"]:
         a = TTYAssert(raw)
-        a._fail(f"默认应 /help 高亮,实得 accent={accent},rows={rows}")
+        a._fail(f"默认应 /add-dir 高亮,实得 accent={accent},rows={rows}")

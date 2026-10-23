@@ -215,6 +215,16 @@ pub const Conversation = struct {
         try self.append(m);
     }
 
+    /// A user-role text the runtime writes itself (`Message.Origin.host`):
+    /// the model reads it like any user turn, a view of the conversation does
+    /// not show it as the user's.
+    pub fn appendHostText(self: *Conversation, text: []const u8) !void {
+        var m = try msg.textMessage(.user, text, self.allocator);
+        errdefer m.deinit(self.allocator);
+        m.origin = .host;
+        try self.append(m);
+    }
+
     /// 便利方法：追加 text/image 任意有序混排的 user 消息。字节被复制。
     pub fn appendUserParts(self: *Conversation, parts: []const msg.UserContentPart) !void {
         const m = try msg.userMessageFromParts(self.allocator, parts);

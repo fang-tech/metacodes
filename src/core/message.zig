@@ -134,6 +134,19 @@ pub const Message = struct {
     /// 水位随 transcript 持久化(消息级与块级);没有该字段的旧记录恢复为 false。microcompact 据此
     /// 保护尚未被模型看到的图片结果。
     delivered: bool = false,
+    /// Who wrote the message. Never sent to a provider; persisted in the
+    /// transcript, where a record without it loads as `participant`.
+    origin: Origin = .participant,
+
+    pub const Origin = enum {
+        /// The user or the model.
+        participant,
+        /// The runtime itself: a notice, a nudge, a continuation request, a
+        /// background-job notification, a Skill's rendered body. A view of
+        /// the conversation does not attribute it to the user (the REPL
+        /// never echoes one, and a resumed session does not replay it).
+        host,
+    };
 
     pub fn deinit(self: Message, allocator: std.mem.Allocator) void {
         for (self.blocks) |b| b.deinit(allocator);
@@ -150,7 +163,7 @@ pub const Message = struct {
             blocks[i] = try b.dupe(dst);
             n = i + 1;
         }
-        return .{ .role = self.role, .blocks = blocks, .delivered = self.delivered };
+        return .{ .role = self.role, .blocks = blocks, .delivered = self.delivered, .origin = self.origin };
     }
 };
 

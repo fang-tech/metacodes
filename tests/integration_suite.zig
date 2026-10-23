@@ -59,6 +59,7 @@ test {
     _ = @import("component/transcript_roundtrip_test.zig");
     _ = @import("component/headless_json_test.zig");
     _ = @import("component/output_semantics_test.zig");
+    _ = @import("component/message_origin_test.zig");
     _ = @import("component/stream_terminator_test.zig");
     _ = @import("component/time_context_test.zig");
     _ = @import("component/file_change_test.zig");
@@ -97,6 +98,8 @@ test {
     _ = @import("component/render_region_test.zig");
     _ = @import("component/stream_retry_test.zig");
     _ = @import("component/ui_state_test.zig");
+    _ = @import("component/tui_clear_conversation_test.zig");
+    _ = @import("component/skill_overrides_test.zig");
     _ = @import("component/ui_render_test.zig");
     _ = @import("component/ui_backend_test.zig");
     _ = @import("component/ui_multifrontend_test.zig");

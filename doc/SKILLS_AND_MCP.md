@@ -54,7 +54,7 @@ ignored.
 | `argument-hint` | shown beside the command in the `/` menu |
 | `arguments` | positional names for `$name` substitution |
 | `allowed-tools`, `disallowed-tools` | the Skill's tool policy frame |
-| `disable-model-invocation` | not listed to the model and not activatable by it; the user can still run `/name` |
+| `disable-model-invocation` | not listed to the model and not activatable by it; the user can still run `/name` (`skillOverrides` cannot list it) |
 | `user-invocable: false` | hidden from the `/` menu, still model-invocable |
 | `model`, `context: fork`, `agent` | a forked Skill runs under the named subagent's prompt, tool set, permission mode and model |
 | `model-activation`, `shell` | metacodes extensions |
@@ -81,19 +81,64 @@ Code and Codex: only `SKILL.md` and `agents/openai.yaml` are read at startup,
 so Skills that carry a virtualenv, `node_modules` or large assets work.
 (AgentCore's canonical sources still snapshot and materialize the whole tree.)
 
+### `skillOverrides`
+
+Claude Code's per-Skill setting, read from the same files
+(`src/skills/overrides.zig`): `~/.claude/settings.json` <
+`<project>/.claude/settings.json` < `<project>/.claude/settings.local.json`,
+where the project is the repository root or, outside one, the working
+directory.
+
+```json
+{ "skillOverrides": { "release-notes": "name-only", "deploy": "off" } }
+```
+
+| Value | Model listing | Skill tool | `/name` and `/` menu |
+|---|---|---|---|
+| `on` (absent) | name and description | admitted | yes |
+| `name-only` | name only (`- name`) | admitted | yes |
+| `user-invocable-only` | not listed | refused | yes |
+| `off` | not listed | refused | refused, not in the menu |
+
+The Skill tool refuses with Claude Code's words (`Skill <name> is disabled
+for model invocation in skillOverrides settings`); `/name` of an `off` Skill
+prints `Skill "<name>" is disabled via skillOverrides. Re-enable it in /skills
+or remove the override from your settings to run it.` in place of its echo.
+The Skill Runtime enforces the state at activation, so background jobs and
+teammates obey a change at once. An unknown value is ignored (and kept in the
+file); a settings file that does not parse contributes nothing.
+
+The `Skill` tool is registered whenever a Skill may be model-invoked by its
+definition, so an override changes the tool's description, never the tool
+set. The listings change only when an override does: `/skills` closed with
+no change leaves the request bytes as they were.
+
 ### Commands
 
-- Typing `/` opens the command menu: built-in commands, then every
-  user-invocable Skill (marked `(skill)`, with its `argument-hint`). Prefix
-  matches come first, then substring matches; the window scrolls with the
-  selection. Enter on a Skill that takes arguments fills `/name ` instead of
-  submitting.
-- `/skills` lists each Skill with its tier and directory, the Skills without
-  a `description` (listed with their first body line or with nothing), the
-  Skills that did not load and why, and skipped roots. The startup banner and
-  `/doctor` count these, together with hook and agent configuration problems
-  (`/hooks`, `/agents`), so a broken file is noticed without knowing where to
-  look.
+- Typing `/` opens the command menu: built-in commands in alphabetical
+  order, then every user-invocable Skill (its description followed by its
+  tier, e.g. `(user)`, and its `argument-hint`). Prefix matches come first, then substring matches; the
+  window scrolls with the selection; Esc closes the menu and keeps the draft.
+  Enter on a Skill that takes arguments fills `/name ` instead of submitting.
+- `/name args` runs the Skill as a turn of the conversation: the reply
+  streams with the spinner and tool cards and Esc interrupts it, as for any
+  prompt; the rendered Skill body goes to the model, not to the scrollback.
+- In the TUI, `/skills` opens Claude Code's pane: each Skill with its
+  `skillOverrides` state, tier and listing cost (`✔ on  name · user · < 20
+  tok`), and how many Skills did not load. Enter or Space cycles the selected
+  Skill through on → name-only → user-only → off (a
+  `disable-model-invocation` Skill is `🔒 locked by author`); typing or `/`
+  searches, Esc clears the search, then leaves it, then closes the pane.
+  Closing writes the changes to `.claude/settings.local.json` (an entry equal
+  to what the project and user settings give is removed) and prints
+  `Updated N skill overrides` or `No changes`; the next request carries the
+  new listing. Without a terminal (and as the data behind it) `/skills`
+  prints the full report: tier, any override state, and directory, the
+  Skills without a `description` (listed with their first body line or with
+  nothing), the Skills that did not load and why, and skipped roots. The
+  startup banner and `/doctor` count these, together with hook and agent
+  configuration problems (`/hooks`, `/agents`), so a broken file is noticed
+  without knowing where to look.
 
 ### Sealed Skills
 

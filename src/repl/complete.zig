@@ -23,6 +23,9 @@ pub const SlashCmd = struct {
     hint: []const u8 = "",
     /// Enter 选中时只填 `name ` 等用户补参数,而不是立即提交(skill 声明了参数时)。
     takes_args: bool = false,
+    /// A Skill's tier (`user`, `project`, `plugin`, …), shown after its
+    /// description as Claude Code does; empty when unknown.
+    source: []const u8 = "",
 };
 
 /// `/` 菜单与 Tab 补全的命令源:内建命令在前,可由用户调用的 skill 在后。
@@ -35,38 +38,109 @@ pub const SlashCatalog = struct {
 
 pub const MODEL_MENU_MAX_ROWS: usize = 8;
 
-/// slash 命令表(name + 一行描述,供 `/` 菜单与补全共用)。
+/// The built-in commands: the `/` menu, Tab completion, `/help` and the
+/// unknown-command suggestion all read this one table. Alphabetical, as
+/// Claude Code lists them; Skills follow in `buildSlashCatalog`.
 pub const SLASH_COMMAND_TABLE = [_]SlashCmd{
-    .{ .name = "/help", .desc = "Show help and available commands" },
-    .{ .name = "/clear", .desc = "Clear conversation history" },
-    .{ .name = "/tools", .desc = "List available tools" },
-    .{ .name = "/skills", .desc = "List available skills" },
-    .{ .name = "/history", .desc = "Show input history" },
-    .{ .name = "/model", .desc = "Pick a provider, model, and channel (Ctrl+O)" },
-    .{ .name = "/models", .desc = "Select the account API key for this session" },
-    .{ .name = "/login", .desc = "Sign in to a provider with OAuth (kernel flow)" },
-    .{ .name = "/transcript", .desc = "Browse the conversation (Ctrl+X Ctrl+O)" },
-    .{ .name = "/providers", .desc = "List routes; refresh / enable / disable / remove" },
-    .{ .name = "/alias", .desc = "Name a route: pin, float, use, remove" },
-    .{ .name = "/resume", .desc = "Resume a previous session" },
-    .{ .name = "/retry", .desc = "Retry the last request" },
-    .{ .name = "/compact", .desc = "Compact the conversation context" },
-    .{ .name = "/goal", .desc = "View or manage the session goal" },
-    .{ .name = "/loop", .desc = "Control automatic continuation" },
-    .{ .name = "/cost", .desc = "Show token usage and cost" },
-    .{ .name = "/doctor", .desc = "Diagnose the environment" },
-    .{ .name = "/config", .desc = "Show configuration" },
-    .{ .name = "/init", .desc = "Initialize project memory (CLAUDE.md)" },
-    .{ .name = "/mcp", .desc = "Manage MCP servers" },
-    .{ .name = "/agents", .desc = "List subagents" },
-    .{ .name = "/hooks", .desc = "List hooks and hook config problems" },
-    .{ .name = "/permissions", .desc = "Show permission rules and mode" },
-    .{ .name = "/memory", .desc = "Edit persistent memory" },
-    .{ .name = "/kg", .desc = "Knowledge graph: status, mem, plan, forget" },
+    .{ .name = "/add-dir", .desc = "Add a working directory", .hint = "<path>", .takes_args = true },
+    .{ .name = "/agents", .desc = "List available subagents" },
+    .{ .name = "/alias", .desc = "Name a route: pin, float, use, or remove" },
+    .{ .name = "/btw", .desc = "Ask a side question without adding it to the conversation", .hint = "<question>", .takes_args = true },
+    .{ .name = "/clear", .desc = "Start a new session with empty context" },
     .{ .name = "/commit", .desc = "Create a git commit" },
-    .{ .name = "/review", .desc = "Ask the model to review the current diff" },
-    .{ .name = "/exit", .desc = "Exit REPL" },
+    .{ .name = "/compact", .desc = "Free up context by dropping the oldest messages" },
+    .{ .name = "/config", .desc = "Show configuration" },
+    .{ .name = "/cost", .desc = "Show token usage and cost" },
+    .{ .name = "/doctor", .desc = "Diagnose the installation and configuration" },
+    .{ .name = "/effort", .desc = "Show or set reasoning effort" },
+    .{ .name = "/exit", .desc = "Exit metacodes" },
+    .{ .name = "/goal", .desc = "View or manage the session goal" },
+    .{ .name = "/help", .desc = "Show help and available commands" },
+    .{ .name = "/history", .desc = "Show input history" },
+    .{ .name = "/hooks", .desc = "List hooks and hook configuration problems" },
+    .{ .name = "/init", .desc = "Write a CLAUDE.md that documents the codebase" },
+    .{ .name = "/kg", .desc = "Knowledge graph: status, memory, plan, cleanup" },
+    .{ .name = "/login", .desc = "Sign in to a provider" },
+    .{ .name = "/loop", .desc = "Control automatic continuation" },
+    .{ .name = "/mcp", .desc = "List MCP servers" },
+    .{ .name = "/memory", .desc = "List or edit memory files" },
+    .{ .name = "/mode", .desc = "Cycle or set the permission mode" },
+    .{ .name = "/model", .desc = "Choose a provider, model, and channel (Ctrl+O)" },
+    .{ .name = "/models", .desc = "Choose the account API key for this session" },
+    .{ .name = "/overrides", .desc = "Show or set request dialect overrides" },
+    .{ .name = "/permissions", .desc = "Show permission rules and mode" },
+    .{ .name = "/providers", .desc = "List routes; refresh, enable, disable, or remove one" },
+    .{ .name = "/recap", .desc = "Summarize this session in one line" },
+    .{ .name = "/resume", .desc = "Resume a previous session" },
+    .{ .name = "/retry", .desc = "Resend the last message" },
+    .{ .name = "/review", .desc = "Review the current diff" },
+    .{ .name = "/skills", .desc = "List available skills" },
+    .{ .name = "/theme", .desc = "Show or switch the color theme" },
+    .{ .name = "/tools", .desc = "List available tools" },
+    .{ .name = "/transcript", .desc = "Browse the conversation (Ctrl+X Ctrl+O)" },
+    .{ .name = "/vim", .desc = "Toggle vim key bindings" },
 };
+
+comptime {
+    // The table is the one source for the menu's order: keep it sorted.
+    for (SLASH_COMMAND_TABLE[1..], 1..) |cmd, i| {
+        if (!std.mem.lessThan(u8, SLASH_COMMAND_TABLE[i - 1].name, cmd.name))
+            @compileError("SLASH_COMMAND_TABLE must stay alphabetical: " ++ cmd.name);
+    }
+}
+
+/// Whether `name` (with its `/`) is a built-in command.
+pub fn isBuiltinCommand(name: []const u8) bool {
+    for (SLASH_COMMAND_TABLE) |cmd| {
+        if (std.mem.eql(u8, cmd.name, name)) return true;
+    }
+    return false;
+}
+
+/// The command `query` (with its `/`) most likely meant, for "Did you mean
+/// …?": the closest built-in or Skill name within two edits (a transposition
+/// counts as one), ignoring case, and closer than the query's own length so
+/// a one-letter typo is not matched against everything. Ties go to catalog
+/// order (built-ins first).
+pub fn closestCommand(catalog: SlashCatalog, query: []const u8) ?[]const u8 {
+    if (query.len < 2 or query[0] != '/') return null;
+    const needle = query[1..];
+    var best: ?[]const u8 = null;
+    var best_distance: usize = 3;
+    for (catalog.entries) |cmd| {
+        const distance = editDistance(needle, cmd.name[1..]) orelse continue;
+        if (distance == 0 or distance >= best_distance or distance >= needle.len) continue;
+        best = cmd.name;
+        best_distance = distance;
+    }
+    return best;
+}
+
+/// Optimal string alignment distance, case-insensitive. Null for names too
+/// long to be a typo of each other (the table is bounded).
+fn editDistance(a: []const u8, b: []const u8) ?usize {
+    const max = 48;
+    if (a.len > max or b.len > max) return null;
+    var rows: [3][max + 1]usize = undefined;
+    for (0..b.len + 1) |j| rows[1][j] = j;
+    for (1..a.len + 1) |i| {
+        const cur = &rows[(i + 1) % 3];
+        const prev = &rows[i % 3];
+        const prev2 = &rows[(i + 2) % 3];
+        cur[0] = i;
+        for (1..b.len + 1) |j| {
+            const cost: usize = if (std.ascii.toLower(a[i - 1]) == std.ascii.toLower(b[j - 1])) 0 else 1;
+            var d = @min(prev[j] + 1, @min(cur[j - 1] + 1, prev[j - 1] + cost));
+            if (i > 1 and j > 1 and std.ascii.toLower(a[i - 1]) == std.ascii.toLower(b[j - 2]) and
+                std.ascii.toLower(a[i - 2]) == std.ascii.toLower(b[j - 1]))
+            {
+                d = @min(d, prev2[j - 2] + 1);
+            }
+            cur[j] = d;
+        }
+    }
+    return rows[(a.len + 1) % 3][b.len];
+}
 
 /// slash 菜单是否应弹出(整行 trim 后以 `/` 开头且无空格 → 命令补全态)。
 /// 单一真相源:dispatch(导航键语义)与 drawSlashMenu(渲染)共用,防两处判定漂移。
@@ -425,4 +499,15 @@ test "slash catalog: skills join the built-ins, collisions and model-only skills
     try testing.expect(!slashNthMatch(catalog, "/地址库", 0).?.takes_args);
     // A space closes the menu (arguments are being typed).
     try testing.expect(!slashMenuOpen(catalog, "/deploy prod"));
+}
+
+test "closestCommand: suggests the nearest command within two edits" {
+    const catalog = SlashCatalog.builtin;
+    try std.testing.expectEqualStrings("/loop", closestCommand(catalog, "/foo").?);
+    try std.testing.expectEqualStrings("/help", closestCommand(catalog, "/hlep").?);
+    try std.testing.expectEqualStrings("/compact", closestCommand(catalog, "/COMAPCT").?);
+    try std.testing.expectEqualStrings("/login", closestCommand(catalog, "/logni").?);
+    try std.testing.expect(closestCommand(catalog, "/zzzzzz") == null);
+    try std.testing.expect(closestCommand(catalog, "/x") == null); // one letter matches nothing
+    try std.testing.expect(closestCommand(catalog, "/help") == null); // already a command
 }

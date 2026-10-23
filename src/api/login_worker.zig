@@ -27,8 +27,14 @@ pub const TRANSCRIPT_CAPACITY: usize = 1024;
 pub const LoginWorker = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
-    /// A copy; `start` points its `abort_signal` at ours before the thread runs.
-    prepared: provider_login.Prepared,
+    /// A copy; `start` points its `abort_signal` at ours and moves every string
+    /// it reads into `owned` before the thread runs.
+    flow: provider_login.Flow,
+    /// The flow's own copies of what it reads (endpoints, client, state root):
+    /// a sign-in cancelled while inside a request finishes on its thread after
+    /// its dialog has closed, and the registry and configuration it was
+    /// prepared from may have changed by then.
+    owned: std.heap.ArenaAllocator,
     abort_signal: AbortSignal = AbortSignal.init(),
     state: std.atomic.Value(u8) = std.atomic.Value(u8).init(@intFromEnum(State.idle)),
     thread: ?std.Thread = null,
@@ -41,7 +47,41 @@ pub const LoginWorker = struct {
     transcript_truncated: bool = false,
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, prepared: provider_login.Prepared) LoginWorker {
-        return .{ .allocator = allocator, .io = io, .prepared = prepared };
+        return initFlow(allocator, io, .{ .oauth = prepared });
+    }
+
+    /// Any sign-in flow, including Metask's own device grant (`/login`).
+    pub fn initFlow(allocator: std.mem.Allocator, io: std.Io, flow: provider_login.Flow) LoginWorker {
+        return .{ .allocator = allocator, .io = io, .flow = flow, .owned = std.heap.ArenaAllocator.init(allocator) };
+    }
+
+    /// Point the flow at copies it owns (see `owned`).
+    fn ownFlow(self: *LoginWorker) error{OutOfMemory}!void {
+        const a = self.owned.allocator();
+        const options = self.flow.options();
+        options.state_root = try a.dupe(u8, options.state_root);
+        if (options.client_id) |id| options.client_id = try a.dupe(u8, id);
+        switch (self.flow) {
+            .metask => {},
+            .oauth => |*prepared| {
+                const source = prepared.profile;
+                const copy = try a.create(provider_profile.ProviderProfile);
+                copy.* = .{
+                    .id = source.id,
+                    .implementation_id = source.implementation_id,
+                    .display_name = try a.dupe(u8, source.display_name),
+                    .channels = &.{},
+                    .accepted_credential_kinds = try a.dupe(provider_profile.CredentialKind, source.accepted_credential_kinds),
+                    .oauth_token_url = if (source.oauth_token_url) |url| try a.dupe(u8, url) else null,
+                    .oauth_authorize_url = if (source.oauth_authorize_url) |url| try a.dupe(u8, url) else null,
+                    .oauth_device_authorization_url = if (source.oauth_device_authorization_url) |url| try a.dupe(u8, url) else null,
+                    .oauth_client_id = if (source.oauth_client_id) |id| try a.dupe(u8, id) else null,
+                    .oauth_scope = try a.dupe(u8, source.oauth_scope),
+                };
+                prepared.profile = copy;
+                prepared.client_id = try a.dupe(u8, prepared.client_id);
+            },
+        }
     }
 
     /// Idle → running. From here on the worker thread owns the flow until the
@@ -50,15 +90,23 @@ pub const LoginWorker = struct {
         const idle = @intFromEnum(State.idle);
         const running = @intFromEnum(State.running);
         if (self.state.cmpxchgStrong(idle, running, .acq_rel, .acquire) != null) return error.AlreadyStarted;
-        self.prepared.options.abort_signal = &self.abort_signal;
+        // A worker that never starts is destroyed without `join`: release the
+        // copies on every failure here.
+        self.ownFlow() catch {
+            _ = self.owned.reset(.free_all);
+            self.state.store(idle, .release);
+            return error.ThreadSpawnFailed;
+        };
+        self.flow.options().abort_signal = &self.abort_signal;
         self.thread = std.Thread.spawn(.{}, run, .{self}) catch {
+            _ = self.owned.reset(.free_all);
             self.state.store(idle, .release);
             return error.ThreadSpawnFailed;
         };
     }
 
     fn run(self: *LoginWorker) void {
-        _ = self.prepared.run(self.allocator, self.io, self.notify(), &self.diagnostic) catch |err| {
+        _ = self.flow.run(self.allocator, self.io, self.notify(), &self.diagnostic) catch |err| {
             if (err == error.Aborted) {
                 self.state.store(@intFromEnum(State.cancelled), .release);
                 return;
@@ -96,11 +144,19 @@ pub const LoginWorker = struct {
             thread.join();
             self.thread = null;
         }
+        // The thread no longer reads the copies.
+        _ = self.owned.reset(.free_all);
     }
 
     /// Valid after the state read `failed`.
     pub fn failureName(self: *const LoginWorker) []const u8 {
         return self.failure_name[0..self.failure_len];
+    }
+
+    /// Valid after the state read `failed`: the failing import step's own
+    /// error, when the import refused on a failure rather than a decision.
+    pub fn failureCause(self: *const LoginWorker) ?[]const u8 {
+        return if (self.diagnostic.cause) |cause| @errorName(cause) else null;
     }
 
     /// The transcript so far, copied into `out`.

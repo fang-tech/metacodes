@@ -55,6 +55,33 @@ class TTYAssert:
                 self._copy_into(sc, snap)
                 self.frame_screens.append(snap)
 
+    def sync_screens(self):
+        """The screen after every complete synchronized update (DEC 2026 end).
+
+        Modal panes (`/help`, `/login`, …) keep the cursor hidden while open, so
+        their frames never close a hide/show pair; each of their redraws does
+        end a synchronized update, which makes it a complete frame to look at.
+        """
+        marker = b"\x1b[?2026l"
+        screens = []
+        sc = Screen(self.rows, self.cols)
+        start = 0
+        while True:
+            at = self.raw.find(marker, start)
+            if at == -1:
+                break
+            end = at + len(marker)
+            sc.feed(self.raw[start:end])
+            snap = Screen(self.rows, self.cols)
+            self._copy_into(sc, snap)
+            screens.append(snap)
+            start = end
+        return screens
+
+    def screens_with(self, text):
+        """Synchronized-update screens showing `text` on some row."""
+        return [sc for sc in self.sync_screens() if sc.find_row(text) is not None]
+
     @staticmethod
     def _copy_into(src: Screen, dst: Screen):
         for r in range(src.rows):

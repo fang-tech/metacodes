@@ -110,6 +110,7 @@ session supplies its authenticated gateway by default; use `--base-url` or
 
 ```sh
 metacodes                                   # interactive TUI
+metacodes --resume <id>                     # the TUI, back in a session of this directory
 metacodes -p "explain src/main.zig" --json  # headless: one prompt, one NDJSON result
 metacodes -p - --stream-json < task.txt     # headless, streaming every event as NDJSON
 metacodes --web                             # browser UI on 127.0.0.1:7777
@@ -122,6 +123,10 @@ any key skips it. Set `METACODES_NO_STARTUP_ANIMATION` (to any value, even
 `0`), or put
 `"startupAnimation": false` in `<state root>/config.json` (`metacodes doctor`
 shows where the state root is), to start straight at the prompt.
+
+Leaving a session that has run a turn prints the command that reopens it,
+`metacodes --resume <id>`; inside the TUI, `/resume` lists this directory's
+sessions.
 
 `metacodes --help` lists every flag. Embedding the runtime in your own process
 (Zig module or the AgentCore C ABI) starts at [API.md](API.md).

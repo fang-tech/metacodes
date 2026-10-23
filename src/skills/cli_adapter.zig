@@ -10,6 +10,7 @@ const paths = @import("platform").paths;
 const sync = @import("platform").sync;
 const runtime = @import("runtime/root.zig");
 const skill_projection = @import("skill.zig");
+const overrides_mod = @import("overrides.zig");
 const ActiveSkillState = @import("active.zig").ActiveSkillState;
 const ToolContext = @import("../tools/context.zig").ToolContext;
 const PermissionContext = @import("../permission.zig").PermissionContext;
@@ -22,9 +23,7 @@ const subagent = @import("../core/subagent.zig");
 const sealed_provider = @import("sealed/provider.zig");
 const sealed_pin = @import("sealed/pin.zig");
 const preload = @import("../agents/preload.zig");
-const agent_loop = @import("../core/agent_loop.zig");
-const project_activation = @import("../core/project_rule_activation.zig");
-const writer_backend = @import("../core/writer_backend.zig");
+const tool_common = @import("../tools/common.zig");
 
 const Sha256 = std.crypto.hash.sha2.Sha256;
 
@@ -49,6 +48,9 @@ pub const Runtime = struct {
     root_frame: ?*runtime.policy_frame.PolicyFrame = null,
     contexts_mutex: sync.Mutex = .{},
     contexts: std.AutoHashMap([24]u8, *ExecutionState),
+    /// `skillOverrides` (owned by the App, internally synchronized). Set once
+    /// before the Runtime is shared; null applies no overrides.
+    overrides: ?*overrides_mod.Overrides = null,
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io) Runtime {
         return .{
@@ -194,14 +196,66 @@ pub const Runtime = struct {
     /// this Runtime snapshot and therefore stays stable for the Session.
     pub fn applyModelToolSchema(self: *const Runtime, definitions: []ToolDefinition) bool {
         const snapshot = self.snapshot orelse return false;
+        var scratch = std.heap.ArenaAllocator.init(self.allocator);
+        defer scratch.deinit();
+        const listings = self.modelListings(scratch.allocator()) catch null;
         for (definitions) |*definition| {
             if (!std.mem.eql(u8, definition.name, runtime.model_tool.TOOL_NAME))
                 continue;
             definition.input_schema.prop_specs = &runtime.model_tool.INPUT_PROPERTIES;
             definition.input_schema.properties = null;
             definition.input_schema.required = runtime.model_tool.REQUIRED_FIELDS;
-            definition.model_activation = runtime.model_tool.modelActivation(snapshot);
+            definition.model_activation = runtime.model_tool.modelActivationWithListing(snapshot, .all, listings);
             return true;
+        }
+        return false;
+    }
+
+    /// The effective `skillOverrides` state of `invocation_name`.
+    pub fn overrideState(self: *const Runtime, invocation_name: []const u8) overrides_mod.State {
+        const overrides = self.overrides orelse return .on;
+        return overrides.stateOf(invocation_name);
+    }
+
+    /// Per-Skill model listing under `skillOverrides`, aligned with the
+    /// snapshot's records; null when no overrides apply.
+    pub fn modelListings(self: *const Runtime, allocator: std.mem.Allocator) !?[]runtime.model_tool.Listing {
+        const overrides = self.overrides orelse return null;
+        const snapshot = self.snapshot orelse return null;
+        const names = try allocator.alloc([]const u8, snapshot.skills.len);
+        defer allocator.free(names);
+        for (snapshot.skills, names) |record, *name| name.* = record.invocation_name;
+        const states = try allocator.alloc(overrides_mod.State, snapshot.skills.len);
+        defer allocator.free(states);
+        overrides.statesOf(names, states);
+        const listings = try allocator.alloc(runtime.model_tool.Listing, snapshot.skills.len);
+        for (states, listings) |state, *listing| listing.* = state.listing();
+        return listings;
+    }
+
+    /// The Skill tool description for the current `skillOverrides`.
+    pub fn buildModelToolDescription(self: *const Runtime, allocator: std.mem.Allocator) ![]u8 {
+        const snapshot = self.snapshot orelse return error.SkillUnavailable;
+        var scratch = std.heap.ArenaAllocator.init(allocator);
+        defer scratch.deinit();
+        const listings = try self.modelListings(scratch.allocator());
+        return runtime.model_tool.buildDescriptionWithListing(allocator, snapshot, .all, listings);
+    }
+
+    /// Bring the Skill tool in `definitions` up to date after a
+    /// `skillOverrides` change: its description (allocated from
+    /// `allocator`, which must outlive `definitions`) and its required-first
+    /// route. Returns false when `definitions` has no Skill tool.
+    pub fn refreshModelTool(
+        self: *const Runtime,
+        definitions: []ToolDefinition,
+        allocator: std.mem.Allocator,
+    ) !bool {
+        for (definitions) |*definition| {
+            if (!std.mem.eql(u8, definition.name, runtime.model_tool.TOOL_NAME))
+                continue;
+            definition.description = try self.buildModelToolDescription(allocator);
+            return self.applyModelToolSchema(definitions);
         }
         return false;
     }
@@ -224,6 +278,11 @@ pub const Runtime = struct {
         const record = snapshot.findByInvocation(invocation_name) orelse
             return error.SkillNotFound;
         if (record.live_dir == null and materializations == null) return error.SkillUnavailable;
+        const override = self.overrideState(record.invocation_name);
+        switch (activation_context) {
+            .model_tool => if (!override.modelInvocable()) return error.SkillDisabled,
+            .external_run_root => if (!override.userInvocable()) return error.SkillDisabled,
+        }
         const abort = ctx.abort orelse return error.SkillUnavailable;
         const state = try self.ensureContextLocked(ctx);
         const parent = currentFrameLocked(state);
@@ -493,14 +552,13 @@ fn refreshProjectionLocked(state: *ExecutionState) void {
     }
 }
 
+/// Register the model-facing Skill tool. It is registered whenever a Skill
+/// may be model-invoked by its definition, so a `skillOverrides` change in
+/// the Session changes its description, never the tool set.
 pub fn registerModelTool(registry: *DynRegistry, skill_runtime: *Runtime) !void {
     if (!skill_runtime.hasModelInvocable())
         return error.SkillUnavailable;
-    const snapshot = skill_runtime.snapshot orelse return error.SkillUnavailable;
-    const description = try runtime.model_tool.buildDescription(
-        skill_runtime.allocator,
-        snapshot,
-    );
+    const description = try skill_runtime.buildModelToolDescription(skill_runtime.allocator);
     defer skill_runtime.allocator.free(description);
     try registry.register(
         runtime.model_tool.TOOL_NAME,
@@ -532,6 +590,12 @@ pub fn applyModelToolSchema(definitions: []ToolDefinition) bool {
 
 pub const SlashDisposition = enum {
     handled,
+    /// The Skill exists but `skillOverrides` turns it off: nothing ran.
+    disabled,
+    /// The Skill is active and its invocation is in the conversation: the
+    /// host runs the model turn through its own (interactive) turn path, as
+    /// it runs any prompt, then the activation ends with the next message.
+    run,
     unknown_command,
     not_a_command,
 };
@@ -574,6 +638,8 @@ pub fn handleSlash(
         }
         return .unknown_command;
     };
+    if (!app.skill_runtime.overrideState(record.invocation_name).userInvocable())
+        return .disabled;
     const values = parseSlashValues(
         allocator,
         std.mem.trim(u8, rest[head.len..], " \t"),
@@ -692,69 +758,11 @@ pub fn handleSlash(
     );
     defer allocator.free(skill_result);
 
+    // The rendered Skill body is for the model; the user's scrollback shows
+    // the invocation and the reply, as for any prompt (Claude Code).
     try app.conversation.appendText(.user, user_message);
-    try app.conversation.appendText(.user, skill_result);
-    std.debug.print("\x1b[36m{s}\x1b[0m\n", .{skill_result});
-
-    var backend = writer_backend.WriterBackend{
-        .sink_ctx = undefined,
-        .sink = debugSink,
-        .colorize = true,
-        .verbose = app.config.verbose,
-        .show_retry = true,
-        .usage_acc = &app.usage,
-    };
-    const ui_backend = backend.backend();
-    const run_control: ?*project_activation.RunControl = if (app.sessionDir()) |dir|
-        try project_activation.RunControl.init(
-            allocator,
-            dir,
-            app.session_id,
-            if (app.project_dir_or_empty().len > 0) app.project_dir_or_empty() else app.cwdAbs(),
-            &app.abort,
-        )
-    else
-        null;
-    defer if (run_control) |control| control.deinit();
-    if (run_control) |control| control.requireDetachedIdle(
-        (if (app.jobs) |*registry| registry.runningCountForOwner(app.session_id) else 0) +|
-            (if (app.agent_jobs) |*registry| registry.runningCountForSession(app.session_id) else 0),
-        app.swarm.hasTeam(),
-    ) catch |err| {
-        try control.finishRun(@errorName(err));
-        return err;
-    };
-    // U11(issue #3):字段装配走 canonical session_service.buildRunOptions。此前本路径
-    // 手抄 Options 漏了 agents/skills_set/mcp_sessions/cron_registry/file_change_journal/
-    // parent_model 等 7 字段——skill 触发的 run 里模型能力被静默削弱;收敛后仅补
-    // run_control 三件套(本路径专属)。
-    var run_opts = @import("../session_service.zig").buildRunOptions(app, null);
-    run_opts.tool_observer = if (run_control) |control| control.observer() else null;
-    run_opts.execution_boundary = if (run_control) |control| control.executionBoundary() else null;
-    run_opts.project_rule_gate = if (run_control) |control| control.formalGate() else null;
-    const result = agent_loop.run(
-        &app.conversation,
-        app.provider(),
-        app.tool_defs,
-        &app.permission_ctx,
-        run_opts,
-        &ui_backend,
-        allocator,
-    ) catch |err| {
-        if (run_control) |control| try control.finishRun(@errorName(err));
-        std.debug.print("\x1b[31mError after /{s}: {s}\x1b[0m\n", .{ head, @errorName(err) });
-        app.clearPendingModelSwitchCompact();
-        return .handled;
-    };
-    if (run_control) |control| try control.finishRun(@tagName(result.stop_reason));
-    app.clearPendingModelSwitchCompact();
-    app.persistTranscript();
-    if (result.stop_reason == .aborted) app.abort.resetForTesting();
-    return .handled;
-}
-
-fn debugSink(_: *anyopaque, bytes: []const u8) void {
-    std.debug.print("{s}", .{bytes});
+    try app.conversation.appendHostText(skill_result);
+    return .run;
 }
 
 fn executeModelTool(
@@ -769,6 +777,13 @@ fn executeModelTool(
         scratch.allocator(),
         encoded,
     );
+    if (self.findRecord(invocation.name) != null and
+        !self.overrideState(invocation.name).modelInvocable())
+    {
+        // Claude Code's refusal, word for word.
+        tool_common.setErrorDetail(ctx.error_detail, ctx.allocator, "Skill {s} is disabled for model invocation in skillOverrides settings", .{invocation.name});
+        return error.SkillDisabled;
+    }
     const activation = try self.activate(
         ctx,
         invocation.name,

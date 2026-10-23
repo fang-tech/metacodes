@@ -208,6 +208,7 @@ pub const mcp_naming = @import("mcp/naming.zig");
 pub const mcp_registry_bridge = @import("mcp/registry_bridge.zig");
 pub const mcp_session = @import("core/mcp_session.zig");
 pub const skills = @import("skills/skill.zig");
+pub const skill_overrides = @import("skills/overrides.zig");
 pub const skills_runtime = @import("skills/runtime/root.zig");
 pub const skills_cli_adapter = @import("skills/cli_adapter.zig");
 pub const skills_sealed_protocol = @import("skills/sealed/protocol.zig");
@@ -283,6 +284,7 @@ pub const project_rule_activation = @import("core/project_rule_activation.zig");
 pub const repl_msg_queue = @import("repl/msg_queue.zig");
 pub const repl_history = @import("repl/history.zig");
 pub const repl_user_echo = @import("repl/user_echo.zig");
+pub const repl_replay = @import("repl/replay.zig");
 pub const event_journal = @import("core/event_journal.zig");
 pub const session_host = @import("core/session_host.zig");
 pub const web_backend = @import("web/backend.zig");
@@ -641,6 +643,14 @@ pub fn main(init: std.process.Init) !void {
         @import("core/context_caps.zig").configureStateRoot(config.state_root);
     }
 
+    // `--resume <id>` binds the App to the stored session before it is built,
+    // as the daemon's restore does (#254): KG summary, permission routing and
+    // the transcript writer start as that session, and no new session
+    // directory is made. The conversation loads once the App exists.
+    if (config.resume_session) |query| {
+        config.session_id = resolveResumeSession(allocator, config.state_root, query) catch std.process.exit(1);
+    }
+
     // 初始化日志：读 METACODES_LOG / METACODES_LOG_FILE 环境变量
     const log = @import("util/log.zig");
     log.initFromEnv();
@@ -991,8 +1001,19 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(code);
     }
 
+    // `--resume <id>`: the App was built as that session (above); load its
+    // conversation before the first prompt, or stop before the TUI starts.
+    const resumed: ?app_mod.App.ResumedConversation = if (config.resume_session != null)
+        app.resumePersistedConversation() catch |err| {
+            std.debug.print("error: cannot resume session {s}: {s}\n", .{ app.session_id.asSlice(), repl.resumeLoadFailure(err) });
+            app.deinit();
+            std.process.exit(1);
+        }
+    else
+        null;
+
     // (stderr 日志 gate 已提前到 App.init 之前——见 interactive_tui;init 期日志同样不得上屏。)
-    try repl.run(app, gpa);
+    try repl.run(app, gpa, .{ .resumed = resumed });
 }
 
 /// Write pipeable command output directly to stdout, without routing it through
@@ -1398,6 +1419,34 @@ fn hostStateRoot() error{StateRootRejected}![]const u8 {
         return error.StateRootRejected;
     };
     return resolved.path;
+}
+
+/// The id of the stored session of the working directory that `--resume
+/// <query>` names, by the rule `/resume <id>` uses (`transcript.findSession`).
+/// Says why on stderr when there is none.
+fn resolveResumeSession(allocator: std.mem.Allocator, state_root: []const u8, query: []const u8) error{ResumeTargetNotFound}![]const u8 {
+    if (state_root.len == 0) {
+        std.debug.print("error: --resume: there is no state root, so no stored sessions (set HOME or --state-dir)\n", .{});
+        return error.ResumeTargetNotFound;
+    }
+    const cwd = fs_util.getCwd(allocator) catch {
+        std.debug.print("error: --resume: cannot read the current directory\n", .{});
+        return error.ResumeTargetNotFound;
+    };
+    defer allocator.free(cwd);
+    const list = transcript.listSessions(cwd, .{ .path = state_root }, allocator) catch |err| {
+        std.debug.print("error: --resume: cannot list the sessions of {s} ({s})\n", .{ cwd, @errorName(err) });
+        return error.ResumeTargetNotFound;
+    };
+    defer transcript.freeSessionList(list, allocator);
+    const entry = transcript.findSession(list, query) orelse {
+        std.debug.print("error: no session matching '{s}' in {s} (/resume lists them)\n", .{ query, cwd });
+        return error.ResumeTargetNotFound;
+    };
+    return allocator.dupe(u8, entry.id) catch {
+        std.debug.print("error: --resume: out of memory\n", .{});
+        return error.ResumeTargetNotFound;
+    };
 }
 
 /// The state root this host resolved at startup ("" when there is none).
@@ -2915,6 +2964,14 @@ fn parseArgsInto(config: *types.Config, args: *std.process.Args.Iterator, alloca
                     config.resume_response = allocator.dupe(u8, v) catch v;
                 }
             }
+        } else if (std.mem.eql(u8, arg, "--resume")) {
+            // A flag in the id's place means the id was left out.
+            const v = args.next() orelse "";
+            if (v.len == 0 or v[0] == '-') {
+                setParseError(config, allocator, "missing session id for --resume", .{});
+                return;
+            }
+            config.resume_session = allocator.dupe(u8, v) catch v;
         } else if (std.mem.eql(u8, arg, "--dump-prompt")) {
             config.dump_prompt = true;
         } else if (std.mem.eql(u8, arg, "--sections")) {
@@ -2949,6 +3006,29 @@ fn parseArgsInto(config: *types.Config, args: *std.process.Args.Iterator, alloca
     }
     if (config.dump_prompt_sections and !config.dump_prompt and config.parse_error == null) {
         setParseError(config, allocator, "--sections requires --dump-prompt", .{});
+    }
+    // `--resume` opens a session in the interactive REPL; every other mode
+    // would ignore it, and `--session` names a different session identity.
+    if (config.resume_session != null and config.parse_error == null) {
+        const other: ?[]const u8 = if (config.prompt != null)
+            "-p/--print or -"
+        else if (config.web_port != null)
+            "--web"
+        else if (config.serve_port != null)
+            "serve"
+        else if (config.resume_response != null)
+            "--resume-response"
+        else if (config.session_id != null)
+            "--session"
+        else if (config.teammate_name.len > 0)
+            "--teammate"
+        else if (config.dump_prompt)
+            "--dump-prompt"
+        else if (config.dump_plugins)
+            "--dump-plugins"
+        else
+            null;
+        if (other) |flag| setParseError(config, allocator, "--resume opens the interactive REPL and cannot be combined with {s}", .{flag});
     }
     // The gate without a command would arm a no-op; a lone command would run
     // nothing. Either half alone is a mistyped treatment, so fail closed.
@@ -3159,6 +3239,8 @@ fn printHelp() void {
         \\                        GET /health (a GET may pass ?token=). Prefer env METACODES_WEB_TOKEN:
         \\                        the flag is visible in ps
         \\  --web-allow-unauth    --web/serve: allow a non-loopback --web-bind without a token
+        \\  --resume <id>         Start the REPL in a stored session of this directory (an id or id prefix, as
+        \\                        /resume takes; an interactive exit prints the command for the current one)
         \\  --resume-response <j> Resume a suspended session with a late tool response (@file to read from a file)
         \\  --model <model>       Model (default: claude-sonnet-4-20250514)
         \\  --model-display-name <name>  Stable actor-visible model identity
@@ -3245,6 +3327,45 @@ test "basic" {
     try std.testing.expect(true);
 }
 
+test "--resume takes a session id for the REPL and fails closed without one or beside another mode" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const ok = parseArgsForTest(&[_][*:0]const u8{ "metacodes", "--resume", "000001a16627", "--model", "m" }, a);
+    try std.testing.expect(ok.parse_error == null);
+    try std.testing.expectEqualStrings("000001a16627", ok.resume_session.?);
+    try std.testing.expectEqualStrings("m", ok.model);
+    // The id resolves against the stored sessions in main, before App.init.
+    try std.testing.expect(ok.session_id == null);
+
+    const missing = [_][]const [*:0]const u8{
+        &.{ "metacodes", "--resume" },
+        &.{ "metacodes", "--resume", "" },
+        &.{ "metacodes", "--resume", "--model", "m" },
+    };
+    for (missing) |argv| {
+        const config = parseArgsForTest(argv, a);
+        try std.testing.expectEqualStrings("missing session id for --resume", config.parse_error.?);
+    }
+
+    const Conflict = struct { argv: []const [*:0]const u8, flag: []const u8 };
+    const conflicts = [_]Conflict{
+        .{ .argv = &.{ "metacodes", "--resume", "x", "-p", "hi" }, .flag = "-p/--print or -" },
+        .{ .argv = &.{ "metacodes", "--web", "--resume", "x" }, .flag = "--web" },
+        .{ .argv = &.{ "metacodes", "serve", "--resume", "x" }, .flag = "serve" },
+        .{ .argv = &.{ "metacodes", "--resume", "x", "--resume-response", "{}" }, .flag = "--resume-response" },
+        .{ .argv = &.{ "metacodes", "--resume", "x", "--session", "y" }, .flag = "--session" },
+        .{ .argv = &.{ "metacodes", "--resume", "x", "--agent-name", "w" }, .flag = "--teammate" },
+        .{ .argv = &.{ "metacodes", "--resume", "x", "--dump-prompt" }, .flag = "--dump-prompt" },
+        .{ .argv = &.{ "metacodes", "--resume", "x", "--dump-plugins" }, .flag = "--dump-plugins" },
+    };
+    for (conflicts) |c| {
+        const config = parseArgsForTest(c.argv, a);
+        const expected = try std.fmt.allocPrint(a, "--resume opens the interactive REPL and cannot be combined with {s}", .{c.flag});
+        try std.testing.expectEqualStrings(expected, config.parse_error.?);
+    }
+}
+
 test "Metask login dispatch uses JSON device flow except token import" {
     try std.testing.expect(metaskUsesDeviceFlow(.browser));
     try std.testing.expect(!metaskUsesDeviceFlow(.help));
@@ -3301,6 +3422,7 @@ test {
     _ = &@import("app/kg_autostart.zig");
     _ = &@import("session_service.zig");
     _ = &@import("repl/loop.zig");
+    _ = &@import("repl/replay.zig");
     _ = &@import("util/abort.zig");
     _ = &@import("util/file_lock.zig");
     _ = &@import("util/toolchain.zig");
@@ -3325,6 +3447,9 @@ test {
     _ = &@import("repl/msg_queue.zig");
     _ = &@import("repl/history.zig");
     _ = &@import("repl/user_echo.zig");
+    _ = &@import("repl/cmd_output.zig");
+    _ = &@import("repl/dialogs.zig");
+    _ = &@import("repl/tui/dialog/pane.zig");
     _ = &@import("repl/multiline.zig");
     _ = &@import("repl/render.zig");
     _ = &@import("repl/headless.zig");
@@ -3374,6 +3499,7 @@ test {
     _ = &@import("skills/runtime/frontmatter.zig");
     _ = &@import("tools/dynamic.zig");
     _ = &@import("skills/skill.zig");
+    _ = &@import("skills/overrides.zig");
     _ = &@import("skills/tool_pool_filter.zig");
     _ = &@import("skills/render.zig");
     _ = &@import("skills/discovery.zig");
