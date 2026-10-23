@@ -110,6 +110,12 @@ status, compatibility boundaries, and entry points are defined by
   stream is read to its end first, an idle connection is reused only within
   4 s, and a request that meets a reused connection the server already
   closed is sent again on a new one.
+- **The system prompt keeps naming the model `/model` switched to.** With
+  `--model-display-name`, a `/skills` change, a working directory renamed
+  under the session, or `EnterWorktree` / `ExitWorktree` after a `/model`
+  switch rebuilt the prompt with the startup display name again (the switch
+  itself named the new model). Every rebuild now names the same model: the
+  display name until a switch, the switched model after one.
 - **TUI: a terminal resize no longer answers an open dialog.** A resize
   interrupts a blocked key read (SIGWINCH has no `SA_RESTART`), and the
   permission dialog took the interrupted read for "No": the tool was denied
