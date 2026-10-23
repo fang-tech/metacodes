@@ -1139,6 +1139,39 @@ pub const RenderRegion = struct {
         w.writeAll(th.dim) catch {};
         w.writeAll(hint) catch {};
         w.writeAll(th.reset) catch {};
+
+        // MCP servers connecting in the background, then the ones that
+        // failed (Claude Code's "1 MCP server failed · /mcp"). It is not a
+        // key hint, so a draft keeps it; it is dropped when it does not fit
+        // on the line, which must never wrap.
+        var notice_buf: [96]u8 = undefined;
+        const mcp_startup = @import("../../app/mcp_startup.zig");
+        if (mcp_startup.notice(app.mcp_status.snapshot(), &notice_buf)) |n| {
+            const lead: []const u8 = if (mode_plain.len == 0 and hint.len == 0) " " else " · ";
+            const used = term.displayWidth(mode_plain) + term.displayWidth(hint);
+            const need = term.displayWidth(lead) + term.displayWidth(n.text);
+            if (used + need < self.cols) {
+                w.writeAll(th.dim) catch {};
+                w.writeAll(lead) catch {};
+                w.writeAll(switch (n.tone) {
+                    .progress => th.dim,
+                    .warning => th.warn,
+                    .failure => th.danger,
+                }) catch {};
+                w.writeAll(n.text) catch {};
+                w.writeAll(th.reset) catch {};
+            }
+        }
+    }
+
+    /// Replace the generating spinner's verb (a turn that first waits on
+    /// something names it); returns the verb it replaced.
+    pub fn setSpinnerVerb(self: *RenderRegion, verb: []const u8) []const u8 {
+        self.lock();
+        defer self.unlock();
+        const previous = self.ui.spinner.verb;
+        self.ui.spinner.verb = verb;
+        return previous;
     }
 
     /// Agent viewing 帧(区域2 持久查看):view==.viewing 时画在**输入框上方**(替代 panel 位置)——

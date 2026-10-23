@@ -45,6 +45,21 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Changed
 
+- **The REPL no longer waits for MCP servers before showing its prompt.**
+  Servers connect in the background (the footer reads `connecting to MCP
+  servers (n/total)`); the first message, `/skill`, prompt command, `/btw`,
+  `/recap`, cron or `/loop` turn waits for every server to report (spinner:
+  `Connecting to MCP servers`; Esc or Ctrl+C stops waiting), then registers
+  their tools and builds the tool list and system prompt once, so the first
+  request is byte for byte the one a synchronous start sent. Measured with two
+  stdio servers that take 3 s to start: prompt after 3.02 s before, 0.02 s
+  now. Ctrl+C twice while a server is starting exits at once (its handshake
+  is interrupted and the process reaped). `/mcp` shows servers that are still
+  connecting, and after startup the footer announces failures once (`1 MCP
+  server failed · /mcp`; a 401/403 reads `1 MCP server needs auth · /mcp`
+  and `/mcp` marks it `needs authentication`). `-p`, `--web`, `serve`,
+  `--teammate` and the dumps still connect every server before they start;
+  their connects now overlap the rest of startup.
 - **TUI: the prompt and commands behave like Claude Code 2.1.278** (recorded
   side by side in a PTY). Ctrl+C, and Ctrl+D on an empty prompt, exit on a
   second press within 800 ms; the first shows `Press Ctrl-C again to exit` in

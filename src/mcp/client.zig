@@ -98,6 +98,9 @@ pub const ConnectOptions = struct {
     startup_timeout_ms: ?u32 = null,
     /// Bound on each tool call / resource read. null = only the user's interrupt.
     request_timeout_ms: ?u32 = null,
+    /// Interrupts the handshake (probe included) and nothing after it: the
+    /// connect returns `error.Aborted`. Borrowed for the call only.
+    abort: ?*const AbortSignal = null,
     protocol: ProtocolPolicy = .auto,
     /// Bound on the `server/discover` probe in `.auto`. A Classic server
     /// answers an unknown method at once (or exits); one that ignores it
@@ -158,7 +161,7 @@ pub const McpClient = struct {
         const startup_deadline: ?i64 = if (options.startup_timeout_ms) |ms| started + ms else null;
         if (options.protocol != .classic_only) {
             const probe_deadline = minDeadline(startup_deadline, started + options.probe_timeout_ms);
-            switch (try client.probeModern(probe_deadline)) {
+            switch (try client.probeModern(probe_deadline, options.abort)) {
                 .modern => {
                     client.transport.setDeadline(null);
                     client.initialized = true;
@@ -171,6 +174,7 @@ pub const McpClient = struct {
                     if (startup_deadline) |deadline| {
                         if (util_time.nowMs() >= deadline) return error.McpRequestTimeout;
                     }
+                    if (options.abort) |signal| if (signal.isAborted()) return error.Aborted;
                     // Spawn first: if that fails, the errdefer still owns a
                     // valid transport to reap.
                     const replacement = try StdioTransport.spawnWith(allocator, options.spawn.argv, options.spawn.options());
@@ -181,7 +185,7 @@ pub const McpClient = struct {
             if (options.protocol == .modern_only) return error.UnsupportedProtocolVersion;
         }
         client.transport.setDeadline(startup_deadline);
-        try client.initializeClassic();
+        try client.initializeClassic(options.abort);
         client.transport.setDeadline(null);
         return client;
     }
@@ -206,7 +210,7 @@ pub const McpClient = struct {
         const started = util_time.nowMs();
         const startup_deadline: ?i64 = if (options.startup_timeout_ms) |ms| started + ms else null;
         if (options.protocol != .classic_only) {
-            switch (try client.probeModern(minDeadline(startup_deadline, started + options.probe_timeout_ms))) {
+            switch (try client.probeModern(minDeadline(startup_deadline, started + options.probe_timeout_ms), options.abort)) {
                 .modern => {
                     client.transport.setDeadline(null);
                     client.initialized = true;
@@ -218,7 +222,7 @@ pub const McpClient = struct {
             if (options.protocol == .modern_only) return error.UnsupportedProtocolVersion;
         }
         client.transport.setDeadline(startup_deadline);
-        try client.initializeClassic();
+        try client.initializeClassic(options.abort);
         client.transport.setDeadline(null);
         return client;
     }
@@ -245,7 +249,7 @@ pub const McpClient = struct {
 
     /// `server/discover` with the Modern `_meta`. Only a Modern answer selects
     /// Modern; every other outcome falls back (never keyed to one error code).
-    fn probeModern(self: *McpClient, deadline: i64) !ProbeOutcome {
+    fn probeModern(self: *McpClient, deadline: i64, abort: ?*const AbortSignal) !ProbeOutcome {
         const id = self.nextId();
         self.setModern(true);
         defer if (!self.initialized) self.setModern(false);
@@ -255,6 +259,8 @@ pub const McpClient = struct {
         defer self.allocator.free(request_bytes);
         self.transport.setDeadline(deadline);
         defer self.transport.setDeadline(null);
+        self.transport.setAbort(abort);
+        defer self.transport.setAbort(null);
         const is_http = self.transport.isHttp();
         self.transport.send(request_bytes, .{ .method = "server/discover" }) catch |err| {
             // HTTP: no reply is not evidence of an older server.
@@ -297,7 +303,7 @@ pub const McpClient = struct {
         }
     }
 
-    fn initializeClassic(self: *McpClient) !void {
+    fn initializeClassic(self: *McpClient, abort: ?*const AbortSignal) !void {
         var out: std.Io.Writer.Allocating = .init(self.allocator);
         defer out.deinit();
         try out.writer.print("{{\"protocolVersion\":\"{s}\",\"capabilities\":{s},\"clientInfo\":{{\"name\":\"metacodes\",\"version\":", .{ CLASSIC_VERSION, CLIENT_CAPABILITIES_JSON });
@@ -305,7 +311,7 @@ pub const McpClient = struct {
         try out.writer.writeAll("}}");
         const params = out.written();
 
-        const result = try self.requestUnlocked("initialize", params, null);
+        const result = try self.requestUnlocked("initialize", params, abort);
         defer self.allocator.free(result);
         var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, result, .{}) catch
             return error.McpMalformedResponse;
@@ -751,6 +757,11 @@ pub const McpClient = struct {
 
     /// 返回 tools 列表 `{"tools":[...]}`(owned JSON string,caller free),跨页聚合。
     pub fn listTools(self: *McpClient) ![]u8 {
+        return self.listToolsAbortable(null);
+    }
+
+    /// `tools/list` (every page), interruptible as a whole by `abort`.
+    pub fn listToolsAbortable(self: *McpClient, abort: ?*const AbortSignal) ![]u8 {
         self.request_mutex.lock();
         defer self.request_mutex.unlock();
         var tools: std.Io.Writer.Allocating = .init(self.allocator);
@@ -770,7 +781,7 @@ pub const McpClient = struct {
                 break :blk try out.toOwnedSlice();
             } else try self.allocator.dupe(u8, protocol.EMPTY_PARAMS);
             defer self.allocator.free(params);
-            const result = try self.requestUnlocked("tools/list", params, null);
+            const result = try self.requestUnlocked("tools/list", params, abort);
             defer self.allocator.free(result);
             var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, result, .{ .parse_numbers = false }) catch
                 return error.McpMalformedResponse;
