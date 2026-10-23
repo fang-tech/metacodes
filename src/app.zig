@@ -1851,14 +1851,6 @@ pub const App = struct {
             null;
         errdefer if (previous_model_copy) |m| app.allocator.free(m);
 
-        const sp_mod = @import("core/system_prompt.zig");
-        const sw_cwd = @import("util/fs.zig").getCwd(app.allocator) catch "";
-        defer if (sw_cwd.len > 0) app.allocator.free(sw_cwd);
-        // The startup display identity is bound to the startup transport route.
-        // An explicit /model switch selects a new real model and must not keep
-        // advertising the old backend identity.
-        const new_system_prompt = sp_mod.buildFullWithDefs(app.allocator, model, &app.skills, &app.agents, app.enabled_tool_names, app.memdir_abs, app.kgReady(), sw_cwd, app.tool_defs) catch null;
-
         // U3:先同步全部 model 值镜像(seam,不含 config.model=启动快照/system_prompt=派生重建/
         // usage anchor=作废重建),**再** free 旧 model_switch_owned。
         // **顺序关键(Linus U3 nitpick,消 freed-read UAF)**:旧 model_switch_owned(X)= 当前
@@ -1890,9 +1882,14 @@ pub const App = struct {
         // U4:model 单写侧 emit(syncModelMirrors 后,activeModel() 已是新值)。
         app.emitConfig(.{ .model = app.activeModel() });
 
-        if (new_system_prompt) |sp| {
+        // The prompt names the switched model from here on (promptModelName).
+        const sw_cwd = @import("util/fs.zig").getCwd(app.allocator) catch "";
+        defer if (sw_cwd.len > 0) app.allocator.free(sw_cwd);
+        if (app.buildSystemPrompt(sw_cwd)) |sp| {
             if (app.system_prompt) |old| app.allocator.free(old);
             app.system_prompt = sp;
+        } else |err| {
+            @import("util/log.zig").warn("sysprompt", "not rebuilt after the model switch: {s}", .{@errorName(err)});
         }
     }
 
@@ -1915,8 +1912,7 @@ pub const App = struct {
         _ = app.skill_runtime.refreshModelTool(app.tool_defs, app.tool_defs_arena.allocator()) catch |err| {
             log.warn("skill", "Skill tool listing not refreshed: {s}", .{@errorName(err)});
         };
-        const sp_mod = @import("core/system_prompt.zig");
-        if (sp_mod.buildFullWithDefs(app.allocator, app.config.model_display_name orelse app.activeModel(), &app.skills, &app.agents, app.enabled_tool_names, app.memdir_abs, app.kgReady(), app.cwdAbs(), app.tool_defs)) |sp| {
+        if (app.buildSystemPrompt(app.cwdAbs())) |sp| {
             if (app.system_prompt) |old| app.retireWorkspaceString(old);
             app.system_prompt = sp;
         } else |err| {
@@ -2997,8 +2993,7 @@ pub const App = struct {
         app.permission_ctx.match_ctx.cwd = resolved;
         app.permission_ctx.match_ctx.project_root = app.project_dir orelse resolved;
         // 系统提示词的环境段写死了 cwd;按新路径重建(与 /model 切换同一 builder)。
-        const sp_mod = @import("core/system_prompt.zig");
-        if (sp_mod.buildFullWithDefs(app.allocator, app.config.model_display_name orelse app.activeModel(), &app.skills, &app.agents, app.enabled_tool_names, app.memdir_abs, app.kgReady(), resolved, app.tool_defs)) |sp| {
+        if (app.buildSystemPrompt(resolved)) |sp| {
             if (app.system_prompt) |old| app.retireWorkspaceString(old);
             app.system_prompt = sp;
         } else |err| {
@@ -3091,8 +3086,7 @@ pub const App = struct {
         app.permission_ctx.match_ctx.project_root = if (in_worktree) owned else app.project_dir orelse owned;
         // The prompt's environment names the working directory; the next Run
         // sees the new one (this Run keeps the prompt it was sent with).
-        const sp_mod = @import("core/system_prompt.zig");
-        if (sp_mod.buildFullWithDefs(app.allocator, app.config.model_display_name orelse app.activeModel(), &app.skills, &app.agents, app.enabled_tool_names, app.memdir_abs, app.kgReady(), owned, app.tool_defs)) |sp| {
+        if (app.buildSystemPrompt(owned)) |sp| {
             if (app.system_prompt) |old| app.retireWorkspaceString(old);
             app.system_prompt = sp;
         } else |err| {
@@ -3621,12 +3615,20 @@ pub const App = struct {
         };
     }
 
-    /// The model the system prompt names: the startup display identity until
-    /// a `/model` switch, the switched model after one (as `switchModel`
-    /// builds it).
-    fn promptModelName(app: *const App) []const u8 {
+    /// The model the system prompt names. `--model-display-name` is the
+    /// identity of the startup route; an explicit `/model` switch selects a
+    /// new real model, and from then on the prompt names that model, through
+    /// every later rebuild (`/skills`, a renamed or switched working root).
+    pub fn promptModelName(app: *const App) []const u8 {
         if (app.model_switch_owned != null) return app.activeModel();
         return app.config.model_display_name orelse app.config.model;
+    }
+
+    /// The system prompt for the session as it stands, with `cwd` in its
+    /// environment section: the one builder every rebuild goes through, so
+    /// none can name another model (owned by `app.allocator`).
+    fn buildSystemPrompt(app: *const App, cwd: []const u8) ![]u8 {
+        return system_prompt_mod.buildFullWithDefs(app.allocator, app.promptModelName(), &app.skills, &app.agents, app.enabled_tool_names, app.memdir_abs, app.kgReady(), cwd, app.tool_defs);
     }
 
     /// Build `tool_defs` (static + dynamic: Skill, process plugins, MCP),
@@ -3671,7 +3673,7 @@ pub const App = struct {
         // 环境段 cwd 用进程 cwd(CLI 语义);Session 库消费方用 workspace.root(见 agent_session)。
         const cli_cwd = @import("util/fs.zig").getCwd(app.allocator) catch "";
         defer if (cli_cwd.len > 0) app.allocator.free(cli_cwd);
-        const built = system_prompt_mod.buildFullWithDefs(app.allocator, app.promptModelName(), &app.skills, &app.agents, app.enabled_tool_names, app.memdir_abs, app.kgReady(), cli_cwd, app.tool_defs) catch |err| blk: {
+        const built = app.buildSystemPrompt(cli_cwd) catch |err| blk: {
             @import("util/log.zig").warn("sysprompt", "build failed: {s} (continuing without system prompt)", .{@errorName(err)});
             break :blk null;
         };

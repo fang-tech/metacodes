@@ -1065,7 +1065,7 @@ fn dumpPromptSectionsAndExit(app: *app_mod.App) noreturn {
     const cwd = @import("util/fs.zig").getCwd(app.allocator) catch "";
     const listing = system_prompt_mod.listFullWithDefs(
         app.allocator,
-        app.config.model_display_name orelse app.config.model,
+        app.promptModelName(),
         &app.skills,
         &app.agents,
         app.enabled_tool_names,
