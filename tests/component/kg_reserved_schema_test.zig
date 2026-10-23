@@ -15,6 +15,7 @@
 //! lessons inside a learning turn still land.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const cc = @import("cc");
 const tinykg_binary = @import("tinykg_binary.zig");
 
@@ -93,6 +94,15 @@ const Fixture = struct {
         defer self.allocator.free(body);
         if (std.mem.indexOf(u8, body, "\"remembered\"") == null) return error.RememberWithoutNode;
         return null;
+    }
+
+    /// The ontology snapshot the rule author's packet is projected from; a
+    /// failure names TinyKG's reason in the log.
+    fn snapshot(self: *Fixture, project: u64, project_sha: [64]u8, when: []const u8) ![]u8 {
+        return self.kg.ontologyRuleSnapshot(project, project_sha, self.kg.projectKey()) catch |err| {
+            std.debug.print("ontology snapshot {s}: {s}: {s}\n", .{ when, @errorName(err), self.kg.detail() });
+            return err;
+        };
     }
 };
 
@@ -307,10 +317,16 @@ test "L2 reserved KG types: KgRemember cannot add an ungoverned ontology item" {
         "a run journal interval whose dispatch counters contradict this record",
         &impact_sha,
     );
+    // The real ontology snapshot does not run on Windows: Windows CI fails it
+    // with KgError.Data for this host-governed item alone, before any model
+    // write, and the snapshot tests in ontology_rule_snapshot_adapter_test.zig
+    // and self_evolution_test.zig skip Windows. There only the refusal, which
+    // does not depend on the platform, is checked.
+    const snapshots = builtin.os.tag != .windows;
     const project = (try fx.kg.existingProjectNodeId()) orelse return error.TestExpectedProject;
     const project_sha = cc.project_rule_bundle.projectIdentity(fx.root);
-    {
-        const snapshot = try fx.kg.ontologyRuleSnapshot(project, project_sha, fx.kg.projectKey());
+    if (snapshots) {
+        const snapshot = try fx.snapshot(project, project_sha, "with the host's item");
         defer a.free(snapshot);
         try std.testing.expect(std.mem.indexOf(u8, snapshot, "provisional-rule-impact-v1") != null);
     }
@@ -321,12 +337,11 @@ test "L2 reserved KG types: KgRemember cannot add an ungoverned ontology item" {
 
     // The rule author's packet is projected from this snapshot; an ungoverned
     // item fails it as a whole.
-    const snapshot = fx.kg.ontologyRuleSnapshot(project, project_sha, fx.kg.projectKey()) catch |err| {
-        std.debug.print("ontology snapshot after the model's write: {s}: {s}\n", .{ @errorName(err), fx.kg.detail() });
-        return err;
-    };
-    defer a.free(snapshot);
-    try std.testing.expect(std.mem.indexOf(u8, snapshot, "hidden suite") == null);
+    if (snapshots) {
+        const snapshot = try fx.snapshot(project, project_sha, "after the model's write");
+        defer a.free(snapshot);
+        try std.testing.expect(std.mem.indexOf(u8, snapshot, "hidden suite") == null);
+    }
     try expectReserved(refused, detail, "proposition");
 }
 
