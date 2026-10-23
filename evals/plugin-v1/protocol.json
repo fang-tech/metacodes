@@ -69,7 +69,7 @@
     "treatment_executable": "scripts/eval/fixtures/plugin_candidate.py",
     "treatment_executable_sha256": "1a80f4f240e80df798521cb4cacd9a59d12d494cbee06468412b4fe751f28a61",
     "single_factor": "one namespaced Skill data package",
-    "implementation_fingerprint": "2b73b86b12d7721199ccc463f0e0235790dae8f75b4fe16bacce93ecc9ae7fed",
+    "implementation_fingerprint": "1693b59cb18b450750b43b39858c02840f8fde042cd9b7d309c193a713f99f41",
     "runtime_binary_sha256": "fd330c2e4c4120a129fb8148091011f014d29d2c496f4a24ffdd8232c5cce054",
     "evaluation_contract_version": 4,
     "model": {
