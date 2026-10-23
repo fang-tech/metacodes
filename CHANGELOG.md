@@ -67,6 +67,22 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- **`KgRemember` no longer writes the host's own TinyKG types.**
+  Self-evolution keeps provisional rules, their retractions, task
+  obligations, verifier outcome rows and obligation telemetry in the store
+  the memory tool writes to, and reads them back by schema type without
+  asking who wrote them; the rule author's ontology snapshot reads
+  `proposition`, `prescription` and `intent` the same way. The model could
+  store a well-formed envelope under one of these types (text in a
+  repository file was enough to ask it to), and the next headless run with
+  `METACODES_SELF_EVOLUTION=1` enforced a planted rule, dropped a learned
+  one, nudged toward a planted obligation, retired a needle, or showed the
+  attempt a rewritten outcome; a bare `proposition` made the ontology
+  snapshot fail (`InvalidRecord`). `KgRemember` now refuses these types and
+  the provider decision audit type, in any letter case, with
+  `ReservedMemoryType` (a permission denial naming the type); `lesson` keeps
+  its learning-turn admission, and the host's own writes are unchanged.
+  Nodes the model already stored under these types are not removed.
 - **TUI: a terminal resize no longer answers an open dialog.** A resize
   interrupts a blocked key read (SIGWINCH has no `SA_RESTART`), and the
   permission dialog took the interrupted read for "No": the tool was denied

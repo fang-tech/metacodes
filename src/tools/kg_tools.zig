@@ -18,6 +18,7 @@ const lexical_query_plan = @import("../kg/lexical_query_plan.zig");
 const scoped_recall_mod = @import("../kg/scoped_recall.zig");
 const jev_advisor = @import("../jev/advisor.zig");
 const lesson_mod = @import("../kg/lesson.zig");
+const reserved_types = @import("../kg/reserved_types.zig");
 
 /// Gate for `KgRemember` kind `lesson`. Returns the binding with one of its
 /// slots reserved; every refusal is a tool error naming what to fix.
@@ -99,14 +100,21 @@ pub fn executeRemember(ctx: *const ToolContext, args: []const u8) anyerror![]u8 
         const raw = util_json.extractStringField(args, "scope") orelse break :blk false;
         break :blk std.ascii.eqlIgnoreCase(raw, "global");
     };
-    // Lessons (doc/LEARNING_TURN_DESIGN.md §2.3): written only inside a learning
-    // turn, with the host-bound header, within the turn's budget. The slot is
-    // reserved before the write and given back if the write fails.
-    const lesson_reserved: ?*lesson_mod.Binding = if (std.ascii.eqlIgnoreCase(resolved.schema_type, lesson_mod.SCHEMA_TYPE))
-        try admitLesson(ctx, kg, text_owned)
-    else
-        null;
-    const store_type: []const u8 = if (lesson_reserved != null) lesson_mod.SCHEMA_TYPE else resolved.schema_type;
+    // Types the host writes and reads back by type (kg/reserved_types.zig) are
+    // refused: their readers cannot tell a node written here from the host's.
+    // Lessons (doc/LEARNING_TURN_DESIGN.md §2.3) are the exception: written
+    // only inside a learning turn, with the host-bound header, within the
+    // turn's budget. The slot is reserved before the write and given back if
+    // the write fails.
+    const reserved = reserved_types.lookup(resolved.schema_type);
+    const lesson_reserved: ?*lesson_mod.Binding = if (reserved) |entry| switch (entry.admission) {
+        .host_only => {
+            common.setErrorDetail(ctx.error_detail, ctx.allocator, "kind \"{s}\" is reserved for the host, which keeps {s} under it and cannot tell a node written here from its own; store this memory under another kind (decision, module, bug, observation, or a project type)", .{ entry.schema_type, entry.holds });
+            return error.ReservedMemoryType;
+        },
+        .lesson => try admitLesson(ctx, kg, text_owned),
+    } else null;
+    const store_type: []const u8 = if (reserved) |entry| entry.schema_type else resolved.schema_type;
     var lesson_written = false;
     defer if (lesson_reserved) |binding| if (!lesson_written) binding.release();
 
