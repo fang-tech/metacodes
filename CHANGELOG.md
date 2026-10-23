@@ -45,6 +45,23 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Changed
 
+- **Interactive startup waits for less.** Every interactive start used to
+  spend about 0.55 s asking the account endpoint for its API keys with the
+  API key, which that endpoint always refuses, and about 0.25 s on
+  `/v1/models`, and it played the 1.5 s splash only after all startup work
+  had finished (measured 2026-10-23). The key list is now fetched the first
+  time the `/models` key menu opens, with the stored login token, or with the
+  API key only for an endpoint named by `METACODE_API_KEYS_URL`. Without
+  either, no request is sent and the menu lists the key in use. The REPL keeps
+  each route's `/v1/models` answer, per endpoint and credential, in
+  `<state root>/cache/models/` for 24 hours. A start that finds a fresh copy
+  uses it and refreshes it in the background, and the refreshed answer is
+  used from the next turn on. A start without a fresh copy fetches the answer
+  before the prompt, as before. The splash now starts before startup work and
+  plays during it; the banner follows when both are done. In a PTY with those
+  gateway latencies simulated, the time to the banner went from 0.94 s to
+  0.14 s (0.39 s on a first start) without the animation, and from 2.46 s to
+  1.66 s with it.
 - **TUI: the prompt and commands behave like Claude Code 2.1.278** (recorded
   side by side in a PTY). Ctrl+C, and Ctrl+D on an empty prompt, exit on a
   second press within 800 ms; the first shows `Press Ctrl-C again to exit` in

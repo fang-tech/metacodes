@@ -118,11 +118,15 @@ metacodes serve --sessions 4                # HTTP daemon with create/destroy se
 metacodes doctor                            # where every runtime asset resolves from
 ```
 
-The interactive TUI opens with a short animation of the "Metask Lab" wordmark;
-any key skips it. Set `METACODES_NO_STARTUP_ANIMATION` (to any value, even
+The interactive TUI opens with a short animation of the "Metask Lab" wordmark,
+played while metacodes starts up (MCP servers, catalogs); any key skips it.
+Set `METACODES_NO_STARTUP_ANIMATION` (to any value, even
 `0`), or put
 `"startupAnimation": false` in `<state root>/config.json` (`metacodes doctor`
-shows where the state root is), to start straight at the prompt.
+shows where the state root is), to start straight at the prompt. The TUI keeps
+the model route's `/v1/models` answer in `<state root>/cache/models/` for a
+day, so a start does not wait for it; it is refreshed in the background, and
+the directory can be deleted at any time.
 
 Leaving a session that has run a turn prints the command that reopens it,
 `metacodes --resume <id>`; inside the TUI, `/resume` lists this directory's

@@ -872,8 +872,7 @@ pub const RenderRegion = struct {
     }
 
     fn drawModelsPickerMenu(self: *RenderRegion, w: *std.Io.Writer, app: *const app_mod.App, content: []const u8) u16 {
-        const trimmed = std.mem.trim(u8, content, " \t\r\n");
-        if (!std.mem.eql(u8, trimmed, "/models") and !std.mem.eql(u8, trimmed, "/model")) return 0;
+        if (!complete.modelsPickerLine(content)) return 0;
         if (app.models_picker_key_index == null) return self.drawApiKeyMenu(w, app);
         if (app.models_picker_model_index != null) return self.drawReasoningMenu(w, app);
         return self.drawModelCatalogMenuForTitle(w, app, "Models for selected API key");
