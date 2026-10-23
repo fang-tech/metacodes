@@ -49,6 +49,10 @@ Run `zig build gate:pr` to execute the single AGENTS.md pre-submit checklist.
 - [Learning turn](LEARNING_TURN_DESIGN.md) — post-verdict
   distill-and-reconcile turn that turns a check verdict into conditioned
   lessons; in-run path implemented, CLI flags pending.
+- [Learned-artifact gate](LEARNED_ARTIFACT_GATE_DESIGN.md) — design only:
+  the paired, model-stratified evidence a lesson policy, recall shape,
+  obligation or provisional rule needs to become active or to retire, with
+  the pre-registration draft for the first use case.
 - [Jev System-One memory advisor](JEV_SYSTEM_ONE.md) — optional judge for
   recall injection, memory relations and enumeration intent.
 - [Jev × Harness 接入方案](JEV_HARNESS_INTEGRATION_DESIGN.md) — historical
