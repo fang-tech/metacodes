@@ -99,6 +99,7 @@ const SnapshotCache = struct {
 const types = @import("types.zig");
 const client_mod = @import("client.zig");
 const api_keys_mod = @import("api/api_keys.zig");
+const models_cache_mod = @import("api/models_cache.zig");
 const openai_mod = @import("api/openai_client.zig");
 const gemini_mod = @import("api/gemini_client.zig");
 const provider_host_mod = @import("provider/host.zig");
@@ -262,6 +263,33 @@ pub const PendingOverlay = enum {
     transcript,
 };
 
+/// The TUI theme for this terminal: monochrome under `--no-theme`; otherwise
+/// the `theme` persisted in `<state root>/config.json`, else auto. Auto on a
+/// colour terminal asks the terminal for its background (OSC 11, a short
+/// raw-mode read of stdin) and settles on dark or light (as mecode does). A
+/// persisted variant wins over the probe; `METACODES_NO_PROBE` and a terminal
+/// without colour skip it.
+pub fn resolveThemeVariant(allocator: std.mem.Allocator, no_theme: bool, state_root: []const u8) @import("repl/tui/theme.zig").Variant {
+    if (no_theme) return .monochrome;
+    const persisted = if (state_root.len > 0) @import("repl/tui/config.zig").loadTheme(allocator, state_root) else null;
+    const variant = persisted orelse .auto;
+    if (variant != .auto) return variant;
+    if (@import("repl/tui/term.zig").detectFromEnv(1) == .none or std.c.getenv("METACODES_NO_PROBE") != null) return variant;
+    const bg_probe = @import("repl/tui/bg_probe.zig");
+    const bg = bg_probe.probeBackground(1) orelse return variant;
+    return if (bg_probe.isLight(bg)) .light else .dark;
+}
+
+/// `App.api_key_catalog_load`.
+pub const ApiKeyCatalogLoad = enum {
+    /// This route has no account key list (not Anthropic, a Metask device
+    /// session, or `METACODES_NO_PROBE`): the menu says it is unavailable.
+    off,
+    /// Not loaded yet; the first key menu loads it.
+    deferred,
+    loaded,
+};
+
 pub const App = struct {
     allocator: std.mem.Allocator,
     config: types.Config,
@@ -269,9 +297,14 @@ pub const App = struct {
     /// (embedders and tests that build an App directly); the CLI always passes one.
     state_root_default: ?[]u8 = null,
     api_key: []const u8,
-    oauth_token_for_catalog: ?[]u8 = null,
     selected_api_key_owned: ?[]u8 = null,
     api_key_catalog: api_keys_mod.Catalog,
+    /// When `api_key_catalog` is filled: never on this route, or once, the
+    /// first time the `/models` key menu needs it (`ensureApiKeyCatalog`).
+    api_key_catalog_load: ApiKeyCatalogLoad = .off,
+    /// The background `/v1/models` fetch a cache-served start runs, until the
+    /// REPL takes its answer (`adoptModelCatalogRefresh`) or the App ends.
+    models_refresh: ?*models_cache_mod.Refresh = null,
     models_picker_key_index: ?usize = null,
     models_picker_model_index: ?usize = null,
     model_switch_owned: ?[]u8 = null,
@@ -543,11 +576,36 @@ pub const App = struct {
     /// 模型上下文窗口表(~/.metacode/models.toml)。api_client.model_context 借用它做 auto-compact 阈值。
     model_context: @import("app/model_context.zig").ModelContext,
 
+    /// What a host settles before `App.init` instead of leaving it to init.
+    pub const InitOptions = struct {
+        /// The TUI theme, already resolved (`resolveThemeVariant`). The CLI
+        /// resolves it first so the startup splash can play while init runs;
+        /// init must not query the terminal (OSC 11) while the splash owns it.
+        /// Null resolves it here.
+        theme_variant: ?@import("repl/tui/theme.zig").Variant = null,
+        /// Answer `/v1/models` from the state root's copy of an earlier
+        /// start's answer when it is fresh, refreshing it in the background
+        /// (`api/models_cache.zig`). Only the REPL sets it: it is the host
+        /// that takes the refreshed answer, at its idle points
+        /// (`adoptModelCatalogRefresh`).
+        models_cache: bool = false,
+    };
+
     pub fn init(
         allocator: std.mem.Allocator,
         io: std.Io,
         config: types.Config,
         api_key: []const u8,
+    ) !*App {
+        return initWithOptions(allocator, io, config, api_key, .{});
+    }
+
+    pub fn initWithOptions(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        config: types.Config,
+        api_key: []const u8,
+        options: InitOptions,
     ) !*App {
         const app = try allocator.create(App);
         errdefer allocator.destroy(app);
@@ -701,27 +759,10 @@ pub const App = struct {
             app.cwd_abs = allocator.dupe(u8, cwd) catch null;
         }
 
-        // 选 TUI 主题:--no-theme → monochrome;否则用 .auto + 终端能力检测
+        // 选 TUI 主题(见 resolveThemeVariant);宿主已解析过就沿用,不再探终端。
         const theme_mod = @import("repl/tui/theme.zig");
-        const tui_term = @import("repl/tui/term.zig");
-        const tui_config = @import("repl/tui/config.zig");
-        const cap = tui_term.detectFromEnv(1);
-        if (config.no_theme) {
-            app.theme_variant = .monochrome;
-        } else {
-            // <state root>/config.json 的 theme 字段覆盖默认 auto
-            const persisted = if (app.stateRoot().len > 0) tui_config.loadTheme(allocator, app.stateRoot()) else null;
-            app.theme_variant = persisted orelse .auto;
-        }
-        // variant=.auto 且支持颜色:探测终端背景色自动选 dark/light(仿 mecode)。
-        // 跳过条件:已显式持久化具体 variant(用户优先)、能力 none、NO_PROBE、非 tty。
-        if (app.theme_variant == .auto and cap != .none and std.c.getenv("METACODES_NO_PROBE") == null) {
-            const bg_probe = @import("repl/tui/bg_probe.zig");
-            if (bg_probe.probeBackground(1)) |bg| {
-                app.theme_variant = if (bg_probe.isLight(bg)) .light else .dark;
-            }
-        }
-        app.theme = theme_mod.select(app.theme_variant, cap);
+        app.theme_variant = options.theme_variant orelse resolveThemeVariant(allocator, config.no_theme, app.stateRoot());
+        app.theme = theme_mod.select(app.theme_variant, @import("repl/tui/term.zig").detectFromEnv(1));
 
         // 模型档位表(model_tiers):同一份 <state root>/config.json。解析失败降级为
         // 未配置(档位名全 inherit)并告警——配置拼写错误不该炸启动,但绝不静默。
@@ -879,9 +920,9 @@ pub const App = struct {
             app.oauth_session != null;
         if (config.provider_kind == .anthropic) {
             if (std.c.getenv("METACODES_NO_PROBE") == null and !metask_session_active) {
-                app.oauth_token_for_catalog = @import("core/auth.zig").resolveStoredOAuthBearer(allocator, app.stateRoot()) catch null;
-                app.probeApiKeys();
-                app.api_client.probeModels();
+                // The account's key list waits for the `/models` key menu (ensureApiKeyCatalog).
+                app.api_key_catalog_load = .deferred;
+                app.loadModelCatalog(options.models_cache);
             } else {
                 @import("util/log.zig").debug("catalog", "probeModels skipped (METACODES_NO_PROBE)", .{});
             }
@@ -1102,11 +1143,9 @@ pub const App = struct {
         if (app.transcript_writer) |*w| w.deinit();
         app.handed_off_sessions.deinit(app.allocator);
         app.api_client.deinit();
-        if (app.oauth_token_for_catalog) |tok| {
-            @memset(tok, 0);
-            app.allocator.free(tok);
-        }
         app.api_key_catalog.deinit();
+        // A refresh still in flight finishes (and frees itself) on its own thread.
+        if (app.models_refresh) |refresh| refresh.release();
         if (app.login_worker) |worker| {
             worker.cancel();
             worker.join();
@@ -1200,17 +1239,126 @@ pub const App = struct {
         app.allocator.destroy(app);
     }
 
-    pub fn probeApiKeys(app: *App) void {
-        if (app.config.provider_kind != .anthropic) return;
-        const bearer = app.oauth_token_for_catalog orelse app.api_key;
-        api_keys_mod.fetchInto(&app.api_key_catalog, app.allocator, app.api_client.http_client.io, app.api_client.base_url, bearer) catch |err| {
-            @import("util/log.zig").debug("auth", "api key list probe failed: {s}", .{@errorName(err)});
+    /// Fill `api_key_catalog` for the `/models` key menu, once, the first time
+    /// the menu is drawn. Startup does not wait for it: only that menu reads
+    /// the list, and with a plain API key the account endpoint refuses the
+    /// request, so fetching at startup was a failed round trip on every start
+    /// (`api_keys.bearerFor`). Whatever the outcome, an empty list falls back
+    /// to the key in use.
+    pub fn ensureApiKeyCatalog(app: *App) void {
+        if (app.api_key_catalog_load != .deferred) return;
+        app.api_key_catalog_load = .loaded;
+        const log = @import("util/log.zig");
+        const login_token = @import("core/auth.zig").resolveStoredOAuthBearer(app.allocator, app.stateRoot()) catch null;
+        defer if (login_token) |token| {
+            std.crypto.secureZero(u8, token);
+            app.allocator.free(token);
         };
+        if (api_keys_mod.bearerFor(login_token, app.api_key, api_keys_mod.endpointNamed())) |bearer| {
+            api_keys_mod.fetchInto(&app.api_key_catalog, app.allocator, app.api_client.http_client.io, app.api_client.base_url, bearer) catch |err| {
+                log.debug("auth", "api key list probe failed: {s}", .{@errorName(err)});
+            };
+        } else {
+            log.debug("auth", "api key list skipped: no login token for the account endpoint", .{});
+        }
         if (app.api_key_catalog.entries.items.len == 0) {
             app.api_key_catalog.addCurrentKeyFallback(app.api_key) catch |err| {
-                @import("util/log.zig").debug("auth", "current API key fallback unavailable: {s}", .{@errorName(err)});
+                log.debug("auth", "current API key fallback unavailable: {s}", .{@errorName(err)});
             };
         }
+    }
+
+    /// Fill `api_client.catalog` from the route's `/v1/models`. With the cache
+    /// on, a fresh stored answer for this endpoint and credential answers now
+    /// and a background refresh fetches the current one; otherwise (and on
+    /// any miss) the answer is fetched before init returns, as it always was,
+    /// and stored for the next start.
+    fn loadModelCatalog(app: *App, use_cache: bool) void {
+        if (!use_cache) return app.api_client.probeModels();
+        const log = @import("util/log.zig");
+        const auth = app.routeAuthHeader() orelse return app.api_client.probeModels();
+        defer app.freeRouteAuthHeader(auth);
+        const header: std.http.Header = .{ .name = auth.name, .value = auth.value };
+        const base_url = app.api_client.base_url;
+        const key = models_cache_mod.Key.of(base_url, header);
+        const now = @import("util/time.zig").nowUnix();
+
+        if (models_cache_mod.load(app.allocator, app.stateRoot(), key, base_url, now, models_cache_mod.TTL_SECONDS)) |body| {
+            defer app.allocator.free(body);
+            if (app.api_client.catalog.loadFromModelsListJson(body)) |_| {
+                log.debug("catalog", "/v1/models from the cache; refreshing in the background", .{});
+                app.models_refresh = models_cache_mod.Refresh.start(key, base_url, header, app.stateRoot()) catch |err| blk: {
+                    log.debug("catalog", "background /v1/models refresh not started: {s}", .{@errorName(err)});
+                    break :blk null;
+                };
+                return;
+            } else |err| {
+                log.debug("catalog", "cached /v1/models unusable ({s}); fetching", .{@errorName(err)});
+                app.api_client.catalog.deinit();
+                app.api_client.catalog = @import("api/catalog.zig").Catalog.init(app.allocator);
+            }
+        }
+
+        const body = app.api_client.fetchModelsList() catch |err| {
+            log.debug("catalog", "probeModels: {s} (falling back to local table)", .{@errorName(err)});
+            return;
+        };
+        defer app.allocator.free(body);
+        app.api_client.catalog.loadFromModelsListJson(body) catch |err| {
+            log.debug("catalog", "parse /v1/models failed: {s}", .{@errorName(err)});
+            return;
+        };
+        models_cache_mod.store(app.allocator, app.stateRoot(), key, base_url, body, now) catch |err| {
+            log.debug("catalog", "models cache not written: {s}", .{@errorName(err)});
+        };
+    }
+
+    /// The credential header the Anthropic client's requests carry now
+    /// (owned; `freeRouteAuthHeader`). Null when it cannot build one, as the
+    /// client's own requests would then fail.
+    fn routeAuthHeader(app: *App) ?@import("api/auth_header.zig").Header {
+        return @import("api/auth_header.zig").build(app.allocator, app.api_client.auth_scheme, app.api_client.api_key) catch null;
+    }
+
+    fn freeRouteAuthHeader(app: *App, header: @import("api/auth_header.zig").Header) void {
+        std.crypto.secureZero(u8, header.value);
+        app.allocator.free(header.value);
+    }
+
+    /// Take a finished background `/v1/models` refresh into the live catalog.
+    /// The REPL calls it where nothing is reading the catalog: before it
+    /// reads input and before a turn. An answer for a route or credential the
+    /// session has since left (a key picked in `/models`, another route) is
+    /// dropped; the answer it would replace was fetched for the current one.
+    pub fn adoptModelCatalogRefresh(app: *App) void {
+        const refresh = app.models_refresh orelse return;
+        if (!refresh.finished()) return;
+        app.models_refresh = null;
+        const key = refresh.key;
+        const body = refresh.take();
+        refresh.release();
+        const fresh_body = body orelse return;
+        defer std.heap.c_allocator.free(fresh_body);
+        const log = @import("util/log.zig");
+
+        const auth = app.routeAuthHeader() orelse return;
+        defer app.freeRouteAuthHeader(auth);
+        if (!key.eql(models_cache_mod.Key.of(app.api_client.base_url, .{ .name = auth.name, .value = auth.value }))) {
+            log.debug("catalog", "background /v1/models answer is for another route; dropped", .{});
+            return;
+        }
+        var fresh = @import("api/catalog.zig").Catalog.init(app.allocator);
+        fresh.loadFromModelsListJson(fresh_body) catch |err| {
+            fresh.deinit();
+            log.debug("catalog", "background /v1/models answer unusable: {s}", .{@errorName(err)});
+            return;
+        };
+        app.api_client.catalog.deinit();
+        app.api_client.catalog = fresh;
+        app.refreshChildCatalogSnapshots() catch |err| {
+            log.warn("catalog", "child catalog snapshot refresh failed: {s}", .{@errorName(err)});
+        };
+        log.debug("catalog", "adopted the background /v1/models answer ({d} models)", .{app.api_client.catalog.entries.items.len});
     }
 
     // ── issue #16: the cross-UI provider control plane ──────────────────────

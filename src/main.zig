@@ -117,6 +117,7 @@ pub const core_subagent = @import("core/subagent.zig");
 pub const agent_job_registry = @import("core/agent_job_registry.zig");
 pub const job_registry = @import("core/job_registry.zig");
 pub const util_time = @import("util/time.zig");
+pub const models_cache = @import("api/models_cache.zig");
 pub const util_json = @import("util/json.zig");
 pub const util_toolchain = @import("util/toolchain.zig");
 pub const tools = @import("tools.zig");
@@ -801,9 +802,8 @@ pub fn main(init: std.process.Init) !void {
     const interactive_tui = config.serve_port == null and config.web_port == null and
         config.resume_response == null and config.prompt == null and
         config.teammate_name.len == 0 and !config.dump_prompt and !config.dump_plugins;
-    if (interactive_tui and !config.verbose and platform_term.isatty(2)) {
-        log.setStderrEnabled(false);
-    }
+    const quiet_stderr = interactive_tui and !config.verbose and platform_term.isatty(2);
+    if (quiet_stderr) log.setStderrEnabled(false);
 
     // Introspection builds the same App/Plugin snapshot but cannot issue a
     // provider request, so it neither requires credentials nor consumes the
@@ -905,10 +905,29 @@ pub fn main(init: std.process.Init) !void {
     // Argument and configuration strings stay in the arena; the session reads
     // them and never frees them.
     const gpa = init.gpa;
-    const app = try app_mod.App.init(gpa, init.io, config, api_key);
+
+    // The startup splash plays while App.init runs (MCP connects, catalog
+    // fetches), not after it. Only when init's logs cannot reach the
+    // terminal: a frame redraws its rows relative to the cursor, and a line
+    // written between frames would shift them. The theme is settled first:
+    // its terminal query reads stdin, which is the splash's until it ends.
+    var splash: repl.Splash = .not_started;
+    var init_options: app_mod.App.InitOptions = .{ .models_cache = interactive_tui };
+    if (interactive_tui and (quiet_stderr or !platform_term.isatty(2))) {
+        const variant = app_mod.resolveThemeVariant(allocator, config.no_theme, config.state_root);
+        init_options.theme_variant = variant;
+        splash = repl.startSplash(gpa, variant, config.state_root);
+    }
+    const app = app: {
+        errdefer repl.stopSplash(splash);
+        break :app try app_mod.App.initWithOptions(gpa, init.io, config, api_key, init_options);
+    };
     defer app.deinit();
 
-    try app.installSigintHandler();
+    app.installSigintHandler() catch |err| {
+        repl.stopSplash(splash);
+        return err;
+    };
 
     log.info("main", "metacodes starting; model={s}", .{config.model});
 
@@ -1005,6 +1024,7 @@ pub fn main(init: std.process.Init) !void {
     // conversation before the first prompt, or stop before the TUI starts.
     const resumed: ?app_mod.App.ResumedConversation = if (config.resume_session != null)
         app.resumePersistedConversation() catch |err| {
+            repl.stopSplash(splash);
             std.debug.print("error: cannot resume session {s}: {s}\n", .{ app.session_id.asSlice(), repl.resumeLoadFailure(err) });
             app.deinit();
             std.process.exit(1);
@@ -1013,7 +1033,7 @@ pub fn main(init: std.process.Init) !void {
         null;
 
     // (stderr 日志 gate 已提前到 App.init 之前——见 interactive_tui;init 期日志同样不得上屏。)
-    try repl.run(app, gpa, .{ .resumed = resumed });
+    try repl.run(app, gpa, .{ .resumed = resumed, .splash = splash });
 }
 
 /// Write pipeable command output directly to stdout, without routing it through
@@ -3444,6 +3464,7 @@ test {
     _ = &@import("api/oauth_exchange.zig");
     _ = &@import("api/oauth_login.zig");
     _ = &@import("api/catalog_fetch.zig");
+    _ = &@import("api/models_cache.zig");
     _ = &@import("repl/msg_queue.zig");
     _ = &@import("repl/history.zig");
     _ = &@import("repl/user_echo.zig");

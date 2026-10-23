@@ -41,6 +41,8 @@ const render_region_mod = @import("tui/render_region.zig");
 const agent_job_registry_mod = @import("../core/agent_job_registry.zig");
 const msg_queue_mod = @import("msg_queue.zig");
 const tui_term_root = @import("tui/term.zig");
+const tui_theme = @import("tui/theme.zig");
+const splash_player = @import("tui/splash_player.zig");
 const util_fs = @import("../util/fs.zig");
 const ui_backend_mod = @import("../core/protocol/ui_backend.zig");
 const writer_backend_mod = @import("../core/writer_backend.zig");
@@ -81,9 +83,62 @@ fn debugBackend(verbose: bool, show_retry: bool, usage_acc: ?*@import("../core/u
 pub const Startup = struct {
     /// `--resume <id>`: what src/main.zig restored before the REPL started.
     resumed: ?app_mod.App.ResumedConversation = null,
+    /// The startup splash, as src/main.zig left it.
+    splash: Splash = .not_started,
 };
 
+/// The startup splash before the banner.
+pub const Splash = union(enum) {
+    /// Nobody started it: the banner plays it first (sequentially).
+    not_started,
+    /// Started before `App.init` and playing on its own thread (`startSplash`).
+    playing: *splash_player.Background,
+    /// The gate kept it off.
+    off,
+};
+
+/// Start the startup splash on its own thread, so it plays while `App.init`
+/// runs instead of after it (2026-10-23: ~4 s of blank terminal, then 1.5 s
+/// of animation). Same gate as the sequential splash
+/// (`playStartupSplash`); `variant` is the theme the App will use, resolved
+/// first because its terminal query must not race the splash for stdin.
+/// Until the REPL's banner (or `stopSplash`) the caller must leave the
+/// terminal alone.
+pub fn startSplash(allocator: std.mem.Allocator, variant: tui_theme.Variant, state_root: []const u8) Splash {
+    const plan = splashPlan(allocator, state_root) orelse return .off;
+    const bg = splash_player.Background.start(allocator, plan, splashStyle(variant), splashSeed()) catch |err| {
+        @import("../util/log.zig").debug("splash", "background start failed: {s}; playing after init", .{@errorName(err)});
+        return .not_started;
+    };
+    return .{ .playing = bg };
+}
+
+/// Settle a playing splash now: startup failed and is about to say why.
+pub fn stopSplash(splash: Splash) void {
+    switch (splash) {
+        .playing => |bg| endSplash(bg, .stop),
+        .not_started, .off => {},
+    }
+}
+
+fn endSplash(bg: *splash_player.Background, how: enum { wait, stop }) void {
+    const plan = bg.plan;
+    const mode = bg.style.mode;
+    const outcome = switch (how) {
+        .wait => bg.finish(),
+        .stop => bg.cancel(),
+    };
+    logSplash(outcome, plan, mode);
+}
+
+fn logSplash(outcome: splash_player.Outcome, plan: splash_player.Plan, mode: @import("tui/splash.zig").ColorMode) void {
+    @import("../util/log.zig").debug("splash", "{s} ({d}x{d}, {s})", .{ @tagName(outcome), plan.layout.cols, plan.layout.rows, @tagName(mode) });
+}
+
 pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, startup: Startup) !void {
+    // A splash still playing ends before an error below is printed.
+    var splash = startup.splash;
+    errdefer stopSplash(splash);
     // Evaluation is opt-in and fail-closed: without METACODES_EVAL_METADATA no
     // object is created; when set, malformed/incomplete grounding aborts before
     // any rollout can be mistaken for comparable evidence.
@@ -94,7 +149,8 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, startup: Startup) !v
     else
         null;
 
-    printStartupBanner(app, allocator);
+    printStartupBanner(app, allocator, splash);
+    splash = .off; // ended (and freed) by the banner
 
     // 启动 prompt 建议:基于 git 最近改动的文件给一条灰色提示(对齐 Claude Code)。
     // A resumed session goes on with its conversation; the suggestion is for a new one.
@@ -158,6 +214,9 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, startup: Startup) !v
     };
 
     while (true) {
+        // Idle point: nothing reads the model catalog between turns.
+        app.adoptModelCatalogRefresh();
+
         // 检查到期的 cron 任务 —— 把它们的 prompt 作为 user message 注入并跑一轮
         try fireDueCrons(&turn_host);
 
@@ -732,6 +791,9 @@ const TurnKind = enum { prompt, skill, macro };
 fn runTurn(host: *const TurnHost, kind: TurnKind, synthetic_user_input: ?[]const u8) !void {
     const app = host.app;
     const allocator = host.allocator;
+    // A `/v1/models` refresh that finished while the prompt was typed sets
+    // this turn's limits.
+    app.adoptModelCatalogRefresh();
     // The model streams to the terminal unshaped; a command that started the
     // turn has its echo written first.
     cmd_output.end();
@@ -1504,6 +1566,8 @@ fn readLineRaw(
     const redraw = struct {
         fn call(r: *render_region_mod.RenderRegion, ed: *input.LineEditor, a: *app_mod.App) void {
             if (!complete.modelsMenuOpen(ed.view())) a.models_picker_key_index = null;
+            // The key menu draws the account's key list, loaded on first sight.
+            if (complete.modelsPickerLine(ed.view())) a.ensureApiKeyCatalog();
             r.setInput(ed.view(), ed.cursor);
             r.render(a);
         }
@@ -4597,8 +4661,14 @@ fn shellQuoteSingle(allocator: std.mem.Allocator, s: []const u8) ![]u8 {
 
 /// 启动 banner:圆角 box(对齐 cc 2.1.x)。版本 + 模型 + cwd 三行。
 /// 非 TTY 退化为纯文本两行(pipe 友好)。box 内宽固定取 min(cols-2, 64)。
-/// TTY 下先播启动动画(tui/splash.zig),定格的 "Metask Lab" 字标留在 box 上方。
-fn printStartupBanner(app: *const app_mod.App, allocator: std.mem.Allocator) void {
+/// TTY 下先播启动动画(tui/splash.zig),定格的 "Metask Lab" 字标留在 box 上方;
+/// main 已在 App.init 前起播的(`startSplash`)只等它定格。
+fn printStartupBanner(app: *const app_mod.App, allocator: std.mem.Allocator, splash: Splash) void {
+    switch (splash) {
+        .playing => |bg| endSplash(bg, .wait),
+        .not_started => if (platform_term.isatty(1)) playStartupSplash(app, allocator),
+        .off => {},
+    }
     var problems_buf: [160]u8 = undefined;
     const problems = formatConfigProblems(&problems_buf, app.configProblems());
     if (!platform_term.isatty(1)) {
@@ -4607,7 +4677,6 @@ fn printStartupBanner(app: *const app_mod.App, allocator: std.mem.Allocator) voi
         cmd_output.print("\n", .{});
         return;
     }
-    playStartupSplash(app, allocator);
     printBanner(app);
 }
 
@@ -4656,21 +4725,29 @@ fn printBanner(app: *const app_mod.App) void {
 /// 启动动画:门控(TTY 两端/METACODES_NO_STARTUP_ANIMATION/config.json startupAnimation/
 /// TERM=dumb/终端太小)由 splash_player.decide 判定;任意键跳到定格帧。结果只进 debug 日志。
 fn playStartupSplash(app: *const app_mod.App, allocator: std.mem.Allocator) void {
-    const splash_player = @import("tui/splash_player.zig");
-    const log = @import("../util/log.zig");
-    const config = if (app.stateRoot().len > 0)
-        @import("tui/config.zig").loadStartupAnimation(allocator, app.stateRoot())
-    else
-        null;
-    switch (splash_player.decide(splash_player.gateFromEnv(config))) {
-        .skip => |why| log.debug("splash", "skipped: {s}", .{@tagName(why)}),
-        .play => |plan| {
-            const style = splash_player.styleFor(app.theme_variant, tui_term_root.detectFromEnv(1));
-            const seed: u64 = @truncate(@as(u128, @bitCast(util_time.nowNs())));
-            const outcome = splash_player.play(allocator, plan, style, seed);
-            log.debug("splash", "{s} ({d}x{d}, {s})", .{ @tagName(outcome), plan.layout.cols, plan.layout.rows, @tagName(style.mode) });
+    const plan = splashPlan(allocator, app.stateRoot()) orelse return;
+    const style = splashStyle(app.theme_variant);
+    logSplash(splash_player.play(allocator, plan, style, splashSeed()), plan, style.mode);
+}
+
+/// The splash's plan for this terminal, or null (logged) when its gate keeps it off.
+fn splashPlan(allocator: std.mem.Allocator, state_root: []const u8) ?splash_player.Plan {
+    const config = if (state_root.len > 0) @import("tui/config.zig").loadStartupAnimation(allocator, state_root) else null;
+    return switch (splash_player.decide(splash_player.gateFromEnv(config))) {
+        .skip => |why| {
+            @import("../util/log.zig").debug("splash", "skipped: {s}", .{@tagName(why)});
+            return null;
         },
-    }
+        .play => |plan| plan,
+    };
+}
+
+fn splashStyle(variant: tui_theme.Variant) @import("tui/splash.zig").Style {
+    return splash_player.styleFor(variant, tui_term_root.detectFromEnv(1));
+}
+
+fn splashSeed() u64 {
+    return @truncate(@as(u128, @bitCast(util_time.nowNs())));
 }
 
 /// banner 一行内容:│ + inner 列(2 空格缩进 + text + 右补空格)+ │。

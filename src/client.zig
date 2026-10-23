@@ -665,7 +665,7 @@ pub const Client = struct {
 
     /// 启动时探测 `/v1/models` → 填 catalog。失败静默（不报错，fallback 仍可用）。
     pub fn probeModels(client: *Client) void {
-        const body = client.doGetModels() catch |err| {
+        const body = client.fetchModelsList() catch |err| {
             log.debug("catalog", "probeModels: {s} (falling back to local table)", .{@errorName(err)});
             return;
         };
@@ -675,43 +675,16 @@ pub const Client = struct {
         };
     }
 
-    /// GET <base>/v1/models 拉完整响应。
-    fn doGetModels(client: *Client) ![]u8 {
-        // 把 /v1/messages 替换成 /v1/models
-        const messages_url = client.base_url;
-        const suffix = "/v1/messages";
-        if (!std.mem.endsWith(u8, messages_url, suffix)) return error.UnexpectedUrl;
-        const base = messages_url[0 .. messages_url.len - suffix.len];
-        const url = try std.fmt.allocPrint(client.allocator, "{s}/v1/models", .{base});
-        defer client.allocator.free(url);
-
-        const uri = std.Uri.parse(url) catch return error.InvalidUrl;
-
+    /// GET <base>/v1/models with this client's route and credential: the body,
+    /// owned by `client.allocator`.
+    pub fn fetchModelsList(client: *Client) ![]u8 {
         const auth = auth_header_mod.build(client.allocator, client.auth_scheme, client.api_key) catch return error.RequestFailed;
         defer secureFree(client.allocator, auth.value);
-
-        var connection_lease = connection_gate.acquire(null) catch return error.RequestFailed;
-        defer connection_lease.release();
-        var req = client.http_client.request(.GET, uri, .{
-            .keep_alive = false, // 同 POST:不复用陈旧连接
-            .extra_headers = &.{
-                .{ .name = "anthropic-version", .value = "2023-06-01" },
-                .{ .name = auth.name, .value = auth.value },
-            },
-        }) catch return error.RequestFailed;
-        defer req.deinit();
-
-        req.sendBodiless() catch return error.RequestFailed;
-        var redirect_buf: [4096]u8 = undefined;
-        const http_response = req.receiveHead(&redirect_buf) catch return error.RequestFailed;
-        const status = ResponseStatus.capture(&http_response);
-        client.last_http_status = status.code;
-        connection_lease.release();
-        if (!status.isOk()) return error.HttpError;
-
-        var transfer_buf: [8192]u8 = undefined;
-        const body_reader = req.reader.bodyReader(&transfer_buf, http_response.head.transfer_encoding, http_response.head.content_length);
-        return body_reader.allocRemaining(client.allocator, std.Io.Limit.limited(1024 * 1024)) catch return error.RequestFailed;
+        var status: u16 = 0;
+        defer if (status != 0) {
+            client.last_http_status = status;
+        };
+        return getModelsList(client.allocator, &client.http_client, client.base_url, .{ .name = auth.name, .value = auth.value }, &status);
     }
 
     /// 发送非流式消息请求
@@ -1139,6 +1112,49 @@ pub const Client = struct {
         return RequestResult{ .full_body = .{ .body = response_body, .id = rid, .server_request_id = client.serverRequestId() } };
     }
 };
+
+/// GET `<base>/v1/models`, where `messages_url` is the route's
+/// `<base>/v1/messages`: the body, owned by `allocator`. `status` receives the
+/// HTTP status once a response head arrived. Free of `Client` state, so a
+/// background refresh can run it on an HTTP client of its own.
+pub fn getModelsList(
+    allocator: std.mem.Allocator,
+    http_client: *http.Client,
+    messages_url: []const u8,
+    auth: http.Header,
+    status: *u16,
+) ![]u8 {
+    const suffix = "/v1/messages";
+    if (!std.mem.endsWith(u8, messages_url, suffix)) return error.UnexpectedUrl;
+    const base = messages_url[0 .. messages_url.len - suffix.len];
+    const url = try std.fmt.allocPrint(allocator, "{s}/v1/models", .{base});
+    defer allocator.free(url);
+
+    const uri = std.Uri.parse(url) catch return error.InvalidUrl;
+
+    var connection_lease = connection_gate.acquire(null) catch return error.RequestFailed;
+    defer connection_lease.release();
+    var req = http_client.request(.GET, uri, .{
+        .keep_alive = false, // 同 POST:不复用陈旧连接
+        .extra_headers = &.{
+            .{ .name = "anthropic-version", .value = "2023-06-01" },
+            auth,
+        },
+    }) catch return error.RequestFailed;
+    defer req.deinit();
+
+    req.sendBodiless() catch return error.RequestFailed;
+    var redirect_buf: [4096]u8 = undefined;
+    const http_response = req.receiveHead(&redirect_buf) catch return error.RequestFailed;
+    const response_status = ResponseStatus.capture(&http_response);
+    status.* = response_status.code;
+    connection_lease.release();
+    if (!response_status.isOk()) return error.HttpError;
+
+    var transfer_buf: [8192]u8 = undefined;
+    const body_reader = req.reader.bodyReader(&transfer_buf, http_response.head.transfer_encoding, http_response.head.content_length);
+    return body_reader.allocRemaining(allocator, std.Io.Limit.limited(1024 * 1024)) catch return error.RequestFailed;
+}
 
 fn shutdownRequest(raw: *anyopaque) void {
     const request: *http.Client.Request = @ptrCast(@alignCast(raw));
@@ -1820,7 +1836,7 @@ test "estimateTokens" {
 // Regression: GET /v1/models 必须用 sendBodiless()；std.http 对带 body 的 GET 会 assert。
 // 有人把 sendBodiless 改回 sendBodyComplete("")，离线 probeModels 会 panic（非 error）。
 // 源码扫描级断言兜底：测试读自己的源文件，确保关键行不退化。
-test "doGetModels uses sendBodiless (no sendBodyComplete on GET)" {
+test "getModelsList uses sendBodiless (no sendBodyComplete on GET)" {
     const src = @embedFile("client.zig");
     // 确认函数里有 sendBodiless 调用
     try std.testing.expect(std.mem.indexOf(u8, src, "req.sendBodiless()") != null);

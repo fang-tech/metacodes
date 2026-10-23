@@ -3,6 +3,8 @@
 //! `decide` is the gate (pure, so every reason to stay quiet is testable);
 //! `play` paces frames on the region below the cursor, lets any key jump to
 //! the settled wordmark, and always ends with the cursor shown and SGR reset.
+//! `Background` runs `play` on a thread of its own so the CLI can start it
+//! before `App.init` and let it play during startup.
 //! The key that skips is consumed, without blocking even when it types
 //! nothing (a bare modifier on Windows): before the prompt exists there is
 //! nowhere for it to go. On POSIX the input box's own raw-mode entry
@@ -78,6 +80,8 @@ pub fn styleFor(variant: theme.Variant, cap: term.ColorCapability) splash.Style 
 pub const Outcome = enum {
     completed,
     skipped_by_key,
+    /// The host stopped it early (`Background.cancel`: startup failed).
+    stopped,
     /// The terminal changed size mid-play; the region's rows may have
     /// reflowed, so no settled frame is drawn over them.
     resized,
@@ -88,6 +92,11 @@ pub const Outcome = enum {
 };
 
 pub fn play(gpa: std.mem.Allocator, plan: Plan, style: splash.Style, seed: u64) Outcome {
+    return playUntil(gpa, plan, style, seed, null);
+}
+
+/// `play`, ending at the next frame once `stop` is set, settled as a key would.
+fn playUntil(gpa: std.mem.Allocator, plan: Plan, style: splash.Style, seed: u64, stop: ?*const std.atomic.Value(bool)) Outcome {
     const saved = platform_term.enterRaw(0) orelse return .no_raw_mode;
     defer platform_term.restoreMode(0, saved);
 
@@ -101,6 +110,7 @@ pub fn play(gpa: std.mem.Allocator, plan: Plan, style: splash.Style, seed: u64) 
     const outcome: Outcome = run: while (true) {
         const t = secondsSince(start);
         if (t >= splash.duration) break :run .completed;
+        if (stop) |flag| if (flag.load(.acquire)) break :run .stopped;
         // Before every write: a frame drawn at the old width wraps every row
         // on a narrowed terminal, and the next cursor-up redraw lands on the
         // wrong rows.
@@ -122,7 +132,7 @@ pub fn play(gpa: std.mem.Allocator, plan: Plan, style: splash.Style, seed: u64) 
     var final = outcome;
     if (frames > 0) {
         var settle = switch (outcome) {
-            .completed, .skipped_by_key, .out_of_memory => true,
+            .completed, .skipped_by_key, .stopped, .out_of_memory => true,
             .resized, .write_failed, .no_raw_mode => false,
         };
         // The settled frame is a write like any other.
@@ -142,6 +152,49 @@ pub fn play(gpa: std.mem.Allocator, plan: Plan, style: splash.Style, seed: u64) 
     }
     return final;
 }
+
+/// The splash on a thread of its own, so it plays while the host starts up
+/// (`App.init` connects MCP servers and fetches catalogs). The host keeps the
+/// terminal to the splash until `finish` or `cancel`: nothing else may write
+/// to it or read stdin meanwhile.
+pub const Background = struct {
+    gpa: std.mem.Allocator,
+    plan: Plan,
+    style: splash.Style,
+    seed: u64,
+    stop: std.atomic.Value(bool) = .init(false),
+    outcome: Outcome = .completed,
+    thread: std.Thread = undefined,
+
+    /// Start playing `plan`. `gpa` must be thread-safe and outlive `finish`.
+    pub fn start(gpa: std.mem.Allocator, plan: Plan, style: splash.Style, seed: u64) !*Background {
+        const self = try gpa.create(Background);
+        errdefer gpa.destroy(self);
+        self.* = .{ .gpa = gpa, .plan = plan, .style = style, .seed = seed };
+        self.thread = try std.Thread.spawn(.{}, run, .{self});
+        return self;
+    }
+
+    fn run(self: *Background) void {
+        self.outcome = playUntil(self.gpa, self.plan, self.style, self.seed, &self.stop);
+    }
+
+    /// Wait until the splash has settled (it ends by itself after
+    /// `splash.duration`, or on a key) and free it. The terminal is the host's again.
+    pub fn finish(self: *Background) Outcome {
+        self.thread.join();
+        const outcome = self.outcome;
+        self.gpa.destroy(self);
+        return outcome;
+    }
+
+    /// Settle it at the next frame instead (startup failed and is about to
+    /// say why), then `finish`.
+    pub fn cancel(self: *Background) Outcome {
+        self.stop.store(true, .release);
+        return self.finish();
+    }
+};
 
 fn secondsSince(start: util_time.Nanos) f32 {
     const ns = util_time.nowNs() - start;
