@@ -35,9 +35,10 @@ const Fixture = struct {
     kg: KgClient,
 
     /// A ready client on a private store, initialised in place. False when no
-    /// attested TinyKG binary is staged or the store does not come up (KG is
-    /// an enhancement; its absence is not a failure); `deinit` is then not
-    /// needed.
+    /// attested TinyKG binary is staged (KG is an enhancement; its absence is
+    /// not a failure); `deinit` is then not needed. A staged binary whose
+    /// store does not come up is an error, not a skip: these tests guard a
+    /// trust boundary, and a skip would read as green with nothing checked.
     fn open(self: *Fixture, allocator: std.mem.Allocator, domain: []const u8) !bool {
         const bin = tinykg_binary.find(allocator) orelse return false;
         defer allocator.free(bin);
@@ -60,8 +61,12 @@ const Fixture = struct {
         });
         self.kg.ensureReady();
         if (!self.kg.ready) {
-            self.deinit();
-            return false;
+            // Name the cause in the CI log, as kgd_e2e_test does.
+            std.debug.print("reserved KG types: staged TinyKG store not ready; degraded={?} detail={s}\n", .{
+                self.kg.degradedKind(), self.kg.detail(),
+            });
+            self.kg.deinit(); // root and tmp go with the errdefers above
+            return error.TestExpectedReady;
         }
         return true;
     }
