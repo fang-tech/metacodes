@@ -141,6 +141,7 @@ const skill_overrides_mod = @import("skills/overrides.zig");
 const plugin_mod = @import("plugin/root.zig");
 const path_util = @import("util/path.zig");
 const McpClient = @import("mcp/client.zig").McpClient;
+const mcp_startup = @import("app/mcp_startup.zig");
 const McpSession = @import("mcp/registry_bridge.zig").McpSession;
 const ActiveSkillState = @import("skills/active.zig").ActiveSkillState;
 const AgentSet = @import("agents/set.zig").AgentSet;
@@ -412,12 +413,17 @@ pub const App = struct {
     /// client is visible to it (or the client half-written). Clients are never
     /// freed before `deinit`, so this is the only window.
     route_mutex: sync.Mutex = .{},
-    /// Built once in `init` and kept for the whole session, so the slices,
-    /// the dynamic descriptions (`describe_fn`, env overrides) and
-    /// `enabled_tool_names` live in `tool_defs_arena`, released in `deinit`.
-    /// A description may also be a static string, so the defs are never freed
-    /// one by one.
+    /// Built once, after every MCP server has reported (`publishMcpServers`:
+    /// in `init`, or at the interactive REPL's first join point), and kept for
+    /// the whole session, so the slices, the dynamic descriptions
+    /// (`describe_fn`, env overrides) and `enabled_tool_names` live in
+    /// `tool_defs_arena`, released in `deinit`. A description may also be a
+    /// static string, so the defs are never freed one by one. Empty while
+    /// `tool_surface` is not `.ready`.
     tool_defs: []json_mod.ToolDefinition,
+    /// Whether `tool_defs`, `enabled_tool_names` and `system_prompt` have
+    /// been built, or what they are waiting for.
+    tool_surface: ToolSurface = .unbuilt,
     tool_defs_arena: std.heap.ArenaAllocator,
     /// 当前启用的工具名（含动态 Skill/MCP）。用于 system prompt 的 # Using your tools
     /// 段按工具集裁剪 + 构造 PromptContext。在 `tool_defs_arena` 里。
@@ -555,9 +561,12 @@ pub const App = struct {
     mcp_sessions: std.ArrayList(McpSessionEntry),
     /// Every configured MCP server and its startup outcome (for /mcp).
     mcp_report: McpReport = .{},
-    /// Owns the resolved MCP configuration and `mcp_report` (child of
-    /// `allocator`, released in deinit). Null until MCP servers are loaded.
+    /// Owns the resolved MCP configuration, the startup jobs and `mcp_report`
+    /// (child of `allocator`, released in deinit). Null until MCP servers are
+    /// loaded.
     mcp_arena: ?*std.heap.ArenaAllocator = null,
+    /// MCP startup progress for renderers on any thread (counters only).
+    mcp_status: mcp_startup.Status = .{},
     /// 当前激活的 skill 状态(allowed/disallowed 临时白黑名单)。
     /// 激活 Skill 工具时设;loop.zig 处理下条 user message 前清。
     active_skill: ?ActiveSkillState = null,
@@ -817,37 +826,14 @@ pub const App = struct {
             }
         }
 
-        // 启动时尝试连接 config.json 里声明的 MCP servers。失败逐个 log，不影响启动。
-        app.connectMcpServers() catch |err| {
-            @import("util/log.zig").debug("mcp", "no servers connected: {s}", .{@errorName(err)});
-        };
-
-        // 现在构造完整的 tool_defs：静态 + 动态（Skill / MCP）+ web_search。
-        // 先构造一次拿到全部工具名（含动态），据此建 PromptContext，再带 context 重建——
-        // 让核心工具拿到动态长描述（对应 cc tool.prompt(ctx)）。
-        // 两次都在 tool_defs_arena 里:第一次的临时 defs 随 App 一起释放。
-        // probe pass 用 teams-aware bootstrap ctx,让 enabled_names 与最终 tool_defs 的
-        // swarm 门控一致(否则 --agent-teams 开时 "Using your tools" 段漏列 swarm 工具)。
-        const defs_allocator = app.tool_defs_arena.allocator();
-        const probe_ctx = tools_mod.PromptContext{
-            .agent_teams = config.agent_teams,
-            .tinykg_enabled = config.long_horizon_arm.usesTinyKg(),
-        };
-        const probe_defs = try tools_mod.toToolDefinitionsFull(defs_allocator, &app.dyn_registry, &probe_ctx);
-        const enabled_names = try defs_allocator.alloc([]const u8, probe_defs.len);
-        for (probe_defs, 0..) |d, i| enabled_names[i] = d.name;
-        app.enabled_tool_names = enabled_names;
-
-        const prompt_ctx = tools_mod.PromptContext{
-            .permission_mode = config.permission_mode,
-            .enabled_tool_names = enabled_names,
-            .agent_type = "", // 主对话
-            .include_git = true,
-            .agent_teams = config.agent_teams, // F5:门控 swarm 工具进 tool_defs
-            .tinykg_enabled = config.long_horizon_arm.usesTinyKg(),
-        };
-        app.tool_defs = try tools_mod.toToolDefinitionsFull(defs_allocator, &app.dyn_registry, &prompt_ctx);
-        _ = app.skill_runtime.applyModelToolSchema(app.tool_defs);
+        // MCP servers connect from here on, each on a worker thread, while the
+        // rest of init runs; failures are logged one by one and never stop the
+        // start. Their tools are registered, and the tool surface built, only
+        // once every server has reported (`publishMcpServers` below, or the
+        // REPL's first join point).
+        app.beginMcpStartup();
+        // A failed init frees the App the workers count into: stop them first.
+        errdefer app.cancelMcpStartup();
 
         // 加载模型上下文窗口表(~/.metacode/models.toml)并挂到 client。
         // precedence 高于 probe → auto-compact 阈值优先用此表(offline 可靠 + 用户可编辑)。
@@ -1024,16 +1010,11 @@ pub const App = struct {
             if (app.lsp_service != null) @import("util/log.zig").info("lsp", "language server integration enabled (disable with --no-lsp)", .{});
         }
 
-        // 构造 system prompt。显式 display identity 只作用于模型自述/knowledge
-        // cutoff；真实 transport model 仍独立驱动 provider、catalog、pricing 与 context。
-        // 动态裁剪（对应 cc getUsingYourToolsSection(enabledTools)）。失败仅 log，保持 null。
-        // 环境段 cwd 用进程 cwd(CLI 语义);Session 库消费方用 workspace.root(见 agent_session)。
-        const cli_cwd = @import("util/fs.zig").getCwd(allocator) catch "";
-        defer if (cli_cwd.len > 0) allocator.free(cli_cwd);
-        app.system_prompt = system_prompt_mod.buildFullWithDefs(allocator, app.config.model_display_name orelse app.config.model, &app.skills, &app.agents, app.enabled_tool_names, app.memdir_abs, app.kgReady(), cli_cwd, app.tool_defs) catch |err| blk: {
-            @import("util/log.zig").warn("sysprompt", "build failed: {s} (continuing without system prompt)", .{@errorName(err)});
-            break :blk null;
-        };
+        // Wait for the MCP servers, register their tools and build the tool
+        // surface and system prompt (`publishMcpServers`). The interactive
+        // REPL (`mcp_connect = .first_request`) shows its prompt first and
+        // does this at its first join point, before any request is assembled.
+        if (!app.mcpJoinDeferred()) try app.publishMcpServers();
 
         // 构造首条 user-context message(通道 A:CLAUDE.md 链 + currentDate,system-reminder 包裹)。
         // 向上递归从 cwd 收集 CLAUDE.md;User 级读 ~/.claude/CLAUDE.md。失败仅 log,保持 null。
@@ -2398,6 +2379,7 @@ pub const App = struct {
     /// multi-session daemon's destroy stops the work at once; only memory waits
     /// for the last lease). Idempotent; `deinit` calls it first.
     pub fn stopBackgroundWork(app: *App) void {
+        app.cancelMcpStartup();
         if (app.agent_jobs) |*jobs| jobs.stop();
         app.swarm.detachTeam();
         if (app.jobs) |*jobs| _ = jobs.killAll();
@@ -3642,78 +3624,110 @@ pub const App = struct {
         @import("util/log.zig").info("permission", "loaded {d} rule(s) from config", .{app.rule_set.?.rules.items.len});
     }
 
-    /// 启动时连接所有配置来源里的 MCP server(见 mcp/config.zig:metacodes 自己的
-    /// `<state root>/config.json`,以及 Claude Code / Codex 的配置)。各 server 并行连接,
-    /// 每个受启动超时约束;失败逐个记入 `mcp_report`(/mcp 可见)并 warn,不影响其它
-    /// server 或 App 启动。工具以 `mcp__<server>__<tool>` 注册进 dyn_registry。
-    fn connectMcpServers(app: *App) !void {
+    /// Start connecting every MCP server the configuration sources declare
+    /// (mcp/config.zig: metacodes' own `<state root>/config.json`, Claude
+    /// Code's and Codex's), each on a worker thread bounded by its startup
+    /// timeout. Nothing is registered here: `publishMcpServers` does that on
+    /// this thread once every server has reported. Failures are recorded per
+    /// server (`mcp_report`, `/mcp`) and never stop the App.
+    fn beginMcpStartup(app: *App) void {
         const log = @import("util/log.zig");
-        const mcp_config = @import("mcp/config.zig");
-        const mcp_launch = @import("mcp/launch.zig");
-        const arena_state = try app.allocator.create(std.heap.ArenaAllocator);
+        const arena_state = app.allocator.create(std.heap.ArenaAllocator) catch |err| {
+            log.warn("mcp", "no servers connected: {s}", .{@errorName(err)});
+            return;
+        };
         arena_state.* = std.heap.ArenaAllocator.init(app.allocator);
         app.mcp_arena = arena_state;
-        const a = arena_state.allocator();
-        const cwd = app.cwdAbs();
-        const workspace_root = app.project_dir_or_empty();
-        const environment = try mcp_config.Environment.fromProcess(a);
-        const resolved = try mcp_config.load(a, .{
+        const startup = mcp_startup.Startup.begin(arena_state.allocator(), &app.mcp_status, .{
+            .io = app.io,
             .state_root = app.stateRoot(),
             .home = app.homeDir(),
-            .cwd = cwd,
-            .workspace_root = if (workspace_root.len != 0) workspace_root else cwd,
+            .cwd = app.cwdAbs(),
+            .workspace_root = app.project_dir_or_empty(),
             .codex_home = @import("platform").paths.codexHomeEnv() orelse "",
-            .env = environment,
-        });
-        for (resolved.problems) |problem| {
-            log.warn("mcp", "{s} ({s}){s}{s}: {s}", .{
-                problem.origin_path,
-                problem.origin.label(),
-                if (problem.server.len != 0) " server " else "",
-                problem.server,
-                problem.message,
-            });
-        }
-        for (resolved.pending) |pending| {
-            if (pending.reason == .needs_approval)
-                log.warn("mcp", "project server '{s}' in {s} awaits approval (add it to enabledMcpjsonServers)", .{ pending.name, pending.origin_path });
-        }
+        }) catch |err| {
+            log.debug("mcp", "no servers connected: {s}", .{@errorName(err)});
+            return;
+        };
+        app.tool_surface = .{ .connecting = startup };
+    }
 
-        const jobs = try a.alloc(McpConnectJob, resolved.servers.len);
-        for (resolved.servers, jobs) |server, *job| {
-            job.* = .{ .server = server, .io = app.io };
-            switch (server.transport) {
-                .stdio => |stdio| {
-                    job.launch = mcp_launch.prepare(a, stdio, environment, cwd) catch |err| {
-                        job.result = .{ .failed = if (err == error.CommandNotFound) error.McpCommandNotFound else err };
-                        continue;
-                    };
-                    job.log_path = app.openMcpLog(a, server.name, &job.log_fd);
-                },
-                .http => |http| {
-                    job.http_headers = mcpHttpHeaders(a, http, environment) catch |err| {
-                        job.result = .{ .failed = err };
-                        continue;
-                    };
-                },
-            }
-        }
-        // Parallel startup (Claude Code and Codex both connect servers
-        // concurrently); a thread that cannot be spawned runs inline.
-        const threads = try a.alloc(?std.Thread, jobs.len);
-        for (jobs, threads) |*job, *thread| {
-            thread.* = null;
-            if (job.result != .pending) continue;
-            thread.* = std.Thread.spawn(.{}, McpConnectJob.run, .{job}) catch blk: {
-                job.run();
-                break :blk null;
-            };
-        }
-        for (threads) |maybe| if (maybe) |thread| thread.join();
+    /// Whether `init` leaves the MCP join to the interactive REPL: only with
+    /// `mcp_connect = .first_request` and at least one server to wait for, so
+    /// a session without MCP builds everything in `init` as before.
+    fn mcpJoinDeferred(app: *const App) bool {
+        if (app.config.mcp_connect != .first_request) return false;
+        return switch (app.tool_surface) {
+            .connecting => |startup| startup.jobs.len != 0,
+            .ready, .unbuilt => false,
+        };
+    }
 
-        var statuses: std.ArrayList(McpServerStatus) = .empty;
-        for (jobs) |*job| {
-            if (job.log_fd) |fd| _ = @import("platform").fs.close(fd);
+    /// True once the provider-visible tool surface is built.
+    pub fn toolSurfaceReady(app: *const App) bool {
+        return app.tool_surface == .ready;
+    }
+
+    /// Every MCP server has reported, so `publishMcpServers` will not block
+    /// (the workers may still be exiting). True when nothing is connecting.
+    pub fn mcpStartupSettled(app: *const App) bool {
+        return switch (app.tool_surface) {
+            .connecting => |startup| startup.settled(),
+            .ready, .unbuilt => true,
+        };
+    }
+
+    /// The servers still starting, for `/mcp` while they connect (null when
+    /// nothing is connecting). Owner thread only.
+    pub fn mcpStartupInFlight(app: *const App) ?*const mcp_startup.Startup {
+        return switch (app.tool_surface) {
+            .connecting => |startup| startup,
+            .ready, .unbuilt => null,
+        };
+    }
+
+    /// Join the MCP startup (blocking until every server has reported),
+    /// register the connected servers' tools and build the tool surface:
+    /// `tool_defs`, `enabled_tool_names` and the system prompt. Idempotent.
+    /// The one thread that owns the App calls it, with no Run in flight:
+    /// `init` for every frontend but the interactive REPL, which calls it
+    /// before it assembles its first request. Callers that must stay
+    /// responsive wait for `mcpStartupSettled` first.
+    pub fn publishMcpServers(app: *App) !void {
+        switch (app.tool_surface) {
+            .ready => return,
+            .connecting => |startup| {
+                startup.join();
+                app.tool_surface = .unbuilt;
+                app.registerMcpOutcomes(startup);
+            },
+            .unbuilt => {},
+        }
+        try app.buildToolSurface();
+        app.tool_surface = .ready;
+        app.mcp_status.published.store(true, .release);
+    }
+
+    /// Stop an MCP startup nobody published (teardown): the connects still in
+    /// flight are interrupted and the clients that did connect are closed.
+    fn cancelMcpStartup(app: *App) void {
+        switch (app.tool_surface) {
+            .connecting => |startup| {
+                startup.cancelAndJoin();
+                app.tool_surface = .unbuilt;
+            },
+            .ready, .unbuilt => {},
+        }
+    }
+
+    /// Register every connected server's tools, in configuration order, and
+    /// record each server's outcome in `mcp_report`. A client that cannot be
+    /// registered is closed here; none is left without an owner.
+    fn registerMcpOutcomes(app: *App, startup: *mcp_startup.Startup) void {
+        const log = @import("util/log.zig");
+        const a = app.mcp_arena.?.allocator();
+        var statuses = std.ArrayList(McpServerStatus).initCapacity(a, startup.jobs.len) catch null;
+        for (startup.jobs) |*job| {
             var status = McpServerStatus{
                 .name = job.server.name,
                 .origin = job.server.origin,
@@ -3722,9 +3736,10 @@ pub const App = struct {
                 .state = .failed,
             };
             switch (job.result) {
-                .pending => unreachable,
+                .pending => unreachable, // joined: every job has settled
                 .failed => |err| {
-                    status.detail = mcpFailureDetail(err, job);
+                    status.detail = mcp_startup.failureDetail(err, job);
+                    if (err == error.McpAuthRequired) status.state = .needs_auth;
                     log.warn("mcp", "server '{s}' ({s}) failed: {s}", .{ job.server.name, job.server.origin.label(), status.detail });
                 },
                 .connected => |connected| {
@@ -3739,18 +3754,79 @@ pub const App = struct {
                     } else |err| {
                         client.close();
                         status.detail = @errorName(err);
+                        _ = app.mcp_status.failed.fetchAdd(1, .release);
                         log.warn("mcp", "server '{s}' tool registration failed: {s}", .{ job.server.name, @errorName(err) });
                     }
                 },
             }
-            try statuses.append(a, status);
+            if (statuses) |*list| list.appendAssumeCapacity(status);
         }
         app.mcp_report = .{
-            .servers = try statuses.toOwnedSlice(a),
-            .pending = resolved.pending,
-            .disabled = resolved.disabled,
-            .problems = resolved.problems,
+            .servers = if (statuses) |list| list.items else &.{},
+            .pending = startup.pending,
+            .disabled = startup.disabled,
+            .problems = startup.problems,
         };
+    }
+
+    /// The model the system prompt names: the startup display identity until
+    /// a `/model` switch, the switched model after one (as `switchModel`
+    /// builds it).
+    fn promptModelName(app: *const App) []const u8 {
+        if (app.model_switch_owned != null) return app.activeModel();
+        return app.config.model_display_name orelse app.config.model;
+    }
+
+    /// Build `tool_defs` (static + dynamic: Skill, process plugins, MCP),
+    /// `enabled_tool_names` and the system prompt from the registry as it
+    /// stands. Called once, by `publishMcpServers`.
+    fn buildToolSurface(app: *App) !void {
+        // Build once to learn every tool name (dynamic ones included), make the
+        // PromptContext from them, then build again with it so core tools get
+        // their context-dependent long descriptions (cc tool.prompt(ctx)). Both
+        // live in tool_defs_arena; the first, temporary set goes with the App.
+        // The probe pass uses the teams-aware bootstrap ctx so enabled_names
+        // and the final tool_defs gate swarm tools alike (otherwise
+        // `--agent-teams` would leave them out of "Using your tools").
+        const defs_allocator = app.tool_defs_arena.allocator();
+        const probe_ctx = tools_mod.PromptContext{
+            .agent_teams = app.config.agent_teams,
+            .tinykg_enabled = app.config.long_horizon_arm.usesTinyKg(),
+        };
+        const probe_defs = try tools_mod.toToolDefinitionsFull(defs_allocator, &app.dyn_registry, &probe_ctx);
+        const enabled_names = try defs_allocator.alloc([]const u8, probe_defs.len);
+        for (probe_defs, 0..) |d, i| enabled_names[i] = d.name;
+
+        const prompt_ctx = tools_mod.PromptContext{
+            .permission_mode = app.config.permission_mode,
+            .enabled_tool_names = enabled_names,
+            .agent_type = "", // 主对话
+            .include_git = true,
+            .agent_teams = app.config.agent_teams, // F5:门控 swarm 工具进 tool_defs
+            .tinykg_enabled = app.config.long_horizon_arm.usesTinyKg(),
+        };
+        const defs = try tools_mod.toToolDefinitionsFull(defs_allocator, &app.dyn_registry, &prompt_ctx);
+        // The Skill tool's listing follows the current `skillOverrides` (a
+        // `/skills` change made before an interactive REPL's first join is in
+        // it; otherwise the bytes are the ones registration produced).
+        _ = try app.skill_runtime.refreshModelTool(defs, defs_allocator);
+        app.enabled_tool_names = enabled_names;
+        app.tool_defs = defs;
+
+        // 构造 system prompt。显式 display identity 只作用于模型自述/knowledge
+        // cutoff；真实 transport model 仍独立驱动 provider、catalog、pricing 与 context。
+        // 动态裁剪（对应 cc getUsingYourToolsSection(enabledTools)）。失败仅 log，保持 null。
+        // 环境段 cwd 用进程 cwd(CLI 语义);Session 库消费方用 workspace.root(见 agent_session)。
+        const cli_cwd = @import("util/fs.zig").getCwd(app.allocator) catch "";
+        defer if (cli_cwd.len > 0) app.allocator.free(cli_cwd);
+        const built = system_prompt_mod.buildFullWithDefs(app.allocator, app.promptModelName(), &app.skills, &app.agents, app.enabled_tool_names, app.memdir_abs, app.kgReady(), cli_cwd, app.tool_defs) catch |err| blk: {
+            @import("util/log.zig").warn("sysprompt", "build failed: {s} (continuing without system prompt)", .{@errorName(err)});
+            break :blk null;
+        };
+        // A prompt an interactive REPL rebuilt before its first join (`/model`,
+        // `/skills`) listed no tools; nothing borrows it, no Run has started.
+        if (app.system_prompt) |old| app.retireWorkspaceString(old);
+        app.system_prompt = built;
     }
 
     /// Move a connected client into App ownership and publish its tools.
@@ -3787,35 +3863,6 @@ pub const App = struct {
         return count;
     }
 
-    /// `<state root>/logs/mcp/<server>.log`, truncated per session: the
-    /// server's stderr (startup errors, crashes) lands where `/mcp` points.
-    fn openMcpLog(app: *App, arena: std.mem.Allocator, server: []const u8, fd_out: *?c_int) []const u8 {
-        fd_out.* = null;
-        const state = app.stateRoot();
-        if (state.len == 0) return "";
-        const name = @import("mcp/launch.zig").logFileName(arena, server) catch return "";
-        const dir = std.fs.path.join(arena, &.{ state, "logs", "mcp" }) catch return "";
-        @import("util/fs.zig").mkdirParents(dir) catch return "";
-        const path = std.fs.path.join(arena, &.{ dir, name }) catch return "";
-        const path_z = arena.dupeZ(u8, path) catch return "";
-        // Close-on-exec: every log is open while the servers start in
-        // parallel, and each server gets its own as fd 2 through dup2. Without
-        // the flag each server, and anything else spawned meanwhile, would
-        // also hold every other server's log open. The fork lock keeps a
-        // concurrent spawn out of the gap between open and fcntl.
-        const process = @import("platform").process;
-        process.forkSerialLock();
-        defer process.forkSerialUnlock();
-        const fd = pfs.open(path_z.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o600));
-        if (fd < 0) return "";
-        pfs.makeCloseOnExec(fd) catch {
-            _ = pfs.close(fd);
-            return "";
-        };
-        fd_out.* = fd;
-        return path;
-    }
-
     /// 把 app.abort 绑到进程级 SIGINT handler。**只在前台(TUI N=1)会话调一次。**
     /// SIGINT 是进程级单一信号——一个进程只有一个 handler,只能指向一个 abort。这对 TUI
     /// 正确(N=1:唯一会话即前台会话)。**多 Session(GUI)不用 SIGINT 路由**:GUI 没有
@@ -3840,12 +3887,30 @@ pub const App = struct {
     }
 };
 
+/// The provider-visible tool surface (`tool_defs`, `enabled_tool_names`,
+/// `system_prompt`) is built once from the registry with every MCP server's
+/// outcome in it, never from a partial one: what a provider sees must not
+/// depend on how fast a server answered (the cache contract).
+pub const ToolSurface = union(enum) {
+    /// Built; every request reads it.
+    ready,
+    /// MCP servers are connecting on worker threads (the interactive REPL's
+    /// `mcp_connect = .first_request`); nothing is built yet. The REPL joins
+    /// with `publishMcpServers` before it assembles a request.
+    connecting: *mcp_startup.Startup,
+    /// Every server's outcome is registered but the build has not happened
+    /// (during `init`, or after it failed for lack of memory).
+    unbuilt,
+};
+
 /// One configured MCP server and what became of it at startup (for /mcp).
 pub const McpServerStatus = struct {
     name: []const u8,
     origin: @import("mcp/config.zig").Origin,
     origin_path: []const u8,
-    state: enum { connected, failed } = .failed,
+    /// `needs_auth`: the server answered 401/403 (a failure with its own
+    /// remedy: credentials, not a restart).
+    state: enum { connected, failed, needs_auth } = .failed,
     /// Failure reason ("" when connected).
     detail: []const u8 = "",
     /// Negotiated protocol revision ("" when not connected).
@@ -3861,104 +3926,6 @@ pub const McpReport = struct {
     disabled: []const []const u8 = &.{},
     problems: []const @import("mcp/config.zig").Problem = &.{},
 };
-
-/// Static headers, `Authorization: Bearer $bearer_token_env_var` and
-/// `env_http_headers` for an HTTP server. A missing bearer variable is an
-/// error (Codex); a missing header variable drops that header.
-fn mcpHttpHeaders(
-    arena: std.mem.Allocator,
-    http: @import("mcp/config.zig").Http,
-    environment: @import("mcp/config.zig").Environment,
-) ![]const @import("mcp/transport.zig").Header {
-    var headers: std.ArrayList(@import("mcp/transport.zig").Header) = .empty;
-    for (http.headers) |header| try headers.append(arena, .{ .name = header.name, .value = header.value });
-    for (http.env_headers) |header| {
-        const value = environment.get(header.value) orelse continue;
-        if (value.len == 0) continue;
-        try headers.append(arena, .{ .name = header.name, .value = value });
-    }
-    if (http.bearer_token_env_var) |variable| {
-        const token = environment.get(variable) orelse return error.McpBearerTokenUnset;
-        if (token.len == 0) return error.McpBearerTokenUnset;
-        try headers.append(arena, .{ .name = "Authorization", .value = try std.fmt.allocPrint(arena, "Bearer {s}", .{token}) });
-    }
-    return headers.toOwnedSlice(arena);
-}
-
-/// Startup work for one server, run on its own thread.
-const McpConnectJob = struct {
-    server: @import("mcp/config.zig").Server,
-    io: std.Io,
-    launch: ?@import("mcp/launch.zig").Launch = null,
-    http_headers: []const @import("mcp/transport.zig").Header = &.{},
-    log_fd: ?c_int = null,
-    log_path: []const u8 = "",
-    result: Result = .pending,
-
-    const Result = union(enum) {
-        pending,
-        failed: anyerror,
-        connected: struct { client: McpClient, tools_json: []u8 },
-    };
-
-    fn run(job: *McpConnectJob) void {
-        // c_allocator: the client allocates and frees per request for the
-        // whole session; the App arena could never reclaim that.
-        const options: @import("mcp/client.zig").ConnectOptions = .{
-            .spawn = .{ .argv = &.{} },
-            .startup_timeout_ms = job.server.startup_timeout_ms,
-            .request_timeout_ms = job.server.tool_timeout_ms,
-        };
-        var client = switch (job.server.transport) {
-            .stdio => blk: {
-                const launch = job.launch orelse {
-                    job.result = .{ .failed = error.McpLaunchUnavailable };
-                    return;
-                };
-                var stdio_options = options;
-                stdio_options.spawn = .{
-                    .argv = launch.argv,
-                    .env = launch.env,
-                    .cwd = launch.cwd,
-                    .stderr_fd = job.log_fd,
-                };
-                break :blk McpClient.connectWith(std.heap.c_allocator, stdio_options);
-            },
-            .http => |http| McpClient.connectHttp(std.heap.c_allocator, .{
-                .io = job.io,
-                .url = http.url,
-                .headers = job.http_headers,
-            }, options),
-        } catch |err| {
-            job.result = .{ .failed = err };
-            return;
-        };
-        client.transport.setDeadline(@import("util/time.zig").nowMs() + job.server.startup_timeout_ms);
-        const tools_json = client.listTools() catch |err| {
-            client.close();
-            job.result = .{ .failed = err };
-            return;
-        };
-        client.transport.setDeadline(null);
-        job.result = .{ .connected = .{ .client = client, .tools_json = tools_json } };
-    }
-};
-
-fn mcpFailureDetail(err: anyerror, job: *const McpConnectJob) []const u8 {
-    return switch (err) {
-        error.McpCommandNotFound => "command not found on the server's PATH",
-        error.SpawnFailed => "could not start the command",
-        error.Timeout, error.McpRequestTimeout => "no response before the startup timeout",
-        error.McpServerCrashed, error.Eof => if (job.log_path.len != 0) "server exited; see its log" else "server exited",
-        error.UnsupportedProtocolVersion => "server speaks no supported MCP revision",
-        error.McpAuthRequired => "the server requires authentication (401/403); OAuth login is not supported, configure a bearer token or headers",
-        error.McpBearerTokenUnset => "bearer_token_env_var is not set",
-        error.McpConnectFailed => "could not connect to the server URL",
-        error.McpInvalidUrl => "invalid server URL",
-        error.McpServerError => "the server answered with an HTTP 5xx error",
-        else => @errorName(err),
-    };
-}
 
 /// 从 Config 的方言字段构造 RequestOverrides(给 OpenAI/Gemini client 用)。
 /// reasoning_effort 不进 overrides(它有独立 legacy 字段 + setter,保持原路径)。

@@ -61,6 +61,7 @@ test {
     _ = @import("component/output_semantics_test.zig");
     _ = @import("component/message_origin_test.zig");
     _ = @import("component/startup_catalogs_test.zig");
+    _ = @import("component/mcp_background_startup_test.zig");
     _ = @import("component/stream_terminator_test.zig");
     _ = @import("component/time_context_test.zig");
     _ = @import("component/file_change_test.zig");

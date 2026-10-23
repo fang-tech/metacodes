@@ -187,6 +187,7 @@ pub const repl_headless = @import("repl/headless.zig");
 pub const repl_loop = @import("repl/loop.zig");
 pub const app_module = @import("app.zig");
 pub const app_route_strings = @import("app/route_strings.zig");
+pub const app_mcp_startup = @import("app/mcp_startup.zig");
 pub const app_install = @import("app/install.zig");
 pub const tool_context = @import("tools/context.zig");
 pub const project_rule_gate_protocol = @import("tools/project_rule_gate.zig");
@@ -799,11 +800,12 @@ pub fn main(init: std.process.Init) !void {
     // **必须在 App.init 之前**:init 期的 warn/err(如 KG 降级告警)否则抢在 gate 前直接打进终端,
     // 留在 TUI 上方成残行,且超宽行在 strict-autowrap 终端还会折行挤歪整屏。
     // 非 TUI 模式(teammate/serve/web/resume/headless/dump)无渲染流,保留 stderr 日志。
-    const interactive_tui = config.serve_port == null and config.web_port == null and
-        config.resume_response == null and config.prompt == null and
-        config.teammate_name.len == 0 and !config.dump_prompt and !config.dump_plugins;
+    const interactive_tui = interactiveRepl(config);
     const quiet_stderr = interactive_tui and !config.verbose and platform_term.isatty(2);
     if (quiet_stderr) log.setStderrEnabled(false);
+    // The REPL shows its prompt while MCP servers connect and joins them
+    // before its first request; every other frontend connects them in App.init.
+    if (interactive_tui) config.mcp_connect = .first_request;
 
     // Introspection builds the same App/Plugin snapshot but cannot issue a
     // provider request, so it neither requires credentials nor consumes the
@@ -1034,6 +1036,15 @@ pub fn main(init: std.process.Init) !void {
 
     // (stderr 日志 gate 已提前到 App.init 之前——见 interactive_tui;init 期日志同样不得上屏。)
     try repl.run(app, gpa, .{ .resumed = resumed, .splash = splash });
+}
+
+/// Whether this run ends in the interactive REPL (`repl.run`): no daemon,
+/// web, headless, resumed-suspension, teammate or dump frontend was asked
+/// for. Only that frontend shows a prompt before its MCP servers connect.
+pub fn interactiveRepl(config: types.Config) bool {
+    return config.serve_port == null and config.web_port == null and
+        config.resume_response == null and config.prompt == null and
+        config.teammate_name.len == 0 and !config.dump_prompt and !config.dump_plugins;
 }
 
 /// Write pipeable command output directly to stdout, without routing it through
@@ -3438,6 +3449,7 @@ test {
     _ = &@import("core/memory/memory_section.zig");
     _ = &@import("app.zig");
     _ = &@import("app/route_strings.zig");
+    _ = &@import("app/mcp_startup.zig");
     _ = &@import("app/install.zig");
     _ = &@import("app/kg_autostart.zig");
     _ = &@import("session_service.zig");

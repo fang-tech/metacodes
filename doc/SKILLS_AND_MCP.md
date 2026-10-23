@@ -244,6 +244,20 @@ Code's per-call `timeout` (milliseconds). `type` may be `stdio` (or absent with
   parallel). Tool calls are unbounded unless a tool timeout is configured
   (Codex entries default to 300 s); an expired call is cancelled with
   `notifications/cancelled`.
+- **Startup.** The interactive REPL shows its prompt while the servers
+  connect; the footer reads `connecting to MCP servers (n/total)`. The first
+  thing that sends a request (a message, a `/skill`, `/init` and the other
+  prompt commands, `/btw`, `/recap`, cron and `/loop` turns) waits until every
+  server has reported (the spinner reads `Connecting to MCP servers`; Esc or
+  Ctrl+C stops waiting and the turn does not start), and only then are the
+  tools registered and the tool list and system prompt built — once, so what
+  the model sees never depends on how fast a server answered. Leaving the
+  REPL while a server connects interrupts its handshake. Every other mode
+  (`-p`, `--web`, `serve`, `--teammate`, `--dump-*`) waits for the servers
+  before it starts, as before; their connects overlap the rest of startup.
+  After startup, failures are announced once in the footer, Claude Code's way
+  (`1 MCP server failed · /mcp`, `1 MCP server needs auth · /mcp` for a 401 or
+  403), until `/mcp` or the next turn.
 - **Logs.** Each stdio server's stderr goes to `<state root>/logs/mcp/<name>.log`.
 
 ### Tools
@@ -295,8 +309,10 @@ revisions 2025-11-25, 2025-06-18, 2025-03-26 and 2024-11-05:
 ### `/mcp`
 
 `/mcp` lists every configured server with its source, state (connected and
-the negotiated revision, or why it failed), tool count and log, followed by
-project servers awaiting approval, disabled names and configuration problems.
+the negotiated revision, needs authentication, or why it failed), tool count
+and log, followed by project servers awaiting approval, disabled names and
+configuration problems. While servers are still connecting it shows each one's
+state so far (`connecting… 3s`), without waiting for them.
 The tool list is fixed for a session (it is part of the cached prompt); when a
 server announces `notifications/tools/list_changed`, `/mcp` says so and the new
 list applies after a restart.
