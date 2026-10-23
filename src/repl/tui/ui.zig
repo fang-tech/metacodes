@@ -43,7 +43,7 @@ pub const Frame = struct {
 /// 纯状态转移。改 state + 返回 Effect(副作用描述)。绝不碰 IO。
 pub fn dispatch(state: *UiState, ev: Event) Effect {
     switch (ev) {
-        .key => |k| return dispatchKey(state, k.key),
+        .key => |k| return dispatchKey(state, k.key, k.now_ms),
         .spinner_tick => {
             state.spinner.frame +%= 1;
             return .{ .redraw_region = true };
@@ -110,7 +110,7 @@ pub fn dispatch(state: *UiState, ev: Event) Effect {
     }
 }
 
-fn dispatchKey(state: *UiState, key: input.Key) Effect {
+fn dispatchKey(state: *UiState, key: input.Key, now_ms: i64) Effect {
     // Ctrl+X Ctrl+K 序列(Emacs 双键前缀,杀后台任务)。arming 在 UiState,dispatch 统一处理。
     // 进入即消费上次的 armed(每键清一次,除非本键是 Ctrl+X 重新设)→ 防粘连。
     const was_x_armed = state.ctrl_x_armed;
@@ -169,6 +169,24 @@ fn dispatchKey(state: *UiState, key: input.Key) Effect {
         help_closed = true; // 标记:末尾 pass_to_editor 要带 redraw_region(让 help 菜单消屏)。
     }
 
+    // Idle prompt: Ctrl+C and an empty prompt's Ctrl+D exit on a second press
+    // inside the window (Claude Code `useExitOnCtrlCD`); the first press shows
+    // `Press Ctrl-C again to exit` in the footer. Ctrl+C also discards the
+    // draft. Nothing reaches the scrollback. A reply in flight owns these keys
+    // (the watcher interrupts it), so this is input-phase only.
+    if (state.phase == .input) switch (key) {
+        .ctrl_c => {
+            if (state.press.press(.exit_ctrl_c, now_ms)) return .{ .action = .exit_prompt };
+            if (state.editor.view.len > 0) return .{ .redraw_region = true, .action = .discard_draft };
+            return .{ .redraw_region = true };
+        },
+        .ctrl_d => if (state.editor.view.len == 0) {
+            if (state.press.press(.exit_ctrl_d, now_ms)) return .{ .action = .exit_prompt };
+            return .{ .redraw_region = true };
+        },
+        else => {},
+    };
+
     // Ctrl+O → 打开 model picker(issue #16;transcript 查看器移到 Ctrl+X Ctrl+O)。
     // dispatch 不碰 fd/registry/网络,上抛 .open_model_picker,快照刷新与渲染留调用方。
     // 两期共用:生成中也能开,改动只影响下一轮。
@@ -190,8 +208,17 @@ fn dispatchKey(state: *UiState, key: input.Key) Effect {
         return .{ .redraw_region = true };
     }
 
+    // Esc closes whichever suggestion menu the draft opened and keeps the
+    // draft (Claude Code); the next Esc is the draft's own double press.
+    // While dismissed the menus neither render nor take ↑/↓/Enter/Tab.
+    const menus_dismissed = state.menu_dismissal.covers(state.editor.view);
+    if (state.phase == .input and key == .esc and !menus_dismissed and suggestionMenuOpen(state)) {
+        state.menu_dismissal.dismiss(state.editor.view);
+        return .{ .redraw_region = true };
+    }
+
     // ── /models 两级账号 API key / model 菜单导航。必须先于普通 slash 菜单。
-    {
+    if (!menus_dismissed) {
         const gen_models = state.phase == .generating;
         if (!gen_models and complete.modelsMenuOpen(state.editor.view)) {
             switch (key) {
@@ -205,7 +232,7 @@ fn dispatchKey(state: *UiState, key: input.Key) Effect {
 
     // ── /model 服务端 catalog 菜单导航。必须先于普通 slash 菜单,否则 `/model`
     // 会被当成单个 slash command,方向键无法选择模型。
-    {
+    if (!menus_dismissed) {
         const gen0 = state.phase == .generating;
         if (!gen0 and complete.modelMenuOpen(state.editor.view)) {
             switch (key) {
@@ -221,7 +248,7 @@ fn dispatchKey(state: *UiState, key: input.Key) Effect {
     // ── slash 菜单导航(对齐 cc DIFF#4:`/` 菜单 ↑↓ 移高亮 + Enter 选中 + Tab 补全)──────
     // 仅输入期 + 菜单开(`/` 前缀无空格且有匹配)时介入,抢 ↑↓/Enter/Tab 语义;
     // 否则这些键照常走历史导航/提交/补全。菜单关时 slash_sel 恒 0(下方非 `/` 态会重置)。
-    {
+    if (!menus_dismissed) {
         const gen0 = state.phase == .generating;
         const view = state.editor.view;
         if (!gen0 and complete.slashMenuOpen(state.slash_catalog, view)) {
@@ -246,7 +273,7 @@ fn dispatchKey(state: *UiState, key: input.Key) Effect {
     // ── @-mention 菜单导航(对齐 cc DIFF#5)──────────────────────────────────────
     // dispatch 无 allocator → 不能算文件候选数,只能检测 @ 激活并上抛动作;
     // 候选数/slash_sel 钳位 + 插入由 loop.zig(有 allocator)处理。
-    {
+    if (!menus_dismissed) {
         const gen1 = state.phase == .generating;
         if (!gen1 and complete.atMenuActive(state.editor.view, state.editor.cursor)) {
             switch (key) {
@@ -357,6 +384,16 @@ fn dispatchKey(state: *UiState, key: input.Key) Effect {
         }
     }
 
+    // Idle prompt Esc: a second press inside the window clears the draft and
+    // keeps it in history; the first shows `Esc again to clear` (Claude Code
+    // `useTextInput`). An empty prompt has nothing to clear. During a reply
+    // Esc interrupts, which the watcher owns.
+    if (state.phase == .input and key == .esc) {
+        if (state.editor.view.len == 0) return .{};
+        if (state.press.press(.clear_input, now_ms)) return .{ .redraw_region = true, .action = .clear_draft };
+        return .{ .redraw_region = true };
+    }
+
     // ── 全局快捷键:dispatch 识别 → 上抛 LoopAction,IO 体留调用方(两期共用解析)──────
     // 按 UiState gate:生成期对无意义的键(history/complete/reverse_search/external_edit)
     // 直接吞掉(无补全器/无搜索 UI/不起 $EDITOR),不上抛、不透传。
@@ -380,6 +417,32 @@ fn dispatchKey(state: *UiState, key: input.Key) Effect {
     return .{ .redraw_region = help_closed, .action = .pass_to_editor };
 }
 
+/// The footer line while an exit press is armed (it replaces the whole line).
+pub fn exitHint(state: *const UiState) ?[]const u8 {
+    return switch (state.press.kind) {
+        .exit_ctrl_c => "Press Ctrl-C again to exit",
+        .exit_ctrl_d => "Press Ctrl-D again to exit",
+        .none, .clear_input => null,
+    };
+}
+
+/// The one-line notice right-aligned above the input box: the Esc double
+/// press outranks the yank hint.
+pub fn aboveBoxNotice(state: *const UiState) ?[]const u8 {
+    if (state.press.kind == .clear_input) return "Esc again to clear";
+    if (state.paste_hint) return "Ctrl+Y to paste deleted text";
+    return null;
+}
+
+/// A suggestion menu the draft opens on its own: `/models`, `/model`, the `/`
+/// command menu, or an `@` file mention under the cursor.
+pub fn suggestionMenuOpen(state: *const UiState) bool {
+    const view = state.editor.view;
+    return complete.modelsMenuOpen(view) or complete.modelMenuOpen(view) or
+        complete.slashMenuOpen(state.slash_catalog, view) or
+        complete.atMenuActive(view, state.editor.cursor);
+}
+
 // ============================ render ============================
 
 /// 纯投影:state → 帧字节写入 w。按 phase 渲染输入/生成帧。
@@ -393,57 +456,86 @@ pub fn render(w: anytype, in: RenderInputs) !Frame {
     };
 }
 
-/// 快捷键面板(多列;窄终端降级)。对齐 CC `?` for shortcuts。
-const SHORTCUTS = [_][2][]const u8{
-    .{ "Ctrl+O", "Model picker" },
-    .{ "Ctrl+X Ctrl+O", "Open transcript" },
-    .{ "Shift+Tab", "Cycle mode" },
-    .{ "Esc", "Interrupt task" },
-    .{ "Ctrl+C", "Cancel / quit" },
-    .{ "Ctrl+R", "History search" },
-    .{ "Ctrl+T", "Toggle task list" },
-    .{ "Ctrl+G", "Edit in $EDITOR" },
-    .{ "Ctrl+A/E", "Line start/end" },
-    .{ "Ctrl+U/K", "Kill line" },
-    .{ "Ctrl+W", "Kill word" },
-    .{ "Ctrl+Y", "Yank" },
-    .{ "Ctrl+_", "Undo" },
-    .{ "!cmd", "Bash mode" },
-    .{ "/help", "Commands" },
+/// The `?` shortcut panel and the Shortcuts block of `/help`, phrased and laid
+/// out like Claude Code's (`! for shell mode`, column-major, three columns
+/// when the terminal is wide enough). Every entry names a key this REPL
+/// actually binds.
+pub const SHORTCUTS = [_][]const u8{
+    "! for shell mode",
+    "/ for commands",
+    "@ for file paths",
+    "/btw for side question",
+    "double tap esc to clear input",
+    "shift + tab to cycle modes",
+    "ctrl + o to choose a model",
+    "ctrl + t to toggle tasks",
+    "\\ + return for newline",
+    "ctrl + _ to undo",
+    "ctrl + r to search history",
+    "ctrl + g to edit in $EDITOR",
+    "ctrl + x ctrl + o for transcript",
+    "ctrl + b to run a reply in background",
 };
+
+const SHORTCUT_GAP: usize = 2;
+
+/// Columns the grid uses at `cols`: as many of three as fit, at least one.
+pub fn shortcutColumns(cols: usize) usize {
+    var n: usize = 3;
+    while (n > 1) : (n -= 1) {
+        if (shortcutGridWidth(n) <= cols) return n;
+    }
+    return 1;
+}
+
+fn shortcutRowsFor(ncol: usize) usize {
+    return (SHORTCUTS.len + ncol - 1) / ncol;
+}
+
+fn shortcutColumnWidth(ncol: usize, col: usize) usize {
+    const rows = shortcutRowsFor(ncol);
+    var widest: usize = 0;
+    var r: usize = 0;
+    while (r < rows) : (r += 1) {
+        const i = col * rows + r;
+        if (i < SHORTCUTS.len) widest = @max(widest, term.displayWidth(SHORTCUTS[i]));
+    }
+    return widest;
+}
+
+fn shortcutGridWidth(ncol: usize) usize {
+    var total: usize = 2; // indent
+    var c: usize = 0;
+    while (c < ncol) : (c += 1) total += shortcutColumnWidth(ncol, c) + (if (c + 1 < ncol) SHORTCUT_GAP else 0);
+    return total;
+}
 
 /// help_open 时画在 footer 区的快捷键菜单(**非模态**,输入框在上方仍可打字)。
 /// 对齐 cc PromptInputHelpMenu:多列紧凑布局,占据 footer 行位置。返回写出的行数。
 /// pub + 泛型 writer/theme/cols:render_region(真 tty 输入帧)复用同一份,避免第三处重复。
 /// 注:行首不写 clear.line(调用方按需注入,如 render_region 自带 ansi.clear.line)。
 pub fn renderHelpLines(w: anytype, th: Theme, cols: u16) !u16 {
-    // 每项宽度预算(key 12 + desc ~18 + 间隔)。窄终端 1 列,够宽 2 列。
-    const per_item: u16 = 34;
-    const ncol: usize = if (cols >= per_item * 2) 2 else 1;
-    var rows: u16 = 0;
-    var i: usize = 0;
-    while (i < SHORTCUTS.len) : (i += ncol) {
+    const ncol = shortcutColumns(cols);
+    const rows = shortcutRowsFor(ncol);
+    var r: usize = 0;
+    while (r < rows) : (r += 1) {
         try w.writeAll(th.dim);
+        try w.writeAll("  ");
         var c: usize = 0;
-        while (c < ncol and i + c < SHORTCUTS.len) : (c += 1) {
-            const sc = SHORTCUTS[i + c];
-            try w.print("  {s}", .{sc[0]});
-            const kw = term.displayWidth(sc[0]);
-            var pad: usize = if (kw < 12) 12 - kw else 1;
-            while (pad > 0) : (pad -= 1) try w.writeAll(" ");
-            try w.writeAll(sc[1]);
-            // 列间补到 per_item 宽(末列不补)。
-            if (c + 1 < ncol and i + c + 1 < SHORTCUTS.len) {
-                const used = 2 + 12 + term.displayWidth(sc[1]);
-                var gap: usize = if (used < per_item) per_item - used else 1;
-                while (gap > 0) : (gap -= 1) try w.writeAll(" ");
+        while (c < ncol) : (c += 1) {
+            const i = c * rows + r;
+            const entry = if (i < SHORTCUTS.len) SHORTCUTS[i] else "";
+            try w.writeAll(entry);
+            // Pad to the column (the last column is not padded).
+            if (c + 1 < ncol and (c + 1) * rows + r < SHORTCUTS.len) {
+                var pad = shortcutColumnWidth(ncol, c) + SHORTCUT_GAP - term.displayWidth(entry);
+                while (pad > 0) : (pad -= 1) try w.writeAll(" ");
             }
         }
         try w.writeAll(th.reset);
         try w.writeAll("\r\n");
-        rows += 1;
     }
-    return rows;
+    return @intCast(rows);
 }
 
 /// 输入期帧(阶段 0 最简版:❯ + editor view + footer 行)。
@@ -492,6 +584,10 @@ fn renderGenFrame(w: anytype, in: RenderInputs) !Frame {
 pub fn renderFooterLine(w: anytype, in: RenderInputs) !u16 {
     const th = in.theme;
     const s = in.state;
+    if (exitHint(s)) |text| {
+        try w.print("{s} {s}{s}\r\n", .{ th.dim, text, th.reset });
+        return 1;
+    }
     const sb = @import("widget/status_bar.zig");
     const mode_pm = s.footer.mode;
     const sym = sb.modeSymbol(mode_pm);
@@ -575,11 +671,26 @@ test "issue #16: an open picker never traps the session" {
 test "issue #16: `?` help lists both the picker and its replacement binding" {
     var found_picker = false;
     var found_transcript = false;
-    for (SHORTCUTS) |row| {
-        if (std.mem.eql(u8, row[0], "Ctrl+O") and std.mem.eql(u8, row[1], "Model picker")) found_picker = true;
-        if (std.mem.eql(u8, row[0], "Ctrl+X Ctrl+O")) found_transcript = true;
+    for (SHORTCUTS) |entry| {
+        if (std.mem.eql(u8, entry, "ctrl + o to choose a model")) found_picker = true;
+        if (std.mem.eql(u8, entry, "ctrl + x ctrl + o for transcript")) found_transcript = true;
     }
     // A moved binding that is not documented is a binding users lose.
     try testing.expect(found_picker);
     try testing.expect(found_transcript);
+}
+
+test "shortcut grid: three columns when they fit, fewer on a narrow terminal" {
+    try testing.expectEqual(@as(usize, 3), shortcutColumns(120));
+    try testing.expectEqual(@as(usize, 2), shortcutColumns(80));
+    try testing.expectEqual(@as(usize, 1), shortcutColumns(40));
+    // Every row fits the width it was laid out for.
+    for ([_]u16{ 40, 80, 120 }) |cols| {
+        var buf: [4096]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&buf);
+        const rows = try renderHelpLines(&w, @import("theme.zig").monochrome, cols);
+        try testing.expectEqual(@as(u16, @intCast((SHORTCUTS.len + shortcutColumns(cols) - 1) / shortcutColumns(cols))), rows);
+        var it = std.mem.splitSequence(u8, w.buffered(), "\r\n");
+        while (it.next()) |line| try testing.expect(term.displayWidth(line) <= cols);
+    }
 }

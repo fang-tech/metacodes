@@ -62,9 +62,14 @@ pub const PrepareError = CapabilityError || error{
     ClientIdMissing,
 };
 
+/// Why `prepareFlow` refuses: a `PrepareError`, or a client id offered to a
+/// provider that signs in with a client of its own (Metask), which would
+/// otherwise be ignored.
+pub const FlowError = PrepareError || error{ClientIdFixed};
+
 pub const Error = PrepareError || error{UnknownProvider};
 
-pub fn refusalText(err: PrepareError, method: Method) []const u8 {
+pub fn refusalText(err: FlowError, method: Method) []const u8 {
     return switch (err) {
         error.ProviderHasNoTokenEndpoint => "that provider declares no OAuth token endpoint",
         error.ProviderAcceptsNoOAuthKind => "that provider accepts no OAuth credential kind; a stored login would never be consulted",
@@ -73,6 +78,7 @@ pub fn refusalText(err: PrepareError, method: Method) []const u8 {
             .device_code => "that provider declares no device authorization endpoint",
         },
         error.ClientIdMissing => "that provider declares no OAuth client id; pass --client-id or set providers.<id>.oauth_client_id in <state root>/config.json",
+        error.ClientIdFixed => "that provider signs in with its own client; drop --client-id",
     };
 }
 
@@ -123,6 +129,7 @@ pub const Prepared = struct {
         notify: oauth_login.Notify,
         diagnostic: ?*ImportDiagnostic,
     ) !Outcome {
+        const provider_id = self.profile.id;
         const token_json = try oauth_login.acquireFirstToken(allocator, io, .{
             // Checked by `prepare`; unwrapped here so the flow gets a plain URL.
             .token_url = self.profile.oauth_token_url.?,
@@ -142,10 +149,102 @@ pub const Prepared = struct {
             std.crypto.secureZero(u8, token_json);
             allocator.free(token_json);
         }
-        try importTokenResponse(allocator, self.options.state_root, self.profile.id, token_json, self.client_id, diagnostic);
-        return .{ .provider_id = self.profile.id, .client_id_source = self.client_id_source };
+        try importTokenResponse(allocator, self.options.state_root, provider_id, token_json, self.client_id, diagnostic);
+        return .{ .provider_id = provider_id, .client_id_source = self.client_id_source };
     }
 };
+
+/// Metask's sign-in (#33): its control plane runs its own JSON device grant
+/// (`metask_oauth`), not RFC 8628, so it is not a `Prepared` OAuth profile.
+/// The token response ends in the same `importTokenResponse` every login
+/// ends in, which applies Metask's gateway rules and stores no client id.
+pub const MetaskPrepared = struct {
+    options: Options,
+
+    pub fn run(
+        self: MetaskPrepared,
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        notify: oauth_login.Notify,
+        diagnostic: ?*ImportDiagnostic,
+    ) !Outcome {
+        var hostname_buf: HostNameBuffer = undefined;
+        const token_json = try metask_oauth.acquireDeviceTokenWith(
+            allocator,
+            io,
+            metask_oauth.siteUrl(),
+            hostName(&hostname_buf),
+            self.options.open_browser,
+            .{ .ctx = @ptrCast(@constCast(&notify)), .show = showDeviceCode },
+            self.options.abort_signal,
+        );
+        defer {
+            std.crypto.secureZero(u8, token_json);
+            allocator.free(token_json);
+        }
+        const metask = provider_ids.Slug.lit("metask");
+        try importTokenResponse(allocator, self.options.state_root, metask, token_json, null, diagnostic);
+        return .{ .provider_id = metask, .client_id_source = .declared };
+    }
+
+    /// The device page and code, in the words the generic device flow uses.
+    fn showDeviceCode(ctx: ?*anyopaque, uri: []const u8, code: []const u8) void {
+        const notify: *const oauth_login.Notify = @ptrCast(@alignCast(ctx.?));
+        var buffer: [1024]u8 = undefined;
+        notify.say(std.fmt.bufPrint(&buffer, "Open {s} and enter the code {s}\n\n", .{ uri, code }) catch "Open the Metask device page and enter the code it asks for.\n");
+    }
+};
+
+const is_windows = @import("builtin").os.tag == .windows;
+const HostNameBuffer = if (is_windows) [1]u8 else [std.posix.HOST_NAME_MAX]u8;
+
+/// The kernel-reported host name (sent to the Metask device grant so the
+/// authorization page can say which machine asks); `localhost` when unknown.
+/// HOSTNAME is often unset on macOS and is not authoritative when inherited.
+fn hostName(buffer: *HostNameBuffer) []const u8 {
+    return if (is_windows) "localhost" else blk: {
+        const resolved = std.posix.gethostname(buffer) catch break :blk "localhost";
+        break :blk if (resolved.len == 0) "localhost" else resolved;
+    };
+}
+
+/// A sign-in that passed every refusal check: the generic OAuth grant for a
+/// profile, or Metask's own device grant. The TUI's login worker runs either.
+pub const Flow = union(enum) {
+    oauth: Prepared,
+    metask: MetaskPrepared,
+
+    pub fn options(self: *Flow) *Options {
+        return switch (self.*) {
+            .oauth => |*prepared| &prepared.options,
+            .metask => |*prepared| &prepared.options,
+        };
+    }
+
+    pub fn run(
+        self: Flow,
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        notify: oauth_login.Notify,
+        diagnostic: ?*ImportDiagnostic,
+    ) !Outcome {
+        return switch (self) {
+            .oauth => |prepared| prepared.run(allocator, io, notify, diagnostic),
+            .metask => |prepared| prepared.run(allocator, io, notify, diagnostic),
+        };
+    }
+};
+
+/// The flow `/login` runs for `profile`: Metask's own grant, or the generic
+/// one when the profile passes `prepareProfileWith`.
+pub fn prepareFlow(profile: *const provider_profile.ProviderProfile, options: Options, configured: ?[]const u8) FlowError!Flow {
+    if (profile.id.eqlText("metask")) {
+        try requireOAuthCapable(profile);
+        if (options.client_id != null) return error.ClientIdFixed;
+        return .{ .metask = .{ .options = options } };
+    }
+    return .{ .oauth = try prepareProfileWith(profile, options, configured) };
+}
 
 /// Refuse a profile whose stored login could never be used. Both login paths
 /// ask this before doing anything the user would have to undo — the token-JSON
@@ -285,4 +384,12 @@ test "the client id precedence is explicit, then configured, then declared" {
     const declared = try prepareProfileWith(&undeclared, .{ .state_root = "" }, null);
     try std.testing.expectEqual(ClientIdSource.declared, declared.client_id_source);
     try std.testing.expectEqualStrings("declared-client", declared.client_id);
+}
+
+test "prepareFlow: Metask runs its own grant and refuses a client id it would ignore" {
+    const metask_profile = @import("../provider/profiles/metask.zig").PROFILE;
+    const flow = try prepareFlow(&metask_profile, .{ .state_root = "/state", .open_browser = false }, null);
+    try std.testing.expect(flow == .metask);
+    try std.testing.expect(!flow.metask.options.open_browser);
+    try std.testing.expectError(error.ClientIdFixed, prepareFlow(&metask_profile, .{ .state_root = "/state", .client_id = "x" }, null));
 }

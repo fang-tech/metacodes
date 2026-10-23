@@ -86,8 +86,11 @@ Interactive surfaces: `Ctrl+O` and `/model` open the route picker (transcript
 viewing moved to `Ctrl+X Ctrl+O`, also `/transcript`); `/providers` lists routes
 and takes `refresh`, `enable <id>`, `disable <id>`, `remove <id>`; `/alias`
 names a route (`pin`, `float`, `use`, `remove`); `/models` still selects the
-account key; `/login <id> [--device-code] [--no-browser] [--client-id <client>]`
-runs the kernel OAuth flow for a provider and stores the login where
+account key; `/login` opens a Login pane listing the providers this
+installation can sign in to (Metask's own device grant included), and
+`/login <id> [--device-code] [--no-browser] [--client-id <client>]` starts that
+provider's sign-in directly; either runs the kernel OAuth flow on a worker
+thread (`Esc` cancels it) and stores the login where
 `metacodes login --provider <id>` does (issue #33); `--client-id` is needed
 only when neither the profile nor `providers.<id>.oauth_client_id` in
 `~/.metacodes/config.json` names the installation's registered client (#87). Choosing a route whose
@@ -174,7 +177,25 @@ surface is fail-closed: an unknown flag or positional argument exits with code
 2 and names the offender — nothing is silently ignored, because evaluation
 harnesses pass treatment configuration through this surface. Headless
 automation uses `-p/--print` (or `-` for stdin) with `--json`/`--stream-json`
-NDJSON output; introspection uses `--dump-prompt` and `--dump-plugins`. Every
+NDJSON output; introspection uses `--dump-prompt` and `--dump-plugins`.
+`metacodes --resume <id>` starts the interactive REPL as a stored session of
+the working directory (an id or id prefix, the rule `/resume <id>` uses) with
+its conversation, goal and model route restored, and appends to the same
+transcript. Under the banner, the REPL writes the conversation back as its
+turns were shown live (`src/repl/replay.zig`: prompts, replies and tool cards
+through the live rendering paths; at most the last 200 messages, opening at a
+typed prompt, after a dim count of the rest; Ctrl+O shows all of it). What the
+live view never showed stays out: messages the runtime wrote itself
+(`Message.origin = host`, recorded as `"origin":"host"` in `transcript.jsonl`;
+a record without the key is the user's or the model's) and text blocks that
+ride along with tool results. `/resume <id>` clears the screen and does the
+same, then shows the command and what it restored. An id that names no session exits 1 before the REPL starts;
+`--resume` beside `-p`/`-`, `--web`, `serve`, `--resume-response`, `--session`,
+`--teammate` or `--dump-*` is a usage error. When an interactive session whose
+transcript is on disk exits (`/exit`, Ctrl+C or Ctrl+D twice, EOF), the REPL
+prints, dim, `Resume this session with:` and `metacodes --resume <id>` (with
+`--state-dir <dir>` when that flag chose the state root); a session that never
+persisted a turn, and a run whose stdin is not a terminal, print nothing. Every
 NDJSON line is valid UTF-8: string fields go through the repository's JSON
 encoder, which replaces bytes that are not valid UTF-8 (binary tool output,
 such as a PDF read with `Read`) with U+FFFD while `content_bytes` and

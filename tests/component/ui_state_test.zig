@@ -134,17 +134,104 @@ test "dispatch: 单 Ctrl+K(无 arming)→ pass_to_editor(kill-line 归 editor)" 
     try testing.expectEqual(event.LoopAction.pass_to_editor, e.action); // editor 当 kill-line
 }
 
-test "dispatch: 裸 esc(无 help/overlay)→ pass_to_editor(输入期 clear_draft 归 editor)" {
+fn keyAt(k: input.Key, now_ms: i64) event.Event {
+    return .{ .key = .{ .key = k, .now_ms = now_ms } };
+}
+
+test "dispatch: Esc on an empty idle prompt does nothing" {
     var s = UiState{};
-    const e = ui.dispatch(&s, keyTag(.esc));
-    try testing.expectEqual(event.LoopAction.pass_to_editor, e.action);
+    const e = ui.dispatch(&s, keyAt(.esc, 0));
+    try testing.expectEqual(event.LoopAction.none, e.action);
+    try testing.expect(!e.redraw_region);
+    try testing.expectEqual(ui_state.DoublePress.Kind.none, s.press.kind);
+}
+
+test "dispatch: Esc Esc clears the draft; the first press only shows the hint" {
+    var s = UiState{ .editor = .{ .view = "hello", .cursor = 5 } };
+    const first = ui.dispatch(&s, keyAt(.esc, 1000));
+    try testing.expectEqual(event.LoopAction.none, first.action);
+    try testing.expect(first.redraw_region);
+    try testing.expectEqualStrings("Esc again to clear", ui.aboveBoxNotice(&s).?);
+    const second = ui.dispatch(&s, keyAt(.esc, 1500));
+    try testing.expectEqual(event.LoopAction.clear_draft, second.action);
+    try testing.expect(ui.aboveBoxNotice(&s) == null);
+}
+
+test "dispatch: an Esc after the window re-arms instead of clearing" {
+    var s = UiState{ .editor = .{ .view = "hello", .cursor = 5 } };
+    _ = ui.dispatch(&s, keyAt(.esc, 0));
+    const late = ui.dispatch(&s, keyAt(.esc, ui_state.DOUBLE_PRESS_MS + 1));
+    try testing.expectEqual(event.LoopAction.none, late.action);
+    try testing.expectEqualStrings("Esc again to clear", ui.aboveBoxNotice(&s).?);
+}
+
+test "dispatch: Esc during a reply is the watcher's interrupt, not a clear" {
+    var s = UiState{ .phase = .generating, .editor = .{ .view = "queued", .cursor = 6 } };
+    try testing.expectEqual(event.LoopAction.pass_to_editor, ui.dispatch(&s, keyAt(.esc, 0)).action);
+    try testing.expectEqual(event.LoopAction.pass_to_editor, ui.dispatch(&s, keyAt(.esc, 1)).action);
+}
+
+test "dispatch: Ctrl+C twice inside the window exits; the first discards the draft" {
+    var s = UiState{ .editor = .{ .view = "draft", .cursor = 5 } };
+    const first = ui.dispatch(&s, keyAt(.ctrl_c, 0));
+    try testing.expectEqual(event.LoopAction.discard_draft, first.action);
+    try testing.expectEqualStrings("Press Ctrl-C again to exit", ui.exitHint(&s).?);
+    s.editor = .{}; // the loop discarded it
+    try testing.expectEqual(event.LoopAction.exit_prompt, ui.dispatch(&s, keyAt(.ctrl_c, 700)).action);
+}
+
+test "dispatch: a lone Ctrl+C expires and the next one only re-arms" {
+    var s = UiState{};
+    try testing.expectEqual(event.LoopAction.none, ui.dispatch(&s, keyAt(.ctrl_c, 0)).action);
+    try testing.expect(s.press.expire(ui_state.DOUBLE_PRESS_MS + 1));
+    try testing.expect(ui.exitHint(&s) == null);
+    try testing.expectEqual(event.LoopAction.none, ui.dispatch(&s, keyAt(.ctrl_c, 2000)).action);
+    try testing.expectEqualStrings("Press Ctrl-C again to exit", ui.exitHint(&s).?);
+}
+
+test "dispatch: Ctrl+D exits on an empty prompt only, and deletes forward otherwise" {
+    var s = UiState{};
+    try testing.expectEqual(event.LoopAction.none, ui.dispatch(&s, keyAt(.ctrl_d, 0)).action);
+    try testing.expectEqualStrings("Press Ctrl-D again to exit", ui.exitHint(&s).?);
+    try testing.expectEqual(event.LoopAction.exit_prompt, ui.dispatch(&s, keyAt(.ctrl_d, 100)).action);
+
+    var typed = UiState{ .editor = .{ .view = "abc", .cursor = 0 } };
+    try testing.expectEqual(event.LoopAction.pass_to_editor, ui.dispatch(&typed, keyAt(.ctrl_d, 0)).action);
+    try testing.expectEqual(event.LoopAction.pass_to_editor, ui.dispatch(&typed, keyAt(.ctrl_d, 1)).action);
+}
+
+test "dispatch: Ctrl+C then Ctrl+D do not confirm each other" {
+    var s = UiState{};
+    _ = ui.dispatch(&s, keyAt(.ctrl_c, 0));
+    try testing.expectEqual(event.LoopAction.none, ui.dispatch(&s, keyAt(.ctrl_d, 10)).action);
+    try testing.expectEqualStrings("Press Ctrl-D again to exit", ui.exitHint(&s).?);
+}
+
+test "dispatch: Esc closes the slash menu and keeps the draft; an edit reopens it" {
+    var s = UiState{ .editor = .{ .view = "/he", .cursor = 3 } };
+    try testing.expect(ui.suggestionMenuOpen(&s));
+    const close = ui.dispatch(&s, keyAt(.esc, 0));
+    try testing.expectEqual(event.LoopAction.none, close.action);
+    try testing.expect(close.redraw_region);
+    try testing.expect(s.menu_dismissal.covers("/he"));
+    // The menu no longer takes Enter: it submits the draft as typed.
+    try testing.expectEqual(event.LoopAction.pass_to_editor, ui.dispatch(&s, keyAt(.enter, 10)).action);
+    // Closing the menu did not arm the clear: Esc now starts the draft's double press.
+    _ = ui.dispatch(&s, keyAt(.esc, 20));
+    try testing.expectEqualStrings("Esc again to clear", ui.aboveBoxNotice(&s).?);
+    try testing.expectEqual(event.LoopAction.clear_draft, ui.dispatch(&s, keyAt(.esc, 30)).action);
+    // A changed draft is a different menu.
+    s.editor = .{ .view = "/hel", .cursor = 4 };
+    try testing.expect(!s.menu_dismissal.covers("/hel"));
+    try testing.expectEqual(event.LoopAction.slash_select, ui.dispatch(&s, keyAt(.enter, 40)).action);
 }
 
 test "dispatch: help 开时 esc → 只关 help,不透传(先关弹层)" {
     var s = UiState{ .help_open = true };
     const e = ui.dispatch(&s, keyTag(.esc));
     try testing.expect(!s.help_open); // help 关闭
-    try testing.expectEqual(event.LoopAction.none, e.action); // 不透传(不触发 editor clear_draft)
+    try testing.expectEqual(event.LoopAction.none, e.action); // 不透传(不武装 Esc 的清空)
+    try testing.expectEqual(ui_state.DoublePress.Kind.none, s.press.kind);
     try testing.expect(e.redraw_region);
 }
 
@@ -285,11 +372,13 @@ test "dispatch: slash 菜单 → 打字过滤变窄,slash_sel 钳到末项" {
 }
 
 test "slashNthMatch: 顺序与表一致" {
+    // The table is alphabetical (Claude Code's menu order).
     const c0 = complete.slashNthMatch(.builtin, "/", 0).?;
-    try testing.expectEqualStrings("/help", c0.name);
-    // /c 前缀:/clear /compact /cost /config /commit(按表顺序)
+    try testing.expectEqualStrings("/add-dir", c0.name);
+    // /c 前缀:/clear /commit /compact /config /cost(按表顺序)
     const cc0 = complete.slashNthMatch(.builtin, "/c", 0).?;
     try testing.expectEqualStrings("/clear", cc0.name);
+    try testing.expectEqualStrings("/commit", complete.slashNthMatch(.builtin, "/c", 1).?.name);
 }
 
 // ── DIFF#5: @-mention 菜单(dispatch 检测 @ 激活 → 上抛 at_nav/at_select)──────────

@@ -46,6 +46,13 @@ pub fn isHostInjectedText(text: []const u8) bool {
     return false;
 }
 
+/// A text block of `m` the runtime wrote rather than the user: any text of a
+/// host message (`Message.Origin.host`), or, in a record from before that
+/// field, a gate text that opens with its marker.
+pub fn isHostText(m: @import("message.zig").Message, text: []const u8) bool {
+    return m.origin == .host or isHostInjectedText(text);
+}
+
 test "isHostInjectedText: gate markers, not user prose" {
     try std.testing.expect(isHostInjectedText("[progress update]\nplease"));
     try std.testing.expect(isHostInjectedText("[delivery cadence]\nplease"));

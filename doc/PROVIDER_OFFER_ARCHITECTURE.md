@@ -645,17 +645,22 @@ by several routes is reported with their offer ids instead of guessed, and an
 offer id is accepted verbatim. Names the catalog does not declare fall through
 to the historical path, which still serves proxies and server-catalog models.
 
-`/login <provider> [--device-code] [--no-browser] [--client-id <client>]` is
-the TUI's OAuth setup path (issue #33). It is the kernel flow the CLI runs —
+`/login [<provider>] [--device-code] [--no-browser] [--client-id <client>]` is
+the TUI's OAuth setup path (issue #33). Without a provider it opens a Login
+pane listing every provider `provider_login.prepareFlow` accepts; with one it
+starts that provider's sign-in. It is the kernel flow the CLI runs —
 `api/provider_login.zig` decides whether a login can start and typed-refuses
-when it cannot, `api/oauth_login.zig` runs the grant — with the REPL's
-transcript as the notify sink, and it ends in the same durable import, so a
-login made here and one made from the shell are indistinguishable afterwards.
-`/login` blocks the REPL until the flow completes, as `metacodes login` blocks
-the terminal; Metask keeps its own JSON device grant on the CLI. The loopback
-wait polls its socket (`platform/net.pollReadable`) and checks an
-`AbortSignal` every 100 ms, and the device-code poll sleeps in the same
-slices, so either flow can be cancelled from another thread (#67).
+when it cannot, `api/oauth_login.zig` runs the generic grant and
+`api/metask_oauth.zig` Metask's own JSON device grant (`provider_login.Flow`)
+— on a `LoginWorker` thread whose transcript (the URL to open, the code to
+enter) the pane draws, and it ends in the same durable import, so a login made
+here and one made from the shell are indistinguishable afterwards. Esc cancels
+the sign-in and the pane closes at once; a worker still inside a request it
+cannot abandon is parked on the App and joined once it settles. Without a
+terminal, `/login <provider>` runs the flow blocking, with its instructions on
+stderr. The loopback wait polls its socket (`platform/net.pollReadable`) and
+checks an `AbortSignal` every 100 ms, and both device-code polls sleep in the
+same slices, so every flow can be cancelled from another thread (#67).
 
 The picker has a credential stage (#67). A commit that fails with
 `MissingCredentials` on an OAuth-capable provider does not leave the overlay:

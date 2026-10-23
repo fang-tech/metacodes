@@ -162,6 +162,57 @@ pub const AgentSwitcherState = struct {
     }
 };
 
+/// Window inside which a second press confirms (Claude Code's `useDoublePress`,
+/// 800 ms). The prompt's idle tick expires an armed press after it.
+pub const DOUBLE_PRESS_MS: i64 = 800;
+
+/// A key that acts only when pressed twice within `DOUBLE_PRESS_MS`: Ctrl+C and
+/// Ctrl+D on the idle prompt exit, Esc clears the draft. The first press arms it
+/// and shows its hint; the state is purely time-based, as in Claude Code, so
+/// typing in between neither confirms nor cancels it.
+pub const DoublePress = struct {
+    pub const Kind = enum { none, exit_ctrl_c, exit_ctrl_d, clear_input };
+
+    kind: Kind = .none,
+    deadline_ms: i64 = 0,
+
+    /// Record a press of `k` at `now_ms`. True when it confirms an armed press
+    /// of the same kind; otherwise `k` becomes the armed press.
+    pub fn press(self: *DoublePress, k: Kind, now_ms: i64) bool {
+        if (self.kind == k and now_ms <= self.deadline_ms) {
+            self.* = .{};
+            return true;
+        }
+        self.* = .{ .kind = k, .deadline_ms = now_ms + DOUBLE_PRESS_MS };
+        return false;
+    }
+
+    /// Drop an armed press whose window has passed. True when the hint it
+    /// showed must disappear.
+    pub fn expire(self: *DoublePress, now_ms: i64) bool {
+        if (self.kind == .none or now_ms <= self.deadline_ms) return false;
+        self.* = .{};
+        return true;
+    }
+};
+
+/// Esc closes the `/` and `@` suggestion menus without touching the draft
+/// (Claude Code). The menus are derived from the draft, so the dismissal is
+/// remembered against the draft it closed: any edit reopens them.
+pub const MenuDismissal = struct {
+    active: bool = false,
+    len: usize = 0,
+    hash: u64 = 0,
+
+    pub fn dismiss(self: *MenuDismissal, view: []const u8) void {
+        self.* = .{ .active = true, .len = view.len, .hash = std.hash.Wyhash.hash(0, view) };
+    }
+
+    pub fn covers(self: *const MenuDismissal, view: []const u8) bool {
+        return self.active and self.len == view.len and self.hash == std.hash.Wyhash.hash(0, view);
+    }
+};
+
 /// 集中 UI 逻辑状态。机制态(prev_rows 等)不在此(属 Renderer)。
 pub const UiState = struct {
     // 几何(resize 改)
@@ -203,6 +254,11 @@ pub const UiState = struct {
 
     // 瞬时提示(对齐 CC:"再按 Ctrl+C 退出" / "agent finished" 等)
     hint: ?[]const u8 = null,
+
+    /// Idle-prompt double-press confirmation (Ctrl+C / Ctrl+D exit, Esc clear).
+    press: DoublePress = .{},
+    /// Suggestion menus closed with Esc for the current draft.
+    menu_dismissal: MenuDismissal = .{},
 
     // Agent switcher(区域2):footer 下方 agent 列表 + agent transcript 查看。
     agents: AgentSwitcherState = .{},
@@ -311,4 +367,48 @@ test "AgentSwitcherState: close 复位 view_top" {
     a.close();
     try testing.expectEqual(@as(usize, 0), a.view_top);
     try testing.expect(!a.view_top_at_bottom);
+}
+
+test "DoublePress: a second press inside the window confirms" {
+    var p: DoublePress = .{};
+    try testing.expect(!p.press(.exit_ctrl_c, 1000));
+    try testing.expectEqual(DoublePress.Kind.exit_ctrl_c, p.kind);
+    try testing.expect(p.press(.exit_ctrl_c, 1000 + DOUBLE_PRESS_MS));
+    try testing.expectEqual(DoublePress.Kind.none, p.kind);
+}
+
+test "DoublePress: a late second press re-arms instead of confirming" {
+    var p: DoublePress = .{};
+    try testing.expect(!p.press(.clear_input, 0));
+    try testing.expect(!p.press(.clear_input, DOUBLE_PRESS_MS + 1));
+    try testing.expectEqual(DoublePress.Kind.clear_input, p.kind);
+    try testing.expectEqual(2 * DOUBLE_PRESS_MS + 1, p.deadline_ms);
+}
+
+test "DoublePress: another key's press replaces, never confirms" {
+    var p: DoublePress = .{};
+    try testing.expect(!p.press(.clear_input, 0));
+    try testing.expect(!p.press(.exit_ctrl_c, 10));
+    try testing.expectEqual(DoublePress.Kind.exit_ctrl_c, p.kind);
+    try testing.expect(!p.press(.clear_input, 20));
+}
+
+test "DoublePress: expire clears only after the deadline" {
+    var p: DoublePress = .{};
+    try testing.expect(!p.expire(5));
+    _ = p.press(.exit_ctrl_d, 100);
+    try testing.expect(!p.expire(100 + DOUBLE_PRESS_MS));
+    try testing.expect(p.expire(101 + DOUBLE_PRESS_MS));
+    try testing.expectEqual(DoublePress.Kind.none, p.kind);
+    try testing.expect(!p.expire(10_000));
+}
+
+test "MenuDismissal: covers the dismissed draft and nothing else" {
+    var d: MenuDismissal = .{};
+    try testing.expect(!d.covers("/sk"));
+    d.dismiss("/sk");
+    try testing.expect(d.covers("/sk"));
+    try testing.expect(!d.covers("/ski"));
+    try testing.expect(!d.covers("/s"));
+    try testing.expect(!d.covers("/ks"));
 }

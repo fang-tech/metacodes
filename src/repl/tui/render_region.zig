@@ -330,6 +330,24 @@ pub const RenderRegion = struct {
         self.ui.slash_sel = 0;
         self.ui.paste_hint = false;
         self.ui.agents = .{};
+        self.ui.press = .{};
+        self.ui.menu_dismissal = .{};
+    }
+
+    /// Idle tick: drop a double-press window that has run out. True when its
+    /// hint was on screen and the frame must be redrawn without it.
+    pub fn expirePress(self: *RenderRegion, now_ms: i64) bool {
+        self.lock();
+        defer self.unlock();
+        return self.ui.press.expire(now_ms);
+    }
+
+    fn exitHint(self: *const RenderRegion) ?[]const u8 {
+        return ui_mod.exitHint(&self.ui);
+    }
+
+    fn aboveBoxNotice(self: *const RenderRegion) ?[]const u8 {
+        return ui_mod.aboveBoxNotice(&self.ui);
     }
 
     pub fn deinit(self: *RenderRegion) void {
@@ -620,10 +638,9 @@ pub const RenderRegion = struct {
         const task_tab_rows = self.drawTaskTab(w, app);
         new_rows += task_tab_rows;
 
-        // -- Ctrl+Y paste 提示(对齐 cc DIFF#9:框上方右对齐 `Ctrl+Y to paste deleted text`)--
-        if (self.ui.paste_hint) {
+        // -- 框上方右对齐提示(对齐 cc):`Esc again to clear` / DIFF#9 `Ctrl+Y to paste deleted text`--
+        if (self.aboveBoxNotice()) |hint| {
             w.writeAll(ansi.clear.line) catch {};
-            const hint = "Ctrl+Y to paste deleted text";
             const hw = displayWidth(hint);
             if (self.cols > hw) {
                 var g: usize = 0;
@@ -681,19 +698,21 @@ pub const RenderRegion = struct {
         else
             0;
         new_rows += picker_rows;
+        // Menus the draft opens stay closed after Esc until the draft changes.
+        const menus = picker_rows == 0 and !self.ui.menu_dismissal.covers(content);
         // -- /models 两级菜单:账号 API key → 该 key 可用模型 --
-        const models_menu_rows = if (picker_rows == 0) self.drawModelsPickerMenu(w, app, content) else 0;
+        const models_menu_rows = if (menus) self.drawModelsPickerMenu(w, app, content) else 0;
         new_rows += models_menu_rows;
         // -- /model 服务端 catalog 菜单(输入 `/model` 后立即在底部显示候选,不等提交)--
-        const model_menu_rows = if (picker_rows == 0 and models_menu_rows == 0)
+        const model_menu_rows = if (menus and models_menu_rows == 0)
             self.drawModelCatalogMenu(w, app, content)
         else
             0;
         new_rows += model_menu_rows;
         // -- slash 命令菜单(`/` 前缀,在下边框与 footer 之间垂直列出)--
-        if (picker_rows == 0 and models_menu_rows == 0 and model_menu_rows == 0) new_rows += self.drawSlashMenu(w, content);
+        if (menus and models_menu_rows == 0 and model_menu_rows == 0) new_rows += self.drawSlashMenu(w, content);
         // -- @-mention 文件菜单(`@token`,同位置;对齐 cc DIFF#5)--
-        if (picker_rows == 0) new_rows += self.drawAtMenu(w, content, self.input_cursor);
+        if (menus) new_rows += self.drawAtMenu(w, content, self.input_cursor);
 
         // -- footer 区:help_open 时原地展开快捷键菜单(非模态,对齐 cc);否则正常 footer 行 --
         if (self.ui.help_open) {
@@ -707,7 +726,7 @@ pub const RenderRegion = struct {
             if (hrows > 0) w.writeAll(ansi.cursor.up(1, &nbuf)) catch {};
         } else {
             w.writeAll(ansi.clear.line) catch {};
-            if (shell) {
+            if (shell and self.exitHint() == null) {
                 // shell 模式 footer:`! for bash mode`(对齐 cc PromptInputFooterLeftSide ModeIndicator,
                 // mode==='bash' → `! for bash mode`;无 mode part / token)。
                 w.print("{s}  ! for bash mode{s}", .{ self.theme.dim, self.theme.reset }) catch {};
@@ -736,7 +755,7 @@ pub const RenderRegion = struct {
         // shell 模式:cursor 是相对完整 content(含 `!`)的;body 去掉了 `!` → body_cursor = cursor-1。
         const body_cursor: usize = if (shell and cursor > 0) cursor - 1 else cursor;
         const loc = RenderRegion.locateCursor(body, body_cursor, &vlines);
-        const hint_rows: u16 = if (self.ui.paste_hint) 1 else 0;
+        const hint_rows: u16 = if (self.aboveBoxNotice() != null) 1 else 0;
         const target_row: u16 = task_tab_rows + hint_rows + 1 + @as(u16, @intCast(loc.vline));
         // 最底行 = new_rows-1(footer + 可能的 agent switcher 行)。光标从最底回输入行。
         const footer_row: u16 = new_rows - 1;
@@ -782,7 +801,7 @@ pub const RenderRegion = struct {
     /// 画 slash 命令菜单(`/` 前缀且无空格时)。每行 `  /cmd [hint]   描述`。
     /// 选中项(self.ui.slash_sel)命令名用 accent 高亮,其余 dim(对齐 cc:↑↓ 移高亮)。
     /// 匹配项多于 SLASH_MENU_MAX_ROWS 时按选中项滚动窗口,选中项永远可见;每行按终端宽截断,
-    /// 保证"一项一行"(行数是导航与重画的前提)。skill 项在描述前标 `(skill)`。
+    /// 保证"一项一行"(行数是导航与重画的前提)。skill 项在描述后标出来源层级 `(user)`。
     /// 返回新增行数(每行末尾 \r\n,光标停下一行行首供 footer 续画)。调用前光标停下边框下一行行首。
     fn drawSlashMenu(self: *RenderRegion, w: *std.Io.Writer, content: []const u8) u16 {
         const catalog = self.ui.slash_catalog;
@@ -832,11 +851,18 @@ pub const RenderRegion = struct {
             if (cols > used + 4) {
                 var room = cols - used - 2;
                 w.writeAll(th.dim) catch {};
-                if (cmd.kind == .skill and room > 8) {
-                    w.writeAll("(skill) ") catch {};
-                    room -= 8;
-                }
+                // A Skill names its tier after the description (Claude Code:
+                // `Summarize a file (user)`); the tag is kept when the
+                // description has to be cut.
+                var tag_buf: [32]u8 = undefined;
+                const tag = if (cmd.kind != .skill)
+                    ""
+                else
+                    std.fmt.bufPrint(&tag_buf, " ({s})", .{if (cmd.source.len != 0) cmd.source else "skill"}) catch " (skill)";
+                const tag_w = displayWidth(tag);
+                if (room > tag_w + 4) room -= tag_w;
                 _ = writeClippedWidth(w, cmd.desc, room);
+                w.writeAll(tag) catch {};
                 w.writeAll(th.reset) catch {};
             }
             w.writeAll("\r\n") catch {};
@@ -1034,6 +1060,11 @@ pub const RenderRegion = struct {
     /// 其余文字 dim。token 用量走 /cost,不进 footer。
     fn drawFooter(self: *RenderRegion, w: *std.Io.Writer, app: *const app_mod.App) void {
         const th = self.theme;
+        // An armed exit press takes the whole footer line (Claude Code).
+        if (self.exitHint()) |text| {
+            w.print("{s} {s}{s}", .{ th.dim, text, th.reset }) catch {};
+            return;
+        }
         const sb = @import("widget/status_bar.zig");
         // mode 真相源 = app.permission_ctx.mode(live):输入期与 config 同步,生成期 watcher
         // (Shift+Tab)直接写它 → spinner tick 重画即反映(修 #11 生成期不联动)。
@@ -1088,6 +1119,9 @@ pub const RenderRegion = struct {
             if (multiline) {
                 break :blk std.fmt.bufPrint(&hint_buf, "  {s}", .{input.newlineHint()}) catch " ? for shortcuts";
             }
+            // `?` and `←` only act on an empty prompt, so a draft hides both
+            // hints (Claude Code).
+            if (self.input_view.len != 0) break :blk "";
             const base = if (show_mode) "" else " ? for shortcuts";
             if (has_any_agents) {
                 break :blk std.fmt.bufPrint(&hint_buf, "{s} · ← for agents", .{base}) catch base;
@@ -2953,6 +2987,7 @@ test "slash menu: skills appear, the window follows the selection, rows fit the 
             .desc = "a long description that has to be cut to the terminal width",
             .kind = .skill,
             .hint = if (index == 12) "[file]" else "",
+            .source = if (index == 12) "user" else "",
         };
     }
     r.ui.slash_catalog = .{ .entries = &entries };
@@ -2968,7 +3003,8 @@ test "slash menu: skills appear, the window follows the selection, rows fit the 
     try std.testing.expect(std.mem.indexOf(u8, text, "/s03") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "/s02") == null);
     try std.testing.expect(std.mem.indexOf(u8, text, "/s13") == null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "(skill)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "(skill)") != null); // tier unknown
+    try std.testing.expect(std.mem.indexOf(u8, text, "(user)") != null); // the tier, kept when the description is cut
     var lines = std.mem.splitSequence(u8, text, "\r\n");
     while (lines.next()) |line| {
         // Strip the clear-line escape and measure the visible part.

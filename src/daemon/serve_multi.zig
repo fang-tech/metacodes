@@ -452,11 +452,12 @@ pub const MultiDaemon = struct {
         };
         var messages: usize = 0;
         if (restore) {
-            messages = slot.app.resumePersistedConversation() catch |err| {
+            const resumed = slot.app.resumePersistedConversation() catch |err| {
                 log.err("daemon", "session {s}: restoring the transcript failed: {s}", .{ id.asSlice(), @errorName(err) });
                 md.freeSlot(slot);
                 return if (err == error.TranscriptNotFound) error.TranscriptNotFound else error.RestoreFailed;
             };
+            messages = resumed.messages;
         }
         md.wire(slot) catch |err| {
             log.err("daemon", "session {s}: driver start failed: {s}", .{ id.asSlice(), @errorName(err) });

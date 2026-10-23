@@ -68,7 +68,7 @@ pub fn renderToLinesWithTheme(allocator: std.mem.Allocator, conv: *const Convers
                     .assistant => try appendAssistantMarkdown(allocator, &lines, t, th),
                     // user 文本:❯ 前缀 + 原文(不渲 markdown,对齐主区 user 回显)。host 注入的
                     // 记录(进度提醒等)主区从不回显,回放也不画——那不是用户敲的。
-                    .user => if (!host_injection_meter.isHostInjectedText(t)) try appendUserText(allocator, &lines, t, th),
+                    .user => if (!host_injection_meter.isHostText(m, t)) try appendUserText(allocator, &lines, t, th),
                 },
                 .tool_use => |tu| {
                     // tool_card.renderStart 输出多行字符串(2 行带 ANSI);split 进 lines。

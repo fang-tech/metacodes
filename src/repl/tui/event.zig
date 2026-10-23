@@ -85,9 +85,22 @@ pub const LoopAction = enum {
     agents_view,
     /// x 停止选中 agent(调用方 registry.kill(id))。
     agents_stop,
+    // ── Idle prompt double presses (Claude Code `useDoublePress`) ──────────────
+    /// Second Ctrl+C, or second Ctrl+D on an empty prompt, inside the window:
+    /// leave the REPL.
+    exit_prompt,
+    /// First Ctrl+C on a non-empty prompt: drop the draft (not kept in history).
+    discard_draft,
+    /// Second Esc inside the window: keep the draft in history, then clear it.
+    clear_draft,
 };
 
-pub const KeyEvent = struct { key: input.Key };
+pub const KeyEvent = struct {
+    key: input.Key,
+    /// Monotonic milliseconds of the press; the idle prompt's double-press
+    /// confirmations (Ctrl+C, Ctrl+D, Esc) measure their window with it.
+    now_ms: i64 = 0,
+};
 pub const ResizeEvent = struct { cols: u16, rows: u16 };
 pub const UsageEvent = struct {
     input_tokens: u64,

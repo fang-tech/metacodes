@@ -8,6 +8,8 @@
 const std = @import("std");
 const pfs = @import("platform").fs;
 const catalog = @import("runtime/catalog.zig");
+const overrides_mod = @import("overrides.zig");
+const Listing = @import("runtime/model_tool.zig").Listing;
 
 pub const definition = @import("runtime/definition.zig");
 pub const ExecContext = definition.ExecContext;
@@ -21,6 +23,9 @@ pub const SkillSet = struct {
     /// records; execution must resolve the corresponding Runtime snapshot.
     skills: std.ArrayList(Skill),
     catalog_revision: [64]u8 = [_]u8{0} ** 64,
+    /// `skillOverrides` (owned by the App, internally synchronized); null
+    /// where no settings apply. Set once before the set is shared.
+    overrides: ?*overrides_mod.Overrides = null,
 
     pub fn init(allocator: std.mem.Allocator) SkillSet {
         return .{ .allocator = allocator, .skills = .empty };
@@ -54,6 +59,12 @@ pub const SkillSet = struct {
 
     pub fn len(self: *const SkillSet) usize {
         return self.skills.items.len;
+    }
+
+    /// How the model-facing listings show `name` under `skillOverrides`.
+    pub fn listingOf(self: *const SkillSet, name: []const u8) Listing {
+        const overrides = self.overrides orelse return .full;
+        return overrides.stateOf(name).listing();
     }
 };
 

@@ -201,10 +201,10 @@ def test_T24_esc_interrupts_then_resends_queue(bin_path):
     # 核心(用户的诉求):中断后队列消息必须被自动续发提交。
     if "打断后请回答你是谁" not in prose:
         a._fail("中断后队列消息未自动续发提交")
-    # 中断标记:Esc 落在生成窗口内时应出现 cancelled;若模型恰好已结束则跳过该断言(时序宽松)。
+    # 中断标记:Esc 落在生成窗口内时应出现 `⎿  Interrupted`;若模型恰好已结束则跳过该断言(时序宽松)。
     finished_naturally = "59" in prose or "60" in prose
-    if "cancel" not in prose.lower() and not finished_naturally:
-        a._fail("Esc 未中断当前推理(无 cancelled 标记,且生成未自然结束)")
+    if "Interrupted" not in prose and not finished_naturally:
+        a._fail("Esc 未中断当前推理(无 Interrupted 标记,且生成未自然结束)")
         a._fail("中断后队列消息未自动续发提交")
 
 
@@ -223,7 +223,7 @@ def test_esc_with_draft_interrupts_then_resends_draft(bin_path):
             "type:DRAFTED", "sleep:0.3", "key:esc", "sleep:4.0",
         ], base_url=srv.url, startup_drain=0.8, per_key_drain=0.05)
 
-    assert b"cancelled" in raw.lower(), "带 draft 的 Esc 没有中断当前推理"
+    assert b"Interrupted" in raw, "带 draft 的 Esc 没有中断当前推理"
     assert len(srv.requests) >= 2, "Esc 中断后草稿没有自动续发"
     assert b"DRAFTED" in srv.requests[1], "续发请求不含 Esc 前已打的草稿"
     assert b"RESENT_OK" in raw, "续发轮的响应没有显示"
@@ -239,7 +239,7 @@ def test_empty_esc_and_ctrl_c_interrupt_generation(bin_path):
                 "sleep:0.8", "type:interrupt-me", "key:enter", "sleep:0.8",
                 f"key:{key}", "sleep:2.0",
             ], base_url=srv.url, startup_drain=0.8, per_key_drain=0.05)
-        assert b"cancelled" in raw.lower(), f"空框 {key} 没有中断慢请求"
+        assert b"Interrupted" in raw, f"空框 {key} 没有中断慢请求"
 
 
 def test_completion_spinner_never_commits_to_history(bin_path):
@@ -420,10 +420,10 @@ def test_T31_gen_help_esc_only_closes(bin_path):
     from asserts import split_frames
     prose = re.sub(rb"\x1b\[[0-9;?>]*[A-Za-z]", b"",
                    b"".join(c for k, c in split_frames(raw) if k == "prose")).decode("utf-8", "replace")
-    # esc 只关 help 不中断:生成应继续(prose 有数字增长)或自然结束。不应出现 cancelled。
-    # (若 esc 误中断,会有 cancel 标记且数列被截断。)
+    # esc 只关 help 不中断:生成应继续(prose 有数字增长)或自然结束。不应出现 Interrupted。
+    # (若 esc 误中断,会有 Interrupted 标记且数列被截断。)
     finished_or_progressing = any(str(n) in prose for n in (10, 20, 30, 40, 50, 59, 60))
-    if "cancel" in prose.lower() and not finished_or_progressing:
+    if "Interrupted" in prose and not finished_or_progressing:
         a._fail("生成期 help 开时 esc 误中断了生成(应只关 help)")
 
 

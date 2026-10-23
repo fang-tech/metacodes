@@ -77,9 +77,9 @@ def test_shell_submit_executes(bin_path):
     # (曾被 TTY_SKIP_MODEL 门住,离线时直接 return 计为通过,#222)。
     import re
     # !cmd 纯本地执行、零模型调用 → 走默认死端口 base_url(离线确定性,不依赖凭证)。
-    # 等输出行本身(waitline 整行匹配;回显行 `❯ !echo SHELLMODEMARK` 也含 MARKER)。Windows 上
+    # 等输出行本身(waitline 整行匹配,输出挂在 `⎿` 下;回显行 `❯ !echo SHELLMODEMARK` 也含 MARKER)。Windows 上
     # !cmd 走 PowerShell,起进程常要数秒,固定 sleep:1.5 可能截在命令执行中。
-    raw = run(bin_path, [READY, "type:!echo SHELLMODEMARK", "key:enter", "waitline:SHELLMODEMARK:30"],
+    raw = run(bin_path, [READY, "type:!echo SHELLMODEMARK", "key:enter", "waitline:⎿  SHELLMODEMARK:30"],
               per_key_drain=0.06)
     prose = re.sub(rb"\x1b\[[0-9;?>]*[A-Za-z]", b"", raw).decode("utf-8", "replace")
     assert "SHELLMODEMARK" in prose, "!cmd 未执行(输出缺 MARKER)"

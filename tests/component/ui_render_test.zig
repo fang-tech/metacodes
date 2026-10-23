@@ -25,9 +25,9 @@ test "render: help_open 在输入帧 footer 区投影多列快捷键(非模态,�
     defer cw.deinit();
     const frame = try ui.render(&cw, mkInputs(&s));
     const out = cw.output();
-    try capture.expectContains(out, "Ctrl+O");
-    try capture.expectContains(out, "Open transcript");
-    try capture.expectContains(out, "Shift+Tab");
+    try capture.expectContains(out, "ctrl + o to choose a model");
+    try capture.expectContains(out, "for transcript");
+    try capture.expectContains(out, "shift + tab to cycle modes");
     try capture.expectContains(out, "❯"); // 输入框仍在(非模态)
     try testing.expect(frame.rows > 1);
 }
@@ -92,7 +92,7 @@ test "E2E 内存级: ? 开 help → render help 帧 → 任意键关 → render 
         var cw = capture.CaptureWriter.init(testing.allocator);
         defer cw.deinit();
         _ = try ui.render(&cw, mkInputs(&s));
-        try testing.expect(std.mem.indexOf(u8, cw.output(), "Open transcript") == null);
+        try testing.expect(std.mem.indexOf(u8, cw.output(), "for transcript") == null);
     }
     // dispatch '?' → help_open(非模态)
     const e1 = ui.dispatch(&s, .{ .key = .{ .key = .{ .char = '?' } } });
@@ -102,7 +102,7 @@ test "E2E 内存级: ? 开 help → render help 帧 → 任意键关 → render 
         var cw = capture.CaptureWriter.init(testing.allocator);
         defer cw.deinit();
         _ = try ui.render(&cw, mkInputs(&s));
-        try capture.expectContains(cw.output(), "Open transcript"); // footer 区展开 help
+        try capture.expectContains(cw.output(), "for transcript"); // footer 区展开 help
         try capture.expectContains(cw.output(), "❯"); // 输入框仍在(非模态)
     }
     // dispatch 任意键 → 关闭 help(该键透传编辑器)
@@ -112,7 +112,7 @@ test "E2E 内存级: ? 开 help → render help 帧 → 任意键关 → render 
         var cw = capture.CaptureWriter.init(testing.allocator);
         defer cw.deinit();
         _ = try ui.render(&cw, mkInputs(&s));
-        try testing.expect(std.mem.indexOf(u8, cw.output(), "Open transcript") == null); // 回正常 footer
+        try testing.expect(std.mem.indexOf(u8, cw.output(), "for transcript") == null); // 回正常 footer
     }
 }
 

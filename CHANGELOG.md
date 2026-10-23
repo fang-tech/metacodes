@@ -10,6 +10,61 @@ status, compatibility boundaries, and entry points are defined by
 
 ## Unreleased
 
+### Added
+
+- **`metacodes --resume <id>`** starts the interactive REPL in a stored
+  session of the working directory (an id or id prefix, as `/resume <id>`
+  takes), with its conversation, goal and model route restored; the next turn
+  appends to the same transcript. An unknown id exits 1 before the REPL
+  starts. Combining `--resume` with another mode (`-p`, `--web`, `serve`,
+  `--resume-response`, `--session`, `--teammate`, `--dump-*`) is a usage
+  error. As in Claude Code, an interactive exit (`/exit`, Ctrl+C or Ctrl+D
+  twice, EOF) from a session whose transcript is on disk now ends with a dim
+  `Resume this session with:` / `metacodes --resume <id>`; a session that
+  never ran a turn, and a non-terminal run, print nothing.
+- **A resumed session shows its conversation.** `metacodes --resume <id>`
+  writes the conversation back under the banner, and `/resume <id>` clears
+  the screen and does the same before its result, as Claude Code does: the
+  prompts, replies and tool cards look exactly as they did live (the last 200
+  messages at most, after a dim `… N earlier messages` line). Text the runtime
+  wrote into the conversation itself (continuation requests, nudges, job
+  notifications, a Skill's body) is not shown, here or in Ctrl+O, and
+  `/recap` labels it `Host`: such messages now carry `"origin":"host"` in
+  `transcript.jsonl` (older records load as before).
+- **`skillOverrides`, and `/skills` to set them** (Claude Code's per-Skill
+  setting, same files: user < project < local settings). `name-only` lists a
+  Skill to the model without its description; `user-invocable-only` hides it
+  from the model and the Skill tool refuses it, while `/name` still runs it;
+  `off` also refuses `/name` (`Skill "x" is disabled via skillOverrides. …`)
+  and drops it from the `/` menu. In the TUI, `/skills` shows each Skill's
+  state (`✔ on`, `● name-only`, `◯ user-only`, `✘ off`; a
+  `disable-model-invocation` Skill is locked) and Enter or Space cycles it;
+  closing writes `.claude/settings.local.json` and prints `Updated N skill
+  overrides` or `No changes`, and the next request carries the new listing.
+  Without overrides the Skill listings are byte-for-byte unchanged.
+
+### Changed
+
+- **TUI: the prompt and commands behave like Claude Code 2.1.278** (recorded
+  side by side in a PTY). Ctrl+C, and Ctrl+D on an empty prompt, exit on a
+  second press within 800 ms; the first shows `Press Ctrl-C again to exit` in
+  the footer and Ctrl+C discards the draft, with nothing written to the
+  scrollback. Esc twice clears the draft into history (the first shows `Esc
+  again to clear`); Esc on an open `/` or `@` menu closes it and keeps the
+  draft. Ctrl+D with a draft deletes forward. Enter on a blank prompt does
+  nothing. A local command's result hangs off `⎿` under its echo; an unknown
+  command is reported in place of its echo with the closest command
+  (`Unknown command: /foo. Did you mean /loop?`). `/help`, `/skills` and
+  `/login` open bottom panes (tabs; a searchable Skill list; a provider list
+  whose sign-in runs on a worker that Esc cancels, Metask included). `/clear`
+  starts a new session with empty context, as it said it did. Skill
+  invocations and `/init`, `/commit`, `/review`, `/retry`, cron and loop
+  turns run through the interactive turn path (spinner, tool cards, Esc to
+  interrupt) instead of a plain text stream, and a Skill's body no longer
+  lands in the scrollback. The `/` menu is alphabetical and lists every
+  command; the `?` panel uses Claude Code's phrasing; command output, turn
+  notices and `/kg` are in concise English.
+
 ### Fixed
 
 - **TUI: a terminal resize no longer answers an open dialog.** A resize

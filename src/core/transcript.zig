@@ -277,7 +277,11 @@ pub const Writer = struct {
         try w.writeAll(roleStr(m.role));
         // 送达水位随消息持久化(消息级 + 每个 tool_result 块级):resume 后图片结果的
         // microcompact 保护与请求级裁剪都靠它,不再从消息位置推断。旧文件缺字段 → false(保守)。
-        try w.print("\",\"delivered\":{s},\"blocks\":[", .{if (m.delivered) "true" else "false"});
+        try w.print("\",\"delivered\":{s},", .{if (m.delivered) "true" else "false"});
+        // Only a host message carries its origin, so a participant record is
+        // byte-for-byte what it was before the field existed.
+        if (m.origin != .participant) try w.print("\"origin\":\"{s}\",", .{@tagName(m.origin)});
+        try w.writeAll("\"blocks\":[");
         for (m.blocks, 0..) |b, i| {
             if (i > 0) try w.writeAll(",");
             switch (b) {
@@ -679,6 +683,12 @@ fn parseMessageLine(line: []const u8, allocator: std.mem.Allocator) !msg_mod.Mes
         (if (dv == .bool) dv.bool else return error.InvalidTranscript)
     else
         false;
+    // Written only for host messages; a record without it (every record
+    // before the field, and every participant message) is a participant's.
+    const msg_origin: msg_mod.Message.Origin = if (root.object.get("origin")) |ov|
+        (if (ov == .string) std.meta.stringToEnum(msg_mod.Message.Origin, ov.string) orelse return error.InvalidTranscript else return error.InvalidTranscript)
+    else
+        .participant;
     const blocks_v = root.object.get("blocks") orelse return error.InvalidTranscript;
     if (blocks_v != .array) return error.InvalidTranscript;
 
@@ -784,7 +794,7 @@ fn parseMessageLine(line: []const u8, allocator: std.mem.Allocator) !msg_mod.Mes
         constructed += 1;
     }
 
-    return .{ .role = role, .blocks = blocks, .delivered = msg_delivered };
+    return .{ .role = role, .blocks = blocks, .delivered = msg_delivered, .origin = msg_origin };
 }
 
 // ============================================================================
@@ -944,6 +954,17 @@ fn readMeta(session_dir: []const u8, allocator: std.mem.Allocator) !struct {
         .last_modified_ns = if (lm_v == .integer) lm_v.integer else 0,
         .message_count = message_count,
     };
+}
+
+/// The session `/resume <id>` and `--resume <id>` name: the first entry of
+/// `list` (newest first, as `listSessions` returns it) whose id is `query` or
+/// starts with it. null when none does or `query` is empty.
+pub fn findSession(list: []const SessionListEntry, query: []const u8) ?*const SessionListEntry {
+    if (query.len == 0) return null;
+    for (list) |*entry| {
+        if (std.mem.startsWith(u8, entry.id, query)) return entry;
+    }
+    return null;
 }
 
 pub fn freeSessionList(list: []SessionListEntry, allocator: std.mem.Allocator) void {
@@ -1546,4 +1567,67 @@ test "transcript.jsonl 读失败(EISDIR)→ 明确 ReadFailed,不当 EOF 静默�
     defer conv.deinit();
     try std.testing.expectError(error.ReadFailed, loadTranscript(&conv, session_dir, a));
     try std.testing.expectEqual(@as(usize, 0), conv.len());
+}
+
+test "findSession: an exact id or a prefix, newest match first; nothing for an empty or unknown query" {
+    const entry = struct {
+        fn of(id: []const u8) SessionListEntry {
+            return .{ .id = id, .path = id, .title = "", .last_modified_ns = 0, .message_count = 0, .model = "" };
+        }
+    }.of;
+    // Newest first, as listSessions returns them.
+    const list = [_]SessionListEntry{ entry("019a2b3c4d5e6f7a8b9c0d1e"), entry("019a2b3c4d5e000000000000"), entry("0188ffffffffffffffffffff") };
+    try std.testing.expectEqualStrings("0188ffffffffffffffffffff", findSession(&list, "0188ffffffffffffffffffff").?.id);
+    // A prefix two sessions share names the newer one.
+    try std.testing.expectEqualStrings("019a2b3c4d5e6f7a8b9c0d1e", findSession(&list, "019a2b3c4d5e").?.id);
+    try std.testing.expectEqualStrings("019a2b3c4d5e000000000000", findSession(&list, "019a2b3c4d5e0").?.id);
+    try std.testing.expect(findSession(&list, "") == null);
+    try std.testing.expect(findSession(&list, "zzz") == null);
+    // A query longer than every id matches nothing, not a truncated id.
+    try std.testing.expect(findSession(&list, "0188ffffffffffffffffffff0") == null);
+}
+
+test "origin round-trip: a host message keeps its origin, older and participant records load as participant" {
+    const a = std.testing.allocator;
+    var home_buf: [512]u8 = undefined;
+    const tmp_home = util_fs.testing.perPidDir(&home_buf, "cc-zig-transcript-origin-rt");
+    util_fs.testing.rmrfBestEffort(tmp_home);
+    defer util_fs.testing.rmrfBestEffort(tmp_home);
+
+    var writer = try Writer.init(a, "/dummy/cwd", .{ .path = tmp_home }, "m", genSessionId());
+    defer writer.deinit();
+    var conv = Conversation.init(a);
+    defer conv.deinit();
+    try conv.appendText(.user, "typed by the user");
+    try conv.appendHostText("Your previous response was cut off by the token limit.");
+    try conv.appendText(.assistant, "reply");
+    writer.flush(&conv);
+
+    var path_buf: [std.fs.max_path_bytes + 1]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, "{s}/transcript.jsonl", .{writer.dir});
+    const fd = pfs.open(path.ptr, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+    try std.testing.expect(fd >= 0);
+    defer _ = pfs.close(fd);
+    var read_buf: [4096]u8 = undefined;
+    const bytes = read_buf[0..try readChunk(fd, &read_buf)];
+    // Only the host record names its origin: a participant record is the
+    // same bytes as before the field existed.
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, bytes, "\"origin\""));
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "\"origin\":\"host\"") != null);
+
+    var loaded = Conversation.init(a);
+    defer loaded.deinit();
+    try loadTranscript(&loaded, writer.dir, a);
+    try std.testing.expectEqual(@as(usize, 3), loaded.len());
+    try std.testing.expectEqual(msg_mod.Message.Origin.participant, loaded.messages.items[0].origin);
+    try std.testing.expectEqual(msg_mod.Message.Origin.host, loaded.messages.items[1].origin);
+    try std.testing.expectEqual(msg_mod.Message.Origin.participant, loaded.messages.items[2].origin);
+
+    // A record from before the field is a participant's; a value that is not
+    // a known origin is damage, not a default.
+    const old = try parseMessageLine("{\"role\":\"user\",\"delivered\":true,\"blocks\":[{\"type\":\"text\",\"text\":\"hi\"}]}", a);
+    defer old.deinit(a);
+    try std.testing.expectEqual(msg_mod.Message.Origin.participant, old.origin);
+    try std.testing.expectError(error.InvalidTranscript, parseMessageLine("{\"role\":\"user\",\"origin\":\"system\",\"blocks\":[]}", a));
+    try std.testing.expectError(error.InvalidTranscript, parseMessageLine("{\"role\":\"user\",\"origin\":true,\"blocks\":[]}", a));
 }

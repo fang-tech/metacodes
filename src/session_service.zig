@@ -353,6 +353,34 @@ pub const INIT_PROMPT =
     \\and conventions that are NOT obvious from reading a single file. Do not pad it with restated source code.
 ;
 
+/// The command a stored macro prompt came from (`/commit`, `/review`,
+/// `/init`), so a view of the conversation shows what the user typed rather
+/// than the prompt it expands to. null for any other text.
+pub fn macroCommand(prompt: []const u8) ?[]const u8 {
+    const macros = [_]struct { prompt: []const u8, command: []const u8 }{
+        .{ .prompt = COMMIT_PROMPT, .command = "/commit" },
+        .{ .prompt = REVIEW_PROMPT, .command = "/review" },
+        .{ .prompt = INIT_PROMPT, .command = "/init" },
+    };
+    for (macros) |m| if (std.mem.eql(u8, prompt, m.prompt)) return m.command;
+    return null;
+}
+
+/// How a `!cmd` run is recorded in the conversation: this prefix, the
+/// command, a newline, then the Bash tool's JSON result.
+pub const SHELL_RECORD_PREFIX = "[shell] $ ";
+
+pub const ShellRecord = struct { command: []const u8, result: []const u8 };
+
+/// The command and result of a recorded `!cmd` run (`SHELL_RECORD_PREFIX`),
+/// borrowed from `text`; null for any other text.
+pub fn parseShellRecord(text: []const u8) ?ShellRecord {
+    if (!std.mem.startsWith(u8, text, SHELL_RECORD_PREFIX)) return null;
+    const rest = text[SHELL_RECORD_PREFIX.len..];
+    const nl = std.mem.indexOfScalar(u8, rest, '\n') orelse return null;
+    return .{ .command = rest[0..nl], .result = rest[nl + 1 ..] };
+}
+
 /// run 计划:dispatch 完成全部 validate/prepare/commit(含 conversation append)后,
 /// 告知宿主"现在提交一轮 run"。失败的 preflight 绝不产生 RunPlan,也绝不 append——
 /// 保证 "failed preflight must not mutate Conversation or consume a run id"。
@@ -477,7 +505,7 @@ pub fn shellExecImpl(self: *SessionService, alloc: std.mem.Allocator, command: [
 
     const result = try bash.execute(&tool_ctx, args_json);
     errdefer alloc.free(result);
-    const ctx_msg = try std.fmt.allocPrint(alloc, "[shell] $ {s}\n{s}", .{ command, result });
+    const ctx_msg = try std.fmt.allocPrint(alloc, SHELL_RECORD_PREFIX ++ "{s}\n{s}", .{ command, result });
     defer alloc.free(ctx_msg);
     try self.app.conversation.appendText(.user, ctx_msg);
     return result;

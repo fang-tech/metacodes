@@ -46,6 +46,12 @@ pub fn hasModelInvocableWithAvailability(
     return false;
 }
 
+/// How a Skill appears in the model-facing listing. Claude Code
+/// `skillOverrides`: "name-only" keeps the name and drops the description,
+/// "user-invocable-only" and "off" leave the Skill out (and the Skill tool
+/// refuses it).
+pub const Listing = enum { full, name_only, hidden };
+
 /// Resolve an exact required-first Skill only when the visible catalog is
 /// unambiguous. Enumeration order never selects a winner: two required Skills
 /// deliberately collapse to advisory model behavior.
@@ -53,16 +59,33 @@ pub fn requiredFirstInvocationWithAvailability(
     snapshot: *const catalog.Snapshot,
     available: availability.View,
 ) ?[]const u8 {
+    return requiredFirstInvocationWithListing(snapshot, available, null);
+}
+
+/// As `requiredFirstInvocationWithAvailability`; a Skill hidden from the
+/// model (`listings[i] == .hidden`, aligned with `snapshot.skills`) cannot
+/// be required first.
+pub fn requiredFirstInvocationWithListing(
+    snapshot: *const catalog.Snapshot,
+    available: availability.View,
+    listings: ?[]const Listing,
+) ?[]const u8 {
     var selected: ?[]const u8 = null;
     for (snapshot.skills, 0..) |skill, index| {
         if (!available.isEnabledAt(snapshot, index) or
             skill.definition.disable_model_invocation or
+            listingAt(listings, index) == .hidden or
             skill.definition.model_activation != .required_first)
             continue;
         if (selected != null) return null;
         selected = skill.invocation_name;
     }
     return selected;
+}
+
+fn listingAt(listings: ?[]const Listing, index: usize) Listing {
+    const values = listings orelse return .full;
+    return values[index];
 }
 
 pub fn requiredFirstInvocation(snapshot: *const catalog.Snapshot) ?[]const u8 {
@@ -73,7 +96,15 @@ pub fn modelActivationWithAvailability(
     snapshot: *const catalog.Snapshot,
     available: availability.View,
 ) ?json.ModelToolActivation {
-    const invocation = requiredFirstInvocationWithAvailability(snapshot, available) orelse
+    return modelActivationWithListing(snapshot, available, null);
+}
+
+pub fn modelActivationWithListing(
+    snapshot: *const catalog.Snapshot,
+    available: availability.View,
+    listings: ?[]const Listing,
+) ?json.ModelToolActivation {
+    const invocation = requiredFirstInvocationWithListing(snapshot, available, listings) orelse
         return null;
     return .{
         .mode = .required_first,
@@ -139,6 +170,19 @@ pub fn buildDescriptionWithAvailability(
     snapshot: *const catalog.Snapshot,
     available: availability.View,
 ) ![]u8 {
+    return buildDescriptionWithListing(allocator, snapshot, available, null);
+}
+
+/// The Skill tool description with per-Skill `listings` (aligned with
+/// `snapshot.skills`; null lists every Skill in full). A name-only Skill is
+/// listed as `- name`, as Claude Code lists it.
+pub fn buildDescriptionWithListing(
+    allocator: std.mem.Allocator,
+    snapshot: *const catalog.Snapshot,
+    available: availability.View,
+    listings: ?[]const Listing,
+) ![]u8 {
+    if (listings) |values| std.debug.assert(values.len == snapshot.skills.len);
     var output: std.Io.Writer.Allocating = .init(allocator);
     defer output.deinit();
     try output.writer.writeAll(
@@ -155,6 +199,14 @@ pub fn buildDescriptionWithAvailability(
         if (!available.isEnabledAt(snapshot, index) or
             skill.definition.disable_model_invocation)
             continue;
+        switch (listingAt(listings, index)) {
+            .hidden => continue,
+            .name_only => {
+                try output.writer.print("- {s}\n", .{skill.invocation_name});
+                continue;
+            },
+            .full => {},
+        }
         var scratch = std.heap.ArenaAllocator.init(allocator);
         defer scratch.deinit();
         try output.writer.print(
@@ -351,4 +403,75 @@ test "model Skill surface omits disabled records while catalog stays intact" {
     try std.testing.expect(requiredFirstInvocation(&snapshot) == null);
     try std.testing.expect(modelActivation(&snapshot) == null);
     try std.testing.expectEqual(@as(usize, 2), snapshot.skills.len);
+}
+
+fn testRecord(comptime id: u8, name: []const u8, description: []const u8) catalog.SkillRecord {
+    return .{
+        .skill_id = [_]u8{id} ** 64,
+        .invocation_name = name,
+        .definition = .{
+            .name = name,
+            .description = description,
+            .body = "body",
+            .allowed_tools = &.{},
+            .disallowed_tools = &.{},
+            .arguments = &.{},
+            .disable_model_invocation = false,
+            .when_to_use = "",
+            .description_source = .frontmatter,
+            .argument_hint = "",
+            .user_invocable = true,
+            .model_activation = .required_first,
+            .context = .inline_ctx,
+            .agent = "",
+            .model = "",
+            .shell = "bash",
+            .source_path = "",
+        },
+        .directories = &.{},
+        .files = &.{},
+    };
+}
+
+test "listing: name-only drops the description, hidden drops the Skill" {
+    const records = [_]catalog.SkillRecord{
+        testRecord('1', "full-skill", "described"),
+        testRecord('2', "named-skill", "not shown"),
+        testRecord('3', "hidden-skill", "not shown either"),
+    };
+    var snapshot = catalog.Snapshot{
+        .owner_allocator = std.testing.allocator,
+        .arena = std.heap.ArenaAllocator.init(std.testing.allocator),
+        .scope_id = [_]u8{'a'} ** 64,
+        .revision = [_]u8{'b'} ** 64,
+        .health = .healthy,
+        .skills = &records,
+        .issues = &.{},
+        .descriptor_json = "",
+        .content_bytes = 0,
+        .resident_bytes = 0,
+    };
+    defer snapshot.arena.deinit();
+
+    const listings = [_]Listing{ .full, .name_only, .hidden };
+    const description = try buildDescriptionWithListing(std.testing.allocator, &snapshot, .all, &listings);
+    defer std.testing.allocator.free(description);
+    try std.testing.expect(std.mem.indexOf(u8, description, "- full-skill: described\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, description, "- named-skill\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, description, "not shown") == null);
+    try std.testing.expect(std.mem.indexOf(u8, description, "hidden-skill") == null);
+
+    // Null listings are the full listing, byte for byte.
+    const all = try buildDescriptionWithListing(std.testing.allocator, &snapshot, .all, null);
+    defer std.testing.allocator.free(all);
+    const plain = try buildDescription(std.testing.allocator, &snapshot);
+    defer std.testing.allocator.free(plain);
+    try std.testing.expectEqualStrings(plain, all);
+
+    // Three required-first Skills are ambiguous; hiding two leaves one.
+    try std.testing.expect(requiredFirstInvocationWithListing(&snapshot, .all, null) == null);
+    const one = [_]Listing{ .hidden, .name_only, .hidden };
+    try std.testing.expectEqualStrings("named-skill", requiredFirstInvocationWithListing(&snapshot, .all, &one).?);
+    const none = [_]Listing{ .hidden, .hidden, .hidden };
+    try std.testing.expect(modelActivationWithListing(&snapshot, .all, &none) == null);
 }

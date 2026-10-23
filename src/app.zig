@@ -136,6 +136,7 @@ const system_prompt_mod = @import("core/system_prompt.zig");
 const DynRegistry = @import("tools/dynamic.zig").DynRegistry;
 const skill_tool_mod = @import("skills/tool.zig");
 const skill_cli_adapter = @import("skills/cli_adapter.zig");
+const skill_overrides_mod = @import("skills/overrides.zig");
 const plugin_mod = @import("plugin/root.zig");
 const path_util = @import("util/path.zig");
 const McpClient = @import("mcp/client.zig").McpClient;
@@ -285,6 +286,11 @@ pub const App = struct {
     /// The sign-in the picker's credential stage is running (#67); owned
     /// here because it outlives any one key press.
     login_worker: ?*login_worker.LoginWorker = null,
+    /// `/login` sign-ins cancelled with Esc while their thread was still in a
+    /// request it cannot abandon (the first device-code POST). The dialog
+    /// closes at once; the thread is joined once it settles (`reapLoginWorkers`)
+    /// or at exit.
+    parked_login_workers: [4]?*login_worker.LoginWorker = .{null} ** 4,
     /// Strings a committed offer put into borrowing client fields. Owned here
     /// because `Client.base_url` and `api_key` are borrowed slices that must
     /// outlive every in-flight request.
@@ -395,6 +401,9 @@ pub const App = struct {
     /// Canonical Skill Runtime; `skills` above is only its legacy-shaped
     /// presentation/preload projection.
     skill_runtime: skill_cli_adapter.Runtime,
+    /// `skillOverrides` from the Claude Code settings files. `skills` and
+    /// `skill_runtime` point here; `/skills` changes it (`applySkillOverrides`).
+    skill_overrides: skill_overrides_mod.Overrides,
     /// Host-admitted immutable plugin generation. The snapshot owns manifest
     /// descriptors/provenance and only projects bounded contributions into
     /// canonical registries; AgentLoop remains the sole orchestration owner.
@@ -569,6 +578,7 @@ pub const App = struct {
             .abort = AbortSignal.init(),
             .skills = SkillSet.init(allocator),
             .skill_runtime = skill_cli_adapter.Runtime.init(allocator, io),
+            .skill_overrides = skill_overrides_mod.Overrides.init(allocator),
             .activated_tools = std.StringHashMap(void).init(allocator),
             .read_state = ReadState.init(allocator),
             .edit_hl_cache = @import("core/edit_hl_cache.zig").EditHlCache.init(allocator),
@@ -729,6 +739,19 @@ pub const App = struct {
         // next start, so here an "allow always" answer may outlive the Session.
         app.permission_ctx.always_allow = .settings_file;
         app.permission_ctx.session = app.session_id; // 权限对话框路由到本会话视图(M5/M6)
+
+        // `skillOverrides` (user < project < local settings) shape the Skill
+        // listings below and gate every activation from here on. The local
+        // layer lives where `/skills` writes it: the project root, or the
+        // working directory outside a repository (Claude Code).
+        app.skill_overrides.load(
+            @import("platform").paths.homeDir() orelse "",
+            app.project_dir orelse app.cwd_abs,
+        ) catch |err| {
+            @import("util/log.zig").warn("skill", "skillOverrides not loaded: {s}", .{@errorName(err)});
+        };
+        app.skill_runtime.overrides = &app.skill_overrides;
+        app.skills.overrides = &app.skill_overrides;
 
         // Model-facing Skill is present only when the canonical snapshot has
         // at least one model-invocable record.
@@ -1090,6 +1113,12 @@ pub const App = struct {
             app.allocator.destroy(worker);
             app.login_worker = null;
         }
+        for (&app.parked_login_workers) |*slot| if (slot.*) |worker| {
+            worker.cancel();
+            worker.join();
+            app.allocator.destroy(worker);
+            slot.* = null;
+        };
         app.model_picker.deinit();
         if (app.oauth_session) |*session| session.deinit();
         if (app.provider_host) |host| host.destroy();
@@ -1118,6 +1147,7 @@ pub const App = struct {
         }
         app.skill_runtime.deinit();
         app.skills.deinit();
+        app.skill_overrides.deinit();
         app.read_state.deinit();
         app.edit_hl_cache.deinit();
         if (app.lsp_service) |svc| svc.shutdown(); // 关所有 language server + reaper 线程
@@ -1885,6 +1915,34 @@ pub const App = struct {
         }
     }
 
+    /// `/skills`: record `changes` in the local settings file, then bring the
+    /// model-facing listings (the Skill tool description and the system
+    /// prompt's skills section) up to date for the next request. The Skill
+    /// Runtime enforces the new states for every caller at once; background
+    /// jobs and teammates keep the listing they were started with. Runs on
+    /// the REPL thread between turns.
+    pub fn applySkillOverrides(app: *App, changes: []const skill_overrides_mod.Change) skill_overrides_mod.CommitError!void {
+        if (changes.len == 0) return;
+        try app.skill_overrides.commit(changes);
+        app.refreshSkillListings();
+    }
+
+    fn refreshSkillListings(app: *App) void {
+        const log = @import("util/log.zig");
+        // Descriptions live in the tool-definition arena, which outlives every
+        // borrower of `tool_defs` (jobs copy them when they start).
+        _ = app.skill_runtime.refreshModelTool(app.tool_defs, app.tool_defs_arena.allocator()) catch |err| {
+            log.warn("skill", "Skill tool listing not refreshed: {s}", .{@errorName(err)});
+        };
+        const sp_mod = @import("core/system_prompt.zig");
+        if (sp_mod.buildFullWithDefs(app.allocator, app.config.model_display_name orelse app.activeModel(), &app.skills, &app.agents, app.enabled_tool_names, app.memdir_abs, app.kgReady(), app.cwdAbs(), app.tool_defs)) |sp| {
+            if (app.system_prompt) |old| app.retireWorkspaceString(old);
+            app.system_prompt = sp;
+        } else |err| {
+            log.warn("skill", "system prompt not rebuilt after a skillOverrides change: {s}", .{@errorName(err)});
+        }
+    }
+
     /// Broadcast the active model as `config_changed{model}` without switching:
     /// the confirmation a per-message model override gets when it names the
     /// model already in force (SessionService.setTurnModel).
@@ -1999,6 +2057,50 @@ pub const App = struct {
         app.goal_state.clearInMemory();
     }
 
+    /// Take ownership of a cancelled `/login` worker whose thread has not
+    /// finished. With every slot taken, the oldest is waited for.
+    pub fn parkLoginWorker(app: *App, worker: *login_worker.LoginWorker) void {
+        worker.cancel();
+        app.reapLoginWorkers();
+        for (&app.parked_login_workers) |*slot| if (slot.* == null) {
+            slot.* = worker;
+            return;
+        };
+        const oldest = app.parked_login_workers[0].?;
+        oldest.join();
+        app.allocator.destroy(oldest);
+        std.mem.copyForwards(?*login_worker.LoginWorker, app.parked_login_workers[0..3], app.parked_login_workers[1..4]);
+        app.parked_login_workers[3] = worker;
+    }
+
+    /// Join and free the parked sign-ins that have settled.
+    pub fn reapLoginWorkers(app: *App) void {
+        for (&app.parked_login_workers) |*slot| if (slot.*) |worker| if (worker.isSettled()) {
+            worker.join();
+            app.allocator.destroy(worker);
+            slot.* = null;
+        };
+    }
+
+    /// `/clear` (Claude Code): a new foreground session with empty context.
+    /// The old conversation stays on disk under its id (`/resume` finds it);
+    /// what the model read or changed in it no longer counts for the new one
+    /// (must-read-first table, file-change journal). Work the old session
+    /// started in the background keeps running and stays in view, exactly as
+    /// after a Ctrl+B hand-off.
+    pub fn clearConversation(app: *App) void {
+        app.persistTranscript();
+        app.conversation.deinit();
+        app.conversation = Conversation.init(app.allocator);
+        app.read_state.clearAll();
+        app.file_change_journal.reset();
+        if (app.prepareHandOff()) |_| {
+            app.completeHandOff();
+        } else |_| {
+            app.rotateSessionIdentity();
+        }
+    }
+
     /// Ctrl+B, before the background job is spawned: make room to record the
     /// hand-off, so `completeHandOff` cannot fail once a job owns the
     /// conversation (#219).
@@ -2080,14 +2182,12 @@ pub const App = struct {
     /// `POST /sessions/create {"resume":true}`). The same steps as `/resume`:
     /// `transcript.loadTranscript`, a writer reopened past the restored
     /// messages (App.init opened one at zero, which would append them a second
-    /// time), the session's goal and its own model route. Returns the number of
-    /// messages restored; leaves the App unchanged on error.
-    pub fn resumePersistedConversation(app: *App) !usize {
+    /// time), the session's goal and its own model route (`--resume <id>`
+    /// prints the result, as `/resume` does). Leaves the App unchanged on error.
+    pub fn resumePersistedConversation(app: *App) !ResumedConversation {
         std.debug.assert(app.conversation.len() == 0);
         const writer = if (app.transcript_writer) |*w| w else return error.NoSessionDir;
-        var path_buffer: [std.fs.max_path_bytes + 1]u8 = undefined;
-        const path = std.fmt.bufPrintZ(&path_buffer, "{s}/transcript.jsonl", .{writer.dir}) catch return error.TranscriptNotFound;
-        if (!pfs.exists(path.ptr)) return error.TranscriptNotFound;
+        if (!app.hasPersistedTranscript()) return error.TranscriptNotFound;
 
         var staged = Conversation.init(app.allocator);
         errdefer staged.deinit();
@@ -2099,12 +2199,45 @@ pub const App = struct {
         writer.deinit();
         writer.* = transcript.Writer.openExisting(app.allocator, dir_owned, app.activeModel(), app.conversation.len());
         app.loadGoalFromSessionDir(dir_owned);
-        if (app.restoreSessionSelection()) |restored| {
-            if (restored) writer.model = app.activeModel();
-        } else |err| {
-            @import("util/log.zig").warn("session", "stored model route of session {s} is unavailable ({s}); the current route is kept", .{ app.session_id.asSlice(), @errorName(err) });
+        const route = app.restoreSessionRoute();
+        if (route == .unavailable) {
+            @import("util/log.zig").warn("session", "stored model route of session {s} is unavailable ({s}); the current route is kept", .{ app.session_id.asSlice(), @errorName(route.unavailable) });
         }
-        return app.conversation.len();
+        return .{ .messages = app.conversation.len(), .route = route };
+    }
+
+    /// What resuming a stored session restored.
+    pub const ResumedConversation = struct {
+        messages: usize,
+        route: RouteRestore,
+    };
+
+    /// The resumed session's own model route (`restoreSessionSelection`).
+    pub const RouteRestore = union(enum) {
+        /// It stored none; the current route serves it.
+        kept,
+        restored,
+        /// It stored one that no longer resolves; the current route is kept.
+        unavailable: anyerror,
+    };
+
+    /// Restore the route the session being resumed committed, and keep the
+    /// writer's `metadata.model` on the route that will serve it (the writer
+    /// was opened before the route changed).
+    pub fn restoreSessionRoute(app: *App) RouteRestore {
+        const restored = app.restoreSessionSelection() catch |err| return .{ .unavailable = err };
+        if (!restored) return .kept;
+        if (app.transcript_writer) |*writer| writer.model = app.activeModel();
+        return .restored;
+    }
+
+    /// This session's transcript is on disk: it persisted a turn, or it was
+    /// resumed. A session without one has nothing to resume.
+    pub fn hasPersistedTranscript(app: *App) bool {
+        const dir = app.sessionDir() orelse return false;
+        var path_buffer: [std.fs.max_path_bytes + 1]u8 = undefined;
+        const path = std.fmt.bufPrintZ(&path_buffer, "{s}/transcript.jsonl", .{dir}) catch return false;
+        return pfs.exists(path.ptr);
     }
 
     /// Stop the work this session runs beside its driver and wait for each
