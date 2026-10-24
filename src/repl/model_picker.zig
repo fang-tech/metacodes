@@ -93,6 +93,9 @@ pub const Key = union(enum) {
     /// First and last row of the stage.
     home,
     end,
+    /// On a control row: the previous / next value of its vocabulary.
+    left,
+    right,
     enter,
     /// Clears the filter, then walks back a stage, then closes.
     escape,
@@ -139,6 +142,11 @@ pub const Picker = struct {
     group_key_len: usize = 0,
     offer_id: ?OfferId = null,
     controls: controls_mod.ControlValues = .{},
+    /// Values the session already runs with (the host sets them on open). A
+    /// control an offer declares starts at its preset when the vocabulary
+    /// has it, so committing a route keeps the reasoning effort in use
+    /// instead of silently dropping it.
+    preset_controls: controls_mod.ControlValues = .{},
     scope: Scope = .session,
 
     pub fn init(allocator: std.mem.Allocator) Picker {
@@ -228,6 +236,7 @@ pub const Picker = struct {
         self.group_key_len = 0;
         self.offer_id = null;
         self.controls = .{};
+        self.preset_controls = .{};
         self.scope = .session;
         self.pending_commit = null;
         self.credential_provider = null;
@@ -409,6 +418,13 @@ pub const Picker = struct {
         return null;
     }
 
+    /// Record a value the session runs with, for `preset_controls`. Ignored when
+    /// it does not fit: the control then simply starts unset.
+    pub fn presetControl(self: *Picker, id: []const u8, text: []const u8) void {
+        const value = controls_mod.Value.fromText(text) catch return;
+        self.preset_controls.set(id, value) catch {};
+    }
+
     /// The offer the picker would commit right now, if any.
     pub fn selectedOffer(self: *const Picker) ?*const OfferSummary {
         const index = self.currentOfferIndex() orelse return null;
@@ -437,6 +453,14 @@ pub const Picker = struct {
             .page_down => return self.pageMove(visible.len, true),
             .home => return self.jump(visible.len, false),
             .end => return self.jump(visible.len, true),
+            .left, .right => {
+                if (self.stage != .options or visible.len == 0) return .ignored;
+                const row = visible[@min(self.cursor, visible.len - 1)];
+                return switch (row) {
+                    .control => |control| self.cycleControl(control, key == .right),
+                    else => .ignored,
+                };
+            },
             .cycle_scope => {
                 self.scope = switch (self.scope) {
                     .session => .global,
@@ -606,13 +630,22 @@ pub const Picker = struct {
                 self.window_top = 0;
                 return self.afterOfferChosen();
             },
-            .control => return self.cycleControl(row.control),
+            // Enter on the options step applies the route with the values
+            // shown; ←/→ change them. Enter used to cycle a value, which left
+            // no key that committed a route declaring any control.
+            .control => return self.commitNow(),
         }
     }
 
     fn afterOfferChosen(self: *Picker) Outcome {
         const offer = self.selectedOffer() orelse return .ignored;
         if (offer.controls.len == 0) return self.commitNow();
+        self.controls = .{};
+        for (offer.controls) |spec| {
+            const preset = self.preset_controls.get(spec.id) orelse continue;
+            if (!vocabularyHas(spec, preset)) continue;
+            self.controls.set(spec.id, preset) catch {};
+        }
         self.stage = .options;
         return .redraw;
     }
@@ -620,23 +653,25 @@ pub const Picker = struct {
     /// Enter on a control cycles its value through the provider's declared
     /// vocabulary, ending on "unset". Nothing here invents a value: a control
     /// with no `allowed_values` cannot be edited from the picker at all.
-    fn cycleControl(self: *Picker, row: anytype) Outcome {
+    fn cycleControl(self: *Picker, row: anytype, forward: bool) Outcome {
         const offer = self.offers.items[row.offer_index];
         if (row.spec_index >= offer.controls.len) return .ignored;
         const spec = offer.controls[row.spec_index];
         if (spec.kind != .enumeration or spec.allowed_values.len == 0) return .ignored;
 
-        const current = self.controls.get(spec.id);
-        var next_index: ?usize = 0;
-        if (current) |value| {
-            next_index = null;
+        // The cycle is unset → each declared value in order → unset; ← walks
+        // it the other way.
+        const count = spec.allowed_values.len;
+        var position: ?usize = null; // null = unset
+        if (self.controls.get(spec.id)) |value| {
             for (spec.allowed_values, 0..) |candidate, index| {
-                if (value == .text and value.text.eqlText(candidate)) {
-                    next_index = if (index + 1 < spec.allowed_values.len) index + 1 else null;
-                    break;
-                }
+                if (value == .text and value.text.eqlText(candidate)) position = index;
             }
         }
+        const next_index: ?usize = if (forward)
+            (if (position) |at| (if (at + 1 < count) at + 1 else null) else 0)
+        else
+            (if (position) |at| (if (at > 0) at - 1 else null) else count - 1);
         if (next_index) |index| {
             const value = controls_mod.Value{
                 .text = controls_mod.ControlText.parse(spec.allowed_values[index]) catch return .ignored,
@@ -685,6 +720,14 @@ fn findGroup(existing: []const Row, label: []const u8, self: *const Picker) ?usi
         if (std.mem.eql(u8, current, label)) return index;
     }
     return null;
+}
+
+fn vocabularyHas(spec: controls_mod.ControlSpec, value: controls_mod.Value) bool {
+    if (spec.kind != .enumeration or value != .text) return false;
+    for (spec.allowed_values) |candidate| {
+        if (value.text.eqlText(candidate)) return true;
+    }
+    return false;
 }
 
 fn findGroupByKey(existing: []const Row, key: []const u8, self: *const Picker) ?usize {
@@ -1080,18 +1123,55 @@ test "controls cycle through the provider vocabulary and end unset" {
     try testing.expectEqual(Stage.options, picker.stage);
     try testing.expectEqual(@as(usize, 1), picker.rowCount());
 
-    _ = picker.onKey(.enter);
+    _ = picker.onKey(.right);
     try testing.expect(picker.controls.get("reasoning_effort").?.text.eqlText("low"));
-    _ = picker.onKey(.enter);
+    _ = picker.onKey(.right);
     try testing.expect(picker.controls.get("reasoning_effort").?.text.eqlText("high"));
-    _ = picker.onKey(.enter);
+    _ = picker.onKey(.right);
     // Past the last declared value is "unset", not an invented one.
     try testing.expect(picker.controls.get("reasoning_effort") == null);
+    // ← walks the same cycle backwards.
+    _ = picker.onKey(.left);
+    try testing.expect(picker.controls.get("reasoning_effort").?.text.eqlText("high"));
+    _ = picker.onKey(.left);
+    try testing.expect(picker.controls.get("reasoning_effort").?.text.eqlText("low"));
 
-    _ = picker.onKey(.enter);
-    const outcome = picker.commitNow();
+    // Enter applies the route with the value shown.
+    const outcome = picker.onKey(.enter);
     try testing.expect(outcome == .commit);
     try testing.expect(outcome.commit.controls.get("reasoning_effort").?.text.eqlText("low"));
+}
+
+test "an offer's controls start at the value the session already runs with" {
+    const specs = [_]controls_mod.ControlSpec{.{
+        .id = "reasoning_effort",
+        .label = "Reasoning",
+        .kind = .enumeration,
+        .allowed_values = &.{ "low", "high", "max" },
+    }};
+    var picker = Picker.init(testing.allocator);
+    defer picker.deinit();
+    var offers = [_]OfferSummary{
+        fixtureOffer("zai-coding-plan", "cn-anthropic", "GLM-5.3", "zai/glm-5.3", "glm-5.3", "anthropic_messages"),
+    };
+    offers[0].controls = &specs;
+    try loadFixture(&picker, &offers, null);
+
+    picker.presetControl("reasoning_effort", "high");
+    _ = picker.onKey(.enter);
+    _ = picker.onKey(.enter);
+    try testing.expectEqual(Stage.options, picker.stage);
+    try testing.expect(picker.controls.get("reasoning_effort").?.text.eqlText("high"));
+    const outcome = picker.onKey(.enter);
+    try testing.expect(outcome.commit.controls.get("reasoning_effort").?.text.eqlText("high"));
+
+    // A preset outside the vocabulary starts unset rather than sending a
+    // value the route refuses.
+    picker.restart();
+    picker.presetControl("reasoning_effort", "medium");
+    _ = picker.onKey(.enter);
+    _ = picker.onKey(.enter);
+    try testing.expect(picker.controls.get("reasoning_effort") == null);
 }
 
 test "a control the provider did not enumerate cannot be edited from the picker" {
@@ -1112,8 +1192,12 @@ test "a control the provider did not enumerate cannot be edited from the picker"
     _ = picker.onKey(.enter);
     try testing.expectEqual(Stage.options, picker.stage);
     // The kernel owns no control vocabulary, and neither does the picker.
-    try testing.expect(picker.onKey(.enter) == .ignored);
+    try testing.expect(picker.onKey(.right) == .ignored);
     try testing.expectEqual(@as(u8, 0), picker.controls.len);
+    // Enter still applies the route, without a value for the control.
+    const outcome = picker.onKey(.enter);
+    try testing.expect(outcome == .commit);
+    try testing.expectEqual(@as(u8, 0), outcome.commit.controls.len);
 }
 
 test "backing out of options returns to the stage the user actually saw" {

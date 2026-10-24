@@ -283,3 +283,32 @@ def test_picker_on_the_api_key_route_offers_the_gateway_models(bin_path):
     assert _GatewayMock.message_models[-1:] == ["kimi-k3"], _GatewayMock.message_models
     assert _GatewayMock.message_auths[-1:] == [f"Bearer {STORED_KEY}"], "请求没用存储的 key"
     assert STORED_KEY.encode() not in raw, "TTY 输出泄漏了 API key"
+
+
+def test_picker_options_step_changes_reasoning_with_arrows_and_applies_with_enter(bin_path):
+    # GLM-5.3 declares reasoning_effort (low/high/max). The options step used to
+    # have no key that applied a route: Enter cycled the value. Now ←/→ change
+    # it and Enter applies the route with the value shown.
+    raw = run(
+        bin_path,
+        submit("/model", "Provider") + [
+            "type:zai-coding-plan", wait_for("zai-coding-plan"), "key:enter", f"waitline:Model:{WAIT_S}",
+            "type:glm-5.3", "key:up", "sleep:0.2", "key:home", "sleep:0.2", "key:enter",
+            wait_for("Channel / offer"), "key:enter",
+            wait_for("Options"), "key:right", "key:right", wait_for("= high"),
+            "key:enter", wait_for("switched to glm-5.3"),
+        ],
+        env={"ZAI_API_KEY": "tty-dummy-zai-key"},
+        per_key_drain=0.1,
+    )
+    a, text = _screen(raw)
+
+    def screen_text(sc):
+        return "\n".join(sc.line_text(r) for r in range(sc.rows))
+
+    options = [screen_text(sc) for sc in a.frame_screens if "Options" in screen_text(sc)]
+    assert options, "没有进入 Options 层:\n" + text
+    assert any("←/→ change · enter apply to" in sc for sc in options), "Options 层没说明改值的键:\n" + options[-1]
+    assert any("Reasoning effort" in sc and "= high" in sc and "[low high max]" in sc for sc in options), \
+        "→ 没有把推理强度改到 high:\n" + options[-1]
+    assert "switched to glm-5.3" in text, "Enter 没有应用线路:\n" + text

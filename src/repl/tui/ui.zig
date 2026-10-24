@@ -141,6 +141,8 @@ fn dispatchKey(state: *UiState, key: input.Key, now_ms: i64) Effect {
             .page_down => .page_down,
             .home => .home,
             .end => .end,
+            .left => .left,
+            .right => .right,
             .enter => .enter,
             .esc => .escape,
             .backspace => .backspace,

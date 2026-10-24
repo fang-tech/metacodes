@@ -32,6 +32,11 @@ pub fn open(app: *app_mod.App, ui: *ui_state.UiState) void {
         app.model_picker.markFailed();
     };
     app.model_picker.restart();
+    // The level the session runs with starts selected on any route that
+    // offers it, so applying a route does not quietly drop it.
+    if (app.config.reasoning_effort) |effort| {
+        if (effort.active()) app.model_picker.presetControl("reasoning_effort", effort.name());
+    }
     app.model_picker.page_rows = pageRowsFor(ui.rows);
     ui.picker_open = true;
 }

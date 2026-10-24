@@ -1734,6 +1734,7 @@ pub const App = struct {
         switch (outcome) {
             .committed => |accepted| {
                 try app.bindCommittedSelection(host, accepted.selection);
+                app.applyCommittedReasoning(accepted.selection);
                 if (accepted.requires_persist) try app.persistGlobalSelection(host, accepted.selection);
                 // A session-scoped choice is durable *for this session*: it has
                 // to survive a resume, and it must not reach any other session,
@@ -1749,6 +1750,20 @@ pub const App = struct {
             .rejected, .conflict => {},
         }
         return outcome;
+    }
+
+    /// A reasoning level chosen with the route (the picker's options step) is
+    /// the session's from here: the control is what the route declares, and
+    /// the client is what sends it. A commit that carries none keeps the level
+    /// the session already ran with, as `/model use` always has. The route is
+    /// live either way; a provider that takes no level only logs.
+    fn applyCommittedReasoning(app: *App, selection: provider_selection_mod.RuntimeSelection) void {
+        const value = selection.controls.get("reasoning_effort") orelse return;
+        if (value != .text) return;
+        const effort = types.ReasoningEffort.parse(value.text.slice()) orelse return;
+        app.setReasoningEffort(effort) catch |err| {
+            @import("util/log.zig").warn("provider", "reasoning effort {s} not applied: {s}", .{ effort.name(), @errorName(err) });
+        };
     }
 
     /// `<session_dir>/runtime-selection.json`. Null when this session has no

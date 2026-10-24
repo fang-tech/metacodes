@@ -272,9 +272,11 @@ fn footer(picker: *const Picker, w: *std.Io.Writer, th: Theme) u16 {
         .global => "every future session (durable)",
         .once => "the next turn only",
     };
+    // On the options step the values change with ←/→ and Enter applies them;
+    // a footer that named only Enter left the values looking fixed.
     w.print(
-        "  {s}enter apply to {s} · tab scope · esc back · q close{s}",
-        .{ th.dim, scope_text, th.reset },
+        "  {s}{s}enter apply to {s} · tab scope · esc back · q close{s}",
+        .{ th.dim, if (picker.stage == .options) "←/→ change · " else "", scope_text, th.reset },
     ) catch {};
     newline(w);
     line(w);
@@ -615,6 +617,8 @@ test "an option row shows the vocabulary and marks an unsettable control" {
     try testing.expect(std.mem.indexOf(u8, text, "higher cost and latency") != null);
     // A control the picker cannot set must say so rather than look broken.
     try testing.expect(std.mem.indexOf(u8, text, "(not settable here)") != null);
+    // The footer names the keys that change a value and apply the route.
+    try testing.expect(std.mem.indexOf(u8, text, "←/→ change · enter apply to") != null);
 }
 
 test "the credential stage draws the sign-in transcript, wrapped, and the Esc hint" {

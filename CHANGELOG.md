@@ -60,6 +60,14 @@ status, compatibility boundaries, and entry points are defined by
   max effort: `none` used to send `thinking: disabled`, which GLM-5.3 refuses.
   Gemini 4 (`gemini-4-argon`) is treated as the Gemini 3 family it extends:
   its thinking cannot be switched off.
+- **A reasoning level chosen in `/model` is the one the next request
+  carries.** The picker's options step had no key that applied a route (Enter
+  cycled the value), so a route declaring a control could not be picked at
+  all, and a level committed through the kernel never reached the client.
+  ←/→ now change a value, Enter applies the route with the values shown, and
+  the chosen `reasoning_effort` becomes the session's level. A route that
+  offers the level the session already runs with starts with it selected; a
+  commit that carries no level keeps the session's, as `/model use` does.
 
 ## 0.7.0 — 2026-10-24
 
