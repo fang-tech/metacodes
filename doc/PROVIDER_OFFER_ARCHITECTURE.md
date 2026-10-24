@@ -634,10 +634,10 @@ travels; the secret never does.
 
 `src/repl/model_picker.zig` holds the state machine, `model_picker_view.zig` the
 drawing, and `picker_host.zig` performs the commit against the session.
-`zig build test:picker` compiles all three from a root that reaches the provider
-kernel and the terminal theme and nothing else — the mirror of `test:provider`,
-proving the picker stays a *client* of the control plane rather than a second
-place identity is decided.
+`zig build test:picker` compiles the first two from a root that reaches the
+provider kernel and the terminal theme and nothing else — the mirror of
+`test:provider`, proving the picker stays a *client* of the control plane rather
+than a second place identity is decided.
 
 `/model use <id>` still works. It resolves against the offer catalog first, so a
 model served by another provider or protocol switches in place; a name carried
@@ -713,16 +713,24 @@ thread, the network and `App` live in the host and the worker.
 `zig build test:provider` compiles the subsystem from a narrow root, proving it
 builds standalone. It does **not** enforce the import boundary — that root sits
 at `src/`, so every file below it is importable, and adding `src/client.zig`
-compiles cleanly.
+compiles cleanly. `zig build test` runs it and `test:picker`.
 
 `zig build subsystem:boundary` enforces the rule where the rule lives, in the
 source: every `@import` in `src/provider/**` must resolve inside the subsystem,
-to one of seven named leaf files, or to `std`/`builtin`/`platform`; the picker's
-two files may reach the provider kernel and the terminal theme and nothing else.
-Imports are resolved against the importing file, so `../ids.zig` from a profile
-and `ids.zig` from the kernel are checked as the one path they name — and the
-gate is verified to reject `../client.zig` from the kernel, `../../client.zig`
-from a profile, and `../app.zig` from the picker.
+to one of seven named leaf files or the five files they reach, or to
+`std`/`builtin`/`platform`; the picker's two files may reach the provider kernel
+and the terminal theme and nothing else. The rule covers the closure, not just
+the first hop: each file a subsystem reaches is held to the same lists, test
+blocks included, because an isolation root compiles every test in every file it
+reaches. A file of the other subsystem is entered but not followed, since its
+own entry checks it. Imports are resolved against the importing file, so
+`../ids.zig` from a profile and `ids.zig` from the kernel are checked as the one
+path they name — and the gate is verified to reject `../client.zig` from the
+kernel, `../../client.zig` from a profile, `../app.zig` and `loop.zig` from the
+picker, a test in `api/model_name.zig` that imports the system prompt, and
+`types.zig` importing `core/stall_gate.zig`. The first-hop version of this
+check missed the last two, and both isolation roots came to compile the whole
+application.
 
 ## Not implemented yet
 

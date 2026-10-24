@@ -85,8 +85,9 @@ pub const MAX_TOOL_NAME_BYTES: usize = 64;
 pub const Mode = enum { enforce, observe };
 
 /// Host configuration as the CLI spells it. `host_default` enforces where a
-/// person can resume the run and is off where nobody can.
-pub const Setting = enum { host_default, enforce, observe, off };
+/// person can resume the run and is off where nobody can. Declared in
+/// `types.zig` so `Config` can name it without importing this file.
+pub const Setting = @import("../types.zig").StallGateSetting;
 pub const Host = enum { interactive, headless };
 
 pub fn modeFor(setting: Setting, host: Host) ?Mode {

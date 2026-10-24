@@ -195,7 +195,7 @@ pub const Config = struct {
     /// web) and is off headless; `--stall-gate` enforces everywhere,
     /// `--stall-gate-observe` only records, `--no-stall-gate` turns it off.
     /// The last of these flags wins.
-    stall_gate: @import("core/stall_gate.zig").Setting = .host_default,
+    stall_gate: StallGateSetting = .host_default,
     /// `--add-dir <path>`(可重复):额外可读写目录,注入 additionalDirectories。
     /// 多个用 `\x00` 分隔拼一串(parseArgs 累加)。
     add_dirs: ?[]const u8 = null,
@@ -262,6 +262,13 @@ pub const Config = struct {
     /// environment variable. An explicit choice outranks a route default.
     openai_protocol_explicit: bool = false,
 };
+
+/// `Config.stall_gate`, as the CLI spells it. `host_default` enforces where a
+/// person can resume the run and is off where nobody can. Declared here and
+/// re-exported as `core/stall_gate.zig`'s `Setting`, not the other way round:
+/// the provider kernel reaches this file, and that one imports the tool
+/// executor (`zig build subsystem:boundary`).
+pub const StallGateSetting = enum { host_default, enforce, observe, off };
 
 /// A single tagged treatment prevents invalid combinations such as "TinyKG on
 /// but graph tools hidden".  Swarm is intentionally outside this first-stage

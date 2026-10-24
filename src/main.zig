@@ -3430,6 +3430,7 @@ test {
     _ = &@import("util/model.zig");
     _ = &@import("util/path.zig");
     _ = &@import("api/catalog.zig");
+    _ = &@import("api/model_name_consumers_test.zig");
     _ = &@import("tools/context.zig");
     _ = &@import("repl/input.zig");
     _ = &@import("repl/model_command.zig");

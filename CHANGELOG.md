@@ -67,6 +67,18 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- `zig build test:picker` and `zig build test:provider` compile again, and
+  `zig build test` now runs both. A test in `src/api/model_name.zig` imported
+  the system prompt, and the provider kernel reaches that file through
+  `util/pricing.zig`, so both isolation roots compiled the whole application;
+  once the formal runtime needed a build option they stopped compiling (`no
+  module named 'project_harness_build_options'`). The test moved to
+  `src/api/model_name_consumers_test.zig`, and `types.zig` declares the stall
+  gate setting instead of importing `core/stall_gate.zig` for it. `zig build
+  subsystem:boundary` now checks every file a subsystem reaches, test blocks
+  included, and the picker's own files are its two files rather than all of
+  `src/repl/`. The four tests in `src/provider/capability_matrix_test.zig`,
+  which only the provider root reaches, had never run in CI.
 - **TUI: a terminal resize no longer answers an open dialog.** A resize
   interrupts a blocked key read (SIGWINCH has no `SA_RESTART`), and the
   permission dialog took the interrupted read for "No": the tool was denied
