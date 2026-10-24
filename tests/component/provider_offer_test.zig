@@ -1025,7 +1025,7 @@ test "L2: a picker-driven selection reaches the endpoint, path, and wire model i
         &registry,
         kernel.catalogSnapshot(),
         kernel.effectiveSelection().?,
-        .{ .cli_api_key = "picked-secret" },
+        .{ .cli_api_key = .{ .provider_id = Slug.lit("zai-coding-plan"), .secret = "picked-secret" } },
         &reference_buffer,
     );
     try std.testing.expectEqual(cc.types_mod.ProviderKind.openai, binding.transport);
@@ -1487,7 +1487,7 @@ test "L2: a control the offer declares changes the bytes actually sent" {
             const bound = try cc.provider_runtime_binding.bindOffer(
                 &registry,
                 &catalog.items()[0],
-                .{ .cli_api_key = "sk-control" },
+                .{ .cli_api_key = .{ .provider_id = Slug.lit("openai"), .secret = "sk-control" } },
                 &reference_buffer,
                 false,
             );

@@ -223,6 +223,11 @@ pub fn parseEndpoints(allocator: std.mem.Allocator, text: []const u8) AdapterErr
 /// Endpoint values win over model values, and only where the endpoint actually
 /// has one: an endpoint that omits pricing inherits the model's declared price
 /// with `inherited` provenance rather than becoming free.
+///
+/// Every byte the result points at is copied into `arena`. The model and
+/// endpoint catalogs are parse results their caller releases as soon as the
+/// channels are built, while the registry keeps the channels and every offer
+/// catalog built from them borrows these strings.
 pub fn buildChannels(
     arena: std.mem.Allocator,
     model: CatalogModel,
@@ -231,14 +236,19 @@ pub fn buildChannels(
     const routes = try arena.alloc(profile_mod.ProtocolRoute, 1);
     routes[0] = .{ .protocol = .openai_chat };
 
+    // Shared by every endpoint's entry: one copy per model, not per route.
+    const display_name = try dupe(arena, model.display_name);
+    const canonical_model_id = try dupe(arena, model.id);
+    const controls = try dupeControls(arena, model.controls);
+
     var out = try arena.alloc(profile_mod.ChannelDescriptor, endpoints.len);
     for (endpoints, 0..) |endpoint, index| {
         const models = try arena.alloc(profile_mod.ModelEntry, 1);
         models[0] = .{
-            .request_model_id = endpoint.request_model_id,
-            .display_name = model.display_name,
-            .canonical_model_id = model.id,
-            .model_variant = endpoint.quantization,
+            .request_model_id = try dupe(arena, endpoint.request_model_id),
+            .display_name = display_name,
+            .canonical_model_id = canonical_model_id,
+            .model_variant = try dupeOptional(arena, endpoint.quantization),
             .limits = .{
                 .context_window = endpoint.context_length orelse model.context_length,
                 .max_output_tokens = endpoint.max_output_tokens orelse model.max_output_tokens,
@@ -251,18 +261,65 @@ pub fn buildChannels(
             .capabilities = model.capabilities,
             .quote = if (endpoint.quote.isKnown()) endpoint.quote else inheritQuote(model.quote),
             .availability = endpoint.availability,
-            .controls = model.controls,
+            .controls = controls,
         };
         out[index] = .{
             .id = endpoint.channel_id,
-            .display_name = endpoint.provider_name,
+            .display_name = try dupe(arena, endpoint.provider_name),
             .base_url = "https://openrouter.ai/api/v1",
             .routes = routes,
-            .region = endpoint.region,
+            .region = try dupeOptional(arena, endpoint.region),
             .models = models,
         };
     }
     return out;
+}
+
+/// Deep copy of a control list: the specs, and every string and vocabulary
+/// slice they point at, all into `arena`.
+fn dupeControls(
+    arena: std.mem.Allocator,
+    controls: []const controls_mod.ControlSpec,
+) AdapterError![]const controls_mod.ControlSpec {
+    // A spec is copied by value and then each field that points somewhere is
+    // replaced. A pointer field added to `ControlSpec` later would otherwise
+    // be borrowed from the parse arena without a word.
+    comptime {
+        const copied = [_][]const u8{ "id", "label", "allowed_values", "cost_latency_warning", "extension_data" };
+        for (@typeInfo(controls_mod.ControlSpec).@"struct".fields) |field| {
+            if (!holdsPointer(field.type)) continue;
+            for (copied) |name| {
+                if (std.mem.eql(u8, name, field.name)) break;
+            } else @compileError("dupeControls does not copy ControlSpec." ++ field.name);
+        }
+    }
+    const out = try arena.alloc(controls_mod.ControlSpec, controls.len);
+    for (controls, out) |source, *copy| {
+        const values = try arena.alloc([]const u8, source.allowed_values.len);
+        for (source.allowed_values, values) |value, *slot| slot.* = try dupe(arena, value);
+        copy.* = source;
+        copy.id = try dupe(arena, source.id);
+        copy.label = try dupe(arena, source.label);
+        copy.allowed_values = values;
+        copy.cost_latency_warning = try dupeOptional(arena, source.cost_latency_warning);
+        copy.extension_data = try dupeOptional(arena, source.extension_data);
+    }
+    return out;
+}
+
+fn holdsPointer(comptime T: type) bool {
+    return switch (@typeInfo(T)) {
+        .pointer => true,
+        .optional => |info| holdsPointer(info.child),
+        .array => |info| holdsPointer(info.child),
+        inline .@"struct", .@"union" => |info| {
+            inline for (info.fields) |field| {
+                if (holdsPointer(field.type)) return true;
+            }
+            return false;
+        },
+        else => false,
+    };
 }
 
 fn inheritQuote(quote: offer.Quote) offer.Quote {

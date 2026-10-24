@@ -1,16 +1,22 @@
 """TTY coverage for the cross-UI model picker (issue #16).
 
 Offline: the picker reads compiled provider profiles, so no request is made and
-no credential is needed. What is asserted here is the behaviour the requirement
-names and that unit tests cannot see — that the overlay reaches a real terminal,
+no credential is needed — except on the Metask API-key route, whose inventory is
+the gateway's own `/v1/models`; that case runs against a local mock gateway.
+What is asserted here is the behaviour the requirement names and that unit
+tests cannot see — that the overlay reaches a real terminal,
 that it owns the keyboard without eating the draft, and that a mid-stream
 selection does not disturb the reply in flight.
 """
+import http.server
+import json
 import os
+import re
 import sys
+import threading
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from tty_driver import IDLE, READY, run, wait_for  # noqa: E402
+from tty_driver import IDLE, READY, WAIT_S, case_tmpdir, run, submit, wait_for  # noqa: E402
 from asserts import TTYAssert  # noqa: E402
 
 
@@ -28,6 +34,50 @@ def test_picker_opens_with_scope_and_next_turn_footer(bin_path):
     assert "enter apply to this session" in text, "footer 未说明默认作用域:\n" + text
     assert "next turn" in text, "footer 未说明下一轮语义:\n" + text
     a.assert_no_full_clear()  # 覆盖层不进 alt-screen、不清 scrollback
+
+
+def _provider_rows(text):
+    """Provider 阶段每行的 provider id(行首是 `>`/`*`/空格标记,后跟 id 和 "N models")。"""
+    rows = []
+    for line in text.splitlines():
+        parts = line.replace(">", " ").replace("*", " ").split()
+        if len(parts) == 3 and parts[2] in ("model", "models") and parts[1].isdigit():
+            rows.append(parts[0])
+    return rows
+
+
+def test_model_command_lists_every_provider_and_reaches_its_models(bin_path):
+    # metask / openai / gemini 的 id 都是 6 字节。分组标签曾指向循环变量的栈拷贝,
+    # 等长 id 被并成一行 "metask 16 models",进去只有 metask 的模型:openai、gemini
+    # 在 /model 里根本选不到。
+    raw = run(
+        bin_path,
+        submit("/model", "Provider") + ["sleep:0.3", "key:down", "sleep:0.3", "key:enter", wait_for("Model")],
+        per_key_drain=0.1,
+    )
+    a, text = _screen(raw)
+
+    def screen_text(sc):
+        return "\n".join(sc.line_text(r) for r in range(sc.rows))
+
+    provider_frames = [screen_text(sc) for sc in a.frame_screens if "Provider" in screen_text(sc)]
+    assert provider_frames, "/model 未打开 picker:\n" + text
+    providers = _provider_rows(provider_frames[-1])
+    for wanted in ("metask", "openai", "gemini", "zai-coding-plan"):
+        assert providers.count(wanted) == 1, f"provider {wanted} 不是独立一行: {providers}\n" + provider_frames[-1]
+    # 第二行是 openai(编译期目录顺序);Enter 进去必须是 openai 自己的模型。
+    assert providers[1] == "openai", f"目录顺序变了,第二行不是 openai: {providers}"
+    lines = text.splitlines()
+    header = [i for i, line in enumerate(lines) if line.strip() == "Model"]
+    assert header, "Enter 后没进 Model 阶段:\n" + text
+    model_rows = []
+    for line in lines[header[-1] + 1:]:
+        if "enter apply" in line:
+            break
+        model_rows.append(line)
+    listed = "\n".join(model_rows)
+    assert "gpt-4o" in listed, "进 openai 后没列出它的模型:\n" + text
+    assert "claude" not in listed.lower(), "进 openai 后列的是 metask 的模型:\n" + text
 
 
 def test_picker_typing_filters_without_touching_the_draft(bin_path):
@@ -122,3 +172,114 @@ def test_picker_left_open_by_a_reply_keeps_its_place(bin_path):
             and "zai-coding-plan" in screen_text(sc) and "metask" not in screen_text(sc)]
     assert kept, "回复结束后过滤状态丢了(#220):\n" + text
     assert "Provider" in text and "metask" in text, "回复结束后 picker 不再接收按键:\n" + text
+
+
+STORED_KEY = "tty-stored-gateway-key"
+
+
+class _GatewayMock(http.server.BaseHTTPRequestHandler):
+    """A Metask gateway that serves two models, neither of them a compiled Claude one."""
+
+    message_auths = []
+    message_models = []
+    lock = threading.Lock()
+
+    def log_message(self, fmt, *args):  # noqa: D401
+        return
+
+    def do_GET(self):  # noqa: N802
+        if self.path != "/v1/models":
+            self.send_error(404)
+            return
+        body = json.dumps({"object": "list", "data": [
+            {"id": "glm-5.3-flash", "display_name": "glm-5.3-flash",
+             "max_input_tokens": 1048576, "max_tokens": 131072},
+            {"id": "kimi-k3", "display_name": "Kimi K3", "max_input_tokens": 262144, "max_tokens": 32768},
+        ]}).encode("utf-8")
+        self.send_response(200)
+        self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(body)))
+        self.send_header("connection", "close")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_POST(self):  # noqa: N802
+        if self.path != "/v1/messages":
+            self.send_error(404)
+            return
+        length = int(self.headers.get("content-length", "0") or "0")
+        raw = self.rfile.read(length).decode("utf-8", "replace")
+        try:
+            model = json.loads(raw).get("model")
+        except json.JSONDecodeError:
+            model = None
+        with self.lock:
+            self.message_auths.append(self.headers.get("authorization", ""))
+            self.message_models.append(model)
+        body = (
+            'data: {"type":"message_start","message":{"usage":{"input_tokens":1,"output_tokens":0}}}\n\n'
+            'data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n'
+            'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"answered by the gateway"}}\n\n'
+            'data: {"type":"content_block_stop","index":0}\n\n'
+            'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":4}}\n\n'
+            'data: {"type":"message_stop"}\n\n'
+        ).encode("utf-8")
+        self.send_response(200)
+        self.send_header("content-type", "text/event-stream")
+        self.send_header("content-length", str(len(body)))
+        self.send_header("connection", "close")
+        self.end_headers()
+        self.wfile.write(body)
+
+
+def test_picker_on_the_api_key_route_offers_the_gateway_models(bin_path):
+    # The historical API-key route (no --provider, no Metask session login, the
+    # key stored by `metacodes login`): the picker lists what this gateway's
+    # /v1/models serves for the key, marks the model the session runs, and a
+    # pick is sent with the stored key. Before, it listed the six compiled Claude
+    # models, marked nothing, and a pick asked for a sign-in.
+    home = case_tmpdir("cc-tty-gateway-home-")
+    state = os.path.join(home, ".metacodes")
+    os.makedirs(state)
+    auth = os.path.join(state, "auth.json")
+    with open(auth, "w", encoding="utf-8") as handle:
+        json.dump({"api_key": STORED_KEY, "selected_model": "glm-5.3-flash", "reasoning_effort": "none"}, handle)
+    os.chmod(auth, 0o600)
+
+    with _GatewayMock.lock:
+        _GatewayMock.message_auths = []
+        _GatewayMock.message_models = []
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _GatewayMock)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        raw = run(
+            bin_path,
+            [READY, "key:ctrl_o", wait_for("Provider"), "key:enter", f"waitline:Model:{WAIT_S}",
+             wait_for("Kimi K3"), "type:kimi", "key:enter", wait_for("switched to kimi-k3"),
+             READY, "type:ping", "key:enter", wait_for("answered by the gateway")],
+            base_url=f"http://127.0.0.1:{server.server_port}/v1/messages",
+            env={"HOME": home, "METACODES_NO_PROBE": None, "METASK_API_KEY": None},
+            startup_drain=1.2,
+            per_key_drain=0.08,
+        )
+    finally:
+        server.shutdown()
+
+    a, text = _screen(raw)
+
+    def screen_text(sc):
+        return "\n".join(sc.line_text(r) for r in range(sc.rows))
+
+    # The Model stage before the filter is typed: its header line is exactly "Model".
+    model_stage = [screen_text(sc) for sc in a.frame_screens
+                   if "Kimi K3" in screen_text(sc)
+                   and any(sc.line_text(r).strip() == "Model" for r in range(sc.rows))]
+    assert model_stage, "picker 的 Model 阶段没出现网关模型:\n" + text
+    listing = model_stage[-1]
+    assert re.search(r"\*\s*glm-5\.3-flash", listing), "当前模型 glm-5.3-flash 未标 *:\n" + listing
+    assert "Claude" not in listing, "API-key 路由仍列出编译期 Claude 模型:\n" + listing
+    assert "switched to kimi-k3" in text, "选中网关模型后未切换:\n" + text
+    assert "sign in" not in text, "选网关模型不该要求登录:\n" + text
+    assert _GatewayMock.message_models[-1:] == ["kimi-k3"], _GatewayMock.message_models
+    assert _GatewayMock.message_auths[-1:] == [f"Bearer {STORED_KEY}"], "请求没用存储的 key"
+    assert STORED_KEY.encode() not in raw, "TTY 输出泄漏了 API key"

@@ -224,4 +224,6 @@ test {
     // (此 std 裁剪版无 refAllDeclsRecursive,用 refAllDecls;顶层 re-export 已覆盖全模块。)
     std.testing.refAllDecls(@This());
     std.testing.refAllDecls(protocol);
+    // Test-only: no re-export reaches it (see the file's header).
+    _ = &@import("api/model_name_consumers_test.zig");
 }

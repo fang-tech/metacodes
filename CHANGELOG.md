@@ -132,6 +132,48 @@ status, compatibility boundaries, and entry points are defined by
   `ReservedMemoryType` (a permission denial naming the type); `lesson` keeps
   its learning-turn admission, and the host's own writes are unchanged.
   Nodes the model already stored under these types are not removed.
+- **`/model` lists every provider.** The picker's provider rows grouped by a
+  label that pointed into the loop's copy of each offer, so providers whose
+  ids have the same length shared one row: `metask`, `openai` and `gemini`
+  showed as `metask 16 models`, and Enter on it listed only Metask's models,
+  leaving the OpenAI and Gemini routes unreachable from the picker. Each
+  provider now has its own row.
+- `zig build test:picker` and `zig build test:provider` compile again, and
+  `zig build test` now runs both. A test in `src/api/model_name.zig` imported
+  the system prompt, and the provider kernel reaches that file through
+  `util/pricing.zig`, so both isolation roots compiled the whole application;
+  once the formal runtime needed a build option they stopped compiling (`no
+  module named 'project_harness_build_options'`). The test moved to
+  `src/api/model_name_consumers_test.zig`, and `types.zig` declares the stall
+  gate setting instead of importing `core/stall_gate.zig` for it. `zig build
+  subsystem:boundary` now checks every file a subsystem reaches, test blocks
+  included, and the picker's own files are its two files rather than all of
+  `src/repl/`. The four tests in `src/provider/capability_matrix_test.zig`,
+  which only the provider root reaches, had never run in CI.
+- Linux and macOS CI now run the platform layer's `terminal.zig` and
+  `timezone.zig` tests. The "Native platform modules" step listed the modules
+  to test by hand, and the list missed both; their 7 tests ran only on the
+  Windows gate, where the time zone's daylight-saving test skips. The step now
+  compiles `src/platform/platform.zig`, whose test block references every
+  module it exports. `zig build test` also runs `test:platform` (its fork tests
+  still need `METACODES_PROC_TEST=1`) and `test:lsp`, which until now ran only
+  in `windows:gate`, so `gate:pr` covers both locally.
+- An OpenRouter catalog ingested at runtime keeps its strings. Its channels
+  borrowed model ids, names, regions and control specs from the parse results,
+  which the ingest frees before it returns, so the registry profile and every
+  offer catalog built from it (now or on a later refresh) read freed memory.
+  `buildChannels` now copies everything the channels point at into the
+  profile's arena.
+- **`--api-key` no longer authenticates another provider's `/model` pick.**
+  The flag names no provider: without `--provider` it is the Metask key, after
+  `--provider X` it is X's. A commit in the `/model` picker or `/model use`
+  passed it to whichever offer was chosen, ahead of that provider's own
+  environment key, so `metacodes --api-key <Metask key>` followed by picking a
+  Z.AI, OpenAI or configured-relay model sent the Metask key to that vendor,
+  and `--provider X --api-key` sent X's key to the Metask gateway. The flag now
+  binds only offers of the provider the session started on. Another provider's
+  pick uses its own credential, or is refused for want of one (an OAuth
+  provider offers its sign-in) and the previous route stays active.
 - **TUI: a terminal resize no longer answers an open dialog.** A resize
   interrupts a blocked key read (SIGWINCH has no `SA_RESTART`), and the
   permission dialog took the interrupted read for "No": the tool was denied
@@ -140,6 +182,26 @@ status, compatibility boundaries, and entry points are defined by
   transcript viewer, reverse search and a paste in progress ended the same
   way. An interrupted read is now retried and the dialog is drawn again; a
   SIGINT that asks the process to stop still ends it.
+- **`/model` on a Metask API key lists the models that key can use.** With no
+  `--provider` and no Metask session login, the picker showed the six compiled
+  Claude models at `napi.metask-ai.com` whatever the key's gateway served or
+  `--base-url` named, marked none of them current, and picking one with a key
+  stored by `metacodes login` asked for a sign-in (`MissingCredentials`). The
+  Metask row now holds the models the session's gateway answers on
+  `/v1/models` (again after a `/models` key switch), at the session's own
+  endpoint, one Messages route each; the running model is marked, and a pick
+  is sent with the session's key — the one picked in `/models`, else the one
+  it started with. With no answer from the gateway the compiled list stays.
+- A provider catalog ingested at runtime no longer frees another one's. The
+  host kept one arena for all of them, so Metask's gateway catalog arriving
+  after a configured `provider_catalogs` entry released that entry's profile,
+  and the rebuild in the same ingest read it.
+- The sharded test runner gives `std.debug` and every test a private copy of
+  the start-up environment. Both read the start-up `envp` array lazily, and a
+  test's `setenv` could make macOS free a string that array still pointed at;
+  the first `std.debug.print` in a shard then panicked in the environment
+  scan (`start index 3 is larger than end index 2`) whenever an earlier test
+  in that shard had moved `HOME` the wrong way.
 - `zig build test` no longer leaves TinyKG services from the WorkBuddy replay
   tests. `WorkBuddyLeaderboardProtocolTest`'s window replay and
   `LeaderboardPreflightBinaryTest` arrived after the earlier fix. They run the
