@@ -1696,7 +1696,7 @@ fn serializeOpenAITool(allocator: std.mem.Allocator, out: *std.ArrayList(u8), t:
 ///     {"type":"function_call_output",call_id,output}。thinking block 跳过(不回传)。
 ///   - system → 顶层 `instructions`(经 dialect.injectSystemMods + activateCapabilities,
 ///     同 chat 的 system 组装;非空才发)。
-///   - thinking 控制:顶层 `reasoning:{effort}`(effort 档位上限 high,xhigh→high)——
+///   - thinking 控制:顶层 `reasoning:{effort}`,活跃档位按名字原样发(GPT-6 的 xhigh 与 max 是两档)——
 ///     不走 dialect.serializeThinking(那是 chat body 的字段形态)。
 ///   - tools 扁平:{"type":"function",name,description,parameters,strict:false}(无嵌套 function)。
 ///   - response_format → 顶层 `text:{format:{...}}`(chat 的 response_format 字段形态
@@ -1734,14 +1734,15 @@ pub fn serializeOpenAIResponsesRequestReport(
     errdefer out.deinit(allocator);
     try out.appendSlice(allocator, "{\"model\":");
     try util_json.serializeString(model, &out, allocator);
-    // reasoning.effort:仅 active 档位发;Responses 档位表 minimal|low|medium|high(无 xhigh)。
+    // reasoning.effort: only an active level is sent, by its own name. GPT-6
+    // accepts low..max with xhigh and max as distinct levels (developers.openai.com
+    // models/gpt-6-astra, 2026-10); capping xhigh at high sent a weaker level
+    // than the one chosen. Which levels a model takes is its offer's control
+    // vocabulary, so the picker never offers one the model refuses.
     if (overrides.reasoning_effort) |e| if (e.active()) {
         const effort: []const u8 = switch (e) {
-            .none, .minimal => "minimal", // active() 已排除;保底最低档
-            .low => "low",
-            .medium => "medium",
-            .high => "high",
-            .xhigh => "high", // Responses 无 xhigh 档 → 封顶 high
+            .none, .minimal => "minimal", // excluded by active(); the lowest level
+            .low, .medium, .high, .xhigh, .max => e.name(),
         };
         try out.appendSlice(allocator, ",\"reasoning\":{\"effort\":");
         try util_json.serializeString(effort, &out, allocator);

@@ -358,6 +358,10 @@ pub const ReasoningEffort = enum {
     medium,
     high,
     xhigh,
+    /// Above `xhigh`. OpenAI's GPT-6 family accepts both as distinct levels;
+    /// a route whose top level is called "max" (GLM, Kimi, Anthropic) sends
+    /// `xhigh` and `max` the same way.
+    max,
 
     pub fn parse(s: []const u8) ?ReasoningEffort {
         if (std.ascii.eqlIgnoreCase(s, "none") or std.ascii.eqlIgnoreCase(s, "off")) return .none;
@@ -365,7 +369,8 @@ pub const ReasoningEffort = enum {
         if (std.ascii.eqlIgnoreCase(s, "low")) return .low;
         if (std.ascii.eqlIgnoreCase(s, "medium") or std.ascii.eqlIgnoreCase(s, "med")) return .medium;
         if (std.ascii.eqlIgnoreCase(s, "high")) return .high;
-        if (std.ascii.eqlIgnoreCase(s, "xhigh") or std.ascii.eqlIgnoreCase(s, "max")) return .xhigh;
+        if (std.ascii.eqlIgnoreCase(s, "xhigh")) return .xhigh;
+        if (std.ascii.eqlIgnoreCase(s, "max")) return .max;
         return null;
     }
 
@@ -377,13 +382,14 @@ pub const ReasoningEffort = enum {
             .medium => "medium",
             .high => "high",
             .xhigh => "xhigh",
+            .max => "max",
         };
     }
 
     pub fn active(self: ReasoningEffort) bool {
         return switch (self) {
             .none, .minimal => false,
-            .low, .medium, .high, .xhigh => true,
+            .low, .medium, .high, .xhigh, .max => true,
         };
     }
 };

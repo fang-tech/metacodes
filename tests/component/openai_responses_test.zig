@@ -571,7 +571,7 @@ test "Responses(f): output_text.delta 解除 JSON 转义(真实换行进 .text)"
 
 // ── (g) 请求序列化字节断言 ────────────────────────────────────────────────────
 
-test "Responses(g): 序列化字节断言(reasoning effort=high / xhigh→high / 无多余字段)" {
+test "Responses(g): 序列化字节断言(reasoning effort=high / xhigh、max 原样 / 无多余字段)" {
     const a = std.testing.allocator;
     const msgs = [_]cc.types_mod.ApiMessage{
         .{ .role = .user, .content = &[_]cc.types_mod.ApiContent{.{ .text = "hi" }} },
@@ -589,13 +589,20 @@ test "Responses(g): 序列化字节断言(reasoning effort=high / xhigh→high /
     try std.testing.expect(std.mem.indexOf(u8, body, "max_output_tokens") == null);
     try std.testing.expect(std.mem.indexOf(u8, body, "stream_options") == null);
 
-    // xhigh → Responses 档位封顶 high(无 xhigh 档)。
-    const body2 = try openai.serializeOpenAIResponsesRequest(a, "gpt-5.2", &msgs, null, null, .{ .reasoning_effort = .xhigh }, dialect);
+    // xhigh and max are distinct GPT-6 levels and go out by name; capping
+    // xhigh at high sent a weaker level than the one chosen.
+    const body2 = try openai.serializeOpenAIResponsesRequest(a, "gpt-6-astra", &msgs, null, null, .{ .reasoning_effort = .xhigh }, dialect);
     defer a.free(body2);
-    try std.testing.expect(std.mem.indexOf(u8, body2, "\"reasoning\":{\"effort\":\"high\"}") != null);
-    try std.testing.expect(std.mem.indexOf(u8, body2, "xhigh") == null);
+    try std.testing.expect(std.mem.indexOf(u8, body2, "\"reasoning\":{\"effort\":\"xhigh\"}") != null);
     // system=null → 不发 instructions。
     try std.testing.expect(std.mem.indexOf(u8, body2, "\"instructions\":") == null);
+    const body3 = try openai.serializeOpenAIResponsesRequest(a, "gpt-6-astra", &msgs, null, null, .{ .reasoning_effort = .max }, dialect);
+    defer a.free(body3);
+    try std.testing.expect(std.mem.indexOf(u8, body3, "\"reasoning\":{\"effort\":\"max\"}") != null);
+    // `none` is not an active level: nothing is sent, the model's default applies.
+    const body4 = try openai.serializeOpenAIResponsesRequest(a, "gpt-6-astra", &msgs, null, null, .{ .reasoning_effort = .none }, dialect);
+    defer a.free(body4);
+    try std.testing.expect(std.mem.indexOf(u8, body4, "\"reasoning\"") == null);
 }
 
 test "Responses(g2): tool_use/tool_result → function_call/function_call_output items" {

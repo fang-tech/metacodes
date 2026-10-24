@@ -31,14 +31,14 @@ fn geminiThinkingLevel(p: ModelProfile, effort: ReasoningEffort) ?[]const u8 {
         return switch (effort) {
             .none, .minimal, .low => "low",
             .medium => "medium",
-            .high, .xhigh => "high",
+            .high, .xhigh, .max => "high",
         };
     }
     // Gemini 2.5:none/minimal → 不发(可关);low → low;medium/high/xhigh → high。
     if (!effort.active()) return null;
     return switch (effort) {
         .minimal, .low => "low",
-        .medium, .high, .xhigh => "high",
+        .medium, .high, .xhigh, .max => "high",
         .none => null,
     };
 }

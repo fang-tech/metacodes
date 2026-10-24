@@ -33,6 +33,15 @@ status, compatibility boundaries, and entry points are defined by
   wires there) is still reported. A `--base-url` without `--channel` no longer
   fails for every Z.AI URL: it goes to the channel whose routes accept it (the
   default channel when it does), instead of being checked against all four.
+- **Reasoning effort reaches each route in its own words.** `max` is a level
+  of its own above `xhigh` (OpenAI's GPT-6 models take both; `--effort max`
+  and stored `max` values used to become `xhigh`); routes whose top level is
+  called max (GLM, Kimi, DeepSeek, Anthropic) send both as `max`. The OpenAI
+  Responses wire sends `xhigh` and `max` by name instead of capping them at
+  `high`. GLM-5.3 and later always get `thinking: enabled` with a low / high /
+  max effort: `none` used to send `thinking: disabled`, which GLM-5.3 refuses.
+  Gemini 4 (`gemini-4-argon`) is treated as the Gemini 3 family it extends:
+  its thinking cannot be switched off.
 
 ## 0.7.0 — 2026-10-24
 

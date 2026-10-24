@@ -883,8 +883,8 @@ pub const RenderRegion = struct {
         const entries = app.api_client.catalog.entries.items;
         const model_idx = app.models_picker_model_index orelse 0;
         const mask = if (model_idx < entries.len) entries[model_idx].reasoning_mask else 0;
-        var efforts_buf: [5]types.ReasoningEffort = undefined;
-        const efforts = reasoningOptions(mask, &efforts_buf);
+        var efforts_buf: @import("../../api/catalog.zig").ReasoningOptions = undefined;
+        const efforts = @import("../../api/catalog.zig").reasoningOptions(mask, &efforts_buf);
         var rows: u16 = 0;
 
         w.writeAll(ansi.clear.line) catch {};
@@ -2548,20 +2548,6 @@ fn appendCapabilityChip(
     len.* += sep.len;
     @memcpy(buf[len.*..][0..label.len], label);
     len.* += label.len;
-}
-
-fn reasoningOptions(mask: u8, buf: *[5]types.ReasoningEffort) []const types.ReasoningEffort {
-    const catalog = @import("../../api/catalog.zig");
-    const ordered = [_]types.ReasoningEffort{ .low, .medium, .high, .xhigh };
-    buf[0] = .none;
-    var n: usize = 1;
-    for (ordered) |effort| {
-        if ((mask & catalog.reasoningBit(effort)) != 0) {
-            buf[n] = effort;
-            n += 1;
-        }
-    }
-    return buf[0..n];
 }
 
 fn displayWidthUpTo(s: []const u8, byte_off: usize) usize {

@@ -1969,8 +1969,8 @@ fn readLineRaw(
                         redraw(region, &editor, app);
                         continue;
                     }
-                    var efforts_buf: [5]types_mod.ReasoningEffort = undefined;
-                    const efforts = reasoningOptionsForMask(entries[model_idx].reasoning_mask, &efforts_buf);
+                    var efforts_buf: @import("../api/catalog.zig").ReasoningOptions = undefined;
+                    const efforts = @import("../api/catalog.zig").reasoningOptions(entries[model_idx].reasoning_mask, &efforts_buf);
                     const effort_idx = @min(region.ui.slash_sel, efforts.len - 1);
                     try app.setReasoningEffort(efforts[effort_idx]);
                     const line = try std.fmt.allocPrint(allocator, "/model use {s}", .{entries[model_idx].model_id});
@@ -3209,25 +3209,11 @@ fn printModelCandidate(c: model_command.Candidate, current: bool) void {
     cmd_output.print("\n", .{});
 }
 
-fn reasoningOptionsForMask(mask: u8, buf: *[5]types_mod.ReasoningEffort) []const types_mod.ReasoningEffort {
-    const catalog = @import("../api/catalog.zig");
-    const ordered = [_]types_mod.ReasoningEffort{ .low, .medium, .high, .xhigh };
-    buf[0] = .none;
-    var n: usize = 1;
-    for (ordered) |effort| {
-        if ((mask & catalog.reasoningBit(effort)) != 0) {
-            buf[n] = effort;
-            n += 1;
-        }
-    }
-    return buf[0..n];
-}
-
 fn reasoningOptionCount(app: *const app_mod.App) usize {
     const idx = app.models_picker_model_index orelse return 0;
     if (idx >= app.api_client.catalog.entries.items.len) return 0;
-    var buf: [5]types_mod.ReasoningEffort = undefined;
-    return reasoningOptionsForMask(app.api_client.catalog.entries.items[idx].reasoning_mask, &buf).len;
+    var buf: @import("../api/catalog.zig").ReasoningOptions = undefined;
+    return @import("../api/catalog.zig").reasoningOptions(app.api_client.catalog.entries.items[idx].reasoning_mask, &buf).len;
 }
 
 fn printCapabilities(provider: types_mod.ProviderKind, model: []const u8) void {

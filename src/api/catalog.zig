@@ -36,7 +36,7 @@ pub fn effortLabel(vocabulary: EffortVocabulary, effort: types.ReasoningEffort) 
             .max => "max",
             .neutral => effort.name(),
         },
-        else => effort.name(),
+        .none, .minimal, .low, .medium, .high, .max => effort.name(),
     };
 }
 
@@ -234,12 +234,31 @@ pub fn reasoningBit(effort: types.ReasoningEffort) u8 {
         .medium => 1 << 3,
         .high => 1 << 4,
         .xhigh => 1 << 5,
+        .max => 1 << 6,
     };
 }
 
+/// `none` first, then every level `mask` declares, low to max.
+pub const ReasoningOptions = [6]types.ReasoningEffort;
+
+/// The `/models` reasoning menu for a model: `none`, then each level its
+/// catalog entry declares, in order.
+pub fn reasoningOptions(mask: u8, buf: *ReasoningOptions) []const types.ReasoningEffort {
+    const ordered = [_]types.ReasoningEffort{ .low, .medium, .high, .xhigh, .max };
+    buf[0] = .none;
+    var n: usize = 1;
+    for (ordered) |effort| {
+        if ((mask & reasoningBit(effort)) != 0) {
+            buf[n] = effort;
+            n += 1;
+        }
+    }
+    return buf[0..n];
+}
+
 pub fn defaultReasoningForMask(mask: u8) ?types.ReasoningEffort {
-    const ordered = [_]types.ReasoningEffort{ .low, .medium, .high, .xhigh };
-    var supported: [4]types.ReasoningEffort = undefined;
+    const ordered = [_]types.ReasoningEffort{ .low, .medium, .high, .xhigh, .max };
+    var supported: [ordered.len]types.ReasoningEffort = undefined;
     var n: usize = 0;
     for (ordered) |effort| {
         if ((mask & reasoningBit(effort)) != 0) {
@@ -268,8 +287,12 @@ fn extractReasoningMask(obj: []const u8) u8 {
     if (capSupported(effort, "low")) mask |= reasoningBit(.low);
     if (capSupported(effort, "medium")) mask |= reasoningBit(.medium);
     if (capSupported(effort, "high")) mask |= reasoningBit(.high);
-    if (capSupported(effort, "max")) mask |= reasoningBit(.xhigh);
-    if (capSupported(effort, "xhigh")) mask |= reasoningBit(.xhigh);
+    // A catalog that names only `max` calls its top level that (GLM): the
+    // neutral top `.xhigh`, labelled "max". One that names both (OpenAI's
+    // GPT-6 levels) has two distinct levels.
+    const has_xhigh = capSupported(effort, "xhigh");
+    if (has_xhigh) mask |= reasoningBit(.xhigh);
+    if (capSupported(effort, "max")) mask |= reasoningBit(if (has_xhigh) .max else .xhigh);
     return mask;
 }
 
