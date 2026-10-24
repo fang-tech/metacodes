@@ -658,9 +658,9 @@ pub const Options = struct {
     /// semantically clean. Default 0 preserves interactive behavior — a TUI
     /// user has watched the partial text stream and a silent re-run would
     /// duplicate it; headless evaluation enables 2, where one transient
-    /// otherwise destroys an entire paired arm's evidence. A failure before
-    /// anything visible streamed has no such text and always gets at least
-    /// `SILENT_STREAM_RETRY_FLOOR` retries.
+    /// otherwise destroys an entire paired arm's evidence. A stall or an
+    /// unterminated stream before anything visible streamed has no such text
+    /// and always gets at least `SILENT_STREAM_RETRY_FLOOR` retries.
     max_stream_turn_retries: u8 = 0,
     /// 统一 UI 请求回调(替代旧 ask_question 等多套;ctx 指 *TuiBackend)。
     /// 仅顶层 TUI 接(agent_depth==0)——子 agent 无 tty。见 UiRequester。

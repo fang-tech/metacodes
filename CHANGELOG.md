@@ -116,13 +116,16 @@ status, compatibility boundaries, and entry points are defined by
   learned, so an endpoint that stops sending keepalives is judged by the
   body limit again. An endpoint that never sent a keepalive mid-stream
   keeps the old behaviour.
-- **A stream that fails before anything visible arrived is re-sent once,
-  in the TUI too.** The TUI never re-sent a turn that failed mid-stream, so
-  as not to repeat text the user had already watched. When no text,
-  thinking or tool call had arrived yet, there is nothing to repeat, so the
-  same request is now sent again once (headless keeps its two retries). A
-  body-phase stall on an upstream that is pinged alive can therefore take
-  up to two body limits before the turn ends.
+- **A stream that gave no answer is re-sent once, in the TUI too.** The TUI
+  never re-sent a turn that failed mid-stream, so as not to repeat text the
+  user had already watched. When the stream stalled, or ended without
+  reporting how it stopped, before any text, thinking or tool call arrived,
+  there is nothing to repeat, so the same request is now sent again once
+  (headless keeps its two retries). An error the server reports in the
+  stream is an answer and is not re-sent, and neither is a dropped
+  connection, which on OpenAI Responses cannot be told apart from
+  `response.failed`. A body-phase stall on an upstream that is pinged alive
+  can therefore take up to two body limits before the turn ends.
 
 ## 0.6.0 — 2026-10-20
 

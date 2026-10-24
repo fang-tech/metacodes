@@ -926,9 +926,11 @@ Session 加入宿主调度的 team。lead 的 `SpawnTeammate` 不起线程,只�
   `Stall.cause = .transport_dead`,TUI 打"连接已断: N ms 内无任何字节,连 keepalive 也没有…"。判死即
   清空已学证据,端点不再发保活时退回只按进展上限判;从未在流中途发过保活的端点行为不变。非流式整包
   正文与收头阶段不受此规则影响(`setIdleLimit(.., .whole)`)。
-  **零可见输出的流中途失败同轮重发一次**:`agent_loop.SILENT_STREAM_RETRY_FLOOR`——本次尝试还没有
-  文本 / thinking / 工具调用到达 backend 时,不论 `max_stream_turn_retries` 是多少(TUI 为 0)都至少重发
-  一次;已流出可见内容的失败仍按 `max_stream_turn_retries`。仍然成立的边界:
+  **连接没给出答复、又零可见输出时同轮重发一次**:`agent_loop.SILENT_STREAM_RETRY_FLOOR`——失败是
+  `StreamStalled` 或 `StreamIncomplete`(`isSilentRetryFailure`),且本次尝试还没有文本 / thinking /
+  工具调用到达 backend 时,不论 `max_stream_turn_retries` 是多少(TUI 为 0)都至少重发一次。服务端在流里
+  报的错误(`ApiError`)是答复,不重发;`RequestFailed` 在 OpenAI Responses 上也承载 `response.failed`,
+  分不清断连与服务端失败,也不重发。已流出可见内容的失败仍按 `max_stream_turn_retries`。仍然成立的边界:
   已流出可见内容的正文 stall 在 TUI 不自动重发(已流出的内容不能假装可回滚);TaskBatch 的 join 有界于空闲上限,
   不会 detach 卡死的 worker;TUI 每个 provider 回合结束就刷 transcript,但一个回合内的内容仍只在
   内存里。

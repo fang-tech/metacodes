@@ -29,9 +29,10 @@
 //! 是 keepalive 撑着还是连接死了),正文空闲时钟只由**非保活行**续(`api/stream.zig isKeepaliveLine`)。
 //! ⑤⑨ 仍成立(input_json_delta 帧是非保活行);⑥ 反转;⑥b 补正例。
 //!
-//! 2026-10-24 起,还没有任何可见输出(文本 / thinking / 工具调用)就失败的流,TUI 默认也同轮重发
-//! 一次(`agent_loop.SILENT_STREAM_RETRY_FLOOR`):② 改用带可见文本的前缀,证明已流出内容仍不重发;
-//! ②z 证明零输出的 stall 重发后正常收尾;⑥ 两次零输出 stall,只重发一次。死连接按保活节奏判见
+//! 2026-10-24 起,还没有任何可见输出(文本 / thinking / 工具调用)就 stall 或没收尾就结束的流,
+//! TUI 默认也同轮重发一次(`agent_loop.SILENT_STREAM_RETRY_FLOOR`):② 改用带可见文本的前缀,证明
+//! 已流出内容仍不重发;②z 证明零输出的 stall 重发后正常收尾;②i 同理覆盖 StreamIncomplete;②e 证明
+//! 服务端错误帧(零输出)不重发;⑥ 两次零输出 stall,只重发一次。死连接按保活节奏判见
 //! stream_dead_connection_test.zig。
 
 const std = @import("std");
