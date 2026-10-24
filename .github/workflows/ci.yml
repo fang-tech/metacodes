@@ -309,16 +309,17 @@ jobs:
         run: |
           zig build tinykg:stage -Dtarget=aarch64-linux-musl
           zig build install -Dtarget=aarch64-linux-musl -Drelease-layout=true --prefix "$RUNNER_TEMP/stage-aarch64-linux"
+      # One binary from the platform root, whose test block references every
+      # module: a per-module list here missed terminal.zig and timezone.zig.
+      # Standalone `zig test`, not `zig build`, with METACODES_PROC_TEST=1:
+      # the spawn tests are kept out of the build runner (process.zig's
+      # `procSpawnTestsEnabled`).
       - name: Native platform modules
         if: env.FAST_PATH != 'true' && env.SUITES != 'false'
         shell: bash
         env:
           METACODES_PROC_TEST: "1"
-        run: |
-          set -euo pipefail
-          for module in sync fs rng paths signal process net dir exe_lookup; do
-            zig test "src/platform/${module}.zig" -lc
-          done
+        run: zig test src/platform/platform.zig -lc
       # The installed-adapter WorkBuddy suites (scripts/eval/tests/
       # test_workbuddy_adapter.py) run the overlay inside the real pinned
       # WorkBuddy-Bench, against its locked environment; without a checkout
@@ -664,21 +665,13 @@ jobs:
         if: env.FAST_PATH != 'true' && env.SUITES != 'false'
         shell: cmd
         run: python -m pip install -r requirements-dev.txt
+      # As in the `gates` job: the platform root, standalone, spawn tests on.
       - name: Native platform modules
         if: env.FAST_PATH != 'true' && env.SUITES != 'false'
         shell: cmd
         env:
           METACODES_PROC_TEST: "1"
-        run: >-
-          zig test src/platform/sync.zig -lc &&
-          zig test src/platform/fs.zig -lc &&
-          zig test src/platform/rng.zig -lc &&
-          zig test src/platform/paths.zig -lc &&
-          zig test src/platform/signal.zig -lc &&
-          zig test src/platform/process.zig -lc &&
-          zig test src/platform/net.zig -lc &&
-          zig test src/platform/dir.zig -lc &&
-          zig test src/platform/exe_lookup.zig -lc
+        run: zig test src/platform/platform.zig -lc
       # Current labels and the merge queue's head PR, as in the `gates` job;
       # bash for the same script.
       - name: Version state gate and release rehearsal

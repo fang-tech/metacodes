@@ -19,7 +19,7 @@ L2 必要条件:一条组件测试要跨 ≥3 个真实模块接线(声明=接�
 ## 常用命令
 
 ```bash
-zig build test                   # 完整离线门:core + 聚合 L2/L3 + eval + TinyKG 合约 + 规则传感器
+zig build test                   # 完整离线门:core + 聚合 L2/L3 + eval + TinyKG 合约 + 规则传感器 + 隔离根(platform/lsp/provider/picker)
 zig build test:lib               # core 全图;默认 4 个确定性、fail-closed 分片
 zig build test:lib -Dlib-test-shards=2   # 资源紧张机器可降低并发,不减覆盖
 zig build test:lib-monolithic    # 单进程诊断/与分片基线对照
@@ -29,7 +29,7 @@ zig build test:spike             # 聚合 component/integration 套件(8 分片)
 zig build test:integration-times # 聚合 L2/L3 逐测试耗时
 zig build test:integration-monolithic # 聚合 L2/L3 单进程对照
 zig build test:eval              # harness 评估框架(Python 合同测试 + 原生零付费 smoke)
-zig build test:platform          # 可移植平台抽象层
+zig build test:platform          # 可移植平台抽象层(fork 子进程的测试另需 METACODES_PROC_TEST=1)
 zig build test:mem               # 记忆系统 L2(隔离)
 zig build test:lsp               # LSP 子系统(隔离)
 zig build agentcore:test         # AgentCore 二进制 ABI v1 测试

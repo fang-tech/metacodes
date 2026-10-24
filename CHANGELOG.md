@@ -79,6 +79,14 @@ status, compatibility boundaries, and entry points are defined by
   included, and the picker's own files are its two files rather than all of
   `src/repl/`. The four tests in `src/provider/capability_matrix_test.zig`,
   which only the provider root reaches, had never run in CI.
+- Linux and macOS CI now run the platform layer's `terminal.zig` and
+  `timezone.zig` tests. The "Native platform modules" step listed the modules
+  to test by hand, and the list missed both; their 7 tests ran only on the
+  Windows gate, where the time zone's daylight-saving test skips. The step now
+  compiles `src/platform/platform.zig`, whose test block references every
+  module it exports. `zig build test` also runs `test:platform` (its fork tests
+  still need `METACODES_PROC_TEST=1`) and `test:lsp`, which until now ran only
+  in `windows:gate`, so `gate:pr` covers both locally.
 - **TUI: a terminal resize no longer answers an open dialog.** A resize
   interrupts a blocked key read (SIGWINCH has no `SA_RESTART`), and the
   permission dialog took the interrupted read for "No": the tool was denied

@@ -21,17 +21,9 @@ pub const test_support = @import("test_support.zig");
 // 测试发现:Zig 只收集**被引用到**的文件里的 test 块。此前本文件只有一串 `pub const x =
 // @import(...)`,没有引用它们的 test 块 —— `zig build test:platform` 因此长期跑 0 个测试,
 // 而 `windows:gate` 正是挂在这个 step 上,于是整个 Windows 平台闸门是空跑绿的。
-// 加语句块把每个子模块钉进测试图(与 `src/lsp/lsp.zig` 同款)。**新增子模块必须同时补一行**。
+// refAllDecls 引用上面每个 `pub const`,所以上面那串就是唯一的模块清单:CI 的
+// "Native platform modules" 也只编本文件。它曾自带一份逐模块清单,漏了 terminal 与
+// timezone,两者在 Linux/macOS 上从没进过 CI。
 test {
-    _ = sync;
-    _ = process;
-    _ = fs;
-    _ = signal;
-    _ = rng;
-    _ = paths;
-    _ = terminal;
-    _ = net;
-    _ = dir;
-    _ = exe_lookup;
-    _ = timezone;
+    @import("std").testing.refAllDecls(@This());
 }

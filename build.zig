@@ -2144,6 +2144,7 @@ pub fn build(b: *std.Build) void {
     // test:lsp —— LSP 子系统(Y2 Step2:被动诊断)隔离测试。
     // 根在 src/ 层(而非 src/lsp/lsp.zig):service.zig 相对引 ../util/time.zig,
     // 根在 src/lsp/ 会越出 module path(见 src/lsp_test_root.zig 顶部说明)。
+    // 测试本身也在主套件里跑;`test` 依赖它是为了这份独立编译证明,与 test:provider 同理。
     const lsp_test_mod = b.createModule(.{
         .root_source_file = b.path("src/lsp_test_root.zig"),
         .target = target,
@@ -2219,7 +2220,9 @@ pub fn build(b: *std.Build) void {
     picker_test_step.dependOn(&addTestRunArtifact(b, picker_test).step);
 
     // test:platform —— 可移植抽象层(sync/process/fs/signal/rng/paths)。platform 成独立命名模块后
-    // 其测试不再聚合进 cc-test，故独立入口。process fork 真子进程测试需 METACODES_PROC_TEST=1 启用。
+    // 其测试不再聚合进 cc-test，故独立入口，并由 `test` 依赖。fork 真子进程的测试需
+    // METACODES_PROC_TEST=1,`test` 里不设 —— 并行的 build runner 下 fork 会崩(见 process.zig
+    // `procSpawnTestsEnabled`);它们由 CI 的 "Native platform modules" 用独立 `zig test` 跑。
     const platform_test_mod = b.createModule(.{
         .root_source_file = b.path("src/platform/platform.zig"),
         .target = target,
@@ -2327,6 +2330,8 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(subsystem_boundary_step);
     test_step.dependOn(provider_test_step);
     test_step.dependOn(picker_test_step);
+    test_step.dependOn(lsp_test_step);
+    test_step.dependOn(platform_test_step);
     const tinykg_contract_test_cmd = b.addSystemCommand(&.{
         if (@import("builtin").os.tag == .windows) "python" else "python3",
         "-m",
