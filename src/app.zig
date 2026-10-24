@@ -291,6 +291,50 @@ pub const ApiKeyCatalogLoad = enum {
     loaded,
 };
 
+/// The historical Metask API-key route: no provider named (or `metask` named
+/// with an API key), no Metask session login, the Messages transport.
+///
+/// The key's gateway answers `/v1/models` with the models that key can use,
+/// which need not include a single entry of the compiled Metask profile. The
+/// provider host offers that document instead, so the picker lists what the
+/// session can actually run, marks the one it is running, and a pick reaches
+/// the endpoint the session already talks to.
+pub const MetaskKeyRoute = struct {
+    /// Where this session's Messages requests and its `/v1/models` probe go,
+    /// without the `/v1/messages` path (owned).
+    gateway_origin: []u8,
+    /// The key the session started with. Borrowed: `App.init`'s caller keeps
+    /// it for the process, exactly as it does `App.api_key`.
+    startup_key: []const u8,
+    /// The newest `/v1/models` document that origin answered (owned), or null
+    /// until one has.
+    models_json: ?[]u8 = null,
+
+    /// The route `config` starts on, or null when it starts on another one.
+    /// `messages_url` is the session's Messages endpoint.
+    pub fn of(config: types.Config, messages_url: []const u8) ?[]const u8 {
+        if (config.metask_oauth_selected) return null;
+        if (config.provider_kind != .anthropic) return null;
+        if (config.provider_profile) |name| if (!std.ascii.eqlIgnoreCase(name, "metask")) return null;
+        return gatewayOriginOf(messages_url);
+    }
+
+    /// `messages_url` without its `/v1/messages` path, or null when it does
+    /// not end in one (the same rule `Client.fetchModelsList` derives its
+    /// `/v1/models` URL by).
+    pub fn gatewayOriginOf(messages_url: []const u8) ?[]const u8 {
+        const suffix = "/v1/messages";
+        if (!std.mem.endsWith(u8, messages_url, suffix)) return null;
+        return messages_url[0 .. messages_url.len - suffix.len];
+    }
+
+    fn deinit(self: *MetaskKeyRoute, allocator: std.mem.Allocator) void {
+        allocator.free(self.gateway_origin);
+        if (self.models_json) |document| allocator.free(document);
+        self.* = undefined;
+    }
+};
+
 pub const App = struct {
     allocator: std.mem.Allocator,
     config: types.Config,
@@ -314,6 +358,9 @@ pub const App = struct {
     /// asks for a provider view, so a session that never opens the picker pays
     /// nothing for it.
     provider_host: ?*provider_host_mod.Host = null,
+    /// Set when the session runs the historical Metask API-key route; null on
+    /// every other route. See `MetaskKeyRoute`.
+    metask_key_route: ?MetaskKeyRoute = null,
     /// Cross-UI picker state. Present whether or not it is on screen, so a
     /// reopened picker does not have to refetch the catalog.
     model_picker: model_picker_mod.Picker = undefined,
@@ -877,7 +924,7 @@ pub const App = struct {
                     @import("util/log.zig").warn("catalog", "Metask provider host unavailable: {s}", .{@errorName(err)});
                     break :metask_catalog;
                 };
-                host.ingestMetask(gateway, fetched.body) catch |err| {
+                host.ingestMetask(gateway, fetched.body, .messages_and_chat) catch |err| {
                     @import("util/log.zig").warn("catalog", "Metask model ingestion failed: {s}", .{@errorName(err)});
                 };
                 // The route selected before App construction was derived
@@ -904,6 +951,12 @@ pub const App = struct {
         const metask_session_active =
             std.ascii.eqlIgnoreCase(config.provider_profile orelse "", "metask") and
             app.oauth_session != null;
+        // Recorded whether or not the probe below runs or answers: a later
+        // `/models` key switch probes this same gateway again.
+        if (MetaskKeyRoute.of(config, app.api_client.base_url)) |origin| {
+            app.metask_key_route = .{ .gateway_origin = try allocator.dupe(u8, origin), .startup_key = api_key };
+        }
+        errdefer if (app.metask_key_route) |*route| route.deinit(allocator);
         if (config.provider_kind == .anthropic) {
             if (std.c.getenv("METACODES_NO_PROBE") == null and !metask_session_active) {
                 // The account's key list waits for the `/models` key menu (ensureApiKeyCatalog).
@@ -1127,6 +1180,7 @@ pub const App = struct {
         app.api_key_catalog.deinit();
         // A refresh still in flight finishes (and frees itself) on its own thread.
         if (app.models_refresh) |refresh| refresh.release();
+        if (app.metask_key_route) |*route| route.deinit(app.allocator);
         if (app.login_worker) |worker| {
             worker.cancel();
             worker.join();
@@ -1255,9 +1309,9 @@ pub const App = struct {
     /// any miss) the answer is fetched before init returns, as it always was,
     /// and stored for the next start.
     fn loadModelCatalog(app: *App, use_cache: bool) void {
-        if (!use_cache) return app.api_client.probeModels();
+        if (!use_cache) return app.probeModelCatalog();
         const log = @import("util/log.zig");
-        const auth = app.routeAuthHeader() orelse return app.api_client.probeModels();
+        const auth = app.routeAuthHeader() orelse return app.probeModelCatalog();
         defer app.freeRouteAuthHeader(auth);
         const header: std.http.Header = .{ .name = auth.name, .value = auth.value };
         const base_url = app.api_client.base_url;
@@ -1268,6 +1322,7 @@ pub const App = struct {
             defer app.allocator.free(body);
             if (app.api_client.catalog.loadFromModelsListJson(body)) |_| {
                 log.debug("catalog", "/v1/models from the cache; refreshing in the background", .{});
+                app.adoptMetaskKeyModels(base_url, body);
                 app.models_refresh = models_cache_mod.Refresh.start(key, base_url, header, app.stateRoot()) catch |err| blk: {
                     log.debug("catalog", "background /v1/models refresh not started: {s}", .{@errorName(err)});
                     break :blk null;
@@ -1289,6 +1344,7 @@ pub const App = struct {
             log.debug("catalog", "parse /v1/models failed: {s}", .{@errorName(err)});
             return;
         };
+        app.adoptMetaskKeyModels(base_url, body);
         models_cache_mod.store(app.allocator, app.stateRoot(), key, base_url, body, now) catch |err| {
             log.debug("catalog", "models cache not written: {s}", .{@errorName(err)});
         };
@@ -1336,10 +1392,74 @@ pub const App = struct {
         };
         app.api_client.catalog.deinit();
         app.api_client.catalog = fresh;
+        app.adoptMetaskKeyModels(app.api_client.base_url, fresh_body);
         app.refreshChildCatalogSnapshots() catch |err| {
             log.warn("catalog", "child catalog snapshot refresh failed: {s}", .{@errorName(err)});
         };
         log.debug("catalog", "adopted the background /v1/models answer ({d} models)", .{app.api_client.catalog.entries.items.len});
+    }
+
+    /// GET the route's `/v1/models` into the client catalog. Failure is silent:
+    /// the local tables still answer.
+    fn probeModelCatalog(app: *App) void {
+        const body = app.api_client.fetchModelsList() catch |err| {
+            @import("util/log.zig").debug("catalog", "probeModels: {s} (falling back to local table)", .{@errorName(err)});
+            return;
+        };
+        defer app.api_client.allocator.free(body);
+        app.api_client.catalog.loadFromModelsListJson(body) catch |err| {
+            @import("util/log.zig").debug("catalog", "parse /v1/models failed: {s}", .{@errorName(err)});
+        };
+        app.adoptMetaskKeyModels(app.api_client.base_url, body);
+    }
+
+    /// Make a `/v1/models` answer from the Metask API-key route's gateway the
+    /// provider host's Metask inventory.
+    ///
+    /// The one seam for every such answer — the startup probe (fetched,
+    /// cached, or refreshed in the background) and a `/models` key switch
+    /// today — so the picker cannot keep listing an inventory the
+    /// client catalog has already replaced. `probed_messages_url` is the
+    /// Messages endpoint the document was fetched for: an answer from any
+    /// other endpoint (the session has switched provider) is not Metask's and
+    /// is ignored. The document is copied.
+    pub fn adoptMetaskKeyModels(app: *App, probed_messages_url: []const u8, document: []const u8) void {
+        const route = if (app.metask_key_route) |*value| value else return;
+        const origin = MetaskKeyRoute.gatewayOriginOf(probed_messages_url) orelse return;
+        if (!std.mem.eql(u8, origin, route.gateway_origin)) return;
+        const owned = app.allocator.dupe(u8, document) catch {
+            @import("util/log.zig").warn("catalog", "Metask gateway models not kept: out of memory", .{});
+            return;
+        };
+        if (route.models_json) |previous| app.allocator.free(previous);
+        route.models_json = owned;
+        // A host built before this answer holds the previous inventory, and
+        // a picker kept open (#220) would otherwise go on listing it.
+        if (app.provider_host) |host| {
+            app.applyMetaskKeyCatalog(host);
+            app.seedStartupSelection(host);
+            app.refreshModelPicker() catch app.model_picker.markFailed();
+        }
+    }
+
+    /// Replace the host's compiled Metask inventory with the API-key route's
+    /// gateway document, when there is one. A document the host refuses
+    /// leaves the previous inventory in place.
+    fn applyMetaskKeyCatalog(app: *App, host: *provider_host_mod.Host) void {
+        const route = app.metask_key_route orelse return;
+        const document = route.models_json orelse return;
+        host.ingestMetask(route.gateway_origin, document, .messages) catch |err| {
+            @import("util/log.zig").warn("catalog", "Metask gateway models not offered ({s}); the picker keeps the previous list", .{@errorName(err)});
+        };
+    }
+
+    /// The key a commit onto `provider_id` authenticates with on the Metask
+    /// API-key route: the one picked in `/models`, else the one the session
+    /// started with, scoped to Metask. Null for every other provider and route.
+    fn metaskKeyFor(app: *const App, provider_id: provider_ids_mod.Slug) ?provider_binding_mod.ScopedSecret {
+        const route = app.metask_key_route orelse return null;
+        if (!provider_id.eqlText("metask")) return null;
+        return .{ .provider_id = provider_id, .secret = app.selected_api_key_owned orelse route.startup_key };
     }
 
     // ── issue #16: the cross-UI provider control plane ──────────────────────
@@ -1372,6 +1492,7 @@ pub const App = struct {
                 .{why},
             );
         }
+        app.applyMetaskKeyCatalog(host);
         app.seedStartupSelection(host);
         app.provider_host = host;
         return host;
@@ -1386,28 +1507,34 @@ pub const App = struct {
     /// — the one that actually breaks a session — the turn-boundary OAuth
     /// refresh, which keys on the effective selection, never runs.
     fn seedStartupSelection(app: *App, host: *provider_host_mod.Host) void {
-        const rendered = app.config.selected_offer_id orelse return;
-        const offer_id = provider_ids_mod.OfferId.parse(rendered) catch return;
         const snapshot = host.kernel.catalogSnapshot();
-        if (snapshot.find(offer_id)) |found| {
-            host.kernel.seedSessionSelection(provider_selection_mod.RuntimeSelection.pinned(
-                found.offer_id,
-                found.offer_revision,
-                .session,
-            ));
-            return;
-        }
-        // An authenticated Metask catalog replaces the compiled profile, so
-        // its offer ids legitimately change when the server supplies a model
+        if (app.config.selected_offer_id) |rendered| {
+            const offer_id = provider_ids_mod.OfferId.parse(rendered) catch return;
+            if (snapshot.find(offer_id)) |found| {
+                host.kernel.seedSessionSelection(provider_selection_mod.RuntimeSelection.pinned(
+                    found.offer_id,
+                    found.offer_revision,
+                    .session,
+                ));
+                return;
+            }
+        } else if (app.metask_key_route == null) return;
+        // An ingested Metask catalog replaces the compiled profile, so its
+        // offer ids legitimately change when the server supplies a model
         // display/limit record. Preserve the startup route by matching the
-        // already-resolved model and wire instead of silently losing the
-        // session selection after ingestion.
-        if (std.ascii.eqlIgnoreCase(app.config.provider_profile orelse "", "metask")) {
+        // running model and wire instead of silently losing the session
+        // selection after ingestion. The API-key route never had a startup
+        // offer id at all: the model it runs on its gateway is the offer it is
+        // on — only if it is that gateway's offer (a compiled one points at the
+        // default gateway, which a `--base-url` session is not talking to) —
+        // and a re-ingest after a key switch moves the mark with it.
+        if (std.ascii.eqlIgnoreCase(app.config.provider_profile orelse "", "metask") or app.metask_key_route != null) {
             const protocol = if (app.config.provider_kind == .openai) "openai_chat" else "anthropic_messages";
             for (snapshot.items()) |*candidate| {
                 if (candidate.provider_id.eqlText("metask") and
-                    std.mem.eql(u8, candidate.request_model_id, app.config.model) and
-                    std.mem.eql(u8, candidate.protocol, protocol))
+                    std.mem.eql(u8, candidate.request_model_id, app.activeModel()) and
+                    std.mem.eql(u8, candidate.protocol, protocol) and
+                    (app.metask_key_route == null or std.mem.eql(u8, candidate.endpoint_ref, app.api_client.base_url)))
                 {
                     host.kernel.replaceSessionSelection(provider_selection_mod.RuntimeSelection.pinned(
                         candidate.offer_id,
@@ -1684,6 +1811,24 @@ pub const App = struct {
         host.kernel.adoptConfigRevision(result.config_revision);
     }
 
+    /// `--api-key`, labelled with the provider it was given for.
+    ///
+    /// The flag names no provider, so its owner is the provider the session
+    /// started on: Metask on the historical path (no provider named), otherwise
+    /// the route `main` resolved — `--provider`, `--offer`, or a stored global
+    /// selection — which is also the scope startup resolved the flag in. Same
+    /// rule as `main.selectedProfileIsMetask`, including its failure mode: a
+    /// named provider without a resolved id owns nothing, so the key reaches no
+    /// provider instead of falling back to Metask.
+    fn cliApiKey(config: types.Config) ?provider_binding_mod.ScopedSecret {
+        const secret = config.api_key orelse return null;
+        const owner = if (config.provider_profile == null)
+            provider_ids_mod.Slug.lit("metask")
+        else
+            provider_ids_mod.Slug.parse(config.resolved_provider_id orelse return null) catch return null;
+        return .{ .provider_id = owner, .secret = secret };
+    }
+
     /// Move the live session onto a committed selection.
     ///
     /// Ordering is the correctness argument. Everything that can fail happens
@@ -1707,7 +1852,9 @@ pub const App = struct {
             std.crypto.secureZero(u8, value);
             app.allocator.free(value);
         };
+        var committed_provider: ?provider_ids_mod.Slug = null;
         if (resolvedProfileFor(host, selection)) |built| {
+            committed_provider = built.id;
             // The kind comes from the profile, not from a constant: a profile
             // that accepts only `openai_codex_oauth` would reject a token
             // labelled `openai_oauth`, and the failure would look like a
@@ -1747,7 +1894,15 @@ pub const App = struct {
             selection,
             .{
                 .pool = pool,
-                .cli_api_key = app.config.api_key,
+                // On the Metask API-key route the session's own key — stored
+                // by `metacodes login`, picked in `/models`, or `--api-key` —
+                // authenticates a Metask offer, ahead of the environment, as
+                // it does every turn on the historical path. Without it a
+                // stored key is invisible here and the commit asks for a
+                // sign-in the session does not need. Any other pick sees only
+                // `--api-key`, and only for the provider the session started
+                // on (`cliApiKey`).
+                .cli_api_key = (if (committed_provider) |id| app.metaskKeyFor(id) else null) orelse cliApiKey(app.config),
                 .stored_oauth = if (oauth_token) |value| .{
                     .kind = oauth_kind,
                     .secret = value,
@@ -1919,7 +2074,7 @@ pub const App = struct {
 
         app.api_client.catalog.deinit();
         app.api_client.catalog = @import("api/catalog.zig").Catalog.init(app.allocator);
-        app.api_client.probeModels();
+        app.probeModelCatalog();
         try app.refreshChildCatalogSnapshots();
         app.models_picker_key_index = idx;
     }

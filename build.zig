@@ -2144,6 +2144,7 @@ pub fn build(b: *std.Build) void {
     // test:lsp —— LSP 子系统(Y2 Step2:被动诊断)隔离测试。
     // 根在 src/ 层(而非 src/lsp/lsp.zig):service.zig 相对引 ../util/time.zig,
     // 根在 src/lsp/ 会越出 module path(见 src/lsp_test_root.zig 顶部说明)。
+    // 测试本身也在主套件里跑;`test` 依赖它是为了这份独立编译证明,与 test:provider 同理。
     const lsp_test_mod = b.createModule(.{
         .root_source_file = b.path("src/lsp_test_root.zig"),
         .target = target,
@@ -2159,9 +2160,10 @@ pub fn build(b: *std.Build) void {
     // Compiles the subsystem from a narrow root, which proves it *builds*
     // standalone. It does not enforce the import boundary — the module root is
     // `src/`, so any file under it is importable — that is
-    // `subsystem:boundary`'s job. Its tests also run inside the aggregate
-    // `test` gate; this step exists for the standalone-build proof, not for
-    // extra coverage.
+    // `subsystem:boundary`'s job. `test` runs it: left to be run by hand, this
+    // root and the picker's came to compile the whole application, then
+    // stopped compiling, and nothing noticed. It is also the only root that
+    // reaches `provider/capability_matrix_test.zig`.
     const provider_test_mod = b.createModule(.{
         .root_source_file = b.path("src/provider_test_root.zig"),
         .target = target,
@@ -2174,9 +2176,10 @@ pub fn build(b: *std.Build) void {
     provider_test_step.dependOn(&addTestRunArtifact(b, provider_test).step);
 
     // subsystem:boundary —— the provider kernel and the picker may import only
-    // what their doc comments say. The compile-from-a-narrow-root gates below
-    // cannot enforce it: their module root is `src/`, so any file under it is
-    // importable. This checks the rule where the rule lives, in the source.
+    // what their doc comments say, and so may every file they reach. The
+    // compile-from-a-narrow-root gates cannot enforce it: their module root is
+    // `src/`, so any file under it is importable. This checks the rule where
+    // the rule lives, in the source.
     const subsystem_boundary_mod = b.createModule(.{
         .root_source_file = b.path("scripts/subsystem_boundary_gate.zig"),
         .target = b.graph.host,
@@ -2201,9 +2204,10 @@ pub fn build(b: *std.Build) void {
     subsystem_boundary_step.dependOn(&addTestRunArtifact(b, subsystem_boundary_unit).step);
 
     // test:picker —— issue #16 cross-UI model picker, in isolation.
-    // Same shape as `test:provider`: it proves the picker builds standalone.
-    // The rule that it may reach only the provider kernel and the terminal
-    // theme is enforced by `subsystem:boundary`.
+    // Same shape as `test:provider`, and run by `test` for the same reason: it
+    // proves the picker builds standalone. The rule that it may reach only the
+    // provider kernel and the terminal theme is enforced by
+    // `subsystem:boundary`.
     const picker_test_mod = b.createModule(.{
         .root_source_file = b.path("src/picker_test_root.zig"),
         .target = target,
@@ -2216,7 +2220,9 @@ pub fn build(b: *std.Build) void {
     picker_test_step.dependOn(&addTestRunArtifact(b, picker_test).step);
 
     // test:platform —— 可移植抽象层(sync/process/fs/signal/rng/paths)。platform 成独立命名模块后
-    // 其测试不再聚合进 cc-test，故独立入口。process fork 真子进程测试需 METACODES_PROC_TEST=1 启用。
+    // 其测试不再聚合进 cc-test，故独立入口，并由 `test` 依赖。fork 真子进程的测试需
+    // METACODES_PROC_TEST=1,`test` 里不设 —— 并行的 build runner 下 fork 会崩(见 process.zig
+    // `procSpawnTestsEnabled`);它们由 CI 的 "Native platform modules" 用独立 `zig test` 跑。
     const platform_test_mod = b.createModule(.{
         .root_source_file = b.path("src/platform/platform.zig"),
         .target = target,
@@ -2322,6 +2328,10 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(release_test_step);
     test_step.dependOn(http_status_gate_step);
     test_step.dependOn(subsystem_boundary_step);
+    test_step.dependOn(provider_test_step);
+    test_step.dependOn(picker_test_step);
+    test_step.dependOn(lsp_test_step);
+    test_step.dependOn(platform_test_step);
     const tinykg_contract_test_cmd = b.addSystemCommand(&.{
         if (@import("builtin").os.tag == .windows) "python" else "python3",
         "-m",

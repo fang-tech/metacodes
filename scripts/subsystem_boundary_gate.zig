@@ -11,23 +11,35 @@
 //! every `@import` in each subsystem must be on that subsystem's allowlist.
 //! Widening a list is then a deliberate, reviewable act rather than something
 //! that happens by accident because the module graph allowed it.
+//!
+//! The check follows the closure, not just the first hop. A file a subsystem
+//! may reach is held to the same lists, test blocks included, because an
+//! isolation root compiles every test in every file it reaches. Checking only
+//! the subsystem's own files let both roots compile the whole application:
+//! the approved `util/pricing.zig` began importing `api/model_name.zig`, whose
+//! test imported the system prompt and, through it, the tool set. A file that
+//! belongs to another subsystem listed here is entered but not followed; that
+//! subsystem's own entry checks its closure.
 
 const std = @import("std");
 
 const Subsystem = struct {
+    /// What a violation calls it.
+    name: []const u8,
     /// Directory that defines the subsystem, relative to the repository root.
-    /// Anything resolving inside it is by definition part of the subsystem.
+    /// Its files (see `recursive` and `only`) are by definition part of it.
     dir: []const u8,
     /// Scan nested directories too.
     recursive: bool,
     /// Only these files, when non-empty.
     only: []const []const u8 = &.{},
-    /// Named modules the subsystem may depend on.
+    /// Named modules the subsystem, and every file it reaches, may depend on.
     modules: []const []const u8,
-    /// Files *outside* the subsystem it may reach, as repository-relative
-    /// paths. Resolved from the importing file, so `../types.zig` from
-    /// `src/provider/ids.zig` and from `src/provider/profiles/metask.zig`
-    /// are both checked as the one path they actually name.
+    /// Files *outside* the subsystem it may reach, directly or through another
+    /// file on this list, as repository-relative paths. Resolved from the
+    /// importing file, so `../types.zig` from `src/provider/ids.zig` and from
+    /// `src/provider/profiles/metask.zig` are both checked as the one path
+    /// they actually name.
     reaches: []const []const u8,
 };
 
@@ -36,6 +48,7 @@ const SUBSYSTEMS = [_]Subsystem{
         // The provider kernel: `std`, `types.zig`, the approved leaf
         // utilities, and the portable platform layer. Not the transport, not
         // a UI.
+        .name = "provider kernel",
         .dir = "src/provider",
         .recursive = true,
         .modules = &.{ "std", "builtin", "platform" },
@@ -47,19 +60,26 @@ const SUBSYSTEMS = [_]Subsystem{
             "src/util/file_lock.zig",
             "src/util/json_merge.zig",
             "src/util/json.zig",
+            // Reached through the files above.
+            "src/api/model_name.zig",
+            "src/util/log.zig",
+            "src/util/time.zig",
+            "src/core/read_state.zig",
+            "src/tools/test_tmp.zig",
         },
     },
     .{
         // The picker is a *client* of the control plane: the provider kernel
         // and the terminal theme, and nothing else. Not `App`, not a client.
+        .name = "model picker",
         .dir = "src/repl",
         .recursive = false,
         .only = &.{ "model_picker.zig", "model_picker_view.zig" },
-        .modules = &.{"std"},
+        .modules = &.{ "std", "platform" },
         .reaches = &.{
-            "src/repl/model_picker.zig",
             "src/repl/tui/ansi.zig",
             "src/repl/tui/theme.zig",
+            "src/repl/tui/term.zig",
             "src/provider/ids.zig",
             "src/provider/offer.zig",
             "src/provider/controls.zig",
@@ -109,6 +129,38 @@ fn resolve(buffer: []u8, from: []const u8, target: []const u8) ?[]const u8 {
     return buffer[0..len];
 }
 
+/// True when `path` is one of `subsystem`'s own files.
+fn isMember(subsystem: Subsystem, path: []const u8) bool {
+    if (!std.mem.startsWith(u8, path, subsystem.dir) or
+        path.len <= subsystem.dir.len or
+        path[subsystem.dir.len] != '/') return false;
+    const rest = path[subsystem.dir.len + 1 ..];
+    if (subsystem.only.len > 0) return isListed(subsystem.only, rest);
+    return subsystem.recursive or std.mem.indexOfScalar(u8, rest, '/') == null;
+}
+
+fn isListed(list: []const []const u8, name: []const u8) bool {
+    for (list) |entry| {
+        if (std.mem.eql(u8, entry, name)) return true;
+    }
+    return false;
+}
+
+/// The files one subsystem reaches, each with the file it was reached from
+/// (null for the subsystem's own files), and those still to be checked.
+const Walk = struct {
+    allocator: std.mem.Allocator,
+    reached_from: std.StringHashMapUnmanaged(?[]const u8) = .empty,
+    pending: std.ArrayList([]const u8) = .empty,
+
+    fn visit(walk: *Walk, path: []const u8, from: ?[]const u8) !void {
+        if (walk.reached_from.contains(path)) return;
+        const owned = try walk.allocator.dupe(u8, path);
+        try walk.reached_from.put(walk.allocator, owned, from);
+        try walk.pending.append(walk.allocator, owned);
+    }
+};
+
 pub fn main(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
     var args = std.process.Args.iterateAllocator(init.minimal.args, allocator) catch
@@ -121,21 +173,31 @@ pub fn main(init: std.process.Init) !void {
     defer root.close(init.io);
 
     var violations: usize = 0;
-    for (SUBSYSTEMS) |subsystem| {
+    for (SUBSYSTEMS, 0..) |subsystem, index| {
+        var walk: Walk = .{ .allocator = allocator };
         var dir = try root.openDir(init.io, subsystem.dir, .{ .iterate = true, .follow_symlinks = false });
         defer dir.close(init.io);
-        try scan(allocator, init.io, dir, subsystem, subsystem.dir, &violations);
+        try seed(allocator, init.io, dir, subsystem, subsystem.dir, &walk);
+        while (walk.pending.pop()) |path| {
+            const source = root.readFileAlloc(init.io, path, allocator, .limited(4 * 1024 * 1024)) catch |err| {
+                violations += 1;
+                std.debug.print("{s}: cannot be read ({s})\n", .{ path, @errorName(err) });
+                continue;
+            };
+            try check(&walk, source, path, &SUBSYSTEMS, index, &violations);
+        }
     }
     if (violations != 0) return error.SubsystemBoundaryViolation;
 }
 
-fn scan(
+/// Queue every file of the subsystem.
+fn seed(
     allocator: std.mem.Allocator,
     io: std.Io,
     dir: std.Io.Dir,
     subsystem: Subsystem,
     prefix: []const u8,
-    violations: *usize,
+    walk: *Walk,
 ) !void {
     var iterator = dir.iterate();
     while (try iterator.next(io)) |entry| {
@@ -145,27 +207,30 @@ fn scan(
                 var child = try dir.openDir(io, entry.name, .{ .iterate = true, .follow_symlinks = false });
                 defer child.close(io);
                 const nested = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ prefix, entry.name });
-                try scan(allocator, io, child, subsystem, nested, violations);
+                try seed(allocator, io, child, subsystem, nested, walk);
             },
             .file => {
                 if (!std.mem.endsWith(u8, entry.name, ".zig")) continue;
-                if (subsystem.only.len > 0) {
-                    var listed = false;
-                    for (subsystem.only) |name| {
-                        if (std.mem.eql(u8, name, entry.name)) listed = true;
-                    }
-                    if (!listed) continue;
-                }
                 const path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ prefix, entry.name });
-                const source = try dir.readFileAlloc(io, entry.name, allocator, .limited(4 * 1024 * 1024));
-                try check(source, path, subsystem, violations);
+                if (isMember(subsystem, path)) try walk.visit(path, null);
             },
             else => {},
         }
     }
 }
 
-fn check(source: []const u8, path: []const u8, subsystem: Subsystem, violations: *usize) !void {
+/// Check every `@import` in `source`, the text of `path`, against the lists of
+/// `subsystems[index]`, and queue each file it may reach that is not another
+/// subsystem's.
+fn check(
+    walk: *Walk,
+    source: []const u8,
+    path: []const u8,
+    subsystems: []const Subsystem,
+    index: usize,
+    violations: *usize,
+) !void {
+    const subsystem = subsystems[index];
     const needle = "@import(\"";
     var cursor: usize = 0;
     var line: usize = 1;
@@ -176,64 +241,161 @@ fn check(source: []const u8, path: []const u8, subsystem: Subsystem, violations:
         }
         const start = found + needle.len;
         const end = std.mem.indexOfScalarPos(u8, source, start, '"') orelse break;
-        const target = source[start..end];
-        if (!allowedImport(path, target, subsystem)) {
-            violations.* += 1;
-            std.debug.print(
-                "{s}:{d}: `{s}` is outside this subsystem's import boundary\n",
-                .{ path, line, target },
-            );
-        }
         cursor = end + 1;
+        const target = source[start..end];
+        var buffer: [512]u8 = undefined;
+        if (resolve(&buffer, path, target)) |resolved| {
+            if (isMember(subsystem, resolved)) {
+                try walk.visit(resolved, path);
+                continue;
+            }
+            if (isListed(subsystem.reaches, resolved)) {
+                if (!ownedElsewhere(subsystems, index, resolved)) try walk.visit(resolved, path);
+                continue;
+            }
+        } else if (isListed(subsystem.modules, target)) continue;
+
+        violations.* += 1;
+        std.debug.print(
+            "{s}:{d}: `{s}` is outside the {s} import boundary",
+            .{ path, line, target, subsystem.name },
+        );
+        if (walk.reached_from.get(path)) |from| {
+            if (from) |parent| std.debug.print(" (reached from {s})", .{parent});
+        }
+        std.debug.print("\n", .{});
     }
 }
 
-fn allowedImport(path: []const u8, target: []const u8, subsystem: Subsystem) bool {
-    var buffer: [512]u8 = undefined;
-    const resolved = resolve(&buffer, path, target) orelse {
-        // No `.zig` suffix: a named module, allowed only if declared.
-        for (subsystem.modules) |name| {
-            if (std.mem.eql(u8, name, target)) return true;
-        }
-        return false;
-    };
-    // Inside the subsystem's own directory is by definition part of it.
-    if (std.mem.startsWith(u8, resolved, subsystem.dir) and
-        resolved.len > subsystem.dir.len and
-        resolved[subsystem.dir.len] == '/') return true;
-    for (subsystem.reaches) |allowed| {
-        if (std.mem.eql(u8, allowed, resolved)) return true;
+fn ownedElsewhere(subsystems: []const Subsystem, index: usize, path: []const u8) bool {
+    for (subsystems, 0..) |other, other_index| {
+        if (other_index != index and isMember(other, path)) return true;
     }
     return false;
 }
 
 test "a reach outside the subsystem must be listed by name" {
-    const subsystem = Subsystem{
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const subsystems = [_]Subsystem{.{
+        .name = "provider",
         .dir = "src/provider",
         .recursive = true,
         .modules = &.{ "std", "platform" },
         .reaches = &.{"src/types.zig"},
-    };
+    }};
+    var walk: Walk = .{ .allocator = arena.allocator() };
     var violations: usize = 0;
 
     // Inside the subsystem, from its root and from a nested directory.
-    try check("@import(\"ids.zig\")", "src/provider/registry.zig", subsystem, &violations);
-    try check("@import(\"../ids.zig\")", "src/provider/profiles/metask.zig", subsystem, &violations);
-    try check("@import(\"profiles/metask.zig\")", "src/provider/registry.zig", subsystem, &violations);
-    try check("@import(\"std\")", "src/provider/registry.zig", subsystem, &violations);
-    try check("@import(\"../types.zig\")", "src/provider/ids.zig", subsystem, &violations);
+    try check(&walk, "@import(\"ids.zig\")", "src/provider/registry.zig", &subsystems, 0, &violations);
+    try check(&walk, "@import(\"../ids.zig\")", "src/provider/profiles/metask.zig", &subsystems, 0, &violations);
+    try check(&walk, "@import(\"profiles/metask.zig\")", "src/provider/registry.zig", &subsystems, 0, &violations);
+    try check(&walk, "@import(\"std\")", "src/provider/registry.zig", &subsystems, 0, &violations);
+    try check(&walk, "@import(\"../types.zig\")", "src/provider/ids.zig", &subsystems, 0, &violations);
     try std.testing.expectEqual(@as(usize, 0), violations);
 
     // The reach this boundary exists to prevent, from both depths — a textual
     // `../` rule admitted the first of these, which is how the transport could
     // have entered the provider kernel unnoticed.
-    try check("@import(\"../client.zig\")", "src/provider/registry.zig", subsystem, &violations);
+    try check(&walk, "@import(\"../client.zig\")", "src/provider/registry.zig", &subsystems, 0, &violations);
     try std.testing.expectEqual(@as(usize, 1), violations);
-    try check("@import(\"../../client.zig\")", "src/provider/profiles/metask.zig", subsystem, &violations);
+    try check(&walk, "@import(\"../../client.zig\")", "src/provider/profiles/metask.zig", &subsystems, 0, &violations);
     try std.testing.expectEqual(@as(usize, 2), violations);
     // An undeclared named module is a dependency too.
-    try check("@import(\"hl\")", "src/provider/registry.zig", subsystem, &violations);
+    try check(&walk, "@import(\"hl\")", "src/provider/registry.zig", &subsystems, 0, &violations);
     try std.testing.expectEqual(@as(usize, 3), violations);
+}
+
+test "a reached file is held to the same lists, its tests included" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const subsystems = [_]Subsystem{.{
+        .name = "provider",
+        .dir = "src/provider",
+        .recursive = true,
+        .modules = &.{"std"},
+        .reaches = &.{ "src/util/pricing.zig", "src/api/model_name.zig" },
+    }};
+    var walk: Walk = .{ .allocator = arena.allocator() };
+    var violations: usize = 0;
+
+    // A listed file is followed, and so is a listed file it reaches.
+    try check(&walk, "@import(\"../../util/pricing.zig\")", "src/provider/profiles/metask.zig", &subsystems, 0, &violations);
+    try std.testing.expectEqualStrings("src/util/pricing.zig", walk.pending.pop().?);
+    try check(&walk, "const model_name = @import(\"../api/model_name.zig\");", "src/util/pricing.zig", &subsystems, 0, &violations);
+    try std.testing.expectEqualStrings("src/api/model_name.zig", walk.pending.pop().?);
+    try std.testing.expectEqual(@as(usize, 0), violations);
+
+    // The leak that broke both isolation roots: a test in a reached leaf that
+    // imports the system prompt.
+    try check(&walk,
+        \\test "routing" {
+        \\    const prompt = @import("../core/system_prompt.zig");
+        \\}
+    , "src/api/model_name.zig", &subsystems, 0, &violations);
+    try std.testing.expectEqual(@as(usize, 1), violations);
+    // A reached file's named modules are held to the subsystem's list too.
+    try check(&walk, "@import(\"platform\")", "src/util/pricing.zig", &subsystems, 0, &violations);
+    try std.testing.expectEqual(@as(usize, 2), violations);
+    try std.testing.expectEqual(@as(usize, 0), walk.pending.items.len);
+}
+
+test "a file another subsystem owns is entered, not followed" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const subsystems = [_]Subsystem{
+        .{
+            .name = "picker",
+            .dir = "src/repl",
+            .recursive = false,
+            .only = &.{"model_picker.zig"},
+            .modules = &.{"std"},
+            .reaches = &.{"src/provider/control_plane.zig"},
+        },
+        .{ .name = "provider", .dir = "src/provider", .recursive = true, .modules = &.{"std"}, .reaches = &.{} },
+    };
+    var walk: Walk = .{ .allocator = arena.allocator() };
+    var violations: usize = 0;
+
+    try check(&walk, "@import(\"../provider/control_plane.zig\")", "src/repl/model_picker.zig", &subsystems, 0, &violations);
+    try std.testing.expectEqual(@as(usize, 0), violations);
+    try std.testing.expectEqual(@as(usize, 0), walk.pending.items.len);
+    // Its entry point is still the only way in.
+    try check(&walk, "@import(\"../provider/registry.zig\")", "src/repl/model_picker.zig", &subsystems, 0, &violations);
+    try std.testing.expectEqual(@as(usize, 1), violations);
+}
+
+test "membership follows `only` and `recursive`, not the directory prefix" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const picker = Subsystem{
+        .name = "picker",
+        .dir = "src/repl",
+        .recursive = false,
+        .only = &.{ "model_picker.zig", "model_picker_view.zig" },
+        .modules = &.{"std"},
+        .reaches = &.{},
+    };
+    const subsystems = [_]Subsystem{picker};
+    var walk: Walk = .{ .allocator = arena.allocator() };
+    var violations: usize = 0;
+
+    try check(&walk, "@import(\"model_picker.zig\")", "src/repl/model_picker_view.zig", &subsystems, 0, &violations);
+    try std.testing.expectEqual(@as(usize, 0), violations);
+    // A sibling in the same directory is not part of the picker; a prefix
+    // rule admitted it, and with it the whole REPL.
+    try check(&walk, "@import(\"loop.zig\")", "src/repl/model_picker.zig", &subsystems, 0, &violations);
+    try std.testing.expectEqual(@as(usize, 1), violations);
+
+    try std.testing.expect(isMember(picker, "src/repl/model_picker.zig"));
+    try std.testing.expect(!isMember(picker, "src/repl/loop.zig"));
+    try std.testing.expect(!isMember(picker, "src/repl_extra/model_picker.zig"));
+    const flat = Subsystem{ .name = "flat", .dir = "src/repl", .recursive = false, .modules = &.{}, .reaches = &.{} };
+    try std.testing.expect(isMember(flat, "src/repl/loop.zig"));
+    try std.testing.expect(!isMember(flat, "src/repl/tui/theme.zig"));
+    const deep = Subsystem{ .name = "deep", .dir = "src/repl", .recursive = true, .modules = &.{}, .reaches = &.{} };
+    try std.testing.expect(isMember(deep, "src/repl/tui/theme.zig"));
 }
 
 test "paths resolve the way the compiler would read them" {

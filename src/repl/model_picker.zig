@@ -314,7 +314,11 @@ pub const Picker = struct {
 
     fn providerRows(self: *const Picker, out: []Row) []const Row {
         var len: usize = 0;
-        for (self.offers.items, 0..) |offer, index| {
+        // By pointer: a provider id is an inline `Slug`, so the label of a by-value
+        // capture points into the loop variable. Every stored label then read the
+        // offer being visited, and providers whose ids had the same length
+        // (metask, openai, gemini) folded into the first one's row.
+        for (self.offers.items, 0..) |*offer, index| {
             const label = offer.provider_id.slice();
             // The filter also matches what the provider *serves*. The first
             // stage is the one where the user knows least: someone looking for
@@ -322,9 +326,9 @@ pub const Picker = struct {
             // `zai-coding-plan`.
             if (!matches(self.filter(), label) and
                 !matches(self.filter(), offer.display_name) and
-                !matches(self.filter(), canonicalKey(offer))) continue;
+                !matches(self.filter(), canonicalKey(offer.*))) continue;
             if (findGroup(out[0..len], label, self)) |existing| {
-                bumpGroup(&out[existing], index, self.isCurrent(offer));
+                bumpGroup(&out[existing], index, self.isCurrent(offer.*));
                 continue;
             }
             if (len == out.len) break;
@@ -332,7 +336,7 @@ pub const Picker = struct {
                 .offer_index = index,
                 .offer_count = 1,
                 .label = label,
-                .is_current = self.isCurrent(offer),
+                .is_current = self.isCurrent(offer.*),
             } };
             len += 1;
         }
@@ -786,6 +790,49 @@ test "offers sharing a visible name stay distinct routes" {
     _ = picker.onKey(.enter); // model → offer stage, not a commit
     try testing.expectEqual(Stage.offer, picker.stage);
     try testing.expectEqual(@as(usize, 3), picker.rows(&scratch).len);
+}
+
+test "providers whose ids have the same length stay separate rows" {
+    // metask, openai and gemini are all six bytes: the compiled catalog once
+    // showed one "metask 16 models" row, and Enter on it listed only metask's
+    // models, so the other two providers could not be chosen at all.
+    var picker = Picker.init(testing.allocator);
+    defer picker.deinit();
+    const offers = [_]OfferSummary{
+        fixtureOffer("metask", "default", "Claude Opus 4.6", "anthropic/claude-opus-4-6", "claude-opus-4-6", "anthropic_messages"),
+        fixtureOffer("metask", "default", "Claude Opus 4.5", "anthropic/claude-opus-4-5", "claude-opus-4-5", "anthropic_messages"),
+        fixtureOffer("openai", "default", "GPT-4o", null, "gpt-4o", "openai_chat"),
+        fixtureOffer("openai", "default", "o3", null, "o3", "openai_chat"),
+        fixtureOffer("openai", "default", "GPT-4o mini", null, "gpt-4o-mini", "openai_chat"),
+        fixtureOffer("gemini", "default", "Gemini 2.5 Pro", null, "gemini-2.5-pro", "gemini_generate"),
+    };
+    try loadFixture(&picker, &offers, null);
+
+    var scratch: [Picker.MAX_ROWS]Row = undefined;
+    const provider_rows = picker.rows(&scratch);
+    try testing.expectEqual(@as(usize, 3), provider_rows.len);
+    const expected = [_]struct { id: []const u8, count: usize }{
+        .{ .id = "metask", .count = 2 },
+        .{ .id = "openai", .count = 3 },
+        .{ .id = "gemini", .count = 1 },
+    };
+    for (provider_rows, expected) |row, want| {
+        try testing.expectEqualStrings(want.id, picker.offers.items[row.provider.offer_index].provider_id.slice());
+        // The label outlives the call that built it: it is what the next
+        // offer is grouped against, and what a caller reads afterwards.
+        try testing.expectEqualStrings(want.id, row.provider.label);
+        try testing.expectEqual(want.count, row.provider.offer_count);
+    }
+
+    // Enter on the second row reaches openai's models, not metask's.
+    _ = picker.onKey(.down);
+    _ = picker.onKey(.enter);
+    try testing.expectEqual(Stage.model, picker.stage);
+    const model_rows = picker.rows(&scratch);
+    try testing.expectEqual(@as(usize, 3), model_rows.len);
+    for (model_rows) |row| {
+        try testing.expectEqualStrings("openai", picker.offers.items[row.model.offer_index].provider_id.slice());
+    }
 }
 
 test "a model with one route skips the channel step and commits" {

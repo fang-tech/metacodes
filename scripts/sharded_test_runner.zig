@@ -56,6 +56,30 @@ fn shardForTest(name: []const u8, shard_count: usize) usize {
     return @intCast(hashTestName(name) % @as(u64, @intCast(shard_count)));
 }
 
+/// A private copy of the start-up environment, made before any test runs.
+///
+/// Every `Io.Threaded` built from `init.environ` — `std.debug`'s, on the first
+/// print anywhere in the process, and each test's `std.testing.io` — reads the
+/// start-up `envp` array lazily. Tests change the environment with setenv and
+/// unsetenv, and libc may free a string that array still points at: on macOS
+/// an entry replaced while `environ` was still that array is reallocated, and
+/// freed, by a later longer replacement once the array has moved. The scan
+/// then read a reused `HOME` slot holding a two-byte string and panicked the
+/// first test in its shard to print to stderr — after a test added elsewhere
+/// had only changed which tests ran before it.
+fn stableEnviron(environ: std.process.Environ) std.process.Environ {
+    if (@TypeOf(environ.block) != std.process.Environ.PosixBlock) return environ;
+    const allocator = std.heap.page_allocator;
+    const source = environ.block.slice;
+    const copy = allocator.allocSentinel(?[*:0]const u8, source.len, null) catch
+        @panic("cannot copy the start-up environment");
+    for (source, copy) |entry, *slot| {
+        slot.* = (allocator.dupeZ(u8, std.mem.span(entry.?)) catch
+            @panic("cannot copy the start-up environment")).ptr;
+    }
+    return .{ .block = .{ .slice = copy } };
+}
+
 fn elapsedMs(elapsed_ns: u64) f64 {
     return @as(f64, @floatFromInt(elapsed_ns)) / std.time.ns_per_ms;
 }
@@ -63,7 +87,12 @@ fn elapsedMs(elapsed_ns: u64) f64 {
 pub fn main(init: std.process.Init.Minimal) void {
     @disableInstrumentation();
 
-    const shard = readShardConfig(init.environ) catch |err|
+    const environ = stableEnviron(init.environ);
+    if (std.Options.debug_threaded_io) |threaded| {
+        threaded.environ = .{ .process_environ = environ };
+    }
+
+    const shard = readShardConfig(environ) catch |err|
         std.debug.panic("invalid {s}/{s}: {t}", .{ shard_count_env, shard_index_env, err });
     const test_fns = builtin.test_functions;
     const runner_io = std.Io.Threaded.global_single_threaded.io();
@@ -104,13 +133,13 @@ pub fn main(init: std.process.Init.Minimal) void {
         std.testing.allocator_instance = .{};
         std.testing.io_instance = .init(std.testing.allocator, .{
             .argv0 = .init(init.args),
-            .environ = init.environ,
+            .environ = environ,
         });
         // The fast gate stays terse: tests that intentionally exercise warning
         // paths should assert behavior, not make a successful build look like
         // a failed command. The timing diagnostic keeps .warn for investigation.
         std.testing.log_level = .err;
-        std.testing.environ = init.environ;
+        std.testing.environ = environ;
 
         // The error return trace lives in this frame and is only appended to: every
         // `return error.X` that unwinds into this loop (a skip is one) leaves its frames

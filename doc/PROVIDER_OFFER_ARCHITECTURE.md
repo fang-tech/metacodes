@@ -252,7 +252,14 @@ runtime descriptor → profile-declared environment aliases → persisted store
 the last two steps *within one provider*; it never widens scope.
 
 Because aliases are profile data, a Metask key is not reachable from an OpenAI
-or Z.AI resolution at all. At startup, Metask (and any session that names no
+or Z.AI resolution at all. `--api-key` is the one key that arrives without a
+kind or a provider, and every API-key profile would accept it — ahead of its
+own environment key. It is therefore labelled with the provider the session
+started on (Metask when none is named, otherwise the startup route's provider,
+the scope startup resolved it in), and a `/model` commit offers it to that
+provider only (`ScopedSecret` in `provider/runtime_binding.zig`). Picking
+another provider's model uses that provider's own credential or is refused for
+want of one; the previous route stays active. At startup, Metask (and any session that names no
 provider) keeps the historical `core/auth.zig` path byte for byte — stored
 OAuth, stored key, and the one-shot descriptor. Any other profile resolves in
 its own scope, and the stored Metask model/effort selection is not applied to
@@ -586,6 +593,13 @@ fails leaves the previous catalog in place: a stale catalog is a far better
 answer than an empty one, and every pin stays resolvable because offer ids are
 derived from the stable binding.
 
+Each ingest keeps its own arena until the host ends (`Host.catalog_arenas`).
+One shared slot let an ingest for one provider free the strings behind
+another provider's profile, which the rebuild inside that same ingest then
+read; and a same-provider replace cannot free its predecessor either, because
+the retired catalog and any picker snapshot taken before the swap still borrow
+its model names.
+
 Ingesting a catalog moves the catalog revision and emits `catalog.updated`,
 `pricing.updated`, and — when an endpoint reports degraded or unavailable —
 `provider.degraded`. `auth.changed` and `credential.expiring` have producers on
@@ -634,16 +648,39 @@ travels; the secret never does.
 
 `src/repl/model_picker.zig` holds the state machine, `model_picker_view.zig` the
 drawing, and `picker_host.zig` performs the commit against the session.
-`zig build test:picker` compiles all three from a root that reaches the provider
-kernel and the terminal theme and nothing else — the mirror of `test:provider`,
-proving the picker stays a *client* of the control plane rather than a second
-place identity is decided.
+`zig build test:picker` compiles the first two from a root that reaches the
+provider kernel and the terminal theme and nothing else — the mirror of
+`test:provider`, proving the picker stays a *client* of the control plane rather
+than a second place identity is decided.
 
 `/model use <id>` still works. It resolves against the offer catalog first, so a
 model served by another provider or protocol switches in place; a name carried
 by several routes is reported with their offer ids instead of guessed, and an
 offer id is accepted verbatim. Names the catalog does not declare fall through
 to the historical path, which still serves proxies and server-catalog models.
+
+On the historical Metask API-key route — no provider named, or `metask` named
+with an API key, and no Metask session login — the Metask offers are the ones
+the session's own gateway lists. A key's gateway serves the models of that
+key's group, which need not include any of the compiled profile's Claude
+models, and `--base-url` may name another gateway entirely; the compiled
+inventory at the default gateway therefore listed routes the session could not
+use and none it could. `App.MetaskKeyRoute` records the route at startup, and
+every `/v1/models` answer from that gateway — the startup probe (fetched, read
+from the `/v1/models` cache, or refreshed in the background) and a `/models`
+key switch — goes through one seam (`App.adoptMetaskKeyModels`) into
+`Host.ingestMetask(..., .messages)`: one Messages offer per listed model at the
+session's own endpoint, no Chat Completions offer (the session's transport is
+Messages, the key was never shown to serve Chat, and two wires per model would
+make `/model use <id>` ambiguous). The host stays lazy; it ingests the newest
+document when it is built, and a document that arrives after that re-ingests at
+once. The running model's offer on that endpoint is seeded as the session
+selection, so the picker, `/providers`, and `/alias pin` see the current route.
+A commit onto a Metask offer there binds the session's own key — picked in
+`/models`, else the one the session started with, stored login included —
+ahead of the environment, as every turn on that route already does. With no
+answer from the gateway the compiled inventory stays. A Metask session login
+ingests its authenticated gateway's catalog with both wires, as before.
 
 `/login [<provider>] [--device-code] [--no-browser] [--client-id <client>]` is
 the TUI's OAuth setup path (issue #33). Without a provider it opens a Login
@@ -713,16 +750,24 @@ thread, the network and `App` live in the host and the worker.
 `zig build test:provider` compiles the subsystem from a narrow root, proving it
 builds standalone. It does **not** enforce the import boundary — that root sits
 at `src/`, so every file below it is importable, and adding `src/client.zig`
-compiles cleanly.
+compiles cleanly. `zig build test` runs it and `test:picker`.
 
 `zig build subsystem:boundary` enforces the rule where the rule lives, in the
 source: every `@import` in `src/provider/**` must resolve inside the subsystem,
-to one of seven named leaf files, or to `std`/`builtin`/`platform`; the picker's
-two files may reach the provider kernel and the terminal theme and nothing else.
-Imports are resolved against the importing file, so `../ids.zig` from a profile
-and `ids.zig` from the kernel are checked as the one path they name — and the
-gate is verified to reject `../client.zig` from the kernel, `../../client.zig`
-from a profile, and `../app.zig` from the picker.
+to one of seven named leaf files or the five files they reach, or to
+`std`/`builtin`/`platform`; the picker's two files may reach the provider kernel
+and the terminal theme and nothing else. The rule covers the closure, not just
+the first hop: each file a subsystem reaches is held to the same lists, test
+blocks included, because an isolation root compiles every test in every file it
+reaches. A file of the other subsystem is entered but not followed, since its
+own entry checks it. Imports are resolved against the importing file, so
+`../ids.zig` from a profile and `ids.zig` from the kernel are checked as the one
+path they name — and the gate is verified to reject `../client.zig` from the
+kernel, `../../client.zig` from a profile, `../app.zig` and `loop.zig` from the
+picker, a test in `api/model_name.zig` that imports the system prompt, and
+`types.zig` importing `core/stall_gate.zig`. The first-hop version of this
+check missed the last two, and both isolation roots came to compile the whole
+application.
 
 ## Not implemented yet
 
