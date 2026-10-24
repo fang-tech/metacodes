@@ -25,6 +25,14 @@ status, compatibility boundaries, and entry points are defined by
   follow `after_id` until the gateway says there is no more (at most 50 pages
   of 1000), so every model a key may use reaches `/model` and `/models`. A
   single-page list is read exactly as before.
+- **`--provider zai-coding-plan --model <listed model>` starts.** Z.AI declares
+  every model on four channels, so naming one stopped the start with "model
+  matches several routes" while an unlisted model or a bare `--provider`
+  already took the declared default channel. A listed model now takes the
+  default channel too; only a choice the default channel cannot settle (two
+  wires there) is still reported. A `--base-url` without `--channel` no longer
+  fails for every Z.AI URL: it goes to the channel whose routes accept it (the
+  default channel when it does), instead of being checked against all four.
 
 ## 0.7.0 — 2026-10-24
 
