@@ -168,13 +168,23 @@ status, compatibility boundaries, and entry points are defined by
 - **A stream that gave no answer is re-sent once, in the TUI too.** The TUI
   never re-sent a turn that failed mid-stream, so as not to repeat text the
   user had already watched. When the stream stalled, or ended without
-  reporting how it stopped, before any text, thinking or tool call arrived,
-  there is nothing to repeat, so the same request is now sent again once
-  (headless keeps its two retries). An error the server reports in the
-  stream is an answer and is not re-sent, and neither is a dropped
-  connection, which on OpenAI Responses cannot be told apart from
-  `response.failed`. A body-phase stall on an upstream that is pinged alive
-  can therefore take up to two body limits before the turn ends.
+  reporting how it stopped, or the connection dropped, before any text,
+  thinking or tool call arrived, there is nothing to repeat, so the same
+  request is now sent again once (headless keeps its two retries). An error
+  the server reports in the stream is an answer and is not re-sent, and
+  neither is a local failure such as an over-long line. A body-phase stall
+  on an upstream that is pinged alive can therefore take up to two body
+  limits before the turn ends.
+- **An error a server reports mid-stream is reported as one, on every
+  wire.** On OpenAI-compatible chat and Gemini streams a `data:
+  {"error":{…}}` chunk was skipped as empty; the stream then ended without
+  a stop report and read as an unterminated stream, so the server's own
+  message never reached the user. It now ends the turn with
+  `API 错误帧: <the error object>`, as Anthropic's error frame already did,
+  and OpenAI Responses' `response.failed` and `error` events do the same
+  instead of the generic request failure. Mid-stream, the generic request
+  failure now means only that the connection dropped; local failures (an
+  over-long line, out of memory) keep their own names.
 
 ## 0.6.0 — 2026-10-20
 

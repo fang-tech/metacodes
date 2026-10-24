@@ -504,7 +504,8 @@ const GeminiStream = struct {
                     client_mod.reportBodyStall("gemini", self.id, stall);
                     return error.StreamStalled;
                 }
-                return err;
+                log.warnId("gemini", self.id, "stream read failed: {s}", .{@errorName(err)});
+                return api_stream.midStreamReadError(err);
             };
             const line = line_opt orelse {
                 self.done = true;
@@ -547,6 +548,13 @@ const GeminiStream = struct {
 
     /// 解析一个 Gemini SSE chunk(完整 GenerateContentResponse JSON)→ 中立 StreamEvent。
     fn parseChunk(self: *GeminiStream, data: []const u8) !?StreamEvent {
+        // 流中途的服务端报错:`data: {"error":{"code":…,"message":…,"status":…}}`,没有候选。
+        // 旧实现当空 chunk 跳过,随后没收尾就结束 → StreamIncomplete,答复被当成断流。
+        if (util_json.topLevelObjectField(data, "error")) |err_obj| {
+            self.done = true;
+            client_mod.reportServerError("gemini", self.id, err_obj);
+            return error.ApiError;
+        }
         const report = stopReport(data);
         if (report.finish_reason) |fr| {
             self.last_stop = mapGeminiFinish(fr);
