@@ -334,10 +334,19 @@ pub fn reportHeadStall(comptime module: []const u8, rid: log.RequestId, stall: p
 /// 两种形状要分开点名:传输层也沉默 = 连接死了(网络/代理);传输层活着但没有模型输出 = 网关在
 /// 用 keepalive 撑着一条上游不再产出的流(2026-09-23:napi 每 15s 一条 ping,上游 55 分钟零输出)。
 /// 前者该查网络,后者该查网关/上游——文案让用户一眼分清,不用翻观测日志。
+///
+/// 第三种(2026-10-24):端点此前在流中途总会按节奏发 keepalive,这次连 keepalive 都断了——
+/// 不等 30 分钟的进展上限,按学到的节奏判连接已死(见 RequestAbortRegistry 的 Dead connections)。
 pub fn reportBodyStall(comptime module: []const u8, rid: log.RequestId, stall: provider_mod.RequestAbortRegistry.Stall) void {
+    var buf: [256]u8 = undefined;
+    if (stall.cause == .transport_dead) {
+        log.warnId(module, rid, "no byte for {d}ms, keepalives included (endpoint had pinged at least every {d}ms mid-stream, dead limit {d}ms): connection judged dead and shut down", .{ stall.transport_idle_ms, stall.keepalive_gap_ms, stall.limit_ms });
+        const detail = std.fmt.bufPrint(&buf, "{d} ms 内无任何字节,连 keepalive 也没有(该端点流中途此前每 ≤{d} ms 必发一次,上限 {d} ms),判定连接已断,客户端已关闭", .{ stall.transport_idle_ms, stall.keepalive_gap_ms, stall.limit_ms }) catch "StreamStalled";
+        last_error.recordNamed("连接已断", detail);
+        return;
+    }
     const keepalive_only = stall.transport_idle_ms * 2 < stall.idle_ms;
     log.warnId(module, rid, "no model output for {d}ms (body idle limit {d}ms, last transport byte {d}ms ago): stream stalled, connection shut down", .{ stall.idle_ms, stall.limit_ms, stall.transport_idle_ms });
-    var buf: [192]u8 = undefined;
     const detail = if (keepalive_only)
         std.fmt.bufPrint(&buf, "{d} ms 内无模型输出,但网关 keepalive 仍在到达(最近字节 {d} ms 前)(上限 {d} ms),连接已由客户端关闭;上游/网关卡住,不是网络断了", .{ stall.idle_ms, stall.transport_idle_ms, stall.limit_ms }) catch "StreamStalled"
     else
@@ -1093,7 +1102,7 @@ pub const Client = struct {
         // 响应头已接受 → 正文阶段:切到按 max_tokens 放大的上限(见 bodyIdleLimitMs)。收头阶段的
         // 严上限从此不再适用于这条连接;字节级续命由 LivenessReader 负责。
         const body_idle_limit_ms = bodyIdleLimitMs(client.stream_body_idle_timeout_ms, client.stream_idle_timeout_ms, max_tokens);
-        client.abort_registry.setIdleLimit(req_ptr, body_idle_limit_ms);
+        client.abort_registry.setIdleLimit(req_ptr, body_idle_limit_ms, if (streaming) .sse else .whole);
         log.debugId("client", rid, "body idle limit {d}ms (head limit {d}ms, max_tokens {d})", .{ body_idle_limit_ms, client.stream_idle_timeout_ms, max_tokens });
 
         if (streaming) {
@@ -1445,6 +1454,13 @@ pub const StreamResponse = struct {
         registry.touch(self.stream_result.request);
     }
 
+    /// EventIterator 的保活钩子:一条 ping / 注释行 → 交给注册表学习该端点的保活节奏。
+    fn keepaliveThunk(raw: *anyopaque) void {
+        const self: *StreamResponse = @ptrCast(@alignCast(raw));
+        const registry = self.stream_result.abort_registry orelse return;
+        registry.touchKeepalive(self.stream_result.request);
+    }
+
     /// 读下一个事件。首次调用时懒初始化 EventIterator——Response.reader 的返回是一个
     /// 指向 self.stream_result 内部字段的指针，必须在 self 稳定后才能取地址。
     pub fn next(self: *StreamResponse) !?StreamEvent {
@@ -1465,7 +1481,7 @@ pub const StreamResponse = struct {
                 api_stream.EventIterator.init(reader);
             self.event_iter.setRequestId(self.id);
             if (self.stream_result.abort_registry != null)
-                self.event_iter.setProgressHook(.{ .ctx = @ptrCast(self), .call = progressThunk });
+                self.event_iter.setProgressHook(.{ .ctx = @ptrCast(self), .call = progressThunk, .keepalive = keepaliveThunk });
             if (self.user_query.len > 0) self.event_iter.setUserQuery(self.user_query);
             self.iter_initialized = true;
         }

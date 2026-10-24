@@ -878,17 +878,38 @@ pub const RetryReporter = struct {
 /// Anthropic 风格的 ping(napi 网关每 15 秒一条)。别的任何行——尤其是 tool_use 参数的
 /// `input_json_delta` 帧——都是进展。正文空闲时钟只由进展续命(见 liveness_reader.zig)。
 pub fn isKeepaliveLine(line: []const u8) bool {
+    return classifyLine(line) != .progress;
+}
+
+/// What one SSE line says about the stream's liveness. A blank line only closes
+/// a frame; a keepalive line is the peer speaking up without model output; any
+/// other line is progress. The distinction between the first two matters to the
+/// registry's keepalive learning: a frame separator follows every event, so
+/// counting it as a keepalive would make every endpoint look like a pinger.
+pub const LineKind = enum { separator, keepalive, progress };
+
+pub fn classifyLine(line: []const u8) LineKind {
     const t = std.mem.trim(u8, line, " \t\r\n");
-    if (t.len == 0) return true;
-    if (t[0] == ':') return true;
+    if (t.len == 0) return .separator;
+    if (t[0] == ':') return .keepalive;
     if (std.mem.startsWith(u8, t, "event:")) {
-        return std.mem.eql(u8, std.mem.trim(u8, t["event:".len..], " \t"), "ping");
+        return if (std.mem.eql(u8, std.mem.trim(u8, t["event:".len..], " \t"), "ping")) .keepalive else .progress;
     }
     if (std.mem.startsWith(u8, t, "data:")) {
         const payload = std.mem.trim(u8, t["data:".len..], " \t");
-        return payload.len > 0 and payload[0] == '{' and parseEventType(payload) == .ping;
+        return if (payload.len > 0 and payload[0] == '{' and parseEventType(payload) == .ping) .keepalive else .progress;
     }
-    return false;
+    return .progress;
+}
+
+test "classifyLine: a blank line is a frame separator, not a keepalive" {
+    try std.testing.expectEqual(LineKind.separator, classifyLine(""));
+    try std.testing.expectEqual(LineKind.separator, classifyLine(" \r"));
+    try std.testing.expectEqual(LineKind.keepalive, classifyLine(": keep-alive"));
+    try std.testing.expectEqual(LineKind.keepalive, classifyLine("event: ping"));
+    try std.testing.expectEqual(LineKind.keepalive, classifyLine("data: {\"type\": \"ping\"}"));
+    try std.testing.expectEqual(LineKind.progress, classifyLine("data: {\"type\":\"message_start\"}"));
+    try std.testing.expectEqual(LineKind.progress, classifyLine("event: message_start"));
 }
 
 test "isKeepaliveLine: pings and comments are keepalive, every data-bearing line is progress" {
@@ -909,10 +930,13 @@ test "isKeepaliveLine: pings and comments are keepalive, every data-bearing line
     try std.testing.expect(!isKeepaliveLine("garbage"));
 }
 
-/// 进展回调(见 `setProgressHook`):迭代器每拿到一条非保活 SSE 行就调一次。
+/// 进展回调(见 `setProgressHook`):迭代器每拿到一条非保活 SSE 行就调一次 `call`;
+/// 拿到一条保活行(ping / 注释,不含空行帧分隔)时调 `keepalive`(可选),供注册表学习
+/// 该端点在沉默期间多久发一次保活(见 `RequestAbortRegistry.touchKeepalive`)。
 pub const ProgressHook = struct {
     ctx: *anyopaque,
     call: *const fn (*anyopaque) void,
+    keepalive: ?*const fn (*anyopaque) void = null,
 };
 
 pub const EventIterator = struct {
@@ -1117,8 +1141,13 @@ pub const EventIterator = struct {
             };
 
             // 进展记账:非保活行才续正文空闲时钟(包括下面会被 continue 掉的 input_json_delta /
-            // unknown 事件)。ping / 注释行不续——网关在上游沉默期间照样发它们。
-            if (self.progress) |hook| if (!isKeepaliveLine(line)) hook.call(hook.ctx);
+            // unknown 事件)。ping / 注释行不续——网关在上游沉默期间照样发它们;它们只交给
+            // 保活学习。
+            if (self.progress) |hook| switch (classifyLine(line)) {
+                .progress => hook.call(hook.ctx),
+                .keepalive => if (hook.keepalive) |keepalive| keepalive(hook.ctx),
+                .separator => {},
+            };
 
             // record/replay(Stage 7):录原始 SSE 行(保留 data: 帧 + 空行框架)。no-op 当未录制。
             @import("../core/recorder.zig").recordSseLine(line);

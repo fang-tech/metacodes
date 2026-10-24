@@ -446,7 +446,7 @@ pub const OpenAIClient = struct {
             return error.RequestFailed;
         }
         // 响应头已接受 → 正文阶段上限(见 client.zig bodyIdleLimitMs);字节级续命由 LivenessReader 负责。
-        self.abort_registry.setIdleLimit(req_ptr, client_mod.bodyIdleLimitMs(self.stream_body_idle_timeout_ms, self.stream_idle_timeout_ms, self.max_tokens));
+        self.abort_registry.setIdleLimit(req_ptr, client_mod.bodyIdleLimitMs(self.stream_body_idle_timeout_ms, self.stream_idle_timeout_ms, self.max_tokens), .sse);
 
         const heap = try self.allocator.create(OpenAIStream);
         heap.* = .{
@@ -690,6 +690,12 @@ const OpenAIStream = struct {
         registry.touch(self.request);
     }
 
+    /// 一条保活行(注释 / ping)= 端点在沉默中开口 → 注册表学习保活节奏(见 provider.zig)。
+    fn touchKeepalive(self: *OpenAIStream) void {
+        const registry = self.abort_registry orelse return;
+        registry.touchKeepalive(self.request);
+    }
+
     /// 已排队事件的唯一出口;next() 每次读新行之前先走这里。出队顺序固定:
     ///   1. pending_usage —— 与内容同 chunk 的 usage,紧跟在该 chunk 的内容事件之后;
     ///   2. flush_q       —— 终止时 flush 的 reasoning_item / tool_use_start(按入队顺序);
@@ -759,8 +765,13 @@ const OpenAIStream = struct {
                 if (!self.stop_reported) return self.incomplete();
                 return self.finishFlush();
             };
-            // 进展记账:非保活行(含被 continue 掉的 usage/空 chunk)才续正文空闲时钟。
-            if (!api_stream.isKeepaliveLine(line)) self.touchProgress();
+            // 进展记账:非保活行(含被 continue 掉的 usage/空 chunk)才续正文空闲时钟;
+            // 保活行只交给注册表学习端点的保活节奏。
+            switch (api_stream.classifyLine(line)) {
+                .progress => self.touchProgress(),
+                .keepalive => self.touchKeepalive(),
+                .separator => {},
+            }
             const trimmed = std.mem.trim(u8, line, " \r\n");
             if (trimmed.len == 0) continue;
             if (!std.mem.startsWith(u8, trimmed, "data:")) continue;

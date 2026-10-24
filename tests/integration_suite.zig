@@ -134,6 +134,7 @@ test {
     _ = @import("component/permission_name_normalization_test.zig");
     _ = @import("component/dialect_matrix_test.zig");
     _ = @import("component/stream_liveness_test.zig");
+    _ = @import("component/stream_dead_connection_test.zig");
     _ = @import("component/overrides_test.zig");
     _ = @import("component/ontology_rule_projection_test.zig");
     _ = @import("component/ontology_rule_snapshot_adapter_test.zig");

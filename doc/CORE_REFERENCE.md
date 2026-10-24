@@ -915,8 +915,19 @@ Session 加入宿主调度的 team。lead 的 `SpawnTeammate` 不起线程,只�
   但网关 keepalive 仍在到达(最近字节 K ms 前)"(上游/网关卡住)而不是猜谜文案。用户 Ctrl+C/Esc
   经 `provider.cancel` 关掉 socket 后,阻塞的读以 ReadFailed/干净 EOF 醒来——三个 provider client
   与 agent_loop 都先查 abort 标志,归为 Aborted(保留已流出的 partial 文本),绝不归 api_error;
-  REPL 在每个 run 边界无条件复位 abort 标志。仍然成立的边界:
-  正文阶段的 stall 不自动重发(已流出的内容不能假装可回滚);TaskBatch 的 join 有界于空闲上限,
+  REPL 在每个 run 边界无条件复位 abort 标志。
+  **死连接按学到的保活节奏判**(2026-10-24 起):正文进展上限最长 30 分钟,一条没有 FIN/RST 就死掉的
+  连接也要等满它(实录:响应头 + message_start 之后 1801 s 零字节,连网关平时 ≤15 s 一次的 ping 都
+  没有)。`RequestAbortRegistry` 每个 client 一份,`touchKeepalive` 记录端点在流中途(SSE 正文、本流
+  已有进展之后)用一条保活行打破了多长的沉默(≥2 s 才算样本,同一次读只算一次);攒够 3 个样本后,
+  SSE 正文在传输层(含保活)沉默超过 max(4 × 最长间隔, 2 min) 且小于进展上限时,判
+  `Stall.cause = .transport_dead`,TUI 打"连接已断: N ms 内无任何字节,连 keepalive 也没有…"。判死即
+  清空已学证据,端点不再发保活时退回只按进展上限判;从未在流中途发过保活的端点行为不变。非流式整包
+  正文与收头阶段不受此规则影响(`setIdleLimit(.., .whole)`)。
+  **零可见输出的流中途失败同轮重发一次**:`agent_loop.SILENT_STREAM_RETRY_FLOOR`——本次尝试还没有
+  文本 / thinking / 工具调用到达 backend 时,不论 `max_stream_turn_retries` 是多少(TUI 为 0)都至少重发
+  一次;已流出可见内容的失败仍按 `max_stream_turn_retries`。仍然成立的边界:
+  已流出可见内容的正文 stall 在 TUI 不自动重发(已流出的内容不能假装可回滚);TaskBatch 的 join 有界于空闲上限,
   不会 detach 卡死的 worker;TUI 每个 provider 回合结束就刷 transcript,但一个回合内的内容仍只在
   内存里。
 - **流必须报告它是怎么停的,否则不是收尾**(issue #269):四条 wire 各有一个停止报告——Anthropic

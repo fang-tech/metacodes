@@ -374,7 +374,7 @@ pub const GeminiClient = struct {
             return error.RequestFailed;
         }
         // 响应头已接受 → 正文阶段上限(见 client.zig bodyIdleLimitMs);字节级续命由 LivenessReader 负责。
-        self.abort_registry.setIdleLimit(req_ptr, client_mod.bodyIdleLimitMs(self.stream_body_idle_timeout_ms, self.stream_idle_timeout_ms, self.max_tokens));
+        self.abort_registry.setIdleLimit(req_ptr, client_mod.bodyIdleLimitMs(self.stream_body_idle_timeout_ms, self.stream_idle_timeout_ms, self.max_tokens), .sse);
         // receiveHead 成功后,req_ptr.* 是个开着连接的完整 Request。到 heap 转移所有权之前若出错
         // (create(GeminiStream) OOM),必须 deinit 它(否则泄漏 socket fd + 连接状态,非纯字节)。
         // errdefer LIFO:此 deinit 先跑、顶部 destroy 后跑 = 正确的 deinit()→destroy() 顺序。
@@ -465,6 +465,12 @@ const GeminiStream = struct {
         registry.touch(self.request);
     }
 
+    /// 一条保活行(注释 / ping)= 端点在沉默中开口 → 注册表学习保活节奏(见 provider.zig)。
+    fn touchKeepalive(self: *GeminiStream) void {
+        const registry = self.abort_registry orelse return;
+        registry.touchKeepalive(self.request);
+    }
+
     fn next(self: *GeminiStream) anyerror!?StreamEvent {
         // 并行 functionCall 队列优先 drain(一个 chunk 多个 functionCall 的其余)。
         if (self.fc_pos < self.fc_queue.items.len) {
@@ -522,8 +528,13 @@ const GeminiStream = struct {
                 }
                 return null;
             };
-            // 进展记账:非保活行才续正文空闲时钟(ping/注释行不算,见 stream.zig)。
-            if (!api_stream.isKeepaliveLine(line)) self.touchProgress();
+            // 进展记账:非保活行才续正文空闲时钟(ping/注释行不算,见 stream.zig);
+            // 保活行只交给注册表学习端点的保活节奏。
+            switch (api_stream.classifyLine(line)) {
+                .progress => self.touchProgress(),
+                .keepalive => self.touchKeepalive(),
+                .separator => {},
+            }
             const trimmed = std.mem.trim(u8, line, " \r\n");
             if (trimmed.len == 0) continue;
             if (!std.mem.startsWith(u8, trimmed, "data:")) continue;

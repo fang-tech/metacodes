@@ -28,6 +28,11 @@
 //! 是网关连接活着,不是模型在产出。修法:传输层字节只更新"最近字节"时间戳(供 stall 报告点名
 //! 是 keepalive 撑着还是连接死了),正文空闲时钟只由**非保活行**续(`api/stream.zig isKeepaliveLine`)。
 //! ⑤⑨ 仍成立(input_json_delta 帧是非保活行);⑥ 反转;⑥b 补正例。
+//!
+//! 2026-10-24 起,还没有任何可见输出(文本 / thinking / 工具调用)就失败的流,TUI 默认也同轮重发
+//! 一次(`agent_loop.SILENT_STREAM_RETRY_FLOOR`):② 改用带可见文本的前缀,证明已流出内容仍不重发;
+//! ②z 证明零输出的 stall 重发后正常收尾;⑥ 两次零输出 stall,只重发一次。死连接按保活节奏判见
+//! stream_dead_connection_test.zig。
 
 const std = @import("std");
 const harness = @import("harness");
@@ -174,9 +179,10 @@ test "L2 liveness ①: 收头阶段对端沉默 → 空闲监视 shutdown 连接
     try std.testing.expect(takeLastError(&buf) == null);
 }
 
-test "L2 liveness ②: 正文阶段对端沉默 → StreamStalled 结束本轮(api_error),不挂死也不空转重试,TUI 文案点名 stall" {
+test "L2 liveness ②: 正文阶段已流出可见文本后对端沉默 → StreamStalled 结束本轮(api_error),不挂死也不空转重试,TUI 文案点名 stall" {
     const a = std.testing.allocator;
-    var srv = try harness.MockServer.startCassetteSilent(&[_][]const u8{OK_SSE}, 0, MID_STREAM_PREFIX);
+    // 已流出 "alive":TUI 默认不重发(用户看过的半截文本不能假装没发生)。
+    var srv = try harness.MockServer.startCassetteSilent(&[_][]const u8{OK_SSE}, 0, MID_STREAM_PREFIX_WITH_TEXT);
     defer srv.stop();
     const url = try srv.urlOwned(a);
     defer a.free(url);
@@ -204,6 +210,33 @@ test "L2 liveness ②: 正文阶段对端沉默 → StreamStalled 结束本轮(a
     const idle_ms = try std.fmt.parseInt(u64, detail[prefix.len..idle_end], 10);
     try std.testing.expect(idle_ms >= IDLE_MS);
     try std.testing.expect(takeLastError(&buf) == null); // 读后清空
+}
+
+test "L2 liveness ②z: 正文阶段还没有任何可见输出就沉默 → TUI 默认也同轮自动重发一次 → end_turn" {
+    const a = std.testing.allocator;
+    // 响应 0 只发 message_start + content_block_start 就沉默(2026-10-24 实录的形状),
+    // 响应 1(cassette 用尽后重复最后一条)正常回答。
+    var srv = try harness.MockServer.startCassetteSilent(&[_][]const u8{OK_SSE}, 0, MID_STREAM_PREFIX);
+    defer srv.stop();
+    const url = try srv.urlOwned(a);
+    defer a.free(url);
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
+    defer io_rt.deinit();
+    var client = mkClient(a, io_rt.io(), url, IDLE_MS, IDLE_MS);
+    defer client.deinit();
+    clearLastError();
+
+    const t0 = cc.util_time.nowMs();
+    // runOneTurn 用 TUI 默认(max_stream_turn_retries = 0)。
+    const result = try runOneTurn(a, &client, null);
+    const elapsed = cc.util_time.nowMs() - t0;
+    try std.testing.expectEqual(cc.agent_loop.StopReason.end_turn, result.stop_reason);
+    try std.testing.expectEqual(@as(usize, 2), srv.requestCount());
+    try std.testing.expect(elapsed >= @as(i64, @intCast(IDLE_MS)));
+    try std.testing.expect(elapsed < BOUND_MS);
+    // 重发成功的 HTTP 200 清掉了 stall 现场。
+    var buf: [cc.api_last_error.SUMMARY_BUF_LEN]u8 = undefined;
+    try std.testing.expect(takeLastError(&buf) == null);
 }
 
 test "L2 liveness: StreamStalled 归为可重试错误(与 TransientNetwork 同类)" {
@@ -339,7 +372,7 @@ test "L2 liveness ⑤: input_json_delta 帧滴流(帧间隔 < 空闲上限,总�
     try std.testing.expect(takeLastError(&buf) == null);
 }
 
-test "L2 liveness ⑥: 只有 ping 的保活不算进展 → 超过正文上限即 stall,文案点名网关 keepalive 仍在到达" {
+test "L2 liveness ⑥: 只有 ping 的保活不算进展 → 超过正文上限即 stall,零可见输出只兜底重发一次,文案点名网关 keepalive 仍在到达" {
     const a = std.testing.allocator;
     var srv = try harness.MockServer.startCassette(&[_][]const u8{PING_SSE}, TRICKLE_MS);
     defer srv.stop();
@@ -347,7 +380,9 @@ test "L2 liveness ⑥: 只有 ping 的保活不算进展 → 超过正文上限�
     defer a.free(url);
     var io_rt = @import("platform").signal.threadedIo(a, .{});
     defer io_rt.deinit();
-    var client = mkClient(a, io_rt.io(), url, IDLE_MS, PING_ONLY_BODY_MS);
+    // 收头上限放宽:cassette 模式串行服务,第一条响应要滴流满 20 × 150ms 才轮到重发的连接;
+    // 400ms 的收头上限会把这段排队误判成收头 stall(本用例只看正文阶段)。
+    var client = mkClient(a, io_rt.io(), url, 10_000, PING_ONLY_BODY_MS);
     defer client.deinit();
     clearLastError();
 
@@ -355,8 +390,9 @@ test "L2 liveness ⑥: 只有 ping 的保活不算进展 → 超过正文上限�
     const result = try runOneTurn(a, &client, null);
     const elapsed = cc.util_time.nowMs() - t0;
     try std.testing.expectEqual(cc.agent_loop.StopReason.api_error, result.stop_reason);
-    try std.testing.expectEqual(@as(usize, 1), srv.requestCount());
-    try std.testing.expect(elapsed >= @as(i64, @intCast(PING_ONLY_BODY_MS)));
+    // 两次都在任何可见输出之前 stall:第一次兜底重发,第二次用尽(SILENT_STREAM_RETRY_FLOOR = 1)。
+    try std.testing.expectEqual(@as(usize, 2), srv.requestCount());
+    try std.testing.expect(elapsed >= @as(i64, @intCast(2 * PING_ONLY_BODY_MS)));
     try std.testing.expect(elapsed < BOUND_MS);
     // 文案必须区分"keepalive 撑着的死上游"和"连接死了":前者查网关/上游,后者查网络。
     var buf: [cc.api_last_error.SUMMARY_BUF_LEN]u8 = undefined;
@@ -392,7 +428,8 @@ test "L2 liveness ⑥b: ping 之间夹着真实进展(进展间隔 < 上限)→ 
 
 test "L2 liveness ⑦: 收头/正文阶段各用各的上限——正文沉默按正文上限判(更大),收头严上限不越界" {
     const a = std.testing.allocator;
-    var srv = try harness.MockServer.startCassetteSilent(&[_][]const u8{OK_SSE}, 0, MID_STREAM_PREFIX);
+    // 带可见文本的前缀:本用例只看上限,不让零输出兜底重发掺进来(那是 ②z)。
+    var srv = try harness.MockServer.startCassetteSilent(&[_][]const u8{OK_SSE}, 0, MID_STREAM_PREFIX_WITH_TEXT);
     defer srv.stop();
     const url = try srv.urlOwned(a);
     defer a.free(url);
