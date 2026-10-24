@@ -45,8 +45,16 @@ pub const Host = struct {
     /// Owns every string the configured profiles point at. It must outlive the
     /// registry, which borrows them.
     custom: ?custom_provider.Definitions = null,
-    /// Owns the strings of a provider catalog ingested at runtime.
-    catalog_arena: ?std.heap.ArenaAllocator = null,
+    /// Own the strings of every provider catalog ingested at runtime, one
+    /// arena per ingest, released only when the host ends.
+    ///
+    /// Not one slot: an ingest for one provider used to free the arena behind
+    /// another provider's profile, and the very next rebuild read it. Not freed
+    /// on a same-provider replace either: the retired catalog and any picker
+    /// snapshot taken before the swap still borrow the previous model names.
+    /// Ingests happen at startup, on `/providers refresh`, and on an API-key
+    /// switch, so what this keeps is a few kilobytes per user action.
+    catalog_arenas: std.ArrayList(std.heap.ArenaAllocator) = .empty,
     /// Why a stage of `adoptDurableState` did not apply, if one did not.
     ///
     /// This subsystem must not print — it has no UI and no business owning one
@@ -104,7 +112,8 @@ pub const Host = struct {
         // first.
         self.registry.deinit();
         if (self.custom) |*definitions| definitions.deinit();
-        if (self.catalog_arena) |*arena| arena.deinit();
+        for (self.catalog_arenas.items) |*arena| arena.deinit();
+        self.catalog_arenas.deinit(allocator);
         self.config_bindings.deinit(allocator);
         self.config_exclusions.deinit(allocator);
         self.config_client_ids.deinit(allocator);
@@ -216,12 +225,12 @@ pub const Host = struct {
         // registry pointing into an arena about to be released.
         try self.registry.checkUpsert(built);
         try self.registry.reserve(1);
+        try self.catalog_arenas.ensureUnusedCapacity(self.allocator, 1);
 
         // Infallible from here, so the registry and the arena that backs it
         // change together.
         self.registry.upsertAssumeCapacity(built);
-        if (self.catalog_arena) |*previous| previous.deinit();
-        self.catalog_arena = arena;
+        self.catalog_arenas.appendAssumeCapacity(arena);
         moved = true;
         self.refresh() catch return error.OutOfMemory;
         // Prices and health arrived with the catalog, so the events that
@@ -231,11 +240,26 @@ pub const Host = struct {
         self.kernel.noteProviderHealth(provider_id, worst);
     }
 
-    /// Replace Metask's compiled inventory with the authenticated gateway's
-    /// `/v1/models` document. The gateway origin is kept separate from either
-    /// protocol path; both Anthropic Messages and OpenAI Chat offers are then
-    /// materialized for every returned model.
-    pub fn ingestMetask(self: *Host, gateway_origin: []const u8, models_json: []const u8) IngestError!void {
+    /// Which wire protocols an ingested Metask inventory offers.
+    pub const MetaskWires = enum {
+        /// The historical Messages route only: the API-key path, whose
+        /// session transport is Messages and whose key was never shown to
+        /// serve Chat Completions. One route per model also keeps
+        /// `/model use <id>` unambiguous there.
+        messages,
+        /// Messages and Chat Completions: the authenticated session gateway.
+        messages_and_chat,
+    };
+
+    /// Replace Metask's compiled inventory with a gateway's `/v1/models`
+    /// document. The gateway origin is kept separate from either protocol
+    /// path; every returned model is materialized once per wire in `wires`.
+    pub fn ingestMetask(
+        self: *Host,
+        gateway_origin: []const u8,
+        models_json: []const u8,
+        wires: MetaskWires,
+    ) IngestError!void {
         var parsed = metask_catalog.parseModels(self.allocator, models_json) catch return error.InvalidDocument;
         defer parsed.deinit();
         if (parsed.models.items.len == 0) return error.InvalidDocument;
@@ -277,10 +301,15 @@ pub const Host = struct {
         channel.base_url = try scratch.dupe(u8, std.mem.trimEnd(u8, gateway_origin, "/"));
         // The compiled profile intentionally retains only the historical
         // Messages route so model-only legacy selections stay unambiguous.
-        // An authenticated gateway catalog opts into both wire protocols.
-        const routes = try scratch.alloc(profile_mod.ProtocolRoute, 2);
+        // An authenticated session gateway opts into both wire protocols.
+        const routes = try scratch.alloc(profile_mod.ProtocolRoute, switch (wires) {
+            .messages => 1,
+            .messages_and_chat => 2,
+        });
         routes[0] = .{ .protocol = .anthropic_messages };
-        routes[1] = .{ .protocol = .openai_chat, .path_suffix = "/v1/chat/completions" };
+        if (wires == .messages_and_chat) {
+            routes[1] = .{ .protocol = .openai_chat, .path_suffix = "/v1/chat/completions" };
+        }
         channel.routes = routes;
         channel.models = models;
         const channels = try scratch.alloc(profile_mod.ChannelDescriptor, 1);
@@ -302,9 +331,9 @@ pub const Host = struct {
         };
         try self.registry.checkReplace(built);
         try self.registry.reserve(0);
+        try self.catalog_arenas.ensureUnusedCapacity(self.allocator, 1);
         self.registry.replaceAssumeCapacity(built);
-        if (self.catalog_arena) |*previous| previous.deinit();
-        self.catalog_arena = arena;
+        self.catalog_arenas.appendAssumeCapacity(arena);
         moved = true;
         self.refresh() catch return error.OutOfMemory;
     }
@@ -554,13 +583,38 @@ test "authenticated Metask catalog exposes both protocol routes" {
     const a = std.testing.allocator;
     const host = try Host.create(a);
     defer host.destroy();
-    try host.ingestMetask("http://localhost:9000", "{\"object\":\"list\",\"data\":[{\"id\":\"metask-model\",\"display_name\":\"Gateway Model\",\"max_input_tokens\":32000,\"max_tokens\":2048,\"capabilities\":{\"thinking\":{\"supported\":true},\"image_input\":{\"supported\":false}}}]}");
+    try host.ingestMetask("http://localhost:9000", "{\"object\":\"list\",\"data\":[{\"id\":\"metask-model\",\"display_name\":\"Gateway Model\",\"max_input_tokens\":32000,\"max_tokens\":2048,\"capabilities\":{\"thinking\":{\"supported\":true},\"image_input\":{\"supported\":false}}}]}", .messages_and_chat);
     const profile = host.registry.find("metask").?;
     const channel = profile.channel(Slug.lit("default")).?;
     try std.testing.expectEqual(@as(usize, 1), channel.models.len);
     try std.testing.expectEqualStrings("Gateway Model", channel.models[0].display_name);
     try std.testing.expect(channel.route(.anthropic_messages) != null);
     try std.testing.expect(channel.route(.openai_chat) != null);
+}
+
+test "an API-key Metask catalog offers each gateway model once, on the Messages route" {
+    const a = std.testing.allocator;
+    const host = try Host.create(a);
+    defer host.destroy();
+    try host.ingestMetask(
+        "http://localhost:9000/",
+        "{\"data\":[{\"id\":\"glm-5.3-flash\"},{\"id\":\"kimi-k3\",\"display_name\":\"Kimi K3\"}]}",
+        .messages,
+    );
+    const channel = host.registry.find("metask").?.channel(Slug.lit("default")).?;
+    try std.testing.expect(channel.route(.anthropic_messages) != null);
+    try std.testing.expect(channel.route(.openai_chat) == null);
+
+    var metask_offers: usize = 0;
+    for (host.kernel.catalogSnapshot().items()) |item| {
+        if (!item.provider_id.eqlText("metask")) continue;
+        metask_offers += 1;
+        try std.testing.expectEqualStrings("anthropic_messages", item.protocol);
+        try std.testing.expectEqualStrings("http://localhost:9000/v1/messages", item.endpoint_ref);
+        // The compiled Claude inventory is replaced, not extended.
+        try std.testing.expect(!std.mem.startsWith(u8, item.request_model_id, "claude-"));
+    }
+    try std.testing.expectEqual(@as(usize, 2), metask_offers);
 }
 
 test "two refreshes keep the retired catalog alive for one generation" {
@@ -1257,4 +1311,61 @@ test "built OpenRouter channels copy every string the parse results held" {
     try std.testing.expectEqualStrings("high", control.allowed_values[1]);
     try std.testing.expectEqualStrings("slower", control.cost_latency_warning.?);
     try std.testing.expectEqualStrings("{\"x\":1}", control.extension_data.?);
+}
+
+test "an ingest for one provider leaves another provider's ingested catalog intact" {
+    // A single shared arena slot used to release OpenRouter's channels when
+    // Metask's gateway catalog arrived, and the rebuild inside that same
+    // ingest walked them (a segfault on 0xAA under this allocator).
+    var poison = PoisonOnFree{ .child = std.testing.allocator };
+    const a = poison.allocator();
+    const host = try Host.create(a);
+    defer host.destroy();
+    try host.ingestOpenRouter(
+        Slug.lit("openrouter"),
+        \\{"data": [{"id": "deepseek/deepseek-v4", "name": "DeepSeek V4", "context_length": 163840}]}
+    ,
+        &.{
+            \\{"data": {"id": "deepseek/deepseek-v4", "endpoints": [{"provider_name": "DeepInfra", "context_length": 131072, "status": 0}]}}
+        },
+    );
+    try host.ingestMetask("http://localhost:9000", "{\"object\":\"list\",\"data\":[{\"id\":\"metask-model\",\"display_name\":\"Gateway Model\"}]}", .messages);
+    try host.refresh();
+    var openrouter_seen = false;
+    var metask_seen = false;
+    for (host.kernel.catalogSnapshot().items()) |item| {
+        if (item.provider_id.eqlText("openrouter")) {
+            openrouter_seen = true;
+            try std.testing.expectEqualStrings("openai_chat", item.protocol);
+            try std.testing.expectEqualStrings("https://openrouter.ai/api/v1/chat/completions", item.endpoint_ref);
+        } else if (item.provider_id.eqlText("metask")) {
+            metask_seen = true;
+            try std.testing.expectEqualStrings("metask-model", item.request_model_id);
+            try std.testing.expectEqualStrings("Gateway Model", item.display_name);
+        }
+    }
+    try std.testing.expect(openrouter_seen and metask_seen);
+}
+
+test "a re-ingested Metask catalog leaves the retired generation readable" {
+    // An API-key switch replaces the inventory while the retired catalog (and
+    // a picker snapshot taken from it) still names the previous models.
+    var poison = PoisonOnFree{ .child = std.testing.allocator };
+    const a = poison.allocator();
+    const host = try Host.create(a);
+    defer host.destroy();
+    try host.ingestMetask("http://localhost:9000", "{\"data\":[{\"id\":\"prod-model\",\"display_name\":\"Prod Model\"}]}", .messages);
+    try host.ingestMetask("http://localhost:9000", "{\"data\":[{\"id\":\"dev-model\"}]}", .messages);
+
+    var retired_seen = false;
+    for (host.retired.?.items()) |item| {
+        if (!item.provider_id.eqlText("metask")) continue;
+        retired_seen = true;
+        try std.testing.expectEqualStrings("prod-model", item.request_model_id);
+        try std.testing.expectEqualStrings("Prod Model", item.display_name);
+    }
+    try std.testing.expect(retired_seen);
+    for (host.kernel.catalogSnapshot().items()) |item| {
+        if (item.provider_id.eqlText("metask")) try std.testing.expectEqualStrings("dev-model", item.request_model_id);
+    }
 }
