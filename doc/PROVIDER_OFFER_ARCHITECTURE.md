@@ -94,8 +94,9 @@ permissive direction:
   bound per field and fails closed on incomparable token units.
 - **Admission.** An unknown required limit is either an explicit conservative
   cap (flagged as such in the result) or a rejection — never "unlimited".
-  `glm-4.5-air` ships with unknown limits on purpose so a built-in profile
-  exercises that path.
+  Every built-in model now declares its documented limits; the fail-closed
+  path is exercised by test profiles and by any model a user names that the
+  profile does not declare.
 - **Capabilities.** Tri-state. A channel may remove a canonical capability and
   may confirm one; `unknown` is only promoted by a provider declaration, and
   only `supported` permits emitting the wire feature.
@@ -453,7 +454,7 @@ with no `schema_version` is legacy state and loads as an empty provider map.
 ## CLI
 
 ```sh
-metacodes --provider zai-coding-plan --channel cn-anthropic --model glm-4.6
+metacodes --provider zai-coding-plan --channel cn-anthropic --model glm-5.3
 ```
 
 - `--provider <id|alias>` (or `METACODES_PROVIDER`) switches startup from
@@ -461,10 +462,22 @@ metacodes --provider zai-coding-plan --channel cn-anthropic --model glm-4.6
 - `--channel <id>` narrows to one endpoint/region/plan binding.
 - `--offer <offer-id>` pins one exact reproducible route.
 - `--base-url <url>` is validated against the profile and route policy first.
+  Without `--channel` it belongs to one channel: the default channel when all
+  its routes accept the URL, otherwise the first channel whose routes do. A URL
+  no channel accepts is refused with the default channel's reason.
 
-A model that matches several routes is an error listing the candidate offer ids,
-not a guess. A model the profile does not declare still routes — proxies
-legitimately accept private model names — with metadata left unknown.
+A model declared on several channels resolves on the profile's default channel,
+the rule a bare `--provider` and an unlisted model follow too. Only a choice the
+default channel cannot settle (the model on two wires there) is an error listing
+the candidate offer ids. A model the profile does not declare still routes —
+proxies legitimately accept private model names — with metadata left unknown.
+
+The built-in inventories name the current frontier models with their documented
+limits and reasoning controls (`reasoning_effort`, as the picker's options step
+shows): OpenAI `gpt-6-astra`, `gpt-6.1-sol`, `gpt-6-luna` on the Responses wire
+only (tool calls need it there), Gemini `gemini-4-argon`, `gemini-3.8-flash`, and
+the GLM Coding Plan's `glm-5.3`, `glm-5.3-flash`. Metask's inventory is the
+gateway's own `/v1/models` whenever it answers.
 
 Sessions that name no provider keep the historical path unchanged.
 

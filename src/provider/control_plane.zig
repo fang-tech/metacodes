@@ -1031,25 +1031,30 @@ test "model.list serves every client the same catalog with filters" {
     try std.testing.expectEqual(CatalogRevision.initial, all.meta.catalog_revision);
 
     const zai = try kernel.modelList(.{}, .{ .provider_id = Slug.lit("zai-coding-plan") }, a, &buffer);
-    try std.testing.expectEqual(@as(usize, 12), zai.total);
+    try std.testing.expectEqual(@as(usize, 8), zai.total);
 
     const anthropic_wire = try kernel.modelList(.{}, .{
         .provider_id = Slug.lit("zai-coding-plan"),
         .protocol = "anthropic_messages",
     }, a, &buffer);
-    try std.testing.expectEqual(@as(usize, 6), anthropic_wire.total);
+    // 2 models × the 2 Anthropic-wire channels.
+    try std.testing.expectEqual(@as(usize, 4), anthropic_wire.total);
 
-    const searched = try kernel.modelList(.{}, .{ .search = "glm-4.6" }, a, &buffer);
+    const searched = try kernel.modelList(.{}, .{ .search = "glm-5.3-flash" }, a, &buffer);
     try std.testing.expectEqual(@as(usize, 4), searched.total);
 
     const with_vision = try kernel.modelList(.{}, .{ .requires_capability = .vision }, a, &buffer);
     for (with_vision.offers) |summary| {
         try std.testing.expect(summary.capabilities.supports(.vision));
     }
-    // Unknown capabilities never satisfy a capability filter.
+    // Unknown capabilities never satisfy a capability filter: GLM-5.3 says
+    // nothing about vision and stays out, GLM-5.3-Flash declares it.
+    var flash_seen = false;
     for (with_vision.offers) |summary| {
-        try std.testing.expect(!summary.provider_id.eqlText("zai-coding-plan"));
+        try std.testing.expect(!std.mem.eql(u8, summary.request_model_id, "glm-5.3"));
+        if (std.mem.eql(u8, summary.request_model_id, "glm-5.3-flash")) flash_seen = true;
     }
+    try std.testing.expect(flash_seen);
 }
 
 test "paging reports truncation instead of silently shortening the catalog" {
@@ -1086,11 +1091,11 @@ test "offers with the same visible model stay distinct in the client view" {
 
     var buffer: std.ArrayList(OfferSummary) = .empty;
     defer buffer.deinit(a);
-    const page = try kernel.modelList(.{}, .{ .search = "GLM-4.6" }, a, &buffer);
+    const page = try kernel.modelList(.{}, .{ .search = "GLM-5.3-Flash" }, a, &buffer);
     try std.testing.expectEqual(@as(usize, 4), page.offers.len);
     var seen: [4]OfferId = undefined;
     for (page.offers, 0..) |summary, index| {
-        try std.testing.expectEqualStrings("GLM-4.6", summary.display_name);
+        try std.testing.expectEqualStrings("GLM-5.3-Flash", summary.display_name);
         for (seen[0..index]) |previous| try std.testing.expect(!previous.eql(summary.offer_id));
         seen[index] = summary.offer_id;
     }
@@ -1408,7 +1413,7 @@ test "an auto route records the offer it actually used" {
     var kernel = Kernel.init(a, &catalog);
     defer kernel.deinit();
 
-    const selection = try RuntimeSelection.auto("zai/glm-4.6", .{ .fallback_allowed = true }, .session);
+    const selection = try RuntimeSelection.auto("zai/glm-5.3", .{ .fallback_allowed = true }, .session);
     const outcome = kernel.selectionCommit(.{}, selection, .session);
     try std.testing.expect(outcome == .committed);
     const resolution = try selection_mod.resolve(&catalog, selection);

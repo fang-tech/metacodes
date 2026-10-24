@@ -76,7 +76,7 @@ def test_model_command_lists_every_provider_and_reaches_its_models(bin_path):
             break
         model_rows.append(line)
     listed = "\n".join(model_rows)
-    assert "gpt-4o" in listed, "进 openai 后没列出它的模型:\n" + text
+    assert "gpt-6-astra" in listed, "进 openai 后没列出它的模型:\n" + text
     assert "claude" not in listed.lower(), "进 openai 后列的是 metask 的模型:\n" + text
 
 

@@ -528,7 +528,7 @@ test "a channel plus model pins one route across protocols" {
     const outcome = try resolve(a, &registry, .{
         .provider = "zai",
         .channel = "global-openai",
-        .model = "glm-4.6",
+        .model = "glm-5.3",
     });
     var route = outcome.route;
     defer route.deinit();
@@ -538,7 +538,7 @@ test "a channel plus model pins one route across protocols" {
         "https://api.z.ai/api/coding/paas/v4/chat/completions",
         route.endpoint_url,
     );
-    try std.testing.expectEqualStrings("glm-4.6", route.request_model_id);
+    try std.testing.expectEqualStrings("glm-5.3", route.request_model_id);
 }
 
 test "a listed model on several channels resolves on the profile's default channel" {
@@ -548,12 +548,12 @@ test "a listed model on several channels resolves on the profile's default chann
     const a = std.testing.allocator;
     var registry = try ProviderRegistry.initWithBuiltins(a);
     defer registry.deinit();
-    const outcome = try resolve(a, &registry, .{ .provider = "zai", .model = "glm-4.6" });
+    const outcome = try resolve(a, &registry, .{ .provider = "zai", .model = "glm-5.3" });
     var route = outcome.route;
     defer route.deinit();
     try std.testing.expectEqualStrings("cn-anthropic", route.channel_id.slice());
     try std.testing.expectEqualStrings("https://open.bigmodel.cn/api/anthropic/v1/messages", route.endpoint_url);
-    try std.testing.expectEqualStrings("glm-4.6", route.request_model_id);
+    try std.testing.expectEqualStrings("glm-5.3", route.request_model_id);
 }
 
 test "a model with two wires on the default channel is still reported, not guessed" {
@@ -605,7 +605,7 @@ test "an unscoped --base-url goes to the channel whose routes accept it" {
     {
         const outcome = try resolve(a, &registry, .{
             .provider = "zai",
-            .model = "glm-4.6",
+            .model = "glm-5.3",
             .base_url = "https://relay.internal/api/coding/paas/v4",
         });
         var route = outcome.route;
@@ -862,10 +862,10 @@ test "a stored auto selection resolves through the route policy" {
     var registry = try ProviderRegistry.initWithBuiltins(a);
     defer registry.deinit();
 
-    const selection = try selection_mod.RuntimeSelection.auto("glm-4.6", .{}, .global);
+    const selection = try selection_mod.RuntimeSelection.auto("glm-5.3", .{}, .global);
     const outcome = try resolveSelection(a, &registry, selection);
     var route = outcome.route;
     defer route.deinit();
-    try std.testing.expectEqualStrings("glm-4.6", route.request_model_id);
+    try std.testing.expectEqualStrings("glm-5.3", route.request_model_id);
     try std.testing.expect(route.provider_id.eqlText("zai-coding-plan"));
 }

@@ -33,6 +33,14 @@ const MINIMAL_OPENAI_SSE =
     "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1}}\n\n" ++
     "data: [DONE]\n\n";
 
+const MINIMAL_RESPONSES_SSE =
+    "event: response.created\n" ++
+    "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\"}}\n\n" ++
+    "event: response.output_text.delta\n" ++
+    "data: {\"type\":\"response.output_text.delta\",\"item_id\":\"msg_1\",\"output_index\":0,\"delta\":\"ok\"}\n\n" ++
+    "event: response.completed\n" ++
+    "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\":\"completed\",\"usage\":{\"input_tokens\":1,\"input_tokens_details\":{\"cached_tokens\":0},\"output_tokens\":1}}}\n\n";
+
 fn drainAnthropic(response: *cc.client_mod.StreamResponse) void {
     while (true) {
         const maybe = response.next() catch break;
@@ -1470,7 +1478,7 @@ test "L2: a control the offer declares changes the bytes actually sent" {
             allocator: std.mem.Allocator,
             effort: ?cc.types_mod.ReasoningEffort,
         ) ![]u8 {
-            var server = try harness.MockServer.start(MINIMAL_OPENAI_SSE, 0);
+            var server = try harness.MockServer.start(MINIMAL_RESPONSES_SSE, 0);
             defer server.stop();
             const origin = try server.urlOwned(allocator);
             defer allocator.free(origin);
@@ -1528,8 +1536,10 @@ test "L2: a control the offer declares changes the bytes actually sent" {
 
     // The control is not decoration: setting it changes the request body, and
     // leaving it unset does not smuggle a default onto the wire.
-    try std.testing.expect(std.mem.indexOf(u8, without, "reasoning_effort") == null);
-    try std.testing.expect(std.mem.indexOf(u8, with_high, "\"reasoning_effort\":\"high\"") != null);
+    // The built-in OpenAI models are Responses-only, where the effort is
+    // `reasoning.effort`.
+    try std.testing.expect(std.mem.indexOf(u8, without, "\"reasoning\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, with_high, "\"reasoning\":{\"effort\":\"high\"}") != null);
     try std.testing.expect(!std.mem.eql(u8, without, with_high));
 }
 

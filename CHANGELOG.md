@@ -10,6 +10,24 @@ status, compatibility boundaries, and entry points are defined by
 
 ## Unreleased
 
+### Changed
+
+- **The built-in OpenAI, Gemini and GLM Coding Plan models are the current
+  frontier ones, with their documented limits and reasoning levels.**
+  - OpenAI: `gpt-6-astra`, `gpt-6.1-sol` and `gpt-6-luna` (1,050,000-token
+    window, 922,000 input, 128,000 output), offered on the Responses wire only
+    because tool calls need it on these models; reasoning effort low / medium /
+    high / xhigh / max. gpt-4o, gpt-4o-mini and o3 are deprecated and o3-mini
+    was shut down on 2026-10-23.
+  - Gemini: `gemini-4-argon` and `gemini-3.8-flash` (1,048,576-token window,
+    65,536 output); thinking level low / medium / high.
+  - GLM Coding Plan: `glm-5.3` and `glm-5.3-flash` (1M window, 128K output);
+    reasoning effort low / high / max. GLM-4.6 / 4.5 / 4.5-Air are gone from
+    the list; `glm-4.5-air` had no limits at all, so picking it failed
+    admission.
+
+  `--model` still sends any model id to these providers.
+
 ### Fixed
 
 - **Every model of a long list can be picked.** The `/model` picker built at

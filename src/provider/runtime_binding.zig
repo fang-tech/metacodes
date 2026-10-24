@@ -238,7 +238,7 @@ test "the GLM Anthropic route binds to the Anthropic transport and endpoint" {
 
     const binding = try bindOffer(
         &registry,
-        offerFor(&catalog, "cn-anthropic", "glm-4.6"),
+        offerFor(&catalog, "cn-anthropic", "glm-5.3"),
         .{ .env = env.lookup() },
         &buffer,
         false,
@@ -248,7 +248,7 @@ test "the GLM Anthropic route binds to the Anthropic transport and endpoint" {
         "https://open.bigmodel.cn/api/anthropic/v1/messages",
         binding.endpoint_url,
     );
-    try std.testing.expectEqualStrings("glm-4.6", binding.request_model_id);
+    try std.testing.expectEqualStrings("glm-5.3", binding.request_model_id);
     try std.testing.expectEqualStrings("zai-secret", binding.secret);
     try std.testing.expectEqual(
         credential.CredentialKind.zai_coding_plan_api_key,
@@ -267,7 +267,7 @@ test "the GLM OpenAI route binds to the OpenAI transport and chat protocol" {
 
     const binding = try bindOffer(
         &registry,
-        offerFor(&catalog, "global-openai", "glm-4.6"),
+        offerFor(&catalog, "global-openai", "glm-5.3"),
         .{ .env = env.lookup() },
         &buffer,
         false,
@@ -332,7 +332,7 @@ test "binding fails before I/O when no eligible credential exists" {
     var env = TestEnv{ .pairs = &.{.{ "METASK_API_KEY", "metask-secret" }} };
     try std.testing.expectError(error.MissingCredentials, bindOffer(
         &registry,
-        offerFor(&catalog, "cn-anthropic", "glm-4.6"),
+        offerFor(&catalog, "cn-anthropic", "glm-5.3"),
         .{ .env = env.lookup() },
         &buffer,
         false,
@@ -345,7 +345,7 @@ test "binding fails before I/O when no eligible credential exists" {
     } };
     try std.testing.expectError(error.AmbiguousCredentialAliases, bindOffer(
         &registry,
-        offerFor(&catalog, "cn-anthropic", "glm-4.6"),
+        offerFor(&catalog, "cn-anthropic", "glm-5.3"),
         .{ .env = conflicting.lookup() },
         &buffer,
         false,
@@ -359,7 +359,7 @@ test "a command-line key binds only the provider it was given for" {
     var catalog = try registry.buildCatalog(a, .{ .only_provider = Slug.lit("zai-coding-plan") });
     defer catalog.deinit();
     var buffer: [ids.MAX_SLUG_LEN]u8 = undefined;
-    const offer = offerFor(&catalog, "cn-anthropic", "glm-4.6");
+    const offer = offerFor(&catalog, "cn-anthropic", "glm-5.3");
 
     // `--api-key` on the historical path is the Metask key. Z.AI accepts an
     // unlabelled API key, so only the owner keeps it out.
@@ -397,25 +397,27 @@ test "admission uses the bound channel limits and the provider classifier" {
 
     const bound = try bindOffer(
         &registry,
-        offerFor(&catalog, "cn-anthropic", "glm-4.6"),
+        offerFor(&catalog, "cn-anthropic", "glm-5.3"),
         .{ .env = env.lookup() },
         &buffer,
         false,
     );
-    const too_large = bound.admit(.{ .input_tokens = 900_000, .requested_output_tokens = 10 }, .{});
+    const too_large = bound.admit(.{ .input_tokens = 1_100_000, .requested_output_tokens = 10 }, .{});
     try std.testing.expect(!too_large.isAdmitted());
     const fits = bound.admit(.{ .input_tokens = 1_000, .requested_output_tokens = 1_000 }, .{});
     try std.testing.expect(fits.isAdmitted());
 
-    // The unknown-limit model fails closed on the same route.
-    const air = try bindOffer(
+    // The same route with unknown limits fails closed.
+    var unknown = offerFor(&catalog, "cn-anthropic", "glm-5.3").*;
+    unknown.limits = .{};
+    const unbounded = try bindOffer(
         &registry,
-        offerFor(&catalog, "cn-anthropic", "glm-4.5-air"),
+        &unknown,
         .{ .env = env.lookup() },
         &buffer,
         false,
     );
-    try std.testing.expect(!air.admit(.{ .input_tokens = 1, .requested_output_tokens = 1 }, .{}).isAdmitted());
+    try std.testing.expect(!unbounded.admit(.{ .input_tokens = 1, .requested_output_tokens = 1 }, .{}).isAdmitted());
 
     // Classification comes from the profile, not from a shared default.
     try std.testing.expectEqual(profile_mod.ErrorClass.quota_exceeded, bound.classify(429, "quota exhausted"));
