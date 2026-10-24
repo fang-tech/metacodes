@@ -10,6 +10,8 @@ status, compatibility boundaries, and entry points are defined by
 
 ## Unreleased
 
+## 0.7.0 — 2026-10-24
+
 ### Added
 
 - **`metacodes --resume <id>`** starts the interactive REPL in a stored
