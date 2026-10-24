@@ -15,6 +15,7 @@ test {
     _ = @import("integration/agents_e2e_test.zig");
     _ = @import("component/provider_offer_test.zig");
     _ = @import("component/metask_api_key_picker_test.zig");
+    _ = @import("component/provider_cli_key_scope_test.zig");
     _ = @import("component/provider_oauth_login_test.zig");
     _ = @import("component/subagent_model_test.zig");
     _ = @import("component/subagent_agentdef_fields_test.zig");

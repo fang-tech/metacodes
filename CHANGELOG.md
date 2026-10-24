@@ -164,6 +164,16 @@ status, compatibility boundaries, and entry points are defined by
   offer catalog built from it (now or on a later refresh) read freed memory.
   `buildChannels` now copies everything the channels point at into the
   profile's arena.
+- **`--api-key` no longer authenticates another provider's `/model` pick.**
+  The flag names no provider: without `--provider` it is the Metask key, after
+  `--provider X` it is X's. A commit in the `/model` picker or `/model use`
+  passed it to whichever offer was chosen, ahead of that provider's own
+  environment key, so `metacodes --api-key <Metask key>` followed by picking a
+  Z.AI, OpenAI or configured-relay model sent the Metask key to that vendor,
+  and `--provider X --api-key` sent X's key to the Metask gateway. The flag now
+  binds only offers of the provider the session started on. Another provider's
+  pick uses its own credential, or is refused for want of one (an OAuth
+  provider offers its sign-in) and the previous route stays active.
 - **TUI: a terminal resize no longer answers an open dialog.** A resize
   interrupts a blocked key read (SIGWINCH has no `SA_RESTART`), and the
   permission dialog took the interrupted read for "No": the tool was denied

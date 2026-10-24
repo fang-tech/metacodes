@@ -252,7 +252,14 @@ runtime descriptor → profile-declared environment aliases → persisted store
 the last two steps *within one provider*; it never widens scope.
 
 Because aliases are profile data, a Metask key is not reachable from an OpenAI
-or Z.AI resolution at all. At startup, Metask (and any session that names no
+or Z.AI resolution at all. `--api-key` is the one key that arrives without a
+kind or a provider, and every API-key profile would accept it — ahead of its
+own environment key. It is therefore labelled with the provider the session
+started on (Metask when none is named, otherwise the startup route's provider,
+the scope startup resolved it in), and a `/model` commit offers it to that
+provider only (`ScopedSecret` in `provider/runtime_binding.zig`). Picking
+another provider's model uses that provider's own credential or is refused for
+want of one; the previous route stays active. At startup, Metask (and any session that names no
 provider) keeps the historical `core/auth.zig` path byte for byte — stored
 OAuth, stored key, and the one-shot descriptor. Any other profile resolves in
 its own scope, and the stored Metask model/effort selection is not applied to
@@ -659,7 +666,8 @@ key's group, which need not include any of the compiled profile's Claude
 models, and `--base-url` may name another gateway entirely; the compiled
 inventory at the default gateway therefore listed routes the session could not
 use and none it could. `App.MetaskKeyRoute` records the route at startup, and
-every `/v1/models` answer from that gateway — the startup probe and a `/models`
+every `/v1/models` answer from that gateway — the startup probe (fetched, read
+from the `/v1/models` cache, or refreshed in the background) and a `/models`
 key switch — goes through one seam (`App.adoptMetaskKeyModels`) into
 `Host.ingestMetask(..., .messages)`: one Messages offer per listed model at the
 session's own endpoint, no Chat Completions offer (the session's transport is

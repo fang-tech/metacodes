@@ -1455,11 +1455,11 @@ pub const App = struct {
 
     /// The key a commit onto `provider_id` authenticates with on the Metask
     /// API-key route: the one picked in `/models`, else the one the session
-    /// started with. Null for every other provider and route.
-    fn metaskKeyFor(app: *const App, provider_id: provider_ids_mod.Slug) ?[]const u8 {
+    /// started with, scoped to Metask. Null for every other provider and route.
+    fn metaskKeyFor(app: *const App, provider_id: provider_ids_mod.Slug) ?provider_binding_mod.ScopedSecret {
         const route = app.metask_key_route orelse return null;
         if (!provider_id.eqlText("metask")) return null;
-        return app.selected_api_key_owned orelse route.startup_key;
+        return .{ .provider_id = provider_id, .secret = app.selected_api_key_owned orelse route.startup_key };
     }
 
     // ── issue #16: the cross-UI provider control plane ──────────────────────
@@ -1811,6 +1811,24 @@ pub const App = struct {
         host.kernel.adoptConfigRevision(result.config_revision);
     }
 
+    /// `--api-key`, labelled with the provider it was given for.
+    ///
+    /// The flag names no provider, so its owner is the provider the session
+    /// started on: Metask on the historical path (no provider named), otherwise
+    /// the route `main` resolved — `--provider`, `--offer`, or a stored global
+    /// selection — which is also the scope startup resolved the flag in. Same
+    /// rule as `main.selectedProfileIsMetask`, including its failure mode: a
+    /// named provider without a resolved id owns nothing, so the key reaches no
+    /// provider instead of falling back to Metask.
+    fn cliApiKey(config: types.Config) ?provider_binding_mod.ScopedSecret {
+        const secret = config.api_key orelse return null;
+        const owner = if (config.provider_profile == null)
+            provider_ids_mod.Slug.lit("metask")
+        else
+            provider_ids_mod.Slug.parse(config.resolved_provider_id orelse return null) catch return null;
+        return .{ .provider_id = owner, .secret = secret };
+    }
+
     /// Move the live session onto a committed selection.
     ///
     /// Ordering is the correctness argument. Everything that can fail happens
@@ -1881,8 +1899,10 @@ pub const App = struct {
                 // authenticates a Metask offer, ahead of the environment, as
                 // it does every turn on the historical path. Without it a
                 // stored key is invisible here and the commit asks for a
-                // sign-in the session does not need.
-                .cli_api_key = (if (committed_provider) |id| app.metaskKeyFor(id) else null) orelse app.config.api_key,
+                // sign-in the session does not need. Any other pick sees only
+                // `--api-key`, and only for the provider the session started
+                // on (`cliApiKey`).
+                .cli_api_key = (if (committed_provider) |id| app.metaskKeyFor(id) else null) orelse cliApiKey(app.config),
                 .stored_oauth = if (oauth_token) |value| .{
                     .kind = oauth_kind,
                     .secret = value,
