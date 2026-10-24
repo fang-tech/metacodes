@@ -239,6 +239,52 @@ test "L2 liveness ②z: 正文阶段还没有任何可见输出就沉默 → TUI
     try std.testing.expect(takeLastError(&buf) == null);
 }
 
+/// message_start 之后直接是服务端的错误帧:一个零可见输出、但服务端**给出了答复**的失败。
+const ERROR_FRAME_SSE =
+    "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n" ++
+    "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"model not found\"}}\n\n";
+
+/// message_start 之后干净 EOF:流没报告停止原因就结束了(StreamIncomplete),零可见输出。
+const START_THEN_EOF_SSE =
+    "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n";
+
+test "L2 liveness ②e: 零可见输出但服务端报了错误帧 → 不兜底重发,api_error(服务端的答复不能被重发盖掉)" {
+    const a = std.testing.allocator;
+    // 若被重发,第二条响应会正常回答,run 以 end_turn 收尾,错误被吞掉。
+    var srv = try harness.MockServer.startCassette(&[_][]const u8{ ERROR_FRAME_SSE, OK_SSE }, 0);
+    defer srv.stop();
+    const url = try srv.urlOwned(a);
+    defer a.free(url);
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
+    defer io_rt.deinit();
+    var client = mkClient(a, io_rt.io(), url, IDLE_MS, IDLE_MS);
+    defer client.deinit();
+    clearLastError();
+
+    const result = try runOneTurn(a, &client, null);
+    try std.testing.expectEqual(cc.agent_loop.StopReason.api_error, result.stop_reason);
+    try std.testing.expectEqual(@as(usize, 1), srv.requestCount());
+    clearLastError();
+}
+
+test "L2 liveness ②i: 零可见输出、流没报告停止原因就结束(StreamIncomplete)→ 兜底重发一次 → end_turn" {
+    const a = std.testing.allocator;
+    var srv = try harness.MockServer.startCassette(&[_][]const u8{ START_THEN_EOF_SSE, OK_SSE }, 0);
+    defer srv.stop();
+    const url = try srv.urlOwned(a);
+    defer a.free(url);
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
+    defer io_rt.deinit();
+    var client = mkClient(a, io_rt.io(), url, IDLE_MS, IDLE_MS);
+    defer client.deinit();
+    clearLastError();
+
+    const result = try runOneTurn(a, &client, null);
+    try std.testing.expectEqual(cc.agent_loop.StopReason.end_turn, result.stop_reason);
+    try std.testing.expectEqual(@as(usize, 2), srv.requestCount());
+    clearLastError();
+}
+
 test "L2 liveness: StreamStalled 归为可重试错误(与 TransientNetwork 同类)" {
     try std.testing.expect(cc.client_mod.isRetriableError(error.StreamStalled));
     try std.testing.expect(cc.client_mod.isRetriableError(error.TransientNetwork));

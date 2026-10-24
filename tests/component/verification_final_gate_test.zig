@@ -385,6 +385,9 @@ test "L2 a mid-stream provider failure retries the same turn instead of dying" {
 }
 
 test "L2 zero-retry default preserves the api_error surface" {
+    // The cut lands before END_TURN's first text delta and surfaces as RequestFailed: a
+    // dropped connection is not one of the failures agent_loop.SILENT_STREAM_RETRY_FLOOR
+    // re-sends (stall / stream ended without a stop report), so this stays api_error.
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
