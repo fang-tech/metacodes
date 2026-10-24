@@ -138,6 +138,26 @@ status, compatibility boundaries, and entry points are defined by
   showed as `metask 16 models`, and Enter on it listed only Metask's models,
   leaving the OpenAI and Gemini routes unreachable from the picker. Each
   provider now has its own row.
+- `zig build test:picker` and `zig build test:provider` compile again, and
+  `zig build test` now runs both. A test in `src/api/model_name.zig` imported
+  the system prompt, and the provider kernel reaches that file through
+  `util/pricing.zig`, so both isolation roots compiled the whole application;
+  once the formal runtime needed a build option they stopped compiling (`no
+  module named 'project_harness_build_options'`). The test moved to
+  `src/api/model_name_consumers_test.zig`, and `types.zig` declares the stall
+  gate setting instead of importing `core/stall_gate.zig` for it. `zig build
+  subsystem:boundary` now checks every file a subsystem reaches, test blocks
+  included, and the picker's own files are its two files rather than all of
+  `src/repl/`. The four tests in `src/provider/capability_matrix_test.zig`,
+  which only the provider root reaches, had never run in CI.
+- Linux and macOS CI now run the platform layer's `terminal.zig` and
+  `timezone.zig` tests. The "Native platform modules" step listed the modules
+  to test by hand, and the list missed both; their 7 tests ran only on the
+  Windows gate, where the time zone's daylight-saving test skips. The step now
+  compiles `src/platform/platform.zig`, whose test block references every
+  module it exports. `zig build test` also runs `test:platform` (its fork tests
+  still need `METACODES_PROC_TEST=1`) and `test:lsp`, which until now ran only
+  in `windows:gate`, so `gate:pr` covers both locally.
 - **TUI: a terminal resize no longer answers an open dialog.** A resize
   interrupts a blocked key read (SIGWINCH has no `SA_RESTART`), and the
   permission dialog took the interrupted read for "No": the tool was denied
