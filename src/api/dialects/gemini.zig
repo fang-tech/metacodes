@@ -50,17 +50,16 @@ const Gemini = struct {
         // 由 serializeGeminiRequest 的 gen_cfg 合并逻辑收进 generation_config。
         // **逗号策略**:与 serializeResponseFormat 一致——若 out 非空(已有片段)则加前导逗号。
         // 这让两个片段函数调用顺序无关(gen_cfg 收集器不需关心谁先调)。
-        // Gemini 3.x 不能关 thinking:effort=null 时也发 "low"(默认)。
+        // No level chosen leaves the model's own default: medium on Gemini 4
+        // Argon and 3.8 Flash, high on 3.1 Pro (ai.google.dev .../thinking,
+        // 2026-10). Sending `low` there, as this did, quietly cut the
+        // reasoning of every session that never picked a level. A chosen
+        // none/minimal on a model that cannot stop thinking is still `low`.
         if (effort) |e| if (geminiThinkingLevel(p, e)) |level| {
             if (out.items.len > 0) try out.appendSlice(a, ",");
             try out.appendSlice(a, "\"thinking_level\":");
             try util_json.serializeString(level, out, a);
         };
-        // effort=null 且 cannot_disable_thinking → 发 low(3.x 默认就开)
-        if (effort == null and p.cannot_disable_thinking) {
-            if (out.items.len > 0) try out.appendSlice(a, ",");
-            try out.appendSlice(a, "\"thinking_level\":\"low\"");
-        }
     }
 
     /// Gemini:tool_choice → tool_config.function_calling_config.mode + allowed_function_names。
@@ -167,15 +166,20 @@ test "geminiDialectFor: 2.5 effort=null 不发 thinking_level(可关)" {
     try std.testing.expectEqual(@as(usize, 0), out.items.len);
 }
 
-test "geminiDialectFor: 3.1 Pro effort=null 仍发 thinking_level low(不能关)" {
-    const d = geminiDialectFor("gemini-3.1-pro");
-    const p = profileFor(.gemini, "gemini-3.1-pro");
-    try std.testing.expect(p.cannot_disable_thinking);
-    const a = std.testing.allocator;
-    var out: std.ArrayList(u8) = .empty;
-    defer out.deinit(a);
-    try d.serializeThinking(p, null, &out, a);
-    try std.testing.expect(std.mem.indexOf(u8, out.items, "\"thinking_level\":\"low\"") != null);
+test "geminiDialectFor: no chosen level leaves the model's own default" {
+    // Gemini 3+ cannot stop thinking, but its default is not `low` (Argon and
+    // 3.8 Flash default to medium, 3.1 Pro to high): an unset level sends
+    // nothing rather than lowering it.
+    inline for (.{ "gemini-3.1-pro", "gemini-4-argon", "gemini-3.8-flash" }) |model| {
+        const d = geminiDialectFor(model);
+        const p = profileFor(.gemini, model);
+        try std.testing.expect(p.cannot_disable_thinking);
+        const a = std.testing.allocator;
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(a);
+        try d.serializeThinking(p, null, &out, a);
+        try std.testing.expectEqual(@as(usize, 0), out.items.len);
+    }
 }
 
 test "geminiDialectFor: 3.1 Pro effort=none 仍发 low(不能关,降级到默认)" {

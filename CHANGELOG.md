@@ -68,6 +68,16 @@ status, compatibility boundaries, and entry points are defined by
   the chosen `reasoning_effort` becomes the session's level. A route that
   offers the level the session already runs with starts with it selected; a
   commit that carries no level keeps the session's, as `/model use` does.
+- **Gemini 3 and later can call tools past the first step of a turn.** These
+  models reject a request whose current turn returns a model function call
+  without the `thoughtSignature` it arrived with (400), and the client dropped
+  every signature, so the second request of any turn that used a tool failed.
+  Signatures are now kept by the call ids the client mints and sent back on
+  the part they came on; a step's first call the client never received
+  (history from another model, a resumed session) carries the documented
+  placeholder. An unchosen thinking level is no longer sent as `low` to
+  Gemini 3 and later: their default (medium on Gemini 4 Argon and 3.8 Flash)
+  applies.
 
 ## 0.7.0 — 2026-10-24
 

@@ -124,6 +124,10 @@ pub const ModelProfile = struct {
     /// 不能关 thinking(Kimi K3 总是开;Gemini 3.x 系列不能关)。
     /// 若 effort=null 或 .none/.minimal,dialect 仍要发"最低档"而非不发。
     cannot_disable_thinking: bool = false,
+    /// The model validates the thought signature of each step's first
+    /// function call in the current turn (Gemini 3 and later); a call sent
+    /// back without one fails the request.
+    requires_thought_signatures: bool = false,
     /// 支持原生图像输入(vision)。序列化守门的单一真相:false 的 (kind, model) 在
     /// 请求含 image block 时必须报显式能力错误(error.ImageInputUnsupported),
     /// 绝不静默丢图/OCR/文本占位。保守默认 false;仅对已验证 vision 家族开 true。
@@ -375,6 +379,7 @@ fn geminiProfile(model: []const u8) ModelProfile {
         .effort_levels = .none_, // Gemini 用 thinking_level(minimal/low/medium/high),非 effort
         .returns_reasoning_content = false, // Gemini 用 thought_summary + signature,非平级字段
         .cannot_disable_thinking = is_gemini3_family,
+        .requires_thought_signatures = is_gemini3_family,
     };
 }
 
