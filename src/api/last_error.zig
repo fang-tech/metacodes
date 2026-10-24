@@ -12,7 +12,10 @@
 //! headless 不需要:log.errId 直接落 stderr,现场本来可见。
 //!
 //! 写侧还有:client.reportHeadStall / reportBodyStall(空闲监视 shutdown 连接,2026-09-11 起
-//!       正文阶段 stall 也记,TUI 打"正文空闲超时: N ms 内无任何字节(上限 M ms)…")。
+//!       正文阶段 stall 也记,TUI 打"正文空闲超时: N ms 内无任何字节(上限 M ms)…";2026-10-24 起
+//!       按学到的保活节奏判死的连接记为"连接已断: …连 keepalive 也没有…");以及
+//!       client.reportServerError(OpenAI chat / Responses / Gemini 流内的服务端报错,与 Anthropic
+//!       错误帧同名"API 错误帧")。
 //!
 //! 已知缺口(记录缺失时 UI 回退通用文案,不会错报):
 //! - mid-stream 读错误(200 后半途断连,ReadFailed 类,**非** stall)不经此处,现场只在日志;

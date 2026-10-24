@@ -27,6 +27,29 @@ const END_TURN =
     "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n" ++
     "data: {\"type\":\"message_stop\"}\n\n";
 
+/// Same answer with the visible text first and more of it after: the MockServer's mid-stream
+/// cut (half the body) lands after "done" has streamed. END_TURN's half lands before any text,
+/// a dropped connection that `agent_loop.SILENT_STREAM_RETRY_FLOOR` re-sends even with the
+/// zero-retry default.
+const TEXT_THEN_MORE =
+    "data: {\"type\":\"message_start\",\"message\":{\"id\":\"done\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n" ++
+    "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n" ++
+    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"done\"}}\n\n" ++
+    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\" and the rest of the answer\"}}\n\n" ++
+    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\" which keeps going for a while\"}}\n\n" ++
+    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\" so the cut lands after the first delta\"}}\n\n" ++
+    "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n" ++
+    "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n" ++
+    "data: {\"type\":\"message_stop\"}\n\n";
+
+comptime {
+    @setEvalBranchQuota(200_000);
+    // The cut keeps the first half: "done" must be inside it, END_TURN's must not.
+    const first_text_end = std.mem.indexOf(u8, TEXT_THEN_MORE, "\"done\"}}\n\n").? + "\"done\"}}\n\n".len;
+    if (first_text_end > TEXT_THEN_MORE.len / 2) @compileError("TEXT_THEN_MORE's cut must land after its first text delta");
+    if (std.mem.indexOf(u8, END_TURN[0 .. END_TURN.len / 2], "\"done\"}}\n") != null) @compileError("END_TURN's cut must land before any text");
+}
+
 fn toolSse(allocator: std.mem.Allocator, id: []const u8, name: []const u8, input: []const u8) ![]u8 {
     var escaped: std.Io.Writer.Allocating = .init(allocator);
     defer escaped.deinit();
@@ -384,7 +407,7 @@ test "L2 a mid-stream provider failure retries the same turn instead of dying" {
     try std.testing.expectEqual(@as(usize, 3), server.requestCount());
 }
 
-test "L2 zero-retry default preserves the api_error surface" {
+test "L2 zero-retry default preserves the api_error surface once text has streamed" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -392,6 +415,56 @@ test "L2 zero-retry default preserves the api_error surface" {
     const root = harness.normalizeSlashes(buf[0..try tmp.dir.realPath(std.testing.io, &buf)]);
     const write = try writeSse(a, root);
     defer a.free(write);
+    // Response #1 is cut after "done" streamed: the user watched it, so it is not re-sent.
+    var server = try harness.MockServer.startCassetteMidStreamCut(
+        &.{ write, TEXT_THEN_MORE, END_TURN },
+        1,
+    );
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
+    defer io_runtime.deinit();
+    var client = cc.client_mod.Client.initWithBaseUrl(a, io_runtime.io(), "key", "model", url);
+    defer client.deinit();
+    var conversation = cc.conversation.Conversation.init(a);
+    defer conversation.deinit();
+    try conversation.appendText(.user, "repair the repository");
+    var permission = cc.permission.createContext(.bypass_permissions, a);
+    permission.no_interactive_prompt = true;
+    const defs = try cc.tools.toToolDefinitions(a);
+    defer a.free(defs);
+    var writer = cc.writer_backend.WriterBackend.initNull();
+    const backend = writer.backend();
+    const result = try cc.agent_loop.run(
+        &conversation,
+        client.provider(),
+        defs,
+        &permission,
+        .{
+            .max_turns = 8,
+            .system_prompt = "STABLE-PREFIX",
+            .cwd_abs = root,
+            .home_dir = root,
+            .auto_compact_threshold = std.math.maxInt(usize),
+        },
+        &backend,
+        a,
+    );
+    try std.testing.expectEqual(cc.agent_loop.StopReason.api_error, result.stop_reason);
+    try std.testing.expectEqual(@as(usize, 2), server.requestCount());
+}
+
+test "L2 zero-retry default still re-sends a connection dropped before any visible output, once" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = harness.normalizeSlashes(buf[0..try tmp.dir.realPath(std.testing.io, &buf)]);
+    const write = try writeSse(a, root);
+    defer a.free(write);
+    // Response #1 is cut before its first text delta (RequestFailed): nothing was shown, so
+    // the TUI default (no retries configured) re-sends it once and the replay completes.
     var server = try harness.MockServer.startCassetteMidStreamCut(
         &.{ write, END_TURN, END_TURN },
         1,
@@ -427,7 +500,8 @@ test "L2 zero-retry default preserves the api_error surface" {
         &backend,
         a,
     );
-    try std.testing.expectEqual(cc.agent_loop.StopReason.api_error, result.stop_reason);
+    try std.testing.expectEqual(cc.agent_loop.StopReason.end_turn, result.stop_reason);
+    try std.testing.expectEqual(@as(usize, 3), server.requestCount());
 }
 
 fn probeCommand(allocator: std.mem.Allocator, root: []const u8) ![]u8 {

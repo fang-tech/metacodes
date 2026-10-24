@@ -203,7 +203,9 @@ pub const HttpTransport = struct {
     fn settleStream(self: *HttpTransport) void {
         self.stream_answered = false;
         const exchange = self.stream orelse return;
-        self.registry.setIdleLimit(@ptrCast(&exchange.request), SETTLE_IDLE_MS);
+        // An SSE body; this registry never learns keepalives (no touchKeepalive caller), so
+        // only the settle limit applies, never the transport-dead rule.
+        self.registry.setIdleLimit(@ptrCast(&exchange.request), SETTLE_IDLE_MS, .sse);
         while (exchange.nextEvent(self, MAX_MESSAGE_BYTES) catch null) |message| {
             self.queue.append(self.allocator, message) catch {
                 self.allocator.free(message);

@@ -446,7 +446,7 @@ pub const OpenAIClient = struct {
             return error.RequestFailed;
         }
         // 响应头已接受 → 正文阶段上限(见 client.zig bodyIdleLimitMs);字节级续命由 LivenessReader 负责。
-        self.abort_registry.setIdleLimit(req_ptr, client_mod.bodyIdleLimitMs(self.stream_body_idle_timeout_ms, self.stream_idle_timeout_ms, self.max_tokens));
+        self.abort_registry.setIdleLimit(req_ptr, client_mod.bodyIdleLimitMs(self.stream_body_idle_timeout_ms, self.stream_idle_timeout_ms, self.max_tokens), .sse);
 
         const heap = try self.allocator.create(OpenAIStream);
         heap.* = .{
@@ -690,6 +690,12 @@ const OpenAIStream = struct {
         registry.touch(self.request);
     }
 
+    /// 一条保活行(注释 / ping)= 端点在沉默中开口 → 注册表学习保活节奏(见 provider.zig)。
+    fn touchKeepalive(self: *OpenAIStream) void {
+        const registry = self.abort_registry orelse return;
+        registry.touchKeepalive(self.request);
+    }
+
     /// 已排队事件的唯一出口;next() 每次读新行之前先走这里。出队顺序固定:
     ///   1. pending_usage —— 与内容同 chunk 的 usage,紧跟在该 chunk 的内容事件之后;
     ///   2. flush_q       —— 终止时 flush 的 reasoning_item / tool_use_start(按入队顺序);
@@ -743,7 +749,8 @@ const OpenAIStream = struct {
                     client_mod.reportBodyStall("openai", self.id, stall);
                     return error.StreamStalled;
                 }
-                return err;
+                log.warnId("openai", self.id, "stream read failed: {s}", .{@errorName(err)});
+                return api_stream.midStreamReadError(err);
             };
             const line = line_opt orelse {
                 self.done = true;
@@ -759,8 +766,13 @@ const OpenAIStream = struct {
                 if (!self.stop_reported) return self.incomplete();
                 return self.finishFlush();
             };
-            // 进展记账:非保活行(含被 continue 掉的 usage/空 chunk)才续正文空闲时钟。
-            if (!api_stream.isKeepaliveLine(line)) self.touchProgress();
+            // 进展记账:非保活行(含被 continue 掉的 usage/空 chunk)才续正文空闲时钟;
+            // 保活行只交给注册表学习端点的保活节奏。
+            switch (api_stream.classifyLine(line)) {
+                .progress => self.touchProgress(),
+                .keepalive => self.touchKeepalive(),
+                .separator => {},
+            }
             const trimmed = std.mem.trim(u8, line, " \r\n");
             if (trimmed.len == 0) continue;
             if (!std.mem.startsWith(u8, trimmed, "data:")) continue;
@@ -784,6 +796,14 @@ const OpenAIStream = struct {
         if (self.protocol == .responses) return self.parseResponsesChunk(data);
         // takeQueued 在读本行之前已清空槽(见其注释);这里写入前它必为空。
         std.debug.assert(self.pending_usage == null);
+        // OpenAI 兼容端(OpenRouter 等)在流中途报错的形状:`data: {"error":{...}}`,没有 choices。
+        // 旧实现把它当空 chunk 跳过,流随后没报告停止原因就结束 → StreamIncomplete,服务端的
+        // 答复被当成断流。现在按服务端声明的失败上抛。
+        if (util_json.topLevelObjectField(data, "error")) |err_obj| {
+            self.done = true;
+            client_mod.reportServerError("openai", self.id, err_obj);
+            return error.ApiError;
+        }
         // usage 只在**值为 object** 时存在(见 chatUsageObject)。include_usage 下每个普通
         // chunk 都带 `"usage":null`——旧实现按 substring `"usage"` 判存在并立即 return,
         // 把这些 chunk 的文本/推理/tool_call 增量/finish_reason 全部吞掉(issue #258)。
@@ -932,12 +952,15 @@ const OpenAIStream = struct {
             self.stop_reported = true;
             return self.finishResponsesTerminal(data);
         }
-        // 失败终止(response.failed)/流级 error 事件:上抛给 agent_loop 的 stream_error 处理。
+        // 失败终止(response.failed)/流级 error 事件:服务端声明的失败 → ApiError(不是断连,
+        // agent_loop 不兜底重发;见 stream.zig midStreamReadError 的名字约定)。
         if (std.mem.eql(u8, ev_type, "response.failed") or std.mem.eql(u8, ev_type, "error")) {
-            log.errId("openai", self.id, "responses stream failed: {s}", .{
-                util_json.extractStringField(data, "message") orelse "unknown",
-            });
-            return error.RequestFailed;
+            const response = util_json.topLevelObjectField(data, "response") orelse data;
+            const err_obj = util_json.topLevelObjectField(response, "error") orelse
+                util_json.topLevelObjectField(data, "error") orelse data;
+            self.done = true;
+            client_mod.reportServerError("openai", self.id, err_obj);
+            return error.ApiError;
         }
         return null; // 其它 typed 事件(created/in_progress/output_text.done 等):忽略
     }

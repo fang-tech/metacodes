@@ -202,6 +202,21 @@ pub const MockServer = struct {
         return self;
     }
 
+    /// 同 `startCassetteSilent`,但非沉默响应按 `chunk_delay_ms` 逐事件滴流:先让客户端在
+    /// 前面的响应里看到端点的保活节奏(ping 之间的真实间隔),再让 `silent_index` 那条连接在
+    /// 发完 prefix 后死掉而不关(2026-10-24 半开连接)。沉默响应本身不受 chunk_delay 影响。
+    pub fn startCassetteTrickleSilent(
+        bodies: []const []const u8,
+        chunk_delay_ms: u32,
+        silent_index: usize,
+        silent_prefix_bytes: usize,
+    ) !*MockServer {
+        const self = try startCassette(bodies, chunk_delay_ms);
+        self.silent_index = silent_index;
+        self.silent_prefix_bytes = silent_prefix_bytes;
+        return self;
+    }
+
     /// cassette 多轮 + 从 `first_silent` 起的每个响应都沉默(连响应头都不发):its requests
     /// arrive in any order (a session and its background job, say) and all of them stall.
     pub fn startCassetteSilentFrom(bodies: []const []const u8, first_silent: usize) !*MockServer {

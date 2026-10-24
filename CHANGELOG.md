@@ -212,6 +212,41 @@ status, compatibility boundaries, and entry points are defined by
   replay now stops the service it started, and it fails if one is still
   running under its temporary directory. Autostart stays on, so the replay
   still runs the trial's configuration.
+- **A dead connection is no longer waited out for half an hour.** A session
+  on glm-5.3-flash received the response head and `message_start`, then no
+  byte for 1801 s, not even the gateway's keepalive pings, which that
+  gateway sends at least every 15 s while healthy; the turn ended with
+  `正文空闲超时` after the full 30-minute body limit and needed a manual
+  `/retry`, which finished in 18.7 s. Each provider client now learns how
+  often its endpoint sends a keepalive mid-stream (a ping or SSE comment
+  that ends a silence of at least 2 s, after the stream has produced
+  output; three such samples arm it). On an endpoint that has shown this, a
+  streamed body with no byte at all, keepalives included, for 4 × the
+  longest interval seen (at least 2 minutes) is judged dead, and the TUI
+  prints `连接已断: … 连 keepalive 也没有…`. The verdict resets what was
+  learned, so an endpoint that stops sending keepalives is judged by the
+  body limit again. An endpoint that never sent a keepalive mid-stream
+  keeps the old behaviour.
+- **A stream that gave no answer is re-sent once, in the TUI too.** The TUI
+  never re-sent a turn that failed mid-stream, so as not to repeat text the
+  user had already watched. When the stream stalled, or ended without
+  reporting how it stopped, or the connection dropped, before any text,
+  thinking or tool call arrived, there is nothing to repeat, so the same
+  request is now sent again once (headless keeps its two retries). An error
+  the server reports in the stream is an answer and is not re-sent, and
+  neither is a local failure such as an over-long line. A body-phase stall
+  on an upstream that is pinged alive can therefore take up to two body
+  limits before the turn ends.
+- **An error a server reports mid-stream is reported as one, on every
+  wire.** On OpenAI-compatible chat and Gemini streams a `data:
+  {"error":{…}}` chunk was skipped as empty; the stream then ended without
+  a stop report and read as an unterminated stream, so the server's own
+  message never reached the user. It now ends the turn with
+  `API 错误帧: <the error object>`, as Anthropic's error frame already did,
+  and OpenAI Responses' `response.failed` and `error` events do the same
+  instead of the generic request failure. Mid-stream, the generic request
+  failure now means only that the connection dropped; local failures (an
+  over-long line, out of memory) keep their own names.
 
 ## 0.6.0 — 2026-10-20
 

@@ -68,6 +68,23 @@ pub const StopReason = enum { end_turn, max_turns, aborted, tool_error, api_erro
 /// 与 max_turns 不冲突:那是预算,这是按故障分类停止,不数模型行为。
 pub const MAX_ENVIRONMENT_FAULTS: u32 = 3;
 
+/// 连接没给出答复(`isSilentRetryFailure`)、而本次尝试**还没有任何可见输出**(文本 / thinking /
+/// 工具调用都没到 backend)时,同轮重发次数的下限,不论 `Options.max_stream_turn_retries` 是多少。
+/// TUI 默认不重发是怕重复用户已经看着流出来的半截文本;一个字都没流出来就没有这个顾虑。2026-10-24
+/// 实录:message_start 之后连接静默 30 分钟被判 stall,run 以 api_error 收口,用户手动 /retry,
+/// 同一请求 18.7 s 完成。
+pub const SILENT_STREAM_RETRY_FLOOR: u8 = 1;
+
+/// 哪些流内失败算"连接没给出答复",可以在零可见输出时兜底重发:监视线程判的 stall(进展沉默或
+/// 连接已死)、没报告停止原因就结束的流、以及流中途断连(`RequestFailed`——三个 provider client
+/// 只用它表示断连,见 api/stream.zig `midStreamReadError` 的名字约定)。服务端**主动**报的错误
+/// (`ApiError`:错误帧 / 顶层 `error` 对象 / `response.failed`)是一个答复,重发只会重复它或把它
+/// 盖掉;本地或解析类失败(`StreamTooLong`、`InvalidJson`…)重发也不会变,都不在内。
+fn isSilentRetryFailure(failure: ?anyerror) bool {
+    const err = failure orelse return false;
+    return err == error.StreamStalled or err == error.StreamIncomplete or err == error.RequestFailed;
+}
+
 /// 一条工具结果是否是环境故障:结构化错误信封(`{"error":{…}}`)里 `category` 为
 /// `system_error` 且 `recoverable` 明确为 false。任何别的形状(普通输出、user_error、
 /// 可重试的 system_error、safety 拒绝)都不算。
@@ -642,7 +659,9 @@ pub const Options = struct {
     /// semantically clean. Default 0 preserves interactive behavior — a TUI
     /// user has watched the partial text stream and a silent re-run would
     /// duplicate it; headless evaluation enables 2, where one transient
-    /// otherwise destroys an entire paired arm's evidence.
+    /// otherwise destroys an entire paired arm's evidence. A stall or an
+    /// unterminated stream before anything visible streamed has no such text
+    /// and always gets at least `SILENT_STREAM_RETRY_FLOOR` retries.
     max_stream_turn_retries: u8 = 0,
     /// 统一 UI 请求回调(替代旧 ask_question 等多套;ctx 指 *TuiBackend)。
     /// 仅顶层 TUI 接(agent_depth==0)——子 agent 无 tty。见 UiRequester。
@@ -2314,6 +2333,9 @@ fn runCounted(
             var candidate_rejected = false;
             var aborted_during_stream = false;
             var stream_error = false;
+            // Which error ended the stream (null = none, or a context-window frame).
+            // Only connection-shaped failures qualify for SILENT_STREAM_RETRY_FLOOR.
+            var stream_failure: ?anyerror = null;
             var stream_context_window_exceeded = false;
             var response_usage = @import("cache_break.zig").ResponseUsage{};
             var ledger_outcome: []const u8 = "failed";
@@ -2368,6 +2390,7 @@ fn runCounted(
                             break;
                         };
                         stream_error = true;
+                        stream_failure = e;
                         log.errId("agent", rid, "stream returned error {s} at turn {d}", .{ @errorName(e), turns + 1 });
                         break;
                     },
@@ -2684,6 +2707,15 @@ fn runCounted(
                     assistant_text.items.len == 0 and
                     tool_uses.items.len == 0 and
                     assistant_blocks.items.len == 0;
+                // Nothing the user could have watched: no text, thinking or
+                // tool call reached the backend in this attempt (usage and
+                // reasoning items are not shown), and the connection gave no
+                // answer at all. See SILENT_STREAM_RETRY_FLOOR.
+                const silent_retry_eligible = assistant_text.items.len == 0 and
+                    thinking_text.items.len == 0 and
+                    tool_uses.items.len == 0 and
+                    assistant_blocks.items.len == 0 and
+                    isSilentRetryFailure(stream_failure);
                 // 先 join 预取线程再释放 tool_uses(它们 borrow 其字节),防 UAF(Linus HIGH-1)。
                 prefetch.joinAll();
                 for (tool_uses.items) |tu| {
@@ -2737,11 +2769,19 @@ fn runCounted(
                 // re-issue of the same request is safe. Aborts keep their
                 // own path; context-window exhaustion was handled before.
                 const abort_pending = if (opts.abort) |a| a.isAborted() else false;
-                if (stream_turn_retries < opts.max_stream_turn_retries and
+                const stream_retry_cap = if (silent_retry_eligible)
+                    @max(opts.max_stream_turn_retries, SILENT_STREAM_RETRY_FLOOR)
+                else
+                    opts.max_stream_turn_retries;
+                if (stream_turn_retries < stream_retry_cap and
                     !abort_pending)
                 {
                     stream_turn_retries += 1;
-                    log.warnId("agent", rid_for_turn, "mid-stream failure → same-turn retry {d}/{d}", .{ stream_turn_retries, opts.max_stream_turn_retries });
+                    log.warnId("agent", rid_for_turn, "mid-stream failure{s} → same-turn retry {d}/{d}", .{
+                        if (silent_retry_eligible) " before any visible output" else "",
+                        stream_turn_retries,
+                        stream_retry_cap,
+                    });
                     continue :request_recovery;
                 }
                 return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .api_error, .turns = turns + 1, .tool_calls = total_tool_calls });

@@ -71,13 +71,34 @@ pub const RetryReporter = api_stream.RetryReporter;
 /// head is accepted the transport switches the slot to the body-phase limit
 /// with `setIdleLimit` (larger: a gateway may generate a whole tool call
 /// before writing a single byte of it).
+///
+/// **Dead connections (2026-10-24)**: the body-phase limit is about *progress*
+/// and is long (up to 30 minutes) because a gateway may legitimately sit on a
+/// whole tool call. A connection that has died without a FIN or RST looks the
+/// same to it — a session waited 1801 s on a socket that had received 6.5 KB
+/// and then nothing, not even the keepalive pings that endpoint otherwise sends
+/// every ≤15 s. So the registry also learns, per endpoint (one registry per
+/// client), how long the peer stays quiet before it speaks up with a keepalive
+/// mid-stream (`touchKeepalive`). Once it has seen that often enough, an SSE
+/// body that goes silent at the *transport* level for several of those
+/// intervals is judged dead (`Stall.cause == .transport_dead`). An endpoint
+/// that never pinged mid-stream keeps exactly the old behaviour.
 pub const RequestAbortRegistry = struct {
     const ShutdownFn = *const fn (ctx: *anyopaque) void;
+
+    /// What the response body is once the head has been accepted. Only an SSE
+    /// stream can carry keepalive lines, so only it is judged by the
+    /// transport-dead rule; a whole body keeps the progress limit alone.
+    pub const BodyKind = enum { whole, sse };
+
+    const Phase = enum { head, whole_body, sse_body };
+
     const Slot = struct {
         /// Null = not cancellable through an AbortSignal (liveness-only slot).
         signal: ?*const AbortSignal,
         ctx: *anyopaque,
         shutdown_fn: ShutdownFn,
+        phase: Phase = .head,
         /// 0 = no liveness monitoring for this request.
         idle_limit_ms: u64 = 0,
         /// Last *progress*: bytes that carry model output (any SSE line that is
@@ -89,11 +110,26 @@ pub const RequestAbortRegistry = struct {
         /// a gateway pinged every 15 s for 55 minutes while its upstream produced
         /// nothing; counting those pings as activity made the stall invisible).
         last_transport_ms: u64 = 0,
+        /// The silence the most recent transport read ended (time since the
+        /// byte before it). A keepalive line parsed out of that read inherits it
+        /// as the interval the peer let pass before speaking up.
+        last_transport_gap_ms: u64 = 0,
+        /// A transport read has arrived that no keepalive sample has used yet;
+        /// one read carrying "event: ping" + "data: {ping}" is one sample.
+        unsampled_read: bool = false,
+        /// This stream has produced progress in its body: keepalives sent before
+        /// the first model line (proxies' "processing" comments) say nothing
+        /// about how the endpoint behaves mid-stream.
+        progress_seen: bool = false,
         /// Set once the monitor shut the request down for inactivity: how long
         /// it had been silent. Read by the transport to name the failure.
         stalled_after_ms: ?u64 = null,
         /// Transport idle at the moment of the stall verdict (see `Stall`).
         stalled_transport_idle_ms: u64 = 0,
+        /// Which rule fired and the limit it judged against (see `Stall`).
+        stalled_cause: Stall.Cause = .no_progress,
+        stalled_limit_ms: u64 = 0,
+        stalled_keepalive_gap_ms: u64 = 0,
     };
 
     /// Monitor wake-up interval; also bounds how late a stall is detected.
@@ -103,13 +139,59 @@ pub const RequestAbortRegistry = struct {
     /// the request had been silent and which limit was in force at the time
     /// (head- or body-phase). The transport names the failure with both.
     pub const Stall = struct {
+        pub const Cause = enum {
+            /// No model output for `limit_ms` (the head- or body-phase limit).
+            no_progress,
+            /// No byte at all, keepalives included, for `limit_ms` on an
+            /// endpoint that has been seen to send a keepalive at least every
+            /// `keepalive_gap_ms` mid-stream: the connection is dead.
+            transport_dead,
+        };
         /// Silence in *progress* terms (no model-output bytes for this long).
         idle_ms: u64,
+        /// The limit of the rule that fired.
         limit_ms: u64,
         /// Silence in transport terms (no bytes at all, keepalives included).
         /// Much smaller than `idle_ms` means the gateway kept the connection
         /// alive while producing nothing; equal means the connection was dead.
         transport_idle_ms: u64,
+        cause: Cause = .no_progress,
+        /// For `.transport_dead`: the longest mid-stream keepalive interval
+        /// the endpoint had shown. 0 otherwise.
+        keepalive_gap_ms: u64 = 0,
+    };
+
+    /// How the keepalive evidence turns into a transport limit. Fields are
+    /// public so tests can shrink the time scale; production uses the defaults.
+    pub const KeepaliveTuning = struct {
+        /// A keepalive that ends a shorter silence says nothing about the
+        /// endpoint's cadence (Anthropic-style APIs send one ping right after
+        /// message_start); only longer ones count as samples.
+        min_gap_ms: u64 = 2_000,
+        /// Samples needed before the transport rule arms.
+        min_samples: u32 = 3,
+        /// Silence of this many learned intervals = dead.
+        multiplier: u64 = 4,
+        /// Never judge a connection dead sooner than this.
+        floor_ms: u64 = 120_000,
+    };
+
+    /// What this endpoint has shown about its mid-stream keepalives. Guarded by
+    /// `mutex`. Reset when the transport rule fires, so an endpoint that stops
+    /// pinging (a gateway redeploy) is re-learned instead of killed again.
+    pub const KeepaliveEvidence = struct {
+        samples: u32 = 0,
+        /// Longest silence a mid-stream keepalive ended.
+        max_gap_ms: u64 = 0,
+
+        /// Transport limit for a body judged by `progress_limit_ms`; 0 = the
+        /// rule is not armed (too little evidence, or monitoring is off). Never
+        /// at or above the progress limit, which fires first in that case.
+        pub fn deadLimitMs(self: KeepaliveEvidence, tuning: KeepaliveTuning, progress_limit_ms: u64) u64 {
+            if (progress_limit_ms == 0 or self.samples < tuning.min_samples) return 0;
+            const limit = @max(self.max_gap_ms *| tuning.multiplier, tuning.floor_ms);
+            return if (limit < progress_limit_ms) limit else 0;
+        }
     };
 
     mutex: sync.Mutex = .{},
@@ -117,6 +199,8 @@ pub const RequestAbortRegistry = struct {
     monitor: ?std.Thread = null,
     monitor_stop: bool = false,
     monitor_cond: sync.Condition = .{},
+    keepalive: KeepaliveEvidence = .{},
+    keepalive_tuning: KeepaliveTuning = .{},
 
     pub fn register(
         self: *RequestAbortRegistry,
@@ -172,16 +256,22 @@ pub const RequestAbortRegistry = struct {
     /// Phase switch: the response head has been accepted, so from now on the
     /// request is judged against `limit_ms` (0 = stop monitoring it). The
     /// clock restarts here as well — the head itself was activity. A slot
-    /// the monitor has already shut down keeps its verdict.
-    pub fn setIdleLimit(self: *RequestAbortRegistry, ctx: *anyopaque, limit_ms: u64) void {
+    /// the monitor has already shut down keeps its verdict. `body` says
+    /// whether the transport-dead rule may apply (SSE only).
+    pub fn setIdleLimit(self: *RequestAbortRegistry, ctx: *anyopaque, limit_ms: u64, body: BodyKind) void {
         self.mutex.lock();
         defer self.mutex.unlock();
         for (self.slots.items) |*active| {
             if (active.ctx != ctx) continue;
             active.idle_limit_ms = limit_ms;
+            active.phase = switch (body) {
+                .whole => .whole_body,
+                .sse => .sse_body,
+            };
             const now = monotonicMs();
             active.last_activity_ms = now;
             active.last_transport_ms = now;
+            active.unsampled_read = false;
             self.ensureMonitorLocked(limit_ms);
             return;
         }
@@ -217,6 +307,10 @@ pub const RequestAbortRegistry = struct {
                 const now = monotonicMs();
                 active.last_activity_ms = now;
                 active.last_transport_ms = now;
+                active.progress_seen = true;
+                // The read that carried this line ended its silence with
+                // progress, not with a keepalive.
+                active.unsampled_read = false;
                 return;
             }
         }
@@ -225,15 +319,37 @@ pub const RequestAbortRegistry = struct {
     /// Bytes of any kind arrived for `ctx` (called per transport read by
     /// `LivenessReader` in transport-only mode). Does **not** restart the idle
     /// clock: a keepalive proves the gateway is up, not that the model is
-    /// producing. Only the stall report reads this stamp.
+    /// producing. The stall report and the transport-dead rule read this stamp.
     pub fn touchTransport(self: *RequestAbortRegistry, ctx: *anyopaque) void {
         self.mutex.lock();
         defer self.mutex.unlock();
         for (self.slots.items) |*active| {
             if (active.ctx == ctx) {
-                active.last_transport_ms = monotonicMs();
+                const now = monotonicMs();
+                active.last_transport_gap_ms = now -| active.last_transport_ms;
+                active.last_transport_ms = now;
+                active.unsampled_read = true;
                 return;
             }
+        }
+    }
+
+    /// A keepalive line (ping or SSE comment, never a blank separator) was
+    /// parsed for `ctx`. Restarts no clock; it is evidence about the endpoint:
+    /// when it arrives mid-stream in an SSE body after a real silence, the
+    /// silence it ended is one sample of how long this endpoint stays quiet
+    /// before it speaks up.
+    pub fn touchKeepalive(self: *RequestAbortRegistry, ctx: *anyopaque) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        for (self.slots.items) |*active| {
+            if (active.ctx != ctx) continue;
+            if (active.phase != .sse_body or !active.progress_seen or !active.unsampled_read) return;
+            active.unsampled_read = false;
+            if (active.last_transport_gap_ms < self.keepalive_tuning.min_gap_ms) return;
+            self.keepalive.samples +|= 1;
+            self.keepalive.max_gap_ms = @max(self.keepalive.max_gap_ms, active.last_transport_gap_ms);
+            return;
         }
     }
 
@@ -247,10 +363,32 @@ pub const RequestAbortRegistry = struct {
         for (self.slots.items) |*active| {
             if (active.idle_limit_ms == 0 or active.stalled_after_ms != null) continue;
             const idle = now_ms -| active.last_activity_ms;
-            if (idle < active.idle_limit_ms) continue;
+            const transport_idle = now_ms -| active.last_transport_ms;
+            const dead_limit: u64 = if (active.phase == .sse_body)
+                self.keepalive.deadLimitMs(self.keepalive_tuning, active.idle_limit_ms)
+            else
+                0;
+            if (idle >= active.idle_limit_ms) {
+                active.stalled_cause = .no_progress;
+                active.stalled_limit_ms = active.idle_limit_ms;
+                active.stalled_keepalive_gap_ms = 0;
+            } else if (dead_limit > 0 and transport_idle >= dead_limit) {
+                active.stalled_cause = .transport_dead;
+                active.stalled_limit_ms = dead_limit;
+                active.stalled_keepalive_gap_ms = self.keepalive.max_gap_ms;
+                // The verdict spends the evidence: the retry starts unarmed, so
+                // an endpoint that has stopped pinging is judged by the progress
+                // limit until it shows keepalives again.
+                self.keepalive = .{};
+            } else continue;
             active.stalled_after_ms = idle;
-            active.stalled_transport_idle_ms = now_ms -| active.last_transport_ms;
-            log.warn("client", "stream idle for {d}ms (limit {d}ms, last transport byte {d}ms ago): shutting down the connection so the blocked read returns", .{ idle, active.idle_limit_ms, active.stalled_transport_idle_ms });
+            active.stalled_transport_idle_ms = transport_idle;
+            log.warn("client", "stream {s} for {d}ms (limit {d}ms, last transport byte {d}ms ago): shutting down the connection so the blocked read returns", .{
+                if (active.stalled_cause == .transport_dead) "dead (no byte, keepalives included)" else "idle",
+                idle,
+                active.stalled_limit_ms,
+                transport_idle,
+            });
             active.shutdown_fn(active.ctx);
             reaped += 1;
         }
@@ -271,7 +409,13 @@ pub const RequestAbortRegistry = struct {
         for (self.slots.items) |active| {
             if (active.ctx != ctx) continue;
             const idle = active.stalled_after_ms orelse return null;
-            return .{ .idle_ms = idle, .limit_ms = active.idle_limit_ms, .transport_idle_ms = active.stalled_transport_idle_ms };
+            return .{
+                .idle_ms = idle,
+                .limit_ms = active.stalled_limit_ms,
+                .transport_idle_ms = active.stalled_transport_idle_ms,
+                .cause = active.stalled_cause,
+                .keepalive_gap_ms = active.stalled_keepalive_gap_ms,
+            };
         }
         return null;
     }
@@ -660,7 +804,7 @@ test "RequestAbortRegistry: setIdleLimit switches the slot to the body-phase lim
     const registered_at = registry.slots.items[0].last_activity_ms;
     // Head accepted: the body phase is judged against a larger limit. The old
     // limit no longer applies even though more than 1s of "silence" elapsed.
-    registry.setIdleLimit(@ptrCast(&probe), 5_000);
+    registry.setIdleLimit(@ptrCast(&probe), 5_000, .whole);
     const switched_at = registry.slots.items[0].last_activity_ms;
     try std.testing.expect(switched_at >= registered_at);
     try std.testing.expectEqual(@as(u64, 5_000), registry.slots.items[0].idle_limit_ms);
@@ -676,7 +820,7 @@ test "RequestAbortRegistry: setIdleLimit switches the slot to the body-phase lim
     var quiet = LivenessProbe{};
     try registry.registerMonitored(a, null, @ptrCast(&quiet), LivenessProbe.shutdown, 1_000);
     defer registry.unregister(@ptrCast(&quiet));
-    registry.setIdleLimit(@ptrCast(&quiet), 0);
+    registry.setIdleLimit(@ptrCast(&quiet), 0, .whole);
     const quiet_at = registry.slots.items[1].last_activity_ms;
     try std.testing.expectEqual(@as(usize, 0), registry.reapStalled(quiet_at + 1_000_000));
     try std.testing.expect(registry.stalled(@ptrCast(&quiet)) == null);
@@ -691,7 +835,7 @@ test "RequestAbortRegistry: setIdleLimit on a slot registered without monitoring
     try registry.registerMonitored(a, null, @ptrCast(&probe), LivenessProbe.shutdown, 0);
     defer registry.unregister(@ptrCast(&probe));
     try std.testing.expect(registry.monitor == null);
-    registry.setIdleLimit(@ptrCast(&probe), 50);
+    registry.setIdleLimit(@ptrCast(&probe), 50, .whole);
     try std.testing.expect(registry.monitor != null);
     var waited: u64 = 0;
     while (registry.stalled(@ptrCast(&probe)) == null and waited < 5_000) : (waited += 10) {
@@ -840,4 +984,158 @@ test "RequestAbortRegistry: touchTransport keeps the connection's byte stamp fre
     try std.testing.expectEqual(@as(u64, 1_000), verdict.idle_ms);
     try std.testing.expectEqual(@as(u64, 50), verdict.transport_idle_ms);
     try std.testing.expectEqual(@as(u32, 1), probe.shutdowns.load(.acquire));
+}
+
+/// Test helper: a transport read arrives `gap_ms` after the previous byte and
+/// carries one keepalive line. Back-dates the stamp instead of sleeping.
+fn keepaliveAfter(registry: *RequestAbortRegistry, ctx: *anyopaque, gap_ms: u64) void {
+    registry.mutex.lock();
+    for (registry.slots.items) |*active| {
+        if (active.ctx == ctx) active.last_transport_ms = monotonicMs() -| gap_ms;
+    }
+    registry.mutex.unlock();
+    registry.touchTransport(ctx);
+    registry.touchKeepalive(ctx);
+}
+
+test "RequestAbortRegistry: only a mid-stream SSE keepalive that ends a real silence is evidence, once per read" {
+    const a = std.testing.allocator;
+    var registry = RequestAbortRegistry{};
+    defer registry.deinit(a);
+    var probe = LivenessProbe{};
+    try registry.registerMonitored(a, null, @ptrCast(&probe), LivenessProbe.shutdown, 60_000);
+    defer registry.unregister(@ptrCast(&probe));
+
+    // Head phase: there is no body yet, nothing to learn.
+    keepaliveAfter(&registry, @ptrCast(&probe), 3_000);
+    try std.testing.expectEqual(@as(u32, 0), registry.keepalive.samples);
+    registry.setIdleLimit(@ptrCast(&probe), 1_800_000, .sse);
+    // Before the first model line: a proxy's "processing" comment, not mid-stream behaviour.
+    keepaliveAfter(&registry, @ptrCast(&probe), 3_000);
+    try std.testing.expectEqual(@as(u32, 0), registry.keepalive.samples);
+    registry.touch(@ptrCast(&probe));
+    // A ping that ends a short silence (Anthropic's ping right after message_start) says nothing.
+    keepaliveAfter(&registry, @ptrCast(&probe), 500);
+    try std.testing.expectEqual(@as(u32, 0), registry.keepalive.samples);
+    // A ping after a real silence is one sample, and records how long that silence was.
+    keepaliveAfter(&registry, @ptrCast(&probe), 3_000);
+    try std.testing.expectEqual(@as(u32, 1), registry.keepalive.samples);
+    try std.testing.expect(registry.keepalive.max_gap_ms >= 3_000);
+    // "event: ping" + "data: {ping}" arrive in one read: the second line is not a second sample.
+    registry.touchKeepalive(@ptrCast(&probe));
+    try std.testing.expectEqual(@as(u32, 1), registry.keepalive.samples);
+    // A read whose silence was ended by progress does not become a sample through a
+    // keepalive parsed after it.
+    registry.mutex.lock();
+    registry.slots.items[0].last_transport_ms = monotonicMs() -| 5_000;
+    registry.mutex.unlock();
+    registry.touchTransport(@ptrCast(&probe));
+    registry.touch(@ptrCast(&probe));
+    registry.touchKeepalive(@ptrCast(&probe));
+    try std.testing.expectEqual(@as(u32, 1), registry.keepalive.samples);
+
+    // A whole (non-SSE) body is never evidence, whatever arrives.
+    var whole = LivenessProbe{};
+    try registry.registerMonitored(a, null, @ptrCast(&whole), LivenessProbe.shutdown, 60_000);
+    defer registry.unregister(@ptrCast(&whole));
+    registry.setIdleLimit(@ptrCast(&whole), 1_800_000, .whole);
+    registry.touch(@ptrCast(&whole));
+    keepaliveAfter(&registry, @ptrCast(&whole), 3_000);
+    try std.testing.expectEqual(@as(u32, 1), registry.keepalive.samples);
+}
+
+test "KeepaliveEvidence.deadLimitMs: arms after min_samples, multiplier over a floor, never at or above the progress limit" {
+    const tuning = RequestAbortRegistry.KeepaliveTuning{};
+    const E = RequestAbortRegistry.KeepaliveEvidence;
+    // Too little evidence: unarmed.
+    try std.testing.expectEqual(@as(u64, 0), (E{ .samples = 2, .max_gap_ms = 15_000 }).deadLimitMs(tuning, 1_800_000));
+    // napi's 15 s cadence: 4 × 15 s = 60 s, raised to the 2-minute floor.
+    try std.testing.expectEqual(@as(u64, 120_000), (E{ .samples = 3, .max_gap_ms = 15_000 }).deadLimitMs(tuning, 1_800_000));
+    // A slower pinger gets proportionally more room.
+    try std.testing.expectEqual(@as(u64, 240_000), (E{ .samples = 3, .max_gap_ms = 60_000 }).deadLimitMs(tuning, 1_800_000));
+    // At or above the progress limit the rule is redundant: off.
+    try std.testing.expectEqual(@as(u64, 0), (E{ .samples = 3, .max_gap_ms = 15_000 }).deadLimitMs(tuning, 120_000));
+    // Body monitoring off (METACODES_STREAM_BODY_IDLE_TIMEOUT_MS=0) turns this off too.
+    try std.testing.expectEqual(@as(u64, 0), (E{ .samples = 9, .max_gap_ms = 15_000 }).deadLimitMs(tuning, 0));
+}
+
+test "RequestAbortRegistry: an armed endpoint's silent SSE body is judged dead at the learned limit, and the verdict spends the evidence" {
+    const a = std.testing.allocator;
+    var registry = RequestAbortRegistry{};
+    defer registry.deinit(a);
+    registry.keepalive = .{ .samples = 3, .max_gap_ms = 15_000 };
+    var sse = LivenessProbe{};
+    var whole = LivenessProbe{};
+    // The whole body is registered first so the reaper reaches it while the evidence is
+    // still armed: after the SSE verdict spends it, nothing would be judged by transport.
+    try registry.registerMonitored(a, null, @ptrCast(&whole), LivenessProbe.shutdown, 60_000);
+    defer registry.unregister(@ptrCast(&whole));
+    try registry.registerMonitored(a, null, @ptrCast(&sse), LivenessProbe.shutdown, 60_000);
+    defer registry.unregister(@ptrCast(&sse));
+    registry.setIdleLimit(@ptrCast(&sse), 1_800_000, .sse);
+    registry.setIdleLimit(@ptrCast(&whole), 1_800_000, .whole);
+    registry.mutex.lock();
+    const base = registry.slots.items[0].last_transport_ms;
+    for (registry.slots.items) |*active| {
+        active.last_activity_ms = base;
+        active.last_transport_ms = base;
+    }
+    registry.mutex.unlock();
+
+    try std.testing.expectEqual(@as(usize, 0), registry.reapStalled(base + 119_999));
+    // Two minutes without a byte: the SSE body is dead; the whole body is not judged by this rule.
+    try std.testing.expectEqual(@as(usize, 1), registry.reapStalled(base + 120_000));
+    const verdict = registry.stalled(@ptrCast(&sse)) orelse return error.TestExpectedStall;
+    try std.testing.expectEqual(RequestAbortRegistry.Stall.Cause.transport_dead, verdict.cause);
+    try std.testing.expectEqual(@as(u64, 120_000), verdict.limit_ms);
+    try std.testing.expectEqual(@as(u64, 120_000), verdict.transport_idle_ms);
+    try std.testing.expectEqual(@as(u64, 15_000), verdict.keepalive_gap_ms);
+    try std.testing.expectEqual(@as(u32, 1), sse.shutdowns.load(.acquire));
+    try std.testing.expect(registry.stalled(@ptrCast(&whole)) == null);
+    try std.testing.expectEqual(@as(u32, 0), whole.shutdowns.load(.acquire));
+    // Spent: the next request is judged by the progress limit until the endpoint pings again.
+    try std.testing.expectEqual(@as(u32, 0), registry.keepalive.samples);
+    try std.testing.expectEqual(@as(u64, 0), registry.keepalive.max_gap_ms);
+    // The whole body still stalls on the progress limit as before.
+    try std.testing.expectEqual(@as(usize, 1), registry.reapStalled(base + 1_800_000));
+    try std.testing.expectEqual(RequestAbortRegistry.Stall.Cause.no_progress, (registry.stalled(@ptrCast(&whole)) orelse return error.TestExpectedStall).cause);
+}
+
+test "RequestAbortRegistry: an armed endpoint whose keepalives keep arriving is judged by progress only, and an unarmed one never by transport" {
+    const a = std.testing.allocator;
+    var registry = RequestAbortRegistry{};
+    defer registry.deinit(a);
+    registry.keepalive = .{ .samples = 3, .max_gap_ms = 15_000 };
+    var probe = LivenessProbe{};
+    try registry.registerMonitored(a, null, @ptrCast(&probe), LivenessProbe.shutdown, 60_000);
+    defer registry.unregister(@ptrCast(&probe));
+    registry.setIdleLimit(@ptrCast(&probe), 1_800_000, .sse);
+    registry.mutex.lock();
+    const base = registry.slots.items[0].last_transport_ms;
+    registry.slots.items[0].last_activity_ms = base;
+    // Pings every 15 s for the whole half hour: the transport is alive.
+    registry.slots.items[0].last_transport_ms = base + 1_785_000;
+    registry.mutex.unlock();
+    try std.testing.expectEqual(@as(usize, 0), registry.reapStalled(base + 1_799_999));
+    try std.testing.expectEqual(@as(usize, 1), registry.reapStalled(base + 1_800_000));
+    const verdict = registry.stalled(@ptrCast(&probe)) orelse return error.TestExpectedStall;
+    try std.testing.expectEqual(RequestAbortRegistry.Stall.Cause.no_progress, verdict.cause);
+    try std.testing.expectEqual(@as(u64, 1_800_000), verdict.limit_ms);
+    // A progress verdict does not spend the keepalive evidence.
+    try std.testing.expectEqual(@as(u32, 3), registry.keepalive.samples);
+
+    // Unarmed (an endpoint that never pinged mid-stream): total silence waits for the progress limit.
+    var quiet_registry = RequestAbortRegistry{};
+    defer quiet_registry.deinit(a);
+    var quiet = LivenessProbe{};
+    try quiet_registry.registerMonitored(a, null, @ptrCast(&quiet), LivenessProbe.shutdown, 60_000);
+    defer quiet_registry.unregister(@ptrCast(&quiet));
+    quiet_registry.setIdleLimit(@ptrCast(&quiet), 1_800_000, .sse);
+    quiet_registry.mutex.lock();
+    const quiet_base = quiet_registry.slots.items[0].last_transport_ms;
+    quiet_registry.slots.items[0].last_activity_ms = quiet_base;
+    quiet_registry.mutex.unlock();
+    try std.testing.expectEqual(@as(usize, 0), quiet_registry.reapStalled(quiet_base + 1_799_999));
+    try std.testing.expectEqual(@as(usize, 1), quiet_registry.reapStalled(quiet_base + 1_800_000));
+    try std.testing.expectEqual(RequestAbortRegistry.Stall.Cause.no_progress, (quiet_registry.stalled(@ptrCast(&quiet)) orelse return error.TestExpectedStall).cause);
 }
