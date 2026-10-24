@@ -3435,6 +3435,7 @@ test {
     _ = &@import("core/learning_turn.zig");
     _ = &@import("core/learning_end_of_run.zig");
     _ = &@import("kg/lesson.zig");
+    _ = &@import("kg/reserved_types.zig");
     _ = &@import("core/test_integrity.zig");
     _ = &@import("swarm/team.zig");
     _ = &@import("swarm/mailbox.zig");

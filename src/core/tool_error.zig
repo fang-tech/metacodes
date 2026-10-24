@@ -174,6 +174,9 @@ const ERROR_MAP = [_]ErrorSpec{
     .{ .name = "LessonBudgetSpent", .code = .permission_denied, .category = .safety, .recoverable = false },
     .{ .name = "LessonHeaderMismatch", .code = .invalid_args, .category = .user_error, .recoverable = true },
     .{ .name = "LessonSupersedesUnknown", .code = .invalid_args, .category = .user_error, .recoverable = true },
+    // KgRemember of a schema type the host owns (kg/reserved_types.zig): the
+    // same call can never succeed; the memory belongs under another kind.
+    .{ .name = "ReservedMemoryType", .code = .permission_denied, .category = .safety, .recoverable = false },
     // 图片读取:非 vision 模型的门控(换模型即可成功 → recoverable);超限是输入问题。
     .{ .name = "ImageInputUnsupported", .code = .capability_unsupported, .category = .system_error, .recoverable = true },
     .{ .name = "ImageTooLarge", .code = .invalid_args, .category = .user_error, .recoverable = true },

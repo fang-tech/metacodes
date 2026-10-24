@@ -87,6 +87,7 @@ test {
     _ = @import("component/multimodal_input_test.zig");
     _ = @import("component/tool_result_image_test.zig");
     _ = @import("component/kg_integration_test.zig");
+    _ = @import("component/kg_reserved_schema_test.zig");
     _ = @import("component/kg_task_projection_test.zig");
     _ = @import("component/formal_kernel_test.zig");
     _ = @import("component/memory_migration_adapter_test.zig");
