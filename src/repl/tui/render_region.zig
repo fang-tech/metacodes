@@ -872,8 +872,7 @@ pub const RenderRegion = struct {
     }
 
     fn drawModelsPickerMenu(self: *RenderRegion, w: *std.Io.Writer, app: *const app_mod.App, content: []const u8) u16 {
-        const trimmed = std.mem.trim(u8, content, " \t\r\n");
-        if (!std.mem.eql(u8, trimmed, "/models") and !std.mem.eql(u8, trimmed, "/model")) return 0;
+        if (!complete.modelsPickerLine(content)) return 0;
         if (app.models_picker_key_index == null) return self.drawApiKeyMenu(w, app);
         if (app.models_picker_model_index != null) return self.drawReasoningMenu(w, app);
         return self.drawModelCatalogMenuForTitle(w, app, "Models for selected API key");
@@ -1139,6 +1138,39 @@ pub const RenderRegion = struct {
         w.writeAll(th.dim) catch {};
         w.writeAll(hint) catch {};
         w.writeAll(th.reset) catch {};
+
+        // MCP servers connecting in the background, then the ones that
+        // failed (Claude Code's "1 MCP server failed · /mcp"). It is not a
+        // key hint, so a draft keeps it; it is dropped when it does not fit
+        // on the line, which must never wrap.
+        var notice_buf: [96]u8 = undefined;
+        const mcp_startup = @import("../../app/mcp_startup.zig");
+        if (mcp_startup.notice(app.mcp_status.snapshot(), &notice_buf)) |n| {
+            const lead: []const u8 = if (mode_plain.len == 0 and hint.len == 0) " " else " · ";
+            const used = term.displayWidth(mode_plain) + term.displayWidth(hint);
+            const need = term.displayWidth(lead) + term.displayWidth(n.text);
+            if (used + need < self.cols) {
+                w.writeAll(th.dim) catch {};
+                w.writeAll(lead) catch {};
+                w.writeAll(switch (n.tone) {
+                    .progress => th.dim,
+                    .warning => th.warn,
+                    .failure => th.danger,
+                }) catch {};
+                w.writeAll(n.text) catch {};
+                w.writeAll(th.reset) catch {};
+            }
+        }
+    }
+
+    /// Replace the generating spinner's verb (a turn that first waits on
+    /// something names it); returns the verb it replaced.
+    pub fn setSpinnerVerb(self: *RenderRegion, verb: []const u8) []const u8 {
+        self.lock();
+        defer self.unlock();
+        const previous = self.ui.spinner.verb;
+        self.ui.spinner.verb = verb;
+        return previous;
     }
 
     /// Agent viewing 帧(区域2 持久查看):view==.viewing 时画在**输入框上方**(替代 panel 位置)——

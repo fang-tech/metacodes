@@ -1,8 +1,10 @@
 //! API key catalog for OAuth-backed model selection.
 //!
 //! `/models` first shows the current account's API keys, then uses the chosen
-//! key to query `/v1/models`. The endpoint is Metask-specific, so the URL is
-//! env-overridable while the parser accepts a few common response shapes.
+//! key to query `/v1/models`. The list is loaded when that menu first opens
+//! (`App.ensureApiKeyCatalog`), not at startup. The endpoint is
+//! Metask-specific, so the URL is env-overridable while the parser accepts a
+//! few common response shapes.
 
 const std = @import("std");
 const ResponseStatus = @import("http_status.zig").ResponseStatus;
@@ -156,6 +158,22 @@ fn suffixFor(allocator: std.mem.Allocator, secret: []const u8, idx: usize) ![]u8
     return std.fmt.allocPrint(allocator, "#{d}", .{idx + 1});
 }
 
+/// The bearer to list an account's keys with, or null when no request can
+/// succeed. The endpoint authenticates the account, i.e. a login token; one of
+/// the account's API keys is refused (the 2026-10-23 startup trace showed a 401
+/// on every start). A plain API key is sent only to an endpoint the user named
+/// with `METACODE_API_KEYS_URL`, which may take one.
+pub fn bearerFor(login_token: ?[]const u8, api_key: []const u8, endpoint_named: bool) ?[]const u8 {
+    if (login_token) |token| return token;
+    if (endpoint_named and api_key.len > 0) return api_key;
+    return null;
+}
+
+/// Whether `METACODE_API_KEYS_URL` names the endpoint.
+pub fn endpointNamed() bool {
+    return std.c.getenv(API_KEYS_URL_ENV) != null;
+}
+
 pub fn endpointForMessagesUrl(allocator: std.mem.Allocator, messages_url: []const u8) ![]u8 {
     if (std.c.getenv(API_KEYS_URL_ENV)) |u| return allocator.dupe(u8, std.mem.span(u));
     const suffix = "/v1/messages";
@@ -228,6 +246,14 @@ test "api key catalog parses metask data items and skips inactive keys" {
     try std.testing.expectEqualStrings("Prod key", c.entries.items[0].label);
     try std.testing.expectEqualStrings("MiniMax-M3", c.entries.items[0].group);
     try std.testing.expectEqualStrings("1234", c.entries.items[0].suffix);
+}
+
+test "bearerFor: a login token always; an API key only to a named endpoint" {
+    try std.testing.expectEqualStrings("login", bearerFor("login", "sk-key", false).?);
+    try std.testing.expectEqualStrings("login", bearerFor("login", "sk-key", true).?);
+    try std.testing.expectEqualStrings("sk-key", bearerFor(null, "sk-key", true).?);
+    try std.testing.expect(bearerFor(null, "sk-key", false) == null);
+    try std.testing.expect(bearerFor(null, "", true) == null);
 }
 
 test "api key catalog current-key fallback masks secret in display fields" {

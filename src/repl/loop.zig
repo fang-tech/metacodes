@@ -41,6 +41,8 @@ const render_region_mod = @import("tui/render_region.zig");
 const agent_job_registry_mod = @import("../core/agent_job_registry.zig");
 const msg_queue_mod = @import("msg_queue.zig");
 const tui_term_root = @import("tui/term.zig");
+const tui_theme = @import("tui/theme.zig");
+const splash_player = @import("tui/splash_player.zig");
 const util_fs = @import("../util/fs.zig");
 const ui_backend_mod = @import("../core/protocol/ui_backend.zig");
 const writer_backend_mod = @import("../core/writer_backend.zig");
@@ -81,9 +83,64 @@ fn debugBackend(verbose: bool, show_retry: bool, usage_acc: ?*@import("../core/u
 pub const Startup = struct {
     /// `--resume <id>`: what src/main.zig restored before the REPL started.
     resumed: ?app_mod.App.ResumedConversation = null,
+    /// The startup splash, as src/main.zig left it.
+    splash: Splash = .not_started,
+    /// The descriptor the prompt reads: stdin, or a pipe in tests.
+    input_fd: c_int = 0,
 };
 
+/// The startup splash before the banner.
+pub const Splash = union(enum) {
+    /// Nobody started it: the banner plays it first (sequentially).
+    not_started,
+    /// Started before `App.init` and playing on its own thread (`startSplash`).
+    playing: *splash_player.Background,
+    /// The gate kept it off.
+    off,
+};
+
+/// Start the startup splash on its own thread, so it plays while `App.init`
+/// runs instead of after it (2026-10-23: ~4 s of blank terminal, then 1.5 s
+/// of animation). Same gate as the sequential splash
+/// (`playStartupSplash`); `variant` is the theme the App will use, resolved
+/// first because its terminal query must not race the splash for stdin.
+/// Until the REPL's banner (or `stopSplash`) the caller must leave the
+/// terminal alone.
+pub fn startSplash(allocator: std.mem.Allocator, variant: tui_theme.Variant, state_root: []const u8) Splash {
+    const plan = splashPlan(allocator, state_root) orelse return .off;
+    const bg = splash_player.Background.start(allocator, plan, splashStyle(variant), splashSeed()) catch |err| {
+        @import("../util/log.zig").debug("splash", "background start failed: {s}; playing after init", .{@errorName(err)});
+        return .not_started;
+    };
+    return .{ .playing = bg };
+}
+
+/// Settle a playing splash now: startup failed and is about to say why.
+pub fn stopSplash(splash: Splash) void {
+    switch (splash) {
+        .playing => |bg| endSplash(bg, .stop),
+        .not_started, .off => {},
+    }
+}
+
+fn endSplash(bg: *splash_player.Background, how: enum { wait, stop }) void {
+    const plan = bg.plan;
+    const mode = bg.style.mode;
+    const outcome = switch (how) {
+        .wait => bg.finish(),
+        .stop => bg.cancel(),
+    };
+    logSplash(outcome, plan, mode);
+}
+
+fn logSplash(outcome: splash_player.Outcome, plan: splash_player.Plan, mode: @import("tui/splash.zig").ColorMode) void {
+    @import("../util/log.zig").debug("splash", "{s} ({d}x{d}, {s})", .{ @tagName(outcome), plan.layout.cols, plan.layout.rows, @tagName(mode) });
+}
+
 pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, startup: Startup) !void {
+    // A splash still playing ends before an error below is printed.
+    var splash = startup.splash;
+    errdefer stopSplash(splash);
     // Evaluation is opt-in and fail-closed: without METACODES_EVAL_METADATA no
     // object is created; when set, malformed/incomplete grounding aborts before
     // any rollout can be mistaken for comparable evidence.
@@ -94,7 +151,8 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, startup: Startup) !v
     else
         null;
 
-    printStartupBanner(app, allocator);
+    printStartupBanner(app, allocator, splash);
+    splash = .off; // ended (and freed) by the banner
 
     // 启动 prompt 建议:基于 git 最近改动的文件给一条灰色提示(对齐 Claude Code)。
     // A resumed session goes on with its conversation; the suggestion is for a new one.
@@ -112,7 +170,7 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, startup: Startup) !v
     history.loadFromFile(hist_path) catch {};
     defer history.saveToFile(hist_path) catch {};
 
-    const stdin_fd: c_int = 0;
+    const stdin_fd: c_int = startup.input_fd;
     const tty = platform_term.isatty(stdin_fd);
     if (tty) input.installResumeHandler();
 
@@ -158,6 +216,9 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, startup: Startup) !v
     };
 
     while (true) {
+        // Idle point: nothing reads the model catalog between turns.
+        app.adoptModelCatalogRefresh();
+
         // 检查到期的 cron 任务 —— 把它们的 prompt 作为 user message 注入并跑一轮
         try fireDueCrons(&turn_host);
 
@@ -194,7 +255,7 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, startup: Startup) !v
                 else => return err,
             }
         else
-            readLineBuffered(allocator) catch {
+            readLineBuffered(allocator, stdin_fd) catch {
                 cmd_output.print("Goodbye!\n", .{});
                 break;
             };
@@ -263,10 +324,18 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, startup: Startup) !v
             continue;
         }
         if (std.mem.eql(u8, trimmed, "/tools")) {
+            // Servers that have all reported are registered first, so their tools are listed.
+            if (app.mcpStartupSettled()) app.publishMcpServers() catch |err| {
+                cmd_output.print("{s}MCP tools could not be registered: {s}{s}\n", .{ app.theme.danger, @errorName(err), app.theme.reset });
+            };
             for (tools.registry) |*t| cmd_output.print("  \x1b[32m{s}\x1b[0m - {s}\n", .{ t.name, t.description });
             // 动态工具（Skill / MCP）
             for (app.dyn_registry.entries.items) |e| {
                 cmd_output.print("  \x1b[36m{s}\x1b[0m - {s}\n", .{ e.name, e.description });
+            }
+            if (app.mcpStartupInFlight() != null) {
+                const progress_now = app.mcp_status.snapshot();
+                cmd_output.print("  \x1b[2m(MCP tools load with your first message: {d} of {d} servers still connecting; see /mcp)\x1b[0m\n", .{ progress_now.total - progress_now.settled, progress_now.total });
             }
             continue;
         }
@@ -543,11 +612,13 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, startup: Startup) !v
         }
         // /btw <question>:侧问,不进对话历史(用临时 conversation 跑一次)
         if (std.mem.startsWith(u8, trimmed, "/btw ")) {
+            if (!try awaitMcpServers(&turn_host)) continue;
             try handleBtw(app, allocator, std.mem.trim(u8, trimmed[5..], " \t"));
             continue;
         }
         // /recap:生成会话一行总结(不进历史)
         if (std.mem.eql(u8, trimmed, "/recap")) {
+            if (app.conversation.len() >= 2 and !try awaitMcpServers(&turn_host)) continue;
             try handleRecap(app, allocator);
             continue;
         }
@@ -641,6 +712,17 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, startup: Startup) !v
                 }
                 cmd_output.end();
             }
+            // Activation builds the Skill policy frame from the tool list
+            // (cached for the session), and a fork sends a request: both
+            // need every MCP server's tools in it.
+            switch (skill_cli_adapter.parseSlashSyntax(trimmed[1..])) {
+                .command => |head| if (app.skill_runtime.findRecord(head) != null and
+                    app.skill_runtime.overrideState(head).userInvocable())
+                {
+                    if (!try awaitMcpServers(&turn_host)) continue;
+                },
+                .not_a_command => {},
+            }
             switch (try skill_cli_adapter.handleSlash(app, allocator, trimmed[1..])) {
                 .handled => continue,
                 .disabled => {
@@ -670,7 +752,7 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, startup: Startup) !v
             defer accum.deinit();
             var status = try accum.feedLine(line);
             while (status == .more) {
-                const cont = readLineBuffered(allocator) catch break;
+                const cont = readLineBuffered(allocator, stdin_fd) catch break;
                 defer allocator.free(cont);
                 status = try accum.feedLine(cont);
             }
@@ -727,11 +809,70 @@ const TurnHost = struct {
 ///     `/retry`, cron, loop continuation); none of the above, as before.
 const TurnKind = enum { prompt, skill, macro };
 
+/// The TUI backend of a generating phase: renders into `region`, owns the
+/// keyboard while it runs (Esc / Ctrl+C interrupt, Enter queues). Lives on
+/// the caller's stack at a fixed address while its watcher runs.
+fn turnBackend(host: *const TurnHost, region: *render_region_mod.RenderRegion) tui_backend_mod.TuiBackend {
+    const app = host.app;
+    return .{ .region = region, .theme = &app.theme, .alloc = host.allocator, .edit_hl_cache = &app.edit_hl_cache, .colorize = true, .verbose = app.config.verbose, .show_retry = true, .usage_acc = &app.usage, .queue = host.msg_queue, .history = host.history, .abort_signal = &app.abort, .input_abort = &app.abort };
+}
+
+/// What the spinner says while a request waits on MCP servers.
+const MCP_WAIT_VERB = "Connecting to MCP servers";
+
+/// Wait, inside a generating phase, until every MCP server has reported. On
+/// a tty the spinner names the wait and the input watcher keeps Esc, Ctrl+C
+/// and queued typing working; elsewhere SIGINT interrupts it. False when the
+/// user interrupted (the servers go on connecting).
+fn waitForMcpServers(host: *const TurnHost, tb: ?*tui_backend_mod.TuiBackend) bool {
+    const app = host.app;
+    if (app.mcpStartupSettled()) return !app.abort.isAborted();
+    const previous_verb: ?[]const u8 = if (host.region) |r| r.setSpinnerVerb(MCP_WAIT_VERB) else null;
+    defer if (host.region) |r| {
+        _ = r.setSpinnerVerb(previous_verb.?);
+    };
+    if (host.tty) if (tb) |b| b.startInput(host.stdin_fd, app, host.allocator) catch {};
+    defer if (tb) |b| b.stopInput();
+    while (!app.mcpStartupSettled() and !app.abort.isAborted()) util_time.sleepMs(MCP_WAIT_POLL_MS);
+    return !app.abort.isAborted();
+}
+
+const MCP_WAIT_POLL_MS = 50;
+
+/// Join the background MCP startup before a request is assembled outside
+/// `runTurn` (`/<skill>`, `/btw`, `/recap`): the spinner shows while servers
+/// still connect. False when the user interrupted the wait (reported here).
+fn awaitMcpServers(host: *const TurnHost) !bool {
+    const app = host.app;
+    if (app.toolSurfaceReady()) return true;
+    if (!app.mcpStartupSettled()) {
+        // A held command echo goes out before the spinner takes the screen.
+        cmd_output.flushEcho();
+        const region = host.region;
+        if (region) |r| r.enterGenerating(app, host.msg_queue);
+        defer if (region) |r| leaveGenerationRegion(app, r);
+        const raw = if (host.tty) input.enterRawMode(host.stdin_fd) else null;
+        defer if (raw) |o| input.restoreMode(host.stdin_fd, o);
+        var tui_be: ?tui_backend_mod.TuiBackend = if (region) |r| turnBackend(host, r) else null;
+        if (!waitForMcpServers(host, if (tui_be) |*tb| tb else null)) {
+            if (region) |r| leaveGenerationRegion(app, r);
+            app.abort.reset();
+            cmd_output.print("Interrupted · MCP servers are still connecting (see /mcp)\n", .{});
+            return false;
+        }
+    }
+    try app.publishMcpServers();
+    return true;
+}
+
 /// Run one model turn on the conversation as it stands (the caller appended
 /// the user side) through the interactive generation path.
 fn runTurn(host: *const TurnHost, kind: TurnKind, synthetic_user_input: ?[]const u8) !void {
     const app = host.app;
     const allocator = host.allocator;
+    // A `/v1/models` refresh that finished while the prompt was typed sets
+    // this turn's limits.
+    app.adoptModelCatalogRefresh();
     // The model streams to the terminal unshaped; a command that started the
     // turn has its echo written first.
     cmd_output.end();
@@ -774,12 +915,32 @@ fn runTurn(host: *const TurnHost, kind: TurnKind, synthetic_user_input: ?[]const
     // capture,指向 optional payload 在 tui_be 内部的稳定地址),watcher 线程的 `self` 也是
     // 同一地址——agent_loop(emit)与 watcher(键盘)共享这一个 TuiBackend 实例。
     // 不要把 tui_be 重新赋值 / 搬移 / 放进会 realloc 的容器,否则两个指针指向坟墓。
-    var tui_be: ?tui_backend_mod.TuiBackend = if (region_writer) |*rw|
-        .{ .region = rw.region, .theme = &app.theme, .alloc = allocator, .edit_hl_cache = &app.edit_hl_cache, .colorize = true, .verbose = app.config.verbose, .show_retry = true, .usage_acc = &app.usage, .queue = host.msg_queue, .history = host.history, .abort_signal = &app.abort, .input_abort = &app.abort }
-    else
-        null;
+    var tui_be: ?tui_backend_mod.TuiBackend = if (region_writer) |*rw| turnBackend(host, rw.region) else null;
     var fallback_be = debugBackend(app.config.verbose, true, &app.usage);
     const ui_be: ui_backend_mod.UiBackend = if (tui_be) |*tb| tb.backend() else fallback_be.backend();
+
+    // MCP servers connect in the background while the prompt is up. Nothing
+    // provider-visible exists until every one has reported: wait here (the
+    // spinner says so; Esc or Ctrl+C stops waiting and the turn does not
+    // start), then register them and build the tool list and system prompt
+    // once, so the bytes a provider sees never depend on the timing.
+    if (!app.toolSurfaceReady()) {
+        const settled = waitForMcpServers(host, if (tui_be) |*tb| tb else null);
+        const published = if (settled) app.publishMcpServers() else error.Interrupted;
+        published catch |err| {
+            if (gen_region) |r| leaveGenerationRegion(app, r);
+            if (host.tty) terminal_title.setFromApp(app, .idle);
+            if (err == error.Interrupted) {
+                app.abort.reset();
+                printInterrupted(app);
+            } else {
+                cmd_output.print("\x1b[31mError: {s}\x1b[0m\n", .{@errorName(err)});
+            }
+            return;
+        };
+    }
+    // A turn is where the user looks next: the footer's MCP failure notice has done its job.
+    app.mcp_status.acknowledged.store(true, .release);
 
     // L4:METACODES_TRACE 开启时,旁挂 DiagnosticsBackend(经 TeeBackend 转发)收集结构化
     // trace,run 结束后 dump 成 NDJSON 到 stderr。关闭时直接用 ui_be,零开销。
@@ -1179,12 +1340,12 @@ fn drainStdin(fd: c_int) void {
 }
 
 /// 非 tty / 管道模式下的朴素逐字节行读（保留 M0 行为）。
-fn readLineBuffered(allocator: std.mem.Allocator) ![]u8 {
+fn readLineBuffered(allocator: std.mem.Allocator, fd: c_int) ![]u8 {
     var buf: [4096]u8 = undefined;
     var len: usize = 0;
     while (len < buf.len) {
         var b: [1]u8 = undefined;
-        const n_i = platform_term.readInput(0, &b);
+        const n_i = platform_term.readInput(fd, &b);
         if (n_i < 0) return error.ReadError;
         const n: usize = @intCast(n_i);
         if (n == 0) {
@@ -1275,6 +1436,13 @@ fn insertAtCursor(editor: *input.LineEditor, allocator: std.mem.Allocator, text:
 
 /// Session 内递增的粘贴编号（用于 [Pasted text #N] 占位符 + pastes/<N>.txt 文件名）。
 var g_paste_id: usize = 0;
+
+/// What the footer's MCP notice depends on, packed: a change means redraw.
+fn mcpFooterKey(app: *const app_mod.App) u64 {
+    const status = app.mcp_status.snapshot();
+    return @as(u64, status.settled) | (@as(u64, status.failed) << 24) |
+        (@as(u64, @intFromBool(status.acknowledged)) << 48) | (@as(u64, @intFromBool(status.published)) << 49);
+}
 
 /// SIGWINCH(终端 resize)标志。handler 只 atomic-store(async-signal-safe),
 /// readLineRaw 的 poll 循环超时时观察它 → 立即重画输入框自适应新宽度。
@@ -1433,7 +1601,7 @@ fn readLineRaw(
 ) ![]u8 {
     const orig = input.enterRawMode(fd) orelse {
         // 无法进 raw mode：退化
-        return readLineBuffered(allocator);
+        return readLineBuffered(allocator, fd);
     };
     defer input.restoreMode(fd, orig);
 
@@ -1504,10 +1672,16 @@ fn readLineRaw(
     const redraw = struct {
         fn call(r: *render_region_mod.RenderRegion, ed: *input.LineEditor, a: *app_mod.App) void {
             if (!complete.modelsMenuOpen(ed.view())) a.models_picker_key_index = null;
+            // The key menu draws the account's key list, loaded on first sight.
+            if (complete.modelsPickerLine(ed.view())) a.ensureApiKeyCatalog();
             r.setInput(ed.view(), ed.cursor);
             r.render(a);
         }
     }.call;
+
+    // MCP servers settle in the background while this read waits: the idle
+    // tick redraws the footer whenever its MCP notice would change.
+    var mcp_footer_seen = mcpFooterKey(app);
 
     while (true) {
         var b: [1]u8 = undefined;
@@ -1528,6 +1702,13 @@ fn readLineRaw(
             if (rc == 0) region.noteInputIdle();
             // A double-press window that ran out takes its hint with it.
             if (rc <= 0 and region.expirePress(util_time.nowMs())) redraw(region, &editor, app);
+            if (rc <= 0) {
+                const key = mcpFooterKey(app);
+                if (key != mcp_footer_seen) {
+                    mcp_footer_seen = key;
+                    redraw(region, &editor, app);
+                }
+            }
             if (rc <= 0) {
                 // 超时/EINTR:若 parser 卡在 esc_seen(收到孤立 ESC 等后续字节),
                 // 此时无后续字节到来 → 兑现为 .esc(否则 Esc 永远到不了 dispatch/editor)。
@@ -3163,7 +3344,11 @@ fn handleConfigCmd(app: *app_mod.App, allocator: std.mem.Allocator, rest: []cons
         cmd_output.print("Verbose output:   {}\n", .{app.config.verbose});
         cmd_output.print("Skills:           {d}\n", .{app.skills.len()});
         cmd_output.print("Subagents:        {d}\n", .{app.agents.len()});
-        cmd_output.print("MCP servers:      {d}\n", .{app.mcp_sessions.items.len});
+        if (app.mcpStartupInFlight()) |startup| {
+            cmd_output.print("MCP servers:      {d} connecting (see /mcp)\n", .{startup.jobs.len});
+        } else {
+            cmd_output.print("MCP servers:      {d}\n", .{app.mcp_sessions.items.len});
+        }
         const cfg_z = try allocator.dupeZ(u8, cfg_path);
         defer allocator.free(cfg_z);
         const exists = pfs.exists(cfg_z.ptr);
@@ -4253,6 +4438,13 @@ fn oneLine(buf: []u8, text: []const u8) []const u8 {
 /// 待批准的项目级 server、被禁用的名字与配置问题。失败必须可见——启动期只打 warn 日志
 /// 而默认日志级别看不到,这里是用户唯一的排查入口。
 fn handleMcp(app: *app_mod.App) !void {
+    app.mcp_status.acknowledged.store(true, .release);
+    // Every server has reported: register them now (this thread, no Run in
+    // flight), so the report below has their tool counts.
+    if (app.mcpStartupSettled()) app.publishMcpServers() catch |err| {
+        cmd_output.print("{s}MCP tools could not be registered: {s}{s}\n", .{ app.theme.danger, @errorName(err), app.theme.reset });
+    };
+    if (app.mcpStartupInFlight()) |startup| return printMcpConnecting(app, startup);
     const report = app.mcp_report;
     if (report.servers.len == 0 and report.pending.len == 0 and report.problems.len == 0) {
         cmd_output.print(
@@ -4273,6 +4465,9 @@ fn handleMcp(app: *app_mod.App) !void {
                 server.name, server.tool_count, server.name, server.protocol, server.origin.label(),
             }),
             .failed => cmd_output.print("  \x1b[31m✗\x1b[0m \x1b[36m{s}\x1b[0m  {s}  \x1b[2m({s})\x1b[0m\n", .{
+                server.name, server.detail, server.origin.label(),
+            }),
+            .needs_auth => cmd_output.print("  \x1b[33m!\x1b[0m \x1b[36m{s}\x1b[0m  needs authentication: {s}  \x1b[2m({s})\x1b[0m\n", .{
                 server.name, server.detail, server.origin.label(),
             }),
         }
@@ -4305,6 +4500,37 @@ fn handleMcp(app: *app_mod.App) !void {
             problem.message,
         });
     }
+}
+
+/// `/mcp` while the servers are still connecting: each one's state so far.
+/// A connected server's tools are registered when the first message is
+/// sent (or `/mcp` runs again after every server has reported).
+fn printMcpConnecting(app: *const app_mod.App, startup: *const @import("../app/mcp_startup.zig").Startup) void {
+    const failure_detail = @import("../app/mcp_startup.zig").failureDetail;
+    const now = util_time.nowMs();
+    cmd_output.print("MCP servers ({d}), connecting:\n", .{startup.jobs.len});
+    for (startup.jobs) |*job| {
+        const name = job.server.name;
+        const origin = job.server.origin.label();
+        if (!job.isSettled()) {
+            cmd_output.print("  \x1b[2m◌\x1b[0m \x1b[36m{s}\x1b[0m  connecting… {d}s  \x1b[2m({s})\x1b[0m\n", .{
+                name, @divTrunc(@max(now - job.started_ms, 0), 1000), origin,
+            });
+            continue;
+        }
+        switch (job.result) {
+            .pending => {},
+            .connected => cmd_output.print("  \x1b[32m●\x1b[0m \x1b[36m{s}\x1b[0m  connected; its tools load with your first message  \x1b[2m({s})\x1b[0m\n", .{ name, origin }),
+            .failed => |err| if (err == error.McpAuthRequired)
+                cmd_output.print("  \x1b[33m!\x1b[0m \x1b[36m{s}\x1b[0m  needs authentication: {s}  \x1b[2m({s})\x1b[0m\n", .{ name, failure_detail(err, job), origin })
+            else
+                cmd_output.print("  \x1b[31m✗\x1b[0m \x1b[36m{s}\x1b[0m  {s}  \x1b[2m({s})\x1b[0m\n", .{ name, failure_detail(err, job), origin }),
+        }
+    }
+    for (startup.pending) |pending| if (pending.reason == .needs_approval)
+        cmd_output.print("  \x1b[33m○\x1b[0m \x1b[36m{s}\x1b[0m  awaiting approval (project {s}); add \"{s}\" to \"enabledMcpjsonServers\" in {s}/config.json\n", .{
+            pending.name, pending.origin_path, pending.name, app.stateRoot(),
+        });
 }
 
 /// /agents:列出已加载的 subagent 定义(builtin / personal / project / plugin),缺 `description`
@@ -4597,8 +4823,14 @@ fn shellQuoteSingle(allocator: std.mem.Allocator, s: []const u8) ![]u8 {
 
 /// 启动 banner:圆角 box(对齐 cc 2.1.x)。版本 + 模型 + cwd 三行。
 /// 非 TTY 退化为纯文本两行(pipe 友好)。box 内宽固定取 min(cols-2, 64)。
-/// TTY 下先播启动动画(tui/splash.zig),定格的 "Metask Lab" 字标留在 box 上方。
-fn printStartupBanner(app: *const app_mod.App, allocator: std.mem.Allocator) void {
+/// TTY 下先播启动动画(tui/splash.zig),定格的 "Metask Lab" 字标留在 box 上方;
+/// main 已在 App.init 前起播的(`startSplash`)只等它定格。
+fn printStartupBanner(app: *const app_mod.App, allocator: std.mem.Allocator, splash: Splash) void {
+    switch (splash) {
+        .playing => |bg| endSplash(bg, .wait),
+        .not_started => if (platform_term.isatty(1)) playStartupSplash(app, allocator),
+        .off => {},
+    }
     var problems_buf: [160]u8 = undefined;
     const problems = formatConfigProblems(&problems_buf, app.configProblems());
     if (!platform_term.isatty(1)) {
@@ -4607,7 +4839,6 @@ fn printStartupBanner(app: *const app_mod.App, allocator: std.mem.Allocator) voi
         cmd_output.print("\n", .{});
         return;
     }
-    playStartupSplash(app, allocator);
     printBanner(app);
 }
 
@@ -4656,21 +4887,29 @@ fn printBanner(app: *const app_mod.App) void {
 /// 启动动画:门控(TTY 两端/METACODES_NO_STARTUP_ANIMATION/config.json startupAnimation/
 /// TERM=dumb/终端太小)由 splash_player.decide 判定;任意键跳到定格帧。结果只进 debug 日志。
 fn playStartupSplash(app: *const app_mod.App, allocator: std.mem.Allocator) void {
-    const splash_player = @import("tui/splash_player.zig");
-    const log = @import("../util/log.zig");
-    const config = if (app.stateRoot().len > 0)
-        @import("tui/config.zig").loadStartupAnimation(allocator, app.stateRoot())
-    else
-        null;
-    switch (splash_player.decide(splash_player.gateFromEnv(config))) {
-        .skip => |why| log.debug("splash", "skipped: {s}", .{@tagName(why)}),
-        .play => |plan| {
-            const style = splash_player.styleFor(app.theme_variant, tui_term_root.detectFromEnv(1));
-            const seed: u64 = @truncate(@as(u128, @bitCast(util_time.nowNs())));
-            const outcome = splash_player.play(allocator, plan, style, seed);
-            log.debug("splash", "{s} ({d}x{d}, {s})", .{ @tagName(outcome), plan.layout.cols, plan.layout.rows, @tagName(style.mode) });
+    const plan = splashPlan(allocator, app.stateRoot()) orelse return;
+    const style = splashStyle(app.theme_variant);
+    logSplash(splash_player.play(allocator, plan, style, splashSeed()), plan, style.mode);
+}
+
+/// The splash's plan for this terminal, or null (logged) when its gate keeps it off.
+fn splashPlan(allocator: std.mem.Allocator, state_root: []const u8) ?splash_player.Plan {
+    const config = if (state_root.len > 0) @import("tui/config.zig").loadStartupAnimation(allocator, state_root) else null;
+    return switch (splash_player.decide(splash_player.gateFromEnv(config))) {
+        .skip => |why| {
+            @import("../util/log.zig").debug("splash", "skipped: {s}", .{@tagName(why)});
+            return null;
         },
-    }
+        .play => |plan| plan,
+    };
+}
+
+fn splashStyle(variant: tui_theme.Variant) @import("tui/splash.zig").Style {
+    return splash_player.styleFor(variant, tui_term_root.detectFromEnv(1));
+}
+
+fn splashSeed() u64 {
+    return @truncate(@as(u128, @bitCast(util_time.nowNs())));
 }
 
 /// banner 一行内容:│ + inner 列(2 空格缩进 + text + 右补空格)+ │。

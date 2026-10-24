@@ -136,3 +136,123 @@ test "MCP HTTP: 401 is an authentication error, not a protocol fallback" {
         .url = try mock.url(&buffer, "auth"),
     }, .{ .spawn = undefined, .startup_timeout_ms = 5_000 }));
 }
+
+/// The requests the mock saw on `path`, in order: method (or "" for a reply),
+/// client port (one per TCP connection) and the `Connection` header.
+const Seen = struct {
+    method: []const u8,
+    conn: i64,
+    connection: ?[]const u8,
+};
+
+fn seenOn(arena: std.mem.Allocator, log: []const u8, path: []const u8) ![]Seen {
+    var out: std.ArrayList(Seen) = .empty;
+    var lines = std.mem.splitScalar(u8, log, '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        const value = try std.json.parseFromSliceLeaky(std.json.Value, arena, line, .{});
+        if (value != .object) continue;
+        const entry_path = value.object.get("path") orelse continue;
+        if (entry_path != .string or !std.mem.eql(u8, entry_path.string, path)) continue;
+        const method = value.object.get("method") orelse continue;
+        const conn = value.object.get("conn") orelse continue;
+        const connection = value.object.get("connection");
+        try out.append(arena, .{
+            .method = if (method == .string) method.string else "",
+            .conn = conn.integer,
+            .connection = if (connection) |c| (if (c == .string) c.string else null) else null,
+        });
+    }
+    return out.toOwnedSlice(arena);
+}
+
+test "MCP HTTP: one kept-alive connection carries the handshake and later calls" {
+    var mock = (try Mock.start()) orelse return error.SkipZigTest;
+    defer mock.stop();
+    const a = std.testing.allocator;
+    var buffer: [128]u8 = undefined;
+    {
+        // The mock drops any request that asks for `Connection: close`, as
+        // developers.openai.com does intermittently.
+        var client = try cc.mcp_client.McpClient.connectHttp(a, .{
+            .io = std.testing.io,
+            .url = try mock.url(&buffer, "keepalive"),
+        }, .{ .spawn = undefined, .startup_timeout_ms = 10_000 });
+        defer client.close();
+        try std.testing.expectEqualStrings("2025-11-25", client.protocol_version);
+        const tools = try client.listTools();
+        defer a.free(tools);
+        try std.testing.expect(std.mem.indexOf(u8, tools, "\"kept\"") != null);
+        const called = try client.callTool("kept", "{}");
+        defer a.free(called);
+        try std.testing.expect(std.mem.indexOf(u8, called, "kept-call") != null);
+    }
+    const log = try mock.log(a);
+    defer a.free(log);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const seen = try seenOn(arena.allocator(), log, "/keepalive");
+    // server/discover (400 JSON), initialize (SSE), notifications/initialized
+    // (202), tools/list (SSE), tools/call (JSON): one TCP connection.
+    try std.testing.expectEqual(@as(usize, 5), seen.len);
+    for (seen) |request| {
+        try std.testing.expectEqual(seen[0].conn, request.conn);
+        if (request.connection) |value| try std.testing.expect(!std.ascii.eqlIgnoreCase(value, "close"));
+    }
+}
+
+test "MCP HTTP: a pooled connection the server closed is replaced, the request sent once" {
+    var mock = (try Mock.start()) orelse return error.SkipZigTest;
+    defer mock.stop();
+    const a = std.testing.allocator;
+    var buffer: [128]u8 = undefined;
+    {
+        var client = try cc.mcp_client.McpClient.connectHttp(a, .{
+            .io = std.testing.io,
+            .url = try mock.url(&buffer, "idleclose"),
+        }, .{ .spawn = undefined, .startup_timeout_ms = 10_000 });
+        defer client.close();
+        // The server closes each connection 50 ms after answering; the pooled
+        // one is dead by now.
+        cc.util_time.sleepMs(300);
+        const tools = try client.listTools();
+        defer a.free(tools);
+        try std.testing.expect(std.mem.indexOf(u8, tools, "\"kept\"") != null);
+    }
+    const log = try mock.log(a);
+    defer a.free(log);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const seen = try seenOn(arena.allocator(), log, "/idleclose");
+    var lists: usize = 0;
+    for (seen) |request| lists += @intFromBool(std.mem.eql(u8, request.method, "tools/list"));
+    try std.testing.expectEqual(@as(usize, 1), lists);
+}
+
+test "MCP HTTP: a connection idle past the reuse window is not reused" {
+    var mock = (try Mock.start()) orelse return error.SkipZigTest;
+    defer mock.stop();
+    const a = std.testing.allocator;
+    var buffer: [128]u8 = undefined;
+    {
+        var client = try cc.mcp_client.McpClient.connectHttp(a, .{
+            .io = std.testing.io,
+            .url = try mock.url(&buffer, "keepalive"),
+        }, .{ .spawn = undefined, .startup_timeout_ms = 10_000 });
+        defer client.close();
+        client.transport.http.reuse_idle_ms = 100;
+        const tools = try client.listTools();
+        defer a.free(tools);
+        cc.util_time.sleepMs(300);
+        const called = try client.callTool("kept", "{}");
+        defer a.free(called);
+    }
+    const log = try mock.log(a);
+    defer a.free(log);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const seen = try seenOn(arena.allocator(), log, "/keepalive");
+    try std.testing.expectEqualStrings("tools/list", seen[seen.len - 2].method);
+    try std.testing.expectEqualStrings("tools/call", seen[seen.len - 1].method);
+    try std.testing.expect(seen[seen.len - 2].conn != seen[seen.len - 1].conn);
+}

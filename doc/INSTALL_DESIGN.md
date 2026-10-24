@@ -68,7 +68,8 @@ Everything that used to live under `~/.metacodes` lives under the root with
 the same relative names (`config.json`, `auth.json`, `oauth/`, `kg/`,
 `projects/`, `teams/`, `plans/`, `worktrees/`, `history`, `pastes/`,
 `models.toml`, `context_caps.json`, `ledger/`, `agents/`, `CLAUDE.md`,
-`AGENTS.md`, `skills/`, `research/`). Project-scoped `<project>/.metacodes/` and
+`AGENTS.md`, `skills/`, `research/`), and the REPL's `/v1/models` copies live in
+`cache/models/`. Project-scoped `<project>/.metacodes/` and
 the user's `~/.claude/` are unchanged. The more specific overrides
 (`METACODES_CONFIG_FILE`, `METACODES_AUTH_FILE`, `METACODES_KG_STORE`, …) still
 win over the root.

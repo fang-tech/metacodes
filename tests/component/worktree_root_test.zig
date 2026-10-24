@@ -210,7 +210,7 @@ const Fixture = struct {
         self.server = try harness.MockServer.startCassette(responses, 0);
         errdefer self.server.stop();
         const url_z = try allocator.dupeZ(u8, try self.server.urlOwned(allocator));
-        const argv = [_][*:0]const u8{ "metacodes", "--base-url", url_z.ptr, "--model", "test-model", "--permission", "bypassPermissions" };
+        const argv = [_][*:0]const u8{ "metacodes", "--base-url", url_z.ptr, "--model", "test-model", "--model-display-name", WORKTREE_DISPLAY_NAME, "--permission", "bypassPermissions" };
         const config = cc.parseArgsForTest(&argv, allocator);
         try std.testing.expect(config.parse_error == null);
 
@@ -263,6 +263,11 @@ fn expectContains(haystack: []const u8, needle: []const u8) !void {
     }
 }
 
+/// The startup display identity; a `/model` switch replaces it in the prompt
+/// for good, worktree switches included (prompt_model_identity_test).
+const WORKTREE_DISPLAY_NAME = "worktree-display-identity";
+const WORKTREE_SWITCHED_MODEL = "worktree-switched-model";
+
 test "L2 worktree: a later call, the next Run and Bash follow EnterWorktree; ExitWorktree brings them back" {
     if (builtin.os.tag == .windows) return error.SkipZigTest; // POSIX git fixture
     const a = std.testing.allocator;
@@ -287,6 +292,9 @@ test "L2 worktree: a later call, the next Run and Bash follow EnterWorktree; Exi
     const worktree = try std.fmt.allocPrint(a, "{s}/.metacodes/worktrees/wt-one", .{fx.repo});
     defer a.free(worktree);
 
+    // A `/model` switch first: the prompts the worktree switches rebuild keep naming it.
+    try fx.app.switchModel(WORKTREE_SWITCHED_MODEL);
+
     // Run 1: enter, then a later tool call in the same Run.
     try fx.run(&results, "work in a worktree");
     try expectContains(try results.get(0), "\"entered\":true");
@@ -298,6 +306,8 @@ test "L2 worktree: a later call, the next Run and Bash follow EnterWorktree; Exi
     const next = cc.session_service.buildRunOptions(fx.app, null);
     try std.testing.expectEqualStrings(worktree, next.cwd_abs);
     try expectContains(next.system_prompt.?, worktree);
+    try expectContains(next.system_prompt.?, WORKTREE_SWITCHED_MODEL);
+    try std.testing.expect(std.mem.indexOf(u8, next.system_prompt.?, WORKTREE_DISPLAY_NAME) == null);
     try fx.run(&results, "still there?");
     try expectContains(try results.get(2), worktree);
     try expectContains(try results.get(3), "\"removed\":false");
@@ -307,6 +317,8 @@ test "L2 worktree: a later call, the next Run and Bash follow EnterWorktree; Exi
     try std.testing.expect(std.mem.indexOf(u8, back, ".metacodes/worktrees") == null);
     try std.testing.expectEqualStrings(fx.repo, fx.app.cwdAbs());
     try std.testing.expectEqualStrings(fx.repo, fx.app.permission_ctx.match_ctx.cwd);
+    try expectContains(fx.app.system_prompt.?, WORKTREE_SWITCHED_MODEL);
+    try std.testing.expect(std.mem.indexOf(u8, fx.app.system_prompt.?, WORKTREE_DISPLAY_NAME) == null);
     const process_cwd = try cc.util_fs.getCwd(a);
     defer a.free(process_cwd);
     try std.testing.expectEqualStrings(fx.repo, process_cwd);
