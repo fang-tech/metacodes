@@ -158,6 +158,12 @@ status, compatibility boundaries, and entry points are defined by
   module it exports. `zig build test` also runs `test:platform` (its fork tests
   still need `METACODES_PROC_TEST=1`) and `test:lsp`, which until now ran only
   in `windows:gate`, so `gate:pr` covers both locally.
+- An OpenRouter catalog ingested at runtime keeps its strings. Its channels
+  borrowed model ids, names, regions and control specs from the parse results,
+  which the ingest frees before it returns, so the registry profile and every
+  offer catalog built from it (now or on a later refresh) read freed memory.
+  `buildChannels` now copies everything the channels point at into the
+  profile's arena.
 - **TUI: a terminal resize no longer answers an open dialog.** A resize
   interrupts a blocked key read (SIGWINCH has no `SA_RESTART`), and the
   permission dialog took the interrupted read for "No": the tool was denied
