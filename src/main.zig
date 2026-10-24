@@ -3478,6 +3478,7 @@ test {
     _ = &@import("api/oauth_exchange.zig");
     _ = &@import("api/oauth_login.zig");
     _ = &@import("api/catalog_fetch.zig");
+    _ = &@import("api/models_pages.zig");
     _ = &@import("api/models_cache.zig");
     _ = &@import("repl/msg_queue.zig");
     _ = &@import("repl/history.zig");

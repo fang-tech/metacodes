@@ -19,6 +19,12 @@ status, compatibility boundaries, and entry points are defined by
   lists now hold every entry, scroll with the selection, and take PgUp/PgDn
   and Home/End (↑ from the first row still wraps to the last); a list longer
   than its window says `[n/m] · PgUp/PgDn page · Home/End` under it.
+- **A paginated `/v1/models` is read to its end.** The list is Anthropic-shaped
+  (`has_more`, `last_id`), and the session's probe, its background refresh and
+  the Metask session login's catalog fetch kept only the first page. They now
+  follow `after_id` until the gateway says there is no more (at most 50 pages
+  of 1000), so every model a key may use reaches `/model` and `/models`. A
+  single-page list is read exactly as before.
 
 ## 0.7.0 — 2026-10-24
 

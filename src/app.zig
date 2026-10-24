@@ -912,7 +912,7 @@ pub const App = struct {
                     break :metask_catalog;
                 };
                 defer app.allocator.free(models_url);
-                const fetched = @import("api/catalog_fetch.zig").fetch(app.allocator, io, .{
+                const fetched = @import("api/catalog_fetch.zig").fetchModelPages(app.allocator, io, .{
                     .url = models_url,
                     .bearer = app.api_key,
                 }) catch |err| {

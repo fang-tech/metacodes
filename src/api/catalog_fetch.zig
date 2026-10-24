@@ -12,6 +12,7 @@
 
 const std = @import("std");
 const http_status = @import("http_status.zig");
+const models_pages = @import("models_pages.zig");
 
 pub const FetchError = error{
     OutOfMemory,
@@ -103,4 +104,42 @@ pub fn fetch(
         else => error.HttpError,
     };
     return .{ .body = body };
+}
+
+/// GET a `/v1/models` list and every page after it (`has_more` + `last_id`,
+/// see `models_pages.zig`), as one document. A single-page list comes back
+/// byte for byte; a continuation that fails keeps the pages already read
+/// rather than discarding the whole list.
+pub fn fetchModelPages(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    request: Request,
+) FetchError!Response {
+    const first = try fetch(allocator, io, request);
+    var pages: std.ArrayList([]u8) = .empty;
+    defer {
+        for (pages.items) |page| allocator.free(page);
+        pages.deinit(allocator);
+    }
+    pages.append(allocator, first.body) catch {
+        allocator.free(first.body);
+        return error.OutOfMemory;
+    };
+    while (pages.items.len < models_pages.MAX_PAGES) {
+        const cursor = (try models_pages.nextCursor(allocator, pages.items[pages.items.len - 1])) orelse break;
+        defer allocator.free(cursor);
+        const url = try models_pages.continuationUrl(allocator, request.url, cursor);
+        defer allocator.free(url);
+        const next = fetch(allocator, io, .{ .url = url, .bearer = request.bearer }) catch break;
+        pages.append(allocator, next.body) catch {
+            allocator.free(next.body);
+            return error.OutOfMemory;
+        };
+    }
+    if (pages.items.len == 1) {
+        const only = pages.items[0];
+        pages.clearRetainingCapacity();
+        return .{ .body = only };
+    }
+    return .{ .body = try models_pages.merge(allocator, pages.items) };
 }
