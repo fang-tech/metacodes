@@ -12,6 +12,7 @@ const rng = @import("platform").rng;
 const sync = @import("platform").sync;
 const time = @import("../util/time.zig");
 const ResponseStatus = @import("../api/http_status.zig").ResponseStatus;
+const no_redirects = @import("../api/http_status.zig").no_redirects;
 
 pub const protocol_version: u32 = 2;
 pub const control_plane_version: u32 = 1;
@@ -443,6 +444,7 @@ pub const WebTransport = struct {
         const uri = std.Uri.parse(url) catch return Error.InvalidUrl;
         var req = self.http_client.request(.GET, uri, .{
             .keep_alive = false,
+            .redirect_behavior = no_redirects,
             .extra_headers = &.{.{ .name = "x-api-key", .value = self.api_key }},
         }) catch return Error.RequestFailed;
         defer req.deinit();
@@ -538,6 +540,7 @@ pub const WebTransport = struct {
         const uri = std.Uri.parse(url) catch return Error.InvalidUrl;
         var req = self.http_client.request(.POST, uri, .{
             .keep_alive = false,
+            .redirect_behavior = no_redirects,
             .extra_headers = &.{
                 .{ .name = "content-type", .value = "application/json" },
                 .{ .name = "x-api-key", .value = self.api_key },

@@ -269,6 +269,7 @@ pub const HttpTransport = struct {
         try self.appendCommonHeaders(&extra, .{});
         var request = try self.client.request(.DELETE, self.uri, .{
             .headers = .{ .accept_encoding = .omit },
+            .redirect_behavior = http_status.no_redirects,
             .extra_headers = extra.items,
         });
         defer request.deinit();
@@ -361,6 +362,9 @@ pub const HttpTransport = struct {
                 exchange.kind = if (is_sse) .sse else .json;
             },
             400, 402, 405...499 => exchange.kind = if (is_sse) .sse else .json,
+            // Not followed (`http_status.no_redirects`): the configured headers
+            // would go to wherever it points.
+            300...399 => return error.McpRedirected,
             else => return error.McpServerError,
         }
         // Keep only the abort routing for the body; a deadline still applies.
@@ -378,6 +382,9 @@ pub const HttpTransport = struct {
                 .accept_encoding = .omit,
                 .content_type = .{ .override = "application/json" },
             },
+            // The configured headers (often an Authorization) go wherever a
+            // redirect points; a 3xx is the server's answer.
+            .redirect_behavior = http_status.no_redirects,
             .extra_headers = extra_headers,
         }) catch return error.McpConnectFailed;
         errdefer exchange.request.deinit();

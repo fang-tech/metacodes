@@ -7,6 +7,8 @@ const types = @import("types.zig");
 const json_mod = @import("json.zig");
 const api_stream = @import("api/stream.zig");
 const ResponseStatus = @import("api/http_status.zig").ResponseStatus;
+const no_redirects = @import("api/http_status.zig").no_redirects;
+const copyRedirectLocation = @import("api/http_status.zig").copyRedirectLocation;
 const error_class = @import("api/error_class.zig");
 const last_error = @import("api/last_error.zig");
 const Catalog = @import("api/catalog.zig").Catalog;
@@ -325,6 +327,17 @@ pub fn reportHeadStall(comptime module: []const u8, rid: log.RequestId, stall: p
     var buf: [128]u8 = undefined;
     const detail = std.fmt.bufPrint(&buf, "{d} ms 内无响应头(上限 {d} ms),连接已由客户端关闭", .{ stall.idle_ms, stall.limit_ms }) catch "StreamStalled";
     last_error.recordNamed("响应头空闲超时", detail);
+}
+
+/// A 3xx to a request that carries a key is the answer, not a hop
+/// (`http_status.no_redirects`). Say where it points: the fix is to use that
+/// URL as the endpoint, and "HTTP 302" alone does not say so. Shared by the
+/// three provider clients; overwrites the generic HTTP record.
+pub fn reportRedirect(comptime module: []const u8, rid: log.RequestId, status: ResponseStatus, location: []const u8) void {
+    log.errId(module, rid, "HTTP {d} {s}: redirect to {s} not followed: the request carries a credential", .{ status.code, status.name, location });
+    var buf: [400]u8 = undefined;
+    const detail = std.fmt.bufPrint(&buf, "HTTP {d} → {s};带凭据的请求不跟随重定向,请把端点(--base-url)改成重定向后的地址", .{ status.code, location }) catch "带凭据的请求不跟随重定向";
+    last_error.recordNamed("端点重定向", detail);
 }
 
 /// 正文阶段 stall 的统一交代:日志 + last_error 现场。此前 mid-stream 的 StreamStalled 不写
@@ -995,6 +1008,8 @@ pub const Client = struct {
         // process-wide connection_gate(MAX_CONNECTING_REQUESTS) 限制，不重新引入陈旧池连接。
         req_ptr.* = client.http_client.request(.POST, uri, .{
             .keep_alive = false,
+            // The key rides in a header; a redirect would carry it to another host.
+            .redirect_behavior = no_redirects,
             .extra_headers = &.{
                 .{ .name = "anthropic-version", .value = "2023-06-01" },
                 .{ .name = "content-type", .value = "application/json" },
@@ -1074,9 +1089,13 @@ pub const Client = struct {
                 client.last_context_window_numbers = .{};
             },
             .failure => |failure| {
+                // The head's bytes are reused by the body read below.
+                var location_buf: [256]u8 = undefined;
+                const redirected_to = copyRedirectLocation(&http_response, &location_buf);
                 // Read every error body exactly once while the request reader is alive. Cleanup
                 // remains with the surrounding errdefers; do not deinit/destroy here.
                 const body_info = logErrorBody(req_ptr, rid, status, http_response);
+                if (redirected_to) |location| reportRedirect("client", rid, status, location);
                 client.last_context_window_numbers = body_info.context_window_numbers;
                 return resolveHttpFailure(failure, body_info);
             },
@@ -1154,6 +1173,7 @@ pub fn getModelsList(
     defer connection_lease.release();
     var req = http_client.request(.GET, uri, .{
         .keep_alive = false, // 同 POST:不复用陈旧连接
+        .redirect_behavior = no_redirects, // 同 POST:key 不随重定向去别的主机
         .extra_headers = &.{
             .{ .name = "anthropic-version", .value = "2023-06-01" },
             auth,

@@ -139,6 +139,8 @@ pub const Client = struct {
         }
         var request = self.http.request(.POST, self.uri, .{
             .keep_alive = false,
+            // Bearer and provider credential ride in headers.
+            .redirect_behavior = http_status.no_redirects,
             .headers = .{
                 .accept_encoding = .omit,
                 .content_type = .{ .override = "application/json" },
