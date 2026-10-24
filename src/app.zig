@@ -1555,6 +1555,24 @@ pub const App = struct {
         host.kernel.adoptConfigRevision(result.config_revision);
     }
 
+    /// `--api-key`, labelled with the provider it was given for.
+    ///
+    /// The flag names no provider, so its owner is the provider the session
+    /// started on: Metask on the historical path (no provider named), otherwise
+    /// the route `main` resolved — `--provider`, `--offer`, or a stored global
+    /// selection — which is also the scope startup resolved the flag in. Same
+    /// rule as `main.selectedProfileIsMetask`, including its failure mode: a
+    /// named provider without a resolved id owns nothing, so the key reaches no
+    /// provider instead of falling back to Metask.
+    fn cliApiKey(config: types.Config) ?provider_binding_mod.ScopedSecret {
+        const secret = config.api_key orelse return null;
+        const owner = if (config.provider_profile == null)
+            provider_ids_mod.Slug.lit("metask")
+        else
+            provider_ids_mod.Slug.parse(config.resolved_provider_id orelse return null) catch return null;
+        return .{ .provider_id = owner, .secret = secret };
+    }
+
     /// Move the live session onto a committed selection.
     ///
     /// Ordering is the correctness argument. Everything that can fail happens
@@ -1618,7 +1636,7 @@ pub const App = struct {
             selection,
             .{
                 .pool = pool,
-                .cli_api_key = app.config.api_key,
+                .cli_api_key = cliApiKey(app.config),
                 .stored_oauth = if (oauth_token) |value| .{
                     .kind = oauth_kind,
                     .secret = value,

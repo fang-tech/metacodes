@@ -252,7 +252,14 @@ runtime descriptor → profile-declared environment aliases → persisted store
 the last two steps *within one provider*; it never widens scope.
 
 Because aliases are profile data, a Metask key is not reachable from an OpenAI
-or Z.AI resolution at all. At startup, Metask (and any session that names no
+or Z.AI resolution at all. `--api-key` is the one key that arrives without a
+kind or a provider, and every API-key profile would accept it — ahead of its
+own environment key. It is therefore labelled with the provider the session
+started on (Metask when none is named, otherwise the startup route's provider,
+the scope startup resolved it in), and a `/model` commit offers it to that
+provider only (`ScopedSecret` in `provider/runtime_binding.zig`). Picking
+another provider's model uses that provider's own credential or is refused for
+want of one; the previous route stays active. At startup, Metask (and any session that names no
 provider) keeps the historical `core/auth.zig` path byte for byte — stored
 OAuth, stored key, and the one-shot descriptor. Any other profile resolves in
 its own scope, and the stored Metask model/effort selection is not applied to

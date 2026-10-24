@@ -36,11 +36,28 @@ pub const BindError = selection_mod.ResolveError ||
     registry_mod.TransportError ||
     error{UnknownProvider};
 
+/// A key that arrived without a declared kind, together with the provider it
+/// was given for.
+///
+/// `--api-key` names no provider: on the historical path it is the Metask key,
+/// after `--provider X` it is X's. A profile cannot tell an unlabelled key
+/// apart from its own — every API-key profile accepts one — so the owner has
+/// to travel with the secret, and `bindOffer` offers it to that provider only.
+pub const ScopedSecret = struct {
+    provider_id: Slug,
+    secret: []const u8,
+
+    fn forProvider(self: ?ScopedSecret, provider_id: Slug) ?[]const u8 {
+        const scoped = self orelse return null;
+        return if (scoped.provider_id.eql(provider_id)) scoped.secret else null;
+    }
+};
+
 /// Credential material available to this process, independent of provider.
 /// Which of it is *eligible* is decided by the provider profile, so a key for
 /// one vendor can never satisfy another.
 pub const CredentialSources = struct {
-    cli_api_key: ?[]const u8 = null,
+    cli_api_key: ?ScopedSecret = null,
     runtime_fd_secret: ?[]const u8 = null,
     stored_api_key: ?credential.StoredEntry = null,
     stored_oauth: ?credential.StoredEntry = null,
@@ -155,7 +172,7 @@ pub fn bindOffer(
         .env_aliases = profile.env_aliases,
         .explicit = pinned_credential,
         .runtime_fd_secret = sources.runtime_fd_secret,
-        .cli_api_key = sources.cli_api_key,
+        .cli_api_key = ScopedSecret.forProvider(sources.cli_api_key, profile.id),
         .stored_api_key = sources.stored_api_key,
         .stored_oauth = sources.stored_oauth,
         .precedence = sources.precedence,
@@ -333,6 +350,40 @@ test "binding fails before I/O when no eligible credential exists" {
         &buffer,
         false,
     ));
+}
+
+test "a command-line key binds only the provider it was given for" {
+    const a = std.testing.allocator;
+    var registry = try ProviderRegistry.initWithBuiltins(a);
+    defer registry.deinit();
+    var catalog = try registry.buildCatalog(a, .{ .only_provider = Slug.lit("zai-coding-plan") });
+    defer catalog.deinit();
+    var buffer: [ids.MAX_SLUG_LEN]u8 = undefined;
+    const offer = offerFor(&catalog, "cn-anthropic", "glm-4.6");
+
+    // `--api-key` on the historical path is the Metask key. Z.AI accepts an
+    // unlabelled API key, so only the owner keeps it out.
+    const metask_key = ScopedSecret{ .provider_id = Slug.lit("metask"), .secret = "metask-secret" };
+    try std.testing.expectError(error.MissingCredentials, bindOffer(
+        &registry,
+        offer,
+        .{ .cli_api_key = metask_key },
+        &buffer,
+        false,
+    ));
+
+    // Nor does it outrank Z.AI's own key: the provider's alias answers.
+    var env = TestEnv{ .pairs = &.{.{ "ZAI_API_KEY", "zai-secret" }} };
+    const from_env = try bindOffer(&registry, offer, .{ .cli_api_key = metask_key, .env = env.lookup() }, &buffer, false);
+    try std.testing.expectEqualStrings("zai-secret", from_env.secret);
+    try std.testing.expectEqual(credential.CredentialSource.env, from_env.credential_ref.source);
+
+    // `--provider zai-coding-plan --api-key`: the key is Z.AI's, and it still
+    // comes first within that provider.
+    const zai_key = ScopedSecret{ .provider_id = Slug.lit("zai-coding-plan"), .secret = "zai-cli" };
+    const from_flag = try bindOffer(&registry, offer, .{ .cli_api_key = zai_key, .env = env.lookup() }, &buffer, false);
+    try std.testing.expectEqualStrings("zai-cli", from_flag.secret);
+    try std.testing.expectEqual(credential.CredentialSource.cli, from_flag.credential_ref.source);
 }
 
 test "admission uses the bound channel limits and the provider classifier" {
