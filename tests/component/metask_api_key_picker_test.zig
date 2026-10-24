@@ -245,9 +245,15 @@ test "L2 metask api-key route: the picker offers the gateway's models at the ses
     try std.testing.expectEqualStrings("Bearer " ++ SESSION_KEY, headerValue(captured, "authorization").?);
     try std.testing.expectEqualStrings("\"kimi-k3\"", captured.jsonField("model").?);
 
-    // `/model use` resolves the same catalog: one route, so no ambiguity.
+    // `/model use` resolves the same catalog. Z.AI lists glm-5.3-flash too
+    // (four channels); the name means the provider the session is on.
     try std.testing.expect(cc.repl_picker_host.useSelector(app, "glm-5.3-flash") == .switched);
     try std.testing.expectEqualStrings("glm-5.3-flash", app.activeModel());
+    // A name only another provider serves, on several channels, is still a
+    // question rather than a guess.
+    const elsewhere = cc.repl_picker_host.useSelector(app, "glm-5.3");
+    try std.testing.expect(elsewhere == .ambiguous);
+    try std.testing.expectEqual(@as(usize, 4), elsewhere.ambiguous.total);
 }
 
 test "L2 metask api-key route: every page of a paginated /v1/models becomes the inventory" {

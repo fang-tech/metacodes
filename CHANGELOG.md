@@ -70,6 +70,12 @@ status, compatibility boundaries, and entry points are defined by
   the chosen `reasoning_effort` becomes the session's level. A route that
   offers the level the session already runs with starts with it selected; a
   commit that carries no level keeps the session's, as `/model use` does.
+- **`/model use <name>` means the provider the session is on.** A name several
+  providers list (glm-5.3-flash is on the Metask gateway and on Z.AI's four
+  channels) was reported as ambiguous; it now switches to the current
+  provider's route when that provider has exactly one, then the current
+  channel's. A name only other providers list on several routes is still
+  reported with its offer ids.
 - **Gemini 3 and later can call tools past the first step of a turn.** These
   models reject a request whose current turn returns a model function call
   without the `thoughtSignature` it arrived with (400), and the client dropped

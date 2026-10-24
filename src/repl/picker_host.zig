@@ -293,9 +293,38 @@ pub fn useSelector(app: *app_mod.App, selector: []const u8) UseOutcome {
     }
 
     if (out.ambiguous.total == 0) return .not_in_catalog;
-    if (out.ambiguous.total > 1) return out;
+    if (out.ambiguous.total > 1) {
+        // A name several providers serve means the one the session is on:
+        // `/model use glm-5.3-flash` in a Metask session is Metask's route,
+        // not a question about Z.AI's four. Then the current channel. Only
+        // a choice neither settles is reported.
+        const current_id = host.kernel.currentOfferId() orelse return out;
+        const current = catalog.find(current_id) orelse return out;
+        if (soleMatch(catalog, selector, current, false)) |chosen| return commitOffer(app, chosen);
+        if (soleMatch(catalog, selector, current, true)) |chosen| return commitOffer(app, chosen);
+        return out;
+    }
 
     return commitOffer(app, only.?);
+}
+
+/// The one offer matching `selector` on `current`'s provider (and, when
+/// `same_channel`, its channel too); null when there is none or several.
+fn soleMatch(
+    catalog: anytype,
+    selector: []const u8,
+    current: *const registry_mod.ModelOffer,
+    same_channel: bool,
+) ?*const registry_mod.ModelOffer {
+    var found: ?*const registry_mod.ModelOffer = null;
+    for (catalog.items()) |*candidate| {
+        if (!candidate.provider_id.eql(current.provider_id)) continue;
+        if (same_channel and !candidate.channel_id.eql(current.channel_id)) continue;
+        if (!registry_mod.matchesSelector(candidate.*, selector)) continue;
+        if (found != null) return null;
+        found = candidate;
+    }
+    return found;
 }
 
 fn commitOffer(app: *app_mod.App, chosen: *const registry_mod.ModelOffer) UseOutcome {
