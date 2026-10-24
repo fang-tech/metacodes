@@ -94,6 +94,14 @@ pub fn onKey(app: *app_mod.App, ui: *ui_state.UiState, key: Key) Result {
             cancelLogin(app);
             return .redraw;
         },
+        .submit_key => return submitKey(app),
+        .open_key_page => {
+            const choices = app.model_picker.keyChoices();
+            if (app.model_picker.key_choice < choices.len) {
+                @import("../core/auth.zig").openBrowser(app.allocator, choices[app.model_picker.key_choice].url) catch {};
+            }
+            return .ignored;
+        },
     }
 }
 
@@ -159,6 +167,64 @@ fn startLogin(app: *app_mod.App, commit: picker_mod.Commit) bool {
     return true;
 }
 
+/// A commit refused for want of a credential on a provider that has no OAuth
+/// grant but declares where its API keys are created
+/// (`ProviderProfile.api_key_setup`): the picker shows those pages and takes
+/// the pasted key, with the commit pending. False when the provider declares
+/// no such pages.
+fn startKeyEntry(app: *app_mod.App, commit: picker_mod.Commit) bool {
+    const host = app.providerHost() catch return false;
+    const offer = host.kernel.catalogSnapshot().find(commit.offer_id) orelse return false;
+    const profile = host.registry.findById(offer.provider_id) orelse return false;
+    const setup = profile.api_key_setup orelse return false;
+    var choices: [picker_mod.MAX_KEY_CHOICES]picker_mod.KeyChoice = undefined;
+    const count = @min(setup.pages.len, choices.len);
+    // The plan page for the region of the channel the user picked.
+    const default = profile.defaultKeyPage(offer.channel_id);
+    var default_index: usize = 0;
+    for (setup.pages[0..count], 0..) |page, index| {
+        choices[index] = .{ .label = page.label, .url = page.url };
+        if (default) |wanted| if (wanted.id.eql(page.id)) {
+            default_index = index;
+        };
+    }
+    _ = app.model_picker.enterKeyStage(profile.id, commit, choices[0..count], default_index, setup.note);
+    return true;
+}
+
+/// Enter on a pasted key: check and store it on the login worker. `poll`
+/// then retries the pending commit, which finds the stored key.
+fn submitKey(app: *app_mod.App) Result {
+    const picker = &app.model_picker;
+    const provider = picker.credential_provider orelse return .ignored;
+    const host = app.providerHost() catch return .ignored;
+    const profile = host.registry.findById(provider) orelse return .ignored;
+    const setup = profile.api_key_setup orelse return .ignored;
+    if (picker.key_choice >= setup.pages.len) return .ignored;
+    const prepared = provider_login.prepareApiKey(profile, setup.pages[picker.key_choice].id.slice(), null, picker.keyText(), .{
+        .state_root = app.stateRoot(),
+        .open_browser = false,
+    }) catch |err| {
+        picker.credentialFailed(@errorName(err));
+        return .redraw;
+    };
+    cancelLogin(app);
+    const worker = app.allocator.create(login_worker_mod.LoginWorker) catch {
+        picker.credentialFailed("OutOfMemory");
+        return .redraw;
+    };
+    worker.* = login_worker_mod.LoginWorker.initFlow(app.allocator, app.io, .{ .api_key = prepared });
+    // `start` copies the key into the worker; only then is the field wiped.
+    worker.start() catch |err| {
+        app.allocator.destroy(worker);
+        picker.credentialFailed(@errorName(err));
+        return .redraw;
+    };
+    app.login_worker = worker;
+    picker.keySubmitted();
+    return .redraw;
+}
+
 fn finishLogin(app: *app_mod.App) void {
     const worker = app.login_worker orelse return;
     worker.join();
@@ -166,10 +232,14 @@ fn finishLogin(app: *app_mod.App) void {
     app.login_worker = null;
 }
 
+/// Esc must not wait on the network: a key check is one GET that does not
+/// watch the abort signal, so a worker still inside it is parked on the App
+/// (cancelled, joined once it settles) instead of joined here.
 fn cancelLogin(app: *app_mod.App) void {
     const worker = app.login_worker orelse return;
-    worker.cancel();
-    finishLogin(app);
+    if (worker.isSettled()) return finishLogin(app);
+    app.login_worker = null;
+    app.parkLoginWorker(worker);
 }
 
 fn apply(app: *app_mod.App, ui: *ui_state.UiState, commit: picker_mod.Commit) Result {
@@ -178,6 +248,7 @@ fn apply(app: *app_mod.App, ui: *ui_state.UiState, commit: picker_mod.Commit) Re
         // its provider. When the provider can be signed in to, say how.
         if (err == error.MissingCredentials) {
             if (startLogin(app, commit)) return .redraw;
+            if (startKeyEntry(app, commit)) return .redraw;
             const host = app.providerHost() catch null;
             if (host) |value| if (missingCredentialPointer(value, commit.offer_id)) |provider| {
                 app.model_picker.setNotice("no credential for {s}; sign in with /login {s}; the previous route is still active", .{ provider.slice(), provider.slice() });

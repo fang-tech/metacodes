@@ -62,6 +62,7 @@ pub const provider_host = @import("provider/host.zig");
 pub const provider_alias = @import("provider/alias.zig");
 pub const provider_custom = @import("provider/custom_provider.zig");
 pub const provider_oauth = @import("provider/oauth.zig");
+pub const provider_api_key_store = @import("provider/api_key_store.zig");
 pub const provider_metask_catalog = @import("provider/metask_catalog.zig");
 pub const provider_metask_ledger = @import("provider/metask_ledger.zig");
 pub const kg_provider_audit = @import("kg/provider_audit.zig");
@@ -1632,6 +1633,17 @@ fn maybeRunAuthCommand(init: std.process.Init, allocator: std.mem.Allocator, lea
     }
     if (std.mem.eql(u8, cmd, "logout")) {
         if (args.next()) |extra| {
+            if (std.mem.eql(u8, extra, "--provider")) {
+                const name = args.next() orelse {
+                    std.debug.print("usage: metacodes logout --provider <id>\n", .{});
+                    return 2;
+                };
+                if (args.next()) |more| {
+                    std.debug.print("error: unknown logout argument '{s}'\n", .{more});
+                    return 2;
+                }
+                return logoutProviderKey(allocator, state_dir, name);
+            }
             std.debug.print("error: unknown logout argument '{s}'\n", .{extra});
             return 2;
         }
@@ -1665,7 +1677,26 @@ fn maybeRunAuthCommand(init: std.process.Init, allocator: std.mem.Allocator, lea
     // The registered OAuth client this installation presents. Not a secret,
     // but not something the profile can guess either.
     var client_id: ?[]const u8 = null;
+    // The guided API-key setup (`ProviderProfile.api_key_setup`): which key
+    // page, a key read from stdin instead of a hidden prompt, and storing it
+    // without the check.
+    var key_page: ?[]const u8 = null;
+    var key_from_stdin = false;
+    var check_key = true;
     while (args.next()) |arg| {
+        if (std.mem.eql(u8, arg, "--key-page")) {
+            key_page = args.next() orelse {
+                std.debug.print("usage: metacodes login --provider <id> --key-page <page>\n", .{});
+                return 2;
+            };
+            continue;
+        } else if (std.mem.eql(u8, arg, "--api-key-stdin")) {
+            key_from_stdin = true;
+            continue;
+        } else if (std.mem.eql(u8, arg, "--no-check")) {
+            check_key = false;
+            continue;
+        }
         if (std.mem.eql(u8, arg, "status") or std.mem.eql(u8, arg, "--status")) {
             mode = .status;
         } else if (std.mem.eql(u8, arg, "--api-key")) {
@@ -1711,6 +1742,10 @@ fn maybeRunAuthCommand(init: std.process.Init, allocator: std.mem.Allocator, lea
     // says what they wanted — the same fail-closed rule the unknown-argument
     // branch above exists for.
     if (provider_name == null and mode != .help) {
+        if (key_page != null or key_from_stdin or !check_key) {
+            std.debug.print("error: --key-page, --api-key-stdin and --no-check require --provider <id>\n", .{});
+            return 2;
+        }
         if (client_id != null) {
             std.debug.print("error: --client-id requires --provider <id>\n", .{});
             return 2;
@@ -1722,6 +1757,25 @@ fn maybeRunAuthCommand(init: std.process.Init, allocator: std.mem.Allocator, lea
     }
 
     if (provider_name) |name| {
+        // A provider without an OAuth grant but with a page to create a key on
+        // signs in with a pasted key (`ProviderProfile.api_key_setup`).
+        if (providerTakesPastedKey(allocator, name) or key_page != null or key_from_stdin or !check_key) {
+            if (mode == .oauth_json) {
+                std.debug.print("error: --oauth-token-json is for providers that sign in with OAuth\n", .{});
+                return 2;
+            }
+            if (mode == .help) {
+                printLoginHelp();
+                return 0;
+            }
+            return runProviderKeyLogin(allocator, init.io, state_dir, name, .{
+                .key = if (mode == .api_key) value else null,
+                .from_stdin = key_from_stdin,
+                .page = key_page,
+                .open_browser = open_browser,
+                .check = check_key,
+            });
+        }
         // Metask's control plane uses its JSON device grant by default.  Keep
         // this special case before the generic profile flow: the latter sends
         // form-encoded RFC 8628 requests and would violate the Metask contract.
@@ -1867,7 +1921,10 @@ fn printLoginHelp() void {
         \\  metacodes login --provider <id> [--client-id <client>] [--device-code] [--no-browser]
         \\  metacodes login --provider <id> --oauth-token-json <token-response.json>
         \\  metacodes login --api-key <key>
+        \\  metacodes login --provider <id> [--key-page <page>] [--no-browser]
+        \\  metacodes login --provider <id> (--api-key <key> | --api-key-stdin) [--key-page <page>] [--no-check]
         \\  metacodes logout
+        \\  metacodes logout --provider <id>
         \\
         \\Default login starts a local browser OAuth flow on /auth/callback.
         \\Use --no-browser to print the URL without launching a browser.
@@ -1877,6 +1934,13 @@ fn printLoginHelp() void {
         \\loopback-redirect PKCE flow by default; --device-code is the flow for a
         \\headless or SSH session that cannot open a browser. --client-id supplies
         \\the registered OAuth client when the profile declares none.
+        \\
+        \\A provider that signs in with an API key (the GLM Coding Plan) opens the
+        \\page the key is created on, reads the pasted key without showing it,
+        \\checks it with a request the provider does not bill, and stores it in
+        \\<state root>/keys/<provider>.json (0600). --key-page picks the page
+        \\(cn-personal, cn-team, global-personal, global-team), --no-check stores
+        \\the key unchecked, and `logout --provider <id>` removes it.
         \\
         \\OAuth token JSON must match the token endpoint response:
         \\access_token, refresh_token, token_type=Bearer, expires_in. It remains
@@ -1948,6 +2012,218 @@ fn replaceStoredApiKey(allocator: std.mem.Allocator, stored: *auth.StoredCredent
         allocator.free(old);
     }
     stored.api_key = try allocator.dupe(u8, key);
+}
+
+const KeyLoginRequest = struct {
+    /// `--api-key <key>`.
+    key: ?[]const u8 = null,
+    /// `--api-key-stdin`: the key is the first line of stdin.
+    from_stdin: bool = false,
+    /// `--key-page <id>`.
+    page: ?[]const u8 = null,
+    open_browser: bool = true,
+    check: bool = true,
+};
+
+/// Whether `name` is a provider whose login is a pasted key: it declares a
+/// key page and no OAuth grant.
+fn providerTakesPastedKey(allocator: std.mem.Allocator, name: []const u8) bool {
+    const host = buildProviderHost(allocator) orelse return false;
+    defer host.destroy();
+    const profile = host.registry.find(name) orelse return false;
+    if (profile.api_key_setup == null) return false;
+    provider_login.requireOAuthCapable(profile) catch return true;
+    return false;
+}
+
+/// `metacodes login --provider <id>` for a provider that signs in with an API
+/// key: the user picks the plan, the page the key is created on opens, the
+/// pasted key is read without echo, checked, and stored in the provider's own
+/// key file.
+fn runProviderKeyLogin(allocator: std.mem.Allocator, io: std.Io, state_dir: []const u8, name: []const u8, request: KeyLoginRequest) u8 {
+    const host = buildProviderHost(allocator) orelse {
+        std.debug.print("error: the provider registry is unavailable\n", .{});
+        return 1;
+    };
+    defer host.destroy();
+    const profile = host.registry.find(name) orelse {
+        std.debug.print("error: unknown provider '{s}'\n", .{name});
+        return 2;
+    };
+    const setup = profile.api_key_setup orelse {
+        std.debug.print("error: {s} declares no page to create an API key on; set its environment variable instead\n", .{profile.display_name});
+        return 2;
+    };
+    if (request.key != null and request.from_stdin) {
+        std.debug.print("error: pass the key with --api-key or --api-key-stdin, not both\n", .{});
+        return 2;
+    }
+    const interactive = request.key == null and !request.from_stdin;
+
+    var page = if (request.page) |id| profile.keyPage(id) orelse {
+        std.debug.print("error: unknown key page '{s}'; {s} has:", .{ id, profile.display_name });
+        for (setup.pages) |candidate| std.debug.print(" {s}", .{candidate.id.slice()});
+        std.debug.print("\n", .{});
+        return 2;
+    } else profile.defaultKeyPage(profile.default_channel).?;
+
+    var key_buffer: [provider_login.MAX_KEY_LEN]u8 = undefined;
+    var key_len: usize = 0;
+    // The whole buffer: a read that fails part way (too long, interrupted)
+    // has written bytes past a `key_len` that is still 0.
+    defer std.crypto.secureZero(u8, &key_buffer);
+
+    if (interactive) {
+        requireInteractiveLogin() catch {
+            std.debug.print("error: no terminal to paste the key into; use --api-key-stdin\n", .{});
+            return 2;
+        };
+        std.debug.print("Create an API key for {s}.\n", .{profile.display_name});
+        if (setup.note) |note| std.debug.print("{s}\n", .{note});
+        if (request.page == null and setup.pages.len > 1) {
+            std.debug.print("\nWhich plan is the key for?\n", .{});
+            var default_index: usize = 0;
+            for (setup.pages, 0..) |candidate, i| {
+                if (candidate.id.eql(page.id)) default_index = i;
+                std.debug.print("  {d}. {s}\n", .{ i + 1, candidate.label });
+            }
+            std.debug.print("Choose [1-{d}] (Enter = {d}): ", .{ setup.pages.len, default_index + 1 });
+            var line_buf: [32]u8 = undefined;
+            const n = readLine(&line_buf) catch return 1;
+            const answer = std.mem.trim(u8, line_buf[0..n], " \t\r\n");
+            if (answer.len > 0) {
+                const choice = std.fmt.parseInt(usize, answer, 10) catch 0;
+                if (choice < 1 or choice > setup.pages.len) {
+                    std.debug.print("error: no plan {s}\n", .{answer});
+                    return 2;
+                }
+                page = setup.pages[choice - 1];
+            }
+        }
+        std.debug.print("\nOpen this page and create a key:\n{s}\n\n", .{page.url});
+        if (request.open_browser) auth.openBrowser(allocator, page.url) catch {};
+        key_len = readSecretLine("Paste the key (it is not shown) and press Enter: ", &key_buffer) catch |err| {
+            std.debug.print("\n", .{});
+            if (err == error.Interrupted) {
+                std.debug.print("Login interrupted; nothing was stored.\n", .{});
+                return 130;
+            }
+            std.debug.print("error: the key could not be read ({s})\n", .{@errorName(err)});
+            return 1;
+        };
+        std.debug.print("\n", .{});
+    } else if (request.from_stdin) {
+        key_len = readLine(&key_buffer) catch {
+            std.debug.print("error: the key could not be read from stdin\n", .{});
+            return 1;
+        };
+    } else {
+        const given = request.key.?;
+        if (given.len > key_buffer.len) {
+            std.debug.print("error: that key is longer than any key this login accepts\n", .{});
+            return 2;
+        }
+        @memcpy(key_buffer[0..given.len], given);
+        key_len = given.len;
+    }
+
+    var prepared = provider_login.prepareApiKey(profile, page.id.slice(), null, key_buffer[0..key_len], .{
+        .state_root = state_dir,
+        .open_browser = false,
+    }) catch |err| {
+        std.debug.print("error: {s}\n", .{switch (err) {
+            error.EmptyKey => "no key was entered; nothing was stored",
+            error.UnknownKeyPage => "unknown key page",
+            error.NoKeySetup => "this provider declares no key page",
+        }});
+        return 2;
+    };
+    prepared.check = request.check;
+    _ = prepared.run(allocator, io, oauth_login.stderrNotify(), null) catch |err| {
+        switch (err) {
+            error.KeyRefused => std.debug.print(
+                "{s} refused this key; nothing was stored. Check that it was copied whole and that it is a key for {s}.\n",
+                .{ profile.display_name, page.label },
+            ),
+            error.KeyCheckFailed => std.debug.print(
+                "The key could not be checked (network or provider error); nothing was stored. Retry, or store it unchecked with --no-check.\n",
+                .{},
+            ),
+            else => std.debug.print("error: the key was not stored: {s}\n", .{@errorName(err)}),
+        }
+        return 1;
+    };
+    std.debug.print("New sessions on {s} use it (`metacodes --provider {s}`, or pick a {s} model in /model). No key was printed.\n", .{ profile.display_name, profile.id.slice(), profile.display_name });
+    return 0;
+}
+
+/// Read a line from the terminal without echo (raw mode, so Ctrl+C arrives as
+/// a byte and is honoured). Bracketed-paste markers and other escape sequences
+/// are skipped; a non-terminal stdin is read as a plain line.
+/// Echo is off before the prompt is written: a paste that arrived between the
+/// prompt and the mode switch would be echoed by the terminal itself.
+fn readSecretLine(prompt: []const u8, buf: []u8) !usize {
+    const saved = platform_term.enterRaw(0) orelse {
+        std.debug.print("{s}", .{prompt});
+        return readLine(buf);
+    };
+    defer platform_term.restoreMode(0, saved);
+    std.debug.print("{s}", .{prompt});
+    var len: usize = 0;
+    var in_escape = false;
+    while (true) {
+        var ch: [1]u8 = undefined;
+        const n = pfs.read(0, ch[0..1]);
+        if (n < 0) return error.InputFailed;
+        if (n == 0) break;
+        const c = ch[0];
+        if (in_escape) {
+            // CSI ends on a byte in 0x40..0x7e ('~' for the paste markers).
+            if (c >= 0x40 and c <= 0x7e and c != '[') in_escape = false;
+            continue;
+        }
+        switch (c) {
+            '\r', '\n' => break,
+            0x03 => return error.Interrupted,
+            0x1b => in_escape = true,
+            0x7f, 0x08 => {
+                if (len > 0) {
+                    len -= 1;
+                    buf[len] = 0;
+                }
+            },
+            else => {
+                if (c < 0x20) continue;
+                if (len == buf.len) return error.KeyTooLong;
+                buf[len] = c;
+                len += 1;
+            },
+        }
+    }
+    return len;
+}
+
+/// `metacodes logout --provider <id>`: forget the API key stored for it.
+fn logoutProviderKey(allocator: std.mem.Allocator, state_dir: []const u8, name: []const u8) u8 {
+    const host = buildProviderHost(allocator) orelse {
+        std.debug.print("error: the provider registry is unavailable\n", .{});
+        return 1;
+    };
+    defer host.destroy();
+    const profile = host.registry.find(name) orelse {
+        std.debug.print("error: unknown provider '{s}'\n", .{name});
+        return 2;
+    };
+    const removed = provider_api_key_store.remove(allocator, state_dir, profile.id) catch |err| {
+        std.debug.print("Logout failed: {s}\n", .{@errorName(err)});
+        return 1;
+    };
+    if (removed) {
+        std.debug.print("Removed the stored key for {s}.\n", .{profile.display_name});
+    } else {
+        std.debug.print("No key is stored for {s}.\n", .{profile.display_name});
+    }
+    return 0;
 }
 
 fn requireInteractiveLogin() !void {
@@ -2529,12 +2805,20 @@ pub fn resolveProviderScopedSecret(
     defer host.destroy();
     const profile = host.registry.find(profile_name) orelse return error.UnknownProviderProfile;
 
+    // The key `login --provider` stored for this provider, in its own file.
+    var stored_key = provider_api_key_store.load(allocator, config.state_root, profile.id) catch |err| blk: {
+        std.debug.print("warning: the stored key for '{s}' cannot be used ({s}); run `metacodes login --provider {s}` again\n", .{ profile.id.slice(), @errorName(err), profile.id.slice() });
+        break :blk null;
+    };
+    defer if (stored_key) |*key| key.deinit();
+
     var reference_buffer: [provider_ids_local.MAX_SLUG_LEN]u8 = undefined;
     const resolved = credential_mod.resolve(.{
         .provider_id = profile.id,
         .accepted_kinds = profile.accepted_credential_kinds,
         .env_aliases = profile.env_aliases,
         .cli_api_key = config.api_key,
+        .stored_api_key = if (stored_key) |*key| key.entry() else null,
         .env = credential_mod.EnvLookup.process(),
     }, &reference_buffer) catch |err| {
         printProviderCredentialHelp(profile.*, err);
@@ -2561,6 +2845,9 @@ fn printProviderCredentialHelp(
                 "Authentication required for provider '{s}'.\n",
                 .{profile.id.slice()},
             );
+            if (profile.api_key_setup != null) {
+                std.debug.print("  metacodes login --provider {s}   (opens the page the key is created on, then stores it)\n", .{profile.id.slice()});
+            }
             for (profile.accepted_credential_kinds) |kind| {
                 if (profile.canonicalEnvAlias(kind)) |canonical| {
                     std.debug.print("  export {s}=...\n", .{canonical});
@@ -3458,6 +3745,7 @@ test {
     _ = &@import("repl/model_picker_view.zig");
     _ = &@import("repl/picker_host.zig");
     _ = &@import("provider/host.zig");
+    _ = &@import("provider/api_key_store.zig");
     _ = &@import("provider/alias.zig");
     _ = &@import("provider/custom_provider.zig");
     _ = &@import("provider/oauth.zig");

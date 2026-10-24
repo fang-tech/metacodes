@@ -140,7 +140,10 @@ built — before any request URL exists.
 Coding Plan credentials are their own kind (`zai_coding_plan_api_key`), separate
 from a general Z.AI key. `ZAI_API_KEY` is canonical; `GLM_API_KEY` and
 `Z_AI_API_KEY` are accepted aliases. Two aliases holding *different* values is
-an ambiguity error, not a silent first-wins pick.
+an ambiguity error, not a silent first-wins pick. Zhipu offers no third-party
+sign-in, so the profile declares the pages a plan key is created on instead,
+and `metacodes login --provider zai-coding-plan`, `/login` and the picker walk
+the user there and store the pasted key (*Stored API keys* below).
 
 Error classification is provider-owned: `429` with quota wording is
 `quota_exceeded` (not retryable) while plain throttling is `rate_limited`
@@ -367,6 +370,61 @@ one is ever wanted, is a one-line profile constant behind the same precedence.
 A profile that declares neither an authorization nor a device endpoint has no
 interactive flow, and says so at the entry point instead of failing later at a
 null URL.
+
+### Stored API keys and the guided key login
+
+Some providers have a plan whose keys are created on a web page and offer no
+grant a third-party client could run; the GLM Coding Plan is the first. Such a
+profile declares `api_key_setup` (`provider/profile.zig`): the credential kind
+the key is, the pages it is created on (`KeyPage { id, label, url, check_url,
+region }`), and a note shown before the user picks one. Validation requires an
+accepted kind, at least one page, https URLs and unique ids. The Coding Plan
+declares four plan pages — China and Global, personal and team — and its note
+says why the standard API-key page is the wrong one: since 2026-10-16 a key
+from it bills the account balance even on the Coding Plan endpoints. The page
+offered first follows the region of the chosen channel (`defaultKeyPage`).
+
+The login is a `provider_login.Flow` variant (`ApiKeyPrepared`), so the CLI,
+`/login` and the picker share it with the OAuth grants and run it on the same
+`LoginWorker`. `prepareApiKey` trims what a paste adds around the key; `run`
+checks the key with a GET of the page's `check_url` — the plan's
+`/models` list, which answers 401 without a valid key and is not a model call
+— and only then writes it. A 401/403 is `KeyRefused`. Any other failure is
+`KeyCheckFailed`, and so is a 2xx that is not the provider answering — HTML
+from a captive portal, or the `"success": false` body Z.AI answers some
+failures with — and a redirect: a GET that carries a credential never follows
+one (`catalog_fetch`), because std's client re-sends the header to whatever
+host it names, and a host that never saw the key says nothing about it. In
+every case nothing is written. `login --no-check` stores without the GET, for
+a network that cannot reach it.
+
+The key is written to `<state root>/keys/<provider>.json`
+(`provider/api_key_store.zig`), 0600, through the same atomic writer as an
+OAuth login, and never to `config.json`, which may only name environment
+variables. The file is per provider, and so is the lookup: startup
+(`resolveProviderScopedSecret`) and a picker commit (`bindCommittedSelection`)
+load only the file of the provider being resolved, and pass it as
+`stored_api_key`, after the profile's environment aliases. A key stored for
+Z.AI therefore cannot authenticate any other provider. A file that does not
+parse, carries an unknown schema or kind, or holds an empty key is an error
+the user is told about, not a missing key. `metacodes logout --provider <id>`
+removes it.
+
+`METACODES_KEY_CHECK_URL` replaces every page's check URL — the local mock the
+tests use, as `METASK_GATEWAY_URL` is for Metask. Only https or plain http to
+an exact loopback host is accepted, because the check carries the key.
+
+The three front ends differ only in how the key is typed. The CLI prompts for
+the plan, prints the page whole, opens it, and reads the key with echo off;
+echo goes off before the prompt is written, so a paste that arrives early is
+not echoed by the terminal (`--api-key-stdin` and `--key-page` script it).
+`/login` lists such a provider as "API key" and walks plan page → paste. In
+the picker, a commit refused with `MissingCredentials` on a provider with no
+OAuth grant but a key setup enters the credential stage in paste mode: ↑/↓
+picks the plan, Tab opens its page, Enter hands the key to the worker and the
+field is wiped, and a landed key retries the pending commit. Every front end
+masks the key as a character count and draws the page URL whole so it can be
+copied.
 
 ## Controls
 
@@ -723,7 +781,10 @@ aborts the flow through the signal and returns to the stage the user came
 from; a landed login refreshes the catalog and retries the pending commit, so
 the route the user chose is the one that becomes active. The state machine
 stays pure (`Stage.credential`, `Outcome.login` / `Outcome.cancel_login`); the
-thread, the network and `App` live in the host and the worker.
+thread, the network and `App` live in the host and the worker. A provider with
+no OAuth grant but a key setup gets the same stage in paste mode
+(`CredentialMode.paste_key`, `Outcome.submit_key` / `Outcome.open_key_page`;
+see *Stored API keys and the guided key login*).
 
 ## Module map
 
@@ -748,9 +809,10 @@ thread, the network and `App` live in the host and the worker.
 | `src/provider/custom_provider.zig` | `custom_providers` schema, validation, materialization |
 | `src/provider/openrouter.zig` | model/endpoint catalogs, preferences → `RoutePolicy`, router metadata |
 | `src/provider/oauth.zig` | provider-scoped OAuth lifecycle (no I/O) |
+| `src/provider/api_key_store.zig` | provider-scoped API keys at rest, one 0600 file per provider |
 | `src/api/oauth_exchange.zig` | the `refresh_token` grant over HTTP |
 | `src/api/oauth_login.zig` | the interactive first-token grants (PKCE, device) |
-| `src/api/provider_login.zig` | the login entry both the CLI and `/login` call: typed refusals, then grant + durable import (#33) |
+| `src/api/provider_login.zig` | the login entry both the CLI and `/login` call: typed refusals, then grant + durable import (#33), or the checked pasted key |
 | `src/api/login_worker.zig` | a prepared login on a worker thread: `AbortSignal` cancellation, bounded `Notify` transcript, atomic state (#67) |
 | `src/api/catalog_fetch.zig` | catalog GET, bounded and status-classified |
 | `src/repl/model_picker.zig` | picker state machine (pure) |

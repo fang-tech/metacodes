@@ -655,8 +655,18 @@ fn postTokenForm(allocator: std.mem.Allocator, form: []const u8) ![]u8 {
     return response_body;
 }
 
+/// The program that opens a URL when `BROWSER` names none. macOS has no
+/// `xdg-open`: with it as the default, `/usr/bin/env` exec'd fine and then
+/// exited 127, so no sign-in page ever opened there and nothing said so.
+fn defaultOpener(os_tag: std.Target.Os.Tag) []const u8 {
+    return switch (os_tag) {
+        .macos => "open",
+        else => "xdg-open",
+    };
+}
+
 pub fn openBrowser(allocator: std.mem.Allocator, url: []const u8) !void {
-    const opener = if (std.c.getenv("BROWSER")) |b| std.mem.span(b) else "xdg-open";
+    const opener = if (std.c.getenv("BROWSER")) |b| std.mem.span(b) else defaultOpener(builtin.os.tag);
     const env_path = "/usr/bin/env";
     const env_z = try allocator.dupeZ(u8, env_path);
     defer allocator.free(env_z);
@@ -1109,4 +1119,10 @@ test "the loopback wait is not pinned by a client that connects and stalls" {
     const t = try std.Thread.spawn(.{}, Worker.run, .{ server.port, &signal });
     defer t.join();
     try std.testing.expectError(error.Aborted, server.waitForAuthorizationCode(std.testing.allocator, "s", &signal));
+}
+
+test "the default URL opener exists on the platform it is used on" {
+    try std.testing.expectEqualStrings("open", defaultOpener(.macos));
+    try std.testing.expectEqualStrings("xdg-open", defaultOpener(.linux));
+    try std.testing.expectEqualStrings("xdg-open", defaultOpener(.freebsd));
 }

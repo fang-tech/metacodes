@@ -548,22 +548,44 @@ fn containsFold(haystack: []const u8, needle: []const u8) bool {
 
 // ── /login ──────────────────────────────────────────────────────────────────
 
+/// What to do about a key that was not stored, by the flow's error name.
+fn failureAdvice(buffer: []u8, name: []const u8, provider_id: []const u8) []const u8 {
+    if (std.mem.startsWith(u8, name, "KeyRefused"))
+        return "The provider refused this key. Check that it was copied whole and that it is a key for the plan you chose.";
+    if (std.mem.startsWith(u8, name, "KeyCheckFailed"))
+        return std.fmt.bufPrint(buffer, "The key could not be checked (network or provider error); nothing was stored. Retry, or store it unchecked with `metacodes login --provider {s} --api-key-stdin --no-check`.", .{provider_id}) catch "The key could not be checked; nothing was stored.";
+    return "Nothing was stored.";
+}
+
 pub const LoginDialog = struct {
     pub const MAX_PROVIDERS = 12;
 
     pub const Choice = struct {
         profile: *const provider_profile.ProviderProfile,
-        flow: provider_login.Flow,
+        method: Method,
     };
 
-    pub const Stage = enum { choose, signing_in, failed };
+    /// How a provider is signed in to: a grant ready to run, or a key the user
+    /// creates on the provider's key page and pastes here
+    /// (`ProviderProfile.api_key_setup`).
+    pub const Method = union(enum) {
+        flow: provider_login.Flow,
+        api_key,
+    };
+
+    pub const Stage = enum { choose, key_page, key_entry, signing_in, failed };
 
     pub const Outcome = union(enum) {
         interrupted,
         signed_in: []const u8,
+        /// A pasted key was checked and stored for this provider.
+        key_stored: []const u8,
         /// The sign-in could not start (no worker thread, out of memory).
         failed: []const u8,
     };
+
+    /// Longest key accepted from a paste.
+    pub const MAX_KEY_LEN = provider_login.MAX_KEY_LEN;
 
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -580,6 +602,12 @@ pub const LoginDialog = struct {
     transcript: [login_worker_mod.TRANSCRIPT_CAPACITY]u8 = undefined,
     transcript_len: usize = 0,
     outcome: Outcome = .interrupted,
+    /// What a key flow is started with: where it is stored, whether a key
+    /// page may be opened in the browser.
+    key_options: provider_login.Options = .{ .state_root = "" },
+    key_page: usize = 0,
+    key_buffer: [MAX_KEY_LEN]u8 = undefined,
+    key_len: usize = 0,
 
     pub fn add(self: *LoginDialog, choice: Choice) void {
         if (self.choices_len >= MAX_PROVIDERS) return;
@@ -589,12 +617,15 @@ pub const LoginDialog = struct {
 
     /// Jump straight to signing in (`/login <provider>`).
     pub fn startAt(self: *LoginDialog, index: usize) void {
+        // A provider past `MAX_PROVIDERS` was never added; the list is shown.
+        if (index >= self.choices_len) return;
         self.sel = index;
         self.begin();
     }
 
     /// Ends any sign-in still owned here, waiting for its thread.
     pub fn deinit(self: *LoginDialog) void {
+        self.clearKey();
         if (self.detached) |worker| join(self.allocator, worker);
         self.detached = null;
         if (self.worker) |worker| {
@@ -631,6 +662,55 @@ pub const LoginDialog = struct {
     }
 
     fn begin(self: *LoginDialog) void {
+        switch (self.current().method) {
+            .flow => |flow| self.startFlow(flow),
+            .api_key => {
+                // The key page for the region the user is most likely on.
+                const profile = self.current().profile;
+                const default = profile.defaultKeyPage(profile.default_channel);
+                self.key_page = 0;
+                if (profile.api_key_setup) |setup| {
+                    for (setup.pages, 0..) |page, i| {
+                        if (default != null and page.id.eql(default.?.id)) self.key_page = i;
+                    }
+                }
+                self.clearKey();
+                self.failure_len = 0;
+                self.stage = .key_page;
+            },
+        }
+    }
+
+    fn keyPages(self: *const LoginDialog) []const provider_profile.KeyPage {
+        const setup = self.current().profile.api_key_setup orelse return &.{};
+        return setup.pages;
+    }
+
+    fn clearKey(self: *LoginDialog) void {
+        std.crypto.secureZero(u8, self.key_buffer[0..self.key_len]);
+        self.key_len = 0;
+    }
+
+    /// Check and store the pasted key on the worker thread. The worker copies
+    /// it, so the field is wiped as soon as the flow is handed over.
+    fn submitKey(self: *LoginDialog) void {
+        const pages = self.keyPages();
+        if (pages.len == 0) return;
+        const prepared = provider_login.prepareApiKey(
+            self.current().profile,
+            pages[self.key_page].id.slice(),
+            null,
+            self.key_buffer[0..self.key_len],
+            self.key_options,
+        ) catch |err| {
+            self.setFailure(@errorName(err));
+            return;
+        };
+        self.startFlow(.{ .api_key = prepared });
+        self.clearKey();
+    }
+
+    fn startFlow(self: *LoginDialog, flow: provider_login.Flow) void {
         self.stopWorker();
         self.transcript_len = 0;
         self.failure_len = 0;
@@ -638,7 +718,7 @@ pub const LoginDialog = struct {
             self.setFailure("out of memory");
             return;
         };
-        worker.* = login_worker_mod.LoginWorker.initFlow(self.allocator, self.io, self.current().flow);
+        worker.* = login_worker_mod.LoginWorker.initFlow(self.allocator, self.io, flow);
         worker.start() catch |err| {
             self.allocator.destroy(worker);
             self.setFailure(@errorName(err));
@@ -660,11 +740,15 @@ pub const LoginDialog = struct {
     }
 
     fn method(choice: *const Choice) []const u8 {
-        return switch (choice.flow) {
-            .metask => "device code",
-            .oauth => |prepared| switch (prepared.options.method) {
-                .loopback => "browser sign-in",
-                .device_code => "device code",
+        return switch (choice.method) {
+            .api_key => "API key",
+            .flow => |flow| switch (flow) {
+                .metask => "device code",
+                .api_key => "API key",
+                .oauth => |prepared| switch (prepared.options.method) {
+                    .loopback => "browser sign-in",
+                    .device_code => "device code",
+                },
             },
         };
     }
@@ -691,6 +775,49 @@ pub const LoginDialog = struct {
                 try p.blank();
                 try p.footer("↑/↓ to select · Enter to sign in · Esc to cancel");
             },
+            .key_page => {
+                const profile = self.current().profile;
+                var head_buf: [160]u8 = undefined;
+                try p.text(std.fmt.bufPrint(&head_buf, "Create an API key for {s}", .{profile.display_name}) catch "Create an API key");
+                try p.blank();
+                if (profile.api_key_setup) |setup| if (setup.note) |note| {
+                    try p.paragraph(p.th.warn, note);
+                    try p.blank();
+                };
+                try p.text("Which plan is the key for?");
+                try p.blank();
+                for (self.keyPages(), 0..) |page, i| {
+                    try p.option(i + 1, i == self.key_page, page.label, "");
+                }
+                try p.blank();
+                try p.footer(if (self.key_options.open_browser)
+                    "↑/↓ to select · Enter opens the page · Esc to go back"
+                else
+                    "↑/↓ to select · Enter to continue · Esc to go back");
+            },
+            .key_entry => {
+                const page = self.keyPages()[self.key_page];
+                try p.text("Create a key on this page, then paste it here:");
+                try p.blank();
+                try p.raw(page.url);
+                try p.blank();
+                var mask_buf: [64]u8 = undefined;
+                const shown = @min(self.key_len, 24);
+                var mask_len: usize = 0;
+                for (0..shown) |_| {
+                    // "•" is three bytes; the buffer holds 21 of them.
+                    if (mask_len + 3 > mask_buf.len) break;
+                    @memcpy(mask_buf[mask_len..][0..3], "\u{2022}");
+                    mask_len += 3;
+                }
+                var key_line: [160]u8 = undefined;
+                try p.text(if (self.key_len == 0)
+                    "Key: (paste it; it is not shown)"
+                else
+                    std.fmt.bufPrint(&key_line, "Key: {s}  ({d} characters)", .{ mask_buf[0..mask_len], self.key_len }) catch "Key: (entered)");
+                try p.blank();
+                try p.footer("Enter to check and store · Esc to go back");
+            },
             .signing_in => {
                 var head_buf: [128]u8 = undefined;
                 try p.text(std.fmt.bufPrint(&head_buf, "Signing in to {s}…", .{label(self.current())}) catch "Signing in…");
@@ -702,10 +829,17 @@ pub const LoginDialog = struct {
             .failed => {
                 const th = p.th;
                 var head_buf: [192]u8 = undefined;
-                try p.line(th.danger, std.fmt.bufPrint(&head_buf, "Sign-in to {s} failed: {s}", .{
-                    label(self.current()),
-                    self.failure[0..self.failure_len],
-                }) catch "Sign-in failed");
+                const keyed = self.current().method == .api_key;
+                const head_args = .{ label(self.current()), self.failure[0..self.failure_len] };
+                try p.line(th.danger, (if (keyed)
+                    std.fmt.bufPrint(&head_buf, "The key for {s} was not stored: {s}", head_args)
+                else
+                    std.fmt.bufPrint(&head_buf, "Sign-in to {s} failed: {s}", head_args)) catch "Sign-in failed");
+                if (keyed) {
+                    var advice_buf: [256]u8 = undefined;
+                    try p.blank();
+                    try p.paragraph("", failureAdvice(&advice_buf, self.failure[0..self.failure_len], self.current().profile.id.slice()));
+                }
                 try p.blank();
                 try p.footer("Enter to retry · Esc to cancel");
             },
@@ -768,6 +902,82 @@ pub const LoginDialog = struct {
                 },
                 else => return .none,
             },
+            .key_page => switch (k) {
+                .esc => {
+                    self.stage = .choose;
+                    return .redraw;
+                },
+                .ctrl_c => {
+                    self.outcome = .interrupted;
+                    return .done;
+                },
+                .up => {
+                    const n = self.keyPages().len;
+                    if (n == 0) return .none;
+                    self.key_page = if (self.key_page == 0) n - 1 else self.key_page - 1;
+                    return .redraw;
+                },
+                .down => {
+                    const n = self.keyPages().len;
+                    if (n == 0) return .none;
+                    self.key_page = (self.key_page + 1) % n;
+                    return .redraw;
+                },
+                .enter => {
+                    if (self.keyPages().len == 0) return .none;
+                    if (self.key_options.open_browser) {
+                        // Best effort: the page is also printed whole to copy.
+                        @import("../core/auth.zig").openBrowser(self.allocator, self.keyPages()[self.key_page].url) catch {};
+                    }
+                    self.stage = .key_entry;
+                    return .redraw;
+                },
+                .char => |c| {
+                    if (c < '1' or c > '9') return .none;
+                    const index: usize = c - '1';
+                    if (index >= self.keyPages().len) return .none;
+                    self.key_page = index;
+                    return .redraw;
+                },
+                else => return .none,
+            },
+            .key_entry => switch (k) {
+                .esc => {
+                    self.clearKey();
+                    self.stage = .key_page;
+                    return .redraw;
+                },
+                .ctrl_c => {
+                    self.clearKey();
+                    self.outcome = .interrupted;
+                    return .done;
+                },
+                .backspace => {
+                    if (self.key_len == 0) return .none;
+                    self.key_len -= 1;
+                    self.key_buffer[self.key_len] = 0;
+                    return .redraw;
+                },
+                .ctrl_u => {
+                    self.clearKey();
+                    return .redraw;
+                },
+                .enter => {
+                    if (std.mem.trim(u8, self.key_buffer[0..self.key_len], " \t").len == 0) return .none;
+                    self.submitKey();
+                    return .redraw;
+                },
+                .char => |c| {
+                    // A paste arrives as characters; whitespace and controls a
+                    // terminal adds around it are not part of a key.
+                    if (c <= ' ' or c == 0x7f) return .none;
+                    if (self.key_len == self.key_buffer.len) return .none;
+                    self.key_buffer[self.key_len] = c;
+                    self.key_len += 1;
+                    return .redraw;
+                },
+                else => return .none,
+            },
             .signing_in => switch (k) {
                 .esc, .ctrl_c => {
                     self.stopWorker();
@@ -782,7 +992,13 @@ pub const LoginDialog = struct {
                     return .done;
                 },
                 .enter => {
-                    self.begin();
+                    // A refused key is re-pasted on the same page.
+                    if (self.current().method == .api_key) {
+                        self.clearKey();
+                        self.stage = .key_entry;
+                    } else {
+                        self.begin();
+                    }
                     return .redraw;
                 },
                 else => return .none,
@@ -806,7 +1022,10 @@ pub const LoginDialog = struct {
             .idle, .running => return if (changed) .redraw else .none,
             .succeeded => {
                 self.stopWorker();
-                self.outcome = .{ .signed_in = label(self.current()) };
+                self.outcome = if (self.current().method == .api_key)
+                    .{ .key_stored = label(self.current()) }
+                else
+                    .{ .signed_in = label(self.current()) };
                 return .done;
             },
             .cancelled => {
@@ -1111,8 +1330,8 @@ test "login: the list wraps, numbers are shown, Esc interrupts" {
     var dialog = LoginDialog{ .allocator = testing.allocator, .io = undefined };
     defer dialog.deinit();
     const flow = try provider_login.prepareFlow(&profile, .{ .state_root = "", .open_browser = false, .port = 0 }, null);
-    dialog.add(.{ .profile = &profile, .flow = flow });
-    dialog.add(.{ .profile = &profile, .flow = flow });
+    dialog.add(.{ .profile = &profile, .method = .{ .flow = flow } });
+    dialog.add(.{ .profile = &profile, .method = .{ .flow = flow } });
     const plain = try renderPlain(&dialog, 80);
     defer testing.allocator.free(plain);
     try testing.expect(std.mem.indexOf(u8, plain, "> 1. Dialog Test · browser sign-in") != null);
@@ -1123,4 +1342,78 @@ test "login: the list wraps, numbers are shown, Esc interrupts" {
     try testing.expectEqual(@as(usize, 0), dialog.sel);
     try testing.expectEqual(Step.done, dialog.key(.esc));
     try testing.expect(dialog.outcome == .interrupted);
+}
+
+test "login: a key provider goes plan page → paste, and the key is never drawn" {
+    const zai = &@import("../provider/profiles/zai_coding_plan.zig").PROFILE;
+    var dialog = LoginDialog{ .allocator = testing.allocator, .io = undefined, .key_options = .{ .state_root = "", .open_browser = false } };
+    defer dialog.deinit();
+    dialog.add(.{ .profile = zai, .method = .api_key });
+    const listed = try renderPlain(&dialog, 200);
+    defer testing.allocator.free(listed);
+    try testing.expect(std.mem.indexOf(u8, listed, "Z.AI GLM Coding Plan · API key") != null);
+
+    try testing.expectEqual(Step.redraw, dialog.key(.enter));
+    try testing.expectEqual(LoginDialog.Stage.key_page, dialog.stage);
+    // The default channel is in China, so its personal plan page leads.
+    try testing.expectEqualStrings("cn-personal", dialog.keyPages()[dialog.key_page].id.slice());
+    const pages = try renderPlain(&dialog, 200);
+    defer testing.allocator.free(pages);
+    try testing.expect(std.mem.indexOf(u8, pages, "standard API Key page is billed to your balance") != null);
+    try testing.expect(std.mem.indexOf(u8, pages, "Global · Team Coding Plan") != null);
+    try testing.expectEqual(Step.redraw, dialog.key(.{ .char = '3' }));
+    try testing.expectEqualStrings("global-personal", dialog.keyPages()[dialog.key_page].id.slice());
+    try testing.expectEqual(Step.redraw, dialog.key(.up));
+    try testing.expectEqual(Step.redraw, dialog.key(.down));
+    try testing.expectEqual(Step.redraw, dialog.key(.enter));
+    try testing.expectEqual(LoginDialog.Stage.key_entry, dialog.stage);
+
+    // Nothing to submit yet; whitespace around a paste is not part of a key.
+    try testing.expectEqual(Step.none, dialog.key(.enter));
+    for (" sk-secret-42\n") |c| _ = dialog.key(.{ .char = c });
+    try testing.expectEqualStrings("sk-secret-42", dialog.key_buffer[0..dialog.key_len]);
+    const entry = try renderPlain(&dialog, 200);
+    defer testing.allocator.free(entry);
+    // The page is printed whole to copy; the key only as a count.
+    try testing.expect(std.mem.indexOf(u8, entry, "https://z.ai/manage-apikey/apikey-list") != null);
+    try testing.expect(std.mem.indexOf(u8, entry, "(12 characters)") != null);
+    try testing.expect(std.mem.indexOf(u8, entry, "sk-secret") == null);
+    try testing.expectEqual(Step.redraw, dialog.key(.backspace));
+    try testing.expectEqual(@as(usize, 11), dialog.key_len);
+    try testing.expectEqual(Step.redraw, dialog.key(.ctrl_u));
+    try testing.expectEqual(@as(usize, 0), dialog.key_len);
+
+    // Esc goes back a step and wipes what was typed; Ctrl-C interrupts.
+    for ("sk-again") |c| _ = dialog.key(.{ .char = c });
+    try testing.expectEqual(Step.redraw, dialog.key(.esc));
+    try testing.expectEqual(LoginDialog.Stage.key_page, dialog.stage);
+    try testing.expectEqual(@as(usize, 0), dialog.key_len);
+    for (dialog.key_buffer[0..8]) |byte| try testing.expectEqual(@as(u8, 0), byte);
+    try testing.expectEqual(Step.redraw, dialog.key(.esc));
+    try testing.expectEqual(LoginDialog.Stage.choose, dialog.stage);
+    try testing.expectEqual(Step.redraw, dialog.key(.enter));
+    try testing.expectEqual(Step.done, dialog.key(.ctrl_c));
+    try testing.expect(dialog.outcome == .interrupted);
+}
+
+test "login: a key that was not stored says why and what to do, by provider" {
+    const zai = &@import("../provider/profiles/zai_coding_plan.zig").PROFILE;
+    var dialog = LoginDialog{ .allocator = testing.allocator, .io = undefined, .key_options = .{ .state_root = "", .open_browser = false } };
+    defer dialog.deinit();
+    dialog.add(.{ .profile = zai, .method = .api_key });
+    _ = dialog.key(.enter);
+    _ = dialog.key(.enter);
+    dialog.setFailure("KeyCheckFailed (HttpError)");
+    const failed = try renderPlain(&dialog, 200);
+    defer testing.allocator.free(failed);
+    try testing.expect(std.mem.indexOf(u8, failed, "The key for Z.AI GLM Coding Plan was not stored: KeyCheckFailed") != null);
+    try testing.expect(std.mem.indexOf(u8, failed, "metacodes login --provider zai-coding-plan --api-key-stdin --no-check") != null);
+    // Enter re-pastes on the same page rather than starting over.
+    try testing.expectEqual(Step.redraw, dialog.key(.enter));
+    try testing.expectEqual(LoginDialog.Stage.key_entry, dialog.stage);
+
+    dialog.setFailure("KeyRefused");
+    const refused = try renderPlain(&dialog, 200);
+    defer testing.allocator.free(refused);
+    try testing.expect(std.mem.indexOf(u8, refused, "The provider refused this key") != null);
 }

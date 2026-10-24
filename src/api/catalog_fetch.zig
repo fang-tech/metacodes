@@ -37,7 +37,8 @@ pub const MAX_DOCUMENT_BYTES: usize = 8 * 1024 * 1024;
 pub const Request = struct {
     url: []const u8,
     /// Optional bearer credential. Catalog endpoints are usually public;
-    /// per-account pricing needs one.
+    /// per-account pricing needs one. A request that carries one does not
+    /// follow redirects (see `fetch`).
     bearer: ?[]const u8 = null,
 };
 
@@ -77,6 +78,13 @@ pub fn fetch(
 
     var http_request = client.request(.GET, uri, .{
         .extra_headers = headers[0..header_count],
+        // std's client re-sends `extra_headers` on every redirect hop,
+        // whatever host it points at, and in 0.16 never sends
+        // `privileged_headers` at all. A credential therefore never follows a
+        // redirect: the 3xx is answered as the non-2xx it is (`HttpError`).
+        // That also keeps a key check honest — a host that never saw the key
+        // has nothing to say about it.
+        .redirect_behavior = if (request.bearer == null) @enumFromInt(3) else .unhandled,
     }) catch return error.RequestFailed;
     defer http_request.deinit();
 

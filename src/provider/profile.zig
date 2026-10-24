@@ -440,6 +440,30 @@ pub const ProviderProfile = struct {
     /// parameter entirely, which is what a provider that scopes by client
     /// registration expects.
     oauth_scope: []const u8 = "",
+    /// Where a user of this provider creates an API key, for the guided
+    /// `login --provider` setup of a provider without an OAuth grant. Null
+    /// means the provider documents no such page.
+    api_key_setup: ?ApiKeySetup = null,
+
+    /// The key page for a channel's region, else the first page.
+    pub fn defaultKeyPage(self: ProviderProfile, channel_id: ?Slug) ?KeyPage {
+        const setup = self.api_key_setup orelse return null;
+        if (setup.pages.len == 0) return null;
+        if (channel_id) |id| if (self.channel(id)) |descriptor| if (descriptor.region) |region| {
+            for (setup.pages) |page| {
+                if (page.region) |page_region| if (std.mem.eql(u8, page_region, region)) return page;
+            }
+        };
+        return setup.pages[0];
+    }
+
+    pub fn keyPage(self: ProviderProfile, id: []const u8) ?KeyPage {
+        const setup = self.api_key_setup orelse return null;
+        for (setup.pages) |page| {
+            if (page.id.eqlText(id)) return page;
+        }
+        return null;
+    }
 
     /// True when this profile can obtain a first token without the user
     /// producing a token response by other means.
@@ -485,10 +509,35 @@ pub const ProviderProfile = struct {
     }
 };
 
+/// One place a user creates an API key for a provider.
+pub const KeyPage = struct {
+    /// What the CLI names (`--key-page cn-personal`).
+    id: Slug,
+    /// What the user reads, e.g. "China · Personal Coding Plan".
+    label: []const u8,
+    url: []const u8,
+    /// A GET with the key as bearer that the provider does not bill: 200 means
+    /// it accepts the key, 401/403 that it refuses it. Null: keys are stored
+    /// unchecked.
+    check_url: ?[]const u8 = null,
+    /// Matched against `ChannelDescriptor.region` to pick the default page.
+    region: ?[]const u8 = null,
+};
+
+/// The guided API-key setup a profile declares (`ProviderProfile.api_key_setup`).
+pub const ApiKeySetup = struct {
+    /// The kind a pasted key is stored and resolved as.
+    kind: CredentialKind,
+    pages: []const KeyPage,
+    /// One thing the user must know before creating the key.
+    note: ?[]const u8 = null,
+};
+
 /// Structural validation performed before a profile is admitted to the
 /// registry. Catching these at registration keeps every downstream consumer
 /// free of "can this even be routed?" defensive code.
 pub const ProfileError = error{
+    InvalidKeySetup,
     NoChannels,
     NoRoutes,
     DuplicateChannelId,
@@ -538,6 +587,23 @@ pub fn validateProfile(profile: ProviderProfile) ProfileError!void {
 
     if (profile.default_channel) |id| {
         if (profile.channel(id) == null) return error.UnknownDefaultChannel;
+    }
+
+    if (profile.api_key_setup) |setup| {
+        var accepted = false;
+        for (profile.accepted_credential_kinds) |kind| {
+            if (kind == setup.kind) accepted = true;
+        }
+        // A page a user is sent to, or a check a key is sent to, over plain
+        // HTTP would hand the key to anyone on the path.
+        if (!accepted or setup.pages.len == 0) return error.InvalidKeySetup;
+        for (setup.pages, 0..) |page, index| {
+            if (!std.mem.startsWith(u8, page.url, "https://")) return error.InvalidKeySetup;
+            if (page.check_url) |url| if (!std.mem.startsWith(u8, url, "https://")) return error.InvalidKeySetup;
+            for (setup.pages[index + 1 ..]) |other| {
+                if (page.id.eql(other.id)) return error.InvalidKeySetup;
+            }
+        }
     }
 }
 
@@ -858,4 +924,40 @@ test "an endpoint may not carry credentials in its userinfo" {
     }
     // The declared bases of every built-in profile are checked the same way by
     // `validateProfile`, so a profile cannot ship one either.
+}
+
+test "a key setup is admitted only with an accepted kind and https pages of distinct ids" {
+    const one_route = [_]ProtocolRoute{.{ .protocol = .openai_chat }};
+    const channels = [_]ChannelDescriptor{
+        .{ .id = Slug.lit("cn"), .display_name = "China", .base_url = "https://example.test/v1", .routes = &one_route, .region = "cn" },
+    };
+    const good_pages = [_]KeyPage{
+        .{ .id = Slug.lit("global"), .label = "Global", .url = "https://example.test/global/keys", .region = "global" },
+        .{ .id = Slug.lit("cn"), .label = "China", .url = "https://example.test/cn/keys", .check_url = "https://example.test/v1/models", .region = "cn" },
+    };
+    var profile = testProfile(&channels, .{});
+    profile.api_key_setup = .{ .kind = .api_key, .pages = &good_pages };
+    try validateProfile(profile);
+    // The default page follows the channel's region, else the first page.
+    try std.testing.expectEqualStrings("cn", profile.defaultKeyPage(Slug.lit("cn")).?.id.slice());
+    try std.testing.expectEqualStrings("global", profile.defaultKeyPage(null).?.id.slice());
+    try std.testing.expectEqualStrings("global", profile.keyPage("global").?.id.slice());
+    try std.testing.expect(profile.keyPage("missing") == null);
+
+    profile.api_key_setup = .{ .kind = .zai_coding_plan_api_key, .pages = &good_pages };
+    try std.testing.expectError(error.InvalidKeySetup, validateProfile(profile));
+    profile.api_key_setup = .{ .kind = .api_key, .pages = &.{} };
+    try std.testing.expectError(error.InvalidKeySetup, validateProfile(profile));
+    const plain_page = [_]KeyPage{.{ .id = Slug.lit("a"), .label = "A", .url = "http://example.test/keys" }};
+    profile.api_key_setup = .{ .kind = .api_key, .pages = &plain_page };
+    try std.testing.expectError(error.InvalidKeySetup, validateProfile(profile));
+    const plain_check = [_]KeyPage{.{ .id = Slug.lit("a"), .label = "A", .url = "https://example.test/keys", .check_url = "http://example.test/models" }};
+    profile.api_key_setup = .{ .kind = .api_key, .pages = &plain_check };
+    try std.testing.expectError(error.InvalidKeySetup, validateProfile(profile));
+    const twice = [_]KeyPage{
+        .{ .id = Slug.lit("a"), .label = "A", .url = "https://example.test/a" },
+        .{ .id = Slug.lit("a"), .label = "A again", .url = "https://example.test/b" },
+    };
+    profile.api_key_setup = .{ .kind = .api_key, .pages = &twice };
+    try std.testing.expectError(error.InvalidKeySetup, validateProfile(profile));
 }

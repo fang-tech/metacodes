@@ -151,6 +151,50 @@ const CHANNELS = [_]profile.ChannelDescriptor{
 
 const CREDENTIAL_KINDS = [_]profile.CredentialKind{.zai_coding_plan_api_key};
 
+/// Where a Coding Plan key is created (docs.bigmodel.cn/cn/coding-plan/notice/
+/// api-key-management, docs.z.ai/devpack/notice/api-key-management, 2026-10).
+/// Since 2026-10-16 standard and plan keys are separate: a key from the
+/// standard API-key page bills the account balance even on these endpoints,
+/// which is why every page here is a plan page. The check lists the plan's
+/// models over the OpenAI wire: it answers 401 without a valid key and is not
+/// a model call.
+const KEY_PAGES = [_]profile.KeyPage{
+    .{
+        .id = Slug.lit("cn-personal"),
+        .label = "China · Personal Coding Plan",
+        .url = "https://bigmodel.cn/coding-plan/personal/overview",
+        .check_url = CN_OPENAI_BASE ++ "/models",
+        .region = "cn",
+    },
+    .{
+        .id = Slug.lit("cn-team"),
+        .label = "China · Team Coding Plan",
+        .url = "https://bigmodel.cn/coding-plan?z_plan=team",
+        .check_url = CN_OPENAI_BASE ++ "/models",
+        .region = "cn",
+    },
+    .{
+        .id = Slug.lit("global-personal"),
+        .label = "Global · Personal Coding Plan",
+        .url = "https://z.ai/manage-apikey/apikey-list",
+        .check_url = GLOBAL_OPENAI_BASE ++ "/models",
+        .region = "global",
+    },
+    .{
+        .id = Slug.lit("global-team"),
+        .label = "Global · Team Coding Plan",
+        .url = "https://z.ai/manage-apikey/coding-plan/team/my-plan",
+        .check_url = GLOBAL_OPENAI_BASE ++ "/models",
+        .region = "global",
+    },
+};
+
+const KEY_SETUP = profile.ApiKeySetup{
+    .kind = .zai_coding_plan_api_key,
+    .pages = &KEY_PAGES,
+    .note = "Create the key on your Coding Plan page. A key from the standard API Key page is billed to your balance, not your plan.",
+};
+
 /// `ZAI_API_KEY` is the documented canonical name; the other two are accepted
 /// aliases. Adding an alias is a change to this list, not to the resolver.
 const ENV_ALIASES = [_]profile.EnvAlias{
@@ -206,6 +250,7 @@ pub const PROFILE = profile.ProviderProfile{
     // China is the launch default; the Anthropic wire is the better-exercised
     // transport in this codebase, so it is the default channel.
     .default_channel = Slug.lit("cn-anthropic"),
+    .api_key_setup = KEY_SETUP,
     .endpoint_policy = .{ .forbidden_path_fragments = &FORBIDDEN },
     .classify_error = classifyError,
 };
@@ -356,4 +401,20 @@ test "coding-plan quotes stay unknown because the plan is not billed per token" 
         );
     }
     try std.testing.expect(PROFILE.quote_hook == null);
+}
+
+test "the Coding Plan key pages are plan pages, checked on the plan's own endpoint" {
+    try profile.validateProfile(PROFILE);
+    const setup = PROFILE.api_key_setup.?;
+    try std.testing.expectEqual(@as(usize, 4), setup.pages.len);
+    for (setup.pages) |page| {
+        // Never the standard API-key page, whose keys bill the balance.
+        try std.testing.expect(std.mem.indexOf(u8, page.url, "usercenter/proj-mgmt/apikeys") == null);
+        try std.testing.expect(std.mem.indexOf(u8, page.check_url.?, "/api/coding/paas/v4/models") != null);
+    }
+    // The default page follows the channel's region.
+    try std.testing.expectEqualStrings("cn-personal", PROFILE.defaultKeyPage(Slug.lit("cn-anthropic")).?.id.slice());
+    try std.testing.expectEqualStrings("global-personal", PROFILE.defaultKeyPage(Slug.lit("global-openai")).?.id.slice());
+    try std.testing.expectEqualStrings("cn-personal", PROFILE.defaultKeyPage(null).?.id.slice());
+    try std.testing.expectEqualStrings("Global · Team Coding Plan", PROFILE.keyPage("global-team").?.label);
 }
