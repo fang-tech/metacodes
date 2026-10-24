@@ -932,11 +932,9 @@ pub const RenderRegion = struct {
             return rows + 1;
         }
 
-        const MAX_ROWS: u16 = @intCast(complete.MODEL_MENU_MAX_ROWS);
-        const selected_idx = @min(self.ui.slash_sel, @min(entries.len, complete.MODEL_MENU_MAX_ROWS) - 1);
-        var shown: u16 = 0;
-        for (entries, 0..) |entry, i| {
-            if (shown >= MAX_ROWS) break;
+        const selected_idx = @min(self.ui.slash_sel, entries.len - 1);
+        const window = complete.menuWindow(entries.len, selected_idx, complete.MODEL_MENU_MAX_ROWS);
+        for (entries[window.top..window.end], window.top..) |entry, i| {
             const selected = i == selected_idx;
             const color = if (selected) th.accent else th.dim;
             w.writeAll(ansi.clear.line) catch {};
@@ -951,16 +949,19 @@ pub const RenderRegion = struct {
             w.print("{s} {s}...{s}{s}", .{ th.reset, th.dim, entry.suffix, th.reset }) catch {};
             w.writeAll("\r\n") catch {};
             rows += 1;
-            shown += 1;
-            if (shown == MAX_ROWS and i + 1 < entries.len) {
-                w.writeAll(ansi.clear.line) catch {};
-                w.print("  {s}… +{d} more API keys{s}", .{ th.dim, entries.len - shown, th.reset }) catch {};
-                w.writeAll("\r\n") catch {};
-                rows += 1;
-                break;
-            }
         }
-        return rows;
+        return rows + self.drawMenuPosition(w, selected_idx, entries.len);
+    }
+
+    /// `[n/m]` under a list menu longer than its window, naming the keys that
+    /// reach the rest. Nothing for a list that fits. Returns the rows drawn.
+    fn drawMenuPosition(self: *RenderRegion, w: *std.Io.Writer, selected: usize, len: usize) u16 {
+        if (len <= complete.MODEL_MENU_MAX_ROWS) return 0;
+        const th = self.theme;
+        w.writeAll(ansi.clear.line) catch {};
+        w.print("  {s}[{d}/{d}] · PgUp/PgDn page · Home/End{s}", .{ th.dim, selected + 1, len, th.reset }) catch {};
+        w.writeAll("\r\n") catch {};
+        return 1;
     }
 
     /// 输入框里正好是 `/model` 时,在下边框与 footer 之间显示启动期从服务端 `/v1/models`
@@ -993,12 +994,10 @@ pub const RenderRegion = struct {
             return rows + 1;
         }
 
-        const MAX_ROWS: u16 = @intCast(complete.MODEL_MENU_MAX_ROWS);
         const id_max: usize = if (self.cols > 42) self.cols - 42 else 24;
-        const selected_idx = @min(self.ui.slash_sel, @min(entries.len, complete.MODEL_MENU_MAX_ROWS) - 1);
-        var shown: u16 = 0;
-        for (entries, 0..) |entry, i| {
-            if (shown >= MAX_ROWS) break;
+        const selected_idx = @min(self.ui.slash_sel, entries.len - 1);
+        const window = complete.menuWindow(entries.len, selected_idx, complete.MODEL_MENU_MAX_ROWS);
+        for (entries[window.top..window.end], window.top..) |entry, i| {
             const selected = i == selected_idx;
             const current = std.mem.eql(u8, entry.model_id, app.activeModel());
             const color = if (selected or current) th.accent else th.dim;
@@ -1014,17 +1013,8 @@ pub const RenderRegion = struct {
             w.print(" {s}{s}", .{ caps, th.reset }) catch {};
             w.writeAll("\r\n") catch {};
             rows += 1;
-            shown += 1;
-
-            if (shown == MAX_ROWS and i + 1 < entries.len) {
-                w.writeAll(ansi.clear.line) catch {};
-                w.print("  {s}… +{d} more from server{s}", .{ th.dim, entries.len - shown, th.reset }) catch {};
-                w.writeAll("\r\n") catch {};
-                rows += 1;
-                break;
-            }
         }
-        return rows;
+        return rows + self.drawMenuPosition(w, selected_idx, entries.len);
     }
 
     /// 画 @-mention 文件菜单(`@token`,下边框与 footer 之间)。每行 `+ <path>`(对齐 cc),

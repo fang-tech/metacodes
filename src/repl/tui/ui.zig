@@ -139,6 +139,8 @@ fn dispatchKey(state: *UiState, key: input.Key, now_ms: i64) Effect {
             .down => .down,
             .page_up => .page_up,
             .page_down => .page_down,
+            .home => .home,
+            .end => .end,
             .enter => .enter,
             .esc => .escape,
             .backspace => .backspace,
@@ -222,8 +224,12 @@ fn dispatchKey(state: *UiState, key: input.Key, now_ms: i64) Effect {
         const gen_models = state.phase == .generating;
         if (!gen_models and complete.modelsMenuOpen(state.editor.view)) {
             switch (key) {
-                .down => return .{ .action = .models_nav, .at_nav_dir = true },
-                .up => return .{ .action = .models_nav, .at_nav_dir = false },
+                .down => return .{ .action = .models_nav, .menu_step = .next },
+                .up => return .{ .action = .models_nav, .menu_step = .previous },
+                .page_down => return .{ .action = .models_nav, .menu_step = .page_down },
+                .page_up => return .{ .action = .models_nav, .menu_step = .page_up },
+                .home => return .{ .action = .models_nav, .menu_step = .first },
+                .end => return .{ .action = .models_nav, .menu_step = .last },
                 .enter => return .{ .action = .models_select },
                 else => {},
             }

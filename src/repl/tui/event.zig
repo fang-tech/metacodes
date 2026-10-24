@@ -145,8 +145,10 @@ pub const Effect = struct {
     immediate: bool = false,
     /// 非渲染语义动作,交主循环处理。
     action: LoopAction = .none,
-    /// nav 方向:true=down(下/选下一个),false=up。仅 action==.at_nav/.model_nav/.models_nav 时有意义。
+    /// nav 方向:true=down(下/选下一个),false=up。仅 action==.at_nav/.model_nav 时有意义。
     at_nav_dir: bool = true,
+    /// How `.models_nav` moves the `/models` selection (arrows, pages, ends).
+    menu_step: @import("../complete.zig").MenuStep = .next,
     /// 仅 action==.picker_key 时有意义:要喂给 picker 状态机的键。
     picker_key: @import("../model_picker.zig").Key = .escape,
 };

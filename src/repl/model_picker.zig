@@ -90,6 +90,9 @@ pub const Key = union(enum) {
     down,
     page_up,
     page_down,
+    /// First and last row of the stage.
+    home,
+    end,
     enter,
     /// Clears the filter, then walks back a stage, then closes.
     escape,
@@ -289,31 +292,48 @@ pub const Picker = struct {
 
     // ── row construction ────────────────────────────────────────────────────
 
-    /// Fill `out` with the rows of the current stage. Returns the used prefix.
-    /// Rows are recomputed rather than cached: the filter changes them on every
-    /// keystroke, and a cache that missed one keystroke would highlight a row
-    /// the user is not looking at.
-    pub fn rows(self: *const Picker, out: []Row) []const Row {
-        return switch (self.stage) {
-            .provider => self.providerRows(out),
-            .model => self.modelRows(out),
-            .offer => self.offerRows(out),
-            .options => self.controlRows(out),
-            .credential => out[0..0],
-        };
+    /// Storage for one stage's rows, owned by the caller and sized by the
+    /// catalog. There is deliberately no fixed capacity: a stage capped at a
+    /// constant silently dropped every model past it (a gateway listing 300
+    /// models showed `[1/256]`, and the last 44 could not be reached).
+    pub const RowBuffer = struct {
+        gpa: std.mem.Allocator,
+        list: std.ArrayList(Row) = .empty,
+
+        pub fn init(gpa: std.mem.Allocator) RowBuffer {
+            return .{ .gpa = gpa };
+        }
+
+        pub fn deinit(self: *RowBuffer) void {
+            self.list.deinit(self.gpa);
+            self.* = undefined;
+        }
+    };
+
+    /// The rows of the current stage, rebuilt into `buffer` (its previous rows
+    /// are dropped). Rows are recomputed rather than cached: the filter changes
+    /// them on every keystroke, and a cache that missed one keystroke would
+    /// highlight a row the user is not looking at.
+    pub fn rows(self: *const Picker, buffer: *RowBuffer) error{OutOfMemory}![]const Row {
+        buffer.list.clearRetainingCapacity();
+        switch (self.stage) {
+            .provider => try self.providerRows(buffer),
+            .model => try self.modelRows(buffer),
+            .offer => try self.offerRows(buffer),
+            .options => try self.controlRows(buffer),
+            .credential => {},
+        }
+        return buffer.list.items;
     }
 
+    /// Row count of the current stage; 0 when the rows cannot be built.
     pub fn rowCount(self: *const Picker) usize {
-        var scratch: [MAX_ROWS]Row = undefined;
-        return self.rows(&scratch).len;
+        var buffer = RowBuffer.init(self.allocator);
+        defer buffer.deinit();
+        return (self.rows(&buffer) catch return 0).len;
     }
 
-    /// Upper bound for a stage's row count. Sized to the largest catalog the
-    /// kernel will page out at once.
-    pub const MAX_ROWS: usize = 256;
-
-    fn providerRows(self: *const Picker, out: []Row) []const Row {
-        var len: usize = 0;
+    fn providerRows(self: *const Picker, buffer: *RowBuffer) error{OutOfMemory}!void {
         // By pointer: a provider id is an inline `Slug`, so the label of a by-value
         // capture points into the loop variable. Every stored label then read the
         // offer being visited, and providers whose ids had the same length
@@ -327,74 +347,58 @@ pub const Picker = struct {
             if (!matches(self.filter(), label) and
                 !matches(self.filter(), offer.display_name) and
                 !matches(self.filter(), canonicalKey(offer.*))) continue;
-            if (findGroup(out[0..len], label, self)) |existing| {
-                bumpGroup(&out[existing], index, self.isCurrent(offer.*));
+            if (findGroup(buffer.list.items, label, self)) |existing| {
+                bumpGroup(&buffer.list.items[existing], index, self.isCurrent(offer.*));
                 continue;
             }
-            if (len == out.len) break;
-            out[len] = .{ .provider = .{
+            try buffer.list.append(buffer.gpa, .{ .provider = .{
                 .offer_index = index,
                 .offer_count = 1,
                 .label = label,
                 .is_current = self.isCurrent(offer.*),
-            } };
-            len += 1;
+            } });
         }
-        return out[0..len];
     }
 
-    fn modelRows(self: *const Picker, out: []Row) []const Row {
-        const wanted = self.provider orelse return out[0..0];
-        var len: usize = 0;
+    fn modelRows(self: *const Picker, buffer: *RowBuffer) error{OutOfMemory}!void {
+        const wanted = self.provider orelse return;
         for (self.offers.items, 0..) |offer, index| {
             if (!offer.provider_id.eql(wanted)) continue;
             const key = canonicalKey(offer);
             if (!matches(self.filter(), offer.display_name) and
                 !matches(self.filter(), key) and
                 !matches(self.filter(), offer.request_model_id)) continue;
-            if (findGroupByKey(out[0..len], key, self)) |existing| {
-                bumpGroup(&out[existing], index, self.isCurrent(offer));
+            if (findGroupByKey(buffer.list.items, key, self)) |existing| {
+                bumpGroup(&buffer.list.items[existing], index, self.isCurrent(offer));
                 continue;
             }
-            if (len == out.len) break;
-            out[len] = .{ .model = .{
+            try buffer.list.append(buffer.gpa, .{ .model = .{
                 .offer_index = index,
                 .offer_count = 1,
                 .label = key,
                 .is_current = self.isCurrent(offer),
-            } };
-            len += 1;
+            } });
         }
-        return out[0..len];
     }
 
-    fn offerRows(self: *const Picker, out: []Row) []const Row {
-        const wanted = self.provider orelse return out[0..0];
+    fn offerRows(self: *const Picker, buffer: *RowBuffer) error{OutOfMemory}!void {
+        const wanted = self.provider orelse return;
         const key = self.groupKey();
-        var len: usize = 0;
         for (self.offers.items, 0..) |offer, index| {
             if (!offer.provider_id.eql(wanted)) continue;
             if (!std.mem.eql(u8, canonicalKey(offer), key)) continue;
             // Deliberately no filter on this stage: it exists precisely to show
             // every route behind one visible name, and a filter over names
             // would hide the ones that share it.
-            if (len == out.len) break;
-            out[len] = .{ .offer = .{ .offer_index = index, .is_current = self.isCurrent(offer) } };
-            len += 1;
+            try buffer.list.append(buffer.gpa, .{ .offer = .{ .offer_index = index, .is_current = self.isCurrent(offer) } });
         }
-        return out[0..len];
     }
 
-    fn controlRows(self: *const Picker, out: []Row) []const Row {
-        const index = self.currentOfferIndex() orelse return out[0..0];
-        const specs = self.offers.items[index].controls;
-        var len: usize = 0;
-        for (specs, 0..) |_, spec_index| {
-            if (len == out.len) break;
-            out[len] = .{ .control = .{ .spec_index = spec_index, .offer_index = index } };
-            len += 1;
+    fn controlRows(self: *const Picker, buffer: *RowBuffer) error{OutOfMemory}!void {
+        const index = self.currentOfferIndex() orelse return;
+        for (self.offers.items[index].controls, 0..) |_, spec_index| {
+            try buffer.list.append(buffer.gpa, .{ .control = .{ .spec_index = spec_index, .offer_index = index } });
         }
-        return out[0..len];
     }
 
     fn currentOfferIndex(self: *const Picker) ?usize {
@@ -422,13 +426,17 @@ pub const Picker = struct {
         // The credential stage has no list to move in and nothing to type:
         // only Esc, which ends the sign-in.
         if (self.stage == .credential) return if (key == .escape) self.back() else .ignored;
-        var scratch: [MAX_ROWS]Row = undefined;
-        const visible = self.rows(&scratch);
+        var buffer = RowBuffer.init(self.allocator);
+        defer buffer.deinit();
+        // Without its rows a key cannot be interpreted; nothing changes.
+        const visible = self.rows(&buffer) catch return .ignored;
         switch (key) {
             .up => return self.move(visible.len, false),
             .down => return self.move(visible.len, true),
             .page_up => return self.pageMove(visible.len, false),
             .page_down => return self.pageMove(visible.len, true),
+            .home => return self.jump(visible.len, false),
+            .end => return self.jump(visible.len, true),
             .cycle_scope => {
                 self.scope = switch (self.scope) {
                     .session => .global,
@@ -480,6 +488,13 @@ pub const Picker = struct {
         } else {
             self.cursor -|= step;
         }
+        self.scrollTo(count);
+        return .redraw;
+    }
+
+    fn jump(self: *Picker, count: usize, to_end: bool) Outcome {
+        if (count == 0) return .ignored;
+        self.cursor = if (to_end) count - 1 else 0;
         self.scrollTo(count);
         return .redraw;
     }
@@ -553,11 +568,10 @@ pub const Picker = struct {
     }
 
     fn offerCountForGroup(self: *const Picker) usize {
-        var scratch: [MAX_ROWS]Row = undefined;
         var probe = self.*;
         probe.stage = .offer;
         probe.filter_len = 0;
-        return probe.offerRows(&scratch).len;
+        return probe.rowCount();
     }
 
     fn advance(self: *Picker, visible: []const Row) Outcome {
@@ -777,11 +791,12 @@ test "offers sharing a visible name stay distinct routes" {
     };
     try loadFixture(&picker, &offers, null);
 
-    var scratch: [Picker.MAX_ROWS]Row = undefined;
-    try testing.expectEqual(@as(usize, 1), picker.rows(&scratch).len);
+    var scratch = Picker.RowBuffer.init(testing.allocator);
+    defer scratch.deinit();
+    try testing.expectEqual(@as(usize, 1), (try picker.rows(&scratch)).len);
     _ = picker.onKey(.enter); // provider
 
-    const model_rows = picker.rows(&scratch);
+    const model_rows = (try picker.rows(&scratch));
     try testing.expectEqual(@as(usize, 1), model_rows.len);
     // One name, three routes. Collapsing them here is the failure this whole
     // grouping rule exists to prevent.
@@ -789,7 +804,7 @@ test "offers sharing a visible name stay distinct routes" {
 
     _ = picker.onKey(.enter); // model → offer stage, not a commit
     try testing.expectEqual(Stage.offer, picker.stage);
-    try testing.expectEqual(@as(usize, 3), picker.rows(&scratch).len);
+    try testing.expectEqual(@as(usize, 3), (try picker.rows(&scratch)).len);
 }
 
 test "providers whose ids have the same length stay separate rows" {
@@ -808,8 +823,9 @@ test "providers whose ids have the same length stay separate rows" {
     };
     try loadFixture(&picker, &offers, null);
 
-    var scratch: [Picker.MAX_ROWS]Row = undefined;
-    const provider_rows = picker.rows(&scratch);
+    var scratch = Picker.RowBuffer.init(testing.allocator);
+    defer scratch.deinit();
+    const provider_rows = (try picker.rows(&scratch));
     try testing.expectEqual(@as(usize, 3), provider_rows.len);
     const expected = [_]struct { id: []const u8, count: usize }{
         .{ .id = "metask", .count = 2 },
@@ -828,11 +844,48 @@ test "providers whose ids have the same length stay separate rows" {
     _ = picker.onKey(.down);
     _ = picker.onKey(.enter);
     try testing.expectEqual(Stage.model, picker.stage);
-    const model_rows = picker.rows(&scratch);
+    const model_rows = (try picker.rows(&scratch));
     try testing.expectEqual(@as(usize, 3), model_rows.len);
     for (model_rows) |row| {
         try testing.expectEqualStrings("openai", picker.offers.items[row.model.offer_index].provider_id.slice());
     }
+}
+
+test "a stage lists every model however large the catalog, and Home/End reach both ends" {
+    // A fixed row buffer of 256 once capped every stage: a gateway listing 300
+    // models showed `[1/256]`, and the last 44 could be reached only by name.
+    const count = 300;
+    var picker = Picker.init(testing.allocator);
+    defer picker.deinit();
+    var names: [count][8]u8 = undefined;
+    var offers: [count]OfferSummary = undefined;
+    for (&offers, 0..) |*slot, index| {
+        const id = std.fmt.bufPrint(&names[index], "m-{d:0>3}", .{index + 1}) catch unreachable;
+        slot.* = fixtureOffer("metask", "default", id, null, id, "anthropic_messages");
+    }
+    try loadFixture(&picker, &offers, null);
+    _ = picker.onKey(.enter); // provider
+    picker.page_rows = 8;
+
+    var scratch = Picker.RowBuffer.init(testing.allocator);
+    defer scratch.deinit();
+    const model_rows = try picker.rows(&scratch);
+    try testing.expectEqual(@as(usize, count), model_rows.len);
+    try testing.expectEqualStrings("m-300", model_rows[count - 1].model.label);
+
+    try testing.expect(picker.onKey(.end) == .redraw);
+    try testing.expectEqual(@as(usize, count - 1), picker.cursor);
+    try testing.expectEqual(@as(usize, count - 8), picker.window_top);
+    try testing.expect(picker.onKey(.home) == .redraw);
+    try testing.expectEqual(@as(usize, 0), picker.cursor);
+    try testing.expectEqual(@as(usize, 0), picker.window_top);
+    // Up from the first row wraps to the last, not to the 256th.
+    _ = picker.onKey(.up);
+    try testing.expectEqual(@as(usize, count - 1), picker.cursor);
+    // And Enter on it commits the 300th model.
+    const outcome = picker.onKey(.enter);
+    try testing.expect(outcome == .commit);
+    try testing.expect(outcome.commit.offer_id.eql(offers[count - 1].offer_id));
 }
 
 test "a model with one route skips the channel step and commits" {
@@ -883,12 +936,13 @@ test "the filter is a subsequence match and Esc clears it before walking back" {
     try loadFixture(&picker, &offers, null);
     _ = picker.onKey(.enter); // provider
 
-    var scratch: [Picker.MAX_ROWS]Row = undefined;
-    try testing.expectEqual(@as(usize, 2), picker.rows(&scratch).len);
+    var scratch = Picker.RowBuffer.init(testing.allocator);
+    defer scratch.deinit();
+    try testing.expectEqual(@as(usize, 2), (try picker.rows(&scratch)).len);
 
     for ("g46") |byte| _ = picker.onKey(.{ .char = byte });
     try testing.expectEqualStrings("g46", picker.filter());
-    try testing.expectEqual(@as(usize, 1), picker.rows(&scratch).len);
+    try testing.expectEqual(@as(usize, 1), (try picker.rows(&scratch)).len);
 
     // Esc clears the filter first; it does not jump back a stage and lose the
     // provider the user already chose.
@@ -979,8 +1033,9 @@ test "the current selection is marked through its group" {
     };
     try loadFixture(&picker, &offers, offers[1].offer_id);
 
-    var scratch: [Picker.MAX_ROWS]Row = undefined;
-    const provider_rows = picker.rows(&scratch);
+    var scratch = Picker.RowBuffer.init(testing.allocator);
+    defer scratch.deinit();
+    const provider_rows = (try picker.rows(&scratch));
     try testing.expectEqual(@as(usize, 2), provider_rows.len);
     try testing.expect(!provider_rows[0].provider.is_current);
     try testing.expect(provider_rows[1].provider.is_current);
@@ -1158,13 +1213,14 @@ test "the provider stage is searchable by what a provider serves" {
     };
     try loadFixture(&picker, &offers, null);
 
-    var scratch: [Picker.MAX_ROWS]Row = undefined;
-    try testing.expectEqual(@as(usize, 2), picker.rows(&scratch).len);
+    var scratch = Picker.RowBuffer.init(testing.allocator);
+    defer scratch.deinit();
+    try testing.expectEqual(@as(usize, 2), (try picker.rows(&scratch)).len);
 
     // "glm" names no provider, but it is what the user is looking for — and
     // the provider stage is the one where they know least.
     for ("glm") |byte| _ = picker.onKey(.{ .char = byte });
-    const filtered = picker.rows(&scratch);
+    const filtered = (try picker.rows(&scratch));
     try testing.expectEqual(@as(usize, 1), filtered.len);
     try testing.expect(picker.offers.items[filtered[0].provider.offer_index].provider_id.eqlText("zai-coding-plan"));
     // The count reflects the offers that matched, so the row does not promise
@@ -1174,7 +1230,7 @@ test "the provider stage is searchable by what a provider serves" {
     // Filtering by provider id still works.
     picker.restart();
     for ("metask") |byte| _ = picker.onKey(.{ .char = byte });
-    try testing.expectEqual(@as(usize, 1), picker.rows(&scratch).len);
+    try testing.expectEqual(@as(usize, 1), (try picker.rows(&scratch)).len);
 }
 
 test "a commit refused for want of a credential enters the credential stage and Esc brings it back" {
@@ -1193,8 +1249,9 @@ test "a commit refused for want of a credential enters the credential stage and 
     try testing.expect(login == .login);
     try testing.expect(login.login.eqlText("metask"));
     try testing.expectEqual(Stage.credential, picker.stage);
-    var scratch: [Picker.MAX_ROWS]Row = undefined;
-    try testing.expectEqual(@as(usize, 0), picker.rows(&scratch).len);
+    var scratch = Picker.RowBuffer.init(testing.allocator);
+    defer scratch.deinit();
+    try testing.expectEqual(@as(usize, 0), (try picker.rows(&scratch)).len);
     try testing.expect(picker.onKey(.down) == .ignored);
     try testing.expect(picker.onKey(.{ .char = 'q' }) == .ignored);
     try testing.expect(picker.onKey(.enter) == .ignored);

@@ -10,6 +10,16 @@ status, compatibility boundaries, and entry points are defined by
 
 ## Unreleased
 
+### Fixed
+
+- **Every model of a long list can be picked.** The `/model` picker built at
+  most 256 rows per step, so a gateway listing 300 models showed `[1/256]` and
+  the last 44 could be reached only by typing their names; the `/models` menu
+  let the selection reach only the first 8 API keys or models it listed. Both
+  lists now hold every entry, scroll with the selection, and take PgUp/PgDn
+  and Home/End (↑ from the first row still wraps to the last); a list longer
+  than its window says `[n/m] · PgUp/PgDn page · Home/End` under it.
+
 ## 0.7.0 — 2026-10-24
 
 ### Added

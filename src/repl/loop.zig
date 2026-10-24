@@ -1919,20 +1919,16 @@ fn readLineRaw(
                     return try allocator.dupe(u8, editor.view());
                 },
                 .models_nav => {
+                    // Every entry is selectable: the menu draws a window around
+                    // the selection (`complete.menuWindow`), so the selection
+                    // ranges over the whole list, not over its first page.
                     const n = if (app.models_picker_key_index == null)
-                        @min(app.api_key_catalog.entries.items.len, complete.MODEL_MENU_MAX_ROWS)
+                        app.api_key_catalog.entries.items.len
                     else if (app.models_picker_model_index == null)
-                        @min(app.api_client.catalog.entries.items.len, complete.MODEL_MENU_MAX_ROWS)
+                        app.api_client.catalog.entries.items.len
                     else
                         reasoningOptionCount(app);
-                    if (n > 0) {
-                        if (region.ui.slash_sel >= n) region.ui.slash_sel = n - 1;
-                        if (eff.at_nav_dir) {
-                            region.ui.slash_sel = (region.ui.slash_sel + 1) % n;
-                        } else {
-                            region.ui.slash_sel = if (region.ui.slash_sel == 0) n - 1 else region.ui.slash_sel - 1;
-                        }
-                    }
+                    region.ui.slash_sel = complete.menuMove(n, region.ui.slash_sel, eff.menu_step, complete.MODEL_MENU_MAX_ROWS);
                     redraw(region, &editor, app);
                     continue;
                 },
@@ -1943,8 +1939,7 @@ fn readLineRaw(
                             redraw(region, &editor, app);
                             continue;
                         }
-                        const visible_n = @min(keys.len, complete.MODEL_MENU_MAX_ROWS);
-                        const idx = @min(region.ui.slash_sel, visible_n - 1);
+                        const idx = @min(region.ui.slash_sel, keys.len - 1);
                         app.selectApiKeyForModels(idx) catch |err| {
                             region.clear();
                             region.emitTerminalFmt("\x1b[31m/model key selection failed: {s}\x1b[0m\n", .{@errorName(err)});
@@ -1961,8 +1956,7 @@ fn readLineRaw(
                             redraw(region, &editor, app);
                             continue;
                         }
-                        const visible_n = @min(entries.len, complete.MODEL_MENU_MAX_ROWS);
-                        const idx = @min(region.ui.slash_sel, visible_n - 1);
+                        const idx = @min(region.ui.slash_sel, entries.len - 1);
                         app.models_picker_model_index = idx;
                         region.ui.slash_sel = 0;
                         redraw(region, &editor, app);
