@@ -10,7 +10,7 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from tty_driver import IDLE, READY, run, wait_for  # noqa: E402
+from tty_driver import IDLE, READY, run, submit, wait_for  # noqa: E402
 from asserts import TTYAssert  # noqa: E402
 
 
@@ -28,6 +28,50 @@ def test_picker_opens_with_scope_and_next_turn_footer(bin_path):
     assert "enter apply to this session" in text, "footer 未说明默认作用域:\n" + text
     assert "next turn" in text, "footer 未说明下一轮语义:\n" + text
     a.assert_no_full_clear()  # 覆盖层不进 alt-screen、不清 scrollback
+
+
+def _provider_rows(text):
+    """Provider 阶段每行的 provider id(行首是 `>`/`*`/空格标记,后跟 id 和 "N models")。"""
+    rows = []
+    for line in text.splitlines():
+        parts = line.replace(">", " ").replace("*", " ").split()
+        if len(parts) == 3 and parts[2] in ("model", "models") and parts[1].isdigit():
+            rows.append(parts[0])
+    return rows
+
+
+def test_model_command_lists_every_provider_and_reaches_its_models(bin_path):
+    # metask / openai / gemini 的 id 都是 6 字节。分组标签曾指向循环变量的栈拷贝,
+    # 等长 id 被并成一行 "metask 16 models",进去只有 metask 的模型:openai、gemini
+    # 在 /model 里根本选不到。
+    raw = run(
+        bin_path,
+        submit("/model", "Provider") + ["sleep:0.3", "key:down", "sleep:0.3", "key:enter", wait_for("Model")],
+        per_key_drain=0.1,
+    )
+    a, text = _screen(raw)
+
+    def screen_text(sc):
+        return "\n".join(sc.line_text(r) for r in range(sc.rows))
+
+    provider_frames = [screen_text(sc) for sc in a.frame_screens if "Provider" in screen_text(sc)]
+    assert provider_frames, "/model 未打开 picker:\n" + text
+    providers = _provider_rows(provider_frames[-1])
+    for wanted in ("metask", "openai", "gemini", "zai-coding-plan"):
+        assert providers.count(wanted) == 1, f"provider {wanted} 不是独立一行: {providers}\n" + provider_frames[-1]
+    # 第二行是 openai(编译期目录顺序);Enter 进去必须是 openai 自己的模型。
+    assert providers[1] == "openai", f"目录顺序变了,第二行不是 openai: {providers}"
+    lines = text.splitlines()
+    header = [i for i, line in enumerate(lines) if line.strip() == "Model"]
+    assert header, "Enter 后没进 Model 阶段:\n" + text
+    model_rows = []
+    for line in lines[header[-1] + 1:]:
+        if "enter apply" in line:
+            break
+        model_rows.append(line)
+    listed = "\n".join(model_rows)
+    assert "gpt-4o" in listed, "进 openai 后没列出它的模型:\n" + text
+    assert "claude" not in listed.lower(), "进 openai 后列的是 metask 的模型:\n" + text
 
 
 def test_picker_typing_filters_without_touching_the_draft(bin_path):

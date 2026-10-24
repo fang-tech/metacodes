@@ -132,6 +132,12 @@ status, compatibility boundaries, and entry points are defined by
   `ReservedMemoryType` (a permission denial naming the type); `lesson` keeps
   its learning-turn admission, and the host's own writes are unchanged.
   Nodes the model already stored under these types are not removed.
+- **`/model` lists every provider.** The picker's provider rows grouped by a
+  label that pointed into the loop's copy of each offer, so providers whose
+  ids have the same length shared one row: `metask`, `openai` and `gemini`
+  showed as `metask 16 models`, and Enter on it listed only Metask's models,
+  leaving the OpenAI and Gemini routes unreachable from the picker. Each
+  provider now has its own row.
 - **TUI: a terminal resize no longer answers an open dialog.** A resize
   interrupts a blocked key read (SIGWINCH has no `SA_RESTART`), and the
   permission dialog took the interrupted read for "No": the tool was denied
