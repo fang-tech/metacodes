@@ -881,6 +881,22 @@ pub fn isKeepaliveLine(line: []const u8) bool {
     return classifyLine(line) != .progress;
 }
 
+/// 流中途错误的名字约定(三个 provider client 共用,agent_loop 据此决定零产出兜底重发):
+/// - `RequestFailed`:**只**表示连接在流中途断了(读失败,且不是取消、不是 stall 判定);
+/// - `ApiError`:服务端在流里声明的失败(错误帧 / 顶层 `error` 对象 / `response.failed`);
+/// - `StreamStalled` / `StreamIncomplete` / `ContextWindowExceeded` / `Aborted`:各有专名;
+/// - 本地或解析类错误(`StreamTooLong`、`InvalidJson`、`OutOfMemory`…)保留原名。
+/// 本函数把传输层读失败折成 `RequestFailed`,其余原样返回;调用方先排除取消与 stall。
+pub fn midStreamReadError(err: anyerror) anyerror {
+    return if (err == error.ReadFailed) error.RequestFailed else err;
+}
+
+test "midStreamReadError: a transport read failure is RequestFailed, a local failure keeps its name" {
+    try std.testing.expectEqual(@as(anyerror, error.RequestFailed), midStreamReadError(error.ReadFailed));
+    try std.testing.expectEqual(@as(anyerror, error.StreamTooLong), midStreamReadError(error.StreamTooLong));
+    try std.testing.expectEqual(@as(anyerror, error.OutOfMemory), midStreamReadError(error.OutOfMemory));
+}
+
 /// What one SSE line says about the stream's liveness. A blank line only closes
 /// a frame; a keepalive line is the peer speaking up without model output; any
 /// other line is progress. The distinction between the first two matters to the

@@ -354,6 +354,15 @@ pub fn reportBodyStall(comptime module: []const u8, rid: log.RequestId, stall: p
     last_error.recordNamed("正文空闲超时", detail);
 }
 
+/// 服务端在流里**主动声明**的失败(OpenAI chat 兼容端 / Gemini 的顶层 `error` 对象、Responses 的
+/// `response.failed` / `error` 事件)的统一交代:日志 + last_error 现场,与 Anthropic 错误帧
+/// (stream.zig `.error_event`)同一个名字。调用方随后返回 `error.ApiError`——它是服务端的答复,
+/// 不是断连(`RequestFailed`),agent_loop 不会为它兜底重发。
+pub fn reportServerError(comptime module: []const u8, rid: log.RequestId, err_obj: []const u8) void {
+    log.warnId(module, rid, "API error in stream: {s}", .{err_obj});
+    last_error.recordNamed("API 错误帧", err_obj);
+}
+
 /// 流在报告"怎么停的"之前就结束(干净 EOF / 只有 `[DONE]`,却没有 stop_reason、
 /// finish_reason、Responses 终止事件或 finishReason)的统一交代:日志 + last_error 现场。
 /// 这样的流不能当成完整回答——丢的可能正是 max_tokens(issue #269);调用方(agent_loop)
@@ -1547,8 +1556,10 @@ pub const StreamResponse = struct {
                     log.warnId("stream", self.id, "event_iter.next failed after cancel ({s}) → Aborted", .{@errorName(err)});
                     return error.Aborted;
                 }
+                // 本地/解析类失败(StreamTooLong / InvalidJson / OutOfMemory…)保留原名:
+                // RequestFailed 只留给流中途断连(见 stream.zig midStreamReadError 的约定)。
                 log.warnId("stream", self.id, "event_iter.next failed: {s}", .{@errorName(err)});
-                return error.RequestFailed;
+                return err;
             },
         };
         // 正文空闲时钟由 EventIterator 的进展钩子续(每条非保活行);LivenessReader 只记传输层字节。

@@ -76,12 +76,13 @@ pub const MAX_ENVIRONMENT_FAULTS: u32 = 3;
 pub const SILENT_STREAM_RETRY_FLOOR: u8 = 1;
 
 /// 哪些流内失败算"连接没给出答复",可以在零可见输出时兜底重发:监视线程判的 stall(进展沉默或
-/// 连接已死),以及没报告停止原因就结束的流。服务端**主动**报的错误(`ApiError` 错误帧)是一个
-/// 答复,重发只会重复它或把它盖掉;`RequestFailed` 在 OpenAI Responses 上也承载 `response.failed`,
-/// 单凭错误名分不清是断连还是服务端失败,所以也不在内。
+/// 连接已死)、没报告停止原因就结束的流、以及流中途断连(`RequestFailed`——三个 provider client
+/// 只用它表示断连,见 api/stream.zig `midStreamReadError` 的名字约定)。服务端**主动**报的错误
+/// (`ApiError`:错误帧 / 顶层 `error` 对象 / `response.failed`)是一个答复,重发只会重复它或把它
+/// 盖掉;本地或解析类失败(`StreamTooLong`、`InvalidJson`…)重发也不会变,都不在内。
 fn isSilentRetryFailure(failure: ?anyerror) bool {
     const err = failure orelse return false;
-    return err == error.StreamStalled or err == error.StreamIncomplete;
+    return err == error.StreamStalled or err == error.StreamIncomplete or err == error.RequestFailed;
 }
 
 /// 一条工具结果是否是环境故障:结构化错误信封(`{"error":{…}}`)里 `category` 为
