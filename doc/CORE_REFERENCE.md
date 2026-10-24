@@ -234,7 +234,9 @@ query、Ctrl+O transcript、resume 回放与 `/recap` 把它们与用户输入�
   只有接受了 lesson 且已有同题 lesson 时才发 reconcile 消息。每段至多 6 个模型轮次。
 - **边界**:答案在学习回合开始前已定为 final,学习文本一律是 commentary;学习段里只有
   Read / Grep / Glob / KgRecall / KgContext / KgRemember 能跑,过程传感器与环境故障熔断都不计这些
-  轮次。`KgRemember` 在学习回合之外、或 lesson 头与宿主所见不符时拒绝写入。
+  轮次。`KgRemember` 在学习回合之外、或 lesson 头与宿主所见不符时拒绝写入;宿主自有、按类型读回的
+  其它类型(`kg/reserved_types.zig`:临时规则、撤回、任务义务、结局行、义务遥测、provider 审计、
+  本体快照四类)一律拒绝(`ReservedMemoryType`),因为读回方只按类型认节点,分不出作者。
 - **宿主契约字段**:`Options.learning_turn: ?learning_turn.Options`(mode、task_hint、run_label),
   canonical `buildRunOptions` 不带。武装时 Run 结束发一条 `learning_turn` 终局记录
   (`metacodes-learning-turn-v1`)。下一次同题尝试(`METACODES_TASK_HINT`)经 scoped recall 看到最新
