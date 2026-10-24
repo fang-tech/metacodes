@@ -9,8 +9,9 @@
 //! authenticate any pick (`MissingCredentials`, then a sign-in prompt).
 //!
 //! Mock transport only: the gateway is a MockServer cassette answering, in
-//! order, the startup key-list probe, the `/v1/models` probe, and what the
-//! case sends next.
+//! order, the startup `/v1/models` probe and what the case sends next. The
+//! account key list is fetched only when a case opens the `/models` key menu
+//! (`ensureApiKeyCatalog`), as the REPL does.
 
 const std = @import("std");
 const harness = @import("harness");
@@ -194,7 +195,7 @@ test "L2 metask api-key route: the picker offers the gateway's models at the ses
     defer case.deinit();
     const allocator = case.arena.allocator();
 
-    const bodies = [_][]const u8{ KEYS_BODY, GATEWAY_MODELS, END_TURN_SSE };
+    const bodies = [_][]const u8{ GATEWAY_MODELS, END_TURN_SSE };
     var server = try harness.MockServer.startCassette(&bodies, 0);
     defer server.stop();
     const messages_url = try allocator.dupeZ(u8, try server.urlOwned(allocator));
@@ -258,10 +259,15 @@ test "L2 metask api-key route: a /models key switch replaces the inventory and i
     // in `/models`. The picked key must win over the environment.
     try case.setEnv("METASK_API_KEY", "ambient-env-key");
 
-    const bodies = [_][]const u8{ KEYS_BODY, GATEWAY_MODELS, DEV_MODELS, END_TURN_SSE };
+    const bodies = [_][]const u8{ GATEWAY_MODELS, KEYS_BODY, DEV_MODELS, END_TURN_SSE };
     var server = try harness.MockServer.startCassette(&bodies, 0);
     defer server.stop();
     const messages_url = try allocator.dupeZ(u8, try server.urlOwned(allocator));
+    // A plain API key reaches the account key list only where that endpoint
+    // is named (`api_keys.bearerFor`).
+    const origin = cc.app_module.MetaskKeyRoute.gatewayOriginOf(messages_url).?;
+    const keys_url = try allocator.dupeZ(u8, try std.fmt.allocPrint(allocator, "{s}/api/v1/keys?page=1&page_size=100", .{origin}));
+    try case.setEnv("METACODE_API_KEYS_URL", keys_url.ptr);
 
     const argv = [_][*:0]const u8{ "metacodes", "--base-url", messages_url.ptr, "--model", "glm-5.3-flash" };
     const config = try case.config(&argv);
@@ -273,12 +279,15 @@ test "L2 metask api-key route: a /models key switch replaces the inventory and i
     var buffer: [64][]const u8 = undefined;
     try std.testing.expect(containsModel(try metaskOffers(app, &buffer), "kimi-k3"));
 
+    // Opening the `/models` key menu loads the account's keys.
+    app.ensureApiKeyCatalog();
     var dev_index: ?usize = null;
     for (app.api_key_catalog.entries.items, 0..) |entry, index| {
         if (std.mem.eql(u8, entry.secret, KEY_DEV)) dev_index = index;
     }
     // The host already exists, so the re-probe has to reach it directly.
     try app.selectApiKeyForModels(dev_index.?);
+    try std.testing.expect(std.mem.startsWith(u8, requestLine(server.requestAt(1).?), "GET /api/v1/keys?"));
     try std.testing.expectEqualStrings("GET /v1/models HTTP/1.1", requestLine(server.requestAt(2).?));
     try std.testing.expectEqualStrings("Bearer " ++ KEY_DEV, headerValue(server.requestAt(2).?, "authorization").?);
 
@@ -299,7 +308,7 @@ test "L2 metask api-key route: another provider's /v1/models never becomes Metas
     defer case.deinit();
     const allocator = case.arena.allocator();
 
-    const bodies = [_][]const u8{ KEYS_BODY, GATEWAY_MODELS };
+    const bodies = [_][]const u8{GATEWAY_MODELS};
     var server = try harness.MockServer.startCassette(&bodies, 0);
     defer server.stop();
     const messages_url = try allocator.dupeZ(u8, try server.urlOwned(allocator));
@@ -313,7 +322,7 @@ test "L2 metask api-key route: another provider's /v1/models never becomes Metas
     defer io_runtime.deinit();
     const app = try App.init(allocator, io_runtime.io(), config, "zai-key");
     defer app.deinit();
-    try std.testing.expectEqualStrings("GET /v1/models HTTP/1.1", requestLine(server.requestAt(1).?));
+    try std.testing.expectEqualStrings("GET /v1/models HTTP/1.1", requestLine(server.requestAt(0).?));
 
     try std.testing.expect(app.metask_key_route == null);
     var buffer: [64][]const u8 = undefined;
@@ -321,6 +330,53 @@ test "L2 metask api-key route: another provider's /v1/models never becomes Metas
     try std.testing.expect(containsModel(models, "claude-sonnet-4-6"));
     try std.testing.expect(!containsModel(models, "glm-5.3-flash"));
     try std.testing.expect(!containsModel(models, "kimi-k3"));
+}
+
+test "L2 metask api-key route: a warm start offers the cached gateway models, and the background refresh replaces them" {
+    // The interactive REPL answers `/v1/models` from the stored copy and
+    // refreshes it on a background thread. Both answers are the route's
+    // inventory: a picker fed only by the network probe showed the compiled
+    // Claude list on every warm start.
+    var case: Case = undefined;
+    try case.init();
+    defer case.deinit();
+    const allocator = case.arena.allocator();
+
+    // Only the background refresh reaches the gateway.
+    const bodies = [_][]const u8{DEV_MODELS};
+    var server = try harness.MockServer.startCassette(&bodies, 0);
+    defer server.stop();
+    const messages_url = try allocator.dupeZ(u8, try server.urlOwned(allocator));
+    const key = cc.models_cache.Key.of(messages_url, .{ .name = "authorization", .value = "Bearer " ++ SESSION_KEY });
+    try cc.models_cache.store(allocator, case.root, key, messages_url, GATEWAY_MODELS, cc.util_time.nowUnix());
+
+    const argv = [_][*:0]const u8{ "metacodes", "--base-url", messages_url.ptr, "--model", "glm-5.3-flash" };
+    const config = try case.config(&argv);
+    var io_runtime = @import("platform").signal.threadedIo(allocator, .{});
+    defer io_runtime.deinit();
+    const app = try App.initWithOptions(std.testing.allocator, io_runtime.io(), config, SESSION_KEY, .{ .models_cache = true });
+    defer app.deinit();
+
+    // The stored copy is the inventory before any request has returned.
+    var buffer: [64][]const u8 = undefined;
+    const warm = try metaskOffers(app, &buffer);
+    try std.testing.expectEqual(@as(usize, 2), warm.len);
+    try std.testing.expect(containsModel(warm, "kimi-k3"));
+    try std.testing.expectEqualStrings("glm-5.3-flash", currentModel(app).?);
+
+    const refresh = app.models_refresh orelse return error.NoRefresh;
+    var waited_ms: u32 = 0;
+    while (!refresh.finished()) : (waited_ms += 5) {
+        if (waited_ms > 10_000) return error.RefreshTimeout;
+        std.Io.sleep(std.testing.io, .fromMilliseconds(5), .awake) catch {};
+    }
+    try std.testing.expectEqualStrings("GET /v1/models HTTP/1.1", requestLine(server.requestAt(0).?));
+
+    // Adopted at the REPL's idle point, it reaches a picker left open.
+    app.adoptModelCatalogRefresh();
+    const refreshed = snapshotMetaskOffers(app, &buffer);
+    try std.testing.expectEqual(@as(usize, 1), refreshed.len);
+    try std.testing.expectEqualStrings("dev-model", refreshed[0]);
 }
 
 test "L2 metask api-key route: with no gateway answer the compiled inventory stays and the running model is marked" {
