@@ -58,6 +58,8 @@ status, compatibility boundaries, and entry points are defined by
   Responses wire sends `xhigh` and `max` by name instead of capping them at
   `high`. GLM-5.3 and later always get `thinking: enabled` with a low / high /
   max effort: `none` used to send `thinking: disabled`, which GLM-5.3 refuses.
+  On the Anthropic wire (Z.AI's default channel, the Metask gateway) GLM-5.3
+  gets the same low / high / max words instead of Anthropic's `medium`.
   Gemini 4 (`gemini-4-argon`) is treated as the Gemini 3 family it extends:
   its thinking cannot be switched off.
 - **A reasoning level chosen in `/model` is the one the next request

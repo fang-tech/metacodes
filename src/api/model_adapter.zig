@@ -128,6 +128,9 @@ pub const ModelProfile = struct {
     /// function call in the current turn (Gemini 3 and later); a call sent
     /// back without one fails the request.
     requires_thought_signatures: bool = false,
+    /// The model takes only low / high / max as its effort (GLM 5.3 and later,
+    /// on any wire); a neutral level is sent as the nearest of those.
+    glm53_effort_vocabulary: bool = false,
     /// 支持原生图像输入(vision)。序列化守门的单一真相:false 的 (kind, model) 在
     /// 请求含 image block 时必须报显式能力错误(error.ImageInputUnsupported),
     /// 绝不静默丢图/OCR/文本占位。保守默认 false;仅对已验证 vision 家族开 true。
@@ -175,6 +178,9 @@ fn anthropicProfile(model: []const u8) ModelProfile {
     if (hasSubstr(model, "claude-opus-4") or hasSubstr(model, "claude-sonnet-4") or hasSubstr(model, "claude-haiku-4")) {
         p.preserved_thinking_default = false; // 保留(对齐 Claude Opus 4.5+)
     }
+    // GLM 5.3+ behind an Anthropic-wire endpoint (Z.AI's default channel, the
+    // Metask gateway) still takes only its own three levels.
+    p.glm53_effort_vocabulary = glmAlwaysThinks(model);
     return p;
 }
 
