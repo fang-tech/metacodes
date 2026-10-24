@@ -168,8 +168,10 @@ class _Capture:
     keepalive 过滤、宽字符)全部在 read_once 内消化,等待语义这里只有一份。
     """
 
-    def __init__(self, read_once, rows, cols):
+    def __init__(self, read_once, rows, cols, timeline=None):
         self._read_once = read_once
+        # 可选:每收到一片字节记 (time.monotonic(), 累计字节数),供时序断言(见 arrival_time)。
+        self.timeline = timeline
         self.out = bytearray()
         self.rows = rows
         self.cols = cols
@@ -187,6 +189,8 @@ class _Capture:
             return False
         if data:
             self.out.extend(data)
+            if self.timeline is not None:
+                self.timeline.append((time.monotonic(), len(self.out)))
             return True
         return False
 
@@ -386,7 +390,7 @@ def _drive(key_events, write, cap, set_size, per_key_drain, signal_child=None):
 
 def run(bin_path, key_events, term_size=(24, 80), env=None,
         startup_drain=0.8, per_key_drain=0.25, base_url="http://127.0.0.1:1/v1/messages",
-        permission="bypassPermissions", cwd=None, extra_args=None):
+        permission="bypassPermissions", cwd=None, extra_args=None, timeline=None):
     """fork pty,设窗口,exec bin,按 key_events 喂键,返回合并原始字节流。
 
     base_url: 默认指死端口(连接立即 refused,probeModels/请求不 hang)——离线渲染测试用。
@@ -394,6 +398,8 @@ def run(bin_path, key_events, term_size=(24, 80), env=None,
     permission: --permission 模式(默认 bypassPermissions 免弹窗;测权限弹窗传 "default")。
     cwd: 子进程工作目录(默认继承)。测权限弹窗时传隔离临时目录,避免项目 .claude/settings 污染。
     extra_args: 追加到命令行的参数(如 ["--provider", "metask", "--model", "GLM-5.3-Flash"])。
+    timeline: 传一个 list,收到的每片字节记 (time.monotonic(), 累计字节数);配 arrival_time()
+              断言"某段字节在某时刻之前已上屏"(POSIX;ConPTY 重合成流,时序不可断言)。
 
     key_events 元素(字符串):
       "type:文本"        逐 codepoint 写(模拟打字,每字单独 drain → 暴露逐帧 bug)
@@ -419,11 +425,25 @@ def run(bin_path, key_events, term_size=(24, 80), env=None,
             return _run_windows(bin_path, key_events, (rows, cols), full_env,
                                 permission, base_url, cwd, startup_drain, per_key_drain, extra_args=extra_args)
         return _run_posix(bin_path, key_events, (rows, cols), full_env,
-                          permission, base_url, cwd, startup_drain, per_key_drain, extra_args=extra_args)
+                          permission, base_url, cwd, startup_drain, per_key_drain, extra_args=extra_args,
+                          timeline=timeline)
     finally:
         # ephemeral home 无凭证(live 用例都显式传播种 HOME),删失败无害,尽力而为。
         if ephemeral_home:
             shutil.rmtree(ephemeral_home, ignore_errors=True)
+
+
+def arrival_time(timeline, raw, needle, last=False):
+    """run(timeline=...) 之后:needle 在 raw 里(首次;last=True 取末次)出现时,其末字节所在那片
+    的到达时刻(time.monotonic())。没出现返回 None。"""
+    idx = raw.rfind(needle) if last else raw.find(needle)
+    if idx < 0:
+        return None
+    end = idx + len(needle)
+    for t, size in timeline:
+        if size >= end:
+            return t
+    return None
 
 
 def _set_child_canonical(pid):
@@ -448,7 +468,7 @@ def _set_child_canonical(pid):
 
 
 def _run_posix(bin_path, key_events, term_size, full_env,
-               permission, base_url, cwd, startup_drain, per_key_drain, extra_args=None):
+               permission, base_url, cwd, startup_drain, per_key_drain, extra_args=None, timeline=None):
     rows, cols = term_size
     pid, fd = pty.fork()
     if pid == 0:
@@ -485,7 +505,7 @@ def _run_posix(bin_path, key_events, term_size, full_env,
             return None
         return data
 
-    cap = _Capture(read_once, rows, cols)
+    cap = _Capture(read_once, rows, cols, timeline)
 
     def write(b):
         try:

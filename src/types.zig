@@ -1,5 +1,8 @@
 const std = @import("std");
 
+/// See `Config.mcp_connect`.
+pub const McpConnect = enum { app_init, first_request };
+
 /// 通用配置
 pub const Config = struct {
     /// 第一个无法识别的命令行参数(fail-closed:main 检查后报错退出)。
@@ -46,6 +49,12 @@ pub const Config = struct {
     /// 上限兜底。盘写本身不被阻塞,等待可被 Ctrl+C 打断。见 `lsp/service.zig` 顶部 Linus #4。
     /// 嫌慢就 `--no-lsp`。
     lsp_enabled: bool = true,
+    /// When the MCP servers configured for the session must have connected.
+    /// `app_init`: App.init waits for them (every frontend but the
+    /// interactive REPL). `first_request`: App.init returns while they
+    /// connect and the REPL joins them before it assembles its first request
+    /// (`App.publishMcpServers`), so its prompt never waits on a server.
+    mcp_connect: McpConnect = .app_init,
     /// Swarm(teams/teammates):`--agent-teams` 开启。opt-in——默认关,不污染单 agent 会话
     /// 的工具菜单(对齐 cc agentSwarmsEnabled 门)。
     agent_teams: bool = false,

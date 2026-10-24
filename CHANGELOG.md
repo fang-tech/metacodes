@@ -45,6 +45,38 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Changed
 
+- **Interactive startup waits for less.** Every interactive start used to
+  spend about 0.55 s asking the account endpoint for its API keys with the
+  API key, which that endpoint always refuses, and about 0.25 s on
+  `/v1/models`, and it played the 1.5 s splash only after all startup work
+  had finished (measured 2026-10-23). The key list is now fetched the first
+  time the `/models` key menu opens, with the stored login token, or with the
+  API key only for an endpoint named by `METACODE_API_KEYS_URL`. Without
+  either, no request is sent and the menu lists the key in use. The REPL keeps
+  each route's `/v1/models` answer, per endpoint and credential, in
+  `<state root>/cache/models/` for 24 hours. A start that finds a fresh copy
+  uses it and refreshes it in the background, and the refreshed answer is
+  used from the next turn on. A start without a fresh copy fetches the answer
+  before the prompt, as before. The splash now starts before startup work and
+  plays during it; the banner follows when both are done. In a PTY with those
+  gateway latencies simulated, the time to the banner went from 0.94 s to
+  0.14 s (0.39 s on a first start) without the animation, and from 2.46 s to
+  1.66 s with it.
+- **The REPL no longer waits for MCP servers before showing its prompt.**
+  Servers connect in the background (the footer reads `connecting to MCP
+  servers (n/total)`); the first message, `/skill`, prompt command, `/btw`,
+  `/recap`, cron or `/loop` turn waits for every server to report (spinner:
+  `Connecting to MCP servers`; Esc or Ctrl+C stops waiting), then registers
+  their tools and builds the tool list and system prompt once, so the first
+  request is byte for byte the one a synchronous start sent. Measured with two
+  stdio servers that take 3 s to start: prompt after 3.02 s before, 0.02 s
+  now. Ctrl+C twice while a server is starting exits at once (its handshake
+  is interrupted and the process reaped). `/mcp` shows servers that are still
+  connecting, and after startup the footer announces failures once (`1 MCP
+  server failed · /mcp`; a 401/403 reads `1 MCP server needs auth · /mcp`
+  and `/mcp` marks it `needs authentication`). `-p`, `--web`, `serve`,
+  `--teammate` and the dumps still connect every server before they start;
+  their connects now overlap the rest of startup.
 - **TUI: the prompt and commands behave like Claude Code 2.1.278** (recorded
   side by side in a PTY). Ctrl+C, and Ctrl+D on an empty prompt, exit on a
   second press within 800 ms; the first shows `Press Ctrl-C again to exit` in
@@ -67,6 +99,23 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- **MCP over HTTP: one kept-alive connection per server, and no more
+  dropped requests.** Every message used to open its own TLS connection with
+  `Connection: close`, so a server cost about four handshakes at startup
+  (2–2.7 s per server for the imported Codex / Claude Code servers measured),
+  and Vercel-hosted servers such as developers.openai.com dropped those
+  requests unanswered most of the time (`could not connect to the server
+  URL`).
+  Requests in quick succession now share one connection; an answered SSE
+  stream is read to its end first, an idle connection is reused only within
+  4 s, and a request that meets a reused connection the server already
+  closed is sent again on a new one.
+- **The system prompt keeps naming the model `/model` switched to.** With
+  `--model-display-name`, a `/skills` change, a working directory renamed
+  under the session, or `EnterWorktree` / `ExitWorktree` after a `/model`
+  switch rebuilt the prompt with the startup display name again (the switch
+  itself named the new model). Every rebuild now names the same model: the
+  display name until a switch, the switched model after one.
 - **`KgRemember` no longer writes the host's own TinyKG types.**
   Self-evolution keeps provisional rules, their retractions, task
   obligations, verifier outcome rows and obligation telemetry in the store

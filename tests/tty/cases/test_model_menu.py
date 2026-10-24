@@ -14,6 +14,7 @@ DEV_MODEL = "claude-dev-sonnet-20260702"
 
 
 class _ModelsTwoStepMock(http.server.BaseHTTPRequestHandler):
+    key_auths = []
     model_auths = []
     message_auths = []
     message_models = []
@@ -26,6 +27,7 @@ class _ModelsTwoStepMock(http.server.BaseHTTPRequestHandler):
     @classmethod
     def reset(cls):
         with cls.lock:
+            cls.key_auths = []
             cls.model_auths = []
             cls.message_auths = []
             cls.message_models = []
@@ -60,6 +62,8 @@ class _ModelsTwoStepMock(http.server.BaseHTTPRequestHandler):
     def do_GET(self):  # noqa: N802
         auth = self.headers.get("authorization", "")
         if self.path == "/api/v1/keys?page=1&page_size=100":
+            with self.lock:
+                self.key_auths.append(auth)
             self._send_json({
                 "code": 0,
                 "message": "success",
@@ -129,6 +133,13 @@ def _start_two_step_mock():
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     return server, f"http://127.0.0.1:{server.server_port}/v1/messages"
+
+
+def _keys_endpoint(base_url):
+    """The account key list on the mock. The derived endpoint answers only a
+    login token; a plain API key is sent only to one named by
+    METACODE_API_KEYS_URL (the case these tests drive)."""
+    return base_url.replace("/v1/messages", "/api/v1/keys?page=1&page_size=100")
 
 
 def _menu_between_box_and_footer(raw):
@@ -221,7 +232,7 @@ def test_tty_models_after_model_selection_shows_reasoning_default_none(bin_path)
                 wait_for("Reasoning effort"),
             ],
             base_url=base_url,
-            env={"METACODES_NO_PROBE": None},
+            env={"METACODES_NO_PROBE": None, "METACODE_API_KEYS_URL": _keys_endpoint(base_url)},
             startup_drain=1.2,
             per_key_drain=0.08,
         )
@@ -244,7 +255,7 @@ def test_tty_models_first_shows_account_api_keys_not_model_list(bin_path):
             bin_path,
             [READY, "type:/models", wait_for("Dev key")],
             base_url=base_url,
-            env={"METACODES_NO_PROBE": None},
+            env={"METACODES_NO_PROBE": None, "METACODE_API_KEYS_URL": _keys_endpoint(base_url)},
             startup_drain=1.2,
             per_key_drain=0.08,
         )
@@ -288,7 +299,7 @@ def test_tty_models_selects_api_key_then_model_and_answers_with_selected_key(bin
                 wait_for("answer ok from selected key"),
             ],
             base_url=base_url,
-            env={"METACODES_NO_PROBE": None},
+            env={"METACODES_NO_PROBE": None, "METACODE_API_KEYS_URL": _keys_endpoint(base_url)},
             startup_drain=1.2,
             per_key_drain=0.08,
         )
@@ -312,3 +323,29 @@ def test_tty_models_selects_api_key_then_model_and_answers_with_selected_key(bin
     body = _ModelsTwoStepMock.message_bodies[-1]
     if '"output_config"' in body or '"thinking"' in body:
         raise AssertionError(f"reasoning=none 时 /v1/messages 不应带 thinking/output_config: {body!r}")
+
+
+def test_tty_models_with_a_plain_api_key_lists_only_the_key_in_use(bin_path):
+    """No login token and no named key endpoint: the account endpoint cannot
+    take the API key, so neither startup nor `/models` asks it; the menu
+    lists the key in use."""
+    server, base_url = _start_two_step_mock()
+    try:
+        raw = run(
+            bin_path,
+            [READY, "type:/models", wait_for("Current API key")],
+            base_url=base_url,
+            env={"METACODES_NO_PROBE": None},
+            startup_drain=1.2,
+            per_key_drain=0.08,
+        )
+    finally:
+        server.shutdown()
+
+    a, menu = _menu_between_box_and_footer(raw)
+    if "API keys for this account (1)" not in menu or "Current API key" not in menu:
+        a._fail(f"`/models` 应只列当前 key:\n{menu}")
+    if _ModelsTwoStepMock.key_auths:
+        raise AssertionError(f"account key endpoint was asked with an API key: {_ModelsTwoStepMock.key_auths!r}")
+    if not _ModelsTwoStepMock.model_auths:
+        raise AssertionError("startup did not probe /v1/models")

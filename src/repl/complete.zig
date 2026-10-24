@@ -165,6 +165,13 @@ pub fn modelsMenuOpen(line: []const u8) bool {
     return std.mem.eql(u8, trimmed, "/models");
 }
 
+/// A draft the `/models` picker menu is drawn under: `/models`, or `/model`
+/// before it is submitted (`RenderRegion.drawModelsPickerMenu`).
+pub fn modelsPickerLine(line: []const u8) bool {
+    const trimmed = std.mem.trim(u8, line, " \t\r\n");
+    return std.mem.eql(u8, trimmed, "/models") or std.mem.eql(u8, trimmed, "/model");
+}
+
 /// 菜单处于命令态时的查询串(含 `/`);非命令态 null。
 fn slashQuery(line: []const u8) ?[]const u8 {
     const trimmed = std.mem.trimStart(u8, line, " \t");

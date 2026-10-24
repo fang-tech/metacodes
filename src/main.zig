@@ -117,6 +117,7 @@ pub const core_subagent = @import("core/subagent.zig");
 pub const agent_job_registry = @import("core/agent_job_registry.zig");
 pub const job_registry = @import("core/job_registry.zig");
 pub const util_time = @import("util/time.zig");
+pub const models_cache = @import("api/models_cache.zig");
 pub const util_json = @import("util/json.zig");
 pub const util_toolchain = @import("util/toolchain.zig");
 pub const tools = @import("tools.zig");
@@ -186,6 +187,7 @@ pub const repl_headless = @import("repl/headless.zig");
 pub const repl_loop = @import("repl/loop.zig");
 pub const app_module = @import("app.zig");
 pub const app_route_strings = @import("app/route_strings.zig");
+pub const app_mcp_startup = @import("app/mcp_startup.zig");
 pub const app_install = @import("app/install.zig");
 pub const tool_context = @import("tools/context.zig");
 pub const project_rule_gate_protocol = @import("tools/project_rule_gate.zig");
@@ -798,12 +800,12 @@ pub fn main(init: std.process.Init) !void {
     // **必须在 App.init 之前**:init 期的 warn/err(如 KG 降级告警)否则抢在 gate 前直接打进终端,
     // 留在 TUI 上方成残行,且超宽行在 strict-autowrap 终端还会折行挤歪整屏。
     // 非 TUI 模式(teammate/serve/web/resume/headless/dump)无渲染流,保留 stderr 日志。
-    const interactive_tui = config.serve_port == null and config.web_port == null and
-        config.resume_response == null and config.prompt == null and
-        config.teammate_name.len == 0 and !config.dump_prompt and !config.dump_plugins;
-    if (interactive_tui and !config.verbose and platform_term.isatty(2)) {
-        log.setStderrEnabled(false);
-    }
+    const interactive_tui = interactiveRepl(config);
+    const quiet_stderr = interactive_tui and !config.verbose and platform_term.isatty(2);
+    if (quiet_stderr) log.setStderrEnabled(false);
+    // The REPL shows its prompt while MCP servers connect and joins them
+    // before its first request; every other frontend connects them in App.init.
+    if (interactive_tui) config.mcp_connect = .first_request;
 
     // Introspection builds the same App/Plugin snapshot but cannot issue a
     // provider request, so it neither requires credentials nor consumes the
@@ -905,10 +907,29 @@ pub fn main(init: std.process.Init) !void {
     // Argument and configuration strings stay in the arena; the session reads
     // them and never frees them.
     const gpa = init.gpa;
-    const app = try app_mod.App.init(gpa, init.io, config, api_key);
+
+    // The startup splash plays while App.init runs (MCP connects, catalog
+    // fetches), not after it. Only when init's logs cannot reach the
+    // terminal: a frame redraws its rows relative to the cursor, and a line
+    // written between frames would shift them. The theme is settled first:
+    // its terminal query reads stdin, which is the splash's until it ends.
+    var splash: repl.Splash = .not_started;
+    var init_options: app_mod.App.InitOptions = .{ .models_cache = interactive_tui };
+    if (interactive_tui and (quiet_stderr or !platform_term.isatty(2))) {
+        const variant = app_mod.resolveThemeVariant(allocator, config.no_theme, config.state_root);
+        init_options.theme_variant = variant;
+        splash = repl.startSplash(gpa, variant, config.state_root);
+    }
+    const app = app: {
+        errdefer repl.stopSplash(splash);
+        break :app try app_mod.App.initWithOptions(gpa, init.io, config, api_key, init_options);
+    };
     defer app.deinit();
 
-    try app.installSigintHandler();
+    app.installSigintHandler() catch |err| {
+        repl.stopSplash(splash);
+        return err;
+    };
 
     log.info("main", "metacodes starting; model={s}", .{config.model});
 
@@ -1005,6 +1026,7 @@ pub fn main(init: std.process.Init) !void {
     // conversation before the first prompt, or stop before the TUI starts.
     const resumed: ?app_mod.App.ResumedConversation = if (config.resume_session != null)
         app.resumePersistedConversation() catch |err| {
+            repl.stopSplash(splash);
             std.debug.print("error: cannot resume session {s}: {s}\n", .{ app.session_id.asSlice(), repl.resumeLoadFailure(err) });
             app.deinit();
             std.process.exit(1);
@@ -1013,7 +1035,16 @@ pub fn main(init: std.process.Init) !void {
         null;
 
     // (stderr 日志 gate 已提前到 App.init 之前——见 interactive_tui;init 期日志同样不得上屏。)
-    try repl.run(app, gpa, .{ .resumed = resumed });
+    try repl.run(app, gpa, .{ .resumed = resumed, .splash = splash });
+}
+
+/// Whether this run ends in the interactive REPL (`repl.run`): no daemon,
+/// web, headless, resumed-suspension, teammate or dump frontend was asked
+/// for. Only that frontend shows a prompt before its MCP servers connect.
+pub fn interactiveRepl(config: types.Config) bool {
+    return config.serve_port == null and config.web_port == null and
+        config.resume_response == null and config.prompt == null and
+        config.teammate_name.len == 0 and !config.dump_prompt and !config.dump_plugins;
 }
 
 /// Write pipeable command output directly to stdout, without routing it through
@@ -1054,7 +1085,7 @@ fn dumpPromptSectionsAndExit(app: *app_mod.App) noreturn {
     const cwd = @import("util/fs.zig").getCwd(app.allocator) catch "";
     const listing = system_prompt_mod.listFullWithDefs(
         app.allocator,
-        app.config.model_display_name orelse app.config.model,
+        app.promptModelName(),
         &app.skills,
         &app.agents,
         app.enabled_tool_names,
@@ -3419,6 +3450,7 @@ test {
     _ = &@import("core/memory/memory_section.zig");
     _ = &@import("app.zig");
     _ = &@import("app/route_strings.zig");
+    _ = &@import("app/mcp_startup.zig");
     _ = &@import("app/install.zig");
     _ = &@import("app/kg_autostart.zig");
     _ = &@import("session_service.zig");
@@ -3445,6 +3477,7 @@ test {
     _ = &@import("api/oauth_exchange.zig");
     _ = &@import("api/oauth_login.zig");
     _ = &@import("api/catalog_fetch.zig");
+    _ = &@import("api/models_cache.zig");
     _ = &@import("repl/msg_queue.zig");
     _ = &@import("repl/history.zig");
     _ = &@import("repl/user_echo.zig");

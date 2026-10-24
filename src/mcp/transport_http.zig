@@ -20,6 +20,16 @@
 //! static bearer token or headers authenticate). Cancellation and deadlines
 //! shut the connection down through the provider client's request registry,
 //! which also wakes a read blocked in the kernel.
+//!
+//! Connections are kept alive and reused while requests come in quick
+//! succession (the handshake, a burst of tool calls): one TLS handshake
+//! instead of one per message. `Connection: close` is never sent — some
+//! servers (Vercel's edge, developers.openai.com) drop such a request
+//! unanswered. A connection is reused only after its response was read to
+//! the end (std.http marks it closing otherwise), only within
+//! `reuse_idle_ms` of its last use (servers close idle ones; Node's default
+//! is 5 s), and a request that finds the reused connection already closed,
+//! before a single response byte, is sent again on a new one.
 
 const std = @import("std");
 const AbortSignal = @import("../util/abort.zig").AbortSignal;
@@ -44,6 +54,15 @@ pub const SendMeta = struct {
 
 const MAX_MESSAGE_BYTES: usize = 128 * 1024 * 1024 + 1024 * 1024;
 
+/// How long an idle pooled connection stays reusable (below Node's 5 s
+/// keep-alive default).
+pub const REUSE_IDLE_MS: i64 = 4_000;
+/// How long the next request waits, in silence, for an answered SSE stream
+/// to end so its connection can be reused (the monitor ticks every 250 ms).
+const SETTLE_IDLE_MS: u64 = 250;
+/// Fresh attempts after a reused connection turned out closed.
+const MAX_STALE_RETRIES: usize = 3;
+
 pub const HttpTransport = struct {
     allocator: std.mem.Allocator,
     client: std.http.Client,
@@ -63,6 +82,13 @@ pub const HttpTransport = struct {
     queue: std.ArrayList([]u8) = .empty,
     /// The open SSE response, read lazily by `recvLine`.
     stream: ?*Exchange = null,
+    /// The client has its response from `stream`: what is left of it is the
+    /// end of the body, finished before the next request (`settleStream`).
+    stream_answered: bool = false,
+    /// When a response last finished arriving: the pooled connections have
+    /// been idle since.
+    last_used_ms: i64 = 0,
+    reuse_idle_ms: i64 = REUSE_IDLE_MS,
 
     pub fn create(
         allocator: std.mem.Allocator,
@@ -128,14 +154,21 @@ pub const HttpTransport = struct {
     pub fn send(self: *HttpTransport, json: []const u8, meta: SendMeta) !void {
         // A reply posted while a request's SSE stream is still open (Classic
         // server→client request) uses its own connection; the open stream
-        // keeps its place.
+        // keeps its place. A stream whose request was answered is finished
+        // first, so its connection can carry this message.
+        if (self.stream_answered) self.settleStream();
         var exchange = try self.post(json, meta);
         errdefer exchange.destroy(self);
         switch (exchange.kind) {
-            .empty => exchange.destroy(self),
+            .empty => {
+                exchange.drainEmpty();
+                exchange.destroy(self);
+                self.last_used_ms = util_time.nowMs();
+            },
             .json => {
                 const body = try exchange.readAll(self, MAX_MESSAGE_BYTES);
                 exchange.destroy(self);
+                self.last_used_ms = util_time.nowMs();
                 errdefer self.allocator.free(body);
                 if (std.mem.trim(u8, body, " \t\r\n").len == 0) {
                     self.allocator.free(body);
@@ -150,8 +183,34 @@ pub const HttpTransport = struct {
                     previous.destroy(self);
                 }
                 self.stream = exchange;
+                self.stream_answered = false;
             },
         }
+    }
+
+    /// The client read the response it was waiting for. An SSE stream still
+    /// open is then only the rest of that response's body.
+    pub fn markAnswered(self: *HttpTransport) void {
+        self.stream_answered = self.stream != null;
+        self.last_used_ms = util_time.nowMs();
+    }
+
+    /// Read the rest of an answered SSE stream. Servers end it right after
+    /// the response (the spec says they SHOULD), so this normally reads only
+    /// the closing chunk and the connection goes back to the pool; a server
+    /// that keeps it open costs SETTLE_IDLE_MS of silence and the connection.
+    /// Late messages wait in the queue for the next reader.
+    fn settleStream(self: *HttpTransport) void {
+        self.stream_answered = false;
+        const exchange = self.stream orelse return;
+        self.registry.setIdleLimit(@ptrCast(&exchange.request), SETTLE_IDLE_MS);
+        while (exchange.nextEvent(self, MAX_MESSAGE_BYTES) catch null) |message| {
+            self.queue.append(self.allocator, message) catch {
+                self.allocator.free(message);
+                break;
+            };
+        }
+        self.closeStream();
     }
 
     pub fn recvLine(self: *HttpTransport) ![]u8 {
@@ -178,6 +237,28 @@ pub const HttpTransport = struct {
     fn closeStream(self: *HttpTransport) void {
         if (self.stream) |exchange| exchange.destroy(self);
         self.stream = null;
+        self.stream_answered = false;
+    }
+
+    /// Close the pooled connections (none is in use): they have been idle
+    /// long enough for the server to have closed them.
+    fn dropIdleConnections(self: *HttpTransport) void {
+        const pool = &self.client.connection_pool;
+        const io = self.client.io;
+        pool.mutex.lockUncancelable(io);
+        defer pool.mutex.unlock(io);
+        while (pool.free.popFirst()) |node| {
+            pool.free_len -= 1;
+            const connection: *std.http.Client.Connection = @alignCast(@fieldParentPtr("pool_node", node));
+            connection.destroy(io);
+        }
+    }
+
+    fn idleConnections(self: *HttpTransport) usize {
+        const pool = &self.client.connection_pool;
+        pool.mutex.lockUncancelable(self.client.io);
+        defer pool.mutex.unlock(self.client.io);
+        return pool.free_len;
     }
 
     fn deleteSession(self: *HttpTransport) !void {
@@ -185,7 +266,6 @@ pub const HttpTransport = struct {
         defer extra.deinit(self.allocator);
         try self.appendCommonHeaders(&extra, .{});
         var request = try self.client.request(.DELETE, self.uri, .{
-            .keep_alive = false,
             .headers = .{ .accept_encoding = .omit },
             .extra_headers = extra.items,
         });
@@ -229,28 +309,31 @@ pub const HttpTransport = struct {
             try extra.appendSlice(scratch.allocator(), common.items);
         }
 
-        const exchange = try self.allocator.create(Exchange);
-        errdefer self.allocator.destroy(exchange);
-        exchange.* = .{ .request = undefined };
-        exchange.request = self.client.request(.POST, self.uri, .{
-            .keep_alive = false,
-            .headers = .{
-                .accept_encoding = .omit,
-                .content_type = .{ .override = "application/json" },
-            },
-            .extra_headers = extra.items,
-        }) catch return error.McpConnectFailed;
-        errdefer exchange.request.deinit();
-        const remaining: u64 = if (self.deadline_ms) |deadline| @intCast(@max(deadline - util_time.nowMs(), 1)) else 0;
-        try self.registry.registerMonitored(self.allocator, self.abort, @ptrCast(&exchange.request), shutdownRequest, remaining);
-        exchange.registered = true;
-        errdefer self.registry.unregister(@ptrCast(&exchange.request));
+        if (util_time.nowMs() - self.last_used_ms > self.reuse_idle_ms and self.idleConnections() != 0)
+            self.dropIdleConnections();
 
-        exchange.request.sendBodyComplete(@constCast(json)) catch return self.transportError();
         var redirect: [4096]u8 = undefined;
-        exchange.response = exchange.request.receiveHead(&redirect) catch return self.transportError();
-        exchange.has_response = true;
+        var stale_retries: usize = 0;
+        const exchange = while (true) {
+            const reusing = self.idleConnections() != 0;
+            const exchange = try self.open(extra.items);
+            if (exchange.exchangeHead(json, &redirect)) |_| break exchange else |err| {
+                // This connection cannot carry another request either.
+                if (exchange.request.connection) |connection| connection.closing = true;
+                exchange.destroy(self);
+                // Closed before a single response byte: the server dropped an
+                // idle connection we reused and never read this request.
+                const stale = err == error.HttpConnectionClosing or err == error.WriteFailed;
+                if (reusing and stale and stale_retries < MAX_STALE_RETRIES and !self.interrupted()) {
+                    stale_retries += 1;
+                    continue;
+                }
+                return self.transportError();
+            }
+        };
+        errdefer exchange.destroy(self);
         const status = http_status.ResponseStatus.capture(&exchange.response).code;
+        exchange.status = status;
         const head = exchange.response.head;
 
         // Classic: the server assigns its session on the initialize response.
@@ -282,6 +365,32 @@ pub const HttpTransport = struct {
         return exchange;
     }
 
+    /// A POST exchange on a pooled or new connection, registered for abort
+    /// and deadline.
+    fn open(self: *HttpTransport, extra_headers: []const std.http.Header) !*Exchange {
+        const exchange = try self.allocator.create(Exchange);
+        errdefer self.allocator.destroy(exchange);
+        exchange.* = .{ .request = undefined };
+        exchange.request = self.client.request(.POST, self.uri, .{
+            .headers = .{
+                .accept_encoding = .omit,
+                .content_type = .{ .override = "application/json" },
+            },
+            .extra_headers = extra_headers,
+        }) catch return error.McpConnectFailed;
+        errdefer exchange.request.deinit();
+        const remaining: u64 = if (self.deadline_ms) |deadline| @intCast(@max(deadline - util_time.nowMs(), 1)) else 0;
+        try self.registry.registerMonitored(self.allocator, self.abort, @ptrCast(&exchange.request), shutdownRequest, remaining);
+        exchange.registered = true;
+        return exchange;
+    }
+
+    fn interrupted(self: *const HttpTransport) bool {
+        if (self.abort) |abort| if (abort.isAborted()) return true;
+        if (self.deadline_ms) |deadline| if (util_time.nowMs() >= deadline) return true;
+        return false;
+    }
+
     fn transportError(self: *HttpTransport) anyerror {
         if (self.abort) |abort| if (abort.isAborted()) return error.Aborted;
         if (self.deadline_ms) |deadline| if (util_time.nowMs() >= deadline) return error.Timeout;
@@ -298,6 +407,8 @@ const Exchange = struct {
     request: std.http.Client.Request,
     response: std.http.Client.Response = undefined,
     has_response: bool = false,
+    /// The captured HTTP status (`http_status.ResponseStatus`), 0 before.
+    status: u16 = 0,
     registered: bool = false,
     kind: Kind = .empty,
     transfer: [16 * 1024]u8 = undefined,
@@ -311,8 +422,28 @@ const Exchange = struct {
     fn destroy(self: *Exchange, transport: *HttpTransport) void {
         if (self.registered) transport.registry.unregister(@ptrCast(&self.request));
         self.pending.deinit(transport.allocator);
+        // Back to the pool when its response was read to the end, closed
+        // otherwise (std.http.Client.Request.deinit).
         self.request.deinit();
         transport.allocator.destroy(self);
+    }
+
+    /// Send `json` and read the response head.
+    fn exchangeHead(self: *Exchange, json: []const u8, redirect: []u8) !void {
+        try self.request.sendBodyComplete(@constCast(json));
+        self.response = try self.request.receiveHead(redirect);
+        self.has_response = true;
+    }
+
+    /// Read a 202/204 answer's body when it is framed, so the connection is
+    /// reusable; an unframed body ends only when the server closes, and that
+    /// connection is closed instead.
+    fn drainEmpty(self: *Exchange) void {
+        if (!self.has_response) return;
+        if (self.status == 204 or self.status == 304) return; // no body by definition
+        const head = self.response.head;
+        if (head.transfer_encoding != .chunked and head.content_length == null) return;
+        _ = self.reader().discardRemaining() catch {};
     }
 
     fn reader(self: *Exchange) *std.Io.Reader {
