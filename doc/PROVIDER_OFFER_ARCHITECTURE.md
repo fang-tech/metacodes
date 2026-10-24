@@ -586,6 +586,13 @@ fails leaves the previous catalog in place: a stale catalog is a far better
 answer than an empty one, and every pin stays resolvable because offer ids are
 derived from the stable binding.
 
+Each ingest keeps its own arena until the host ends (`Host.catalog_arenas`).
+One shared slot let an ingest for one provider free the strings behind
+another provider's profile, which the rebuild inside that same ingest then
+read; and a same-provider replace cannot free its predecessor either, because
+the retired catalog and any picker snapshot taken before the swap still borrow
+its model names.
+
 Ingesting a catalog moves the catalog revision and emits `catalog.updated`,
 `pricing.updated`, and — when an endpoint reports degraded or unavailable —
 `provider.degraded`. `auth.changed` and `credential.expiring` have producers on
@@ -644,6 +651,28 @@ model served by another provider or protocol switches in place; a name carried
 by several routes is reported with their offer ids instead of guessed, and an
 offer id is accepted verbatim. Names the catalog does not declare fall through
 to the historical path, which still serves proxies and server-catalog models.
+
+On the historical Metask API-key route — no provider named, or `metask` named
+with an API key, and no Metask session login — the Metask offers are the ones
+the session's own gateway lists. A key's gateway serves the models of that
+key's group, which need not include any of the compiled profile's Claude
+models, and `--base-url` may name another gateway entirely; the compiled
+inventory at the default gateway therefore listed routes the session could not
+use and none it could. `App.MetaskKeyRoute` records the route at startup, and
+every `/v1/models` answer from that gateway — the startup probe and a `/models`
+key switch — goes through one seam (`App.adoptMetaskKeyModels`) into
+`Host.ingestMetask(..., .messages)`: one Messages offer per listed model at the
+session's own endpoint, no Chat Completions offer (the session's transport is
+Messages, the key was never shown to serve Chat, and two wires per model would
+make `/model use <id>` ambiguous). The host stays lazy; it ingests the newest
+document when it is built, and a document that arrives after that re-ingests at
+once. The running model's offer on that endpoint is seeded as the session
+selection, so the picker, `/providers`, and `/alias pin` see the current route.
+A commit onto a Metask offer there binds the session's own key — picked in
+`/models`, else the one the session started with, stored login included —
+ahead of the environment, as every turn on that route already does. With no
+answer from the gateway the compiled inventory stays. A Metask session login
+ingests its authenticated gateway's catalog with both wires, as before.
 
 `/login [<provider>] [--device-code] [--no-browser] [--client-id <client>]` is
 the TUI's OAuth setup path (issue #33). Without a provider it opens a Login

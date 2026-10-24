@@ -75,6 +75,26 @@ status, compatibility boundaries, and entry points are defined by
   transcript viewer, reverse search and a paste in progress ended the same
   way. An interrupted read is now retried and the dialog is drawn again; a
   SIGINT that asks the process to stop still ends it.
+- **`/model` on a Metask API key lists the models that key can use.** With no
+  `--provider` and no Metask session login, the picker showed the six compiled
+  Claude models at `napi.metask-ai.com` whatever the key's gateway served or
+  `--base-url` named, marked none of them current, and picking one with a key
+  stored by `metacodes login` asked for a sign-in (`MissingCredentials`). The
+  Metask row now holds the models the session's gateway answers on
+  `/v1/models` (again after a `/models` key switch), at the session's own
+  endpoint, one Messages route each; the running model is marked, and a pick
+  is sent with the session's key — the one picked in `/models`, else the one
+  it started with. With no answer from the gateway the compiled list stays.
+- A provider catalog ingested at runtime no longer frees another one's. The
+  host kept one arena for all of them, so Metask's gateway catalog arriving
+  after a configured `provider_catalogs` entry released that entry's profile,
+  and the rebuild in the same ingest read it.
+- The sharded test runner gives `std.debug` and every test a private copy of
+  the start-up environment. Both read the start-up `envp` array lazily, and a
+  test's `setenv` could make macOS free a string that array still pointed at;
+  the first `std.debug.print` in a shard then panicked in the environment
+  scan (`start index 3 is larger than end index 2`) whenever an earlier test
+  in that shard had moved `HOME` the wrong way.
 - `zig build test` no longer leaves TinyKG services from the WorkBuddy replay
   tests. `WorkBuddyLeaderboardProtocolTest`'s window replay and
   `LeaderboardPreflightBinaryTest` arrived after the earlier fix. They run the

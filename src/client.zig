@@ -665,7 +665,7 @@ pub const Client = struct {
 
     /// 启动时探测 `/v1/models` → 填 catalog。失败静默（不报错，fallback 仍可用）。
     pub fn probeModels(client: *Client) void {
-        const body = client.doGetModels() catch |err| {
+        const body = client.fetchModelsDocument() catch |err| {
             log.debug("catalog", "probeModels: {s} (falling back to local table)", .{@errorName(err)});
             return;
         };
@@ -675,8 +675,8 @@ pub const Client = struct {
         };
     }
 
-    /// GET <base>/v1/models 拉完整响应。
-    fn doGetModels(client: *Client) ![]u8 {
+    /// GET <base>/v1/models 拉完整响应(client.allocator 所有,调用方释放)。
+    pub fn fetchModelsDocument(client: *Client) ![]u8 {
         // 把 /v1/messages 替换成 /v1/models
         const messages_url = client.base_url;
         const suffix = "/v1/messages";
@@ -1820,7 +1820,7 @@ test "estimateTokens" {
 // Regression: GET /v1/models 必须用 sendBodiless()；std.http 对带 body 的 GET 会 assert。
 // 有人把 sendBodiless 改回 sendBodyComplete("")，离线 probeModels 会 panic（非 error）。
 // 源码扫描级断言兜底：测试读自己的源文件，确保关键行不退化。
-test "doGetModels uses sendBodiless (no sendBodyComplete on GET)" {
+test "fetchModelsDocument uses sendBodiless (no sendBodyComplete on GET)" {
     const src = @embedFile("client.zig");
     // 确认函数里有 sendBodiless 调用
     try std.testing.expect(std.mem.indexOf(u8, src, "req.sendBodiless()") != null);
