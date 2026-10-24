@@ -67,6 +67,12 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- An OpenRouter catalog ingested at runtime keeps its strings. Its channels
+  borrowed model ids, names, regions and control specs from the parse results,
+  which the ingest frees before it returns, so the registry profile and every
+  offer catalog built from it (now or on a later refresh) read freed memory.
+  `buildChannels` now copies everything the channels point at into the
+  profile's arena.
 - **TUI: a terminal resize no longer answers an open dialog.** A resize
   interrupts a blocked key read (SIGWINCH has no `SA_RESTART`), and the
   permission dialog took the interrupted read for "No": the tool was denied

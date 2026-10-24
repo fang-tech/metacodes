@@ -1090,3 +1090,171 @@ test "a startup stage that does not apply records why" {
     // And the built-in providers still work.
     try std.testing.expect(host.kernel.catalogSnapshot().items().len > 0);
 }
+
+/// Forwards to `child` but overwrites every freed block first, so a read of
+/// released memory sees 0xAA instead of the bytes it used to hold.
+const PoisonOnFree = struct {
+    child: std.mem.Allocator,
+
+    fn allocator(self: *PoisonOnFree) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const self: *PoisonOnFree = @ptrCast(@alignCast(ctx));
+        return self.child.rawAlloc(len, alignment, ra);
+    }
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) bool {
+        const self: *PoisonOnFree = @ptrCast(@alignCast(ctx));
+        return self.child.rawResize(memory, alignment, new_len, ra);
+    }
+    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) ?[*]u8 {
+        _ = ctx;
+        _ = memory;
+        _ = alignment;
+        _ = new_len;
+        _ = ra;
+        return null;
+    }
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ra: usize) void {
+        const self: *PoisonOnFree = @ptrCast(@alignCast(ctx));
+        @memset(memory, 0xAA);
+        self.child.rawFree(memory, alignment, ra);
+    }
+};
+
+test "an ingested OpenRouter catalog owns its strings once the parse results are gone" {
+    // `ingestOpenRouter` releases the model and endpoint parse results before
+    // it returns. The channels used to borrow their strings from them, so the
+    // registry profile — and every offer built from it, now or on a later
+    // refresh — read 0xAA under this allocator.
+    var poison = PoisonOnFree{ .child = std.testing.allocator };
+    const a = poison.allocator();
+    const host = try Host.create(a);
+    defer host.destroy();
+    try host.ingestOpenRouter(
+        Slug.lit("openrouter"),
+        \\{"data": [{"id": "deepseek/deepseek-v4", "name": "DeepSeek V4", "context_length": 163840,
+        \\  "supported_parameters": ["tools", "reasoning"]}]}
+    ,
+        &.{
+            \\{"data": {"id": "deepseek/deepseek-v4", "endpoints": [
+            \\  {"provider_name": "DeepInfra", "quantization": "fp8", "region": "us-east", "status": 0}]}}
+        },
+    );
+
+    const Check = struct {
+        fn offer(catalog: *const OfferCatalog) !ids.OfferId {
+            var found: ?ids.OfferId = null;
+            for (catalog.items()) |item| {
+                if (!item.provider_id.eqlText("openrouter")) continue;
+                try std.testing.expect(found == null);
+                found = item.offer_id;
+                try std.testing.expectEqualStrings("deepseek/deepseek-v4", item.request_model_id);
+                try std.testing.expectEqualStrings("DeepSeek V4", item.display_name);
+                try std.testing.expectEqualStrings("deepseek/deepseek-v4", item.canonical_model_id.?);
+                try std.testing.expectEqualStrings("fp8", item.model_variant.?);
+                try std.testing.expectEqualStrings("us-east", item.region.?);
+                try std.testing.expectEqual(@as(usize, 1), item.controls.len);
+                try std.testing.expectEqualStrings("reasoning_effort", item.controls[0].id);
+                try std.testing.expectEqualStrings("medium", item.controls[0].allowed_values[1]);
+            }
+            return found orelse error.TestExpectedOffer;
+        }
+    };
+
+    const ingested = try Check.offer(host.kernel.catalogSnapshot());
+    const channel = host.registry.find("openrouter").?.channel(Slug.lit("deepinfra")).?;
+    try std.testing.expectEqualStrings("DeepInfra", channel.display_name);
+
+    // A rebuild re-reads the profile, and the offer id is derived from its
+    // request model id: a borrowed one would change the id under a pin.
+    try host.refresh();
+    const refreshed = try Check.offer(host.kernel.catalogSnapshot());
+    try std.testing.expect(refreshed.eql(ingested));
+    _ = try Check.offer(&host.retired.?);
+}
+
+test "built OpenRouter channels copy every string the parse results held" {
+    // The ingest above can only observe what the parser produces, and the
+    // parser's control vocabulary is static text. This pins the rest of the
+    // contract: everything a model or endpoint row points at, overwritten in
+    // place once the channels exist — which is what releasing them does.
+    const a = std.testing.allocator;
+    var retained = std.heap.ArenaAllocator.init(a);
+    defer retained.deinit();
+    var parsed = std.heap.ArenaAllocator.init(a);
+    defer parsed.deinit();
+
+    const Source = struct {
+        allocator: std.mem.Allocator,
+        held: std.ArrayList([]u8) = .empty,
+
+        fn text(self: *@This(), value: []const u8) ![]const u8 {
+            const copy = try self.allocator.dupe(u8, value);
+            try self.held.append(self.allocator, copy);
+            return copy;
+        }
+        fn release(self: *@This()) void {
+            for (self.held.items) |bytes| @memset(bytes, 0xAA);
+        }
+    };
+    var source = Source{ .allocator = parsed.allocator() };
+
+    const values = try source.allocator.alloc([]const u8, 2);
+    values[0] = try source.text("low");
+    values[1] = try source.text("high");
+    const controls = try source.allocator.alloc(@import("controls.zig").ControlSpec, 1);
+    controls[0] = .{
+        .id = try source.text("reasoning_effort"),
+        .label = try source.text("Reasoning"),
+        .kind = .enumeration,
+        .allowed_values = values,
+        .cost_latency_warning = try source.text("slower"),
+        .extension_data = try source.text("{\"x\":1}"),
+    };
+    const model = openrouter.CatalogModel{
+        .id = try source.text("x/y"),
+        .display_name = try source.text("X Y"),
+        .context_length = null,
+        .max_output_tokens = null,
+        .quote = .unknown,
+        .capabilities = .{},
+        .controls = controls,
+    };
+    const endpoint = openrouter.Endpoint{
+        .provider_name = try source.text("Alpha"),
+        .channel_id = Slug.lit("alpha"),
+        .request_model_id = try source.text("x/y:fp8"),
+        .context_length = null,
+        .max_output_tokens = null,
+        .quote = .unknown,
+        .health = .{},
+        .availability = .unknown,
+        .quantization = try source.text("fp8"),
+        .region = try source.text("eu"),
+        .supports_zdr = .unknown,
+    };
+
+    const channels = try openrouter.buildChannels(retained.allocator(), model, &.{endpoint});
+    source.release();
+    @memset(std.mem.sliceAsBytes(values), 0xAA);
+    @memset(std.mem.sliceAsBytes(controls), 0xAA);
+
+    try std.testing.expectEqualStrings("Alpha", channels[0].display_name);
+    try std.testing.expectEqualStrings("eu", channels[0].region.?);
+    const entry = channels[0].models[0];
+    try std.testing.expectEqualStrings("x/y:fp8", entry.request_model_id);
+    try std.testing.expectEqualStrings("X Y", entry.display_name);
+    try std.testing.expectEqualStrings("x/y", entry.canonical_model_id.?);
+    try std.testing.expectEqualStrings("fp8", entry.model_variant.?);
+    try std.testing.expectEqual(@as(usize, 1), entry.controls.len);
+    const control = entry.controls[0];
+    try std.testing.expectEqual(@import("controls.zig").ValueKind.enumeration, control.kind);
+    try std.testing.expectEqualStrings("reasoning_effort", control.id);
+    try std.testing.expectEqualStrings("Reasoning", control.label);
+    try std.testing.expectEqual(@as(usize, 2), control.allowed_values.len);
+    try std.testing.expectEqualStrings("low", control.allowed_values[0]);
+    try std.testing.expectEqualStrings("high", control.allowed_values[1]);
+    try std.testing.expectEqualStrings("slower", control.cost_latency_warning.?);
+    try std.testing.expectEqualStrings("{\"x\":1}", control.extension_data.?);
+}
