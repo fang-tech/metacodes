@@ -291,7 +291,7 @@ test "L2 --api-key scope: on the historical path a Metask pick still authenticat
 
     // A Metask catalog at the mock gateway, so the pick has somewhere real to go.
     const host = try app.providerHost();
-    try host.ingestMetask(try originOf(allocator, gateway), GATEWAY_MODELS);
+    try host.ingestMetask(try originOf(allocator, gateway), GATEWAY_MODELS, .messages_and_chat);
     const offer = try offerIdText(app, "metask", "kimi-k3", "anthropic_messages");
 
     try std.testing.expect(cc.repl_picker_host.useSelector(app, &offer) == .switched);
