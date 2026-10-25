@@ -57,12 +57,17 @@ Where it goes:
                       this script for releases up to 0.5.0, which predate the
                       check)
   --force             also replace foreign files at --prefix or another launcher
-  --release-base URL  mirror of https://github.com/metask-ai/metacodes/releases
+  --release-base URL  mirror of https://github.com/metask-ai/metacodes/releases;
+                      the install records it and `metacodes update` keeps using it
   -h, --help          this text
 
 Rerunning over an install of this product replaces its version and keeps its
 state root, but never with an older version unless --allow-downgrade; foreign
 files and other launchers are never replaced without --force.
+
+Once installed, `metacodes update` brings the install up to date from where it
+came from: the release mirror it was downloaded from, or for --dev the checkout
+that built it (doc/UPDATE_DESIGN.md).
 EOF
 }
 
@@ -323,6 +328,7 @@ main() {
   dev=0
   uninstall=0
   source_dir=""
+  from_release=0
   base="https://github.com/$repo/releases"
 
   while [ $# -gt 0 ]; do
@@ -397,6 +403,7 @@ main() {
     unit="$source_dir/zig-out/dev-unit"
     build_from_source "$source_dir" "$unit" "$target"
   elif [ -z "$unit" ]; then
+    from_release=1
     target=$(host_target)
     if [ -z "$version" ]; then
       version=$(latest_tag "$base") || die "could not find the latest release at $base (pass --version X.Y.Z)"
@@ -431,11 +438,14 @@ main() {
   # A unit refuses to replace a newer install with an older version, but only
   # units released after 0.5.0 carry that check (their `install --help` names
   # --allow-downgrade). For an earlier unit this script makes the same check;
-  # a unit that carries it decides for itself.
+  # a unit that carries it decides for itself. The same help says whether the
+  # unit can record where it came from (--release-base, --checkout), which
+  # releases up to 0.7.0 cannot.
+  unit_help=$("$root/bin/metacodes" install --help 2>&1 </dev/null || true)
   unit_guards=0
-  if "$root/bin/metacodes" install --help 2>&1 </dev/null | grep -q -e '--allow-downgrade'; then
-    unit_guards=1
-  fi
+  case "$unit_help" in *--allow-downgrade*) unit_guards=1 ;; esac
+  unit_sources=0
+  case "$unit_help" in *--release-base*) unit_sources=1 ;; esac
   if [ "$unit_guards" = 0 ] && [ -f "$prefix/etc/metacodes/install.json" ]; then
     unit_version=$(json_version "$root/manifest.json")
     installed_version=$(json_version "$prefix/etc/metacodes/install.json")
@@ -457,6 +467,16 @@ main() {
   # Only a unit that knows the option gets it; an earlier one rejects it as
   # unknown (and was already checked above).
   [ -n "$allow_downgrade" ] && [ "$unit_guards" = 1 ] && set -- "$@" --allow-downgrade
+  # Where `metacodes update` will look next: the checkout that built a --dev
+  # unit, or the base a published release came from. An archive or unit named
+  # on the command line records nothing, so the install keeps what it had.
+  if [ "$unit_sources" = 1 ]; then
+    if [ "$dev" = 1 ]; then
+      set -- "$@" --checkout "$source_dir"
+    elif [ "$from_release" = 1 ]; then
+      set -- "$@" --release-base "$base"
+    fi
+  fi
 
   "$root/bin/metacodes" "$@" </dev/null
 

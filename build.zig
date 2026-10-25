@@ -1176,6 +1176,30 @@ pub fn build(b: *std.Build) void {
     });
     const install_selfexe_probe = b.addInstallArtifact(selfexe_probe_exe, .{});
 
+    // update_unit_probe 二进制:`metacodes update` 组件测试里 fixture release unit 的
+    // `bin/metacodes`。`install …` 跑真安装器(src/app/install.zig,不做 doctor 自检),
+    // 其余调用只记 argv;只链 platform + 安装器那一小块,不拖整个 app 图。
+    const install_probe_root_mod = b.createModule(.{
+        .root_source_file = b.path("src/install_root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    addPlatform(b, install_probe_root_mod);
+    const update_unit_probe_mod = b.createModule(.{
+        .root_source_file = b.path("tests/_harness/update_unit_probe.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    addPlatform(b, update_unit_probe_mod);
+    update_unit_probe_mod.addImport("install_root", install_probe_root_mod);
+    const update_unit_probe_exe = b.addExecutable(.{
+        .name = "update_unit_probe",
+        .root_module = update_unit_probe_mod,
+    });
+    const install_update_unit_probe = b.addInstallArtifact(update_unit_probe_exe, .{});
+
     // replay_server 二进制(Stage 7):从 cassette 起 mock,供 e2e replay。测试专用。
     // 三端可编:曾经的三个 Windows blocker 已清(socket server→platform/net、
     // args→iterateAllocator、cassette 文件 IO→pfs)。TTY ui_tools 用例依赖它。
@@ -1200,10 +1224,11 @@ pub fn build(b: *std.Build) void {
         .root_module = replay_mod,
     });
     const install_replay = b.addInstallArtifact(replay_exe, .{});
-    const test_harness_step = b.step("test:harness", "Install the test harness binaries: mock_mcp_server, replay_server and selfexe_probe");
+    const test_harness_step = b.step("test:harness", "Install the test harness binaries: mock_mcp_server, replay_server, selfexe_probe and update_unit_probe");
     test_harness_step.dependOn(&install_mock_mcp.step);
     test_harness_step.dependOn(&install_replay.step);
     test_harness_step.dependOn(&install_selfexe_probe.step);
+    test_harness_step.dependOn(&install_update_unit_probe.step);
 
     // ── metacodes-core 可复用库 module(root=src/lib.zig,UI 图不可达)──────────
     // 供其他 Zig 项目经 build.zig.zon 依赖 `@import("metacodes-core")`。
@@ -2757,6 +2782,7 @@ pub fn build(b: *std.Build) void {
         run_shard.step.dependOn(&install_cli.step);
         run_shard.step.dependOn(&install_mock_mcp.step);
         run_shard.step.dependOn(&install_selfexe_probe.step);
+        run_shard.step.dependOn(&install_update_unit_probe.step);
         wireTinyKgTestInput(run_shard, staged_tinykg);
         wireTinyKgdTestInput(run_shard, staged_tinykgd);
         wireLeanKernelTestInputs(run_shard, staged_lean_kernels);
@@ -2775,6 +2801,7 @@ pub fn build(b: *std.Build) void {
     integration_monolithic_run.step.dependOn(&install_cli.step);
     integration_monolithic_run.step.dependOn(&install_mock_mcp.step);
     integration_monolithic_run.step.dependOn(&install_selfexe_probe.step);
+    integration_monolithic_run.step.dependOn(&install_update_unit_probe.step);
     wireTinyKgTestInput(integration_monolithic_run, staged_tinykg);
     wireTinyKgdTestInput(integration_monolithic_run, staged_tinykgd);
     wireLeanKernelTestInputs(integration_monolithic_run, staged_lean_kernels);
@@ -2795,6 +2822,7 @@ pub fn build(b: *std.Build) void {
     integration_timed_run.step.dependOn(&install_cli.step);
     integration_timed_run.step.dependOn(&install_mock_mcp.step);
     integration_timed_run.step.dependOn(&install_selfexe_probe.step);
+    integration_timed_run.step.dependOn(&install_update_unit_probe.step);
     wireTinyKgTestInput(integration_timed_run, staged_tinykg);
     wireTinyKgdTestInput(integration_timed_run, staged_tinykgd);
     wireLeanKernelTestInputs(integration_timed_run, staged_lean_kernels);

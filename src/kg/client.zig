@@ -262,6 +262,11 @@ pub const KgClient = struct {
     /// Configuration inputs retained so a session can re-read a repaired daemon.json.
     daemon_state_root: ?[]u8 = null,
     daemon_io: ?std.Io = null,
+    /// The caller named the service (`daemon_url`/`_api_key`/
+    /// `_expected_build_id` options). Those are not retained, so re-reading
+    /// the environment and files would replace the caller's service with
+    /// another: such a client never re-reads.
+    daemon_explicit: bool = false,
     unconfigured_kind: DegradedKind = .unconfigured,
     last_probe_ms: i64 = 0,
     probe_backoff_ms: i64 = 0,
@@ -333,19 +338,30 @@ pub const KgClient = struct {
     /// reports it unreachable and the next session's probe starts it.
     pub const Autostart = struct {
         ctx: *anyopaque,
-        start: *const fn (ctx: *anyopaque) bool,
+        start: *const fn (ctx: *anyopaque, reason: StartReason) bool,
+    };
+
+    /// Why the client asks the host for its service.
+    pub const StartReason = enum {
+        /// Unconfigured, or nothing listens on the configured port.
+        not_running,
+        /// The listener refused this configuration's key.
+        key_refused,
+        /// This install's service answered with another build id than the
+        /// configuration pins (`transport.Error.BuildMismatch`).
+        stale_pin,
     };
 
     /// One host start per client per window: a service that cannot come up
     /// must not cost a start attempt on every KG call.
     pub const AUTOSTART_RETRY_MS: i64 = 30_000;
 
-    fn tryAutostart(self: *KgClient) bool {
+    fn tryAutostart(self: *KgClient, reason: StartReason) bool {
         const hook = self.autostart orelse return false;
         const now = time.nowMs();
         if (self.autostart_last_ms != 0 and now - self.autostart_last_ms < AUTOSTART_RETRY_MS) return false;
         self.autostart_last_ms = if (now > 0) now else 1;
-        const started = hook.start(hook.ctx);
+        const started = hook.start(hook.ctx, reason);
         log.info("kg", "local TinyKG service autostart: {s}", .{if (started) "up" else "not started"});
         return started;
     }
@@ -466,6 +482,8 @@ pub const KgClient = struct {
             .domain = domain,
             .daemon_state_root = daemon_state_root,
             .daemon_io = if (!use_cli) opts.io else null,
+            .daemon_explicit = opts.daemon_url != null or opts.daemon_api_key != null or
+                opts.daemon_expected_build_id != null or opts.daemon_expected_schema_digest != null,
             .unconfigured_kind = unconfigured_kind,
             .autostart = if (!use_cli) opts.autostart else null,
             .scoped_types = std.StringHashMap(void).init(allocator),
@@ -898,7 +916,7 @@ pub const KgClient = struct {
         if (self.ready) return;
         // Not configured yet: the host may provision and start the local
         // service, after which the configuration it wrote is read here.
-        if (self.transport == .unconfigured and self.unconfigured_kind == .unconfigured and self.tryAutostart()) {
+        if (self.transport == .unconfigured and self.unconfigured_kind == .unconfigured and self.tryAutostart(.not_running)) {
             self.reloadDaemonConfig();
         }
         switch (self.transport) {
@@ -913,26 +931,51 @@ pub const KgClient = struct {
                 // of ~2 s each, so when the listener table already says
                 // nothing listens, the host is asked first. The verdict still
                 // comes from store-info; this only moves the start earlier.
+                //
+                // After the host started a service, the probe runs again as a
+                // fresh pass: the host may have repinned `daemon.json` to the
+                // binaries the new service runs, and the `BuildMismatch` path
+                // below reads the file again ("A stale pin" in
+                // doc/TINYKG_INTEGRATION.md).
                 if (daemon.loopbackPort()) |port| {
-                    if (net.loopbackListenState(port) == .not_listening) _ = self.tryAutostart();
+                    if (net.loopbackListenState(port) == .not_listening and self.tryAutostart(.not_running))
+                        return self.ensureReady();
                 }
-                const result = daemon.run("store-info", &.{}, false) catch |first| retry: {
+                const result = daemon.run("store-info", &.{}, false) catch |first| {
                     // Configured but not listening: the host may start it.
-                    if (serviceNotRunning(first) and self.tryAutostart()) {
-                        break :retry daemon.run("store-info", &.{}, false) catch |err| {
-                            self.setDegraded(classifyDaemonError(err), "TinyKG daemon preflight 失败: {s}；未打开本地 Store", .{@errorName(err)});
-                            return;
-                        };
-                    }
+                    if (serviceNotRunning(first) and self.tryAutostart(.not_running)) return self.ensureReady();
                     // A local service that refuses this configuration's key may
                     // be another state root's, holding the port this install
                     // pinned. The host can move this install to a free port and
                     // start its own service there; read what it wrote and probe
                     // once more (tryAutostart allows one start per window, so
                     // this does not recurse further).
-                    if (first == transport_mod.Error.AuthenticationFailed and daemon.loopbackPort() != null and self.tryAutostart()) {
+                    if (first == transport_mod.Error.AuthenticationFailed and daemon.loopbackPort() != null and self.tryAutostart(.key_refused)) {
                         self.reloadDaemonConfig();
                         return self.ensureReady();
+                    }
+                    // This install's own service on other binaries than the
+                    // pin names (an update changed them). The configuration
+                    // may already have been repinned by another session or by
+                    // `metacodes update`: read it again first. Otherwise the
+                    // host repins it to the installed binaries
+                    // (doc/TINYKG_INTEGRATION.md, "A stale pin"). Each step
+                    // happens at most once per call: a pin that did not change
+                    // is not reloaded again, and tryAutostart allows one start
+                    // per window.
+                    if (first == transport_mod.Error.BuildMismatch and daemon.loopbackPort() != null) {
+                        var held_buf: [80]u8 = undefined;
+                        const held_len = @min(daemon.expected_build_id.len, held_buf.len);
+                        @memcpy(held_buf[0..held_len], daemon.expected_build_id[0..held_len]);
+                        self.reloadDaemonConfig();
+                        if (self.transport == .daemon and !std.mem.eql(u8, self.transport.daemon.expected_build_id, held_buf[0..held_len]))
+                            return self.ensureReady();
+                        if (self.tryAutostart(.stale_pin)) {
+                            self.reloadDaemonConfig();
+                            return self.ensureReady();
+                        }
+                        self.setDegraded(.pin_mismatch, "TinyKG daemon preflight 失败: {s}；未打开本地 Store", .{@errorName(first)});
+                        return;
                     }
                     self.setDegraded(classifyDaemonError(first), "TinyKG daemon preflight 失败: {s}；未打开本地 Store", .{@errorName(first)});
                     return;
@@ -1235,7 +1278,7 @@ pub const KgClient = struct {
     fn classifyDaemonError(err: transport_mod.Error) DegradedKind {
         return switch (err) {
             transport_mod.Error.AuthenticationFailed => .auth_failed,
-            transport_mod.Error.IncompatibleDaemon => .pin_mismatch,
+            transport_mod.Error.IncompatibleDaemon, transport_mod.Error.BuildMismatch => .pin_mismatch,
             transport_mod.Error.RequestFailed, transport_mod.Error.RequestTimedOut, transport_mod.Error.DaemonUnavailable, transport_mod.Error.Backpressure => .daemon_unreachable,
             else => .daemon_unreachable,
         };
@@ -1258,7 +1301,7 @@ pub const KgClient = struct {
             .config_invalid => "fix url/api_key/expected_build_id JSON",
             .daemon_unreachable => "a CLI session starts it when it begins (METACODES_KG_AUTOSTART=0 turns that off); `metacodes kgd` starts it now",
             .auth_failed => "the service on this port refused this configuration's key: another state root's service (or one started with an older key) holds it; with the default daemon.json the next session moves this install to a free port, otherwise stop that service or fix the configured key or port",
-            .pin_mismatch => "set expected_build_id/schema digest to the running daemon's /api/catalog values",
+            .pin_mismatch => "a session repins this install's own service when its TinyKG binaries changed; if it still runs an earlier build, stop it (`metacodes kgd`) so the next session starts the installed one; `metacodes kg install [--config <path>]` repins by hand; a remote service needs its catalog build/schema values",
             .store_contract_mismatch => "migrate the store to storage 3 / schema 3",
             .server_degraded => "the daemon is up but reports a degraded store, check its logs",
             .cli_bin_missing => "set METACODES_KG_BIN or install the staged bundle",
@@ -1278,6 +1321,7 @@ pub const KgClient = struct {
     /// Re-read daemon.json (root client only: clones hold no configuration
     /// inputs). A repaired or newly written file replaces the transport.
     fn reloadDaemonConfig(self: *KgClient) void {
+        if (self.daemon_explicit) return;
         const io = self.daemon_io orelse return;
         const root = self.daemon_state_root orelse return;
         const rebuilt = initDaemonTransport(self.allocator, io, .{ .state_root = root, .domain = self.domain, .io = io }) catch |err| blk: {
@@ -3167,10 +3211,10 @@ pub const KgClient = struct {
             transport_mod.Error.AmbiguousCommit => unreachable,
             transport_mod.Error.Backpressure => KgError.Backpressure,
             transport_mod.Error.OutOfMemory => KgError.OutOfMemory,
-            transport_mod.Error.AuthenticationFailed, transport_mod.Error.IncompatibleDaemon, transport_mod.Error.InvalidConfiguration, transport_mod.Error.InvalidUrl => blk: {
+            transport_mod.Error.AuthenticationFailed, transport_mod.Error.IncompatibleDaemon, transport_mod.Error.BuildMismatch, transport_mod.Error.InvalidConfiguration, transport_mod.Error.InvalidUrl => blk: {
                 const kind: DegradedKind = switch (err) {
                     transport_mod.Error.AuthenticationFailed => .auth_failed,
-                    transport_mod.Error.IncompatibleDaemon => .pin_mismatch,
+                    transport_mod.Error.IncompatibleDaemon, transport_mod.Error.BuildMismatch => .pin_mismatch,
                     else => .config_invalid,
                 };
                 self.setDegraded(kind, "TinyKG daemon contract 失败: {s}；禁止 CLI fallback", .{@errorName(err)});
