@@ -85,8 +85,10 @@ class _Case:
 
     def opened_urls(self, expect=0):
         # The opener is spawned detached: it may still be writing when the
-        # process that started it has exited.
-        deadline = time.monotonic() + (5.0 if expect else 0.0)
+        # process that started it has exited, and right after a build, when
+        # the system is still assessing the new binaries, it can take
+        # seconds to start. The wait ends as soon as the URL is there.
+        deadline = time.monotonic() + (15.0 if expect else 0.0)
         while True:
             urls = []
             if os.path.exists(self.opened):
@@ -215,6 +217,20 @@ def _cli(bin_path, args, env, answers, timeout=WAIT_S):
         os.kill(pid, 9)
     if status is None or not os.WIFEXITED(status):
         _, status = os.waitpid(pid, 0)
+    # Read to EOF after the exit. macOS holds the exit until the output is
+    # read, but on Linux the child can be reaped with its last lines (the
+    # "Stored the key" line) still in the pty buffer.
+    while True:
+        r, _, _ = select.select([fd], [], [], 0.5)
+        if not r:
+            break
+        try:
+            chunk = os.read(fd, 4096)
+        except OSError:
+            break
+        if not chunk:
+            break
+        out += chunk
     os.close(fd)
     return os.waitstatus_to_exitcode(status), out
 
