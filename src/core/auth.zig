@@ -22,6 +22,7 @@ const fs_util = @import("../util/fs.zig");
 const time = @import("../util/time.zig");
 const types = @import("../types.zig");
 const ResponseStatus = @import("../api/http_status.zig").ResponseStatus;
+const no_redirects = @import("../api/http_status.zig").no_redirects;
 const AbortSignal = @import("../util/abort.zig").AbortSignal;
 const util_json = @import("../util/json.zig");
 
@@ -633,6 +634,8 @@ fn postTokenForm(allocator: std.mem.Allocator, form: []const u8) ![]u8 {
     var http_client = std.http.Client{ .allocator = allocator, .io = io_runtime.io() };
     defer http_client.deinit();
     var req = http_client.request(.POST, uri, .{
+        // Only the token endpoint can answer a grant it received.
+        .redirect_behavior = no_redirects,
         .extra_headers = &.{
             .{ .name = "content-type", .value = "application/x-www-form-urlencoded" },
             .{ .name = "accept", .value = "application/json" },
@@ -823,6 +826,8 @@ fn refreshOAuthCredential(allocator: std.mem.Allocator, old: *const OAuthCredent
     defer http_client.deinit();
 
     var req = http_client.request(.POST, uri, .{
+        // Only the token endpoint can answer a grant it received.
+        .redirect_behavior = no_redirects,
         .extra_headers = &.{
             .{ .name = "content-type", .value = "application/x-www-form-urlencoded" },
             .{ .name = "accept", .value = "application/json" },

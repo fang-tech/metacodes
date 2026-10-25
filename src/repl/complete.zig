@@ -38,6 +38,39 @@ pub const SlashCatalog = struct {
 
 pub const MODEL_MENU_MAX_ROWS: usize = 8;
 
+/// How a key moves the selection of a list menu (`/models`).
+pub const MenuStep = enum { previous, next, page_up, page_down, first, last };
+
+/// The selection after `step` over `len` entries. ↑/↓ wrap, as the menus
+/// always have; a page moves by `page` and stops at either end.
+pub fn menuMove(len: usize, selected: usize, step: MenuStep, page: usize) usize {
+    if (len == 0) return 0;
+    const current = @min(selected, len - 1);
+    const by = @max(page, 1);
+    return switch (step) {
+        .next => (current + 1) % len,
+        .previous => if (current == 0) len - 1 else current - 1,
+        .page_down => @min(current + by, len - 1),
+        .page_up => current -| by,
+        .first => 0,
+        .last => len - 1,
+    };
+}
+
+pub const MenuWindow = struct { top: usize, end: usize };
+
+/// The entries of a `len`-entry menu drawn in `rows` lines: the first page
+/// until the selection leaves it, then the page that ends at the selection.
+/// Every entry is reachable and the selected one is always on screen; a
+/// menu that drew only its first page made entry `rows + 1` unselectable.
+pub fn menuWindow(len: usize, selected: usize, rows: usize) MenuWindow {
+    if (len == 0) return .{ .top = 0, .end = 0 };
+    const page = @max(rows, 1);
+    const current = @min(selected, len - 1);
+    const top = if (current + 1 > page) current + 1 - page else 0;
+    return .{ .top = top, .end = @min(top + page, len) };
+}
+
 /// The built-in commands: the `/` menu, Tab completion, `/help` and the
 /// unknown-command suggestion all read this one table. Alphabetical, as
 /// Claude Code lists them; Skills follow in `buildSlashCatalog`.
@@ -388,6 +421,29 @@ pub fn commonPrefix(candidates: []const []const u8) []const u8 {
 // ============================================================================
 
 const testing = std.testing;
+
+test "menuMove: arrows wrap, pages stop at the ends" {
+    try testing.expectEqual(@as(usize, 1), menuMove(20, 0, .next, 8));
+    try testing.expectEqual(@as(usize, 0), menuMove(20, 19, .next, 8));
+    try testing.expectEqual(@as(usize, 19), menuMove(20, 0, .previous, 8));
+    try testing.expectEqual(@as(usize, 8), menuMove(20, 0, .page_down, 8));
+    try testing.expectEqual(@as(usize, 19), menuMove(20, 15, .page_down, 8));
+    try testing.expectEqual(@as(usize, 0), menuMove(20, 5, .page_up, 8));
+    try testing.expectEqual(@as(usize, 19), menuMove(20, 3, .last, 8));
+    try testing.expectEqual(@as(usize, 0), menuMove(20, 3, .first, 8));
+    try testing.expectEqual(@as(usize, 0), menuMove(0, 3, .next, 8));
+    // A stale selection past the end is clamped before it moves.
+    try testing.expectEqual(@as(usize, 19), menuMove(20, 99, .page_down, 8));
+}
+
+test "menuWindow: the selection is always drawn, the last entry included" {
+    try testing.expectEqual(MenuWindow{ .top = 0, .end = 8 }, menuWindow(300, 0, 8));
+    try testing.expectEqual(MenuWindow{ .top = 0, .end = 8 }, menuWindow(300, 7, 8));
+    try testing.expectEqual(MenuWindow{ .top = 1, .end = 9 }, menuWindow(300, 8, 8));
+    try testing.expectEqual(MenuWindow{ .top = 292, .end = 300 }, menuWindow(300, 299, 8));
+    try testing.expectEqual(MenuWindow{ .top = 0, .end = 3 }, menuWindow(3, 2, 8));
+    try testing.expectEqual(MenuWindow{ .top = 0, .end = 0 }, menuWindow(0, 0, 8));
+}
 
 test "slash completion: /he -> /help" {
     var r = try compute(testing.allocator, .builtin, "/he", 3);

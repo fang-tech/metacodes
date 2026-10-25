@@ -1919,20 +1919,16 @@ fn readLineRaw(
                     return try allocator.dupe(u8, editor.view());
                 },
                 .models_nav => {
+                    // Every entry is selectable: the menu draws a window around
+                    // the selection (`complete.menuWindow`), so the selection
+                    // ranges over the whole list, not over its first page.
                     const n = if (app.models_picker_key_index == null)
-                        @min(app.api_key_catalog.entries.items.len, complete.MODEL_MENU_MAX_ROWS)
+                        app.api_key_catalog.entries.items.len
                     else if (app.models_picker_model_index == null)
-                        @min(app.api_client.catalog.entries.items.len, complete.MODEL_MENU_MAX_ROWS)
+                        app.api_client.catalog.entries.items.len
                     else
                         reasoningOptionCount(app);
-                    if (n > 0) {
-                        if (region.ui.slash_sel >= n) region.ui.slash_sel = n - 1;
-                        if (eff.at_nav_dir) {
-                            region.ui.slash_sel = (region.ui.slash_sel + 1) % n;
-                        } else {
-                            region.ui.slash_sel = if (region.ui.slash_sel == 0) n - 1 else region.ui.slash_sel - 1;
-                        }
-                    }
+                    region.ui.slash_sel = complete.menuMove(n, region.ui.slash_sel, eff.menu_step, complete.MODEL_MENU_MAX_ROWS);
                     redraw(region, &editor, app);
                     continue;
                 },
@@ -1943,8 +1939,7 @@ fn readLineRaw(
                             redraw(region, &editor, app);
                             continue;
                         }
-                        const visible_n = @min(keys.len, complete.MODEL_MENU_MAX_ROWS);
-                        const idx = @min(region.ui.slash_sel, visible_n - 1);
+                        const idx = @min(region.ui.slash_sel, keys.len - 1);
                         app.selectApiKeyForModels(idx) catch |err| {
                             region.clear();
                             region.emitTerminalFmt("\x1b[31m/model key selection failed: {s}\x1b[0m\n", .{@errorName(err)});
@@ -1961,8 +1956,7 @@ fn readLineRaw(
                             redraw(region, &editor, app);
                             continue;
                         }
-                        const visible_n = @min(entries.len, complete.MODEL_MENU_MAX_ROWS);
-                        const idx = @min(region.ui.slash_sel, visible_n - 1);
+                        const idx = @min(region.ui.slash_sel, entries.len - 1);
                         app.models_picker_model_index = idx;
                         region.ui.slash_sel = 0;
                         redraw(region, &editor, app);
@@ -1975,8 +1969,8 @@ fn readLineRaw(
                         redraw(region, &editor, app);
                         continue;
                     }
-                    var efforts_buf: [5]types_mod.ReasoningEffort = undefined;
-                    const efforts = reasoningOptionsForMask(entries[model_idx].reasoning_mask, &efforts_buf);
+                    var efforts_buf: @import("../api/catalog.zig").ReasoningOptions = undefined;
+                    const efforts = @import("../api/catalog.zig").reasoningOptions(entries[model_idx].reasoning_mask, &efforts_buf);
                     const effort_idx = @min(region.ui.slash_sel, efforts.len - 1);
                     try app.setReasoningEffort(efforts[effort_idx]);
                     const line = try std.fmt.allocPrint(allocator, "/model use {s}", .{entries[model_idx].model_id});
@@ -3215,25 +3209,11 @@ fn printModelCandidate(c: model_command.Candidate, current: bool) void {
     cmd_output.print("\n", .{});
 }
 
-fn reasoningOptionsForMask(mask: u8, buf: *[5]types_mod.ReasoningEffort) []const types_mod.ReasoningEffort {
-    const catalog = @import("../api/catalog.zig");
-    const ordered = [_]types_mod.ReasoningEffort{ .low, .medium, .high, .xhigh };
-    buf[0] = .none;
-    var n: usize = 1;
-    for (ordered) |effort| {
-        if ((mask & catalog.reasoningBit(effort)) != 0) {
-            buf[n] = effort;
-            n += 1;
-        }
-    }
-    return buf[0..n];
-}
-
 fn reasoningOptionCount(app: *const app_mod.App) usize {
     const idx = app.models_picker_model_index orelse return 0;
     if (idx >= app.api_client.catalog.entries.items.len) return 0;
-    var buf: [5]types_mod.ReasoningEffort = undefined;
-    return reasoningOptionsForMask(app.api_client.catalog.entries.items[idx].reasoning_mask, &buf).len;
+    var buf: @import("../api/catalog.zig").ReasoningOptions = undefined;
+    return @import("../api/catalog.zig").reasoningOptions(app.api_client.catalog.entries.items[idx].reasoning_mask, &buf).len;
 }
 
 fn printCapabilities(provider: types_mod.ProviderKind, model: []const u8) void {

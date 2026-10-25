@@ -17,6 +17,7 @@ const ids = @import("ids.zig");
 const offer_mod = @import("offer.zig");
 const controls_mod = @import("controls.zig");
 const registry_mod = @import("registry.zig");
+const profile_mod = @import("profile.zig");
 
 pub const Slug = ids.Slug;
 pub const OfferId = ids.OfferId;
@@ -576,7 +577,7 @@ test "auto route without fallback exposes exactly the route it will use" {
     var catalog = try zaiCatalog(std.testing.allocator, &registry);
     defer catalog.deinit();
 
-    const selection = try RuntimeSelection.auto("zai/glm-4.6", .{}, .session);
+    const selection = try RuntimeSelection.auto("zai/glm-5.3", .{}, .session);
     const resolution = try resolve(&catalog, selection);
     try std.testing.expectEqual(@as(u8, 1), resolution.len);
 
@@ -594,7 +595,7 @@ test "only/ignore channel lists are hard constraints" {
 
     var policy = RoutePolicy{ .fallback_allowed = true };
     policy.only_channels = try ChannelList.of(&.{ Slug.lit("cn-openai"), Slug.lit("cn-anthropic") });
-    const only = try resolve(&catalog, try RuntimeSelection.auto("zai/glm-4.6", policy, .session));
+    const only = try resolve(&catalog, try RuntimeSelection.auto("zai/glm-5.3", policy, .session));
     try std.testing.expectEqual(@as(u8, 2), only.len);
     for (only.items()) |candidate| {
         try std.testing.expectEqualStrings("cn", candidate.region.?);
@@ -602,7 +603,7 @@ test "only/ignore channel lists are hard constraints" {
 
     var ignoring = RoutePolicy{ .fallback_allowed = true };
     ignoring.ignore_channels = try ChannelList.of(&.{Slug.lit("cn-openai")});
-    const rest = try resolve(&catalog, try RuntimeSelection.auto("zai/glm-4.6", ignoring, .session));
+    const rest = try resolve(&catalog, try RuntimeSelection.auto("zai/glm-5.3", ignoring, .session));
     try std.testing.expectEqual(@as(u8, 3), rest.len);
 }
 
@@ -614,7 +615,7 @@ test "preferred order wins over the soft sort preference" {
 
     var policy = RoutePolicy{ .fallback_allowed = true, .sort_preference = .latency };
     policy.preferred_order = try ChannelList.of(&.{ Slug.lit("global-openai"), Slug.lit("cn-anthropic") });
-    const resolution = try resolve(&catalog, try RuntimeSelection.auto("zai/glm-4.6", policy, .session));
+    const resolution = try resolve(&catalog, try RuntimeSelection.auto("zai/glm-5.3", policy, .session));
     try std.testing.expect(resolution.primary().channel_id.eqlText("global-openai"));
     try std.testing.expect(resolution.items()[1].channel_id.eqlText("cn-anthropic"));
 }
@@ -625,12 +626,40 @@ test "hard constraints reject what cannot be proved to qualify" {
     var catalog = try zaiCatalog(std.testing.allocator, &registry);
     defer catalog.deinit();
 
-    // glm-4.5-air has unknown limits: a context-window floor must reject it.
-    const air_policy = RoutePolicy{ .hard_min_context_window = 100_000, .fallback_allowed = true };
-    try std.testing.expectError(
-        error.AllCandidatesRejected,
-        resolve(&catalog, try RuntimeSelection.auto("zai/glm-4.5-air", air_policy, .session)),
-    );
+    // A model with unknown limits cannot be proved to meet a context-window
+    // floor, so the floor rejects it.
+    {
+        var unknown_registry = ProviderRegistry.init(std.testing.allocator);
+        defer unknown_registry.deinit();
+        const models = [_]profile_mod.ModelEntry{.{
+            .request_model_id = "unbounded",
+            .display_name = "Unbounded",
+            .canonical_model_id = "test/unbounded",
+        }};
+        const routes = [_]profile_mod.ProtocolRoute{.{ .protocol = .openai_chat }};
+        const channels = [_]profile_mod.ChannelDescriptor{.{
+            .id = Slug.lit("default"),
+            .display_name = "Test",
+            .base_url = "https://unbounded.example/v1",
+            .routes = &routes,
+        }};
+        try unknown_registry.register(.{
+            .id = Slug.lit("unbounded"),
+            .implementation_id = Slug.lit("unbounded"),
+            .display_name = "Unbounded",
+            .channels = &channels,
+            .models = &models,
+            .accepted_credential_kinds = &.{.api_key},
+            .auth = .bearer,
+        });
+        var unknown_catalog = try unknown_registry.buildCatalog(std.testing.allocator, .{});
+        defer unknown_catalog.deinit();
+        const floor = RoutePolicy{ .hard_min_context_window = 100_000, .fallback_allowed = true };
+        try std.testing.expectError(
+            error.AllCandidatesRejected,
+            resolve(&unknown_catalog, try RuntimeSelection.auto("test/unbounded", floor, .session)),
+        );
+    }
 
     // Unknown price under a hard price ceiling is a rejection, not a pass.
     const price_policy = RoutePolicy{
@@ -643,14 +672,14 @@ test "hard constraints reject what cannot be proved to qualify" {
     };
     try std.testing.expectError(
         error.AllCandidatesRejected,
-        resolve(&catalog, try RuntimeSelection.auto("zai/glm-4.6", price_policy, .session)),
+        resolve(&catalog, try RuntimeSelection.auto("zai/glm-5.3", price_policy, .session)),
     );
 
     // A latency ceiling with no health observation likewise rejects.
     const latency_policy = RoutePolicy{ .hard_max_latency_ms = 500, .fallback_allowed = true };
     try std.testing.expectError(
         error.AllCandidatesRejected,
-        resolve(&catalog, try RuntimeSelection.auto("zai/glm-4.6", latency_policy, .session)),
+        resolve(&catalog, try RuntimeSelection.auto("zai/glm-5.3", latency_policy, .session)),
     );
 }
 
@@ -718,18 +747,30 @@ test "require_parameters routes only to offers declaring the controls" {
     defer catalog.deinit();
 
     var selection = try RuntimeSelection.auto(
-        "zai/glm-4.6",
+        "zai/glm-5.3",
         .{ .require_parameters = true, .fallback_allowed = true },
         .session,
     );
     try selection.controls.set("reasoning_effort", try controls_mod.Value.fromText("high"));
-    // The built-in profile declares no controls yet, so a hard requirement for
-    // one cannot be satisfied.
-    try std.testing.expectError(error.AllCandidatesRejected, resolve(&catalog, selection));
+    // Every Coding Plan offer declares reasoning_effort: the requirement holds.
+    const routed = try resolve(&catalog, selection);
+    try std.testing.expect(routed.len > 0);
+    for (routed.items()) |candidate| {
+        try std.testing.expect(controls_mod.findSpec(candidate.controls, "reasoning_effort") != null);
+    }
+
+    // A control no offer declares cannot be satisfied.
+    var unmet = try RuntimeSelection.auto(
+        "zai/glm-5.3",
+        .{ .require_parameters = true, .fallback_allowed = true },
+        .session,
+    );
+    try unmet.controls.set("verbosity", try controls_mod.Value.fromText("low"));
+    try std.testing.expectError(error.AllCandidatesRejected, resolve(&catalog, unmet));
 
     // Without the hard requirement the same selection still routes.
-    selection.target.auto_route.policy.require_parameters = false;
-    const relaxed = try resolve(&catalog, selection);
+    unmet.target.auto_route.policy.require_parameters = false;
+    const relaxed = try resolve(&catalog, unmet);
     try std.testing.expect(relaxed.len > 0);
 }
 
@@ -764,7 +805,7 @@ test "ambiguous legacy state fails with actionable candidates" {
     var catalog = try zaiCatalog(std.testing.allocator, &registry);
     defer catalog.deinit();
 
-    const outcome = migrateLegacy(&catalog, .{ .model_id = "glm-4.6" });
+    const outcome = migrateLegacy(&catalog, .{ .model_id = "glm-5.3" });
     try std.testing.expect(outcome == .ambiguous);
     try std.testing.expectEqual(@as(u16, 4), outcome.ambiguous.match_count);
     try std.testing.expectEqual(@as(u8, 4), outcome.ambiguous.sample_len);
@@ -784,7 +825,7 @@ test "actual-route events carry ids and no payload" {
     defer catalog.deinit();
 
     const selection = try RuntimeSelection.auto(
-        "zai/glm-4.6",
+        "zai/glm-5.3",
         .{ .fallback_allowed = true },
         .session,
     );

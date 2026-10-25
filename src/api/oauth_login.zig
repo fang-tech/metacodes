@@ -399,6 +399,8 @@ fn postFormRaw(
     var client = std.http.Client{ .allocator = allocator, .io = io };
     defer client.deinit();
     var request = client.request(.POST, uri, .{
+        // Only the token endpoint can answer a grant it received.
+        .redirect_behavior = http_status.no_redirects,
         .extra_headers = &.{
             .{ .name = "content-type", .value = "application/x-www-form-urlencoded" },
             .{ .name = "accept", .value = "application/json" },

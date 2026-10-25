@@ -245,9 +245,53 @@ test "L2 metask api-key route: the picker offers the gateway's models at the ses
     try std.testing.expectEqualStrings("Bearer " ++ SESSION_KEY, headerValue(captured, "authorization").?);
     try std.testing.expectEqualStrings("\"kimi-k3\"", captured.jsonField("model").?);
 
-    // `/model use` resolves the same catalog: one route, so no ambiguity.
+    // `/model use` resolves the same catalog. Z.AI lists glm-5.3-flash too
+    // (four channels); the name means the provider the session is on.
     try std.testing.expect(cc.repl_picker_host.useSelector(app, "glm-5.3-flash") == .switched);
     try std.testing.expectEqualStrings("glm-5.3-flash", app.activeModel());
+    // A name only another provider serves, on several channels, is still a
+    // question rather than a guess.
+    const elsewhere = cc.repl_picker_host.useSelector(app, "glm-5.3");
+    try std.testing.expect(elsewhere == .ambiguous);
+    try std.testing.expectEqual(@as(usize, 4), elsewhere.ambiguous.total);
+}
+
+test "L2 metask api-key route: every page of a paginated /v1/models becomes the inventory" {
+    // The gateway's list is Anthropic-shaped (`has_more` + `last_id`); a
+    // reader that kept only the first page dropped every model after it.
+    var case: Case = undefined;
+    try case.init();
+    defer case.deinit();
+    const allocator = case.arena.allocator();
+
+    const page_one =
+        "{\"object\":\"list\",\"data\":[{\"id\":\"glm-5.3-flash\",\"max_tokens\":131072},{\"id\":\"kimi-k3\"}]," ++
+        "\"first_id\":\"glm-5.3-flash\",\"last_id\":\"kimi-k3\",\"has_more\":true}";
+    const page_two = "{\"object\":\"list\",\"data\":[{\"id\":\"deepseek-v4\"}],\"last_id\":\"deepseek-v4\",\"has_more\":false}";
+    const bodies = [_][]const u8{ page_one, page_two };
+    var server = try harness.MockServer.startCassette(&bodies, 0);
+    defer server.stop();
+    const messages_url = try allocator.dupeZ(u8, try server.urlOwned(allocator));
+
+    const argv = [_][*:0]const u8{ "metacodes", "--base-url", messages_url.ptr, "--model", "glm-5.3-flash" };
+    const config = try case.config(&argv);
+    var io_runtime = @import("platform").signal.threadedIo(allocator, .{});
+    defer io_runtime.deinit();
+    const app = try App.init(std.testing.allocator, io_runtime.io(), config, SESSION_KEY);
+    defer app.deinit();
+
+    try std.testing.expectEqualStrings("GET /v1/models HTTP/1.1", requestLine(server.requestAt(0).?));
+    try std.testing.expectEqualStrings("GET /v1/models?after_id=kimi-k3&limit=1000 HTTP/1.1", requestLine(server.requestAt(1).?));
+    try std.testing.expectEqualStrings("Bearer " ++ SESSION_KEY, headerValue(server.requestAt(1).?, "authorization").?);
+
+    var buffer: [64][]const u8 = undefined;
+    const models = try metaskOffers(app, &buffer);
+    try std.testing.expectEqual(@as(usize, 3), models.len);
+    try std.testing.expect(containsModel(models, "glm-5.3-flash"));
+    try std.testing.expect(containsModel(models, "kimi-k3"));
+    try std.testing.expect(containsModel(models, "deepseek-v4"));
+    // The client catalog (limits, `/models`) holds the second page too.
+    try std.testing.expectEqual(@as(usize, 3), app.api_client.catalog.entries.items.len);
 }
 
 test "L2 metask api-key route: a /models key switch replaces the inventory and its key authenticates the pick" {

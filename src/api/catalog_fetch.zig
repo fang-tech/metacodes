@@ -12,6 +12,7 @@
 
 const std = @import("std");
 const http_status = @import("http_status.zig");
+const models_pages = @import("models_pages.zig");
 
 pub const FetchError = error{
     OutOfMemory,
@@ -36,7 +37,8 @@ pub const MAX_DOCUMENT_BYTES: usize = 8 * 1024 * 1024;
 pub const Request = struct {
     url: []const u8,
     /// Optional bearer credential. Catalog endpoints are usually public;
-    /// per-account pricing needs one.
+    /// per-account pricing needs one. A request that carries one does not
+    /// follow redirects (see `fetch`).
     bearer: ?[]const u8 = null,
 };
 
@@ -76,6 +78,13 @@ pub fn fetch(
 
     var http_request = client.request(.GET, uri, .{
         .extra_headers = headers[0..header_count],
+        // std's client re-sends `extra_headers` on every redirect hop,
+        // whatever host it points at, and in 0.16 never sends
+        // `privileged_headers` at all. A credential therefore never follows a
+        // redirect: the 3xx is answered as the non-2xx it is (`HttpError`).
+        // That also keeps a key check honest — a host that never saw the key
+        // has nothing to say about it.
+        .redirect_behavior = if (request.bearer == null) @enumFromInt(3) else .unhandled,
     }) catch return error.RequestFailed;
     defer http_request.deinit();
 
@@ -103,4 +112,42 @@ pub fn fetch(
         else => error.HttpError,
     };
     return .{ .body = body };
+}
+
+/// GET a `/v1/models` list and every page after it (`has_more` + `last_id`,
+/// see `models_pages.zig`), as one document. A single-page list comes back
+/// byte for byte; a continuation that fails keeps the pages already read
+/// rather than discarding the whole list.
+pub fn fetchModelPages(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    request: Request,
+) FetchError!Response {
+    const first = try fetch(allocator, io, request);
+    var pages: std.ArrayList([]u8) = .empty;
+    defer {
+        for (pages.items) |page| allocator.free(page);
+        pages.deinit(allocator);
+    }
+    pages.append(allocator, first.body) catch {
+        allocator.free(first.body);
+        return error.OutOfMemory;
+    };
+    while (pages.items.len < models_pages.MAX_PAGES) {
+        const cursor = (try models_pages.nextCursor(allocator, pages.items[pages.items.len - 1])) orelse break;
+        defer allocator.free(cursor);
+        const url = try models_pages.continuationUrl(allocator, request.url, cursor);
+        defer allocator.free(url);
+        const next = fetch(allocator, io, .{ .url = url, .bearer = request.bearer }) catch break;
+        pages.append(allocator, next.body) catch {
+            allocator.free(next.body);
+            return error.OutOfMemory;
+        };
+    }
+    if (pages.items.len == 1) {
+        const only = pages.items[0];
+        pages.clearRetainingCapacity();
+        return .{ .body = only };
+    }
+    return .{ .body = try models_pages.merge(allocator, pages.items) };
 }

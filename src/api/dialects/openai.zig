@@ -270,6 +270,35 @@ const Glm = struct {
     };
 };
 
+// ── GLM-5.3 and later: thinking cannot be switched off ─────────────────────
+const Glm53 = struct {
+    fn serializeThinking(ctx: *anyopaque, p: ModelProfile, effort: ?ReasoningEffort, out: *std.ArrayList(u8), a: std.mem.Allocator) anyerror!void {
+        _ = ctx;
+        _ = p;
+        // `thinking.type` is always `enabled`: GLM-5.3 fails a request that
+        // disables it, which the GLM-5.2 dialect sends for `none`. The effort
+        // is one of low / high / max; none and minimal ask for the least,
+        // `low`. Null leaves the server default (`max`).
+        try out.appendSlice(a, ",\"thinking\":{\"type\":\"enabled\"},\"clear_thinking\":false");
+        if (effort) |e| {
+            try out.appendSlice(a, ",\"reasoning_effort\":");
+            try util_json.serializeString(model_adapter.glm53EffortName(e), out, a);
+        }
+    }
+
+    const dialect = Dialect{
+        .ctx = undefined,
+        .serializeThinkingFn = serializeThinking,
+        .activateCapabilitiesFn = Glm.activateCapabilities,
+        .extractThinkingDeltaFn = openaiExtractReasoningContent,
+        .serializeToolChoiceFn = openaiSerializeToolChoice,
+        .serializeResponseFormatFn = openaiSerializeResponseFormat,
+        .serializePromptCacheKeyFn = openaiSerializePromptCacheKey,
+        .serializeParallelToolCallsFn = openaiSerializeParallelToolCalls,
+        .serializeImagePartFn = openaiSerializeImagePart,
+    };
+};
+
 // ── Kimi K3(顶层 reasoning_effort,不发 thinking body)─────────────────────────
 const KimiK3 = struct {
     fn serializeThinking(ctx: *anyopaque, p: ModelProfile, effort: ?ReasoningEffort, out: *std.ArrayList(u8), a: std.mem.Allocator) anyerror!void {
@@ -455,6 +484,7 @@ const MiniMaxM2 = struct {
 // 不同厂商只是 fn-ptr 集不同,ctx 指向同一块内存(不解引用)。
 
 pub fn openaiDialectFor(model: []const u8) Dialect {
+    if (model_adapter.glmAlwaysThinks(model)) return Glm53.dialect.withCtx(statelessCtx());
     if (model_adapter.hasSubstr(model, "glm-5") or model_adapter.hasSubstr(model, "glm4") or model_adapter.hasSubstr(model, "glm-4")) {
         return Glm.dialect.withCtx(statelessCtx());
     }
@@ -489,6 +519,32 @@ pub fn openaiDialectFor(model: []const u8) Dialect {
 // 注:Dialect.withCtx 方法在 dialect.zig 定义,这里直接用。
 
 // ── 测试 ─────────────────────────────────────────────────────────────────────
+
+test "openaiDialectFor: GLM-5.3 never disables thinking and speaks low/high/max" {
+    const a = std.testing.allocator;
+    const d = openaiDialectFor("glm-5.3");
+    inline for (.{
+        .{ ReasoningEffort.none, "low" },
+        .{ ReasoningEffort.medium, "high" },
+        .{ ReasoningEffort.high, "high" },
+        .{ ReasoningEffort.xhigh, "max" },
+        .{ ReasoningEffort.max, "max" },
+    }) |case| {
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(a);
+        try d.serializeThinking(.{}, case[0], &out, a);
+        try std.testing.expect(std.mem.indexOf(u8, out.items, "\"thinking\":{\"type\":\"enabled\"}") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out.items, "disabled") == null);
+        const want = "\"reasoning_effort\":\"" ++ case[1] ++ "\"";
+        try std.testing.expect(std.mem.indexOf(u8, out.items, want) != null);
+    }
+    // No effort chosen: thinking on, the server's default level.
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(a);
+    try d.serializeThinking(.{}, null, &out, a);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "reasoning_effort") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "\"type\":\"enabled\"") != null);
+}
 
 test "openaiDialectFor: GLM-5.2 返 Glm dialect(thinking+clear_thinking+reasoning_effort 顶层)" {
     const d = openaiDialectFor("glm-5.2");

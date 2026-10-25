@@ -33,6 +33,14 @@ const MINIMAL_OPENAI_SSE =
     "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1}}\n\n" ++
     "data: [DONE]\n\n";
 
+const MINIMAL_RESPONSES_SSE =
+    "event: response.created\n" ++
+    "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\"}}\n\n" ++
+    "event: response.output_text.delta\n" ++
+    "data: {\"type\":\"response.output_text.delta\",\"item_id\":\"msg_1\",\"output_index\":0,\"delta\":\"ok\"}\n\n" ++
+    "event: response.completed\n" ++
+    "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\":\"completed\",\"usage\":{\"input_tokens\":1,\"input_tokens_details\":{\"cached_tokens\":0},\"output_tokens\":1}}}\n\n";
+
 fn drainAnthropic(response: *cc.client_mod.StreamResponse) void {
     while (true) {
         const maybe = response.next() catch break;
@@ -106,7 +114,7 @@ test "L2: the GLM China Anthropic route reaches its own endpoint, path, and mode
     const outcome = try cc.provider_startup.resolve(a, &registry, .{
         .provider = "zai-coding-plan",
         .channel = "cn-anthropic",
-        .model = "glm-4.6",
+        .model = "glm-5.3",
         .base_url = base,
     });
     try std.testing.expect(outcome == .route);
@@ -119,7 +127,7 @@ test "L2: the GLM China Anthropic route reaches its own endpoint, path, and mode
     try std.testing.expect(std.mem.indexOf(u8, requestLine(captured), "/api/anthropic/v1/messages") != null);
     try std.testing.expectEqualStrings("Bearer zai-plan-secret", headerValue(captured, "authorization").?);
     const model_field = captured.jsonField("model") orelse return error.ModelFieldMissing;
-    try std.testing.expect(std.mem.indexOf(u8, model_field, "glm-4.6") != null);
+    try std.testing.expect(std.mem.indexOf(u8, model_field, "glm-5.3") != null);
 }
 
 test "L2: the GLM OpenAI-wire route reaches the coding-plan path with the OpenAI transport" {
@@ -136,7 +144,7 @@ test "L2: the GLM OpenAI-wire route reaches the coding-plan path with the OpenAI
     const outcome = try cc.provider_startup.resolve(a, &registry, .{
         .provider = "glm",
         .channel = "cn-openai",
-        .model = "glm-4.6",
+        .model = "glm-5.3",
         .base_url = base,
     });
     try std.testing.expect(outcome == .route);
@@ -177,7 +185,7 @@ test "L2: the GLM OpenAI-wire route reaches the coding-plan path with the OpenAI
     try std.testing.expect(std.mem.indexOf(u8, requestLine(captured), "/api/paas/v4/chat") == null);
     try std.testing.expectEqualStrings("Bearer zai-plan-secret", headerValue(captured, "authorization").?);
     const model_field = captured.jsonField("model") orelse return error.ModelFieldMissing;
-    try std.testing.expect(std.mem.indexOf(u8, model_field, "glm-4.6") != null);
+    try std.testing.expect(std.mem.indexOf(u8, model_field, "glm-5.3") != null);
 }
 
 test "L2: the general Z.AI surface is rejected before any request exists" {
@@ -392,7 +400,7 @@ test "L2: two clients read the same catalog and selection from one kernel" {
     var tui_target: ?*const cc.provider_offer.ModelOffer = null;
     for (catalog.items()) |*candidate| {
         if (candidate.channel_id.eqlText("global-anthropic") and
-            std.mem.eql(u8, candidate.request_model_id, "glm-4.6")) tui_target = candidate;
+            std.mem.eql(u8, candidate.request_model_id, "glm-5.3")) tui_target = candidate;
     }
     const commit = kernel.selectionCommit(
         .{ .request_id = 7 },
@@ -833,7 +841,7 @@ test "L2: a globally committed selection routes the next process, model inferenc
     var target: *const cc.provider_offer.ModelOffer = undefined;
     for (catalog.items()) |*candidate| {
         if (candidate.channel_id.eqlText("cn-openai") and
-            std.mem.eql(u8, candidate.request_model_id, "glm-4.6")) target = candidate;
+            std.mem.eql(u8, candidate.request_model_id, "glm-5.3")) target = candidate;
     }
 
     {
@@ -857,14 +865,14 @@ test "L2: a globally committed selection routes the next process, model inferenc
         a.free(config.model);
     }
 
-    try std.testing.expectEqualStrings("glm-4.6", config.model);
+    try std.testing.expectEqualStrings("glm-5.3", config.model);
     try std.testing.expectEqualStrings(target.endpoint_ref, config.base_url.?);
     try std.testing.expectEqual(cc.types_mod.ProviderKind.openai, config.provider_kind);
     // Credential scope has to follow the restored route, or the session would
     // re-enter the Metask credential path for a Z.AI endpoint.
     try std.testing.expectEqualStrings("zai-coding-plan", config.provider_profile.?);
     try std.testing.expect(!cc.selectedProfileIsMetask(config));
-    // Model-name inference would have said `anthropic` for "glm-4.6".
+    // Model-name inference would have said `anthropic` for "glm-5.3".
     try std.testing.expect(cc.inferProviderKind(config.model) != config.provider_kind);
 }
 
@@ -989,19 +997,25 @@ test "L2: a picker-driven selection reaches the endpoint, path, and wire model i
 
     // Drive the picker exactly as a keyboard would: provider → model → offer.
     _ = picker.onKey(.enter);
-    for ("glm46") |byte| _ = picker.onKey(.{ .char = byte });
+    // The filter matches GLM-5.3 and GLM-5.3-Flash; the flagship is listed first.
+    for ("glm-5.3") |byte| _ = picker.onKey(.{ .char = byte });
     _ = picker.onKey(.enter);
     try std.testing.expectEqual(picker_mod.Stage.offer, picker.stage);
 
-    // Walk to the OpenAI-wire China channel and commit it.
-    var scratch: [picker_mod.Picker.MAX_ROWS]picker_mod.Row = undefined;
+    // Walk to the OpenAI-wire China channel and choose it.
+    var scratch = picker_mod.Picker.RowBuffer.init(a);
+    defer scratch.deinit();
     var guard: usize = 0;
-    while (guard < scratch.len) : (guard += 1) {
-        const rows = picker.rows(&scratch);
+    while (guard < 8) : (guard += 1) {
+        const rows = try picker.rows(&scratch);
         const candidate = picker.offers.items[rows[picker.cursor].offer.offer_index];
         if (candidate.channel_id.eqlText("cn-openai")) break;
         _ = picker.onKey(.down);
     }
+    // GLM-5.3 declares its reasoning control: the options step, then Enter
+    // applies the route.
+    _ = picker.onKey(.enter);
+    try std.testing.expectEqual(picker_mod.Stage.options, picker.stage);
     const outcome = picker.onKey(.enter);
     try std.testing.expect(outcome == .commit);
 
@@ -1058,7 +1072,7 @@ test "L2: a picker-driven selection reaches the endpoint, path, and wire model i
     try std.testing.expect(std.mem.indexOf(u8, requestLine(captured), "/api/coding/paas/v4") != null);
     try std.testing.expectEqualStrings("Bearer picked-secret", headerValue(captured, "authorization").?);
     const model_field = captured.jsonField("model") orelse return error.ModelFieldMissing;
-    try std.testing.expect(std.mem.indexOf(u8, model_field, "glm-4.6") != null);
+    try std.testing.expect(std.mem.indexOf(u8, model_field, "glm-5.3") != null);
 }
 
 test "L2: the TUI picker and a second client see one catalog and one selection" {
@@ -1213,8 +1227,9 @@ test "L2: a configured provider's declared metadata reaches every client the sam
     // A filter specific enough to name one provider: the stage matches what a
     // provider serves as well as its id, so a single letter is not unique.
     for ("house-relay") |byte| _ = picker.onKey(.{ .char = byte });
-    var scratch: [picker_mod.Picker.MAX_ROWS]picker_mod.Row = undefined;
-    const rows = picker.rows(&scratch);
+    var scratch = picker_mod.Picker.RowBuffer.init(a);
+    defer scratch.deinit();
+    const rows = try picker.rows(&scratch);
     try std.testing.expectEqual(@as(usize, 1), rows.len);
     try std.testing.expect(picker.offers.items[rows[0].provider.offer_index].provider_id.eqlText("house-relay"));
 
@@ -1470,7 +1485,7 @@ test "L2: a control the offer declares changes the bytes actually sent" {
             allocator: std.mem.Allocator,
             effort: ?cc.types_mod.ReasoningEffort,
         ) ![]u8 {
-            var server = try harness.MockServer.start(MINIMAL_OPENAI_SSE, 0);
+            var server = try harness.MockServer.start(MINIMAL_RESPONSES_SSE, 0);
             defer server.stop();
             const origin = try server.urlOwned(allocator);
             defer allocator.free(origin);
@@ -1528,8 +1543,10 @@ test "L2: a control the offer declares changes the bytes actually sent" {
 
     // The control is not decoration: setting it changes the request body, and
     // leaving it unset does not smuggle a default onto the wire.
-    try std.testing.expect(std.mem.indexOf(u8, without, "reasoning_effort") == null);
-    try std.testing.expect(std.mem.indexOf(u8, with_high, "\"reasoning_effort\":\"high\"") != null);
+    // The built-in OpenAI models are Responses-only, where the effort is
+    // `reasoning.effort`.
+    try std.testing.expect(std.mem.indexOf(u8, without, "\"reasoning\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, with_high, "\"reasoning\":{\"effort\":\"high\"}") != null);
     try std.testing.expect(!std.mem.eql(u8, without, with_high));
 }
 
@@ -1594,7 +1611,7 @@ test "L2: a route change is broadcast as an ordered, replayable event carrying i
         .provider_id = "zai-coding-plan",
         .channel_id = "cn-openai",
         .protocol = "openai_chat",
-        .request_model_id = "glm-4.6",
+        .request_model_id = "glm-5.3",
         .offer_id = "offer-0123456789abcdef0123456789abcdef",
         .credential_ref = "work",
         .scope = "session",
@@ -1614,7 +1631,7 @@ test "L2: a route change is broadcast as an ordered, replayable event carrying i
         "zai-coding-plan",
         "cn-openai",
         "openai_chat",
-        "glm-4.6",
+        "glm-5.3",
         "offer-0123456789abcdef0123456789abcdef",
         "\"credential_ref\":\"work\"",
         "\"scope\":\"session\"",

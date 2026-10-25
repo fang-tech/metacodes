@@ -24,12 +24,13 @@ fn statelessCtx() *anyopaque {
 const Claude = struct {
     fn serializeThinking(ctx: *anyopaque, p: ModelProfile, effort: ?ReasoningEffort, out: *std.ArrayList(u8), a: std.mem.Allocator) anyerror!void {
         _ = ctx;
-        _ = p;
         // Claude:thinking.type=adaptive + output_config.effort(对齐 metacodes request.zig 既有 wire)。
         // effort=null 时省略(让 Anthropic 端用默认)。
         if (effort) |e| if (e.active()) {
             try out.appendSlice(a, ",\"output_config\":{\"effort\":");
-            try util_json.serializeString(anthropicEffortName(e), out, a);
+            // GLM 5.3+ on this wire knows low / high / max only.
+            const name = if (p.glm53_effort_vocabulary) @import("../model_adapter.zig").glm53EffortName(e) else anthropicEffortName(e);
+            try util_json.serializeString(name, out, a);
             try out.append(a, '}');
             try out.appendSlice(a, ",\"thinking\":{\"type\":\"adaptive\"}");
         };
@@ -130,6 +131,24 @@ pub fn claudeDialectFor(model: []const u8) Dialect {
 }
 
 // ── 测试 ─────────────────────────────────────────────────────────────────────
+
+test "Claude wire: GLM 5.3+ effort uses its own low/high/max words" {
+    const a = std.testing.allocator;
+    const d = Claude.dialect.withCtx(statelessCtx());
+    const p = @import("../model_adapter.zig").profileFor(.anthropic, "glm-5.3-flash");
+    try std.testing.expect(p.glm53_effort_vocabulary);
+    inline for (.{ .{ ReasoningEffort.low, "low" }, .{ ReasoningEffort.medium, "high" }, .{ ReasoningEffort.xhigh, "max" } }) |case| {
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(a);
+        try d.serializeThinking(p, case[0], &out, a);
+        try std.testing.expect(std.mem.indexOf(u8, out.items, "\"effort\":\"" ++ case[1] ++ "\"") != null);
+    }
+    // A Claude model keeps Anthropic's own vocabulary.
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(a);
+    try d.serializeThinking(@import("../model_adapter.zig").profileFor(.anthropic, "claude-opus-4-6"), .medium, &out, a);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "\"effort\":\"medium\"") != null);
+}
 
 test "claudeDialectFor: effort=high 发 thinking adaptive + output_config" {
     const d = claudeDialectFor("claude-sonnet-4");
