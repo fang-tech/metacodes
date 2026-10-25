@@ -69,6 +69,11 @@ from scripts.eval.tests.posix_only import POSIX, requires_posix_budget_journal
 
 ROOT = Path(__file__).resolve().parents[3]
 PROTOCOL = ROOT / "evals/plugin-v1/protocol.json"
+# test_plugin_frozen_run edits a pinned input of the live checkout and
+# restores it, and the other plugin-v1 modules hash that file: the evaluation
+# suite's concurrent shards run the whole group in one process
+# (scripts/eval/tests/run_shard.py).
+EVAL_SHARD_GROUP = "plugin-v1"
 INVENTORIES = mock.patch(
     "scripts.eval.plugin_pair_runner._verify_arm_inventory",
     lambda root, protocol, arm, executable, runtime: "inventory-" + arm,

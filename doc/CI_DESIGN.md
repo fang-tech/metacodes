@@ -242,7 +242,10 @@ What it costs:
   says. The smokes still do, so they run in series. The evaluation suite
   ran behind them as one such process and was the longest; it now runs as
   three shards with captured output (`scripts/eval/tests/run_shard.py`,
-  every third module), beside the smokes and each other. The build runner
+  every third module group), beside the smokes and each other. The
+  plugin-v1 modules are one group: one of them edits a pinned input of the
+  live checkout and restores it, and the first merge-queue run of the
+  shards caught another one, in a different shard, hashing that file. The build runner
   prints a captured command's output when it ends.
 
 ### Where a new check goes
@@ -254,7 +257,7 @@ ones that land nowhere:
 |---|---|---|---|
 | A Zig test in an existing root (`src/**`, `tests/component`, the integration inventory) | Nothing to wire | The part that compiles that root | The roots' own inventories and `scripts/test_coverage_audit.sh` |
 | A new test binary or build step | `test:units` if it needs no installed product, `test:integration` if it runs the installed CLI, `test:product` if it drives the built product end to end | Every platform's legs for that part | `test_gate_manifest.py`: `test` is exactly the three parts |
-| A module under `scripts/eval/tests/` | Nothing to wire | An evaluation suite shard of `test:product` | `test_run_shard.py`: the shards partition the modules |
+| A module under `scripts/eval/tests/` | Nothing to wire, unless it shares state outside its own temporary directories with another module (the live checkout, a fixed path): then both declare one `EVAL_SHARD_GROUP`, and the group runs in one shard, in order | An evaluation suite shard of `test:product` | `test_run_shard.py`: the shards partition the modules, and the plugin-v1 group stays in one shard |
 | A case under `tests/tty/cases/` | Nothing to wire | A TTY shard | The TTY case `test_runner_shards` |
 | A suite under `scripts/tests/` | A command in a `test:*` part of `build.zig`, or a step with a leg flag in `ci.yml` | That part or leg | `test_gate_manifest.py`: every module runs on pull requests, or is listed with where it runs instead |
 | A step in `ci.yml` | The leg flag of the work it belongs to (`units`, `integration`, `product`, `release`, `cross`, `checks`) | Those legs | `test_ci_scope.py`: only the listed setup steps carry no flag, and every flag is set by a leg |
