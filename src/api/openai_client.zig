@@ -37,6 +37,8 @@ const std = @import("std");
 const http = std.http;
 const connection_gate = @import("connection_gate.zig");
 const ResponseStatus = @import("http_status.zig").ResponseStatus;
+const http_status = @import("http_status.zig");
+const no_redirects = http_status.no_redirects;
 const log = @import("../util/log.zig");
 const types = @import("../types.zig");
 const json_mod = @import("../json.zig");
@@ -390,6 +392,8 @@ pub const OpenAIClient = struct {
         req_ptr.* = self.http_client.request(.POST, uri, .{
             // 保持禁用陈旧池连接；跨 provider 的 process-wide connection_gate 限制并发握手。
             .keep_alive = false,
+            // The key rides in a header; a 3xx is reported, not followed.
+            .redirect_behavior = no_redirects,
             .extra_headers = &.{
                 .{ .name = "content-type", .value = "application/json" },
                 .{ .name = auth.name, .value = auth.value },
@@ -430,6 +434,11 @@ pub const OpenAIClient = struct {
         self.server_request_id_len = copyMetaskRequestId(&self.server_request_id, response.head.bytes);
         connection_lease.release();
         if (!status.isOk()) {
+            var location_buf: [256]u8 = undefined;
+            if (http_status.copyRedirectLocation(&response, &location_buf)) |location| {
+                client_mod.reportRedirect("openai", rid, status, location);
+                return error.RequestFailed;
+            }
             var err_body: [4096]u8 = undefined;
             const body_reader = req_ptr.reader.bodyReader(
                 err_body[0..],

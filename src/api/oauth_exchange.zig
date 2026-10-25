@@ -49,6 +49,8 @@ pub const HttpExchange = struct {
         defer client.deinit();
 
         var request = client.request(.POST, uri, .{
+            // Only the token endpoint can answer a grant it received.
+            .redirect_behavior = http_status.no_redirects,
             .extra_headers = &.{
                 .{ .name = "content-type", .value = "application/x-www-form-urlencoded" },
                 .{ .name = "accept", .value = "application/json" },
@@ -101,7 +103,7 @@ pub const MetaskHttpExchange = struct {
         const uri = std.Uri.parse(self.token_url) catch return error.RefreshFailed;
         var client = std.http.Client{ .allocator = self.allocator, .io = self.io };
         defer client.deinit();
-        var request = client.request(.POST, uri, .{ .extra_headers = &.{
+        var request = client.request(.POST, uri, .{ .redirect_behavior = http_status.no_redirects, .extra_headers = &.{
             .{ .name = "content-type", .value = "application/json" },
             .{ .name = "accept", .value = "application/json" },
         } }) catch return error.RefreshFailed;
