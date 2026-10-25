@@ -60,7 +60,10 @@ git diff --check
 full suite at `-Doptimize` (Debug by default). CI runs the same commands (the
 full suite in Debug, the core suite in ReleaseSafe;
 `scripts/tests/test_gate_manifest.py` asserts every command above has a CI
-step), so this block is the single source. The one exception is a release or
+step), so this block is the single source. On Linux and macOS, CI runs the
+full suite as its two halves, `zig build test:units` and `zig build
+test:product`, on separate runners; `zig build test` is exactly those two, so
+a new check goes into one of them (`doc/CI_DESIGN.md` §4). The one exception is a release or
 reopen PR that adds only `scripts/release_cut.py`'s generated bump to a base
 whose full CI passed: it takes the CI fast path
 (`doc/RELEASE_AUTOMATION_DESIGN.md` §3). A change confined to documentation,

@@ -17,18 +17,22 @@ concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-# Topology: one job per platform on GitHub-hosted runners (the repository is
-# public; organization policy keeps public repositories off the self-hosted
-# fleet, and hosted standard runners are free for public repositories).
-# Cross-platform parallelism comes from the matrix; intra-platform steps run
-# cheapest-first for fail-fast. Every runner is ephemeral: nothing persists
-# between runs except what actions/cache and setup-zig restore explicitly.
+# Topology: GitHub-hosted runners only (the repository is public;
+# organization policy keeps public repositories off the self-hosted fleet, and
+# hosted standard runners are free for public repositories). Each platform's
+# gates are split into legs that run in parallel on separate runners, and the
+# TTY suites into shards; a small result job per platform reports the leg or
+# shard results under the name the ruleset requires (doc/CI_DESIGN.md §4).
+# Within a leg, steps run cheapest-first for fail-fast. Every runner is
+# ephemeral: nothing persists between runs except what actions/cache and
+# setup-zig restore explicitly.
 jobs:
   # A release or reopen PR adds only what scripts/release_cut.py generates.
   # When that is proven against the merge commit, and the base commit already
-  # passed this workflow's full run on main, the three required jobs below
-  # report success without running the suites again: their steps check
-  # FAST_PATH, except the checkout and the version state gate in `gates`.
+  # passed this workflow's full run on main, the gate legs and TTY shards
+  # below report success without running the suites again: their steps check
+  # FAST_PATH, except the checkouts and the version state gate in the
+  # `checks` legs.
   # Every other PR, every push, and every doubt (the script never fails the
   # job; an error decides the full path) runs everything.
   # doc/RELEASE_AUTOMATION_DESIGN.md §3, "CI fast path".
@@ -78,9 +82,10 @@ jobs:
   # doc/CI_DESIGN.md §2. Only documentation changed: the gates run the
   # documentation, version-state and gate-manifest checks and nothing that
   # builds. Only documentation and the evaluation harness changed: the gates
-  # run in full and the TTY suites do not. The required jobs below still run
-  # and report under their own names; their steps read SUITES / TTY, as they
-  # read FAST_PATH. A failed decision leaves both empty: everything runs.
+  # run in full and the TTY suites do not. The legs, shards and result jobs
+  # below still run and report under their own names; the legs' and shards'
+  # steps read SUITES / TTY, as they read FAST_PATH. A failed decision leaves
+  # both empty: everything runs.
   scope:
     name: Change scope
     timeout-minutes: 10
@@ -108,23 +113,33 @@ jobs:
           esac
           python3 scripts/ci_scope.py --event "$GITHUB_EVENT_NAME" --base "$base" --candidate HEAD --github-output "$GITHUB_OUTPUT"
 
-  gates:
-    name: Gates (${{ matrix.os }})
-    # This job's steps are a superset of the AGENTS.md "Before submitting"
-    # checklist; scripts/tests/test_gate_manifest.py asserts that every checklist
-    # command has a step here, so the two cannot drift apart silently.
-    # 45 minutes: a cold hosted runner compiles the whole tree and the Lean
-    # kernel; warm runs (setup-zig + Lean cache hits) are far shorter.
+  # The POSIX gates, one leg per runner (doc/CI_DESIGN.md §4). The legs'
+  # steps together are a superset of the AGENTS.md "Before submitting"
+  # checklist; scripts/tests/test_gate_manifest.py asserts that every checklist
+  # command has a step here, and that `zig build test` runs as its two halves
+  # (`test:units`, `test:product`), so the two cannot drift apart silently.
+  # Each step names the legs it belongs to through the matrix flags `units`,
+  # `product`, `release` and `checks`; a step without one is environment setup
+  # and runs on every leg. Linux has a runner per flag. macOS pairs them, since
+  # an organization runs at most five macOS jobs at once.
+  # 45 minutes: a cold hosted runner compiles a leg's share of the tree and
+  # the Lean kernel; warm runs (setup-zig + Lean cache hits) are far shorter.
+  gates-linux:
+    name: Gates (Linux) / ${{ matrix.leg }}
     timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: Linux
-            runner: ubuntu-latest
-          - os: macOS
-            runner: macos-latest
-    runs-on: ${{ matrix.runner }}
+          - leg: units
+            units: true
+          - leg: product
+            product: true
+          - leg: release
+            release: true
+          - leg: checks
+            checks: true
+    runs-on: ubuntu-latest
     needs: [release-fast-path, scope]
     # A failed decision leaves FAST_PATH and SUITES empty: run in full rather
     # than skip.
@@ -135,7 +150,7 @@ jobs:
       # then are the checkout, the version state gate and the documentation
       # and gate-manifest checks (scripts/tests/test_ci_scope.py pins the list).
       SUITES: ${{ needs.scope.outputs.suites }}
-    steps:
+    steps: &gates-steps
       - name: Release fast path
         env:
           REASON: ${{ needs.release-fast-path.outputs.reason }}
@@ -154,15 +169,17 @@ jobs:
       # execution is not affected because test Run steps are has_side_effects
       # in build.zig. cache-size-limit: the directory is dropped instead of
       # saved once it exceeds this many MiB (the default 2 GiB is below what
-      # one full run of these gates produces).
+      # one full run of these gates produces). cache-key: each leg builds a
+      # different share of the graph, so each keeps its own cache line.
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         if: env.FAST_PATH != 'true' && env.SUITES != 'false'
         with:
           version: 0.16.0
           use-cache: true
           cache-size-limit: 4096
+          cache-key: ${{ matrix.leg }}
       - name: Zig format check
-        if: runner.os == 'Linux' && env.FAST_PATH != 'true' && env.SUITES != 'false'
+        if: matrix.checks && runner.os == 'Linux' && env.FAST_PATH != 'true' && env.SUITES != 'false'
         run: zig fmt --check build.zig src tests
       # Lean toolchain and build products. Key: the pinned toolchain plus every
       # Lean source, so a source change rebuilds from the previous products
@@ -257,6 +274,7 @@ jobs:
       # sees the bare version and is refused, exactly as it would be on main
       # (doc/CI_DESIGN.md §3; it relies on the queue's ALLGREEN setting).
       - name: Version state gate and release rehearsal
+        if: matrix.checks
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_PR_NUMBER: ${{ github.event.pull_request.number }}
@@ -283,16 +301,16 @@ jobs:
             python3 scripts/check_version_state.py --rehearse
           fi
       - name: TinyKG binary-contract unit tests
-        if: env.FAST_PATH != 'true' && env.SUITES != 'false'
+        if: matrix.checks && env.FAST_PATH != 'true' && env.SUITES != 'false'
         run: python3 -m unittest scripts.tests.test_stage_tinykg_binary -v
       - name: ripgrep binary-contract unit tests
-        if: env.FAST_PATH != 'true' && env.SUITES != 'false'
+        if: matrix.checks && env.FAST_PATH != 'true' && env.SUITES != 'false'
         run: python3 -m unittest scripts.tests.test_stage_ripgrep_binary -v
       - name: Trajectory audit unit tests
-        if: env.FAST_PATH != 'true' && env.SUITES != 'false'
+        if: matrix.checks && env.FAST_PATH != 'true' && env.SUITES != 'false'
         run: python3 -m unittest scripts.tests.test_audit_trajectories -v
       - name: Verify native bundle and fresh-store contract
-        if: env.FAST_PATH != 'true' && env.SUITES != 'false'
+        if: matrix.release && env.FAST_PATH != 'true' && env.SUITES != 'false'
         shell: bash
         run: |
           python3 scripts/verify_tinykg_binary.py
@@ -305,7 +323,7 @@ jobs:
       # so this leg proves the cross-staged assets and the release unit waits
       # for that runner (doc/INSTALL_DESIGN.md §5).
       - name: Verify Linux arm64 cross-stage contract
-        if: runner.os == 'Linux' && env.FAST_PATH != 'true' && env.SUITES != 'false'
+        if: matrix.release && runner.os == 'Linux' && env.FAST_PATH != 'true' && env.SUITES != 'false'
         run: |
           zig build tinykg:stage -Dtarget=aarch64-linux-musl
           zig build install -Dtarget=aarch64-linux-musl -Drelease-layout=true --prefix "$RUNNER_TEMP/stage-aarch64-linux"
@@ -315,7 +333,7 @@ jobs:
       # the spawn tests are kept out of the build runner (process.zig's
       # `procSpawnTestsEnabled`).
       - name: Native platform modules
-        if: env.FAST_PATH != 'true' && env.SUITES != 'false'
+        if: matrix.units && env.FAST_PATH != 'true' && env.SUITES != 'false'
         shell: bash
         env:
           METACODES_PROC_TEST: "1"
@@ -324,58 +342,66 @@ jobs:
       # test_workbuddy_adapter.py) run the overlay inside the real pinned
       # WorkBuddy-Bench, against its locked environment; without a checkout
       # they skip. provision_checkout.sh fetches the pinned commit, installs
-      # this repository's overlay and `uv sync`s it; the suite below inherits
-      # METACODES_WORKBUDDY_CHECKOUT through zig build.
+      # this repository's overlay and `uv sync`s it; the product half below
+      # inherits METACODES_WORKBUDDY_CHECKOUT through zig build.
       - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
-        if: env.FAST_PATH != 'true' && env.SUITES != 'false'
+        if: matrix.product && env.FAST_PATH != 'true' && env.SUITES != 'false'
         with:
           version: "0.11.19"
       - name: Provision the pinned WorkBuddy-Bench checkout
-        if: env.FAST_PATH != 'true' && env.SUITES != 'false'
+        if: matrix.product && env.FAST_PATH != 'true' && env.SUITES != 'false'
         shell: bash
         run: |
           set -euo pipefail
           checkout=$(scripts/eval/workbuddy/provision_checkout.sh "$RUNNER_TEMP/workbuddy-bench")
           echo "METACODES_WORKBUDDY_CHECKOUT=$checkout" >> "$GITHUB_ENV"
-      - name: Full offline test suite
-        if: env.FAST_PATH != 'true' && env.SUITES != 'false'
+      # `zig build test` as its two halves, one per leg (build.zig: `test` is
+      # exactly `test:units` plus `test:product`).
+      # METACODES_TEST_REQUIRE_LEAN_SDK: every leg builds control-plane/lean
+      # above, so a missing/mislocated ProjectRule.olean is a regression, not
+      # an environment gap: fail instead of skip. --test-timeout 5m: the build
+      # runner watchdog between tests is max(--test-timeout, 60s); same value
+      # as the Windows leg and the AgentCore gate, so a wedged test on a
+      # loaded runner is reported instead of eating the job timeout.
+      # -Dlean-kernels=on: the suite builds both kernels from this checkout
+      # and every kernel-gated test runs; a missing toolchain fails the build
+      # instead of skipping them. --summary all: every step with its duration,
+      # the evidence for the next split of the legs.
+      - name: Offline test suite (units half)
+        if: matrix.units && env.FAST_PATH != 'true' && env.SUITES != 'false'
         env:
-          # Both legs build control-plane/lean above, so a missing/mislocated
-          # ProjectRule.olean is a regression, not an environment gap: fail
-          # instead of skip.
           METACODES_TEST_REQUIRE_LEAN_SDK: "1"
-        # --test-timeout 5m: the build runner watchdog between tests is
-        # max(--test-timeout, 60s); same value as the Windows leg and the
-        # AgentCore gate, so a wedged test on a loaded runner is reported
-        # instead of eating the job timeout. -Dlean-kernels=on: the suite
-        # builds both kernels from this checkout and every kernel-gated test
-        # runs; a missing toolchain fails the build instead of skipping them.
-        run: zig build test --test-timeout 5m -Dlean-kernels=on
+        run: zig build test:units --test-timeout 5m -Dlean-kernels=on --summary all
+      - name: Offline test suite (product half)
+        if: matrix.product && env.FAST_PATH != 'true' && env.SUITES != 'false'
+        env:
+          METACODES_TEST_REQUIRE_LEAN_SDK: "1"
+        run: zig build test:product --test-timeout 5m -Dlean-kernels=on --summary all
       - name: ReleaseSafe core gate
-        if: runner.os == 'Linux' && env.FAST_PATH != 'true' && env.SUITES != 'false'
+        if: matrix.checks && runner.os == 'Linux' && env.FAST_PATH != 'true' && env.SUITES != 'false'
         run: zig build test:lib -Doptimize=ReleaseSafe
       - name: Repository coverage audit
-        if: runner.os == 'Linux' && env.FAST_PATH != 'true' && env.SUITES != 'false'
+        if: matrix.checks && runner.os == 'Linux' && env.FAST_PATH != 'true' && env.SUITES != 'false'
         run: scripts/test_coverage_audit.sh
       - name: Documentation link check
-        if: runner.os == 'Linux' && env.FAST_PATH != 'true'
+        if: matrix.checks && runner.os == 'Linux' && env.FAST_PATH != 'true'
         run: python3 scripts/check_doc_links.py
       - name: Default install prefix
-        if: env.FAST_PATH != 'true' && env.SUITES != 'false'
+        if: matrix.release && env.FAST_PATH != 'true' && env.SUITES != 'false'
         run: zig build --prefix "$RUNNER_TEMP/install-prefix" && python3 scripts/verify_install_prefix.py "$RUNNER_TEMP/install-prefix" --doctor
       # The sidecar the kernel build script wrote, read by the installed
       # product's own loader: the pairing no unit test can cover (the project
       # kernel's v6 sidecar was validated with the formal v4 loader for as long
       # as nothing ran a real one through doctor, 2026-09-21).
       - name: Built project kernel provenance is accepted by doctor
-        if: env.FAST_PATH != 'true' && env.SUITES != 'false'
+        if: matrix.release && env.FAST_PATH != 'true' && env.SUITES != 'false'
         run: python3 scripts/verify_kernel_provenance.py "$RUNNER_TEMP/install-prefix/bin/metacodes" --project "$RUNNER_TEMP/metacodes-project-kernel"
       # Manifest v2 ships both Lean kernels and pins them, so the release
       # layout is two invocations (release/LAYOUT.md): stage the kernels, then
       # build the executable with their digests. KERNEL_PINS carries them to
       # the archive steps.
       - name: Stage Lean kernels for the release layout
-        if: env.FAST_PATH != 'true' && env.SUITES != 'false'
+        if: matrix.release && env.FAST_PATH != 'true' && env.SUITES != 'false'
         shell: bash
         run: |
           set -euo pipefail
@@ -383,19 +409,19 @@ jobs:
           pins=$(python3 scripts/kernel_pins.py "$RUNNER_TEMP/release-prefix")
           echo "KERNEL_PINS=$pins" >> "$GITHUB_ENV"
       - name: Release layout prefix
-        if: env.FAST_PATH != 'true' && env.SUITES != 'false'
+        if: matrix.release && env.FAST_PATH != 'true' && env.SUITES != 'false'
         run: zig build release:verify -Drelease-layout=true --prefix "$RUNNER_TEMP/release-prefix" $KERNEL_PINS && python3 scripts/verify_install_prefix.py "$RUNNER_TEMP/release-prefix" --release --doctor
       # The installer, through the same script users run, on the verified
       # unit: every file re-verified at the new prefix, an install record and
       # state root of its own, and the installed executable's doctor --strict.
       - name: Install the release unit with scripts/install.sh
-        if: env.FAST_PATH != 'true' && env.SUITES != 'false'
+        if: matrix.release && env.FAST_PATH != 'true' && env.SUITES != 'false'
         run: sh scripts/install.sh --no-link --prefix "$RUNNER_TEMP/installed" "$RUNNER_TEMP/release-prefix" && "$RUNNER_TEMP/installed/bin/metacodes" doctor --strict
       - name: Release bundle verifier self-test
-        if: env.FAST_PATH != 'true' && env.SUITES != 'false'
+        if: matrix.release && env.FAST_PATH != 'true' && env.SUITES != 'false'
         run: python3 scripts/verify_release_bundle.py --self-test
       - name: Release archive is reproducible
-        if: env.FAST_PATH != 'true' && env.SUITES != 'false'
+        if: matrix.release && env.FAST_PATH != 'true' && env.SUITES != 'false'
         run: |
           zig build release:archive -Drelease-layout=true --prefix "$RUNNER_TEMP/release-prefix" $KERNEL_PINS -Drelease-archive-dir="$RUNNER_TEMP/dist-1"
           zig build release:archive -Drelease-layout=true --prefix "$RUNNER_TEMP/release-prefix" $KERNEL_PINS -Drelease-archive-dir="$RUNNER_TEMP/dist-2"
@@ -411,50 +437,74 @@ jobs:
           zig build release:sums -Drelease-layout=true --prefix "$RUNNER_TEMP/release-prefix" $KERNEL_PINS -Drelease-archive-dir="$RUNNER_TEMP/dist-1"
           cat "$RUNNER_TEMP"/dist-1/metacodes-*-SHA256SUMS
       - name: Third-party notices check
-        if: runner.os == 'Linux' && env.FAST_PATH != 'true' && env.SUITES != 'false'
+        if: matrix.checks && runner.os == 'Linux' && env.FAST_PATH != 'true' && env.SUITES != 'false'
         run: python3 scripts/gen_third_party_notices.py --check
       - name: Documentation fact check
-        if: runner.os == 'Linux' && env.FAST_PATH != 'true'
+        if: matrix.checks && runner.os == 'Linux' && env.FAST_PATH != 'true'
         run: python3 scripts/check_doc_facts.py
       - name: Documentation fact-check unit tests
-        if: env.FAST_PATH != 'true'
+        if: matrix.checks && env.FAST_PATH != 'true'
         run: python3 -m unittest scripts.tests.test_check_doc_facts -v
       - name: Third-party notices unit tests
-        if: env.FAST_PATH != 'true' && env.SUITES != 'false'
+        if: matrix.checks && env.FAST_PATH != 'true' && env.SUITES != 'false'
         run: python3 -m unittest scripts.tests.test_gen_third_party_notices -v
       - name: Gate manifest unit tests
-        if: env.FAST_PATH != 'true'
+        if: matrix.checks && env.FAST_PATH != 'true'
         run: python3 -m unittest scripts.tests.test_gate_manifest -v
       - name: Verify install prefix unit tests
-        if: env.FAST_PATH != 'true' && env.SUITES != 'false'
+        if: matrix.checks && env.FAST_PATH != 'true' && env.SUITES != 'false'
         run: python3 -m unittest scripts.tests.test_verify_install_prefix -v
       - name: Install script unit tests
-        if: env.FAST_PATH != 'true' && env.SUITES != 'false'
+        if: matrix.checks && env.FAST_PATH != 'true' && env.SUITES != 'false'
         run: python3 -m unittest scripts.tests.test_install_scripts -v
       - name: Kernel self-containment and pin unit tests
-        if: env.FAST_PATH != 'true' && env.SUITES != 'false'
+        if: matrix.checks && env.FAST_PATH != 'true' && env.SUITES != 'false'
         run: python3 -m unittest scripts.tests.test_check_kernel_self_contained scripts.tests.test_kernel_pins -v
       - name: Kernel provenance verifier unit tests
-        if: env.FAST_PATH != 'true' && env.SUITES != 'false'
+        if: matrix.checks && env.FAST_PATH != 'true' && env.SUITES != 'false'
         run: python3 -m unittest scripts.tests.test_verify_kernel_provenance -v
       - name: Python floor unit tests
-        if: env.FAST_PATH != 'true' && env.SUITES != 'false'
+        if: matrix.checks && env.FAST_PATH != 'true' && env.SUITES != 'false'
         run: python3 -m unittest scripts.tests.test_python_floor -v
       - name: Release cut unit tests
-        if: env.FAST_PATH != 'true' && env.SUITES != 'false'
+        if: matrix.checks && env.FAST_PATH != 'true' && env.SUITES != 'false'
         run: python3 -m unittest scripts.tests.test_release_cut -v
       - name: Release fast path unit tests
-        if: env.FAST_PATH != 'true' && env.SUITES != 'false'
+        if: matrix.checks && env.FAST_PATH != 'true' && env.SUITES != 'false'
         run: python3 -m unittest scripts.tests.test_release_fast_path -v
       - name: Change scope unit tests
-        if: env.FAST_PATH != 'true' && env.SUITES != 'false'
+        if: matrix.checks && env.FAST_PATH != 'true' && env.SUITES != 'false'
         run: python3 -m unittest scripts.tests.test_ci_scope -v
       - name: SDK package version unit tests
-        if: env.FAST_PATH != 'true' && env.SUITES != 'false'
+        if: matrix.checks && env.FAST_PATH != 'true' && env.SUITES != 'false'
         run: python3 -m unittest scripts.tests.test_sdk_package_versions -v
       - name: Diff whitespace check
-        if: env.FAST_PATH != 'true'
+        if: matrix.checks && env.FAST_PATH != 'true'
         run: git diff --check
+
+  # The same steps (the YAML alias of `gates-linux`'s list) on two macOS
+  # runners: the halves of `zig build test`, each with the leg whose steps fit
+  # beside it. A leg's flags are what its steps read, not its name.
+  gates-macos:
+    name: Gates (macOS) / ${{ matrix.leg }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - leg: units-checks
+            units: true
+            checks: true
+          - leg: product-release
+            product: true
+            release: true
+    runs-on: macos-latest
+    needs: [release-fast-path, scope]
+    if: ${{ !cancelled() }}
+    env:
+      FAST_PATH: ${{ needs.release-fast-path.outputs.fast }}
+      SUITES: ${{ needs.scope.outputs.suites }}
+    steps: *gates-steps
 
   # The Python and Node packages over the AgentCore shared library (sdk/python,
   # sdk/node). Not a required check yet: it builds a ReleaseSafe bundle, which
@@ -540,20 +590,24 @@ jobs:
   # Windows-only service stall looked like a slow machine. Run the cases with
   # Python directly on POSIX (tests/tty/README.md: the build runner's stdio
   # supervision disturbs pty timing); Windows goes through `windows:tty`.
-  tty:
-    name: TTY (${{ matrix.os }})
-    # 60 minutes: about 12 minutes of cases on POSIX and 25 under ConPTY,
-    # plus a cold debug build.
-    timeout-minutes: 60
+  #
+  # The cases run one at a time and mostly wait on the screen, so the suite is
+  # split into shards on separate runners rather than run concurrently on one
+  # (pty timing is what the cases assert). TTY_SHARD=K/N picks every N-th
+  # case of the sorted list, starting at the K-th (tests/tty/run_tty_tests.py;
+  # a TTY case checks that the shards partition the list); `zig build
+  # windows:tty` passes it through. Each shard builds the debug binary itself,
+  # a warm-cache build of seconds on Linux and about two minutes on Windows.
+  # 30 minutes: about 16 minutes of cases on POSIX and 28 under ConPTY in
+  # all, a third or a quarter of that per shard, plus a cold debug build.
+  tty-linux:
+    name: TTY (Linux) / ${{ matrix.shard }} of ${{ strategy.job-total }}
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - os: Linux
-            runner: ubuntu-latest
-          - os: Windows
-            runner: windows-latest
-    runs-on: ${{ matrix.runner }}
+        shard: [1, 2, 3]
+    runs-on: ubuntu-latest
     needs: [release-fast-path, scope]
     # A failed decision leaves FAST_PATH and TTY empty: run in full rather
     # than skip.
@@ -563,7 +617,8 @@ jobs:
       # 'false' for a change confined to documentation and the evaluation
       # harness, which the TTY suites neither build nor read.
       TTY: ${{ needs.scope.outputs.tty }}
-    steps:
+      TTY_SHARD: ${{ matrix.shard }}/${{ strategy.job-total }}
+    steps: &tty-steps
       - name: Release fast path
         env:
           REASON: ${{ needs.release-fast-path.outputs.reason }}
@@ -582,7 +637,8 @@ jobs:
           git config core.autocrlf false && git rm -q --cached -r . && git reset -q --hard
           git ls-files --eol | findstr /R "w/crlf w/mixed" && exit /b 1
           exit /b 0
-      # See the `gates` job for the cache semantics.
+      # See `gates-linux` for the cache semantics. Every shard builds the same
+      # binaries, so they share one cache line.
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         if: env.FAST_PATH != 'true' && env.TTY != 'false'
         with:
@@ -605,11 +661,37 @@ jobs:
           python -m pip install pywinpty==3.0.5 || exit /b 1
           zig build windows:tty -Dtarget=x86_64-windows-gnu
 
+  tty-windows:
+    name: TTY (Windows) / ${{ matrix.shard }} of ${{ strategy.job-total }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
+    runs-on: windows-latest
+    needs: [release-fast-path, scope]
+    if: ${{ !cancelled() }}
+    env:
+      FAST_PATH: ${{ needs.release-fast-path.outputs.fast }}
+      TTY: ${{ needs.scope.outputs.tty }}
+      TTY_SHARD: ${{ matrix.shard }}/${{ strategy.job-total }}
+    steps: *tty-steps
+
+  # Two legs: the repository-wide suite, and the release unit with the
+  # Windows script suites. Each step reads its leg's flag, as in `gates-linux`.
   windows-gates:
-    name: Gates (Windows)
-    # 45 minutes: same reasoning as the `gates` job; the hosted Windows runner
+    name: Gates (Windows) / ${{ matrix.leg }}
+    # 45 minutes: same reasoning as `gates-linux`; the hosted Windows runner
     # has 4 cores and a cold Zig cache compiles the whole tree.
     timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - leg: suite
+            suite: true
+          - leg: release
+            release: true
     runs-on: windows-latest
     needs: [release-fast-path, scope]
     # A failed decision leaves FAST_PATH and SUITES empty: run in full rather
@@ -632,17 +714,18 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         if: env.FAST_PATH != 'true' && env.SUITES != 'false'
         with:
-          # Same as the `gates` job: the repository-snapshot and grounding
+          # Same as `gates-linux`: the repository-snapshot and grounding
           # fingerprint tests resolve historical commits with `git rev-parse`,
           # which a depth-1 checkout cannot (5 errors on the first full run).
           fetch-depth: 0
-      # See the `gates` job for the cache semantics.
+      # See `gates-linux` for the cache semantics.
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         if: env.FAST_PATH != 'true' && env.SUITES != 'false'
         with:
           version: 0.16.0
           use-cache: true
           cache-size-limit: 4096
+          cache-key: ${{ matrix.leg }}
       # The hosted Windows image checks out with core.autocrlf=true, and
       # .gitattributes (`* text=auto eol=lf`) is the contract: @embedFile'd
       # templates and pinned fixtures hash by the byte. List what is wrong for
@@ -659,23 +742,23 @@ jobs:
           git config core.autocrlf false && git rm -q --cached -r . && git reset -q --hard
           git ls-files --eol | findstr /R "w/crlf w/mixed" && exit /b 1
           exit /b 0
-      # PyYAML for the Python suites that `zig build test` runs; see the
-      # `gates` job.
+      # PyYAML for the Python suites that `zig build test` runs; see
+      # `gates-linux`.
       - name: Install Python development dependencies
         if: env.FAST_PATH != 'true' && env.SUITES != 'false'
         shell: cmd
         run: python -m pip install -r requirements-dev.txt
-      # As in the `gates` job: the platform root, standalone, spawn tests on.
+      # As in `gates-linux`: the platform root, standalone, spawn tests on.
       - name: Native platform modules
-        if: env.FAST_PATH != 'true' && env.SUITES != 'false'
+        if: matrix.suite && env.FAST_PATH != 'true' && env.SUITES != 'false'
         shell: cmd
         env:
           METACODES_PROC_TEST: "1"
         run: zig test src/platform/platform.zig -lc
-      # Current labels and the merge queue's head PR, as in the `gates` job;
+      # Current labels and the merge queue's head PR, as in `gates-linux`;
       # bash for the same script.
       - name: Version state gate and release rehearsal
-        if: env.FAST_PATH != 'true' && env.SUITES != 'false'
+        if: matrix.release && env.FAST_PATH != 'true' && env.SUITES != 'false'
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -699,12 +782,13 @@ jobs:
           fi
           python scripts/check_version_state.py --rehearse
       - name: Verify native bundle and fresh-store contract
-        if: env.FAST_PATH != 'true' && env.SUITES != 'false'
+        if: matrix.release && env.FAST_PATH != 'true' && env.SUITES != 'false'
         shell: cmd
         run: python scripts/verify_tinykg_binary.py && python scripts/verify_ripgrep_binary.py && zig build tinykg:stage
-      # The Windows release unit ships both Lean kernels too (manifest v2), so
-      # this leg provisions the same pinned elan and Lean cache as `gates`;
-      # the kernel scripts run under Git Bash (kernels:stage invokes bash).
+      # The Windows release unit ships both Lean kernels too (manifest v2), and
+      # the suite builds them, so both legs provision the same pinned elan and
+      # Lean cache as `gates-linux`; the kernel scripts run under Git Bash
+      # (kernels:stage invokes bash).
       - name: Restore Lean toolchain and build products
         if: env.FAST_PATH != 'true' && env.SUITES != 'false'
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -720,60 +804,114 @@ jobs:
         shell: bash
         run: bash scripts/ci/install-elan.sh
       - name: Stage Lean kernels for the release layout
-        if: env.FAST_PATH != 'true' && env.SUITES != 'false'
+        if: matrix.release && env.FAST_PATH != 'true' && env.SUITES != 'false'
         shell: cmd
         run: |
           zig build kernels:stage -Dlean-kernels=on --prefix "%RUNNER_TEMP%\release-prefix" || exit /b 1
           for /f "delims=" %%P in ('python scripts\kernel_pins.py "%RUNNER_TEMP%\release-prefix"') do echo KERNEL_PINS=%%P>> "%GITHUB_ENV%"
           findstr /B KERNEL_PINS= "%GITHUB_ENV%" || exit /b 1
       - name: Default install prefix
-        if: env.FAST_PATH != 'true' && env.SUITES != 'false'
+        if: matrix.release && env.FAST_PATH != 'true' && env.SUITES != 'false'
         shell: cmd
         run: zig build --prefix "%RUNNER_TEMP%\install-prefix" && python scripts\verify_install_prefix.py "%RUNNER_TEMP%\install-prefix" --doctor
       - name: Release layout prefix
-        if: env.FAST_PATH != 'true' && env.SUITES != 'false'
+        if: matrix.release && env.FAST_PATH != 'true' && env.SUITES != 'false'
         shell: cmd
         run: zig build release:verify -Drelease-layout=true --prefix "%RUNNER_TEMP%\release-prefix" %KERNEL_PINS% && python scripts\verify_install_prefix.py "%RUNNER_TEMP%\release-prefix" --release --doctor
       - name: Install the release unit with scripts/install.ps1
-        if: env.FAST_PATH != 'true' && env.SUITES != 'false'
+        if: matrix.release && env.FAST_PATH != 'true' && env.SUITES != 'false'
         shell: cmd
         run: powershell -NoProfile -ExecutionPolicy Bypass -File scripts\install.ps1 "%RUNNER_TEMP%\release-prefix" -Prefix "%RUNNER_TEMP%\installed" -NoPath && "%RUNNER_TEMP%\installed\bin\metacodes.exe" doctor --strict
       - name: Release bundle verifier self-test
-        if: env.FAST_PATH != 'true' && env.SUITES != 'false'
+        if: matrix.release && env.FAST_PATH != 'true' && env.SUITES != 'false'
         shell: cmd
         run: python scripts\verify_release_bundle.py --self-test
       - name: Release archive is reproducible
-        if: env.FAST_PATH != 'true' && env.SUITES != 'false'
+        if: matrix.release && env.FAST_PATH != 'true' && env.SUITES != 'false'
         shell: cmd
         run: zig build release:archive -Drelease-layout=true --prefix "%RUNNER_TEMP%\release-prefix" %KERNEL_PINS% -Drelease-archive-dir="%RUNNER_TEMP%\dist-1" && zig build release:archive -Drelease-layout=true --prefix "%RUNNER_TEMP%\release-prefix" %KERNEL_PINS% -Drelease-archive-dir="%RUNNER_TEMP%\dist-2" && python scripts\release_sums.py --self-test && for %%F in ("%RUNNER_TEMP%\dist-1\metacodes-*.zip") do fc /b "%%F" "%RUNNER_TEMP%\dist-2\%%~nxF" > nul && zig build release:sums -Drelease-layout=true --prefix "%RUNNER_TEMP%\release-prefix" %KERNEL_PINS% -Drelease-archive-dir="%RUNNER_TEMP%\dist-1"
       - name: Verify install prefix unit tests
-        if: env.FAST_PATH != 'true' && env.SUITES != 'false'
+        if: matrix.release && env.FAST_PATH != 'true' && env.SUITES != 'false'
         shell: cmd
         run: python -m unittest scripts.tests.test_verify_install_prefix -v
       - name: Install script unit tests
-        if: env.FAST_PATH != 'true' && env.SUITES != 'false'
+        if: matrix.release && env.FAST_PATH != 'true' && env.SUITES != 'false'
         shell: cmd
         run: python -m unittest scripts.tests.test_install_scripts -v
       - name: Kernel provenance verifier unit tests
-        if: env.FAST_PATH != 'true' && env.SUITES != 'false'
+        if: matrix.release && env.FAST_PATH != 'true' && env.SUITES != 'false'
         shell: cmd
         run: python -m unittest scripts.tests.test_verify_kernel_provenance -v
-      # The repository-wide suite on the native Windows host (#53), with the
-      # kernels this leg built above (-Dlean-kernels=on). No
+      # The repository-wide suite on the native Windows host (#53); it builds
+      # both kernels itself (-Dlean-kernels=on). No
       # METACODES_TEST_REQUIRE_LEAN_SDK here: the Python Lean-SDK suites stay
       # POSIX-only (scripts/eval/tests/posix_only.py), and the component tests
       # that drive a kernel through POSIX-only paths skip on Windows as before.
       # --test-timeout 5m: the build runner watchdog between tests is
-      # max(--test-timeout, 60s), same as the AgentCore gate.
+      # max(--test-timeout, 60s), same as the AgentCore gate. --summary all:
+      # see `gates-linux`.
       - name: Full offline test suite
-        if: env.FAST_PATH != 'true' && env.SUITES != 'false'
+        if: matrix.suite && env.FAST_PATH != 'true' && env.SUITES != 'false'
         shell: cmd
-        run: zig build test --test-timeout 5m -Dlean-kernels=on
+        run: zig build test --test-timeout 5m -Dlean-kernels=on --summary all
       # Evidence for the next line-ending incident: if the suite itself rewrites
       # tracked files with CRLF, this lists them; the step never fails.
       - name: Line endings after the suite
-        if: always() && env.FAST_PATH != 'true' && env.SUITES != 'false'
+        if: always() && matrix.suite && env.FAST_PATH != 'true' && env.SUITES != 'false'
         shell: cmd
         run: |
           git ls-files --eol | findstr /R "w/crlf w/mixed" & echo (CRLF worktree files after the suite above, if any)
           exit /b 0
+
+  # The checks the `Protect main` ruleset requires: Gates (Linux), Gates
+  # (macOS), Gates (Windows) and TTY (Linux) (doc/CI_DESIGN.md §1, §4). Each
+  # waits for its platform's legs or shards and passes only if every one of
+  # them succeeded. `always()`, not `!cancelled()`: a result job must never
+  # report skipped, which a required check counts as passing, so on a
+  # cancelled run it runs and fails. TTY (Windows) is not required; it reports
+  # the same way so that it can become required.
+  gates-linux-result:
+    name: Gates (Linux)
+    needs: gates-linux
+    if: ${{ always() }}
+    timeout-minutes: 5
+    runs-on: ubuntu-latest
+    steps: &result-steps
+      - name: Every leg passed
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          echo "$NEEDS" | jq -c 'map_values(.result)'
+          echo "$NEEDS" | jq -e 'length > 0 and all(.[]; .result == "success")' > /dev/null
+
+  gates-macos-result:
+    name: Gates (macOS)
+    needs: gates-macos
+    if: ${{ always() }}
+    timeout-minutes: 5
+    runs-on: ubuntu-latest
+    steps: *result-steps
+
+  gates-windows-result:
+    name: Gates (Windows)
+    needs: windows-gates
+    if: ${{ always() }}
+    timeout-minutes: 5
+    runs-on: ubuntu-latest
+    steps: *result-steps
+
+  tty-linux-result:
+    name: TTY (Linux)
+    needs: tty-linux
+    if: ${{ always() }}
+    timeout-minutes: 5
+    runs-on: ubuntu-latest
+    steps: *result-steps
+
+  tty-windows-result:
+    name: TTY (Windows)
+    needs: tty-windows
+    if: ${{ always() }}
+    timeout-minutes: 5
+    runs-on: ubuntu-latest
+    steps: *result-steps

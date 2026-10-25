@@ -8,8 +8,12 @@
 被管道/重定向到文件时(非 tty)Python 默认块缓冲会把输出攒到进程退出——本 runner 强制
 每条 flush(见 _emit),故 `tail -f` 日志能逐条看到进度,不会"卡到最后才出全部结果"。
 
+**分片**:`--shard K/N`(或环境变量 `TTY_SHARD=K/N`,`zig build windows:tty` 经它透传)只跑
+排序后用例表里下标 `i % N == K-1` 的那些:N 个分片恰好覆盖全表、互不重叠,且慢用例按模块聚集,
+轮转能把它们摊到各片。CI 的 TTY job 按分片在多台 runner 上并行(doc/CI_DESIGN.md §4)。
+
 用法:
-  python3 tests/tty/run_tty_tests.py --bin zig-out/bin/metacodes-debug [-k 过滤] [-v]
+  python3 tests/tty/run_tty_tests.py --bin zig-out/bin/metacodes-debug [-k 过滤] [--shard K/N] [-v]
 """
 import os
 import sys
@@ -57,10 +61,27 @@ def load_cases():
     return cases
 
 
+def parse_shard(text):
+    """`K/N`(1 ≤ K ≤ N)→ (K, N);格式不对返回 None。"""
+    parts = text.split("/")
+    if len(parts) != 2 or not all(p.isdigit() for p in parts):
+        return None
+    index, count = int(parts[0]), int(parts[1])
+    if count < 1 or not 1 <= index <= count:
+        return None
+    return index, count
+
+
+def select_shard(cases, index, count):
+    """第 index 片(1 起):下标 i % count == index-1 的用例。count 片恰好划分全表。"""
+    return [case for i, case in enumerate(cases) if i % count == index - 1]
+
+
 def main():
     args = sys.argv[1:]
     bin_path = "zig-out/bin/metacodes-debug"
     kfilter = None
+    shard_text = os.environ.get("TTY_SHARD") or None
     verbose = False
     i = 0
     while i < len(args):
@@ -70,11 +91,21 @@ def main():
         elif args[i] == "-k":
             kfilter = args[i + 1]
             i += 2
+        elif args[i] == "--shard":
+            shard_text = args[i + 1]
+            i += 2
         elif args[i] == "-v":
             verbose = True
             i += 1
         else:
             i += 1
+
+    shard = None
+    if shard_text is not None:
+        shard = parse_shard(shard_text)
+        if shard is None:
+            print(f"[ERROR] 分片须为 K/N(1 ≤ K ≤ N): {shard_text}", file=sys.stderr)
+            return 2
 
     if not os.access(bin_path, os.X_OK):
         print(f"[ERROR] 二进制不存在/不可执行: {bin_path}", file=sys.stderr)
@@ -83,6 +114,8 @@ def main():
     cases = load_cases()
     if kfilter:
         cases = [(n, f) for n, f in cases if kfilter in n]
+    if shard is not None:
+        cases = select_shard(cases, *shard)
     if not cases:
         print("[ERROR] 没有匹配的用例", file=sys.stderr)
         return 2
@@ -91,7 +124,8 @@ def main():
     failed = []
     skipped = []
     total = len(cases)
-    _emit(f"=== TTY 测试:{total} 个用例,bin={bin_path} ===\n")
+    shard_note = f",分片 {shard[0]}/{shard[1]}" if shard is not None else ""
+    _emit(f"=== TTY 测试:{total} 个用例{shard_note},bin={bin_path} ===\n")
     suite_t0 = time.monotonic()
     for idx, (name, fn) in enumerate(cases, 1):
         # 先打"开始"行(无换行,带 carriage-return 风格的进度前缀),立即 flush

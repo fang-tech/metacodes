@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """Decide which of CI's suites a change can affect.
 
-Design: doc/CI_DESIGN.md §2, "Change scope". The required jobs of ci.yml
-always run and report under their own names; their expensive steps read the
-scope decided here, so a change that cannot affect a suite does not pay for
-it. Skipping whole jobs instead would leave a matrix job's required check
-unnamed and pending (the `on.pull_request.paths` filter of #134 blocked PRs
-the same way).
+Design: doc/CI_DESIGN.md §2, "Change scope". The gate legs, TTY shards and
+the result jobs over them (the required checks) always run and report under
+their own names; the legs' and shards' expensive steps read the scope decided
+here, so a change that cannot affect a suite does not pay for it. Skipping
+whole jobs instead would leave a matrix job unnamed and a required check
+pending or, for a skipped result job, passing (the `on.pull_request.paths`
+filter of #134 blocked PRs the same way).
 
 Scopes, narrowest first:
 

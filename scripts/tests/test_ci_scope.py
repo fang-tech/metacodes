@@ -1,13 +1,15 @@
-"""scripts/ci_scope.py and how ci.yml uses it (doc/CI_DESIGN.md §2-§3).
+"""scripts/ci_scope.py and how ci.yml uses it (doc/CI_DESIGN.md §2-§4).
 
 The classification is a pure function of the changed paths. The workflow
-tests pin the wiring: which `gates` steps still run on a documentation-only
-change, that every other step of a required job reads its scope, that the
-scope fails open, and that the decision steps pick the right base for a pull
-request, a merge queue group and a push."""
+tests pin the wiring: which gate steps still run on a documentation-only
+change, that every other step of a leg or shard reads its scope, that the
+scope fails open, that each required check is a result job that passes only
+when all of its legs did, and that the decision steps pick the right base for
+a pull request, a merge queue group and a push."""
 from __future__ import annotations
 
 import io
+import json
 import os
 import re
 import subprocess
@@ -41,6 +43,21 @@ DOC_STEPS = {
     "Diff whitespace check",
 }
 ECHO_STEPS = {"Release fast path", "Change scope"}
+# The jobs that do the work, one runner per leg or shard (doc/CI_DESIGN.md §4),
+# and the switch each one's steps read.
+LEG_JOBS = (("gates-linux", "SUITES"), ("gates-macos", "SUITES"), ("windows-gates", "SUITES"),
+            ("tty-linux", "TTY"), ("tty-windows", "TTY"))
+# The checks the `Protect main` ruleset requires, plus TTY (Windows), and the
+# job whose legs or shards each one reports.
+RESULT_JOBS = {
+    "Gates (Linux)": "gates-linux",
+    "Gates (macOS)": "gates-macos",
+    "Gates (Windows)": "windows-gates",
+    "TTY (Linux)": "tty-linux",
+    "TTY (Windows)": "tty-windows",
+}
+# The leg flags a gate step may be gated on; a step without one runs on every leg.
+LEG_FLAGS = {"units", "product", "release", "checks", "suite"}
 
 
 class ClassifyTest(unittest.TestCase):
@@ -227,8 +244,8 @@ class WorkflowTest(unittest.TestCase):
         triggers = self.workflow.get("on", self.workflow.get(True))  # YAML 1.1 reads `on` as true
         self.assertIn("merge_group", triggers)
 
-    def test_every_required_job_reads_its_scope(self) -> None:
-        for job, var in (("gates", "SUITES"), ("windows-gates", "SUITES"), ("tty", "TTY")):
+    def test_every_leg_reads_its_scope(self) -> None:
+        for job, var in LEG_JOBS:
             with self.subTest(job=job):
                 spec = self.jobs[job]
                 self.assertEqual(sorted(spec["needs"]), ["release-fast-path", "scope"])
@@ -237,7 +254,7 @@ class WorkflowTest(unittest.TestCase):
 
     def test_only_the_documentation_checks_run_on_a_docs_change(self) -> None:
         running = set()
-        for step in self.jobs["gates"]["steps"]:
+        for step in self.jobs["gates-linux"]["steps"]:
             condition = step.get("if", "")
             if "env.SUITES != 'false'" not in condition:
                 running.add(step_label(step))
@@ -245,8 +262,8 @@ class WorkflowTest(unittest.TestCase):
                 self.assertIn("env.FAST_PATH != 'true'", condition, step_label(step))
         self.assertEqual(running, DOC_STEPS)
 
-    def test_every_other_step_of_a_required_job_fails_open(self) -> None:
-        for job, var in (("windows-gates", "SUITES"), ("tty", "TTY")):
+    def test_every_other_step_of_a_leg_fails_open(self) -> None:
+        for job, var in (("windows-gates", "SUITES"), ("tty-linux", "TTY"), ("tty-windows", "TTY")):
             for step in self.jobs[job]["steps"]:
                 label = step_label(step)
                 if label in ECHO_STEPS:
@@ -256,6 +273,68 @@ class WorkflowTest(unittest.TestCase):
                     # scope job failed) runs the step.
                     self.assertIn("env.%s != 'false'" % var, step.get("if", ""))
                     self.assertIn("env.FAST_PATH != 'true'", step.get("if", ""))
+
+    def test_each_required_check_is_a_result_job_over_its_legs(self) -> None:
+        by_name = {}
+        for job_id, spec in self.jobs.items():
+            by_name.setdefault(spec.get("name", job_id), []).append(job_id)
+        for name, legs in RESULT_JOBS.items():
+            with self.subTest(check=name):
+                self.assertEqual(len(by_name.get(name, [])), 1, by_name.get(name))
+                spec = self.jobs[by_name[name][0]]
+                self.assertNotIn("strategy", spec)  # a matrix name is not the literal check name
+                self.assertEqual(spec["needs"], legs)
+                # Never skipped: a skipped job passes a required check.
+                self.assertEqual(spec["if"], "${{ always() }}")
+                self.assertEqual(spec["steps"], self.jobs["gates-linux-result"]["steps"])
+
+    @unittest.skipIf(os.name == "nt", "bash and jq")
+    def test_a_result_job_passes_only_when_every_leg_succeeded(self) -> None:
+        step = self.jobs["gates-linux-result"]["steps"][0]
+        self.assertEqual(step["env"]["NEEDS"], "${{ toJSON(needs) }}")
+        cases = (
+            ({"gates-linux": {"result": "success", "outputs": {}}}, True),
+            ({"gates-linux": {"result": "failure", "outputs": {}}}, False),
+            ({"gates-linux": {"result": "cancelled", "outputs": {}}}, False),
+            ({"gates-linux": {"result": "skipped", "outputs": {}}}, False),
+            ({"a": {"result": "success"}, "b": {"result": "failure"}}, False),
+            ({}, False),
+        )
+        for needs, passes in cases:
+            with self.subTest(needs=needs):
+                proc = subprocess.run([*BASH, step["run"]], env=dict(os.environ, NEEDS=json.dumps(needs)),
+                                      capture_output=True, text=True)
+                self.assertEqual(proc.returncode == 0, passes, proc.stdout + proc.stderr)
+
+    def test_every_leg_flag_a_step_reads_is_set_by_a_leg(self) -> None:
+        # A flag no leg sets is a step that runs on no runner at all.
+        for job, flags in (("gates-linux", {"units", "product", "release", "checks"}),
+                           ("gates-macos", {"units", "product", "release", "checks"}),
+                           ("windows-gates", {"suite", "release"})):
+            with self.subTest(job=job):
+                spec = self.jobs[job]
+                read = set()
+                for step in spec["steps"]:
+                    read |= set(re.findall(r"\bmatrix\.(\w+)", step.get("if", "")))
+                self.assertLessEqual(read, LEG_FLAGS)
+                legs = spec["strategy"]["matrix"]["include"]
+                set_by_legs = {key for leg in legs for key, value in leg.items() if value is True}
+                self.assertEqual(read, flags)
+                self.assertEqual(set_by_legs, flags)
+                self.assertEqual(len({leg["leg"] for leg in legs}), len(legs))
+                self.assertIn("${{ matrix.leg }}", spec["name"])
+
+    def test_both_posix_gates_and_both_tty_platforms_run_one_step_list(self) -> None:
+        self.assertEqual(self.jobs["gates-macos"]["steps"], self.jobs["gates-linux"]["steps"])
+        self.assertEqual(self.jobs["tty-windows"]["steps"], self.jobs["tty-linux"]["steps"])
+
+    def test_the_tty_shards_cover_the_suite(self) -> None:
+        for job in ("tty-linux", "tty-windows"):
+            with self.subTest(job=job):
+                spec = self.jobs[job]
+                shards = spec["strategy"]["matrix"]["shard"]
+                self.assertEqual(shards, list(range(1, len(shards) + 1)))
+                self.assertEqual(spec["env"]["TTY_SHARD"], "${{ matrix.shard }}/${{ strategy.job-total }}")
 
     def test_the_sdk_job_reports_on_every_run(self) -> None:
         # Not a required check today; reporting under its own name on every

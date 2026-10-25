@@ -1,21 +1,23 @@
-# CI design: required checks, change scope and the merge queue
+# CI design: required checks, change scope, the merge queue and the legs
 
 `ci.yml` runs the AGENTS.md pre-submit checklist on three platforms plus the
-offline TTY suites. One run takes about 25 minutes of wall time. The gates
-take 20 to 25 minutes per platform, TTY (Linux) about 13 and TTY (Windows)
-about 23. This document covers how a required job skips work (§1), which of
-that work a change has to pay for (§2), and how a batch of approved PRs lands
-without every PR merging `main` in and starting over (§3).
+offline TTY suites. This document covers how a required job skips work (§1),
+which of that work a change has to pay for (§2), how a batch of approved PRs
+lands without every PR merging `main` in and starting over (§3), and how one
+platform's work is spread over several runners so that a run takes about as
+long as its longest leg rather than the sum of a platform's steps (§4).
 
 ## 1. Required checks and how a job skips work
 
 The `Protect main` ruleset requires `Gates (Linux)`, `Gates (macOS)`,
-`Gates (Windows)` and `TTY (Linux)`. Each of these jobs always runs and
-reports under its own name. Work is skipped by step conditions, never by
-skipping the job, for two reasons:
+`Gates (Windows)` and `TTY (Linux)`. Each is a result job over that
+platform's legs or shards (§4). The legs and shards always run and report
+under their own names, and so do the result jobs. Work is skipped by step
+conditions, never by skipping a job, for two reasons:
 
 - A matrix job skipped by a job-level `if` reports under its unexpanded name
-  (`Gates (${{ matrix.os }})`), so the required check stays pending.
+  (`Gates (Linux) / ${{ matrix.leg }}`), and a skipped result job would count
+  as a passing required check.
 - A workflow `paths` filter leaves the check pending the same way, which is
   how doc-only PRs were blocked in #134.
 
@@ -25,14 +27,16 @@ meaning its decision job failed, runs the step.
 | Switch | Decided by | Effect |
 |---|---|---|
 | `FAST_PATH` | `Release fast path` job (`scripts/release_fast_path.py`) | `true` for a generated release or reopen bump over a green base: only the checkout and the version state gate run ([RELEASE_AUTOMATION_DESIGN.md](RELEASE_AUTOMATION_DESIGN.md) §3). |
-| `SUITES` | `Change scope` job (`scripts/ci_scope.py`) | `false` for a documentation-only change: `Gates` runs only the documentation, version-state and gate-manifest checks, and `Gates (Windows)` runs nothing. |
-| `TTY` | `Change scope` job | `false` for a change confined to documentation and the evaluation harness: the TTY jobs run nothing. The `SDK bindings` jobs read the same output as `SDK`. They are not required, but they report the same way, so they can become required without holding such PRs. |
+| `SUITES` | `Change scope` job (`scripts/ci_scope.py`) | `false` for a documentation-only change: the POSIX `checks` legs run only the documentation, version-state and gate-manifest checks, the other gate legs only check out, and the Windows legs run nothing. |
+| `TTY` | `Change scope` job | `false` for a change confined to documentation and the evaluation harness: the TTY shards run nothing. The `SDK bindings` jobs read the same output as `SDK`. They are not required, but they report the same way, so they can become required without holding such PRs. |
 
 `scripts/tests/test_ci_scope.py` pins the wiring:
 
-- the `Gates` steps that still run on a documentation-only change;
-- that every other step of the required jobs reads its switch, as
+- the gate steps that still run on a documentation-only change;
+- that every other step of the legs and shards reads its switch, as
   `!= 'false'`, together with `FAST_PATH`;
+- that each required check is a result job that passes only when every leg
+  or shard under it succeeded (§4);
 - which base each decision step diffs against, per event.
 
 ## 2. Change scope
@@ -120,8 +124,8 @@ ruleset can be switched in one edit. A maintainer makes it in `Protect main`:
   guarantee.
 - **Add "require merge queue"** with these settings:
   - merge method: merge commit (the repository's history convention);
-  - build concurrency 5: up to five entries tested at once, about eight
-    hosted jobs each;
+  - build concurrency 5: up to five entries tested at once, about two dozen
+    hosted jobs each, three of them on macOS (§4);
   - maximum group size 5 and minimum 1. With a minimum of 1 the wait time
     setting has no effect;
   - only merge non-failing pull requests (ALLGREEN), which the release
@@ -144,3 +148,85 @@ same tree. Replacing it, for instance with a nightly full run plus a
 fast-path base check that accepts the merge group run, is the next step and
 is not designed here. The per-PR `pull_request` run also stays full for now;
 with the queue as the final gate it could shrink to a subset.
+
+## 4. Legs, shards and result jobs
+
+Until October 2026 each platform's gates ran on one runner and the TTY
+suites ran one case after another, so a run took about 31 minutes: Gates
+(Linux) about 25, Gates (macOS) 22 to 33, Gates (Windows) about 19, TTY
+(Linux) about 17 and TTY (Windows) about 31. Little of that is a single
+long task:
+
+- On a three-core macOS runner `zig build test` compiles about twenty
+  artifacts that each take in most of the tree (the ReleaseSmall app and its
+  shadow, the Debug app, the test binaries, the drivers), all through LLVM.
+- Gates (Linux) ran the ReleaseSafe core suite, the arm64 cross-stage and
+  the release layout one after another behind its suite.
+- The TTY cases mostly wait for the screen to settle, a few seconds each.
+
+So the work is spread over runners, and each required check is a result job
+over its platform's share:
+
+| Job | Runners | What each one runs |
+|---|---|---|
+| `gates-linux` | `units`, `product`, `release`, `checks` | One flag each, below |
+| `gates-macos` | `units-checks`, `product-release` | Two flags each |
+| `windows-gates` | `suite`, `release` | `zig build test`; the release unit and the Windows script suites |
+| `tty-linux` | three shards | Every third case of `tests/tty` |
+| `tty-windows` | four shards | Every fourth case, under ConPTY |
+
+The POSIX gate flags:
+
+| Flag | Steps |
+|---|---|
+| `units` | `zig build test:units`, the native platform modules |
+| `product` | `zig build test:product`, with the pinned WorkBuddy-Bench checkout |
+| `release` | The bundle verification, the arm64 cross-stage (Linux), the install prefix, kernel provenance and staging, the release layout, `install.sh` and the reproducible archive |
+| `checks` | `zig fmt`, the version state gate, `zig build test:lib -Doptimize=ReleaseSafe`, the coverage audit, the documentation checks and notices (Linux), the script unit suites and `git diff --check` |
+
+The rules that keep the split from dropping coverage:
+
+- **`zig build test` is exactly its two halves.** In `build.zig`, `test`
+  depends on `test:units` (the test binaries and the script unit suites)
+  and `test:product` (the built product end to end: the evaluation harness,
+  the smokes, the daemon, the TinyKG transport), and nothing else is wired
+  into it. Both halves run with the same options.
+  `scripts/tests/test_gate_manifest.py` checks both. A new check goes into
+  one of the halves; wired straight into `test`, it would run on no POSIX
+  runner.
+- **Every step a flag gates runs on some runner.** A step without a flag is
+  environment setup (the checkout, Zig, Lean, ripgrep, bubblewrap, the
+  Python dependencies) and runs on every leg, so each leg sees the
+  environment the single job had. `scripts/tests/test_ci_scope.py` checks
+  that every flag a step reads is set by a leg, and that both POSIX jobs run
+  one step list (a YAML alias).
+- **A result job passes only when every leg did.** `Gates (Linux)` and the
+  other result jobs need their leg job, run under `always()` so that they
+  are never skipped, and pass only if every need's result is `success`. A
+  failed, cancelled or skipped leg fails the check. `TTY (Windows)` is not
+  required, but it reports the same way so that it can become required.
+- **The TTY shards partition the cases.** `run_tty_tests.py --shard K/N`
+  (or `TTY_SHARD`) runs the cases whose index in the sorted list is `K-1`
+  modulo `N`; a TTY case checks that the shards cover the list exactly once.
+  Shards run on separate runners, not concurrently on one, because the
+  cases assert pty timing.
+
+What it costs:
+
+- **Duplicate compilation.** Each leg compiles what its steps need, so the
+  ReleaseSmall app, for example, is built on several runners of a platform.
+  Hosted standard runners are free for a public repository; only wall time
+  is scarce.
+- **Concurrency.** The organization runs at most 60 hosted jobs and five
+  macOS jobs at once. A run uses about two dozen jobs, three of them on
+  macOS (two gate legs and `SDK bindings (macOS)`), so macOS pairs the flags
+  instead of giving each its own runner. Runs that overlap can still queue
+  macOS jobs.
+- **Cache lines.** Each gate leg keeps its own setup-zig cache
+  (`cache-key: ${{ matrix.leg }}`), since each builds a different share of
+  the graph. The TTY shards build the same binaries and share one.
+
+The suite steps run with `--summary all`, so every run records the duration
+of each build step. When one leg becomes the long pole, its Build Summary
+says which steps to move: between the halves in `build.zig`, or between the
+flags in `ci.yml`.

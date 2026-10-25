@@ -24,6 +24,12 @@ python3 tests/tty/run_tty_tests.py --bin zig-out/bin/metacodes-debug -k T07 -v
 **CI**:`.github/workflows/ci.yml` 的 `TTY (Linux)` 按上面的命令跑离线全套;`TTY (Windows)`
 跑 `zig build windows:tty -Dtarget=x86_64-windows-gnu`(ConPTY,需 `pip install pywinpty`)。
 在此之前套件不在任何 workflow 里,12 个 agent 树用例挂了几周没人发现(#218、#222)。
+两者都按 `TTY_SHARD=K/N` 拆到多台 runner(Linux 3 片、Windows 4 片),`TTY (Linux)` /
+`TTY (Windows)` 是汇总各片结果的 result job(doc/CI_DESIGN.md §4)。本地复现某一片:
+
+```bash
+python3 tests/tty/run_tty_tests.py --bin zig-out/bin/metacodes-debug --shard 2/3
+```
 
 ## 结构
 

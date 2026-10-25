@@ -2304,10 +2304,21 @@ pub fn build(b: *std.Build) void {
         run_debug_cmd.addArgs(args);
     }
 
+    // `test` is exactly its two halves; nothing else is wired into it
+    // (scripts/tests/test_gate_manifest.py checks this). CI runs the halves on
+    // separate runners on Linux and macOS, so a check wired straight into
+    // `test` would run there on no runner at all (doc/CI_DESIGN.md §4).
+    // `test:units` is the test binaries and the repository's script unit
+    // suites; `test:product` drives the built product end to end (the
+    // evaluation harness, the smokes, the daemon and the TinyKG transport).
     const test_step = b.step("test", "Run tests");
+    const units_test_step = b.step("test:units", "Run the test binaries and the script unit suites (half of `test`)");
+    const product_test_step = b.step("test:product", "Run the built product end to end: evaluation harness, smokes, daemon (half of `test`)");
+    test_step.dependOn(units_test_step);
+    test_step.dependOn(product_test_step);
     // Built by nothing else in the suite; compiling it here keeps it in step
     // with the runtime API it calls.
-    test_step.dependOn(&jev_recall_eval_driver.step);
+    product_test_step.dependOn(&jev_recall_eval_driver.step);
     // The same holds for the rule-author probe and the project-rule pilot:
     // left to their eval steps, both stopped compiling when the state root
     // became an explicit parameter and nothing noticed. Check-only compiles
@@ -2315,23 +2326,23 @@ pub fn build(b: *std.Build) void {
     // and hermetic, so macOS also runs it: a drifted TinyKG daemon or provider
     // contract fails here rather than on the next manual run.
     if (@import("builtin").os.tag != .windows) {
-        test_step.dependOn(&b.addExecutable(.{
+        product_test_step.dependOn(&b.addExecutable(.{
             .name = "rule-author-feasibility-check",
             .root_module = rule_author_trial_mod,
         }).step);
-        test_step.dependOn(&b.addExecutable(.{
+        product_test_step.dependOn(&b.addExecutable(.{
             .name = "project-rule-mac-pilot-check",
             .root_module = project_rule_mac_pilot_mod,
         }).step);
     }
-    if (@import("builtin").os.tag == .macos) test_step.dependOn(&project_rule_mac_pilot_run.step);
-    test_step.dependOn(release_test_step);
-    test_step.dependOn(http_status_gate_step);
-    test_step.dependOn(subsystem_boundary_step);
-    test_step.dependOn(provider_test_step);
-    test_step.dependOn(picker_test_step);
-    test_step.dependOn(lsp_test_step);
-    test_step.dependOn(platform_test_step);
+    if (@import("builtin").os.tag == .macos) product_test_step.dependOn(&project_rule_mac_pilot_run.step);
+    units_test_step.dependOn(release_test_step);
+    units_test_step.dependOn(http_status_gate_step);
+    units_test_step.dependOn(subsystem_boundary_step);
+    units_test_step.dependOn(provider_test_step);
+    units_test_step.dependOn(picker_test_step);
+    units_test_step.dependOn(lsp_test_step);
+    units_test_step.dependOn(platform_test_step);
     const tinykg_contract_test_cmd = b.addSystemCommand(&.{
         if (@import("builtin").os.tag == .windows) "python" else "python3",
         "-m",
@@ -2345,7 +2356,7 @@ pub fn build(b: *std.Build) void {
         "Test the bundled and explicit manually maintained TinyKG boundary",
     );
     tinykg_contract_test_step.dependOn(&tinykg_contract_test_cmd.step);
-    test_step.dependOn(&tinykg_contract_test_cmd.step);
+    units_test_step.dependOn(&tinykg_contract_test_cmd.step);
 
     // The trajectory audit itself only runs against a real ~/.metacodes, which
     // CI does not have - but its parsing does not need one, and two defects in
@@ -2363,7 +2374,7 @@ pub fn build(b: *std.Build) void {
         "Test the session-transcript audit (parsing, pairing, privacy)",
     );
     audit_test_step.dependOn(&audit_test_cmd.step);
-    test_step.dependOn(&audit_test_cmd.step);
+    units_test_step.dependOn(&audit_test_cmd.step);
     const doc_check_cmd = b.addSystemCommand(&.{
         if (@import("builtin").os.tag == .windows) "python" else "python3",
         "scripts/check_doc_links.py",
@@ -2396,7 +2407,7 @@ pub fn build(b: *std.Build) void {
     });
     const doc_facts_test_step = b.step("test:doc-facts", "Test documentation fact checks");
     doc_facts_test_step.dependOn(&doc_facts_test_cmd.step);
-    test_step.dependOn(&doc_facts_test_cmd.step);
+    units_test_step.dependOn(&doc_facts_test_cmd.step);
     // Every std.Io.Threaded goes through platform.signal.threadedIo (SIGPIPE
     // must stay ignored; see src/platform/signal.zig).
     const io_threaded_test_cmd = b.addSystemCommand(&.{
@@ -2408,7 +2419,7 @@ pub fn build(b: *std.Build) void {
     });
     const io_threaded_test_step = b.step("test:io-threaded", "Test that std.Io.Threaded is created only through platform.signal.threadedIo");
     io_threaded_test_step.dependOn(&io_threaded_test_cmd.step);
-    test_step.dependOn(&io_threaded_test_cmd.step);
+    units_test_step.dependOn(&io_threaded_test_cmd.step);
     const gate_manifest_test_cmd = b.addSystemCommand(&.{
         if (@import("builtin").os.tag == .windows) "python" else "python3",
         "-m",
@@ -2418,7 +2429,7 @@ pub fn build(b: *std.Build) void {
     });
     const gate_manifest_test_step = b.step("test:gate-manifest", "Test the AGENTS.md and CI gate manifest");
     gate_manifest_test_step.dependOn(&gate_manifest_test_cmd.step);
-    test_step.dependOn(&gate_manifest_test_cmd.step);
+    units_test_step.dependOn(&gate_manifest_test_cmd.step);
     const release_cut_test_cmd = b.addSystemCommand(&.{
         if (@import("builtin").os.tag == .windows) "python" else "python3",
         "-m",
@@ -2428,7 +2439,7 @@ pub fn build(b: *std.Build) void {
     });
     const release_cut_test_step = b.step("test:release-cut", "Test the release cut / reopen rules and the version-state gate");
     release_cut_test_step.dependOn(&release_cut_test_cmd.step);
-    test_step.dependOn(&release_cut_test_cmd.step);
+    units_test_step.dependOn(&release_cut_test_cmd.step);
     // The rule-control sensors read source text, so moving the code a sensor
     // reads turns its rule red without failing any product test. Only the
     // dispatch-only rule-control workflow ran them, and three drifted
@@ -2444,7 +2455,7 @@ pub fn build(b: *std.Build) void {
     });
     const rule_control_test_step = b.step("test:rule-control", "Test the rule-control sensors on fixtures and on the checked-in tree");
     rule_control_test_step.dependOn(&rule_control_test_cmd.step);
-    test_step.dependOn(&rule_control_test_cmd.step);
+    units_test_step.dependOn(&rule_control_test_cmd.step);
     const gate_fmt = b.addFmt(.{ .paths = &.{ "build.zig", "src", "tests" }, .check = true });
     const gate_coverage = if (@import("builtin").os.tag == .windows)
         b.addSystemCommand(&.{ "cmd", "/C", "echo scripts/test_coverage_audit.sh is bash-only; skipped on Windows" })
@@ -2482,7 +2493,7 @@ pub fn build(b: *std.Build) void {
     wireTinyKgTestInput(test_run, staged_tinykg);
     wireTinyKgdTestInput(test_run, staged_tinykgd);
     wireLeanKernelTestInputs(test_run, staged_lean_kernels);
-    test_step.dependOn(&test_run.step);
+    units_test_step.dependOn(&test_run.step);
 
     // Two independent Metacodes processes share one authenticated StoreActor.
     // This is the runtime actuator for the daemon transport control plane.
@@ -2506,7 +2517,7 @@ pub fn build(b: *std.Build) void {
     kg_transport_runtime.addArtifactArg(kg_transport_probe);
     const kg_transport_step = b.step("test:kg-daemon-transport", "Run authenticated shared-Store daemon transport L2");
     kg_transport_step.dependOn(&kg_transport_runtime.step);
-    test_step.dependOn(&kg_transport_runtime.step);
+    product_test_step.dependOn(&kg_transport_runtime.step);
 
     // test:eval —— harness 评估控制面（suite/readiness/rollout/judgement/
     // compare/gate）。Python 合同测试 + 同宿主原生零付费 smoke；不访问真实模型，
@@ -2523,7 +2534,7 @@ pub fn build(b: *std.Build) void {
         "-v",
     });
     eval_test_step.dependOn(&eval_test_cmd.step);
-    test_step.dependOn(&eval_test_cmd.step);
+    product_test_step.dependOn(&eval_test_cmd.step);
     const runtime_tests_can_execute_target =
         target.result.os.tag == @import("builtin").os.tag and
         target.result.cpu.arch == @import("builtin").cpu.arch;
@@ -2551,7 +2562,7 @@ pub fn build(b: *std.Build) void {
             arm_smoke.addArgs(&.{ "--expected-version", manifest.version });
             wireTinyKgdTestInput(arm_smoke, staged_tinykgd);
             eval_test_step.dependOn(&arm_smoke.step);
-            test_step.dependOn(&arm_smoke.step);
+            product_test_step.dependOn(&arm_smoke.step);
 
             // A session must not keep what it frees: memory growth over a
             // scripted tool session stays below the bytes it sent, and the
@@ -2565,7 +2576,7 @@ pub fn build(b: *std.Build) void {
                     "--binary",
                 });
                 session_memory_smoke.addArtifactArg(binary);
-                test_step.dependOn(&session_memory_smoke.step);
+                product_test_step.dependOn(&session_memory_smoke.step);
             }
 
             // A replay fixture cannot prove that memory adapters cross the
@@ -2590,7 +2601,7 @@ pub fn build(b: *std.Build) void {
                 memory_runtime_smoke.addArg("--tinykg-binary");
                 memory_runtime_smoke.addFileArg(tinykg.artifact);
                 eval_test_step.dependOn(&memory_runtime_smoke.step);
-                test_step.dependOn(&memory_runtime_smoke.step);
+                product_test_step.dependOn(&memory_runtime_smoke.step);
 
                 // Startup/resume over a persistent store: two fresh processes and
                 // the state root's local service (`kg install` + `kgd`), which
@@ -2604,7 +2615,7 @@ pub fn build(b: *std.Build) void {
                     process_resume_smoke.step.dependOn(tinykg.install_step);
                     process_resume_smoke.step.dependOn(daemon.install_step);
                     process_resume_smoke.setEnvironmentVariable("METACODES_PROCESS_E2E_BIN", b.getInstallPath(.bin, exe.out_filename));
-                    test_step.dependOn(&process_resume_smoke.step);
+                    product_test_step.dependOn(&process_resume_smoke.step);
 
                     // Chained attempts carry memory (scripts/eval/chained_runner.py):
                     // the real E2E harness, TinyKG daemon, store export/import and
@@ -2623,7 +2634,7 @@ pub fn build(b: *std.Build) void {
                     chained_memory_smoke.addArg("--tinykgd-binary");
                     chained_memory_smoke.addFileArg(daemon.artifact);
                     eval_test_step.dependOn(&chained_memory_smoke.step);
-                    test_step.dependOn(&chained_memory_smoke.step);
+                    product_test_step.dependOn(&chained_memory_smoke.step);
                 }
             }
         }
@@ -2647,7 +2658,7 @@ pub fn build(b: *std.Build) void {
                 const daemon_e2e = b.addSystemCommand(&.{ "bash", script });
                 daemon_e2e.step.dependOn(b.getInstallStep());
                 daemon_e2e.setEnvironmentVariable("METACODES_DAEMON_E2E_BIN", b.getInstallPath(.bin, exe.out_filename));
-                test_step.dependOn(&daemon_e2e.step);
+                product_test_step.dependOn(&daemon_e2e.step);
             }
         }
         // The native project-Harness suites (E3 runtime and templates, the
@@ -2824,7 +2835,7 @@ pub fn build(b: *std.Build) void {
     const dispatcher_metadata_run = addTestRunArtifact(b, dispatcher_metadata_test);
     const dispatcher_metadata_step = b.step("test:dispatcher-metadata", "Run the ToolDispatcher metadata acceptance suite");
     dispatcher_metadata_step.dependOn(&dispatcher_metadata_run.step);
-    test_step.dependOn(&dispatcher_metadata_run.step);
+    units_test_step.dependOn(&dispatcher_metadata_run.step);
 
     // Focused Skill Runtime gate. Keep this work independently
     // runnable instead of forcing every unrelated spike/component artifact
@@ -2879,7 +2890,7 @@ pub fn build(b: *std.Build) void {
         ).step,
     );
 
-    test_step.dependOn(spike_step);
+    units_test_step.dependOn(spike_step);
 
     // test:new —— 只跑本次 e2e 框架新增的 L2 component 测试(隔离运行,绕开主套件已知
     // 的 integration 挂起)。每个文件独立 artifact,带 cc + harness imports。
