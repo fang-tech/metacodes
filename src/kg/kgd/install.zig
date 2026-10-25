@@ -74,6 +74,22 @@ pub const Outcome = struct {
     }
 };
 
+/// The build id a service started now would report: the identity of the
+/// TinyKG executables this install resolves, which is what `run` pins. Writes
+/// nothing.
+pub fn installedBuildId(allocator: std.mem.Allocator, state_root: []const u8) Error![71]u8 {
+    var cli = (KgClient.resolveTinykgBinary(allocator, .{ .state_root = state_root, .domain = "" }) catch null) orelse
+        return Error.BinariesMissing;
+    defer cli.deinit(allocator);
+    var daemon = (KgClient.resolveTinykgdBinary(allocator, .{ .state_root = state_root, .domain = "" }) catch null) orelse
+        return Error.BinariesMissing;
+    defer daemon.deinit(allocator);
+    var identity = identity_mod.discover(allocator, cli.path, daemon.path) catch
+        return Error.IdentityUnavailable;
+    defer identity.deinit();
+    return identity.build_id;
+}
+
 pub fn run(allocator: std.mem.Allocator, state_root: []const u8, options: Options) Error!Outcome {
     if (state_root.len == 0 and options.config_path == null) return Error.NoHome;
 

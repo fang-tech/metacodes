@@ -29,6 +29,11 @@ pub const Error = error{
     InvalidResponse,
     AuthenticationFailed,
     IncompatibleDaemon,
+    /// A metacodes-kgd service of this protocol accepted the key but reports
+    /// another build id than the configuration pins: it runs other TinyKG
+    /// binaries than the pin was written for, as after an update changed
+    /// them (doc/TINYKG_INTEGRATION.md, "A stale pin").
+    BuildMismatch,
     RequestIdConflict,
     AmbiguousCommit,
     Backpressure,
@@ -569,11 +574,14 @@ pub const WebTransport = struct {
             integer(object.get("controlPlaneVersion")) != control_plane_version or
             !implementationAccepted(object.get("implementation")) or
             !stringEquals(object.get("schemaMode"), "server-canonical") or
-            !stringEquals(object.get("buildId"), self.expected_build_id) or
             !stringEquals(object.get("requestId"), request_id))
         {
             return Error.IncompatibleDaemon;
         }
+        // Everything but the build matches: this install's own service, on
+        // other binaries than the pin names. Told apart so the host can
+        // repin rather than leave the session degraded.
+        if (!stringEquals(object.get("buildId"), self.expected_build_id)) return Error.BuildMismatch;
         const engine = object.get("engine") orelse return Error.IncompatibleDaemon;
         if (engine != .object or !stringEquals(engine.object.get("implementation"), "tinykg-cli") or
             (string(engine.object.get("version")) orelse @as([]const u8, "")).len == 0 or

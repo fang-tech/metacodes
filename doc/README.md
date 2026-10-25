@@ -81,6 +81,10 @@ Run `zig build gate:pr` to execute the single AGENTS.md pre-submit checklist.
   PRs once.
 - [Release automation](RELEASE_AUTOMATION_DESIGN.md) — version bumping,
   cutting, tagging, publishing, and the CI fast path for release PRs.
+- [`metacodes update`](UPDATE_DESIGN.md) — bring an install up to date from
+  where it came from (a release, a recorded mirror, or its checkout) by
+  delegating to that source's own installer; running sessions, the TinyKG
+  pin, Windows, convergence after a failed run.
 
 ## History
 

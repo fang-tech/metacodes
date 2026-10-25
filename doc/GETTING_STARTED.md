@@ -41,6 +41,35 @@ and installs it beside the released one: the main checkout as `metacodes-dev`
 install is a copy, so rebuilding or removing the checkout leaves it running;
 `--dev --uninstall` removes it again.
 
+### Update an install
+
+```sh
+metacodes update
+```
+
+This brings the install up to date from where it came from. A release install
+moves to the latest published release, downloaded from the same place it came
+from: a mirror named with `install.sh --release-base` (or
+`update --release-base`) is recorded and used again. A development install is
+rebuilt from the checkout that built it; `--pull` fast-forwards that checkout
+first.
+
+- **What it keeps.** The prefix, the state root, the launcher and the SDK all
+  stay as they are.
+- **Never backwards.** It never moves an install to an older version without
+  `--allow-downgrade`.
+- **Repairs.** It repairs an install whose files no longer match its
+  manifest.
+- **Running sessions.** Exit the sessions of the install first, or pass
+  `--ignore-running` (not on Windows). Restart them afterwards: their next
+  formal-kernel check fails closed.
+
+`--check` only reports (exit 3 when there is something to do), `--version
+X.Y.Z` picks a release, and `--json` prints the result. Downloads go through
+curl, as `install.sh`'s do, so a proxy set for one works for the other.
+Installs older than the first release with `update` take one more
+`install.sh` run.
+
 The release unit is complete on every supported platform: the TUI, TinyKG (CLI
 and daemon) and both Lean governance kernels under `libexec/metacodes/`, each
 pinned into the executable ([release/LAYOUT.md](../release/LAYOUT.md)). Runtime

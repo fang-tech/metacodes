@@ -178,6 +178,20 @@ surface is fail-closed: an unknown flag or positional argument exits with code
 harnesses pass treatment configuration through this surface. Headless
 automation uses `-p/--print` (or `-` for stdin) with `--json`/`--stream-json`
 NDJSON output; introspection uses `--dump-prompt` and `--dump-plugins`.
+`metacodes update [--check] [--version X.Y.Z] [--release-base <url>] [--pull]
+[--allow-downgrade] [--no-sdk] [--ignore-running] [--json]` brings the install
+the executable belongs to up to date from the source its install record names
+(doc/UPDATE_DESIGN.md).
+- **Exit codes:** 0 when it is done or there is nothing to do, 1 when it is
+  refused or fails, 2 for a usage error, and 3 with `--check` when an update
+  or repair is available.
+- **`--json` result:** one document on stdout,
+  `{action, source, from, to, prefix, origin, sdk, checked_only,
+  stopped_services, running_sessions, notes}`.
+  - `action` is `up_to_date`, `newer_installed`, `upgrade`, `downgrade`,
+    `repair` or `rebuild`.
+  - `source` is `release` or `checkout`.
+  - A failure prints `{action: "refused", error}` instead.
 `metacodes --resume <id>` starts the interactive REPL as a stored session of
 the working directory (an id or id prefix, the rule `/resume <id>` uses) with
 its conversation, goal and model route restored, and appends to the same

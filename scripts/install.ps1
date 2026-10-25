@@ -17,6 +17,12 @@ powershell -ExecutionPolicy Bypass -File scripts\install.ps1 metacodes-<version>
 
 .EXAMPLE
 powershell -File scripts\install.ps1 -Prefix C:\tools\mc-work -Sdk agentcore-<version>.zip metacodes-<version>.zip
+
+.EXAMPLE
+powershell -File scripts\install.ps1 -ReleaseBase https://mirror.example/metacodes/releases metacodes-<version>-x86_64-windows-gnu.zip
+
+Once installed, `metacodes update` brings the install up to date from the
+release mirror its record names (doc/UPDATE_DESIGN.md).
 #>
 [CmdletBinding()]
 param(
@@ -35,6 +41,9 @@ param(
     [switch]$NoPath,
     # Let a rerun replace a newer install with this older version.
     [switch]$AllowDowngrade,
+    # The releases mirror the archive came from; the install records it and
+    # `metacodes update` downloads from it (default: the GitHub releases).
+    [string]$ReleaseBase,
     # Replace a different version or foreign files at -Prefix.
     [switch]$Force
 )
@@ -158,6 +167,7 @@ try {
     $ErrorActionPreference = 'Continue'
     try { $help = & $exe install --help 2>&1 | Out-String } finally { $ErrorActionPreference = $savedPreference }
     $unitGuards = $help -match '--allow-downgrade'
+    $unitSources = $help -match '--release-base'
     $record = Join-Path $Prefix 'etc\metacodes\install.json'
     if (-not $unitGuards -and (Test-Path -LiteralPath $record -PathType Leaf)) {
         $unitVersion = $null
@@ -182,6 +192,10 @@ try {
     # Only a unit that knows the option gets it; an earlier one rejects it as
     # unknown (and was already checked above).
     if ($AllowDowngrade -and $unitGuards) { $installArgs += '--allow-downgrade' }
+    if ($ReleaseBase) {
+        if ($unitSources) { $installArgs += @('--release-base', $ReleaseBase.TrimEnd('/')) }
+        else { Write-Host "install.ps1: this unit cannot record a mirror; -ReleaseBase is ignored" }
+    }
 
     & $exe @installArgs
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

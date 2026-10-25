@@ -22,6 +22,20 @@
 //!    `<state root>/kg/kgd.log`) when nothing listens there;
 //! 4. waits until the configured port accepts connections.
 //!
+//! The pin (`expected_build_id`) follows the TinyKG binaries this install
+//! runs (doc/TINYKG_INTEGRATION.md, "A stale pin"). An update that changes
+//! them leaves `daemon.json` naming the old ones, and every session would then
+//! be refused by the service. So, for the default configuration:
+//! - before starting a service, which will run the installed binaries, the
+//!   pin is rewritten to their id when it differs;
+//! - when the client reports `stale_pin` and the service on the port accepts
+//!   this configuration's key, the pin is rewritten to the installed binaries'
+//!   id, unless it already is that id: then the running service is on other
+//!   binaries than are installed, and only restarting it helps.
+//! Both rewrites are what `metacodes kg install` does: the key, the port and
+//! the store stay. A `METACODES_KG_CONFIG` file is never rewritten, and a
+//! listener that refuses the key is never repinned.
+//!
 //! It stays out of the way of everything it does not own: an explicit
 //! `METACODES_KG_URL`/`_API_KEY`/`_EXPECTED_BUILD_ID` service, a non-loopback
 //! URL, a `METACODES_KG_CONFIG` file that does not exist (that one fails
@@ -61,6 +75,8 @@ pub const Autostart = struct {
     /// that nothing outlives them.
     launcher: ?Launcher = null,
 
+    pub const StartReason = KgClient.StartReason;
+
     pub const Launcher = struct {
         ctx: *anyopaque,
         /// `config_path` is null for the state root's default configuration.
@@ -95,17 +111,17 @@ pub const Autostart = struct {
         return .{ .ctx = self, .start = startThunk };
     }
 
-    fn startThunk(ctx: *anyopaque) bool {
+    fn startThunk(ctx: *anyopaque, reason: StartReason) bool {
         const self: *Autostart = @ptrCast(@alignCast(ctx));
         self.mutex.lock();
         defer self.mutex.unlock();
-        return self.start() catch |err| {
+        return self.start(reason) catch |err| {
             log.warn("kg", "TinyKG service autostart failed: {s}", .{@errorName(err)});
             return false;
         };
     }
 
-    fn start(self: *Autostart) !bool {
+    fn start(self: *Autostart, reason: StartReason) !bool {
         if (!enabled()) return false;
         if (envSet("METACODES_KG_URL") or envSet("METACODES_KG_API_KEY") or envSet("METACODES_KG_EXPECTED_BUILD_ID")) return false;
         const a = self.allocator;
@@ -122,12 +138,15 @@ pub const Autostart = struct {
             var target = configuredTarget(a, config_path) orelse return false;
             defer target.deinit(a);
             return switch (occupant(target.port, target.api_key)) {
+                // The other start may have repinned it: the client reads the
+                // configuration again.
                 .ours, .unknown => true,
                 .none, .foreign => false,
             };
         };
         defer lock.release();
 
+        var provisioned = false;
         if (!fileExists(a, config_path)) {
             // A configuration the user named must exist; only the default is
             // ours to create.
@@ -138,17 +157,24 @@ pub const Autostart = struct {
             };
             defer outcome.deinit(a);
             log.info("kg", "TinyKG service provisioned: {s} at {s}", .{ outcome.config_path, outcome.url });
+            provisioned = true;
         }
 
         var target = configuredTarget(a, config_path) orelse return false;
         defer target.deinit(a);
         var port = target.port;
         switch (occupant(port, target.api_key)) {
+            .ours => return if (reason == .stale_pin) self.repinRunning(target, config_path, custom_config) else true,
             // A listener that does not answer within the probe is most likely
             // this install's service busy with a request: never start a
-            // second service over it.
-            .ours, .unknown => return true,
-            .none => {},
+            // second service over it. Nor repin one that has not shown it
+            // holds this configuration's key.
+            .unknown => return reason != .stale_pin,
+            .none => {
+                // The service about to start runs the installed binaries:
+                // pin their id first, or every session would be refused.
+                if (!custom_config and !provisioned) self.repinBeforeStart(target);
+            },
             .foreign => {
                 if (custom_config) {
                     log.warn("kg", "TinyKG port {d} named by {s} is held by a service that refuses its key; stop that service or give the configuration a free port (`metacodes kg install --config <path> --port <port>`)", .{ port, config_path });
@@ -191,6 +217,43 @@ pub const Autostart = struct {
         log.info("kg", "TinyKG service started on port {d} (log {s})", .{ port, log_path });
         return waitAccepting(port);
     }
+
+    /// `stale_pin` with this install's service answering: pin the installed
+    /// binaries, or say why that would not help.
+    fn repinRunning(self: *Autostart, target: Target, config_path: []const u8, custom_config: bool) bool {
+        if (custom_config) {
+            log.warn("kg", "the TinyKG service on port {d} runs other binaries than {s} pins; repin it with `metacodes kg install --config {s}`", .{ target.port, config_path, config_path });
+            return false;
+        }
+        const installed = kgd_install.installedBuildId(self.allocator, self.state_root) catch |err| {
+            log.warn("kg", "cannot read the installed TinyKG binaries' identity to repin the service: {s}", .{@errorName(err)});
+            return false;
+        };
+        if (std.mem.eql(u8, target.build_id, &installed)) {
+            log.warn("kg", "the TinyKG service on port {d} runs other binaries than this install has (it still runs an earlier build); stop it, and the next session starts the installed one", .{target.port});
+            return false;
+        }
+        return self.repin(target, &installed);
+    }
+
+    /// Before starting a service: its build is the installed binaries'.
+    fn repinBeforeStart(self: *Autostart, target: Target) void {
+        const installed = kgd_install.installedBuildId(self.allocator, self.state_root) catch return; // the start reports it
+        if (std.mem.eql(u8, target.build_id, &installed)) return;
+        _ = self.repin(target, &installed);
+    }
+
+    /// What `metacodes kg install` does: the key, the port and the store
+    /// stay; the pin becomes the installed binaries' id.
+    fn repin(self: *Autostart, target: Target, installed: []const u8) bool {
+        var outcome = kgd_install.run(self.allocator, self.state_root, .{}) catch |err| {
+            log.warn("kg", "repinning the TinyKG service failed: {s}", .{@errorName(err)});
+            return false;
+        };
+        defer outcome.deinit(self.allocator);
+        log.info("kg", "TinyKG binaries changed: repinned the service on port {d} from {s} to {s}", .{ target.port, target.build_id, installed });
+        return true;
+    }
 };
 
 /// Whether a CLI session would start the service for a client degraded this
@@ -225,13 +288,16 @@ fn fileExists(a: std.mem.Allocator, path: []const u8) bool {
     return pfs.exists(z.ptr);
 }
 
-/// The loopback port a configuration names and the key its service accepts.
+/// The loopback port a configuration names, the key its service accepts and
+/// the build id it pins.
 const Target = struct {
     port: u16,
     api_key: []u8,
+    build_id: []u8,
 
     fn deinit(self: *Target, a: std.mem.Allocator) void {
         a.free(self.api_key);
+        a.free(self.build_id);
     }
 };
 
@@ -244,7 +310,12 @@ fn configuredTarget(a: std.mem.Allocator, config_path: []const u8) ?Target {
     if (!std.mem.startsWith(u8, url, "http://127.0.0.1:")) return null;
     const port = kgd_install.portOfUrl(url) orelse return null;
     if (port == 0) return null;
-    return .{ .port = port, .api_key = a.dupe(u8, parsed.value.api_key) catch return null };
+    const api_key = a.dupe(u8, parsed.value.api_key) catch return null;
+    const build_id = a.dupe(u8, parsed.value.expected_build_id orelse "") catch {
+        a.free(api_key);
+        return null;
+    };
+    return .{ .port = port, .api_key = api_key, .build_id = build_id };
 }
 
 /// Who answers on a port, as judged with this configuration's key.

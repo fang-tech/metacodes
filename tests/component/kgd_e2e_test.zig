@@ -267,7 +267,8 @@ const Restarter = struct {
         return .{ .ctx = self, .start = start };
     }
 
-    fn start(ctx: *anyopaque) bool {
+    fn start(ctx: *anyopaque, reason: cc.kg_client.KgClient.StartReason) bool {
+        _ = reason;
         const self: *Restarter = @ptrCast(@alignCast(ctx));
         self.calls += 1;
         if (self.first_call_ms == 0) self.first_call_ms = cc.util_time.nowMs();
@@ -785,4 +786,240 @@ test "Kgd: what install wrote is what the service starts from" {
     defer a.free(config_c);
     try std.testing.expectEqual(@as(c_int, 0), pfs.chmod(config_c.ptr, 0o644));
     try std.testing.expectError(error.ConfigUnsafe, cc.kgd_runtime_exports.loadConfig(a, home, .{ .config_path = config_path }));
+}
+
+// ── a stale pin (doc/TINYKG_INTEGRATION.md "A stale pin") ─────────────────────
+
+/// The pin an earlier TinyKG bundle would have left in `daemon.json`: the
+/// file is rewritten in place (its mode, 0600, stays).
+const stale_build_id = "sha256:" ++ ("0" ** 64);
+
+fn writeStalePin(a: std.mem.Allocator, config_path: []const u8, current: []const u8) !void {
+    const text = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, config_path, a, .limited(64 << 10));
+    defer a.free(text);
+    const stale = try std.mem.replaceOwned(u8, a, text, current, stale_build_id);
+    defer a.free(stale);
+    try std.testing.expect(!std.mem.eql(u8, text, stale));
+    var file = try std.Io.Dir.cwd().openFile(std.testing.io, config_path, .{ .mode = .write_only });
+    defer file.close(std.testing.io);
+    try file.writePositionalAll(std.testing.io, stale, 0);
+    try file.setLength(std.testing.io, stale.len);
+}
+
+/// The TinyKG executables the suite staged, as this install's, and nothing in
+/// the environment that would make a session leave autostart alone.
+fn staleEnv(a: std.mem.Allocator, cli_z: [*:0]const u8, daemon_z: [*:0]const u8) ![7]EnvRestore {
+    return .{
+        try EnvRestore.set(a, "METACODES_KG_BIN", cli_z),
+        try EnvRestore.set(a, "METACODES_KGD_BIN", daemon_z),
+        try EnvRestore.set(a, "METACODES_KG_AUTOSTART", null),
+        try EnvRestore.set(a, "METACODES_KG_CONFIG", null),
+        try EnvRestore.set(a, "METACODES_KG_URL", null),
+        try EnvRestore.set(a, "METACODES_KG_API_KEY", null),
+        try EnvRestore.set(a, "METACODES_KG_EXPECTED_BUILD_ID", null),
+    };
+}
+
+test "Kgd: a session holding a stale pin has the host repin this install's service, keeping the key" {
+    const a = std.testing.allocator;
+    const cli = tinykg_binary.find(a) orelse return error.SkipZigTest;
+    defer a.free(cli);
+    const daemon = daemonPath(a) orelse return error.SkipZigTest;
+    defer a.free(daemon);
+    const cli_z = try a.dupeZ(u8, cli);
+    defer a.free(cli_z);
+    const daemon_z = try a.dupeZ(u8, daemon);
+    defer a.free(daemon_z);
+    var env = try staleEnv(a, cli_z.ptr, daemon_z.ptr);
+    defer for (&env) |*entry| entry.restore(a);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buffer[0..try tmp.dir.realPath(std.testing.io, &root_buffer)];
+    var installed = try cc.kgd_install.run(a, root, .{});
+    defer installed.deinit(a);
+    try writeStalePin(a, installed.config_path, &installed.build_id);
+    var before = try cc.kg_client.KgClient.loadDaemonConfig(a, installed.config_path);
+    defer before.deinit();
+
+    // This install's service, started from the installed binaries.
+    var service = InProcessService{ .allocator = a };
+    defer service.deinit();
+    try service.start(root, null);
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
+    defer io_runtime.deinit();
+
+    // It refuses the stale pin with the error that names this case...
+    {
+        var stale = try WebTransport.init(a, .{ .io = io_runtime.io(), .url = installed.url, .api_key = before.value.api_key, .expected_build_id = stale_build_id, .expected_schema_digest = "" });
+        defer stale.deinit();
+        try std.testing.expectError(error.BuildMismatch, stale.run("store-info", &.{}, false));
+    }
+    // ...and without a host nothing recovers it.
+    var bare = try cc.kg_client.KgClient.init(a, .{ .state_root = root, .domain = "stale-pin-probe", .io = io_runtime.io() });
+    defer bare.deinit();
+    bare.ensureReady();
+    try std.testing.expect(!bare.ready);
+    try std.testing.expectEqual(cc.kg_client.DegradedKind.pin_mismatch, bare.degradedKind().?);
+
+    // With the host, the session gets the service repinned to the installed
+    // binaries, and nothing else changes: no second service, same key, port
+    // and store.
+    var unused = InProcessService{ .allocator = a };
+    defer unused.deinit();
+    const autostart = cc.kg_autostart.Autostart.create(a, root) orelse return error.SkipZigTest;
+    defer autostart.destroy();
+    autostart.launcher = unused.launcher();
+    var kg = try cc.kg_client.KgClient.init(a, .{ .state_root = root, .domain = "stale-pin-probe", .io = io_runtime.io(), .autostart = autostart.hook() });
+    defer kg.deinit();
+    kg.ensureReady();
+    if (!kg.ready) {
+        std.debug.print("stale pin test: not ready; degraded={?} detail={s}\n", .{ kg.degradedKind(), kg.detail() });
+        return error.TestExpectedReady;
+    }
+    try std.testing.expectEqual(@as(u32, 0), unused.launches);
+    var after = try cc.kg_client.KgClient.loadDaemonConfig(a, installed.config_path);
+    defer after.deinit();
+    try std.testing.expectEqualStrings(service.supervisor.?.identity.buildId(), after.value.expected_build_id.?);
+    try std.testing.expectEqualStrings(before.value.api_key, after.value.api_key);
+    try std.testing.expectEqualStrings(before.value.url, after.value.url);
+    try std.testing.expectEqualStrings(before.value.store.?, after.value.store.?);
+    const task = try kg.createTask("stale pin probe task", "task");
+    _ = try kg.taskStatus(task);
+
+    // The session that degraded before the repin, still holding the old pin,
+    // recovers on its next probe: it reads the repinned file, no host needed.
+    try std.testing.expect(bare.retryReadyNow());
+    _ = try bare.taskStatus(task);
+}
+
+test "Kgd: the host pins the installed binaries before it starts the service, so a session never meets the stale pin" {
+    const a = std.testing.allocator;
+    const cli = tinykg_binary.find(a) orelse return error.SkipZigTest;
+    defer a.free(cli);
+    const daemon = daemonPath(a) orelse return error.SkipZigTest;
+    defer a.free(daemon);
+    const cli_z = try a.dupeZ(u8, cli);
+    defer a.free(cli_z);
+    const daemon_z = try a.dupeZ(u8, daemon);
+    defer a.free(daemon_z);
+    var env = try staleEnv(a, cli_z.ptr, daemon_z.ptr);
+    defer for (&env) |*entry| entry.restore(a);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buffer[0..try tmp.dir.realPath(std.testing.io, &root_buffer)];
+    var installed = try cc.kgd_install.run(a, root, .{});
+    defer installed.deinit(a);
+    // An update changed the binaries, then the machine restarted: a stale
+    // pin, and nothing listening.
+    try writeStalePin(a, installed.config_path, &installed.build_id);
+    var before = try cc.kg_client.KgClient.loadDaemonConfig(a, installed.config_path);
+    defer before.deinit();
+
+    var service = InProcessService{ .allocator = a };
+    defer service.deinit();
+    const autostart = cc.kg_autostart.Autostart.create(a, root) orelse return error.SkipZigTest;
+    defer autostart.destroy();
+    autostart.launcher = service.launcher();
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
+    defer io_runtime.deinit();
+    var kg = try cc.kg_client.KgClient.init(a, .{ .state_root = root, .domain = "stale-pin-start", .io = io_runtime.io(), .autostart = autostart.hook() });
+    defer kg.deinit();
+    kg.ensureReady();
+    if (!kg.ready) {
+        std.debug.print("stale pin start test: not ready; launches={d} launch_error={?} degraded={?} detail={s}\n", .{ service.launches, service.last_error, kg.degradedKind(), kg.detail() });
+        return error.TestExpectedReady;
+    }
+    try std.testing.expectEqual(@as(u32, 1), service.launches);
+    var after = try cc.kg_client.KgClient.loadDaemonConfig(a, installed.config_path);
+    defer after.deinit();
+    try std.testing.expectEqualStrings(service.supervisor.?.identity.buildId(), after.value.expected_build_id.?);
+    try std.testing.expectEqualStrings(before.value.api_key, after.value.api_key);
+    try std.testing.expectEqualStrings(before.value.url, after.value.url);
+}
+
+test "Kgd: a stale pin in a METACODES_KG_CONFIG file is reported, never rewritten" {
+    const a = std.testing.allocator;
+    const cli = tinykg_binary.find(a) orelse return error.SkipZigTest;
+    defer a.free(cli);
+    const daemon = daemonPath(a) orelse return error.SkipZigTest;
+    defer a.free(daemon);
+    const cli_z = try a.dupeZ(u8, cli);
+    defer a.free(cli_z);
+    const daemon_z = try a.dupeZ(u8, daemon);
+    defer a.free(daemon_z);
+    var env = try staleEnv(a, cli_z.ptr, daemon_z.ptr);
+    defer for (&env) |*entry| entry.restore(a);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buffer[0..try tmp.dir.realPath(std.testing.io, &root_buffer)];
+    const config_path = try std.fmt.allocPrint(a, "{s}/operator.json", .{root});
+    defer a.free(config_path);
+    var installed = try cc.kgd_install.run(a, root, .{ .config_path = config_path });
+    defer installed.deinit(a);
+    try writeStalePin(a, config_path, &installed.build_id);
+    const config_z = try a.dupeZ(u8, config_path);
+    defer a.free(config_z);
+    var named = try EnvRestore.set(a, "METACODES_KG_CONFIG", config_z.ptr);
+    defer named.restore(a);
+    const written = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, config_path, a, .limited(64 << 10));
+    defer a.free(written);
+
+    var service = InProcessService{ .allocator = a };
+    defer service.deinit();
+    try service.start(root, config_path);
+    var unused = InProcessService{ .allocator = a };
+    defer unused.deinit();
+    const autostart = cc.kg_autostart.Autostart.create(a, root) orelse return error.SkipZigTest;
+    defer autostart.destroy();
+    autostart.launcher = unused.launcher();
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
+    defer io_runtime.deinit();
+    var kg = try cc.kg_client.KgClient.init(a, .{ .state_root = root, .domain = "stale-pin-named", .io = io_runtime.io(), .autostart = autostart.hook() });
+    defer kg.deinit();
+    kg.ensureReady();
+    try std.testing.expect(!kg.ready);
+    try std.testing.expectEqual(cc.kg_client.DegradedKind.pin_mismatch, kg.degradedKind().?);
+    try std.testing.expectEqual(@as(u32, 0), unused.launches);
+    const now = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, config_path, a, .limited(64 << 10));
+    defer a.free(now);
+    try std.testing.expectEqualStrings(written, now);
+}
+
+test "Kgd: a client given its service explicitly keeps it when the pin is stale" {
+    // Its options are not retained, so re-reading configuration would swap
+    // the caller's service for whatever the environment and files name.
+    const a = std.testing.allocator;
+    var harness = (try Harness.start(a, TEST_KEY)) orelse return error.SkipZigTest;
+    defer harness.deinit();
+    const endpoint = try harness.url(a);
+    defer a.free(endpoint);
+    var env = [_]EnvRestore{
+        try EnvRestore.set(a, "METACODES_KG_CONFIG", null),
+        try EnvRestore.set(a, "METACODES_KG_URL", null),
+        try EnvRestore.set(a, "METACODES_KG_API_KEY", null),
+        try EnvRestore.set(a, "METACODES_KG_EXPECTED_BUILD_ID", null),
+    };
+    defer for (&env) |*entry| entry.restore(a);
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buffer[0..try harness.tmp.dir.realPath(std.testing.io, &root_buffer)];
+    var kg = try cc.kg_client.KgClient.init(a, .{
+        .state_root = root,
+        .domain = "explicit-stale-pin",
+        .io = harness.io_runtime.io(),
+        .daemon_url = endpoint,
+        .daemon_api_key = TEST_KEY,
+        .daemon_expected_build_id = stale_build_id,
+    });
+    defer kg.deinit();
+    kg.ensureReady();
+    try std.testing.expect(!kg.ready);
+    try std.testing.expectEqual(cc.kg_client.DegradedKind.pin_mismatch, kg.degradedKind().?);
+    try std.testing.expect(kg.retryReadyNow() == false);
+    try std.testing.expectEqual(cc.kg_client.DegradedKind.pin_mismatch, kg.degradedKind().?);
 }

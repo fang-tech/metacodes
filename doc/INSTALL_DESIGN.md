@@ -50,7 +50,9 @@ Resolution policy (host layer only, `src/util/state_root.zig`, pure
 2. `METACODES_HOME`;
 3. `<prefix>/etc/metacodes/install.json` beside the physical executable:
    `{"schema_version":"metacodes-install-v1","version":"…","state_root":"state"}`,
-   a relative root being relative to `<prefix>` so the whole install can move;
+   a relative root being relative to `<prefix>` so the whole install can move
+   (an optional `update_source` member says where `metacodes update` looks:
+   [UPDATE_DESIGN.md](UPDATE_DESIGN.md) §3);
 4. `$HOME/.metacodes` (development builds; installs predating this design).
 
 A present but invalid `install.json`, or a relative override, stops the CLI
@@ -82,8 +84,8 @@ process-global resolution.
 ## 4. Installer
 
 `bin/metacodes install --prefix <dir> [--state-dir <dir>] [--sdk <bundle>]
-[--link <dir> [--link-name <name>]] [--upgrade] [--allow-downgrade] [--force]`
-(src/app/install.zig),
+[--link <dir> [--link-name <name>]] [--upgrade] [--allow-downgrade] [--force]
+[--release-base <url> | --checkout <dir>]` (src/app/install.zig),
 run from an extracted release unit or one staged from source (`release:verify`):
 
 1. refuses a prefix that holds anything but this product's install unless
@@ -106,7 +108,10 @@ run from an extracted release unit or one staged from source (`release:verify`):
    absolute `--state-dir`) and creates the state root (0700), first, so a copy
    that fails half way can be retried without `--force`. A reinstall or
    upgrade without `--state-dir` keeps the root the existing record names:
-   rerunning the installer never re-points an install at an empty root;
+   rerunning the installer never re-points an install at an empty root. The
+   same holds for the update source: `--release-base` (a releases mirror) or
+   `--checkout` (the checkout that built a development unit) records one, and
+   without either the record keeps what it had;
 3. copies every file the unit's `manifest.json` lists and re-hashes it at the
    destination (a damaged unit fails on the first mismatch); when it replaces
    another version, removes the files the old manifest listed and the new one
@@ -157,8 +162,14 @@ release.yml on the archives it publishes.
 A released install and development installs therefore coexist by default,
 with separate prefixes, launchers and state roots. An install is a copy of the
 unit, each file replaced atomically, so rebuilding, switching branches or
-removing a worktree never disturbs a running install, and an upgrade does not
-break a session that is still running the old executable.
+removing a worktree never disturbs a running install. An upgrade lets a
+session that is still running the old executable keep running, but not keep
+working fully: the Lean kernels are re-hashed against the old executable's
+pins on every use, so its next formal check fails closed until it restarts
+([UPDATE_DESIGN.md](UPDATE_DESIGN.md) §6.1). `install.sh` records where it
+got the unit — `--release-base <the base it downloaded from>`, or with `--dev`
+`--checkout <checkout>` — for a unit whose installer knows the options, and
+`metacodes update` then brings the install up to date from there.
 
 `install.sh --uninstall` (with the same `--dev`/`--prefix`/`--link-name`
 selection) removes an install: only a prefix holding this product's install

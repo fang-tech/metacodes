@@ -30,6 +30,8 @@ const builtin = @import("builtin");
 const is_windows = builtin.os.tag == .windows;
 const state_root = @import("../util/state_root.zig");
 const util_fs = @import("../util/fs.zig");
+const release_source = @import("release_source.zig");
+pub const UpdateSource = release_source.UpdateSource;
 
 pub const Options = struct {
     /// Absolute destination prefix.
@@ -51,8 +53,22 @@ pub const Options = struct {
     link_dir: ?[]const u8 = null,
     /// Launcher name (`metacodes` by default; several installs need several names).
     link_name: []const u8 = "metacodes",
+    /// What the record names as this install's update source
+    /// (doc/UPDATE_DESIGN.md §3).
+    update_source: SourceChoice = .keep,
     /// Run the installed executable's `doctor --strict` (tests switch it off).
     self_check: bool = true,
+};
+
+pub const SourceChoice = union(enum) {
+    /// The previous record's source (`--release-base` and `--checkout` both
+    /// absent): an archive installed by hand over a mirrored or development
+    /// install keeps updating from where it did. A fresh install gets the
+    /// default.
+    keep,
+    /// `--release-base` (`release_source.parseBase`) or `--checkout`
+    /// (`release_source.parseCheckout`).
+    set: UpdateSource,
 };
 
 pub const Error = error{
@@ -80,6 +96,7 @@ pub const Outcome = struct {
     sdk: ?[]const u8 = null,
     launcher: ?[]const u8 = null,
     in_place: bool = false,
+    update_source: UpdateSource = .default_release,
 };
 
 const unit_name = "metacodes-cli";
@@ -88,16 +105,21 @@ const sdk_name = "agentcore";
 const install_manifest_rel = state_root.manifest_relative_path;
 const max_artifact_bytes = 256 << 20;
 
-const FileEntry = struct { path: []const u8, sha256: []const u8 };
+pub const FileEntry = struct { path: []const u8, sha256: []const u8 };
 
-const UnitManifest = struct {
+/// The members of a unit's `manifest.json` (release/manifest.schema.json)
+/// that installing and updating read. A release manifest always carries
+/// them all; the defaults only let the unit tests write small ones.
+pub const UnitManifest = struct {
     schema_version: u32,
     name: []const u8,
-    release: struct { version: []const u8 },
+    release: struct { version: []const u8, channel: []const u8 = "" },
+    source: struct { commit: []const u8 = "", dirty: bool = false } = .{},
+    target: struct { id: []const u8 = "" } = .{},
     files: []const FileEntry,
 };
 
-const SdkManifest = struct {
+pub const SdkManifest = struct {
     name: []const u8,
     files: []const FileEntry,
 };
@@ -106,6 +128,21 @@ const InstallRecord = struct {
     schema_version: []const u8,
     version: []const u8 = "",
     state_root: []const u8 = "",
+};
+
+/// The record's `update_source`, parsed on its own: a malformed member must
+/// never make the rest of the record unreadable, or a reinstall would forget
+/// the state root it names.
+const RecordSource = struct {
+    update_source: ?release_source.Json = null,
+};
+
+/// What the installer writes.
+const RecordOut = struct {
+    schema_version: []const u8,
+    version: []const u8,
+    state_root: []const u8,
+    update_source: ?release_source.Json,
 };
 
 /// `source_root` is the unit the running executable belongs to. `arena`
@@ -170,11 +207,16 @@ pub fn run(arena: std.mem.Allocator, io: std.Io, source_root: []const u8, option
     const recorded_root = options.state_dir orelse kept_root orelse "state";
     const resolved_root = if (std.fs.path.isAbsolute(recorded_root)) recorded_root else try std.fs.path.join(arena, &.{ prefix, recorded_root });
     try util_fs.mkdirParents(resolved_root);
-    const record = try std.json.Stringify.valueAlloc(arena, .{
+    const update_source: UpdateSource = switch (options.update_source) {
+        .set => |chosen| chosen,
+        .keep => try previousUpdateSource(arena, io, prefix, log),
+    };
+    const record = try std.json.Stringify.valueAlloc(arena, RecordOut{
         .schema_version = state_root.manifest_schema,
         .version = version,
         .state_root = recorded_root,
-    }, .{ .whitespace = .indent_2 });
+        .update_source = release_source.Json.from(update_source),
+    }, .{ .whitespace = .indent_2, .emit_null_optional_fields = false });
     try cwd.createDirPath(io, try std.fs.path.join(arena, &.{ prefix, "etc", "metacodes" }));
     try cwd.writeFile(io, .{
         .sub_path = try std.fs.path.join(arena, &.{ prefix, install_manifest_rel }),
@@ -203,6 +245,11 @@ pub fn run(arena: std.mem.Allocator, io: std.Io, source_root: []const u8, option
     if (previous) |old| try removeDropped(arena, io, prefix, old, manifest, log);
     try log.print("installed metacodes {s}: {d} files verified under {s}\n", .{ version, manifest.files.len, prefix });
     try log.print("state root: {s}{s}\n", .{ resolved_root, if (kept_root != null) " (kept from the install record)" else "" });
+    switch (update_source) {
+        .default_release => try log.print("updates from: {s}\n", .{release_source.default_release_base}),
+        .mirror => |base| try log.print("updates from: {s} (a mirror)\n", .{base}),
+        .checkout => |path| try log.print("updates from: the checkout {s}\n", .{path}),
+    }
 
     var outcome: Outcome = .{
         .version = version,
@@ -211,6 +258,7 @@ pub fn run(arena: std.mem.Allocator, io: std.Io, source_root: []const u8, option
         .state_root = resolved_root,
         .files = manifest.files.len,
         .in_place = in_place,
+        .update_source = update_source,
     };
 
     if (sdk_manifest) |sdk| outcome.sdk = try installSdk(arena, io, options.sdk.?, sdk, prefix, log);
@@ -219,7 +267,8 @@ pub fn run(arena: std.mem.Allocator, io: std.Io, source_root: []const u8, option
     return outcome;
 }
 
-fn readUnitManifest(arena: std.mem.Allocator, io: std.Io, root: []const u8) !UnitManifest {
+/// The release manifest of the unit (or install) at `root`.
+pub fn readUnitManifest(arena: std.mem.Allocator, io: std.Io, root: []const u8) !UnitManifest {
     const path = try std.fs.path.join(arena, &.{ root, "manifest.json" });
     const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(4 << 20));
     const manifest = std.json.parseFromSliceLeaky(UnitManifest, arena, bytes, .{ .ignore_unknown_fields = true }) catch
@@ -266,7 +315,7 @@ fn checkPrefix(arena: std.mem.Allocator, io: std.Io, prefix: []const u8, version
 /// `candidate` precedes `installed` in semantic-version order (pre-releases
 /// before their release, build metadata ignored). Versions that do not parse
 /// have no order, and nothing is called a downgrade.
-fn isOlder(candidate: []const u8, installed: []const u8) bool {
+pub fn isOlder(candidate: []const u8, installed: []const u8) bool {
     const a = std.SemanticVersion.parse(candidate) catch return false;
     const b = std.SemanticVersion.parse(installed) catch return false;
     return a.order(b) == .lt;
@@ -294,6 +343,155 @@ fn previousStateRoot(arena: std.mem.Allocator, io: std.Io, prefix: []const u8) !
     return record.state_root;
 }
 
+/// The update source the prefix's record names (doc/UPDATE_DESIGN.md §3): the
+/// default without a record or without the member; a member that is not a
+/// valid source is dropped with a note rather than carried forward.
+fn previousUpdateSource(arena: std.mem.Allocator, io: std.Io, prefix: []const u8, log: *std.Io.Writer) !UpdateSource {
+    const record_path = try std.fs.path.join(arena, &.{ prefix, install_manifest_rel });
+    const bytes = std.Io.Dir.cwd().readFileAlloc(io, record_path, arena, .limited(64 << 10)) catch return .default_release;
+    return switch (try parseRecordSource(arena, bytes)) {
+        .valid => |source| source,
+        .invalid => {
+            try log.print("ignoring the install record's update_source, which is not a valid source\n", .{});
+            return .default_release;
+        },
+    };
+}
+
+const ParsedSource = union(enum) { valid: UpdateSource, invalid };
+
+fn parseRecordSource(arena: std.mem.Allocator, bytes: []const u8) !ParsedSource {
+    const parsed = std.json.parseFromSliceLeaky(RecordSource, arena, bytes, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
+        error.OutOfMemory => |e| return e,
+        else => return .invalid,
+    };
+    const member = parsed.update_source orelse return .{ .valid = .default_release };
+    const source = (try member.toSource(arena)) orelse return .invalid;
+    return .{ .valid = source };
+}
+
+/// An install record as `metacodes update` reads it.
+pub const Record = struct {
+    version: []const u8,
+    state_root: []const u8,
+    update_source: UpdateSource,
+    /// The record carries an `update_source` member that is not a valid one.
+    invalid_update_source: bool = false,
+};
+
+/// The record at `<prefix>/etc/metacodes/install.json`.
+pub fn readRecord(arena: std.mem.Allocator, io: std.Io, prefix: []const u8) error{ NoInstallRecord, InvalidInstallRecord, OutOfMemory }!Record {
+    const record_path = try std.fs.path.join(arena, &.{ prefix, install_manifest_rel });
+    const bytes = std.Io.Dir.cwd().readFileAlloc(io, record_path, arena, .limited(64 << 10)) catch |err| switch (err) {
+        error.FileNotFound => return error.NoInstallRecord,
+        error.OutOfMemory => |e| return e,
+        else => return error.InvalidInstallRecord,
+    };
+    const core = std.json.parseFromSliceLeaky(InstallRecord, arena, bytes, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
+        error.OutOfMemory => |e| return e,
+        else => return error.InvalidInstallRecord,
+    };
+    if (!std.mem.eql(u8, core.schema_version, state_root.manifest_schema) or core.version.len == 0)
+        return error.InvalidInstallRecord;
+    return switch (try parseRecordSource(arena, bytes)) {
+        .valid => |source| .{ .version = core.version, .state_root = core.state_root, .update_source = source },
+        .invalid => .{ .version = core.version, .state_root = core.state_root, .update_source = .default_release, .invalid_update_source = true },
+    };
+}
+
+/// An install as found, before anything changes it (doc/UPDATE_DESIGN.md §4.1
+/// step 3).
+pub const Measurement = struct {
+    record: Record,
+    /// Null when `manifest.json` is missing or unreadable, as after an
+    /// install that failed before copying it.
+    manifest: ?UnitManifest,
+    /// The SDK bundle's manifest, when `sdk/agentcore/manifest.json` exists.
+    sdk: ?SdkManifest,
+    /// The first thing that is not as the record and manifests say; null when
+    /// the install is intact: the record names the manifest's version and
+    /// every file either manifest lists is present with its digest.
+    problem: ?[]const u8,
+
+    pub fn intact(self: Measurement) bool {
+        return self.problem == null;
+    }
+
+    /// The version to compare against: for an install that is not intact the
+    /// higher of the record's and the manifest's, so a half-finished upgrade
+    /// is completed rather than undone.
+    pub fn installedVersion(self: Measurement) []const u8 {
+        const manifest = self.manifest orelse return self.record.version;
+        if (isOlder(self.record.version, manifest.release.version)) return manifest.release.version;
+        return self.record.version;
+    }
+};
+
+pub fn measure(arena: std.mem.Allocator, io: std.Io, prefix: []const u8) !Measurement {
+    const record = try readRecord(arena, io, prefix);
+    var result: Measurement = .{ .record = record, .manifest = null, .sdk = null, .problem = null };
+    result.manifest = readUnitManifest(arena, io, prefix) catch |err| switch (err) {
+        error.OutOfMemory => |e| return e,
+        else => null,
+    };
+    const sdk_root = try std.fs.path.join(arena, &.{ prefix, "sdk", "agentcore" });
+    const sdk_manifest_path = try std.fs.path.join(arena, &.{ sdk_root, "manifest.json" });
+    if (std.Io.Dir.cwd().access(io, sdk_manifest_path, .{})) |_| {
+        result.sdk = readSdkManifest(arena, io, sdk_root) catch |err| switch (err) {
+            error.OutOfMemory => |e| return e,
+            else => blk: {
+                result.problem = "sdk/agentcore/manifest.json is not an AgentCore bundle manifest";
+                break :blk null;
+            },
+        };
+    } else |_| {}
+    const manifest = result.manifest orelse {
+        result.problem = "manifest.json is missing or not a metacodes-cli schema 2 manifest";
+        return result;
+    };
+    if (!std.mem.eql(u8, manifest.release.version, record.version)) {
+        result.problem = try std.fmt.allocPrint(arena, "the record names {s} but manifest.json {s}", .{ record.version, manifest.release.version });
+        return result;
+    }
+    if (result.problem != null) return result;
+    if (try firstMismatch(arena, io, prefix, manifest.files)) |path| {
+        result.problem = try std.fmt.allocPrint(arena, "{s} is missing or does not match the manifest", .{path});
+        return result;
+    }
+    if (result.sdk) |sdk| if (try firstMismatch(arena, io, sdk_root, sdk.files)) |path| {
+        result.problem = try std.fmt.allocPrint(arena, "sdk/agentcore/{s} is missing or does not match the SDK manifest", .{path});
+    };
+    return result;
+}
+
+/// The first listed file under `root` that is absent, unreadable or not the
+/// listed digest.
+pub fn firstMismatch(arena: std.mem.Allocator, io: std.Io, root: []const u8, files: []const FileEntry) !?[]const u8 {
+    for (files) |file| {
+        checkRelative(file.path) catch return file.path;
+        const path = try std.fs.path.join(arena, &.{ root, file.path });
+        const digest = fileDigest(io, path) catch return file.path;
+        if (!std.mem.eql(u8, &digest, file.sha256)) return file.path;
+    }
+    return null;
+}
+
+/// The lowercase hex SHA-256 of a file, streamed rather than read whole.
+pub fn fileDigest(io: std.Io, path: []const u8) ![64]u8 {
+    var file = try std.Io.Dir.cwd().openFile(io, path, .{});
+    defer file.close(io);
+    var read_buffer: [64 * 1024]u8 = undefined;
+    var reader = file.reader(io, &read_buffer);
+    var hash_buffer: [64]u8 = undefined;
+    var hashing: std.Io.Writer.Hashing(std.crypto.hash.sha2.Sha256) = .init(&hash_buffer);
+    _ = reader.interface.streamRemaining(&hashing.writer) catch |err| switch (err) {
+        error.ReadFailed => return reader.err.?,
+        error.WriteFailed => unreachable, // hashing never fails to write
+    };
+    try hashing.writer.flush();
+    return std.fmt.bytesToHex(hashing.hasher.finalResult(), .lower);
+}
+
 /// Files the replaced unit listed and this one does not: a renamed or dropped
 /// asset must not linger beside the new executable. Only manifest paths, each
 /// held inside the prefix, are ever removed.
@@ -311,7 +509,8 @@ fn removeDropped(arena: std.mem.Allocator, io: std.Io, prefix: []const u8, old: 
     }
 }
 
-fn readSdkManifest(arena: std.mem.Allocator, io: std.Io, bundle: []const u8) !SdkManifest {
+/// The manifest of an unpacked AgentCore SDK bundle.
+pub fn readSdkManifest(arena: std.mem.Allocator, io: std.Io, bundle: []const u8) !SdkManifest {
     const bytes = std.Io.Dir.cwd().readFileAlloc(io, try std.fs.path.join(arena, &.{ bundle, "manifest.json" }), arena, .limited(4 << 20)) catch
         return error.InvalidSdkBundle;
     const manifest = std.json.parseFromSliceLeaky(SdkManifest, arena, bytes, .{ .ignore_unknown_fields = true }) catch
@@ -872,6 +1071,135 @@ test "a reinstall or upgrade keeps the recorded state root unless --state-dir na
     const first = try run(arena, testing.io, newer, .{ .prefix = fresh, .self_check = false }, &log.writer);
     try testing.expectEqualStrings(try std.fs.path.join(arena, &.{ fresh, "state" }), first.state_root);
     try testing.expect(std.mem.indexOf(u8, try read(arena, try fixture.path(arena, "opt/fresh/etc/metacodes/install.json")), "\"state_root\": \"state\"") != null);
+}
+
+test "the record names its update source: set, kept across reinstalls, replaced and cleared" {
+    if (is_windows) return error.SkipZigTest;
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var fixture: Fixture = .{ .tmp = undefined };
+    try fixture.init();
+    defer fixture.tmp.cleanup();
+    var log: std.Io.Writer.Allocating = .init(arena);
+    const prefix = try fixture.path(arena, "opt/mc");
+    const unit = try fixture.unit(arena, "0.3.0", &unit_files);
+
+    // A fresh install without either option: the default, and no member.
+    const fresh = try run(arena, testing.io, unit, .{ .prefix = prefix, .self_check = false }, &log.writer);
+    try testing.expect(fresh.update_source == .default_release);
+    try testing.expect(std.mem.indexOf(u8, try read(arena, try fixture.path(arena, "opt/mc/etc/metacodes/install.json")), "update_source") == null);
+    try testing.expect((try readRecord(arena, testing.io, prefix)).update_source == .default_release);
+
+    // --release-base records the mirror, and a reinstall without it keeps it.
+    const mirror = try release_source.parseBase(arena, "https://mirror.example/metacodes/releases/");
+    _ = try run(arena, testing.io, unit, .{ .prefix = prefix, .update_source = .{ .set = mirror }, .self_check = false }, &log.writer);
+    try testing.expect((try readRecord(arena, testing.io, prefix)).update_source.eql(mirror));
+    const kept = try run(arena, testing.io, unit, .{ .prefix = prefix, .self_check = false }, &log.writer);
+    try testing.expect(kept.update_source.eql(mirror));
+    try testing.expect((try readRecord(arena, testing.io, prefix)).update_source.eql(mirror));
+    // An upgrade keeps it too.
+    try fixture.tmp.dir.deleteTree(testing.io, "unit");
+    const newer = try fixture.unit(arena, "0.4.0", &unit_files);
+    _ = try run(arena, testing.io, newer, .{ .prefix = prefix, .upgrade = true, .self_check = false }, &log.writer);
+    try testing.expect((try readRecord(arena, testing.io, prefix)).update_source.eql(mirror));
+
+    // A checkout replaces it; naming the default base clears any source.
+    const checkout = try release_source.parseCheckout(arena, "/home/me/src/metacodes");
+    _ = try run(arena, testing.io, newer, .{ .prefix = prefix, .update_source = .{ .set = checkout }, .self_check = false }, &log.writer);
+    try testing.expect((try readRecord(arena, testing.io, prefix)).update_source.eql(checkout));
+    _ = try run(arena, testing.io, newer, .{ .prefix = prefix, .update_source = .{ .set = try release_source.parseBase(arena, release_source.default_release_base) }, .self_check = false }, &log.writer);
+    try testing.expect((try readRecord(arena, testing.io, prefix)).update_source == .default_release);
+    try testing.expect(std.mem.indexOf(u8, try read(arena, try fixture.path(arena, "opt/mc/etc/metacodes/install.json")), "update_source") == null);
+}
+
+test "a malformed update_source is dropped with a note and never costs the state root" {
+    if (is_windows) return error.SkipZigTest;
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var fixture: Fixture = .{ .tmp = undefined };
+    try fixture.init();
+    defer fixture.tmp.cleanup();
+    var log: std.Io.Writer.Allocating = .init(arena);
+    const prefix = try fixture.path(arena, "opt/mc");
+    const shared = try fixture.path(arena, "home/.metacodes");
+    const unit = try fixture.unit(arena, "0.3.0", &unit_files);
+    _ = try run(arena, testing.io, unit, .{ .prefix = prefix, .state_dir = shared, .self_check = false }, &log.writer);
+
+    for ([_][]const u8{
+        "\"update_source\": \"https://mirror.example/r\"",
+        "\"update_source\": {\"kind\": \"release\", \"base\": \"http://mirror.example/r\"}",
+        "\"update_source\": {\"kind\": \"checkout\", \"path\": \"relative\"}",
+    }) |member| {
+        const record = try std.fmt.allocPrint(arena, "{{\"schema_version\": \"{s}\", \"version\": \"0.3.0\", \"state_root\": \"{s}\", {s}}}\n", .{ state_root.manifest_schema, shared, member });
+        try fixture.tmp.dir.writeFile(testing.io, .{ .sub_path = "opt/mc/etc/metacodes/install.json", .data = record });
+        const read_back = try readRecord(arena, testing.io, prefix);
+        try testing.expect(read_back.invalid_update_source);
+        try testing.expectEqualStrings(shared, read_back.state_root);
+
+        log.clearRetainingCapacity();
+        const outcome = try run(arena, testing.io, unit, .{ .prefix = prefix, .self_check = false }, &log.writer);
+        try testing.expectEqualStrings(shared, outcome.state_root);
+        try testing.expect(outcome.update_source == .default_release);
+        try testing.expect(std.mem.indexOf(u8, log.written(), "ignoring the install record's update_source") != null);
+    }
+}
+
+test "measuring an install for update: intact, a missing or altered file, a half-written record, a damaged SDK" {
+    if (is_windows) return error.SkipZigTest;
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var fixture: Fixture = .{ .tmp = undefined };
+    try fixture.init();
+    defer fixture.tmp.cleanup();
+    var log: std.Io.Writer.Allocating = .init(arena);
+    const prefix = try fixture.path(arena, "opt/mc");
+    try testing.expectError(error.NoInstallRecord, measure(arena, testing.io, prefix));
+
+    const sdk_dir = try fixture.path(arena, "sdk");
+    try fixture.tmp.dir.createDirPath(testing.io, "sdk/lib");
+    try fixture.tmp.dir.writeFile(testing.io, .{ .sub_path = "sdk/lib/libagentcore.a", .data = "lib" });
+    const lib_hex = std.fmt.bytesToHex(blk: {
+        var d: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash("lib", &d, .{});
+        break :blk d;
+    }, .lower);
+    try fixture.tmp.dir.writeFile(testing.io, .{ .sub_path = "sdk/manifest.json", .data = try std.fmt.allocPrint(arena, "{{\"name\":\"agentcore\",\"files\":[{{\"path\":\"lib/libagentcore.a\",\"sha256\":\"{s}\"}}]}}", .{&lib_hex}) });
+    _ = try run(arena, testing.io, try fixture.unit(arena, "0.3.0", &unit_files), .{ .prefix = prefix, .sdk = sdk_dir, .self_check = false }, &log.writer);
+
+    const intact = try measure(arena, testing.io, prefix);
+    try testing.expect(intact.intact());
+    try testing.expectEqualStrings("0.3.0", intact.installedVersion());
+    try testing.expect(intact.sdk != null);
+
+    // An altered file.
+    try fixture.tmp.dir.writeFile(testing.io, .{ .sub_path = "opt/mc/vendor/tinykg/tinykgd", .data = "tampered" });
+    try testing.expect(std.mem.indexOf(u8, (try measure(arena, testing.io, prefix)).problem.?, "vendor/tinykg/tinykgd") != null);
+    // A missing one.
+    try fixture.tmp.dir.deleteFile(testing.io, "opt/mc/vendor/tinykg/tinykgd");
+    try testing.expect(std.mem.indexOf(u8, (try measure(arena, testing.io, prefix)).problem.?, "vendor/tinykg/tinykgd") != null);
+    _ = try run(arena, testing.io, try fixture.path(arena, "unit"), .{ .prefix = prefix, .self_check = false }, &log.writer);
+    try testing.expect((try measure(arena, testing.io, prefix)).intact());
+
+    // A damaged SDK file.
+    try fixture.tmp.dir.writeFile(testing.io, .{ .sub_path = "opt/mc/sdk/agentcore/lib/libagentcore.a", .data = "x" });
+    try testing.expect(std.mem.indexOf(u8, (try measure(arena, testing.io, prefix)).problem.?, "sdk/agentcore/lib/libagentcore.a") != null);
+    _ = try run(arena, testing.io, try fixture.path(arena, "unit"), .{ .prefix = prefix, .sdk = sdk_dir, .self_check = false }, &log.writer);
+
+    // The record already names the next version, the manifest is still the
+    // old one: not intact, and the higher version is the installed one.
+    const record = try std.fmt.allocPrint(arena, "{{\"schema_version\": \"{s}\", \"version\": \"0.4.0\", \"state_root\": \"state\"}}\n", .{state_root.manifest_schema});
+    try fixture.tmp.dir.writeFile(testing.io, .{ .sub_path = "opt/mc/etc/metacodes/install.json", .data = record });
+    const half = try measure(arena, testing.io, prefix);
+    try testing.expect(!half.intact());
+    try testing.expectEqualStrings("0.4.0", half.installedVersion());
+    // Without manifest.json at all.
+    try fixture.tmp.dir.deleteFile(testing.io, "opt/mc/manifest.json");
+    const bare = try measure(arena, testing.io, prefix);
+    try testing.expect(bare.manifest == null and !bare.intact());
+    try testing.expectEqualStrings("0.4.0", bare.installedVersion());
 }
 
 test "the doctor state_root line parses paths with spaces" {
