@@ -44,8 +44,10 @@ pub fn main(init: std.process.Init) !u8 {
             try line.appendSlice(arena, arg);
         }
         try line.append(arena, '\n');
-        var file = std.Io.Dir.cwd().openFile(init.io, log_path, .{ .mode = .write_only }) catch
-            try std.Io.Dir.cwd().createFile(init.io, log_path, .{ .truncate = false });
+        // Opened with read access as well: on Windows `stat` needs it (a
+        // write-only handle has no FILE_READ_ATTRIBUTES, and the query is
+        // refused with AccessDenied).
+        var file = try std.Io.Dir.cwd().createFile(init.io, log_path, .{ .read = true, .truncate = false });
         defer file.close(init.io);
         const end = (try file.stat(init.io)).size;
         try file.writePositionalAll(init.io, line.items, end);
