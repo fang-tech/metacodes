@@ -282,12 +282,13 @@ a change to `src/` recompiles what depends on it, and its legs take longer.
 | 2 | The resume smoke's capture server answers in full; Windows halves | 13.8 minutes |
 | 3 | Legs rebalanced from run 2's Build Summaries | 12.9 minutes |
 | 4 | Three parts, three macOS legs, a Linux `cross` leg, six Windows TTY shards | 13.1 minutes, 10.9 without the 2.2 minutes a macOS leg queued behind another PR's run |
+| 5 | Every cache line warm | 11.9 minutes |
+| 6 | Suite steps at `-j8` (`-j6` on macOS) | 10.4 minutes |
+| 7 | Evaluation suite as three captured shards, eight Windows TTY shards | 9.1 minutes |
 
-In run 4 the longest legs were Gates (macOS) / units-checks (10.6 minutes:
-the cc-test binary runs for two minutes on macOS, the integration suite's
-eight shards share three cores), Gates (Windows) / integration (9.8, its
-first run with that cache line), Gates (macOS) / product (9.4) and the
-Windows TTY shards (7.6 to 8.9). The organization's job limits bound what
-more legs can buy: a run uses about thirty jobs, so two overlapping runs
-already reach the limit of 60, and four macOS jobs leave one of the five for
-every other run.
+In run 7 the longest jobs were Windows TTY shards (5.0 to 8.8 minutes; the
+slowest holds a 78-second case and a slow debug build), Gates (Windows) /
+product (8.2), Gates (macOS) / product (7.2) and Gates (Linux) / units
+(7.1). The organization's job limits bound what more legs can buy: a run
+uses about thirty-five jobs, so two overlapping runs already reach the limit
+of 60, and four macOS jobs leave one of the five for every other run.
