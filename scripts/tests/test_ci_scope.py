@@ -342,6 +342,17 @@ class WorkflowTest(unittest.TestCase):
                 self.assertEqual(len({leg["leg"] for leg in legs}), len(legs))
                 self.assertIn("${{ matrix.leg }}", spec["name"])
 
+    def test_every_gate_job_sets_the_build_runner_jobs_its_suite_steps_pass(self) -> None:
+        # An unset ZIG_BUILD_JOBS turns `-j"$ZIG_BUILD_JOBS"` into a bare `-j`.
+        for job, _, _ in GATE_JOBS:
+            with self.subTest(job=job):
+                spec = self.jobs[job]
+                self.assertRegex(str(spec["env"].get("ZIG_BUILD_JOBS", "")), r"^[1-9][0-9]*$")
+                uses = [step for step in spec["steps"] if "ZIG_BUILD_JOBS" in step.get("run", "")]
+                self.assertTrue(uses)
+                for step in uses:
+                    self.assertTrue(all("test:" in line for line in step["run"].splitlines() if "ZIG_BUILD_JOBS" in line))
+
     def test_every_platform_runs_every_part_of_the_suite(self) -> None:
         # `zig build test` is exactly its three parts (build.zig); each
         # platform must run all three on legs it has.

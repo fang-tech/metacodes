@@ -153,6 +153,8 @@ jobs:
       # then are the checkout, the version state gate and the documentation
       # and gate-manifest checks (scripts/tests/test_ci_scope.py pins the list).
       SUITES: ${{ needs.scope.outputs.suites }}
+      # The suite steps' build runner jobs; see "Offline test suite" below.
+      ZIG_BUILD_JOBS: "8"
     steps: &gates-steps
       - name: Release fast path
         env:
@@ -370,17 +372,23 @@ jobs:
       # -Dlean-kernels=on: the suite builds both kernels from this checkout
       # and every kernel-gated test runs; a missing toolchain fails the build
       # instead of skipping them. --summary all: every step with its duration,
-      # the evidence for the next split of the legs.
+      # the evidence for the next split of the legs. -j: the build runner runs
+      # at most that many steps at once, one per core by default, and a run
+      # step holds its slot while its child mostly waits (a smoke on a loopback
+      # daemon, the evaluation suite on its subprocesses). At one per core the
+      # smokes kept the evaluation suite, or the drivers it needs, from
+      # starting for four to seven minutes; twice that many keeps the cores
+      # busy. Scheduling only: what runs is the same.
       - name: Offline test suite (units and integration)
         if: matrix.units && env.FAST_PATH != 'true' && env.SUITES != 'false'
         env:
           METACODES_TEST_REQUIRE_LEAN_SDK: "1"
-        run: zig build test:units test:integration --test-timeout 5m -Dlean-kernels=on --summary all
+        run: zig build test:units test:integration -j"$ZIG_BUILD_JOBS" --test-timeout 5m -Dlean-kernels=on --summary all
       - name: Offline test suite (product)
         if: matrix.product && env.FAST_PATH != 'true' && env.SUITES != 'false'
         env:
           METACODES_TEST_REQUIRE_LEAN_SDK: "1"
-        run: zig build test:product --test-timeout 5m -Dlean-kernels=on --summary all
+        run: zig build test:product -j"$ZIG_BUILD_JOBS" --test-timeout 5m -Dlean-kernels=on --summary all
       - name: ReleaseSafe core gate
         if: matrix.checks && runner.os == 'Linux' && env.FAST_PATH != 'true' && env.SUITES != 'false'
         run: zig build test:lib -Doptimize=ReleaseSafe
@@ -512,6 +520,9 @@ jobs:
     env:
       FAST_PATH: ${{ needs.release-fast-path.outputs.fast }}
       SUITES: ${{ needs.scope.outputs.suites }}
+      # Two per core, as on Linux, would overlap more LLVM builds than the
+      # runner's 7 GB hold (the app and the drivers peak at 1 to 2 GB each).
+      ZIG_BUILD_JOBS: "6"
     steps: *gates-steps
 
   # The Python and Node packages over the AgentCore shared library (sdk/python,
@@ -713,8 +724,11 @@ jobs:
     env:
       FAST_PATH: ${{ needs.release-fast-path.outputs.fast }}
       # 'false' only for a documentation-only change; the version state gate
-      # and the documentation checks of `gates` cover it, so nothing runs here.
+      # and the documentation checks of `gates-linux` cover it, so nothing runs
+      # here.
       SUITES: ${{ needs.scope.outputs.suites }}
+      # As in `gates-linux`.
+      ZIG_BUILD_JOBS: "8"
     steps:
       - name: Release fast path
         env:
@@ -869,15 +883,15 @@ jobs:
       - name: Offline test suite (units)
         if: matrix.units && env.FAST_PATH != 'true' && env.SUITES != 'false'
         shell: cmd
-        run: zig build test:units --test-timeout 5m -Dlean-kernels=on --summary all
+        run: zig build test:units -j%ZIG_BUILD_JOBS% --test-timeout 5m -Dlean-kernels=on --summary all
       - name: Offline test suite (integration)
         if: matrix.integration && env.FAST_PATH != 'true' && env.SUITES != 'false'
         shell: cmd
-        run: zig build test:integration --test-timeout 5m -Dlean-kernels=on --summary all
+        run: zig build test:integration -j%ZIG_BUILD_JOBS% --test-timeout 5m -Dlean-kernels=on --summary all
       - name: Offline test suite (product)
         if: matrix.product && env.FAST_PATH != 'true' && env.SUITES != 'false'
         shell: cmd
-        run: zig build test:product --test-timeout 5m -Dlean-kernels=on --summary all
+        run: zig build test:product -j%ZIG_BUILD_JOBS% --test-timeout 5m -Dlean-kernels=on --summary all
       # Evidence for the next line-ending incident: if the suite itself rewrites
       # tracked files with CRLF, this lists them; the step never fails.
       - name: Line endings after the suite

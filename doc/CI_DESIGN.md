@@ -231,6 +231,13 @@ What it costs:
 - **Cache lines.** Each gate leg keeps its own setup-zig cache
   (`cache-key: ${{ matrix.leg }}`), since each builds a different share of
   the graph. The TTY shards build the same binaries and share one.
+- **Build runner jobs.** The suite steps pass `-j$ZIG_BUILD_JOBS`: 8 on the
+  four-core Linux and Windows runners, 6 on the three-core macOS one, whose
+  7 GB cannot hold more overlapping LLVM builds. The build runner runs that
+  many steps at once, one per core by default, and a run step keeps its slot
+  while its child mostly waits. At one per core the smokes kept the
+  evaluation suite, or the two drivers it needs, from starting for four to
+  seven minutes of a product leg.
 
 The suite steps run with `--summary all`, so every run records the duration
 of each build step. When one leg becomes the long pole, its Build Summary

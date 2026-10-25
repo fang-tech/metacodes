@@ -64,7 +64,10 @@ def test_part_commands(ci):
                 break
             steps.append(word)
         if steps and all(step in TEST_PARTS for step in steps):
-            found.append((steps, words[2 + len(steps):]))
+            # -jN only schedules the build runner (each job sets its own
+            # ZIG_BUILD_JOBS); it does not change what runs.
+            options = [word for word in words[2 + len(steps):] if not word.startswith("-j")]
+            found.append((steps, options))
     return found
 
 
