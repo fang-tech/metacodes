@@ -478,6 +478,12 @@ jobs:
       - name: Python floor unit tests
         if: matrix.checks && env.FAST_PATH != 'true' && env.SUITES != 'false'
         run: python3 -m unittest scripts.tests.test_python_floor -v
+      # scripts/build_project_rule.py's own suite: no workflow ran it before
+      # test_gate_manifest.py started requiring every scripts/tests module
+      # to run somewhere.
+      - name: Project rule builder unit tests
+        if: matrix.checks && env.FAST_PATH != 'true' && env.SUITES != 'false'
+        run: python3 -m unittest scripts.tests.test_build_project_rule -v
       - name: Release cut unit tests
         if: matrix.checks && env.FAST_PATH != 'true' && env.SUITES != 'false'
         run: python3 -m unittest scripts.tests.test_release_cut -v
@@ -618,7 +624,7 @@ jobs:
   # windows:tty` passes it through. Each shard builds the debug binary itself,
   # a warm-cache build of seconds on Linux and about two minutes on Windows.
   # 30 minutes: about 16 minutes of cases on POSIX and 28 under ConPTY in
-  # all, a third or a sixth of that per shard, plus a cold debug build.
+  # all, a third or an eighth of that per shard, plus a cold debug build.
   tty-linux:
     name: TTY (Linux) / ${{ matrix.shard }} of ${{ strategy.job-total }}
     timeout-minutes: 30
@@ -686,7 +692,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2, 3, 4, 5, 6]
+        shard: [1, 2, 3, 4, 5, 6, 7, 8]
     runs-on: windows-latest
     needs: [release-fast-path, scope]
     if: ${{ !cancelled() }}

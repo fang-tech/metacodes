@@ -63,6 +63,23 @@ GATE_JOBS = (("gates-linux", "Linux", {"units", "product", "release", "cross", "
              ("gates-macos", "macOS", {"units", "product", "release", "checks"}),
              ("windows-gates", "Windows", {"units", "integration", "product", "release"}))
 TEST_PARTS = {"test:units", "test:integration", "test:product"}
+# The gate steps without a leg flag: environment setup, which runs on every
+# leg. A new step names the leg it belongs to; added here instead, it runs on
+# all twelve gate runners.
+SETUP_STEPS = {
+    "gates-linux": {
+        "Release fast path", "Change scope", CHECKOUT,
+        "mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29",
+        "Restore Lean toolchain and build products", "Install pinned elan", "Build pinned Lean kernel",
+        "Install ripgrep", "Install bubblewrap", "Install Python development dependencies",
+    },
+    "windows-gates": {
+        "Release fast path", "Change scope", CHECKOUT,
+        "mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29",
+        "Normalize line endings of the checkout", "Install Python development dependencies",
+        "Restore Lean toolchain and build products", "Install pinned elan",
+    },
+}
 
 
 def runs_on(step: dict, os_name: str) -> bool:
@@ -352,6 +369,12 @@ class WorkflowTest(unittest.TestCase):
                 self.assertTrue(uses)
                 for step in uses:
                     self.assertTrue(all("test:" in line for line in step["run"].splitlines() if "ZIG_BUILD_JOBS" in line))
+
+    def test_only_environment_setup_runs_on_every_leg(self) -> None:
+        for job, setup in SETUP_STEPS.items():
+            with self.subTest(job=job):
+                unflagged = {step_label(step) for step in self.jobs[job]["steps"] if not leg_flags(step)}
+                self.assertEqual(unflagged, setup)
 
     def test_every_platform_runs_every_part_of_the_suite(self) -> None:
         # `zig build test` is exactly its three parts (build.zig); each

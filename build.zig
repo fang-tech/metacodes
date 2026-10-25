@@ -2528,17 +2528,26 @@ pub fn build(b: *std.Build) void {
     // 默认 test 也执行，避免评估器或 native 接线漂移后继续给出看似可信的分数。
     const eval_test_step = b.step("test:eval", "Test the harness evaluation framework");
     const eval_python_exe = if (@import("builtin").os.tag == .windows) "python" else "python3";
-    const eval_test_cmd = b.addSystemCommand(&.{
-        eval_python_exe,
-        "-m",
-        "unittest",
-        "discover",
-        "-s",
-        "scripts/eval/tests",
-        "-v",
-    });
-    eval_test_step.dependOn(&eval_test_cmd.step);
-    product_test_step.dependOn(&eval_test_cmd.step);
+    // The suite runs as shards (scripts/eval/tests/run_shard.py: every N-th
+    // module), each with its output captured. As one process inheriting the
+    // terminal it ran after every smoke, since the build runner runs such
+    // commands one at a time, and it was the longest of them
+    // (doc/CI_DESIGN.md §4). Captured, the shards run beside the smokes and
+    // each other; the build runner prints a shard's output when it ends.
+    const eval_test_shards = 3;
+    var eval_test_cmds: [eval_test_shards]*std.Build.Step.Run = undefined;
+    for (&eval_test_cmds, 1..) |*slot, shard| {
+        const eval_test_cmd = b.addSystemCommand(&.{
+            eval_python_exe,
+            "scripts/eval/tests/run_shard.py",
+            b.fmt("{d}/{d}", .{ shard, eval_test_shards }),
+            "-v",
+        });
+        eval_test_cmd.expectExitCode(0);
+        eval_test_step.dependOn(&eval_test_cmd.step);
+        product_test_step.dependOn(&eval_test_cmd.step);
+        slot.* = eval_test_cmd;
+    }
     const runtime_tests_can_execute_target =
         target.result.os.tag == @import("builtin").os.tag and
         target.result.cpu.arch == @import("builtin").cpu.arch;
@@ -2548,12 +2557,14 @@ pub fn build(b: *std.Build) void {
             // a clean checkout they must wait for installation; otherwise
             // test discovery races the build and silently turns coverage into
             // machine-state-dependent skips.
-            eval_test_cmd.step.dependOn(tinykg.install_step);
-            eval_test_cmd.setEnvironmentVariable("METACODES_TEST_TINYKG_BIN", tinykg.installed_path);
-            eval_test_cmd.setEnvironmentVariable("METACODES_TEST_TINYKG_SHA256", tinykg.source_sha256);
-            if (staged_tinykgd) |daemon| {
-                eval_test_cmd.step.dependOn(daemon.install_step);
-                eval_test_cmd.setEnvironmentVariable("METACODES_TEST_TINYKGD_BIN", daemon.installed_path);
+            for (eval_test_cmds) |eval_test_cmd| {
+                eval_test_cmd.step.dependOn(tinykg.install_step);
+                eval_test_cmd.setEnvironmentVariable("METACODES_TEST_TINYKG_BIN", tinykg.installed_path);
+                eval_test_cmd.setEnvironmentVariable("METACODES_TEST_TINYKG_SHA256", tinykg.source_sha256);
+                if (staged_tinykgd) |daemon| {
+                    eval_test_cmd.step.dependOn(daemon.install_step);
+                    eval_test_cmd.setEnvironmentVariable("METACODES_TEST_TINYKGD_BIN", daemon.installed_path);
+                }
             }
             const arm_smoke = b.addSystemCommand(&.{
                 eval_python_exe,
@@ -2646,10 +2657,10 @@ pub fn build(b: *std.Build) void {
         // drives the installed product against a loopback provider; it hands
         // the evaluation metadata over inherited descriptors (pass_fds), so
         // it is POSIX-only like the memory runtime smoke.
-        if (@import("builtin").os.tag != .windows) {
+        if (@import("builtin").os.tag != .windows) for (eval_test_cmds) |eval_test_cmd| {
             eval_test_cmd.step.dependOn(b.getInstallStep());
             eval_test_cmd.setEnvironmentVariable("METACODES_NATIVE_E2E_BIN", b.getInstallPath(.bin, exe.out_filename));
-        }
+        };
         // The daemon HTTP surface end to end: the installed product's `serve`
         // and `serve --sessions 2 --uds` against a loopback mock provider
         // (paid=0, external network=0, kernel-picked ports, TinyKG autostart
@@ -2679,7 +2690,7 @@ pub fn build(b: *std.Build) void {
             .linux => if (b.findProgram(&.{"bwrap"}, &.{})) |_| true else |_| false,
             else => true,
         };
-        if (rule_sandbox_available) if (staged_lean_kernels.project != null) {
+        if (rule_sandbox_available) if (staged_lean_kernels.project != null) for (eval_test_cmds) |eval_test_cmd| {
             wireLeanKernelTestInputs(eval_test_cmd, staged_lean_kernels);
             // The installed layout, not the cached artifact: the runner
             // resolves rg and the kernels beside the executable.

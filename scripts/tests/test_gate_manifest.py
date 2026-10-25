@@ -71,7 +71,34 @@ def test_part_commands(ci):
     return found
 
 
+# The repository's script suites that no PR run executes, each with where it
+# does run. A new suite under scripts/tests/ runs from ci.yml or from
+# build.zig's `test` graph, or is listed here with a reason.
+SCRIPT_SUITES_RUN_ELSEWHERE = {
+    # Builds two complete artifacts per test; rule-control.yml (dispatch only)
+    # runs it as the evidence of the artifact-reproducibility rule.
+    "test_artifact_reproducibility": ".github/workflows/rule-control.yml",
+}
+
+
 class GateManifestTest(unittest.TestCase):
+    def test_every_script_suite_runs_on_every_pull_request(self):
+        """A suite nothing runs passes forever. Every scripts/tests module is
+        named by a ci.yml step or a build.zig command (the `test` graph runs on
+        every pull request), unless it is listed above."""
+        workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+        build = (ROOT / "build.zig").read_text(encoding="utf-8")
+        for path in sorted((ROOT / "scripts" / "tests").glob("test_*.py")):
+            module = "scripts.tests." + path.stem
+            with self.subTest(suite=path.stem):
+                named = re.search(re.escape(module) + r"\b", workflow) or ('"%s"' % module) in build
+                if path.stem in SCRIPT_SUITES_RUN_ELSEWHERE:
+                    self.assertFalse(named, "%s runs on pull requests now; drop its exemption" % path.stem)
+                    self.assertIn(module, (ROOT / SCRIPT_SUITES_RUN_ELSEWHERE[path.stem]).read_text(encoding="utf-8")
+                                  + (ROOT / "control-plane" / "rules.json").read_text(encoding="utf-8"))
+                else:
+                    self.assertTrue(named, "%s runs in no pull request run: add a ci.yml step or a build.zig command" % module)
+
     def test_checklist_commands_are_present_in_ci(self):
         ci = [normalized_words(command) for command in ci_commands()]
         parts = test_part_commands(ci)
