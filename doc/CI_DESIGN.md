@@ -236,3 +236,26 @@ The suite steps run with `--summary all`, so every run records the duration
 of each build step. When one leg becomes the long pole, its Build Summary
 says which steps to move: between the parts in `build.zig`, or between the
 flags in `ci.yml`.
+
+### Measured
+
+The runs of the change that introduced the legs (#353). It touched no file
+under `src/`, so from the second run on most compilations were cache hits;
+a change to `src/` recompiles what depends on it, and its legs take longer.
+
+| Run | Layout | Wall time |
+|---|---|---|
+| Before | One gate job per platform, one TTY job per platform | About 31 minutes (the 30 runs before) |
+| 1 | First split, every cache cold | 20.4 minutes |
+| 2 | The resume smoke's capture server answers in full; Windows halves | 13.8 minutes |
+| 3 | Legs rebalanced from run 2's Build Summaries | 12.9 minutes |
+| 4 | Three parts, three macOS legs, a Linux `cross` leg, six Windows TTY shards | 13.1 minutes, 10.9 without the 2.2 minutes a macOS leg queued behind another PR's run |
+
+In run 4 the longest legs were Gates (macOS) / units-checks (10.6 minutes:
+the cc-test binary runs for two minutes on macOS, the integration suite's
+eight shards share three cores), Gates (Windows) / integration (9.8, its
+first run with that cache line), Gates (macOS) / product (9.4) and the
+Windows TTY shards (7.6 to 8.9). The organization's job limits bound what
+more legs can buy: a run uses about thirty jobs, so two overlapping runs
+already reach the limit of 60, and four macOS jobs leave one of the five for
+every other run.
