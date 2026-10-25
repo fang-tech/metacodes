@@ -19,6 +19,7 @@ const liveness_reader = @import("api/liveness_reader.zig");
 const sync = @import("platform").sync;
 const rng = @import("platform").rng;
 const connection_gate = @import("api/connection_gate.zig");
+const models_pages = @import("api/models_pages.zig");
 const dialect_mod = @import("api/dialect.zig");
 const auth_header_mod = @import("api/auth_header.zig");
 
@@ -1167,6 +1168,48 @@ pub fn getModelsList(
     const url = try std.fmt.allocPrint(allocator, "{s}/v1/models", .{base});
     defer allocator.free(url);
 
+    // Every page of the list (`has_more` + `last_id`): a gateway may serve a
+    // key's models over several, and the first alone drops the rest. A
+    // single page comes back byte for byte; a continuation that fails keeps
+    // the pages already read.
+    const first = try getModelsPage(allocator, http_client, url, auth, status);
+    var pages: std.ArrayList([]u8) = .empty;
+    defer {
+        for (pages.items) |page| allocator.free(page);
+        pages.deinit(allocator);
+    }
+    pages.append(allocator, first) catch {
+        allocator.free(first);
+        return error.OutOfMemory;
+    };
+    while (pages.items.len < models_pages.MAX_PAGES) {
+        const cursor = (try models_pages.nextCursor(allocator, pages.items[pages.items.len - 1])) orelse break;
+        defer allocator.free(cursor);
+        const next_url = try models_pages.continuationUrl(allocator, url, cursor);
+        defer allocator.free(next_url);
+        var page_status: u16 = 0;
+        const page = getModelsPage(allocator, http_client, next_url, auth, &page_status) catch break;
+        pages.append(allocator, page) catch {
+            allocator.free(page);
+            return error.OutOfMemory;
+        };
+    }
+    if (pages.items.len == 1) {
+        const only = pages.items[0];
+        pages.clearRetainingCapacity();
+        return only;
+    }
+    return models_pages.merge(allocator, pages.items);
+}
+
+/// One GET of a `/v1/models` page at `url`.
+fn getModelsPage(
+    allocator: std.mem.Allocator,
+    http_client: *http.Client,
+    url: []const u8,
+    auth: http.Header,
+    status: *u16,
+) ![]u8 {
     const uri = std.Uri.parse(url) catch return error.InvalidUrl;
 
     var connection_lease = connection_gate.acquire(null) catch return error.RequestFailed;

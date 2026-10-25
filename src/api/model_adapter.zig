@@ -124,6 +124,13 @@ pub const ModelProfile = struct {
     /// 不能关 thinking(Kimi K3 总是开;Gemini 3.x 系列不能关)。
     /// 若 effort=null 或 .none/.minimal,dialect 仍要发"最低档"而非不发。
     cannot_disable_thinking: bool = false,
+    /// The model validates the thought signature of each step's first
+    /// function call in the current turn (Gemini 3 and later); a call sent
+    /// back without one fails the request.
+    requires_thought_signatures: bool = false,
+    /// The model takes only low / high / max as its effort (GLM 5.3 and later,
+    /// on any wire); a neutral level is sent as the nearest of those.
+    glm53_effort_vocabulary: bool = false,
     /// 支持原生图像输入(vision)。序列化守门的单一真相:false 的 (kind, model) 在
     /// 请求含 image block 时必须报显式能力错误(error.ImageInputUnsupported),
     /// 绝不静默丢图/OCR/文本占位。保守默认 false;仅对已验证 vision 家族开 true。
@@ -171,6 +178,9 @@ fn anthropicProfile(model: []const u8) ModelProfile {
     if (hasSubstr(model, "claude-opus-4") or hasSubstr(model, "claude-sonnet-4") or hasSubstr(model, "claude-haiku-4")) {
         p.preserved_thinking_default = false; // 保留(对齐 Claude Opus 4.5+)
     }
+    // GLM 5.3+ behind an Anthropic-wire endpoint (Z.AI's default channel, the
+    // Metask gateway) still takes only its own three levels.
+    p.glm53_effort_vocabulary = glmAlwaysThinks(model);
     return p;
 }
 
@@ -362,7 +372,8 @@ fn geminiProfile(model: []const u8) ModelProfile {
     // Gemini 3.x 系列(3.1 Pro / 3.1 Flash-Lite / 3 Flash)不能关 thinking:
     // 默认就是 low,effort=null/none/minimal 应映射为 low(不是不发)。
     // 来源:ai.google.dev/gemini-api/docs/openai(2026-08 KnowForge 调研)。
-    const is_gemini3_family = hasSubstr(model, "gemini-3");
+    // Gemini 3 and every later generation (gemini-4-argon, ...).
+    const is_gemini3_family = if (familyVersion(model, "gemini-")) |v| v.major >= 3 else false;
     return .{
         .thinking_mode = .gemini_level,
         .supports_image_input = true, // Gemini 全系原生多模态(inline_data parts)
@@ -374,6 +385,7 @@ fn geminiProfile(model: []const u8) ModelProfile {
         .effort_levels = .none_, // Gemini 用 thinking_level(minimal/low/medium/high),非 effort
         .returns_reasoning_content = false, // Gemini 用 thought_summary + signature,非平级字段
         .cannot_disable_thinking = is_gemini3_family,
+        .requires_thought_signatures = is_gemini3_family,
     };
 }
 
@@ -383,7 +395,7 @@ pub fn kimiEffortMap(effort: @import("../types.zig").ReasoningEffort) ?[]const u
         .none, .minimal => null, // 跳过
         .low => "low",
         .medium, .high => "high",
-        .xhigh => "max",
+        .xhigh, .max => "max",
     };
 }
 
@@ -394,7 +406,7 @@ pub fn kimiK3EffortMap(effort: @import("../types.zig").ReasoningEffort) []const 
         .none, .minimal => "max", // K3 不能关,降级到默认 max
         .low => "low",
         .medium, .high => "high",
-        .xhigh => "max",
+        .xhigh, .max => "max",
     };
 }
 
@@ -405,7 +417,7 @@ pub fn deepseekEffortMap(effort: @import("../types.zig").ReasoningEffort) ?[]con
     return switch (effort) {
         .none, .minimal => null, // 跳过
         .low, .medium, .high => "high",
-        .xhigh => "max",
+        .xhigh, .max => "max",
     };
 }
 
@@ -418,8 +430,78 @@ pub fn minimaxM3ThinkingType(effort: ?@import("../types.zig").ReasoningEffort) [
     return switch (e) {
         .none => "disabled",
         .minimal, .low => "adaptive",
-        .medium, .high, .xhigh => "enabled",
+        .medium, .high, .xhigh, .max => "enabled",
     };
+}
+
+pub const FamilyVersion = struct { major: u32, minor: u32 };
+
+/// The `<major>[.<minor>]` right after `prefix` in `model` (case-insensitive):
+/// `glm-5.3-flash` → 5.3 for "glm-", `gemini-4-argon` → 4.0 for "gemini-".
+/// Null when the prefix is absent or no digit follows it.
+pub fn familyVersion(model: []const u8, prefix: []const u8) ?FamilyVersion {
+    if (model.len < prefix.len) return null;
+    var at: usize = 0;
+    while (at + prefix.len <= model.len) : (at += 1) {
+        if (!std.ascii.eqlIgnoreCase(model[at .. at + prefix.len], prefix)) continue;
+        var i = at + prefix.len;
+        const major = readNumber(model, &i) orelse continue;
+        var minor: u32 = 0;
+        if (i + 1 < model.len and model[i] == '.' and std.ascii.isDigit(model[i + 1])) {
+            i += 1;
+            minor = readNumber(model, &i) orelse 0;
+        }
+        return .{ .major = major, .minor = minor };
+    }
+    return null;
+}
+
+fn readNumber(text: []const u8, index: *usize) ?u32 {
+    const start = index.*;
+    var value: u32 = 0;
+    while (index.* < text.len and std.ascii.isDigit(text[index.*])) : (index.* += 1) {
+        value = std.math.mul(u32, value, 10) catch return null;
+        value = std.math.add(u32, value, text[index.*] - '0') catch return null;
+    }
+    return if (index.* == start) null else value;
+}
+
+/// GLM 5.3 and later think on every request: `thinking.type` must be
+/// `enabled` (disabled fails the request) and `reasoning_effort` is one of
+/// low / high / max (docs.z.ai guides/llm/glm-5.3, 2026-10).
+pub fn glmAlwaysThinks(model: []const u8) bool {
+    const v = familyVersion(model, "glm-") orelse return false;
+    return v.major > 5 or (v.major == 5 and v.minor >= 3);
+}
+
+/// The GLM 5.3 effort vocabulary for a neutral level.
+pub fn glm53EffortName(effort: @import("../types.zig").ReasoningEffort) []const u8 {
+    return switch (effort) {
+        .none, .minimal, .low => "low",
+        .medium, .high => "high",
+        .xhigh, .max => "max",
+    };
+}
+
+test "familyVersion reads the generation after a family prefix" {
+    try std.testing.expectEqual(FamilyVersion{ .major = 5, .minor = 3 }, familyVersion("glm-5.3-flash", "glm-").?);
+    try std.testing.expectEqual(FamilyVersion{ .major = 5, .minor = 0 }, familyVersion("GLM-5", "glm-").?);
+    try std.testing.expectEqual(FamilyVersion{ .major = 4, .minor = 0 }, familyVersion("gemini-4-argon", "gemini-").?);
+    try std.testing.expectEqual(FamilyVersion{ .major = 3, .minor = 8 }, familyVersion("models/gemini-3.8-flash", "gemini-").?);
+    try std.testing.expect(familyVersion("gemini-pro", "gemini-") == null);
+    try std.testing.expect(familyVersion("claude-opus", "glm-") == null);
+}
+
+test "GLM 5.3 and later always think; earlier GLM may switch it off" {
+    try std.testing.expect(glmAlwaysThinks("glm-5.3"));
+    try std.testing.expect(glmAlwaysThinks("glm-5.3-flash[1m]"));
+    try std.testing.expect(glmAlwaysThinks("glm-6"));
+    try std.testing.expect(!glmAlwaysThinks("glm-5.2"));
+    try std.testing.expect(!glmAlwaysThinks("glm-4.6"));
+    try std.testing.expectEqualStrings("low", glm53EffortName(.none));
+    try std.testing.expectEqualStrings("high", glm53EffortName(.medium));
+    try std.testing.expectEqualStrings("max", glm53EffortName(.xhigh));
+    try std.testing.expectEqualStrings("max", glm53EffortName(.max));
 }
 
 pub fn hasSubstr(haystack: []const u8, needle: []const u8) bool {

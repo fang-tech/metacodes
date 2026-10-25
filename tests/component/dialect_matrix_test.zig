@@ -306,15 +306,15 @@ test "无副作用: gemini 2.5 reasoning_effort=null 不发 generation_config(�
     try std.testing.expect(std.mem.indexOf(u8, body, "thinking_level") == null);
 }
 
-test "无副作用: gemini 3.1 Pro reasoning_effort=null 仍发 thinking_level low(不能关)" {
+test "无副作用: gemini 3.1 Pro reasoning_effort=null 不发 thinking_level(用模型默认)" {
     const a = std.testing.allocator;
     const msgs = [_]types.ApiMessage{
         .{ .role = .user, .content = &[_]types.ApiContent{.{ .text = "hi" }} },
     };
     const body = try gemini.serializeGeminiRequest(a, &msgs, "sys", null, null, "gemini-3.1-pro", null, null);
     defer a.free(body);
-    // 3.x 不能关,effort=null 仍发 thinking_level=low
-    try std.testing.expect(std.mem.indexOf(u8, body, "\"thinking_level\":\"low\"") != null);
+    // An unset level leaves the model's default (high on 3.1 Pro), not `low`.
+    try std.testing.expect(std.mem.indexOf(u8, body, "thinking_level") == null);
 }
 
 // ── 原则 3:dialectFor + profileFor 一致性(同 model 选同 dialect)──────────────────

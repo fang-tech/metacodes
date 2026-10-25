@@ -20,9 +20,7 @@
 //! checks run before a request URL is constructed.
 //!
 //! Model metadata is conservative on purpose: only limits the vendor documents
-//! are declared. `glm-4.5-air` intentionally ships with unknown limits so the
-//! fail-closed admission path is exercised by a real built-in profile rather
-//! than only by a fixture.
+//! are declared.
 //!
 //! Every quote here stays `unknown`, and that is the correct value rather than
 //! a gap. The Coding Plan is a **subscription**: the user pays a plan fee, and
@@ -36,6 +34,7 @@ const std = @import("std");
 const ids = @import("../ids.zig");
 const offer = @import("../offer.zig");
 const profile = @import("../profile.zig");
+const controls = @import("../controls.zig");
 
 const Slug = ids.Slug;
 
@@ -56,39 +55,48 @@ const CODING_CAPABILITIES = (offer.CapabilityMatrix{
     // GLM returns a peer `reasoning_content` field rather than a thinking block.
     .with(.reasoning_content, .supported);
 
+/// GLM-5.3 always reasons; `reasoning_effort` picks how much (default
+/// `max`). Disabling thinking fails the request (docs.z.ai guides/llm/glm-5.3,
+/// 2026-10), so there is no "off" here.
+const GLM53_EFFORTS = [_][]const u8{ "low", "high", "max" };
+
+const GLM53_CONTROLS = [_]controls.ControlSpec{.{
+    .id = "reasoning_effort",
+    .label = "Reasoning effort",
+    .kind = .enumeration,
+    .allowed_values = &GLM53_EFFORTS,
+}};
+
+/// 1M-token window, 128K output (docs.z.ai guides/llm/glm-5.3 and
+/// guides/vlm/glm-5.3-flash). Declared as the round numbers the vendor
+/// states, so a request never asks for more than it documents.
+const GLM53_LIMITS = offer.EffectiveLimits{
+    .context_window = 1_000_000,
+    .max_output_tokens = 128_000,
+    .token_counting = .{ .mode = .provider_reported, .unit = .tokens },
+    .provenance = offer.Provenance.known(.builtin_profile, null),
+};
+
+/// The models the Coding Plan serves (docs.z.ai devpack/overview, 2026-10):
+/// GLM-5.3, the flagship, and GLM-5.3-Flash, its multimodal sibling. Older
+/// ids are re-routed by the plan itself (GLM-5.2/5.1 to 5.3, GLM-4.7 to
+/// 5.3-Flash), and `--model` still sends any id the user names.
 const MODELS = [_]profile.ModelEntry{
     .{
-        .request_model_id = "glm-4.6",
-        .display_name = "GLM-4.6",
-        .canonical_model_id = "zai/glm-4.6",
-        .limits = .{
-            .context_window = 200_000,
-            .max_output_tokens = 128_000,
-            .token_counting = .{ .mode = .provider_reported, .unit = .tokens },
-            .provenance = offer.Provenance.known(.builtin_profile, null),
-        },
+        .request_model_id = "glm-5.3",
+        .display_name = "GLM-5.3",
+        .canonical_model_id = "zai/glm-5.3",
+        .limits = GLM53_LIMITS,
         .capabilities = CODING_CAPABILITIES,
+        .controls = &GLM53_CONTROLS,
     },
     .{
-        .request_model_id = "glm-4.5",
-        .display_name = "GLM-4.5",
-        .canonical_model_id = "zai/glm-4.5",
-        .limits = .{
-            .context_window = 128_000,
-            .max_output_tokens = 96_000,
-            .token_counting = .{ .mode = .provider_reported, .unit = .tokens },
-            .provenance = offer.Provenance.known(.builtin_profile, null),
-        },
-        .capabilities = CODING_CAPABILITIES,
-    },
-    .{
-        // Limits are deliberately unknown: the profile does not guess, and
-        // admission fails closed until a catalog refresh or user config
-        // supplies them.
-        .request_model_id = "glm-4.5-air",
-        .display_name = "GLM-4.5-Air",
-        .canonical_model_id = "zai/glm-4.5-air",
-        .capabilities = CODING_CAPABILITIES,
+        .request_model_id = "glm-5.3-flash",
+        .display_name = "GLM-5.3-Flash",
+        .canonical_model_id = "zai/glm-5.3-flash",
+        .limits = GLM53_LIMITS,
+        .capabilities = CODING_CAPABILITIES.with(.vision, .supported),
+        .controls = &GLM53_CONTROLS,
     },
 };
 
@@ -322,14 +330,18 @@ test "error classification bounds retries to genuine capacity pressure" {
     try std.testing.expect(classifyError(503, "").isRetryableTransport());
 }
 
-test "unknown model limits stay unknown and fail admission closed" {
-    var air: ?profile.ModelEntry = null;
+test "every Coding Plan model declares its limits and its reasoning levels" {
     for (MODELS) |entry| {
-        if (std.mem.eql(u8, entry.request_model_id, "glm-4.5-air")) air = entry;
+        try std.testing.expectEqual(@as(?u32, 1_000_000), entry.limits.context_window);
+        try std.testing.expectEqual(@as(?u32, 128_000), entry.limits.max_output_tokens);
+        try std.testing.expect(entry.limits.admit(.{ .input_tokens = 10, .requested_output_tokens = 10 }, .{}).isAdmitted());
+        const spec = controls.findSpec(entry.controls, "reasoning_effort").?;
+        try std.testing.expectEqual(@as(usize, 3), spec.allowed_values.len);
+        for (spec.allowed_values) |value| try std.testing.expect(@import("../../types.zig").ReasoningEffort.parse(value) != null);
     }
-    const entry = air.?;
-    try std.testing.expectEqual(@as(?u32, null), entry.limits.context_window);
-    const decision = entry.limits.admit(.{ .input_tokens = 10, .requested_output_tokens = 10 }, .{});
+    // Unknown limits would still fail closed; nothing here relies on that.
+    const unknown = offer.EffectiveLimits{};
+    const decision = unknown.admit(.{ .input_tokens = 10, .requested_output_tokens = 10 }, .{});
     try std.testing.expect(!decision.isAdmitted());
     try std.testing.expectEqual(offer.RejectionReason.unknown_limit_fail_closed, decision.rejected.reason);
 }

@@ -10,6 +10,24 @@ status, compatibility boundaries, and entry points are defined by
 
 ## Unreleased
 
+### Changed
+
+- **The built-in OpenAI, Gemini and GLM Coding Plan models are the current
+  frontier ones, with their documented limits and reasoning levels.**
+  - OpenAI: `gpt-6-astra`, `gpt-6.1-sol` and `gpt-6-luna` (1,050,000-token
+    window, 922,000 input, 128,000 output), offered on the Responses wire only
+    because tool calls need it on these models; reasoning effort low / medium /
+    high / xhigh / max. gpt-4o, gpt-4o-mini and o3 are deprecated and o3-mini
+    was shut down on 2026-10-23.
+  - Gemini: `gemini-4-argon` and `gemini-3.8-flash` (1,048,576-token window,
+    65,536 output); thinking level low / medium / high.
+  - GLM Coding Plan: `glm-5.3` and `glm-5.3-flash` (1M window, 128K output);
+    reasoning effort low / high / max. GLM-4.6 / 4.5 / 4.5-Air are gone from
+    the list; `glm-4.5-air` had no limits at all, so picking it failed
+    admission.
+
+  `--model` still sends any model id to these providers.
+
 ### Fixed
 
 - **A request carrying a key no longer follows a redirect.** Zig's HTTP
@@ -27,6 +45,62 @@ status, compatibility boundaries, and entry points are defined by
   with `HttpRedirectLocationOversize`; MCP reports `McpRedirected` instead of
   "the server answered with an HTTP 5xx error". A public catalog still
   follows redirects.
+- **Every model of a long list can be picked.** The `/model` picker built at
+  most 256 rows per step, so a gateway listing 300 models showed `[1/256]` and
+  the last 44 could be reached only by typing their names; the `/models` menu
+  let the selection reach only the first 8 API keys or models it listed. Both
+  lists now hold every entry, scroll with the selection, and take PgUp/PgDn
+  and Home/End (↑ from the first row still wraps to the last); a list longer
+  than its window says `[n/m] · PgUp/PgDn page · Home/End` under it.
+- **A paginated `/v1/models` is read to its end.** The list is Anthropic-shaped
+  (`has_more`, `last_id`), and the session's probe, its background refresh and
+  the Metask session login's catalog fetch kept only the first page. They now
+  follow `after_id` until the gateway says there is no more (at most 50 pages
+  of 1000), so every model a key may use reaches `/model` and `/models`. A
+  single-page list is read exactly as before.
+- **`--provider zai-coding-plan --model <listed model>` starts.** Z.AI declares
+  every model on four channels, so naming one stopped the start with "model
+  matches several routes" while an unlisted model or a bare `--provider`
+  already took the declared default channel. A listed model now takes the
+  default channel too; only a choice the default channel cannot settle (two
+  wires there) is still reported. A `--base-url` without `--channel` no longer
+  fails for every Z.AI URL: it goes to the channel whose routes accept it (the
+  default channel when it does), instead of being checked against all four.
+- **Reasoning effort reaches each route in its own words.** `max` is a level
+  of its own above `xhigh` (OpenAI's GPT-6 models take both; `--effort max`
+  and stored `max` values used to become `xhigh`); routes whose top level is
+  called max (GLM, Kimi, DeepSeek, Anthropic) send both as `max`. The OpenAI
+  Responses wire sends `xhigh` and `max` by name instead of capping them at
+  `high`. GLM-5.3 and later always get `thinking: enabled` with a low / high /
+  max effort: `none` used to send `thinking: disabled`, which GLM-5.3 refuses.
+  On the Anthropic wire (Z.AI's default channel, the Metask gateway) GLM-5.3
+  gets the same low / high / max words instead of Anthropic's `medium`.
+  Gemini 4 (`gemini-4-argon`) is treated as the Gemini 3 family it extends:
+  its thinking cannot be switched off.
+- **A reasoning level chosen in `/model` is the one the next request
+  carries.** The picker's options step had no key that applied a route (Enter
+  cycled the value), so a route declaring a control could not be picked at
+  all, and a level committed through the kernel never reached the client.
+  ←/→ now change a value, Enter applies the route with the values shown, and
+  the chosen `reasoning_effort` becomes the session's level. A route that
+  offers the level the session already runs with starts with it selected; a
+  commit that carries no level keeps the session's, as `/model use` does.
+- **`/model use <name>` means the provider the session is on.** A name several
+  providers list (glm-5.3-flash is on the Metask gateway and on Z.AI's four
+  channels) was reported as ambiguous; it now switches to the current
+  provider's route when that provider has exactly one, then the current
+  channel's. A name only other providers list on several routes is still
+  reported with its offer ids.
+- **Gemini 3 and later can call tools past the first step of a turn.** These
+  models reject a request whose current turn returns a model function call
+  without the `thoughtSignature` it arrived with (400), and the client dropped
+  every signature, so the second request of any turn that used a tool failed.
+  Signatures are now kept by the call ids the client mints and sent back on
+  the part they came on; a step's first call the client never received
+  (history from another model, a resumed session) carries the documented
+  placeholder. An unchosen thinking level is no longer sent as `low` to
+  Gemini 3 and later: their default (medium on Gemini 4 Argon and 3.8 Flash)
+  applies.
 
 ## 0.7.0 — 2026-10-24
 

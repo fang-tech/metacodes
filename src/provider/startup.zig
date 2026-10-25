@@ -206,6 +206,16 @@ pub fn resolve(
     var overrides: [1]registry_mod.EndpointOverride = undefined;
     var override_slice: []const registry_mod.EndpointOverride = &.{};
     if (request.base_url) |url| {
+        // With no channel named, the override belongs to one channel: the one
+        // whose routes can serve it. Applied to every channel, a URL that fits
+        // one wire failed the whole catalog on another wire's path rule (Z.AI's
+        // `.../api/anthropic` refused for lacking the OpenAI wire's `/coding/`).
+        if (channel_filter == null and profile.channels.len > 1) {
+            channel_filter = switch (overrideChannel(profile, url)) {
+                .channel => |id| id,
+                .rejected => |err| return .{ .failure = .{ .endpoint_rejected = err } },
+            };
+        }
         overrides[0] = .{
             .provider_id = profile.id,
             .channel_id = channel_filter,
@@ -261,7 +271,16 @@ pub fn resolve(
             if (only == null) only = candidate;
         }
         if (matches == 1) return ownOrFail(allocator, profile, only.?, false);
-        if (matches > 1) return .{ .failure = .{ .ambiguous_model = ambiguity } };
+        if (matches > 1) {
+            // A listed model on several channels takes the profile's declared
+            // default channel: the rule a bare `--provider` and an unlisted
+            // model already follow. Only a choice the default channel cannot
+            // settle (two wires there) is still reported instead of guessed.
+            if (channel_filter == null) {
+                if (onDefaultChannel(&catalog, profile, model)) |chosen| return ownOrFail(allocator, profile, chosen, false);
+            }
+            return .{ .failure = .{ .ambiguous_model = ambiguity } };
+        }
         // Unlisted model: keep the user's exact string on a declared channel.
         const base = try defaultOffer(&catalog, profile, channel_filter) orelse
             return .{ .failure = .no_route };
@@ -349,6 +368,62 @@ fn ownOrFail(
         },
     };
     return .{ .route = route };
+}
+
+/// The one offer for `model` on the profile's default channel, or null when
+/// that channel has none or several (a wire choice).
+fn onDefaultChannel(
+    catalog: *const registry_mod.OfferCatalog,
+    profile: *const profile_mod.ProviderProfile,
+    model: []const u8,
+) ?*const offer_mod.ModelOffer {
+    const default = profile.defaultChannel() orelse return null;
+    var found: ?*const offer_mod.ModelOffer = null;
+    for (catalog.items()) |*candidate| {
+        if (!candidate.channel_id.eql(default.id)) continue;
+        if (!registry_mod.matchesSelector(candidate.*, model)) continue;
+        if (found != null) return null;
+        found = candidate;
+    }
+    return found;
+}
+
+const OverrideFit = union(enum) {
+    channel: Slug,
+    rejected: profile_mod.EndpointError,
+};
+
+/// The channel an unscoped `--base-url` belongs to: the default channel when
+/// every one of its routes accepts the URL, else the first channel (in
+/// declaration order) whose routes all do. When none does, the default
+/// channel's own refusal, which names the rule the URL broke.
+fn overrideChannel(profile: *const profile_mod.ProviderProfile, url: []const u8) OverrideFit {
+    const default = profile.defaultChannel();
+    var first_fit: ?Slug = null;
+    var refusal: ?profile_mod.EndpointError = null;
+    for (profile.channels) |channel| {
+        const is_default = if (default) |d| d.id.eql(channel.id) else false;
+        if (overrideRefusal(profile, channel, url)) |err| {
+            if (is_default or refusal == null) refusal = err;
+            continue;
+        }
+        if (is_default) return .{ .channel = channel.id };
+        if (first_fit == null) first_fit = channel.id;
+    }
+    if (first_fit) |id| return .{ .channel = id };
+    return .{ .rejected = refusal orelse error.MissingRequiredEndpointPath };
+}
+
+fn overrideRefusal(
+    profile: *const profile_mod.ProviderProfile,
+    channel: profile_mod.ChannelDescriptor,
+    url: []const u8,
+) ?profile_mod.EndpointError {
+    for (channel.routes) |route| {
+        var buffer: [1024]u8 = undefined;
+        _ = channel.endpointFor(profile.endpoint_policy, route.protocol, url, &buffer) catch |err| return err;
+    }
+    return null;
 }
 
 fn defaultOffer(
@@ -453,7 +528,7 @@ test "a channel plus model pins one route across protocols" {
     const outcome = try resolve(a, &registry, .{
         .provider = "zai",
         .channel = "global-openai",
-        .model = "glm-4.6",
+        .model = "glm-5.3",
     });
     var route = outcome.route;
     defer route.deinit();
@@ -463,20 +538,87 @@ test "a channel plus model pins one route across protocols" {
         "https://api.z.ai/api/coding/paas/v4/chat/completions",
         route.endpoint_url,
     );
-    try std.testing.expectEqualStrings("glm-4.6", route.request_model_id);
+    try std.testing.expectEqualStrings("glm-5.3", route.request_model_id);
 }
 
-test "an ambiguous model reports the candidate routes instead of guessing" {
+test "a listed model on several channels resolves on the profile's default channel" {
+    // Z.AI declares every model on four channels. Naming one used to stop the
+    // start with "model matches several routes", while an unlisted model or a
+    // bare --provider already took the declared default channel.
     const a = std.testing.allocator;
     var registry = try ProviderRegistry.initWithBuiltins(a);
     defer registry.deinit();
-    const outcome = try resolve(a, &registry, .{ .provider = "zai", .model = "glm-4.6" });
+    const outcome = try resolve(a, &registry, .{ .provider = "zai", .model = "glm-5.3" });
+    var route = outcome.route;
+    defer route.deinit();
+    try std.testing.expectEqualStrings("cn-anthropic", route.channel_id.slice());
+    try std.testing.expectEqualStrings("https://open.bigmodel.cn/api/anthropic/v1/messages", route.endpoint_url);
+    try std.testing.expectEqualStrings("glm-5.3", route.request_model_id);
+}
+
+test "a model with two wires on the default channel is still reported, not guessed" {
+    const a = std.testing.allocator;
+    var registry = ProviderRegistry.init(a);
+    defer registry.deinit();
+    const models = [_]profile_mod.ModelEntry{.{ .request_model_id = "dual", .display_name = "Dual" }};
+    const routes = [_]profile_mod.ProtocolRoute{ .{ .protocol = .openai_chat }, .{ .protocol = .openai_responses } };
+    const channels = [_]profile_mod.ChannelDescriptor{.{
+        .id = Slug.lit("default"),
+        .display_name = "Two wires",
+        .base_url = "https://two-wires.example/v1",
+        .routes = &routes,
+    }};
+    try registry.register(.{
+        .id = Slug.lit("two-wires"),
+        .implementation_id = Slug.lit("two-wires"),
+        .display_name = "Two wires",
+        .channels = &channels,
+        .models = &models,
+        .accepted_credential_kinds = &.{.api_key},
+        .auth = .bearer,
+        .default_channel = Slug.lit("default"),
+    });
+    const outcome = try resolve(a, &registry, .{ .provider = "two-wires", .model = "dual" });
     try std.testing.expect(outcome == .failure);
-    try std.testing.expectEqual(@as(u16, 4), outcome.failure.ambiguous_model.match_count);
+    try std.testing.expectEqual(@as(u16, 2), outcome.failure.ambiguous_model.match_count);
     const text = try outcome.failure.message(a);
     defer a.free(text);
     try std.testing.expect(std.mem.indexOf(u8, text, "--channel") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "cn-anthropic") != null);
+}
+
+test "an unscoped --base-url goes to the channel whose routes accept it" {
+    const a = std.testing.allocator;
+    var registry = try ProviderRegistry.initWithBuiltins(a);
+    defer registry.deinit();
+
+    // Anthropic-wire URL: the default channel (cn-anthropic) takes it. This
+    // used to fail the whole catalog on cn-openai's `/coding/` rule.
+    {
+        const outcome = try resolve(a, &registry, .{ .provider = "zai", .base_url = "https://relay.internal/api/anthropic" });
+        var route = outcome.route;
+        defer route.deinit();
+        try std.testing.expectEqualStrings("cn-anthropic", route.channel_id.slice());
+        try std.testing.expectEqualStrings("https://relay.internal/api/anthropic/v1/messages", route.endpoint_url);
+    }
+    // OpenAI-wire URL: the default channel refuses it, the first channel
+    // whose route accepts it (cn-openai) takes it, with the named model.
+    {
+        const outcome = try resolve(a, &registry, .{
+            .provider = "zai",
+            .model = "glm-5.3",
+            .base_url = "https://relay.internal/api/coding/paas/v4",
+        });
+        var route = outcome.route;
+        defer route.deinit();
+        try std.testing.expectEqualStrings("cn-openai", route.channel_id.slice());
+        try std.testing.expectEqualStrings("https://relay.internal/api/coding/paas/v4/chat/completions", route.endpoint_url);
+    }
+    // No channel accepts the general Z.AI surface: still refused.
+    {
+        const outcome = try resolve(a, &registry, .{ .provider = "zai", .base_url = "https://open.bigmodel.cn/api/paas/v4" });
+        try std.testing.expect(outcome == .failure);
+        try std.testing.expect(outcome.failure == .endpoint_rejected);
+    }
 }
 
 test "an explicit offer id pins without any ambiguity" {
@@ -720,10 +862,10 @@ test "a stored auto selection resolves through the route policy" {
     var registry = try ProviderRegistry.initWithBuiltins(a);
     defer registry.deinit();
 
-    const selection = try selection_mod.RuntimeSelection.auto("glm-4.6", .{}, .global);
+    const selection = try selection_mod.RuntimeSelection.auto("glm-5.3", .{}, .global);
     const outcome = try resolveSelection(a, &registry, selection);
     var route = outcome.route;
     defer route.deinit();
-    try std.testing.expectEqualStrings("glm-4.6", route.request_model_id);
+    try std.testing.expectEqualStrings("glm-5.3", route.request_model_id);
     try std.testing.expect(route.provider_id.eqlText("zai-coding-plan"));
 }

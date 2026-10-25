@@ -233,9 +233,9 @@ test "a floating selector matching several routes is an error with candidates" {
     const entry = AliasEntry{
         .name = try config_doc.AliasName.parse("glm"),
         .policy = .floating,
-        // "glm-4.6" is served by four channels: choosing one would silently
+        // "glm-5.3" is served by four channels: choosing one would silently
         // pick a protocol, region, price, and credential the user never named.
-        .selector = try selection_mod.Selector.parse("glm-4.6"),
+        .selector = try selection_mod.Selector.parse("glm-5.3"),
     };
     try testing.expectError(error.AmbiguousSelector, resolve(&catalog, entry));
 

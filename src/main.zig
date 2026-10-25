@@ -1929,8 +1929,8 @@ fn runModelSelectionForStoredApiKey(allocator: std.mem.Allocator, io: std.Io, st
     if (stored.selected_model) |old| allocator.free(old);
     stored.selected_model = try allocator.dupe(u8, model.model_id);
 
-    var effort_buf: [5]types.ReasoningEffort = undefined;
-    const efforts = reasoningOptionsForMask(model.reasoning_mask, &effort_buf);
+    var effort_buf: catalog_mod.ReasoningOptions = undefined;
+    const efforts = catalog_mod.reasoningOptions(model.reasoning_mask, &effort_buf);
     std.debug.print("\nSelect reasoning effort:\n", .{});
     for (efforts, 0..) |effort, i| {
         std.debug.print("  {d}. {s}\n", .{ i + 1, catalog_mod.effortLabel(model.effort_vocabulary, effort) });
@@ -1985,19 +1985,6 @@ fn readLine(buf: []u8) !usize {
         len += 1;
     }
     return len;
-}
-
-fn reasoningOptionsForMask(mask: u8, buf: *[5]types.ReasoningEffort) []const types.ReasoningEffort {
-    const ordered = [_]types.ReasoningEffort{ .low, .medium, .high, .xhigh };
-    buf[0] = .none;
-    var n: usize = 1;
-    for (ordered) |effort| {
-        if ((mask & catalog_mod.reasoningBit(effort)) != 0) {
-            buf[n] = effort;
-            n += 1;
-        }
-    }
-    return buf[0..n];
 }
 
 fn printLoginStatus(allocator: std.mem.Allocator, state_dir: []const u8) !void {
@@ -3480,6 +3467,8 @@ test {
     _ = &@import("api/oauth_exchange.zig");
     _ = &@import("api/oauth_login.zig");
     _ = &@import("api/catalog_fetch.zig");
+    _ = &@import("api/models_pages.zig");
+    _ = &@import("api/gemini_signatures.zig");
     _ = &@import("api/models_cache.zig");
     _ = &@import("repl/msg_queue.zig");
     _ = &@import("repl/history.zig");

@@ -53,6 +53,7 @@ const request_overrides = @import("request_overrides.zig");
 const dialect_mod = @import("dialect.zig");
 const catalog_mod = @import("catalog.zig");
 const image_capability = @import("image_capability.zig");
+const gemini_signatures = @import("gemini_signatures.zig");
 const AbortSignal = @import("../util/abort.zig").AbortSignal;
 const model_context_mod = @import("../app/model_context.zig");
 
@@ -108,6 +109,11 @@ pub const GeminiClient = struct {
     /// (issue #273). Owned; empty by default.
     host_capabilities: image_capability.Declarations = .{},
 
+    /// Thought signatures of the function calls this client received, by the
+    /// ids it minted for them; each goes back into the part it came from
+    /// (`gemini_signatures.zig`).
+    thought_signatures: gemini_signatures.Store,
+
     /// 有状态缓存句柄表(GeminiClient 私有,不上浮中立契约)。
     /// prepareCache 据 system+tools 的 prefix 哈希查表命中则引用,未命中/过期则(MVP)走隐式。
     cache_table: std.ArrayList(CacheEntry) = .empty,
@@ -121,10 +127,12 @@ pub const GeminiClient = struct {
             .http_client = http.Client{ .allocator = allocator, .io = io },
             .stream_idle_timeout_ms = client_mod.streamIdleTimeoutMsFromEnv(),
             .stream_body_idle_timeout_ms = client_mod.streamBodyIdleTimeoutMsFromEnv(),
+            .thought_signatures = gemini_signatures.Store.init(allocator),
         };
     }
     pub fn deinit(self: *GeminiClient) void {
         self.abort_registry.deinit(self.allocator);
+        self.thought_signatures.deinit();
         for (self.cache_table.items) |e| self.allocator.free(e.cache_name);
         self.cache_table.deinit(self.allocator);
         self.http_client.deinit();
@@ -299,7 +307,7 @@ pub const GeminiClient = struct {
         // 图像 tool_result 定案(原生块 / 占位)由序列化器实际报告,随流句柄回传。
         var report = json_mod.SerializationReport{};
         defer report.deinit(self.allocator);
-        const body = try serializeGeminiRequestWithOverridesAndDialectReport(
+        const body = try serializeGeminiRequestSigned(
             self.allocator,
             messages,
             system,
@@ -309,6 +317,7 @@ pub const GeminiClient = struct {
             overrides,
             dialect,
             &report,
+            &self.thought_signatures,
         );
         defer self.allocator.free(body);
         const placeholder_ids = try report.placeholder_ids.toOwnedSlice(self.allocator);
@@ -398,6 +407,7 @@ pub const GeminiClient = struct {
             .abort = abort,
             .abort_registry = &self.abort_registry,
             .id = rid,
+            .signatures = &self.thought_signatures,
         };
         return heap.handle();
     }
@@ -429,6 +439,9 @@ const GeminiStream = struct {
     /// 一次 next() 只能吐一个事件,故首个直接返回、其余排队,后续 next() 逐个 drain。
     fc_queue: std.ArrayList(StreamEvent) = .empty,
     fc_pos: usize = 0,
+    /// Where the signatures of the calls this stream emits are kept (the
+    /// client's store); null keeps none.
+    signatures: ?*gemini_signatures.Store = null,
     /// pending usage 槽:Gemini 常把 usageMetadata 与末 content chunk 合并(text+finishReason+usage 同 chunk)。
     /// 一个 chunk 只能 emit 一个 StreamEvent,故先 emit 内容、把 usage 存这里,下次 next() 先吐它。
     /// 不这样做 → usage 在最常见的"内容+usage 同 chunk"路径被静默丢(E 类 bug)。
@@ -603,6 +616,13 @@ const GeminiStream = struct {
             var first_ev: ?StreamEvent = null;
             // OOM 时释放已建首事件(未入队、未返回)——不留孤儿 owned 分配(Linus #2)。
             errdefer if (first_ev) |ev| freeToolUseStart(self.allocator, ev);
+            // The k-th signature belongs to the k-th functionCall of this chunk.
+            const chunk_signatures: ?[]?[]u8 = if (self.signatures != null and std.mem.indexOf(u8, data, "\"thoughtSignature\"") != null)
+                try gemini_signatures.chunkSignatures(self.allocator, data)
+            else
+                null;
+            defer if (chunk_signatures) |list| gemini_signatures.freeChunkSignatures(self.allocator, list);
+            var call_index: usize = 0;
             var search: usize = 0;
             while (std.mem.indexOfPos(u8, data, search, "\"functionCall\":")) |fc_at| {
                 // 取 "functionCall": 后的 {...} 对象(括号配平),拿到对象文本 + 结束偏移。
@@ -636,6 +656,10 @@ const GeminiStream = struct {
                 errdefer self.allocator.free(name_dup);
                 const args_dup = try self.allocator.dupe(u8, args);
                 errdefer self.allocator.free(args_dup);
+                if (chunk_signatures) |list| {
+                    if (call_index < list.len) if (list[call_index]) |signature| try self.signatures.?.put(id_dup, signature);
+                }
+                call_index += 1;
                 const ev = StreamEvent{ .tool_use_start = .{ .id = id_dup, .name = name_dup, .input_json = args_dup } };
                 if (first_ev == null) first_ev = ev else try self.fc_queue.append(self.allocator, ev);
             }
@@ -858,6 +882,25 @@ pub fn serializeGeminiRequestWithOverridesAndDialectReport(
     dialect: dialect_mod.Dialect,
     report: *json_mod.SerializationReport,
 ) ![]u8 {
+    return serializeGeminiRequestSigned(allocator, messages, system, tools, cached_ref, model, overrides, dialect, report, null);
+}
+
+/// The request with the thought signatures this client holds put back into
+/// the model functionCall parts they arrived on. A model that validates them
+/// (`ModelProfile.requires_thought_signatures`) gets the documented
+/// placeholder on a step's first call when the signature is unknown.
+pub fn serializeGeminiRequestSigned(
+    allocator: std.mem.Allocator,
+    messages: []const types.ApiMessage,
+    system: ?[]const u8,
+    tools: ?[]const json_mod.ToolDefinition,
+    cached_ref: ?[]const u8,
+    model: []const u8,
+    overrides: request_overrides.RequestOverrides,
+    dialect: dialect_mod.Dialect,
+    report: *json_mod.SerializationReport,
+    signatures: ?*const gemini_signatures.Store,
+) ![]u8 {
     const profile = dialect.profileFor(.gemini, model);
     const visible_capabilities = dialect_mod.visibleCapabilities(tools);
     var out: std.ArrayList(u8) = .empty;
@@ -896,7 +939,7 @@ pub fn serializeGeminiRequestWithOverridesAndDialectReport(
     for (messages, 0..) |m, mi| {
         if (!first_msg) try out.append(allocator, ',');
         first_msg = false;
-        try serializeGeminiContent(allocator, &out, m, mi, messages, dialect, profile, report);
+        try serializeGeminiContent(allocator, &out, m, mi, messages, dialect, profile, report, signatures);
     }
     try out.append(allocator, ']');
     // tools:[{function_declarations:[...]}]
@@ -982,7 +1025,7 @@ fn findToolUseName(messages: []const types.ApiMessage, msg_index: usize, id: []c
     return null;
 }
 
-fn serializeGeminiContent(allocator: std.mem.Allocator, out: *std.ArrayList(u8), m: types.ApiMessage, msg_index: usize, all_messages: []const types.ApiMessage, dialect: dialect_mod.Dialect, profile: dialect_mod.ModelProfile, report: *json_mod.SerializationReport) !void {
+fn serializeGeminiContent(allocator: std.mem.Allocator, out: *std.ArrayList(u8), m: types.ApiMessage, msg_index: usize, all_messages: []const types.ApiMessage, dialect: dialect_mod.Dialect, profile: dialect_mod.ModelProfile, report: *json_mod.SerializationReport, signatures: ?*const gemini_signatures.Store) !void {
     // tool_result → user 角色的 functionResponse part(Gemini 特有)。
     var has_tool_result = false;
     for (m.content) |c| if (c == .tool_result) {
@@ -1100,6 +1143,9 @@ fn serializeGeminiContent(allocator: std.mem.Allocator, out: *std.ArrayList(u8),
     try out.appendSlice(allocator, role_str);
     try out.appendSlice(allocator, "\",\"parts\":[");
     var first_part = true;
+    // One model message is one step; its first functionCall is the part a
+    // validating model checks.
+    var first_call = true;
     for (m.content) |c| switch (c) {
         .text => |t| {
             if (!first_part) try out.append(allocator, ',');
@@ -1116,7 +1162,16 @@ fn serializeGeminiContent(allocator: std.mem.Allocator, out: *std.ArrayList(u8),
             try out.appendSlice(allocator, ",\"args\":");
             // tu.input 是 JSON 字符串(args 对象);直接内联(已是合法 JSON 对象)。
             try out.appendSlice(allocator, if (tu.input.len > 0) tu.input else "{}");
-            try out.appendSlice(allocator, "}}");
+            try out.append(allocator, '}');
+            const known = if (signatures) |store| store.get(tu.id) else null;
+            const signature: ?[]const u8 = known orelse
+                (if (m.role == .assistant and first_call and profile.requires_thought_signatures) gemini_signatures.PLACEHOLDER else null);
+            if (signature) |value| {
+                try out.appendSlice(allocator, ",\"thoughtSignature\":");
+                try util_json.serializeString(value, out, allocator);
+            }
+            try out.append(allocator, '}');
+            first_call = false;
         },
         .image => |img| {
             // 一等图像内容(issue #10):inline_data part,wire 形态委托方言。

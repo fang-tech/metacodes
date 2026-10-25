@@ -535,11 +535,11 @@ test "catalog materializes one offer per channel × route × model" {
         .only_provider = Slug.lit("zai-coding-plan"),
     });
     defer catalog.deinit();
-    // 4 channels × 1 route each × 3 models.
-    try std.testing.expectEqual(@as(usize, 12), catalog.items().len);
+    // 4 channels × 1 route each × 2 models.
+    try std.testing.expectEqual(@as(usize, 8), catalog.items().len);
 
     // The same canonical model reached through four routes stays four offers.
-    try std.testing.expectEqual(@as(usize, 4), catalog.countMatchingSelector("zai/glm-4.6"));
+    try std.testing.expectEqual(@as(usize, 4), catalog.countMatchingSelector("zai/glm-5.3"));
 }
 
 test "same visible model on different channels keeps distinct offers and endpoints" {
@@ -553,7 +553,7 @@ test "same visible model on different channels keeps distinct offers and endpoin
     var cn_anthropic: ?ModelOffer = null;
     var global_openai: ?ModelOffer = null;
     for (catalog.items()) |candidate| {
-        if (!std.mem.eql(u8, candidate.request_model_id, "glm-4.6")) continue;
+        if (!std.mem.eql(u8, candidate.request_model_id, "glm-5.3")) continue;
         if (candidate.channel_id.eqlText("cn-anthropic")) cn_anthropic = candidate;
         if (candidate.channel_id.eqlText("global-openai")) global_openai = candidate;
     }

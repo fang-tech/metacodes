@@ -26,8 +26,10 @@ pub fn render(picker: *const Picker, w: *std.Io.Writer, th: Theme, cols: usize) 
 
     if (picker.stage == .credential) return rows + credentialBody(picker, w, th, cols);
 
-    var scratch: [Picker.MAX_ROWS]Row = undefined;
-    const visible = picker.rows(&scratch);
+    var buffer = Picker.RowBuffer.init(picker.allocator);
+    defer buffer.deinit();
+    // Rows that cannot be built draw as an empty step, never as a crash.
+    const visible = picker.rows(&buffer) catch &.{};
     if (visible.len == 0) {
         line(w);
         w.print("  {s}{s}{s}", .{ th.dim, emptyText(picker), th.reset }) catch {};
@@ -42,8 +44,17 @@ pub fn render(picker: *const Picker, w: *std.Io.Writer, th: Theme, cols: usize) 
         rows += drawRow(picker, w, th, cols, row, index == picker.cursor);
     }
     if (end < visible.len or top > 0) {
+        // Only a list longer than its window gets this line, and it is where
+        // the keys that reach the rest are named: a long list that does not
+        // say how to page reads as the whole list.
         line(w);
-        w.print("  {s}[{d}/{d}]{s}", .{ th.dim, picker.cursor + 1, visible.len, th.reset }) catch {};
+        w.print("  {s}[{d}/{d}] · PgUp/PgDn page · Home/End{s}{s}", .{
+            th.dim,
+            picker.cursor + 1,
+            visible.len,
+            if (picker.stage == .provider or picker.stage == .model) " · type to filter" else "",
+            th.reset,
+        }) catch {};
         newline(w);
         rows += 1;
     }
@@ -261,9 +272,11 @@ fn footer(picker: *const Picker, w: *std.Io.Writer, th: Theme) u16 {
         .global => "every future session (durable)",
         .once => "the next turn only",
     };
+    // On the options step the values change with ←/→ and Enter applies them;
+    // a footer that named only Enter left the values looking fixed.
     w.print(
-        "  {s}enter apply to {s} · tab scope · esc back · q close{s}",
-        .{ th.dim, scope_text, th.reset },
+        "  {s}{s}enter apply to {s} · tab scope · esc back · q close{s}",
+        .{ th.dim, if (picker.stage == .options) "←/→ change · " else "", scope_text, th.reset },
     ) catch {};
     newline(w);
     line(w);
@@ -540,6 +553,42 @@ test "a long list scrolls with a position indicator instead of overflowing" {
     try testing.expect(std.mem.indexOf(u8, text, "m29") == null);
 }
 
+test "a long list names the paging keys and End draws its last row" {
+    const a = testing.allocator;
+    var picker = Picker.init(a);
+    defer picker.deinit();
+    const count = 300;
+    var offers: [count]control_plane.OfferSummary = undefined;
+    var names: [count][8]u8 = undefined;
+    for (&offers, 0..) |*slot, index| {
+        slot.* = richOffer();
+        const text = std.fmt.bufPrint(&names[index], "m{d:0>3}", .{index}) catch unreachable;
+        slot.display_name = text;
+        slot.canonical_model_id = text;
+        slot.request_model_id = text;
+        slot.offer_id = ids.OfferId.derive(.{
+            .provider_id = slot.provider_id,
+            .channel_id = slot.channel_id,
+            .protocol = slot.protocol,
+            .endpoint_url = slot.endpoint_ref,
+            .request_model_id = text,
+        });
+    }
+    try seed(&picker, &offers, null);
+    _ = picker.onKey(.enter);
+    picker.page_rows = 8;
+
+    var buffer: [16384]u8 = undefined;
+    const first = draw(&picker, &buffer);
+    try testing.expect(std.mem.indexOf(u8, first, "[1/300] · PgUp/PgDn page · Home/End · type to filter") != null);
+
+    _ = picker.onKey(.end);
+    const last = draw(&picker, &buffer);
+    try testing.expect(std.mem.indexOf(u8, last, "[300/300]") != null);
+    try testing.expect(std.mem.indexOf(u8, last, "m299") != null);
+    try testing.expect(std.mem.indexOf(u8, last, "m291") == null);
+}
+
 test "an option row shows the vocabulary and marks an unsettable control" {
     const a = testing.allocator;
     const specs = [_]@import("../provider/controls.zig").ControlSpec{
@@ -568,6 +617,8 @@ test "an option row shows the vocabulary and marks an unsettable control" {
     try testing.expect(std.mem.indexOf(u8, text, "higher cost and latency") != null);
     // A control the picker cannot set must say so rather than look broken.
     try testing.expect(std.mem.indexOf(u8, text, "(not settable here)") != null);
+    // The footer names the keys that change a value and apply the route.
+    try testing.expect(std.mem.indexOf(u8, text, "←/→ change · enter apply to") != null);
 }
 
 test "the credential stage draws the sign-in transcript, wrapped, and the Esc hint" {
