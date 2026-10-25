@@ -170,7 +170,7 @@ over its platform's share:
 | Job | Runners | What each one runs |
 |---|---|---|
 | `gates-linux` | `units`, `product`, `release`, `checks` | One flag each, below |
-| `gates-macos` | `units-checks`, `product-release` | Two flags each |
+| `gates-macos` | `units-checks-release`, `product` | `units`, `checks` and `release` on one; `product` on the other |
 | `windows-gates` | `units`, `product`, `release` | One flag each: the two halves, and the release unit with the Windows script suites |
 | `tty-linux` | three shards | Every third case of `tests/tty` |
 | `tty-windows` | four shards | Every fourth case, under ConPTY |
@@ -180,8 +180,8 @@ on `release`):
 
 | Flag | Steps |
 |---|---|
-| `units` | `zig build test:units`, the native platform modules |
-| `product` | `zig build test:product`, with the pinned WorkBuddy-Bench checkout (POSIX) |
+| `units` | `zig build test:units`; the native platform modules (on `product` on Windows) |
+| `product` | `zig build test:product`, with the pinned WorkBuddy-Bench checkout (POSIX); the native platform modules on Windows |
 | `release` | The bundle verification, the arm64 cross-stage (Linux), the install prefix, kernel provenance and staging, the release layout, `install.sh` (`install.ps1` on Windows) and the reproducible archive; on Windows also the version state gate and the Windows script suites |
 | `checks` | `zig fmt`, the version state gate, `zig build test:lib -Doptimize=ReleaseSafe`, the coverage audit, the documentation checks and notices (Linux), the script unit suites and `git diff --check` |
 
@@ -220,7 +220,7 @@ What it costs:
   is scarce.
 - **Concurrency.** The organization runs at most 60 hosted jobs and five
   macOS jobs at once. A run uses about two dozen jobs, three of them on
-  macOS (two gate legs and `SDK bindings (macOS)`), so macOS pairs the flags
+  macOS (two gate legs and `SDK bindings (macOS)`), so macOS groups the flags
   instead of giving each its own runner. Runs that overlap can still queue
   macOS jobs.
 - **Cache lines.** Each gate leg keeps its own setup-zig cache

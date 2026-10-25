@@ -120,8 +120,8 @@ jobs:
   # (`test:units`, `test:product`), so the two cannot drift apart silently.
   # Each step names the legs it belongs to through the matrix flags `units`,
   # `product`, `release` and `checks`; a step without one is environment setup
-  # and runs on every leg. Linux has a runner per flag. macOS pairs them, since
-  # an organization runs at most five macOS jobs at once.
+  # and runs on every leg. Linux has a runner per flag. macOS groups them on
+  # two runners, since an organization runs at most five macOS jobs at once.
   # 45 minutes: a cold hosted runner compiles a leg's share of the tree and
   # the Lean kernel; warm runs (setup-zig + Lean cache hits) are far shorter.
   gates-linux:
@@ -483,8 +483,10 @@ jobs:
         run: git diff --check
 
   # The same steps (the YAML alias of `gates-linux`'s list) on two macOS
-  # runners: the halves of `zig build test`, each with the leg whose steps fit
-  # beside it. A leg's flags are what its steps read, not its name.
+  # runners, one per half of `zig build test`. The product half is the longer
+  # one there (the evaluation suite waits for two ReleaseSafe drivers and the
+  # ReleaseSmall app on three cores), so the release and checks steps go with
+  # the units half. A leg's flags are what its steps read, not its name.
   gates-macos:
     name: Gates (macOS) / ${{ matrix.leg }}
     timeout-minutes: 45
@@ -492,12 +494,12 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - leg: units-checks
+          - leg: units-checks-release
             units: true
             checks: true
-          - leg: product-release
-            product: true
             release: true
+          - leg: product
+            product: true
     runs-on: macos-latest
     needs: [release-fast-path, scope]
     if: ${{ !cancelled() }}
@@ -751,9 +753,11 @@ jobs:
         if: env.FAST_PATH != 'true' && env.SUITES != 'false'
         shell: cmd
         run: python -m pip install -r requirements-dev.txt
-      # As in `gates-linux`: the platform root, standalone, spawn tests on.
+      # As in `gates-linux`: the platform root, standalone, spawn tests on. On
+      # the product leg here, the shorter half on Windows, where this step
+      # takes about two minutes.
       - name: Native platform modules
-        if: matrix.units && env.FAST_PATH != 'true' && env.SUITES != 'false'
+        if: matrix.product && env.FAST_PATH != 'true' && env.SUITES != 'false'
         shell: cmd
         env:
           METACODES_PROC_TEST: "1"
