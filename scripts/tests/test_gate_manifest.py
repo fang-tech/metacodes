@@ -43,12 +43,94 @@ def normalized_words(command):
     return words
 
 
+# CI runs `zig build test` as its three parts, spread over the gate legs
+# (doc/CI_DESIGN.md §4); build.zig makes `test` exactly these three.
+TEST_PARTS = ("test:units", "test:integration", "test:product")
+
+
+def present(words, ci):
+    return any(actual[: len(words)] == words for actual in ci)
+
+
+def test_part_commands(ci):
+    """(parts, options) of every `zig build <test parts...> <options>` command."""
+    found = []
+    for words in ci:
+        if words[:2] != ["zig", "build"]:
+            continue
+        steps = []
+        for word in words[2:]:
+            if word.startswith("-"):
+                break
+            steps.append(word)
+        if steps and all(step in TEST_PARTS for step in steps):
+            # -jN only schedules the build runner (each job sets its own
+            # ZIG_BUILD_JOBS); it does not change what runs.
+            options = [word for word in words[2 + len(steps):] if not word.startswith("-j")]
+            found.append((steps, options))
+    return found
+
+
+# The repository's script suites that no PR run executes, each with where it
+# does run. A new suite under scripts/tests/ runs from ci.yml or from
+# build.zig's `test` graph, or is listed here with a reason.
+SCRIPT_SUITES_RUN_ELSEWHERE = {
+    # Builds two complete artifacts per test; rule-control.yml (dispatch only)
+    # runs it as the evidence of the artifact-reproducibility rule.
+    "test_artifact_reproducibility": ".github/workflows/rule-control.yml",
+}
+
+
 class GateManifestTest(unittest.TestCase):
+    def test_every_script_suite_runs_on_every_pull_request(self):
+        """A suite nothing runs passes forever. Every scripts/tests module is
+        named by a ci.yml step or a build.zig command (the `test` graph runs on
+        every pull request), unless it is listed above."""
+        workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+        build = (ROOT / "build.zig").read_text(encoding="utf-8")
+        for path in sorted((ROOT / "scripts" / "tests").glob("test_*.py")):
+            module = "scripts.tests." + path.stem
+            with self.subTest(suite=path.stem):
+                named = re.search(re.escape(module) + r"\b", workflow) or ('"%s"' % module) in build
+                if path.stem in SCRIPT_SUITES_RUN_ELSEWHERE:
+                    self.assertFalse(named, "%s runs on pull requests now; drop its exemption" % path.stem)
+                    self.assertIn(module, (ROOT / SCRIPT_SUITES_RUN_ELSEWHERE[path.stem]).read_text(encoding="utf-8")
+                                  + (ROOT / "control-plane" / "rules.json").read_text(encoding="utf-8"))
+                else:
+                    self.assertTrue(named, "%s runs in no pull request run: add a ci.yml step or a build.zig command" % module)
+
     def test_checklist_commands_are_present_in_ci(self):
         ci = [normalized_words(command) for command in ci_commands()]
+        parts = test_part_commands(ci)
         for expected in checklist_commands():
             words = normalized_words(expected)
-            self.assertTrue(any(actual[: len(words)] == words for actual in ci), "missing checklist command: %s" % expected)
+            if words[:3] == ["zig", "build", "test"]:
+                # Every part runs somewhere, with the checklist command's options.
+                for part in TEST_PARTS:
+                    self.assertTrue(
+                        any(part in steps and options[: len(words) - 3] == words[3:] for steps, options in parts),
+                        "missing checklist part: zig build %s" % part,
+                    )
+            else:
+                self.assertTrue(present(words, ci), "missing checklist command: %s" % expected)
+
+    def test_every_part_of_the_suite_runs_alike(self):
+        """`zig build test` is its three parts (build.zig), and CI runs them on
+        separate legs (doc/CI_DESIGN.md §4): every part must run, always with
+        the same options, or the split drops or weakens part of the suite.
+        Which legs of which platform run them: test_ci_scope.py."""
+        parts = test_part_commands([normalized_words(command) for command in ci_commands()])
+        self.assertEqual({step for steps, _ in parts for step in steps}, set(TEST_PARTS))
+        self.assertEqual(len({tuple(options) for _, options in parts}), 1, parts)
+
+    def test_the_test_step_is_exactly_its_three_parts(self):
+        build = (ROOT / "build.zig").read_text(encoding="utf-8")
+        self.assertIn('const units_test_step = b.step("test:units",', build)
+        self.assertIn('const integration_test_step = b.step("test:integration",', build)
+        self.assertIn('const product_test_step = b.step("test:product",', build)
+        self.assertEqual(re.findall(r"\btest_step\.dependOn\((\w+)\)", build),
+                         ["units_test_step", "integration_test_step", "product_test_step"])
+        self.assertEqual(len(re.findall(r"\btest_step\.dependOn\(", build)), 3)
 
 
 if __name__ == "__main__":

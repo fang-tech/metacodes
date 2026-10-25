@@ -255,9 +255,9 @@ Two facts must both hold:
    going. A failed, cancelled or missing run is the full path.
 
 On the fast path the required `Gates (Linux|macOS|Windows)` and `TTY (Linux)`
-checks still run and report: every step checks `FAST_PATH`, except the
-checkout and the version state gate in `Gates`, which runs without
-`--rehearse`. The script never fails its job (an error decides the full
+checks still run and report: every step of their legs and shards checks
+`FAST_PATH`, except the checkouts and the version state gate in the POSIX
+`checks` legs, which runs without `--rehearse`. The script never fails its job (an error decides the full
 path), and the required jobs run in full when the decision job itself fails,
 so a doubt costs time, never coverage. Pushes to `main` always run in full,
 including the release merge commit's run. In a merge queue group

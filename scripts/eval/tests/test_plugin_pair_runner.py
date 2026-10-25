@@ -34,6 +34,10 @@ from scripts.eval.plugin_pair_analysis import analyze
 
 ROOT = Path(__file__).resolve().parents[3]
 PROTOCOL = ROOT / "evals/plugin-v1/protocol.json"
+# Hashes the live checkout's plugin-v1 pinned inputs, which
+# test_plugin_frozen_run edits and restores: the evaluation suite's concurrent
+# shards run the whole group in one process (scripts/eval/tests/run_shard.py).
+EVAL_SHARD_GROUP = "plugin-v1"
 
 
 class PluginPairRunnerTest(unittest.TestCase):

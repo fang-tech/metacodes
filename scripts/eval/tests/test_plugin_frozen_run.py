@@ -69,6 +69,11 @@ from scripts.eval.tests.posix_only import POSIX, requires_posix_budget_journal
 
 ROOT = Path(__file__).resolve().parents[3]
 PROTOCOL = ROOT / "evals/plugin-v1/protocol.json"
+# test_plugin_frozen_run edits a pinned input of the live checkout and
+# restores it, and the other plugin-v1 modules hash that file: the evaluation
+# suite's concurrent shards run the whole group in one process
+# (scripts/eval/tests/run_shard.py).
+EVAL_SHARD_GROUP = "plugin-v1"
 INVENTORIES = mock.patch(
     "scripts.eval.plugin_pair_runner._verify_arm_inventory",
     lambda root, protocol, arm, executable, runtime: "inventory-" + arm,
@@ -714,10 +719,35 @@ class PreAuthorizationFailureTest(unittest.TestCase):
         self.assertEqual(["reserved"], [t["state"] for t in journal["transactions"].values()])
 
 
+@requires_posix_budget_journal
 class AnalysisBindsTheJournalTest(unittest.TestCase):
     """The receipt's `budget_journal_sha256` is the hash of a journal that
     replayed, whose authority names this frozen run, and whose transactions
-    are exactly the rollouts' receipts - not of whatever file was passed."""
+    are exactly the rollouts' receipts - not of whatever file was passed.
+
+    One freeze and one paid run serve the class. Each test (and each setUp a
+    test calls again) gets that run's directory back byte for byte at the
+    same path, so the paths the manifest, the authority and the journal
+    record stay valid and no test sees another's edits. Freezing and running
+    in every setUp cost about 4 s a test on a CI runner, most of the
+    evaluation suite's wall time."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls._class_tmp = tempfile.TemporaryDirectory()
+        base = Path(cls._class_tmp.name)
+        cls._directory = base / "fixture"
+        cls._pristine = base / "pristine"
+        cls._directory.mkdir()
+        with INVENTORIES:
+            cls._fixture = _PaidFixture(cls._directory)
+            with _FakeProvider(cls._fixture).installed():
+                cls._fixture.run()
+        shutil.copytree(cls._directory, cls._pristine, symlinks=True)
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls._class_tmp.cleanup()
 
     def setUp(self) -> None:
         patcher = mock.patch(
@@ -726,11 +756,9 @@ class AnalysisBindsTheJournalTest(unittest.TestCase):
         )
         patcher.start()
         self.addCleanup(patcher.stop)
-        self._tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(self._tmp.cleanup)
-        self.fixture = _PaidFixture(Path(self._tmp.name))
-        with _FakeProvider(self.fixture).installed():
-            self.fixture.run()
+        shutil.rmtree(self._directory)
+        shutil.copytree(self._pristine, self._directory, symlinks=True)
+        self.fixture = self._fixture
         self.state = validate_checkpoint_payload(self.fixture.journal.read_bytes())
 
     def _rewrite_candidate(self, mutate) -> None:
