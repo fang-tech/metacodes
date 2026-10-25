@@ -116,12 +116,13 @@ jobs:
   # The POSIX gates, one leg per runner (doc/CI_DESIGN.md §4). The legs'
   # steps together are a superset of the AGENTS.md "Before submitting"
   # checklist; scripts/tests/test_gate_manifest.py asserts that every checklist
-  # command has a step here, and that `zig build test` runs as its two halves
-  # (`test:units`, `test:product`), so the two cannot drift apart silently.
-  # Each step names the legs it belongs to through the matrix flags `units`,
-  # `product`, `release` and `checks`; a step without one is environment setup
-  # and runs on every leg. Linux has a runner per flag. macOS groups them on
-  # two runners, since an organization runs at most five macOS jobs at once.
+  # command has a step here, and that `zig build test` runs as its three parts
+  # (`test:units`, `test:integration`, `test:product`), so the two cannot
+  # drift apart silently. Each step names the legs it belongs to through the
+  # matrix flags `units`, `product`, `release`, `cross` and `checks`; a step
+  # without one is environment setup and runs on every leg. Linux has a runner
+  # per flag. macOS has three (the arm64 cross-stage is Linux-only), since an
+  # organization runs at most five macOS jobs at once.
   # 45 minutes: a cold hosted runner compiles a leg's share of the tree and
   # the Lean kernel; warm runs (setup-zig + Lean cache hits) are far shorter.
   gates-linux:
@@ -137,6 +138,8 @@ jobs:
             product: true
           - leg: release
             release: true
+          - leg: cross
+            cross: true
           - leg: checks
             checks: true
     runs-on: ubuntu-latest
@@ -323,7 +326,7 @@ jobs:
       # so this leg proves the cross-staged assets and the release unit waits
       # for that runner (doc/INSTALL_DESIGN.md §5).
       - name: Verify Linux arm64 cross-stage contract
-        if: matrix.release && runner.os == 'Linux' && env.FAST_PATH != 'true' && env.SUITES != 'false'
+        if: matrix.cross && runner.os == 'Linux' && env.FAST_PATH != 'true' && env.SUITES != 'false'
         run: |
           zig build tinykg:stage -Dtarget=aarch64-linux-musl
           zig build install -Dtarget=aarch64-linux-musl -Drelease-layout=true --prefix "$RUNNER_TEMP/stage-aarch64-linux"
@@ -342,7 +345,7 @@ jobs:
       # test_workbuddy_adapter.py) run the overlay inside the real pinned
       # WorkBuddy-Bench, against its locked environment; without a checkout
       # they skip. provision_checkout.sh fetches the pinned commit, installs
-      # this repository's overlay and `uv sync`s it; the product half below
+      # this repository's overlay and `uv sync`s it; the product part below
       # inherits METACODES_WORKBUDDY_CHECKOUT through zig build.
       - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         if: matrix.product && env.FAST_PATH != 'true' && env.SUITES != 'false'
@@ -355,8 +358,9 @@ jobs:
           set -euo pipefail
           checkout=$(scripts/eval/workbuddy/provision_checkout.sh "$RUNNER_TEMP/workbuddy-bench")
           echo "METACODES_WORKBUDDY_CHECKOUT=$checkout" >> "$GITHUB_ENV"
-      # `zig build test` as its two halves, one per leg (build.zig: `test` is
-      # exactly `test:units` plus `test:product`).
+      # `zig build test` as its three parts (build.zig: `test` is exactly
+      # `test:units`, `test:integration` and `test:product`): units and
+      # integration on one leg, product on another.
       # METACODES_TEST_REQUIRE_LEAN_SDK: every leg builds control-plane/lean
       # above, so a missing/mislocated ProjectRule.olean is a regression, not
       # an environment gap: fail instead of skip. --test-timeout 5m: the build
@@ -367,12 +371,12 @@ jobs:
       # and every kernel-gated test runs; a missing toolchain fails the build
       # instead of skipping them. --summary all: every step with its duration,
       # the evidence for the next split of the legs.
-      - name: Offline test suite (units half)
+      - name: Offline test suite (units and integration)
         if: matrix.units && env.FAST_PATH != 'true' && env.SUITES != 'false'
         env:
           METACODES_TEST_REQUIRE_LEAN_SDK: "1"
-        run: zig build test:units --test-timeout 5m -Dlean-kernels=on --summary all
-      - name: Offline test suite (product half)
+        run: zig build test:units test:integration --test-timeout 5m -Dlean-kernels=on --summary all
+      - name: Offline test suite (product)
         if: matrix.product && env.FAST_PATH != 'true' && env.SUITES != 'false'
         env:
           METACODES_TEST_REQUIRE_LEAN_SDK: "1"
@@ -483,10 +487,11 @@ jobs:
         run: git diff --check
 
   # The same steps (the YAML alias of `gates-linux`'s list) on two macOS
-  # runners, one per half of `zig build test`. The product half is the longer
-  # one there (the evaluation suite waits for two ReleaseSafe drivers and the
-  # ReleaseSmall app on three cores), so the release and checks steps go with
-  # the units half. A leg's flags are what its steps read, not its name.
+  # runners: units and integration with the checks, product, and release. Each
+  # waits on its own LLVM builds (the integration suite on the ReleaseSmall
+  # app, the evaluation suite on two ReleaseSafe drivers, the release layout
+  # on two more ReleaseSmall builds), which a three-core runner cannot overlap
+  # with the rest. A leg's flags are what its steps read, not its name.
   gates-macos:
     name: Gates (macOS) / ${{ matrix.leg }}
     timeout-minutes: 45
@@ -494,12 +499,13 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - leg: units-checks-release
+          - leg: units-checks
             units: true
             checks: true
-            release: true
           - leg: product
             product: true
+          - leg: release
+            release: true
     runs-on: macos-latest
     needs: [release-fast-path, scope]
     if: ${{ !cancelled() }}
@@ -601,7 +607,7 @@ jobs:
   # windows:tty` passes it through. Each shard builds the debug binary itself,
   # a warm-cache build of seconds on Linux and about two minutes on Windows.
   # 30 minutes: about 16 minutes of cases on POSIX and 28 under ConPTY in
-  # all, a third or a quarter of that per shard, plus a cold debug build.
+  # all, a third or a sixth of that per shard, plus a cold debug build.
   tty-linux:
     name: TTY (Linux) / ${{ matrix.shard }} of ${{ strategy.job-total }}
     timeout-minutes: 30
@@ -669,7 +675,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2, 3, 4]
+        shard: [1, 2, 3, 4, 5, 6]
     runs-on: windows-latest
     needs: [release-fast-path, scope]
     if: ${{ !cancelled() }}
@@ -679,7 +685,7 @@ jobs:
       TTY_SHARD: ${{ matrix.shard }}/${{ strategy.job-total }}
     steps: *tty-steps
 
-  # Three legs: the two halves of the repository-wide suite, and the release
+  # Four legs: the three parts of the repository-wide suite, and the release
   # unit with the Windows script suites. Each step reads its leg's flag, as in
   # `gates-linux`.
   windows-gates:
@@ -693,6 +699,8 @@ jobs:
         include:
           - leg: units
             units: true
+          - leg: integration
+            integration: true
           - leg: product
             product: true
           - leg: release
@@ -754,8 +762,8 @@ jobs:
         shell: cmd
         run: python -m pip install -r requirements-dev.txt
       # As in `gates-linux`: the platform root, standalone, spawn tests on. On
-      # the product leg here, the shorter half on Windows, where this step
-      # takes about two minutes.
+      # the product leg here, the shortest suite leg on Windows, where this
+      # step takes about two minutes.
       - name: Native platform modules
         if: matrix.product && env.FAST_PATH != 'true' && env.SUITES != 'false'
         shell: cmd
@@ -849,26 +857,31 @@ jobs:
         if: matrix.release && env.FAST_PATH != 'true' && env.SUITES != 'false'
         shell: cmd
         run: python -m unittest scripts.tests.test_verify_kernel_provenance -v
-      # The repository-wide suite on the native Windows host (#53), as its two
-      # halves like `gates-linux`; each builds both kernels itself
-      # (-Dlean-kernels=on). No METACODES_TEST_REQUIRE_LEAN_SDK here: the
+      # The repository-wide suite on the native Windows host (#53), as its
+      # three parts, one per leg: the integration suite waits five minutes for
+      # the ReleaseSmall app here, so it gets a runner of its own. Each part
+      # builds both kernels itself (-Dlean-kernels=on). No METACODES_TEST_REQUIRE_LEAN_SDK here: the
       # Python Lean-SDK suites stay POSIX-only (scripts/eval/tests/
       # posix_only.py), and the component tests that drive a kernel through
       # POSIX-only paths skip on Windows as before. --test-timeout 5m: the
       # build runner watchdog between tests is max(--test-timeout, 60s), same
       # as the AgentCore gate. --summary all: see `gates-linux`.
-      - name: Offline test suite (units half)
+      - name: Offline test suite (units)
         if: matrix.units && env.FAST_PATH != 'true' && env.SUITES != 'false'
         shell: cmd
         run: zig build test:units --test-timeout 5m -Dlean-kernels=on --summary all
-      - name: Offline test suite (product half)
+      - name: Offline test suite (integration)
+        if: matrix.integration && env.FAST_PATH != 'true' && env.SUITES != 'false'
+        shell: cmd
+        run: zig build test:integration --test-timeout 5m -Dlean-kernels=on --summary all
+      - name: Offline test suite (product)
         if: matrix.product && env.FAST_PATH != 'true' && env.SUITES != 'false'
         shell: cmd
         run: zig build test:product --test-timeout 5m -Dlean-kernels=on --summary all
       # Evidence for the next line-ending incident: if the suite itself rewrites
       # tracked files with CRLF, this lists them; the step never fails.
       - name: Line endings after the suite
-        if: always() && (matrix.units || matrix.product) && env.FAST_PATH != 'true' && env.SUITES != 'false'
+        if: always() && (matrix.units || matrix.integration || matrix.product) && env.FAST_PATH != 'true' && env.SUITES != 'false'
         shell: cmd
         run: |
           git ls-files --eol | findstr /R "w/crlf w/mixed" & echo (CRLF worktree files after the suite above, if any)

@@ -57,7 +57,24 @@ RESULT_JOBS = {
     "TTY (Windows)": "tty-windows",
 }
 # The leg flags a gate step may be gated on; a step without one runs on every leg.
-LEG_FLAGS = {"units", "product", "release", "checks"}
+LEG_FLAGS = {"units", "integration", "product", "release", "cross", "checks"}
+# Each gate job, its runner OS and the flags its steps read there.
+GATE_JOBS = (("gates-linux", "Linux", {"units", "product", "release", "cross", "checks"}),
+             ("gates-macos", "macOS", {"units", "product", "release", "checks"}),
+             ("windows-gates", "Windows", {"units", "integration", "product", "release"}))
+TEST_PARTS = {"test:units", "test:integration", "test:product"}
+
+
+def runs_on(step: dict, os_name: str) -> bool:
+    """Whether a step's `runner.os` conditions let it run on this OS."""
+    condition = step.get("if", "")
+    pinned = re.findall(r"runner\.os == '(\w+)'", condition)
+    excluded = re.findall(r"runner\.os != '(\w+)'", condition)
+    return all(name == os_name for name in pinned) and os_name not in excluded
+
+
+def leg_flags(step: dict) -> set:
+    return set(re.findall(r"\bmatrix\.(\w+)", step.get("if", "")))
 
 
 class ClassifyTest(unittest.TestCase):
@@ -307,15 +324,16 @@ class WorkflowTest(unittest.TestCase):
                 self.assertEqual(proc.returncode == 0, passes, proc.stdout + proc.stderr)
 
     def test_every_leg_flag_a_step_reads_is_set_by_a_leg(self) -> None:
-        # A flag no leg sets is a step that runs on no runner at all.
-        for job, flags in (("gates-linux", {"units", "product", "release", "checks"}),
-                           ("gates-macos", {"units", "product", "release", "checks"}),
-                           ("windows-gates", {"units", "product", "release"})):
+        # A flag no leg sets is a step that runs on no runner at all. A step
+        # the OS condition keeps off this platform (the arm64 cross-stage on
+        # macOS) does not count.
+        for job, os_name, flags in GATE_JOBS:
             with self.subTest(job=job):
                 spec = self.jobs[job]
                 read = set()
                 for step in spec["steps"]:
-                    read |= set(re.findall(r"\bmatrix\.(\w+)", step.get("if", "")))
+                    if runs_on(step, os_name):
+                        read |= leg_flags(step)
                 self.assertLessEqual(read, LEG_FLAGS)
                 legs = spec["strategy"]["matrix"]["include"]
                 set_by_legs = {key for leg in legs for key, value in leg.items() if value is True}
@@ -323,6 +341,25 @@ class WorkflowTest(unittest.TestCase):
                 self.assertEqual(set_by_legs, flags)
                 self.assertEqual(len({leg["leg"] for leg in legs}), len(legs))
                 self.assertIn("${{ matrix.leg }}", spec["name"])
+
+    def test_every_platform_runs_every_part_of_the_suite(self) -> None:
+        # `zig build test` is exactly its three parts (build.zig); each
+        # platform must run all three on legs it has.
+        for job, os_name, _ in GATE_JOBS:
+            with self.subTest(job=job):
+                spec = self.jobs[job]
+                legs = spec["strategy"]["matrix"]["include"]
+                ran = set()
+                for step in spec["steps"]:
+                    if not runs_on(step, os_name) or "run" not in step:
+                        continue
+                    flags = leg_flags(step)
+                    if not any(leg.get(flag) is True for leg in legs for flag in flags):
+                        continue
+                    for words in (line.split() for line in step["run"].splitlines()):
+                        if words[:2] == ["zig", "build"]:
+                            ran |= TEST_PARTS & set(words[2:])
+                self.assertEqual(ran, TEST_PARTS)
 
     def test_both_posix_gates_and_both_tty_platforms_run_one_step_list(self) -> None:
         self.assertEqual(self.jobs["gates-macos"]["steps"], self.jobs["gates-linux"]["steps"])

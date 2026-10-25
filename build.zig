@@ -2304,17 +2304,21 @@ pub fn build(b: *std.Build) void {
         run_debug_cmd.addArgs(args);
     }
 
-    // `test` is exactly its two halves; nothing else is wired into it
-    // (scripts/tests/test_gate_manifest.py checks this). CI runs the halves on
+    // `test` is exactly its three parts; nothing else is wired into it
+    // (scripts/tests/test_gate_manifest.py checks this). CI runs the parts on
     // separate runners, so a check wired straight into `test` would run on no
     // CI runner at all (doc/CI_DESIGN.md §4).
-    // `test:units` is the test binaries and the repository's script unit
-    // suites; `test:product` drives the built product end to end (the
-    // evaluation harness, the smokes, the daemon and the TinyKG transport).
+    // `test:units` is the unit and component test binaries and the
+    // repository's script unit suites; `test:integration` is the integration
+    // suite (in its shards) and the spikes, which wait for the ReleaseSmall
+    // app; `test:product` drives the built product end to end (the evaluation
+    // harness, the smokes, the daemon and the TinyKG transport).
     const test_step = b.step("test", "Run tests");
-    const units_test_step = b.step("test:units", "Run the test binaries and the script unit suites (half of `test`)");
-    const product_test_step = b.step("test:product", "Run the built product end to end: evaluation harness, smokes, daemon (half of `test`)");
+    const units_test_step = b.step("test:units", "Run the unit and component test binaries and the script unit suites (part of `test`)");
+    const integration_test_step = b.step("test:integration", "Run the integration suite against the installed CLI, and the spikes (part of `test`)");
+    const product_test_step = b.step("test:product", "Run the built product end to end: evaluation harness, smokes, daemon (part of `test`)");
     test_step.dependOn(units_test_step);
+    test_step.dependOn(integration_test_step);
     test_step.dependOn(product_test_step);
     // Built by nothing else in the suite; compiling it here keeps it in step
     // with the runtime API it calls.
@@ -2890,7 +2894,7 @@ pub fn build(b: *std.Build) void {
         ).step,
     );
 
-    units_test_step.dependOn(spike_step);
+    integration_test_step.dependOn(spike_step);
 
     // test:new —— 只跑本次 e2e 框架新增的 L2 component 测试(隔离运行,绕开主套件已知
     // 的 integration 挂起)。每个文件独立 artifact,带 cc + harness imports。
@@ -3146,9 +3150,10 @@ pub fn build(b: *std.Build) void {
         windows_help_cmd.step.dependOn(b.getInstallStep());
         // This gate proves the Windows portability layer and installed CLI can
         // execute natively. The repository-wide suite is a separate gate: the
-        // `units` and `product` legs of ci.yml's windows-gates job run its two
-        // halves on native Windows runners (#53 wired it; before that no
-        // workflow ran it and Windows regressions accumulated silently).
+        // `units`, `integration` and `product` legs of ci.yml's windows-gates
+        // job run its three parts on native Windows runners (#53 wired it;
+        // before that no workflow ran it and Windows regressions accumulated
+        // silently).
         // Keep the two decoupled: do not couple the full suite's unrelated
         // subsystem timing/concurrency failures to this platform gate.
         windows_gate_step.dependOn(platform_test_step);

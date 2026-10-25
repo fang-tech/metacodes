@@ -12,7 +12,7 @@ from run_tty_tests import load_cases, parse_shard, select_shard  # noqa: E402
 
 def test_shards_partition_the_real_case_list(bin_path):
     names = [name for name, _ in load_cases()]
-    for count in (1, 2, 3, 4, 7):
+    for count in (1, 2, 3, 4, 6, 7):
         seen = []
         for index in range(1, count + 1):
             seen.extend(name for name, _ in select_shard([(n, None) for n in names], index, count))

@@ -124,8 +124,8 @@ ruleset can be switched in one edit. A maintainer makes it in `Protect main`:
   guarantee.
 - **Add "require merge queue"** with these settings:
   - merge method: merge commit (the repository's history convention);
-  - build concurrency 5: up to five entries tested at once, about two dozen
-    hosted jobs each, three of them on macOS (§4);
+  - build concurrency 5: up to five entries tested at once, about thirty
+    hosted jobs each, four of them on macOS (§4);
   - maximum group size 5 and minimum 1. With a minimum of 1 the wait time
     setting has no effect;
   - only merge non-failing pull requests (ALLGREEN), which the release
@@ -169,38 +169,43 @@ over its platform's share:
 
 | Job | Runners | What each one runs |
 |---|---|---|
-| `gates-linux` | `units`, `product`, `release`, `checks` | One flag each, below |
-| `gates-macos` | `units-checks-release`, `product` | `units`, `checks` and `release` on one; `product` on the other |
-| `windows-gates` | `units`, `product`, `release` | One flag each: the two halves, and the release unit with the Windows script suites |
+| `gates-linux` | `units`, `product`, `release`, `cross`, `checks` | One flag each, below |
+| `gates-macos` | `units-checks`, `product`, `release` | `units` and `checks` on one; one flag each on the others |
+| `windows-gates` | `units`, `integration`, `product`, `release` | One flag each |
 | `tty-linux` | three shards | Every third case of `tests/tty` |
-| `tty-windows` | four shards | Every fourth case, under ConPTY |
+| `tty-windows` | six shards | Every sixth case, under ConPTY |
 
-The gate flags (Windows has no `checks` leg; its version state gate runs
-on `release`):
+The gate flags (Windows has no `checks` leg; its version state gate runs on
+`release`):
 
 | Flag | Steps |
 |---|---|
-| `units` | `zig build test:units`; the native platform modules (on `product` on Windows) |
+| `units` | `zig build test:units`, and on POSIX `test:integration` in the same build; the native platform modules (on `product` on Windows) |
+| `integration` | Windows only: `zig build test:integration`, whose integration suite waits five minutes for the ReleaseSmall app there |
 | `product` | `zig build test:product`, with the pinned WorkBuddy-Bench checkout (POSIX); the native platform modules on Windows |
-| `release` | The bundle verification, the arm64 cross-stage (Linux), the install prefix, kernel provenance and staging, the release layout, `install.sh` (`install.ps1` on Windows) and the reproducible archive; on Windows also the version state gate and the Windows script suites |
+| `release` | The bundle verification, the install prefix, kernel provenance and staging, the release layout, `install.sh` (`install.ps1` on Windows) and the reproducible archive; on Windows also the version state gate and the Windows script suites |
+| `cross` | Linux only: the arm64 cross-stage, a third ReleaseSmall build |
 | `checks` | `zig fmt`, the version state gate, `zig build test:lib -Doptimize=ReleaseSafe`, the coverage audit, the documentation checks and notices (Linux), the script unit suites and `git diff --check` |
 
 The rules that keep the split from dropping coverage:
 
-- **`zig build test` is exactly its two halves.** In `build.zig`, `test`
-  depends on `test:units` (the test binaries and the script unit suites)
-  and `test:product` (the built product end to end: the evaluation harness,
-  the smokes, the daemon, the TinyKG transport), and nothing else is wired
-  into it. Both halves run with the same options.
-  `scripts/tests/test_gate_manifest.py` checks both. A new check goes into
-  one of the halves; wired straight into `test`, it would run on no POSIX
-  runner.
+- **`zig build test` is exactly its three parts.** In `build.zig`, `test`
+  depends on `test:units` (the unit and component test binaries and the
+  script unit suites), `test:integration` (the integration suite, which runs
+  against the installed ReleaseSmall CLI, and the spikes) and
+  `test:product` (the built product end to end: the evaluation harness, the
+  smokes, the daemon, the TinyKG transport), and nothing else is wired into
+  it. Every part runs with the same options.
+  `scripts/tests/test_gate_manifest.py` checks both, and
+  `scripts/tests/test_ci_scope.py` that every platform runs all three. A new
+  check goes into one of the parts; wired straight into `test`, it would run
+  on no CI runner.
 - **Every step a flag gates runs on some runner.** A step without a flag is
   environment setup (the checkout, Zig, Lean, ripgrep, bubblewrap, the
   Python dependencies) and runs on every leg, so each leg sees the
   environment the single job had. `scripts/tests/test_ci_scope.py` checks
-  that every flag a step reads is set by a leg, and that both POSIX jobs run
-  one step list (a YAML alias).
+  that every flag a step reads on a platform is set by one of its legs, and
+  that both POSIX jobs run one step list (a YAML alias).
 - **A result job passes only when every leg did.** `Gates (Linux)` and the
   other result jobs need their leg job, run under `always()` so that they
   are never skipped, and pass only if every need's result is `success`. A
@@ -219,8 +224,8 @@ What it costs:
   Hosted standard runners are free for a public repository; only wall time
   is scarce.
 - **Concurrency.** The organization runs at most 60 hosted jobs and five
-  macOS jobs at once. A run uses about two dozen jobs, three of them on
-  macOS (two gate legs and `SDK bindings (macOS)`), so macOS groups the flags
+  macOS jobs at once. A run uses about thirty jobs, four of them on macOS
+  (three gate legs and `SDK bindings (macOS)`), so macOS groups the flags
   instead of giving each its own runner. Runs that overlap can still queue
   macOS jobs.
 - **Cache lines.** Each gate leg keeps its own setup-zig cache
@@ -229,5 +234,5 @@ What it costs:
 
 The suite steps run with `--summary all`, so every run records the duration
 of each build step. When one leg becomes the long pole, its Build Summary
-says which steps to move: between the halves in `build.zig`, or between the
+says which steps to move: between the parts in `build.zig`, or between the
 flags in `ci.yml`.
