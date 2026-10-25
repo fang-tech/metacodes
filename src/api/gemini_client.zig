@@ -37,6 +37,8 @@ const std = @import("std");
 const http = std.http;
 const connection_gate = @import("connection_gate.zig");
 const ResponseStatus = @import("http_status.zig").ResponseStatus;
+const http_status = @import("http_status.zig");
+const no_redirects = http_status.no_redirects;
 const log = @import("../util/log.zig");
 const types = @import("../types.zig");
 const json_mod = @import("../json.zig");
@@ -332,6 +334,8 @@ pub const GeminiClient = struct {
             // 每请求独立连接:不复用 pooled 连接，避免"干净 EOF→连接入池→复用已弃连接
             // →HttpConnectionClosing"；process-wide connection_gate 负责限制握手洪峰。
             .keep_alive = false,
+            // The key rides in a header; a 3xx is reported, not followed.
+            .redirect_behavior = no_redirects,
             .extra_headers = &.{
                 .{ .name = "content-type", .value = "application/json" },
                 .{ .name = "x-goog-api-key", .value = self.api_key },
@@ -370,6 +374,11 @@ pub const GeminiClient = struct {
         const status = ResponseStatus.capture(&response);
         connection_lease.release();
         if (!status.isOk()) {
+            var location_buf: [256]u8 = undefined;
+            if (http_status.copyRedirectLocation(&response, &location_buf)) |location| {
+                client_mod.reportRedirect("gemini", rid, status, location);
+                return error.RequestFailed;
+            }
             log.errId("gemini", rid, "HTTP {d} {s}", .{ status.code, status.name });
             return error.RequestFailed;
         }

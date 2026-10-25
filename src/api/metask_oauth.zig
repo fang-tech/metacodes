@@ -222,7 +222,9 @@ fn postJson(allocator: std.mem.Allocator, io: std.Io, url: []const u8, body: []c
     const uri = std.Uri.parse(url) catch return error.InvalidUrl;
     var client = std.http.Client{ .allocator = allocator, .io = io };
     defer client.deinit();
-    var request = client.request(.POST, uri, .{ .extra_headers = &.{
+    // The device and token grants travel in the body; only the endpoint
+    // that received one can answer it.
+    var request = client.request(.POST, uri, .{ .redirect_behavior = http_status.no_redirects, .extra_headers = &.{
         .{ .name = "content-type", .value = "application/json" },
         .{ .name = "accept", .value = "application/json" },
     } }) catch return error.RequestFailed;
