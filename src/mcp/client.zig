@@ -461,7 +461,7 @@ pub const McpClient = struct {
                 self.transport.send(note, .{ .method = "notifications/cancelled" }) catch {};
                 return if (err == error.Timeout) error.McpRequestTimeout else err;
             },
-            error.McpAuthRequired, error.McpSessionExpired, error.McpServerError, error.McpConnectFailed, error.McpLineTooLarge => return err,
+            error.McpAuthRequired, error.McpSessionExpired, error.McpServerError, error.McpRedirected, error.McpConnectFailed, error.McpLineTooLarge => return err,
             else => return error.McpServerCrashed,
         }
     }
@@ -919,7 +919,7 @@ fn sendMeta(arena: std.mem.Allocator, method: []const u8, params_json: []const u
 fn sendFailure(err: anyerror) anyerror {
     return switch (err) {
         error.Timeout => error.McpRequestTimeout,
-        error.Aborted, error.McpAuthRequired, error.McpSessionExpired, error.McpServerError, error.McpConnectFailed => err,
+        error.Aborted, error.McpAuthRequired, error.McpSessionExpired, error.McpServerError, error.McpRedirected, error.McpConnectFailed => err,
         else => error.McpServerCrashed,
     };
 }

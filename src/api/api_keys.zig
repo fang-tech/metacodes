@@ -8,6 +8,7 @@
 
 const std = @import("std");
 const ResponseStatus = @import("http_status.zig").ResponseStatus;
+const no_redirects = @import("http_status.zig").no_redirects;
 
 pub const API_KEYS_URL_ENV = "METACODE_API_KEYS_URL";
 
@@ -199,6 +200,7 @@ pub fn fetchInto(
     const auth_header = std.fmt.allocPrint(allocator, "Bearer {s}", .{bearer_token}) catch return error.RequestFailed;
     defer secureFree(allocator, auth_header);
     var req = http_client.request(.GET, uri, .{
+        .redirect_behavior = no_redirects,
         .extra_headers = &.{.{ .name = "authorization", .value = auth_header }},
     }) catch return error.RequestFailed;
     defer req.deinit();

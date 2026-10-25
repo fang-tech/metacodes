@@ -47,11 +47,21 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
-- **A catalog request carrying a key no longer follows redirects.** Zig's
-  HTTP client re-sends its extra headers on every redirect hop, to whatever
-  host the redirect names, so an authenticated `/v1/models` or pricing fetch
-  that was redirected took the key with it. Such a request now ends at the
-  redirect (an HTTP error); a public catalog still follows it.
+- **A request carrying a key no longer follows a redirect.** Zig's HTTP
+  client re-sends its extra headers on every redirect hop, to whatever host
+  the redirect names, and turns a POST answered 301/302/303 into a GET; the
+  headers it would strip across domains it never sends at all. The Messages
+  client, the `/v1/models` probe, the account key list, authenticated catalog
+  fetches, the KG and sealed-skill transports and MCP over HTTP therefore took
+  their key (`x-api-key`, `Authorization`, configured MCP headers) to any host
+  a redirect named, and the OAuth token and device grants took a POST that
+  became a GET elsewhere and read its answer as a token response. Every such
+  request now ends at the redirect. The model clients report it with its
+  target (`端点重定向: HTTP 302 → <url>`, so the fix — that URL as the
+  endpoint — is in the message); the OpenAI and Gemini clients used to fail
+  with `HttpRedirectLocationOversize`; MCP reports `McpRedirected` instead of
+  "the server answered with an HTTP 5xx error". A public catalog still
+  follows redirects.
 - **Sign-in pages open on macOS.** With no `BROWSER` set the opener was
   `xdg-open`, which macOS does not have; the launch failed after the fork, so
   no OAuth or device-code page ever opened there and nothing said so. macOS
