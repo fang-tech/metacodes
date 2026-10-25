@@ -43,25 +43,42 @@ def normalized_words(command):
     return words
 
 
+# CI runs `zig build test` as its two halves, one per gate leg
+# (doc/CI_DESIGN.md §4); build.zig makes `test` exactly these two.
+HALVES = {("zig", "build", "test"): (("zig", "build", "test:units"), ("zig", "build", "test:product"))}
+
+
+def present(words, ci):
+    return any(actual[: len(words)] == words for actual in ci)
+
+
 class GateManifestTest(unittest.TestCase):
     def test_checklist_commands_are_present_in_ci(self):
         ci = [normalized_words(command) for command in ci_commands()]
         for expected in checklist_commands():
             words = normalized_words(expected)
-            self.assertTrue(any(actual[: len(words)] == words for actual in ci), "missing checklist command: %s" % expected)
+            halves = HALVES.get(tuple(words[:3]))
+            if halves:
+                for half in halves:
+                    self.assertTrue(present(list(half) + words[3:], ci), "missing checklist half: %s" % " ".join(half))
+            else:
+                self.assertTrue(present(words, ci), "missing checklist command: %s" % expected)
 
-    def test_the_posix_legs_run_both_halves_of_the_suite_alike(self):
-        """`zig build test` is its two halves (build.zig), and the POSIX gate
-        legs run one each (doc/CI_DESIGN.md §4): both must run, with the same
-        options, or the split drops part of the suite."""
+    def test_every_platform_runs_both_halves_of_the_suite_alike(self):
+        """`zig build test` is its two halves (build.zig), and each platform
+        runs them on separate legs (doc/CI_DESIGN.md §4): both must run on
+        every platform, with the same options, or the split drops part of the
+        suite."""
         halves = {}
         for command in ci_commands():
             words = normalized_words(command)
             if words[:2] == ["zig", "build"] and len(words) > 2 and words[2] in ("test:units", "test:product"):
                 halves.setdefault(words[2], []).append(words[3:])
         self.assertEqual(sorted(halves), ["test:product", "test:units"])
-        self.assertEqual(len(halves["test:units"]), 1, halves)
-        self.assertEqual(halves["test:units"], halves["test:product"])
+        # One step for the POSIX legs (a shared list) and one for Windows.
+        self.assertEqual(len(halves["test:units"]), 2, halves)
+        self.assertEqual(sorted(halves["test:units"]), sorted(halves["test:product"]))
+        self.assertEqual(len({tuple(options) for options in halves["test:units"]}), 1, halves)
 
     def test_the_test_step_is_exactly_its_two_halves(self):
         build = (ROOT / "build.zig").read_text(encoding="utf-8")

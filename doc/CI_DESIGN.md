@@ -171,17 +171,18 @@ over its platform's share:
 |---|---|---|
 | `gates-linux` | `units`, `product`, `release`, `checks` | One flag each, below |
 | `gates-macos` | `units-checks`, `product-release` | Two flags each |
-| `windows-gates` | `suite`, `release` | `zig build test`; the release unit and the Windows script suites |
+| `windows-gates` | `units`, `product`, `release` | One flag each: the two halves, and the release unit with the Windows script suites |
 | `tty-linux` | three shards | Every third case of `tests/tty` |
 | `tty-windows` | four shards | Every fourth case, under ConPTY |
 
-The POSIX gate flags:
+The gate flags (Windows has no `checks` leg; its version state gate runs
+on `release`):
 
 | Flag | Steps |
 |---|---|
 | `units` | `zig build test:units`, the native platform modules |
-| `product` | `zig build test:product`, with the pinned WorkBuddy-Bench checkout |
-| `release` | The bundle verification, the arm64 cross-stage (Linux), the install prefix, kernel provenance and staging, the release layout, `install.sh` and the reproducible archive |
+| `product` | `zig build test:product`, with the pinned WorkBuddy-Bench checkout (POSIX) |
+| `release` | The bundle verification, the arm64 cross-stage (Linux), the install prefix, kernel provenance and staging, the release layout, `install.sh` (`install.ps1` on Windows) and the reproducible archive; on Windows also the version state gate and the Windows script suites |
 | `checks` | `zig fmt`, the version state gate, `zig build test:lib -Doptimize=ReleaseSafe`, the coverage audit, the documentation checks and notices (Linux), the script unit suites and `git diff --check` |
 
 The rules that keep the split from dropping coverage:

@@ -2306,8 +2306,8 @@ pub fn build(b: *std.Build) void {
 
     // `test` is exactly its two halves; nothing else is wired into it
     // (scripts/tests/test_gate_manifest.py checks this). CI runs the halves on
-    // separate runners on Linux and macOS, so a check wired straight into
-    // `test` would run there on no runner at all (doc/CI_DESIGN.md §4).
+    // separate runners, so a check wired straight into `test` would run on no
+    // CI runner at all (doc/CI_DESIGN.md §4).
     // `test:units` is the test binaries and the repository's script unit
     // suites; `test:product` drives the built product end to end (the
     // evaluation harness, the smokes, the daemon and the TinyKG transport).
@@ -3146,9 +3146,9 @@ pub fn build(b: *std.Build) void {
         windows_help_cmd.step.dependOn(b.getInstallStep());
         // This gate proves the Windows portability layer and installed CLI can
         // execute natively. The repository-wide suite is a separate gate: the
-        // "Full offline test suite" step of ci.yml's windows-gates job runs
-        // `zig build test -j6` on the native Windows runner (#53 wired it; before
-        // that no workflow ran it and Windows regressions accumulated silently).
+        // `units` and `product` legs of ci.yml's windows-gates job run its two
+        // halves on native Windows runners (#53 wired it; before that no
+        // workflow ran it and Windows regressions accumulated silently).
         // Keep the two decoupled: do not couple the full suite's unrelated
         // subsystem timing/concurrency failures to this platform gate.
         windows_gate_step.dependOn(platform_test_step);

@@ -677,8 +677,9 @@ jobs:
       TTY_SHARD: ${{ matrix.shard }}/${{ strategy.job-total }}
     steps: *tty-steps
 
-  # Two legs: the repository-wide suite, and the release unit with the
-  # Windows script suites. Each step reads its leg's flag, as in `gates-linux`.
+  # Three legs: the two halves of the repository-wide suite, and the release
+  # unit with the Windows script suites. Each step reads its leg's flag, as in
+  # `gates-linux`.
   windows-gates:
     name: Gates (Windows) / ${{ matrix.leg }}
     # 45 minutes: same reasoning as `gates-linux`; the hosted Windows runner
@@ -688,8 +689,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - leg: suite
-            suite: true
+          - leg: units
+            units: true
+          - leg: product
+            product: true
           - leg: release
             release: true
     runs-on: windows-latest
@@ -750,7 +753,7 @@ jobs:
         run: python -m pip install -r requirements-dev.txt
       # As in `gates-linux`: the platform root, standalone, spawn tests on.
       - name: Native platform modules
-        if: matrix.suite && env.FAST_PATH != 'true' && env.SUITES != 'false'
+        if: matrix.units && env.FAST_PATH != 'true' && env.SUITES != 'false'
         shell: cmd
         env:
           METACODES_PROC_TEST: "1"
@@ -842,22 +845,26 @@ jobs:
         if: matrix.release && env.FAST_PATH != 'true' && env.SUITES != 'false'
         shell: cmd
         run: python -m unittest scripts.tests.test_verify_kernel_provenance -v
-      # The repository-wide suite on the native Windows host (#53); it builds
-      # both kernels itself (-Dlean-kernels=on). No
-      # METACODES_TEST_REQUIRE_LEAN_SDK here: the Python Lean-SDK suites stay
-      # POSIX-only (scripts/eval/tests/posix_only.py), and the component tests
-      # that drive a kernel through POSIX-only paths skip on Windows as before.
-      # --test-timeout 5m: the build runner watchdog between tests is
-      # max(--test-timeout, 60s), same as the AgentCore gate. --summary all:
-      # see `gates-linux`.
-      - name: Full offline test suite
-        if: matrix.suite && env.FAST_PATH != 'true' && env.SUITES != 'false'
+      # The repository-wide suite on the native Windows host (#53), as its two
+      # halves like `gates-linux`; each builds both kernels itself
+      # (-Dlean-kernels=on). No METACODES_TEST_REQUIRE_LEAN_SDK here: the
+      # Python Lean-SDK suites stay POSIX-only (scripts/eval/tests/
+      # posix_only.py), and the component tests that drive a kernel through
+      # POSIX-only paths skip on Windows as before. --test-timeout 5m: the
+      # build runner watchdog between tests is max(--test-timeout, 60s), same
+      # as the AgentCore gate. --summary all: see `gates-linux`.
+      - name: Offline test suite (units half)
+        if: matrix.units && env.FAST_PATH != 'true' && env.SUITES != 'false'
         shell: cmd
-        run: zig build test --test-timeout 5m -Dlean-kernels=on --summary all
+        run: zig build test:units --test-timeout 5m -Dlean-kernels=on --summary all
+      - name: Offline test suite (product half)
+        if: matrix.product && env.FAST_PATH != 'true' && env.SUITES != 'false'
+        shell: cmd
+        run: zig build test:product --test-timeout 5m -Dlean-kernels=on --summary all
       # Evidence for the next line-ending incident: if the suite itself rewrites
       # tracked files with CRLF, this lists them; the step never fails.
       - name: Line endings after the suite
-        if: always() && matrix.suite && env.FAST_PATH != 'true' && env.SUITES != 'false'
+        if: always() && (matrix.units || matrix.product) && env.FAST_PATH != 'true' && env.SUITES != 'false'
         shell: cmd
         run: |
           git ls-files --eol | findstr /R "w/crlf w/mixed" & echo (CRLF worktree files after the suite above, if any)

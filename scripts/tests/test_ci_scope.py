@@ -57,7 +57,7 @@ RESULT_JOBS = {
     "TTY (Windows)": "tty-windows",
 }
 # The leg flags a gate step may be gated on; a step without one runs on every leg.
-LEG_FLAGS = {"units", "product", "release", "checks", "suite"}
+LEG_FLAGS = {"units", "product", "release", "checks"}
 
 
 class ClassifyTest(unittest.TestCase):
@@ -310,7 +310,7 @@ class WorkflowTest(unittest.TestCase):
         # A flag no leg sets is a step that runs on no runner at all.
         for job, flags in (("gates-linux", {"units", "product", "release", "checks"}),
                            ("gates-macos", {"units", "product", "release", "checks"}),
-                           ("windows-gates", {"suite", "release"})):
+                           ("windows-gates", {"units", "product", "release"})):
             with self.subTest(job=job):
                 spec = self.jobs[job]
                 read = set()
