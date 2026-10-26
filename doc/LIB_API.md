@@ -280,16 +280,17 @@ prompt 或工具 schema，因此启用 durability 不改变 prompt-cache key。
   init 决定接手这个 Run 之后才真正截断，拒绝时 journal 原样保留。`fail_closed` 下仍是
   `PartialRecord`。
 
-新 lease 先以 `<lock>.<run_id>` 写好记录再用不覆盖的 link（Windows：move）发布，所以
+新 lease 先以 `<lock>.<run_id>.<attempt>` 写好记录再用不覆盖的 link（Windows：move）发布，所以
 锁文件名下永远不会出现空文件；不支持硬链接的文件系统退回原地创建。产品宿主在 Run
 被中止（Esc、Ctrl+C、SIGTERM/SIGHUP）后发布派生产物时不再沿用该中止信号，由 kernel
 自身的超时兜底，否则 lease 会停在 `publication_pending`。
 
 旧版 metacodes 留下的空标记文件不加锁、不记 owner：有任何进程仍打开着它就视为 busy
 （`holder = .unnamed`），无人打开才视为 owner 已死（`evidence = legacy_lease_unheld`）。
-journal 已完整时，空文件按修改时间区分：早于最后一个 Run 的终止记录，是旧版在发布失败
-后保留的标记（`RunPublicationPending`）；晚于它，是写下记录前就死掉的 owner 的残留，
-不挡下一个 Run。
+journal 已完整时，空文件按修改时间区分：早于最后一个已结束 Run 的开始，是旧版在发布
+失败后保留的标记（`RunPublicationPending`）；不早于它，是写下记录前就死掉的 owner 的
+残留，不挡下一个 Run。以 Run 的开始而非结束为界，把整个 Run 的时长留作粗粒度文件时钟
+的余量。
 宿主用 `describeRefusal` / `describeAbandoned` 把这些结果说给用户听。
 
 ### System prompt profile

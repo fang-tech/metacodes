@@ -280,8 +280,8 @@ pub const ValidationSummary = struct {
     artifact_sha256: [64]u8,
     /// Set exactly when `complete` is false.
     open_run: ?OpenRun = null,
-    /// Wall time of the last Run's terminal record, when a Run has closed.
-    last_closed_wall_ns: ?i128 = null,
+    /// Wall time the last closed Run started, when a Run has closed.
+    last_closed_run_started_wall_ns: ?i128 = null,
 };
 
 /// Immutable source interval for a later reflection/counterexample candidate.
@@ -490,7 +490,6 @@ pub const Journal = struct {
         const summary = validateFd(fd, session_id, null, null) catch |err| blk: {
             if (err != error.PartialRecord or options.abandoned_run != .record_abandoned) return err;
             torn = try planTornTailCut(fd, session_id);
-            if (options.report) |report| report.discarded_tail = torn.?.tail;
             break :blk torn.?.summary;
         };
         var abandon: ?OwnerEvidence = null;
@@ -502,11 +501,13 @@ pub const Journal = struct {
             .record => |state| if (state == .publication_pending) return error.RunPublicationPending,
             // An older metacodes kept its marker past a Run's terminal record
             // only when publication failed (or it died in the instant between),
-            // and that marker dates from the Run's start. An empty lease made
-            // after the journal's last Run closed is a leftover of an owner
+            // and it made that marker just before the Run started. An empty
+            // lease made after the last Run closed is a leftover of an owner
             // that died before writing anything, and keeps nothing pending.
-            .legacy => |modified| if (summary.last_closed_wall_ns) |closed| {
-                if (modified <= closed) return error.RunPublicationPending;
+            // Comparing with the start leaves the Run's whole length as margin
+            // for coarse file clocks; a tie is not taken as kept.
+            .legacy => |modified| if (summary.last_closed_run_started_wall_ns) |started| {
+                if (modified < started) return error.RunPublicationPending;
             },
             .created, .unreadable => {},
         }
@@ -518,7 +519,10 @@ pub const Journal = struct {
             try writeLeaseRecord(lease.fd, run_id, started_wall_ns, .running);
             lease.recorded = true;
         }
-        if (torn) |cut| try applyTornTailCut(fd, cut.kept);
+        if (torn) |cut| {
+            try applyTornTailCut(fd, cut.kept);
+            if (options.report) |report| report.discarded_tail = cut.tail;
+        }
         if (pfs.lseek(fd, 0, .end) < 0) return error.SeekFailed;
 
         var journal = Journal{
@@ -684,8 +688,11 @@ pub const Journal = struct {
         } else {
             // Remove the name while still holding the lock: a process that
             // opened it before then holds a file nobody can name, which
-            // `Lease.acquire` notices, never a second live lease.
-            const removed = if (pfs.unlinkPath(path)) true else |err| err == error.NotFound;
+            // `Lease.acquire` notices, never a second live lease. A name that
+            // no longer leads here (an older metacodes' late unlink, then a
+            // new lease) is someone else's and stays.
+            const ours = namesFile(path, self.lock_fd) catch false;
+            const removed = if (!ours) true else if (pfs.unlinkPath(path)) true else |err| err == error.NotFound;
             // Still named and still locked by this process: a retry may unlink
             // it. Once the name is gone it may belong to a successor at any
             // moment, so nothing below may fail into a retry.
@@ -1014,14 +1021,12 @@ const Lease = struct {
             if (installed == .already_exists) pfs.unlinkPath(staged.ptr) catch {};
             return null;
         }
-        const installed = pfs.installNoReplace(staged.ptr, path) catch {
-            // A filesystem without hard links (FAT, exFAT, many network
-            // mounts): create the lease in place. There the record follows
-            // the create closely, not atomically with it.
-            if (pfs.lastErrnoIs(.PERM) or pfs.lastErrnoIs(.OPNOTSUPP) or pfs.lastErrnoIs(.MLINK))
-                return publishInPlace(path, run_id, acquired_wall_ns);
-            return error.LeasePublishFailed;
-        };
+        // A link refused for any reason but an existing lease (no hard links
+        // on FAT, exFAT, many network and FUSE mounts): create the lease in
+        // place. There the record follows the create closely, not atomically
+        // with it, and an empty leftover is judged by its age.
+        const installed = pfs.installNoReplace(staged.ptr, path) catch
+            return publishInPlace(path, run_id, acquired_wall_ns);
         if (installed == .already_exists) return null;
         // Linked: the lease is published and this descriptor holds its lock.
         keep = true;
@@ -1064,7 +1069,7 @@ const Lease = struct {
                 pfs.unlinkPath(path) catch {};
                 return;
             }
-            pfs.unlinkPath(path) catch {};
+            if (namesFile(path, self.fd) catch false) pfs.unlinkPath(path) catch {};
         }
         _ = pfs.close(self.fd);
     }
@@ -1582,7 +1587,7 @@ fn validateBytes(
     var expected_sequence: u64 = 0;
     var active_run: ?session_id_mod.SessionId = null;
     var active_started_wall_ns: i128 = 0;
-    var last_closed_wall_ns: ?i128 = null;
+    var last_closed_run_started_wall_ns: ?i128 = null;
     // The most recently started dispatch of the active Run, to name the tool a
     // dead owner left running.
     var last_dispatch_key: ?[32]u8 = null;
@@ -1915,9 +1920,9 @@ fn validateBytes(
                     },
                 }
             },
-            .run_finished => |finished| {
+            .run_finished => {
                 const current = active_run orelse return error.InvalidRecord;
-                last_closed_wall_ns = finished.finished_wall_ns;
+                last_closed_run_started_wall_ns = active_started_wall_ns;
                 if (!std.mem.eql(u8, current.asSlice(), run_id.asSlice()) or
                     envelope.monotonic_elapsed_ns < active_elapsed_ns or
                     open_dispatches.count() != 0 or open_provider_attempts.count() != 0 or
@@ -1956,7 +1961,7 @@ fn validateBytes(
                 const current = active_run orelse return error.InvalidRecord;
                 const recovered_by = session_id_mod.SessionId.fromSlice(abandoned.recovered_by_run_id) orelse
                     return error.InvalidRecord;
-                last_closed_wall_ns = abandoned.recovered_wall_ns;
+                last_closed_run_started_wall_ns = active_started_wall_ns;
                 if (!std.mem.eql(u8, envelope.schema_version, SCHEMA_VERSION) or
                     !std.mem.eql(u8, current.asSlice(), run_id.asSlice()) or
                     std.mem.eql(u8, recovered_by.asSlice(), run_id.asSlice()) or
@@ -2013,7 +2018,7 @@ fn validateBytes(
         .complete = reducer_complete,
         .artifact_sha256 = observation.sha256Hex(bytes),
         .open_run = open_run,
-        .last_closed_wall_ns = last_closed_wall_ns,
+        .last_closed_run_started_wall_ns = last_closed_run_started_wall_ns,
     };
 }
 
@@ -3983,8 +3988,24 @@ test "an empty lease made after the last Run closed is a leftover, not a kept ma
     try std.testing.expect(leftover >= 0);
     _ = pfs.close(leftover);
     var next = try Journal.init(root, sid);
-    defer next.deinit();
+    const started = next.started_wall_ns;
     try next.finishRun("end_turn");
+    next.deinit();
+
+    if (is_windows) return; // stamping a file below is POSIX
+    // A coarse file clock can stamp a leftover with the very time the last Run
+    // started: a tie is not a kept marker.
+    const tie = pfs.open(lease_path.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true }, @as(std.c.mode_t, 0o600));
+    try std.testing.expect(tie >= 0);
+    const stamp: std.c.timespec = .{
+        .sec = @intCast(@divFloor(started, std.time.ns_per_s)),
+        .nsec = @intCast(@mod(started, std.time.ns_per_s)),
+    };
+    try std.testing.expectEqual(@as(c_int, 0), std.c.futimens(tie, &.{ stamp, stamp }));
+    _ = pfs.close(tie);
+    var after_tie = try Journal.init(root, sid);
+    defer after_tie.deinit();
+    try after_tie.finishRun("end_turn");
 }
 
 test "a plain finish that died before its release lets the next Run start" {
@@ -4232,6 +4253,28 @@ test "a lease created in place, where links are unsupported, is locked and names
     try std.testing.expectError(error.WouldBlock, pfs.tryLockExclusive(other));
     // A second in-place create finds the lease and leaves it alone.
     try std.testing.expect((try Lease.publishInPlace(lease_path.ptr, session_id_mod.gen(), 8)) == null);
+}
+
+test "a release never removes a lease name that no longer leads to its own file" {
+    if (is_windows) return error.SkipZigTest; // Windows will not delete an open file
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buffer[0..try tmp.dir.realPath(std.testing.io, &root_buffer)];
+    const sid = session_id_mod.SessionId.fromSlice("0123456789abcdef01234567").?;
+    var lease_buf: [std.fs.max_path_bytes + 1]u8 = undefined;
+    const lease_path = try testLeasePath(&lease_buf, root);
+
+    var owner = try Journal.init(root, sid);
+    defer owner.deinit();
+    // An older metacodes' late unlink took this owner's name, and another
+    // process has put its own lease there since.
+    try pfs.unlinkPath(lease_path.ptr);
+    const successor = pfs.open(lease_path.ptr, .{ .ACCMODE = .RDWR, .CREAT = true, .EXCL = true }, @as(std.c.mode_t, 0o600));
+    try std.testing.expect(successor >= 0);
+    defer _ = pfs.close(successor);
+    try owner.finishRun("end_turn");
+    try std.testing.expect(pfs.exists(lease_path.ptr));
 }
 
 test "a lease reached through a name that has since moved is not the lease" {
