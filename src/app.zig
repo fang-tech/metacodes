@@ -4157,9 +4157,12 @@ pub fn terminateRequested() bool {
 var g_terminate_requested = std.atomic.Value(bool).init(false);
 
 /// How long a requested termination may take before the process is ended
-/// outright: enough for a Run to stop its tools and close its journal, not so
-/// long that a process whose terminal is gone outlives it noticeably.
-const terminate_grace_s: c_uint = 10;
+/// outright. A stopped Run with project rules re-attests its bundle before it
+/// gives its lease up, and the project kernel may take up to 30 s
+/// (`METACODES_PROJECT_KERNEL_TIMEOUT_MS`); ending the process inside that
+/// would leave the session closed. Usually the process is gone in well under
+/// a second. (Windows ends a process ~5 s after its console closes.)
+const terminate_grace_s: c_uint = 45;
 
 /// A termination request stops the process as Ctrl+C does (abort the Run,
 /// request shutdown) and bounds how long that may take. Only the first one

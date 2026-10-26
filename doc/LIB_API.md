@@ -276,8 +276,9 @@ prompt 或工具 schema，因此启用 durability 不改变 prompt-cache key。
   `RunPublicationPending`，两种策略都不放行。
 - 死掉的 owner 写到一半的最后一条记录（没有换行）从未被确认过——记录要整条写完并刷盘才
   算确认——所以 `record_abandoned` 下把它从 journal 末尾截掉，长度与 SHA-256 记进新 Run
-  的 `run_started.discarded_tail`；截掉之前，前面的全部记录必须先通过校验。`fail_closed`
-  下仍是 `PartialRecord`。
+  的 `run_started.discarded_tail`；截掉之前，前面的全部记录必须先通过校验，而且只在
+  init 决定接手这个 Run 之后才真正截断，拒绝时 journal 原样保留。`fail_closed` 下仍是
+  `PartialRecord`。
 
 新 lease 先以 `<lock>.<run_id>` 写好记录再用不覆盖的 link（Windows：move）发布，所以
 锁文件名下永远不会出现空文件；不支持硬链接的文件系统退回原地创建。产品宿主在 Run
@@ -286,6 +287,9 @@ prompt 或工具 schema，因此启用 durability 不改变 prompt-cache key。
 
 旧版 metacodes 留下的空标记文件不加锁、不记 owner：有任何进程仍打开着它就视为 busy
 （`holder = .unnamed`），无人打开才视为 owner 已死（`evidence = legacy_lease_unheld`）。
+journal 已完整时，空文件按修改时间区分：早于最后一个 Run 的终止记录，是旧版在发布失败
+后保留的标记（`RunPublicationPending`）；晚于它，是写下记录前就死掉的 owner 的残留，
+不挡下一个 Run。
 宿主用 `describeRefusal` / `describeAbandoned` 把这些结果说给用户听。
 
 ### System prompt profile

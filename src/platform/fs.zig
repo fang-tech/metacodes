@@ -376,6 +376,10 @@ pub const FileInfo = struct {
     /// True for a directory. `is_regular` answers the common case; a caller
     /// that hands a pathname to another process has to know the difference.
     is_dir: bool,
+    /// Last data modification, wall-clock nanoseconds since the Unix epoch
+    /// (Windows: 100 ns resolution). For a file never written since it was
+    /// created, its creation time.
+    modified_wall_ns: i128,
 };
 
 /// 对已打开 fd 做类型与大小检查。安全敏感读取必须先 open(O_NOFOLLOW)，再 fstat fd，
@@ -393,6 +397,7 @@ pub fn fileInfo(fd: Fd) error{StatFailed}!FileInfo {
             .inode = @intCast(st.st_ino),
             .uid = 0,
             .is_dir = (@as(u32, st.st_mode) & S_IFMT) == S_IFDIR,
+            .modified_wall_ns = windowsModifiedNs(fd) orelse @as(i128, st.st_mtime) * std.time.ns_per_s,
         };
     }
     if (builtin.os.tag == .linux) {
@@ -410,6 +415,7 @@ pub fn fileInfo(fd: Fd) error{StatFailed}!FileInfo {
             .inode = stx.ino,
             .uid = stx.uid,
             .is_dir = (@as(u32, stx.mode) & S_IFMT) == S_IFDIR,
+            .modified_wall_ns = @as(i128, stx.mtime.sec) * std.time.ns_per_s + stx.mtime.nsec,
         };
     }
     var st: std.c.Stat = undefined;
@@ -423,8 +429,26 @@ pub fn fileInfo(fd: Fd) error{StatFailed}!FileInfo {
         .inode = @intCast(st.ino),
         .uid = @intCast(st.uid),
         .is_dir = (@as(u32, @intCast(st.mode)) & S_IFMT) == S_IFDIR,
+        .modified_wall_ns = @as(i128, st.mtime().sec) * std.time.ns_per_s + st.mtime().nsec,
     };
 }
+
+/// `_fstat64` keeps whole seconds; the handle's write time has 100 ns.
+fn windowsModifiedNs(fd: Fd) ?i128 {
+    const raw = _get_osfhandle(fd);
+    if (raw == -1) return null;
+    var written: std.os.windows.FILETIME = undefined;
+    if (GetFileTime(@ptrFromInt(@as(usize, @bitCast(raw))), null, null, &written) == 0) return null;
+    const ticks = (@as(i128, written.dwHighDateTime) << 32) | written.dwLowDateTime;
+    // FILETIME counts 100 ns ticks from 1601-01-01.
+    return (ticks - 116_444_736_000_000_000) * 100;
+}
+extern "kernel32" fn GetFileTime(
+    hFile: *anyopaque,
+    lpCreationTime: ?*std.os.windows.FILETIME,
+    lpLastAccessTime: ?*std.os.windows.FILETIME,
+    lpLastWriteTime: ?*std.os.windows.FILETIME,
+) callconv(.winapi) c_int;
 
 /// 禁止 fd 穿过后续 exec 边界。POSIX 用 FD_CLOEXEC；Windows 清底层 HANDLE 的
 /// HANDLE_FLAG_INHERIT，避免 bInheritHandles=TRUE 的工具子进程拿到可信 artifact fd。
@@ -868,6 +892,29 @@ test "tryLockExclusive: one open file holds the lock until it is closed" {
     try std.testing.expectEqualStrings("owner", buf[0..@intCast(n)]);
     close(first);
     try tryLockExclusive(second);
+}
+
+test "fileInfo reports when a file was last written, on the wall clock" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const first = try std.fmt.allocPrintSentinel(allocator, "{s}/first", .{root_buffer[0..root_len]}, 0);
+    defer allocator.free(first);
+    const second = try std.fmt.allocPrintSentinel(allocator, "{s}/second", .{root_buffer[0..root_len]}, 0);
+    defer allocator.free(second);
+    try writeWholeFile(first, "a");
+    try writeWholeFile(second, "b");
+    const a = open(first.ptr, .{ .ACCMODE = .RDONLY }, 0);
+    defer close(a);
+    const b = open(second.ptr, .{ .ACCMODE = .RDONLY }, 0);
+    defer close(b);
+    const written_a = (try fileInfo(a)).modified_wall_ns;
+    const written_b = (try fileInfo(b)).modified_wall_ns;
+    // After 2020-09-13 (1.6e18 ns), and in the order the files were written.
+    try std.testing.expect(written_a > 1_600_000_000 * std.time.ns_per_s);
+    try std.testing.expect(written_b >= written_a);
 }
 
 test "Windows: a plain open reader (no FILE_SHARE_DELETE) does block renameReplace" {
