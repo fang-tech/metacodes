@@ -213,17 +213,7 @@ fn sameSize(size: term.TermSize) bool {
 }
 
 fn writeAll(bytes: []const u8) bool {
-    var rest = bytes;
-    while (rest.len > 0) {
-        const n = pfs.write(1, rest);
-        if (n < 0) {
-            if (pfs.lastErrnoIs(.INTR)) continue;
-            return false;
-        }
-        if (n == 0) return false;
-        rest = rest[@intCast(n)..];
-    }
-    return true;
+    return pfs.writeAll(1, bytes);
 }
 
 const testing = std.testing;

@@ -103,7 +103,7 @@ fn readFile(alloc: std.mem.Allocator, path: []const u8) ![]u8 {
     errdefer all.deinit(alloc);
     var buf: [4096]u8 = undefined;
     while (true) {
-        const n = pfs.read(fd, buf[0..buf.len]);
+        const n = pfs.read(fd, buf[0..buf.len]); // no EINTR: regular file
         if (n < 0) return error.ReadFailed;
         if (n == 0) break;
         try all.appendSlice(alloc, buf[0..@intCast(n)]);
@@ -122,7 +122,7 @@ fn writeFile(path: []const u8, bytes: []const u8) !void {
 
     var written: usize = 0;
     while (written < bytes.len) {
-        const n = pfs.write(fd, bytes[written..][0 .. bytes.len - written]);
+        const n = pfs.write(fd, bytes[written..][0 .. bytes.len - written]); // no EINTR: regular file
         if (n < 0) return error.WriteFailed;
         if (n == 0) break;
         written += @intCast(n);

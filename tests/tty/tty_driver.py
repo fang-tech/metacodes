@@ -360,6 +360,10 @@ def _drive(key_events, write, cap, set_size, per_key_drain, signal_child=None):
             name = ev[4:]
             write(SPECIAL.get(name, b""))
             cap.drain_settle(per_key_drain, QUIET_KEY)
+        elif ev.startswith("resize-now:"):
+            r2, c2 = ev[11:].split("x")
+            set_size(int(r2), int(c2))
+            cap.drain(0.02)
         elif ev.startswith("strictsleep:"):
             cap.drain(float(ev[12:]))
         elif ev.startswith("sleep:"):
@@ -418,6 +422,7 @@ def run(bin_path, key_events, term_size=(24, 80), env=None,
                          (等命令输出用:回显行 `❯ !echo X` 含 X 但整行不等于 X)
       "resize:RxC"       运行中改窗口(触 SIGWINCH / ConPTY resize)
       "raw:..."          原样字节(用 \\xNN 转义)
+      "resize-now:RxC"   改窗口后只收 20ms(resize: 收 0.2s):把 resize 塞进一个按键序列的字节之间
       "signal:stopcont"  POSIX-only: stop and continue the child process
       "signal:stopcont:cooked"  同上,停住期间把 pty 改回 canonical(像 shell 那样)
     """

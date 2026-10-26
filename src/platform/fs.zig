@@ -499,6 +499,80 @@ pub fn write(fd: c_int, buf: []const u8) isize {
     return std.c.write(fd, buf.ptr, buf.len);
 }
 
+/// Write all of `bytes`, retrying a write that a signal cut short before it
+/// moved a byte (EINTR: the REPL's SIGWINCH handler has no SA_RESTART, so a
+/// resize interrupts a write the terminal is blocking). False when a write
+/// fails or makes no progress; what was written stays written. Windows writes
+/// never report EINTR, so a stale errno there is not taken for one.
+pub fn writeAll(fd: c_int, bytes: []const u8) bool {
+    return writeAllVia(write, fd, bytes);
+}
+
+fn writeAllVia(comptime writeFn: fn (c_int, []const u8) isize, fd: c_int, bytes: []const u8) bool {
+    var rest = bytes;
+    while (rest.len > 0) {
+        const n = writeFn(fd, rest);
+        if (n < 0) {
+            if (!is_windows and lastErrnoIs(.INTR)) continue;
+            return false;
+        }
+        if (n == 0) return false;
+        rest = rest[@intCast(n)..];
+    }
+    return true;
+}
+
+const FakeWrite = struct {
+    /// What each call does: a byte count, or an errno to fail with.
+    const Step = union(enum) { wrote: usize, fail: std.c.E };
+    var steps: []const Step = &.{};
+    var calls: usize = 0;
+    var out: [64]u8 = undefined;
+    var len: usize = 0;
+
+    fn reset(script: []const Step) void {
+        steps = script;
+        calls = 0;
+        len = 0;
+    }
+
+    fn write(_: c_int, buf: []const u8) isize {
+        const step = steps[calls];
+        calls += 1;
+        switch (step) {
+            .wrote => |n| {
+                const take = @min(n, buf.len);
+                @memcpy(out[len..][0..take], buf[0..take]);
+                len += take;
+                return @intCast(take);
+            },
+            .fail => |code| {
+                std.c._errno().* = @intFromEnum(code);
+                return -1;
+            },
+        }
+    }
+};
+
+test "writeAll retries a write a signal interrupted and finishes the frame" {
+    if (is_windows) return error.SkipZigTest;
+    FakeWrite.reset(&.{ .{ .wrote = 3 }, .{ .fail = .INTR }, .{ .wrote = 64 } });
+    try std.testing.expect(writeAllVia(FakeWrite.write, 1, "frame-bytes"));
+    try std.testing.expectEqualStrings("frame-bytes", FakeWrite.out[0..FakeWrite.len]);
+    try std.testing.expectEqual(@as(usize, 3), FakeWrite.calls);
+}
+
+test "writeAll stops on a real write error and on a write that moves nothing" {
+    FakeWrite.reset(&.{ .{ .wrote = 2 }, .{ .fail = .IO }, .{ .wrote = 64 } });
+    try std.testing.expect(!writeAllVia(FakeWrite.write, 1, "frame"));
+    try std.testing.expectEqualStrings("fr", FakeWrite.out[0..FakeWrite.len]);
+    try std.testing.expectEqual(@as(usize, 2), FakeWrite.calls);
+
+    FakeWrite.reset(&.{ .{ .wrote = 0 }, .{ .wrote = 64 } });
+    try std.testing.expect(!writeAllVia(FakeWrite.write, 1, "frame"));
+    try std.testing.expectEqual(@as(usize, 1), FakeWrite.calls);
+}
+
 /// 刷盘。POSIX fsync / Windows _commit。
 pub fn fsync(fd: c_int) void {
     fsyncChecked(fd) catch {};

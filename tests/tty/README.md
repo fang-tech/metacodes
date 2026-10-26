@@ -37,7 +37,7 @@ python3 tests/tty/run_tty_tests.py --bin zig-out/bin/metacodes-debug --shard 2/3
   → 虚拟 grid + 光标 + SGR border_class;`char_width` 复刻 `src/repl/tui/term.zig` 的 CJK/emoji 宽度表。
 - `tty_driver.py` —— `run(bin, key_events, term_size)`:fork pty + TIOCSWINSZ + 键名映射
   (`type:文本`/`key:shift_enter|backspace|left|right|shift_tab|ctrl_u|enter`/`sleep:N`/
-  `strictsleep:N`/`wait:PATTERN:N`/`waitbytes:ESC:N`/`resize:RxC`)。锁 `FORCE_COLOR=1` 让 accent/warn SGR 稳定可断言;
+  `strictsleep:N`/`wait:PATTERN:N`/`waitbytes:ESC:N`/`resize:RxC`/`resize-now:RxC`)。锁 `FORCE_COLOR=1` 让 accent/warn SGR 稳定可断言;
   默认 `METACODES_NO_STARTUP_ANIMATION=1` 关掉启动动画(布局类用例断言的是它之后的画面),
   `test_startup_splash` 经 env 参数传 `None` 打开。
   **等待语义(事件+上限结合)**:`sleep:N` 是 settle 睡眠——至多 N 秒,输出流静默 0.8s 即提前返回
@@ -75,6 +75,7 @@ python3 tests/tty/run_tty_tests.py --bin zig-out/bin/metacodes-debug --shard 2/3
 | T13 提交回显 | 提交后用户输入留在 scrollback(❯ 行) |
 | startup_splash | 启动动画原地重绘、定格字标在 banner 上方且只用 Metask Lab 的字母、任意键跳过且吃掉该键、env/config 开关、窄终端不播(帧字节类断言 Windows 跳过:ConPTY 重编码) |
 | e2e_metask_device(真模型) | Metask 设备码登录(程序化确认)→ 经网关请求真实模型 → 本地账本每请求带 X-Metask-Request-Id → `scripts/metask_reconcile.py` 与网关 /v1/usage 对账零差异;需 METASK_WEB_SESSION_TOKEN、METASK_SITE_URL、METASK_MODELS |
+| T45-T47 resize 打断按键 | ESC、resize、`[A` 在一次 ESC 等待内先后到达:反向搜索不被取消、transcript viewer 不被关掉,`[A` 不漏进输入框(#340);单按 Esc 不等下一个键就关 viewer(POSIX;ConPTY 无 SIGWINCH,T45/T46 跳过) |
 
 ## 已发现并修复的 bug
 - **输入框跳动**(T07):回顶用 `prev_rows`(总行数)而非 `cursor_row`(光标实际行)→ 逐帧上漂。
