@@ -156,6 +156,7 @@ test {
     _ = @import("component/jev_memory_plane_test.zig");
     _ = @import("component/tinykgd_resolution_test.zig");
     _ = @import("component/adjacent_symlink_test.zig");
+    _ = @import("component/update_test.zig");
     _ = @import("component/swarm_file_race_test.zig");
     _ = @import("component/kgd_e2e_test.zig");
 }

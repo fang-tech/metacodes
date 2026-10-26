@@ -263,7 +263,7 @@ fixed repair hint:
 | `config_invalid` | fix the URL, API key, and expected build-id JSON |
 | `daemon_unreachable` | a CLI session starts it when it begins (`METACODES_KG_AUTOSTART=0` turns that off); `metacodes kgd` starts it now |
 | `auth_failed` | match the daemon's `TINYKG_WEB_API_KEY` |
-| `pin_mismatch` | use the running daemon's catalog build/schema values |
+| `pin_mismatch` | a session repins this install's own service when its TinyKG binaries changed (see "A stale pin"); if it still runs an earlier build, stop it so the next session starts the installed one; `metacodes kg install [--config <path>]` repins by hand; a remote service needs its catalog build/schema values |
 | `store_contract_mismatch` | migrate storage and schema to 3/3 |
 | `server_degraded` | inspect the daemon's degraded-store logs |
 | `cli_bin_missing` | set `METACODES_KG_BIN` or install the staged bundle |
@@ -324,6 +324,46 @@ fails closed). `METACODES_KG_AUTOSTART=0` (or `false`/`off`) turns it off. The
 `/kg` and `doctor`) say so, and the `auth_failed` hint names the squatting
 case. The core never spawns the service itself:
 an SDK embedder passes its own hook, or none.
+
+#### A stale pin
+
+`daemon.json` pins `expected_build_id`, a hash over the service contract, the
+tinykg and tinykgd executables' digests, the engine version and its
+capabilities (`src/kg/kgd/identity.zig`). An update or reinstall that changes
+the TinyKG binaries leaves the pin naming the old ones. The next service then
+reports another id, and the transport refuses it: `BuildMismatch`, which a
+session reports as `pin_mismatch`. That error is separate from
+`IncompatibleDaemon`, because everything else (protocol, implementation,
+schema mode) matched: it is this install's own service on other binaries.
+Before autostart repinned, nothing recovered from it.
+
+A session that meets `BuildMismatch` from a loopback service:
+
+1. reads `daemon.json` again, and probes again if the pin there changed. A
+   session that started before another session, or `metacodes update`,
+   repinned still holds the old pin in memory;
+2. otherwise asks the host with the reason `stale_pin`. Autostart probes the
+   port with the configuration's key. When the service holds it, autostart
+   compares the pin with the id the installed binaries produce
+   (`kgd_install.installedBuildId`):
+   - **They differ:** it rewrites the pin to the installed id, as
+     `metacodes kg install` does (key, port and store kept), and the session
+     reads the file and probes once more.
+   - **They are equal:** the running service is on an earlier build than is
+     installed, and only restarting it helps. That is logged, and the session
+     stays degraded.
+
+Autostart also pins the installed binaries' id right before it starts a
+service itself, since that service will run them. A session after an update
+and a reboot therefore never meets the stale pin at all.
+
+The rewrite applies only to the default configuration: a `METACODES_KG_CONFIG`
+file is left as written, with a hint to repin it with `kg install --config`.
+A listener that refuses the key is never repinned; it takes the port-move
+path above. A degraded session gets here again on its next re-probe, so it
+recovers without restarting. `metacodes update` repins as well when it changes
+the TinyKG binaries (doc/UPDATE_DESIGN.md §6.3); both rewrites write the same
+value.
 
 The started service stays up until it is stopped or the machine restarts;
 there is no idle exit. A write that met a service which had just exited would

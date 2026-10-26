@@ -11,12 +11,25 @@ against, so the three cannot drift apart unnoticed.
 install.sh runs end to end against a stand-in release unit whose executable
 records its arguments; install.ps1 is checked through its order function only
 (its stand-in would have to be a Windows executable).
+
+The same stand-in shows where install.sh tells a unit it came from, for
+`metacodes update` (doc/UPDATE_DESIGN.md §3): a published release, served from a
+loopback mirror, is installed with `--release-base <base>` when the unit's
+`install --help` names that option and without it otherwise; an archive or unit
+named on the command line is installed with neither, so the install keeps the
+source it had.
 """
+import hashlib
+import http.server
+import io
 import os
+import platform
 import re
 import shutil
 import subprocess
+import tarfile
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 
@@ -55,7 +68,7 @@ def posix_shells():
 # check) and records the arguments of the install it is asked to do.
 STUB = """#!/bin/sh
 if [ "$1" = install ] && [ "$2" = --help ]; then
-  echo "usage: metacodes install --prefix <dir> [--upgrade]{guard_option} [--force]" >&2
+  echo "usage: metacodes install --prefix <dir> [--upgrade]{guard_option} [--force]{source_options}" >&2
   exit 0
 fi
 printf '%s\\n' "$@" > "$STUB_ARGV"
@@ -72,9 +85,10 @@ class InstallShTest(unittest.TestCase):
     def tearDown(self):
         self._tmp.cleanup()
 
-    def unit(self, version, guards):
-        """A release unit of `version`; `guards`: its install refuses downgrades."""
-        unit = Path(tempfile.mkdtemp(dir=self.tmp, prefix="unit-"))
+    def unit(self, version, guards, sources=False, parent=None):
+        """A release unit of `version`; `guards`: its install refuses
+        downgrades; `sources`: it can record where it came from."""
+        unit = Path(tempfile.mkdtemp(dir=parent or self.tmp, prefix="unit-"))
         (unit / "bin").mkdir()
         (unit / "manifest.json").write_text(
             '{\n  "schema_version": 2,\n  "vendor": "metask",\n  "name": "metacodes-cli",\n'
@@ -82,7 +96,12 @@ class InstallShTest(unittest.TestCase):
             encoding="utf-8",
         )
         exe = unit / "bin" / "metacodes"
-        exe.write_text(STUB.replace("{guard_option}", " [--allow-downgrade]" if guards else ""), encoding="utf-8")
+        exe.write_text(
+            STUB.replace("{guard_option}", " [--allow-downgrade]" if guards else "").replace(
+                "{source_options}", " [--release-base <url> | --checkout <dir>]" if sources else ""
+            ),
+            encoding="utf-8",
+        )
         exe.chmod(0o755)
         return unit
 
@@ -101,12 +120,13 @@ class InstallShTest(unittest.TestCase):
 
     def install(self, unit, prefix, *options, shell="/bin/sh"):
         """Runs install.sh; returns (exit code, stderr, the unit's install
-        arguments or None when the unit was not asked to install)."""
+        arguments or None when the unit was not asked to install). A `unit` of
+        None installs a published release (`options` name the mirror)."""
         argv_file = self.tmp / "argv"
         if argv_file.exists():
             argv_file.unlink()
         completed = subprocess.run(
-            [shell, str(INSTALL_SH), "--no-link", "--no-sdk", "--prefix", str(prefix), *options, str(unit)],
+            [shell, str(INSTALL_SH), "--no-link", "--no-sdk", "--prefix", str(prefix), *options, *([str(unit)] if unit else [])],
             # A user locale whose collation is not ASCII order: the order must
             # not depend on it.
             env={
@@ -174,6 +194,98 @@ class InstallShTest(unittest.TestCase):
         code, err, argv = self.install(self.unit("0.5.0", False), prefix)
         self.assertEqual(code, 0, err)
         self.assertEqual(argv[:4], ["install", "--prefix", str(prefix), "--upgrade"])
+
+    def test_a_unit_named_on_the_command_line_records_no_source(self):
+        code, err, argv = self.install(self.unit("0.8.0", True, sources=True), self.prefix(None))
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("--release-base", argv)
+        self.assertNotIn("--checkout", argv)
+
+    @unittest.skipUnless(
+        (platform.system(), platform.machine()) in {("Darwin", "arm64"), ("Linux", "x86_64")},
+        "install.sh downloads releases only for aarch64-macos and x86_64-linux-gnu",
+    )
+    def test_a_published_release_records_the_mirror_it_came_from(self):
+        target = "aarch64-macos" if platform.system() == "Darwin" else "x86_64-linux-gnu"
+        for sources in (True, False):
+            with self.subTest(sources=sources), ReleaseMirror(self, "0.8.0", target, sources) as mirror:
+                code, err, argv = self.install(None, self.prefix(None), "--release-base", mirror.base + "/")
+                self.assertEqual(code, 0, err)
+                self.assertEqual(argv[:4], ["install", "--prefix", str(self.tmp / "opt" / "metacodes"), "--upgrade"])
+                if sources:
+                    # The trailing slash is install.sh's to drop, as always.
+                    self.assertEqual(argv[argv.index("--release-base") + 1], mirror.base)
+                else:
+                    self.assertNotIn("--release-base", argv)  # it would reject it as unknown
+                self.assertTrue(mirror.served("/latest"))
+
+
+class ReleaseMirror:
+    """A loopback copy of the releases page layout: `latest` redirects to
+    `tag/<version>`, and `download/<version>/` holds the release's
+    SHA256SUMS and the target's archive of a stand-in unit."""
+
+    def __init__(self, test, version, target, sources):
+        root_name = f"metacodes-{version}-{target}"
+        staging = Path(tempfile.mkdtemp(dir=test.tmp, prefix="mirror-"))
+        unit = test.unit(version, True, sources=sources, parent=staging)
+        buffer = io.BytesIO()
+        with tarfile.open(fileobj=buffer, mode="w:gz") as archive:
+            archive.add(str(unit), arcname=root_name)
+        asset = f"{root_name}.tar.gz"
+        data = buffer.getvalue()
+        sums = f"{hashlib.sha256(data).hexdigest()}  {asset}\n".encode()
+        self.files = {
+            f"/r/download/{version}/{asset}": data,
+            f"/r/download/{version}/metacodes-{version}-SHA256SUMS": sums,
+        }
+        self.version = version
+        self.requests = []
+
+    def served(self, suffix):
+        return any(path.endswith(suffix) for path in self.requests)
+
+    def __enter__(self):
+        mirror = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_HEAD(self):  # noqa: N802 — install.sh asks for `latest` with curl -I
+                self.do_GET(head=True)
+
+            def do_GET(self, head=False):  # noqa: N802 (http.server's name)
+                mirror.requests.append(self.path)
+                if self.path == "/r/latest":
+                    self.send_response(302)
+                    self.send_header("Location", f"{mirror.base}/tag/{mirror.version}")
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                if self.path == f"/r/tag/{mirror.version}":
+                    body = b"release page"
+                elif self.path in mirror.files:
+                    body = mirror.files[self.path]
+                else:
+                    self.send_error(404)
+                    return
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                if not head:
+                    self.wfile.write(body)
+
+        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.base = f"http://127.0.0.1:{self.server.server_address[1]}/r"
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        return self
+
+    def __exit__(self, *exc):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join()
 
 
 def powershell():

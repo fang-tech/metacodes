@@ -262,6 +262,7 @@ metacodes                                  # interactive TUI
 metacodes -p "explain src/main.zig" --json # headless, one NDJSON result
 metacodes --web                            # browser UI on 127.0.0.1:7777
 metacodes doctor                           # where every runtime asset resolves from
+metacodes update                           # move this install to the latest release
 ```
 
 To build from source you need Zig 0.16:

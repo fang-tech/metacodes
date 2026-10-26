@@ -610,7 +610,7 @@ class VersionGateStepTest(unittest.TestCase):
         return proc, calls
 
     def test_a_pull_request_run_reads_the_labels_the_pr_has_now(self):
-        for job in ("gates", "windows-gates"):
+        for job in ("gates-linux", "windows-gates"):
             proc, calls = self.run_step(job, "176")
             self.assertEqual(proc.returncode, 0, proc.stderr)
             self.assertIn("labels=[bug,release] argv=scripts/check_version_state.py --rehearse", proc.stdout, job)
@@ -620,7 +620,7 @@ class VersionGateStepTest(unittest.TestCase):
     def test_a_merge_queue_run_judges_the_pr_at_the_head_of_its_group(self):
         """A merge_group event carries no PR: the group's ref names the PR at
         its head (the newest entry), and the gate gets that PR's head branch, title and labels."""
-        for job in ("gates", "windows-gates"):
+        for job in ("gates-linux", "windows-gates"):
             proc, calls = self.run_step(job, "", self.QUEUE_REF, title="")
             self.assertEqual(proc.returncode, 0, proc.stderr)
             self.assertIn("labels=[bug,release] argv=scripts/check_version_state.py --rehearse "
@@ -632,21 +632,21 @@ class VersionGateStepTest(unittest.TestCase):
 
     def test_a_merge_queue_run_fails_closed_when_the_pr_cannot_be_read(self):
         self.GH = '#!/bin/sh\necho "$*" >> "$FAKE_GH_LOG"\necho "HTTP 404" >&2\nexit 1\n'
-        for job in ("gates", "windows-gates"):
+        for job in ("gates-linux", "windows-gates"):
             proc, calls = self.run_step(job, "", self.QUEUE_REF, title="")
             self.assertNotEqual(proc.returncode, 0, job)
             self.assertNotIn("argv=scripts/check_version_state.py", proc.stdout, job)
             self.assertEqual(len(calls), 1, (job, calls))
 
     def test_a_merge_group_ref_without_a_pr_is_refused(self):
-        for job in ("gates", "windows-gates"):
+        for job in ("gates-linux", "windows-gates"):
             proc, calls = self.run_step(job, "", "refs/heads/gh-readonly-queue/main/unexpected")
             self.assertEqual(proc.returncode, 1, job)
             self.assertIn("not a merge queue ref", proc.stderr)
             self.assertEqual(calls, [], job)
 
     def test_a_push_run_asks_for_no_labels(self):
-        for job in ("gates", "windows-gates"):
+        for job in ("gates-linux", "windows-gates"):
             proc, calls = self.run_step(job, "")
             self.assertEqual(proc.returncode, 0, proc.stderr)
             self.assertIn("labels=[unset] argv=scripts/check_version_state.py --rehearse", proc.stdout, job)

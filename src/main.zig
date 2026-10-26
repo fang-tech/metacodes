@@ -191,6 +191,9 @@ pub const app_module = @import("app.zig");
 pub const app_route_strings = @import("app/route_strings.zig");
 pub const app_mcp_startup = @import("app/mcp_startup.zig");
 pub const app_install = @import("app/install.zig");
+pub const app_update = @import("app/update.zig");
+pub const app_release_source = @import("app/release_source.zig");
+pub const app_archive_fixture = @import("app/archive_fixture.zig");
 pub const tool_context = @import("tools/context.zig");
 pub const project_rule_gate_protocol = @import("tools/project_rule_gate.zig");
 pub const tool_error = @import("core/tool_error.zig");
@@ -1494,6 +1497,7 @@ const install_usage =
     \\usage: metacodes install --prefix <dir> [--state-dir <dir>] [--sdk <agentcore-bundle-dir>]
     \\                         [--link <bin-dir> [--link-name <name>]] [--upgrade]
     \\                         [--allow-downgrade] [--force]
+    \\                         [--release-base <url> | --checkout <dir>]
     \\
     \\Installs the release unit this executable belongs to at <dir> as one isolated
     \\install: its own state root (default <dir>/state), kernels, TinyKG and, with
@@ -1502,6 +1506,9 @@ const install_usage =
     \\--upgrade replaces another version of this product's install (state kept),
     \\but never a newer one with an older one unless --allow-downgrade;
     \\--force also replaces foreign files and an existing launcher.
+    \\--release-base records the releases mirror this unit came from, and
+    \\--checkout the checkout that built it, for `metacodes update`; without
+    \\either the install keeps the source its record already names.
     \\
 ;
 
@@ -1534,6 +1541,24 @@ fn runInstall(args: *std.process.Args.Iterator, allocator: std.mem.Allocator, io
             options.allow_downgrade = true;
         } else if (std.mem.eql(u8, arg, "--force")) {
             options.force = true;
+        } else if (std.mem.eql(u8, arg, "--release-base") or std.mem.eql(u8, arg, "--checkout")) {
+            if (options.update_source != .keep) {
+                std.debug.print("error: --release-base and --checkout name one update source; give one\n{s}", .{install_usage});
+                return 2;
+            }
+            const value = value_of.get(args, arg) orelse return 2;
+            const release_source = @import("app/release_source.zig");
+            const source = if (std.mem.eql(u8, arg, "--checkout"))
+                release_source.parseCheckout(allocator, absolutePath(allocator, value) orelse return 2) catch |err| {
+                    std.debug.print("error: --checkout {s}: {s}\n", .{ value, @errorName(err) });
+                    return 2;
+                }
+            else
+                release_source.parseBase(allocator, value) catch |err| {
+                    std.debug.print("error: --release-base {s}: {s} (an https:// URL, http:// only to a loopback host, without user-info, query or fragment)\n", .{ value, @errorName(err) });
+                    return 2;
+                };
+            options.update_source = .{ .set = source };
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             dumpWrite(install_usage);
             return 0;
@@ -1579,10 +1604,146 @@ fn runInstall(args: *std.process.Args.Iterator, allocator: std.mem.Allocator, io
     var summary: std.Io.Writer.Allocating = .init(allocator);
     defer summary.deinit();
     summary.writer.print("metacodes {s} is installed at {s}\n  run: {s}\n", .{ outcome.version, outcome.prefix, outcome.launcher orelse outcome.executable }) catch {};
+    summary.writer.print("  update: {s} update\n", .{outcome.launcher orelse outcome.executable}) catch {};
     if (outcome.launcher == null) summary.writer.print("  add {s}{c}bin to PATH, or reinstall with --link <dir on PATH>\n", .{ outcome.prefix, std.fs.path.sep }) catch {};
     if (outcome.sdk) |sdk| summary.writer.print("  SDK: {s}\n", .{sdk}) catch {};
     dumpWrite(summary.written());
     return 0;
+}
+
+const update_usage =
+    \\usage: metacodes [--state-dir <dir>] update [--check] [--version X.Y.Z] [--release-base <url>]
+    \\                 [--pull] [--allow-downgrade] [--no-sdk] [--ignore-running] [--json]
+    \\
+    \\Brings this install up to date from where it came from. A release install
+    \\moves to the latest published release (or --version), downloaded from the
+    \\base its install record names; --release-base names a mirror, and the
+    \\record keeps it. A mirror serves both the archives and their sums: using
+    \\one trusts it. A development install is rebuilt from the checkout that
+    \\built it (--pull fast-forwards that checkout first). Never moves an
+    \\install backwards unless --allow-downgrade.
+    \\Refuses while sessions run from the install (--ignore-running overrides
+    \\that, except on Windows) and stops this install's TinyKG service.
+    \\--check reports and changes nothing: exit 0 when there is nothing to do,
+    \\3 when there is. --json prints the result as one JSON document.
+    \\
+;
+
+fn runUpdate(args: *std.process.Args.Iterator, init: std.process.Init, allocator: std.mem.Allocator) u8 {
+    const update = @import("app/update.zig");
+    var options: update.Options = .{ .prefix = "", .environ = init.environ_map };
+    var json = false;
+    while (args.next()) |arg| {
+        if (std.mem.eql(u8, arg, "--check")) {
+            options.check = true;
+        } else if (std.mem.eql(u8, arg, "--version") or std.mem.eql(u8, arg, "--release-base")) {
+            const value = args.next() orelse {
+                std.debug.print("error: {s} needs a value\n{s}", .{ arg, update_usage });
+                return 2;
+            };
+            if (std.mem.eql(u8, arg, "--version")) options.version = value else options.release_base = value;
+        } else if (std.mem.eql(u8, arg, "--pull")) {
+            options.pull = true;
+        } else if (std.mem.eql(u8, arg, "--allow-downgrade")) {
+            options.allow_downgrade = true;
+        } else if (std.mem.eql(u8, arg, "--no-sdk")) {
+            options.no_sdk = true;
+        } else if (std.mem.eql(u8, arg, "--ignore-running")) {
+            options.ignore_running = true;
+        } else if (std.mem.eql(u8, arg, "--json")) {
+            json = true;
+        } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
+            dumpWrite(update_usage);
+            return 0;
+        } else {
+            std.debug.print("error: unknown update argument '{s}'\n{s}", .{ arg, update_usage });
+            return 2;
+        }
+    }
+    if (leadingStateDir(init, allocator).value) |dir| options.state_dir = absolutePath(allocator, dir) orelse return 2;
+    var exe_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const exe = @import("platform").paths.selfExeRealPath(&exe_buf) orelse {
+        std.debug.print("error: cannot locate this executable\n", .{});
+        return 1;
+    };
+    options.prefix = @import("util/state_root.zig").prefixOf(exe) orelse {
+        std.debug.print("error: this executable is not inside an install (<prefix>/bin/metacodes)\n", .{});
+        return 1;
+    };
+
+    var stderr_buf: [4096]u8 = undefined;
+    // Streaming, not positional: stderr may be a file other writers share.
+    var stderr_writer = std.Io.File.stderr().writerStreaming(init.io, &stderr_buf);
+    const outcome = update.run(allocator, init.io, options, &stderr_writer.interface) catch |err| {
+        stderr_writer.interface.flush() catch {};
+        const usage_error = switch (err) {
+            error.OptionNotForSource, error.CheckWithPull, error.InvalidVersion, error.InvalidReleaseBase, error.IgnoreRunningUnsupported => true,
+            else => false,
+        };
+        std.debug.print("error: update failed ({s}){s}{s}\n", .{ @errorName(err), if (updateHint(err).len > 0) ": " else "", updateHint(err) });
+        if (json) {
+            var doc: std.Io.Writer.Allocating = .init(allocator);
+            std.json.Stringify.value(.{ .action = "refused", .@"error" = @errorName(err) }, .{}, &doc.writer) catch {};
+            doc.writer.writeByte('\n') catch {};
+            dumpWrite(doc.written());
+        }
+        return if (usage_error) 2 else 1;
+    };
+    stderr_writer.interface.flush() catch {};
+    if (json) {
+        var doc: std.Io.Writer.Allocating = .init(allocator);
+        std.json.Stringify.value(.{
+            .action = @tagName(outcome.action),
+            .source = @tagName(outcome.source),
+            .from = outcome.from,
+            .to = outcome.to,
+            .prefix = outcome.prefix,
+            .origin = outcome.origin,
+            .sdk = outcome.sdk,
+            .checked_only = outcome.checked_only,
+            .stopped_services = outcome.stopped_services,
+            .running_sessions = outcome.running_sessions,
+            .notes = outcome.notes,
+        }, .{}, &doc.writer) catch {};
+        doc.writer.writeByte('\n') catch {};
+        dumpWrite(doc.written());
+    }
+    if (outcome.checked_only and outcome.changes()) return 3;
+    return 0;
+}
+
+fn updateHint(err: anyerror) []const u8 {
+    return switch (err) {
+        error.NotAnInstall => "this executable has no install record beside it (etc/metacodes/install.json); install with scripts/install.sh, or `metacodes install --prefix <dir>` from a release unit",
+        error.InvalidInstallRecord => "the install record is unreadable; reinstall with scripts/install.sh over the same prefix (its state is kept)",
+        error.InvalidUpdateSource => "the install record's update_source is not a valid source; reinstall with scripts/install.sh (--release-base <mirror>, or --dev from the checkout) to rewrite it",
+        error.NoCheckoutRecorded => "this is a development install that records no checkout; run scripts/install.sh --dev in its checkout once, and update works from then on",
+        error.OptionNotForSource => "--pull applies to a development install, --version and --release-base to a release install",
+        error.CheckWithPull => "--check changes nothing, so it cannot --pull; run `git pull` in the checkout, then --check",
+        error.InvalidVersion => "--version takes a bare published release, X.Y.Z",
+        error.InvalidReleaseBase => "--release-base must be an https:// URL (http:// only to a loopback host) without user-info, query or fragment",
+        error.UpdateInProgress => "another `metacodes update` of this install is running",
+        error.CheckoutUnsupportedOnWindows => "a development install is rebuilt by scripts/install.sh --dev, which needs a POSIX shell",
+        error.GitUnavailable => "git is needed to read the checkout's state, and was not found or failed",
+        error.PullFailed => "git pull --ff-only failed (above); settle the checkout, or update without --pull",
+        error.SessionsRunning => "processes still run from this install (above)",
+        error.IgnoreRunningUnsupported => "on Windows a file in use cannot be replaced, so every process from the install must exit first",
+        error.ServiceDidNotStop => "this install's TinyKG service did not stop; end it (`metacodes kgd`) and rerun",
+        error.DowngradeRefused => "pass --allow-downgrade to move the install backwards",
+        error.StagedUnitMismatch => "the downloaded release is not what its name says (above); nothing was changed",
+        error.InstallFailed => "the installer failed (above); rerun `metacodes update` to finish",
+        error.ProcessScanFailed => "cannot list the running processes, so the update cannot tell whether the install is in use",
+        error.NoLatestTag => "the base's /latest does not redirect to a release tag; is --release-base a mirror of the releases page?",
+        error.HttpStatus, error.ConnectFailed, error.TransferFailed => "the release could not be fetched (curl's message above); nothing was changed. Behind a proxy set https_proxy; or name a mirror with --release-base",
+        error.DigestMismatch => "a download does not match the release's SHA256SUMS; nothing was changed",
+        error.NoCliAsset => "the release has no archive for this platform",
+        error.AmbiguousSdk => "the release lists more than one AgentCore SDK for this platform; pass --no-sdk",
+        error.MalformedSums, error.DuplicateSum => "the release's SHA256SUMS is malformed; nothing was changed",
+        error.CurlUnavailable => "downloads go through curl, as scripts/install.sh's do, and none is on PATH",
+        error.InvalidUrl => "curl refused a URL or a redirect to anything but https; nothing was changed",
+        error.UnsafeMember, error.UnsupportedMember, error.DuplicateMember, error.NotOneRoot, error.EmptyArchive, error.TooManyMembers, error.TooLarge, error.CorruptArchive => "the release archive is malformed (above); nothing was changed",
+        else => "",
+    };
 }
 
 /// `path` made absolute against the cwd; null (after printing why) on failure.
@@ -1602,14 +1763,17 @@ fn maybeRunAuthCommand(init: std.process.Init, allocator: std.mem.Allocator, lea
     _ = args.next(); // 跳过 argv[0](程序名)
     for (0..leading) |_| _ = args.next(); // a leading --state-dir, already applied
     const cmd = args.next() orelse return null;
-    const subcommands = [_][]const u8{ "doctor", "install", "kgd", "kg", "ledger", "logout", "login", "sealed" };
+    const subcommands = [_][]const u8{ "doctor", "install", "kgd", "kg", "ledger", "logout", "login", "sealed", "update" };
     for (subcommands) |name| {
         if (std.mem.eql(u8, cmd, name)) break;
     } else return null;
-    // `doctor` diagnoses a broken state root instead of refusing to start, and
-    // `install` creates one: neither needs this process's own.
+    // `doctor` diagnoses a broken state root instead of refusing to start,
+    // `install` creates one, and `update` must be able to repair either:
+    // none of them needs this process's own.
     if (std.mem.eql(u8, cmd, "doctor")) return runDoctor(&args, allocator, init.io);
     if (std.mem.eql(u8, cmd, "install")) return runInstall(&args, allocator, init.io);
+    // `update` repairs an install whose state root may be broken, like `doctor`.
+    if (std.mem.eql(u8, cmd, "update")) return runUpdate(&args, init, allocator);
     const state_dir = hostStateRoot() catch return 2;
     if (state_dir.len > 0) @import("core/context_caps.zig").configureStateRoot(state_dir);
     if (std.mem.eql(u8, cmd, "kgd")) return runKgd(&args, allocator);
@@ -3534,6 +3698,10 @@ fn printHelp() void {
         \\  --version             Print version and build identity and exit (--json: one JSON document)
         \\  doctor [--json | --plain] [--strict]
         \\                        Report where ripgrep and TinyKG resolve from and whether they match this build
+        \\  update [--check] [--version X.Y.Z] [--release-base <url>] [--pull] [--allow-downgrade]
+        \\         [--no-sdk] [--ignore-running] [--json]
+        \\                        Bring this install up to date: the latest release (from its recorded
+        \\                        mirror, if any), or a rebuild of the checkout a development install came from
         \\  -p, --print <prompt>  Headless: run one prompt and exit (no REPL)
         \\  -                     Headless: read prompt from stdin
         \\  --json                Headless: emit NDJSON result event
@@ -3728,6 +3896,10 @@ test {
     _ = &@import("app/route_strings.zig");
     _ = &@import("app/mcp_startup.zig");
     _ = &@import("app/install.zig");
+    _ = &@import("app/release_source.zig");
+    _ = &@import("app/unit_archive.zig");
+    _ = &@import("app/release_fetch.zig");
+    _ = &@import("app/update.zig");
     _ = &@import("app/kg_autostart.zig");
     _ = &@import("session_service.zig");
     _ = &@import("repl/loop.zig");

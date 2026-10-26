@@ -706,6 +706,13 @@ const FakeExchange = struct {
     /// Simulated network time, so the single-flight window is real rather than
     /// instantaneous.
     delay_ms: u64 = 0,
+    /// Hold the exchange until this many callers wait on the session's
+    /// in-flight refresh, so a test's racers are one cohort however late the
+    /// runner schedules a thread. A fixed delay is not: on a loaded CI runner
+    /// the fourth racer started after the rejected exchange had settled, and
+    /// its own, later refresh made a second call. Bounded at ten seconds, so a
+    /// broken single flight fails its assertions instead of hanging.
+    hold_until_waiters: ?struct { session: *Session, count: usize } = null,
     rotate: bool = true,
     fail: ?OAuthError = null,
     last_presented: [128]u8 = undefined,
@@ -725,10 +732,23 @@ const FakeExchange = struct {
         @memcpy(self.last_presented[0..len], refresh_token[0..len]);
         self.last_presented_len = len;
         const delay = self.delay_ms;
+        const hold = self.hold_until_waiters;
         const failure = self.fail;
         const rotate = self.rotate;
         self.mutex.unlock();
 
+        // The exchange runs with the session lock released, so the waiters'
+        // count can be read under it.
+        if (hold) |cohort| {
+            var waited_ms: u64 = 0;
+            while (waited_ms < 10_000) : (waited_ms += 1) {
+                cohort.session.mutex.lock();
+                const waiting = cohort.session.waited_count;
+                cohort.session.mutex.unlock();
+                if (waiting >= cohort.count) break;
+                sync.sleepMs(1);
+            }
+        }
         if (delay > 0) sync.sleepMs(delay);
         if (failure) |err| return err;
 
@@ -995,7 +1015,8 @@ test "concurrent stale-token refresh performs exactly one exchange" {
     defer removeSession(&session);
     try seed(a, &session, 10_000);
 
-    var fake = FakeExchange{ .delay_ms = 60 };
+    // The second racer must find the first one's exchange still running.
+    var fake = FakeExchange{ .hold_until_waiters = .{ .session = &session, .count = 1 } };
     const Worker = struct {
         session: *Session,
         exchange: Exchange,
@@ -1022,7 +1043,8 @@ test "a rejected refresh reaches every waiter and is not retried as a transport 
     defer removeSession(&session);
     try seed(a, &session, 0);
 
-    var fake = FakeExchange{ .delay_ms = 40, .fail = error.RefreshRejected };
+    // The exchange settles only once the other three racers wait on it.
+    var fake = FakeExchange{ .fail = error.RefreshRejected, .hold_until_waiters = .{ .session = &session, .count = 3 } };
     const Worker = struct {
         session: *Session,
         exchange: Exchange,

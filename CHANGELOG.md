@@ -26,6 +26,35 @@ status, compatibility boundaries, and entry points are defined by
   Scripted: `--api-key-stdin`, `--key-page <id>`, `--no-check`. The note on
   every key page says why a standard API key is the wrong one: since
   2026-10-16 it bills the account balance even on the Coding Plan endpoints.
+- **`metacodes update`** brings an install up to date from where it came
+  from (doc/UPDATE_DESIGN.md). A release install moves to the latest
+  published release, or `--version X.Y.Z`. The archive is downloaded, checked
+  against the release's SHA256SUMS, unpacked with symlinks, `..` and other
+  escapes refused, and verified against its own manifest. The new release's
+  own `install --upgrade` then installs it. A development install is rebuilt
+  by its checkout's `scripts/install.sh --dev` (`--pull` fast-forwards the
+  checkout first).
+  - An install never moves backwards without `--allow-downgrade`. An update
+    of an intact install to the version it has downloads nothing, and a
+    damaged or half-finished install is repaired.
+  - The update is refused while sessions run from the install
+    (`--ignore-running` overrides that, except on Windows), because an old
+    session's next kernel check would fail closed. The install's TinyKG
+    service is stopped, and repinned when the TinyKG binaries change.
+  - `--check` reports without changing anything (exit 3 when there is
+    something to do), and `--json` prints the result.
+  - Downloads go through curl, as `install.sh`'s do, so proxies, `NO_PROXY`
+    and SOCKS behave the same for both. A transfer stops after 60 s without
+    a byte, and only a loopback mirror may use plain http. On Windows the
+    running executable is renamed aside so it can be replaced.
+- **Install records say where an install updates from.** `metacodes install`
+  takes `--release-base <url>` (a releases mirror) or `--checkout <dir>` (the
+  checkout that built a development unit) and records it in
+  `etc/metacodes/install.json` as `update_source`. Without either option, a
+  reinstall keeps what the record had. `scripts/install.sh` passes the base
+  it downloaded from and, with `--dev`, its checkout. `scripts/install.ps1`
+  takes `-ReleaseBase`. Both pass these options only to a release whose
+  installer knows them.
 
 ### Changed
 
@@ -44,6 +73,13 @@ status, compatibility boundaries, and entry points are defined by
     admission.
 
   `--model` still sends any model id to these providers.
+
+- **Zig embedders of `metacodes-core` (experimental source API):**
+  - `kg_client.KgClient.Autostart.start` now receives a
+    `KgClient.StartReason` (`not_running`, `key_refused`, `stale_pin`).
+  - `kg_transport.Error` gains `BuildMismatch`, which the transport returns
+    where it used to return `IncompatibleDaemon` for a service that matched
+    in everything but its build id.
 
 ### Fixed
 
@@ -122,6 +158,22 @@ status, compatibility boundaries, and entry points are defined by
   placeholder. An unchosen thinking level is no longer sent as `low` to
   Gemini 3 and later: their default (medium on Gemini 4 Argon and 3.8 Flash)
   applies.
+- **A TinyKG service on new binaries no longer leaves every session
+  degraded.** The service's build id is a hash of the TinyKG binaries.
+  Previously, after an update, a rerun of `install.sh` or a hand install
+  changed them, `daemon.json` kept pinning the old id. Every session was then
+  refused (`pin_mismatch`), fell back to the `tasks.json` mirror, and stayed
+  there until someone ran `metacodes kg install`. Now the transport reports
+  this case as its own error (`BuildMismatch`), and autostart repins this
+  install's own service to the installed binaries, keeping the key, the port
+  and the store. It does so before it starts a service, and when a session
+  meets the stale pin. A session that degraded before the repin recovers on
+  its next probe. A `METACODES_KG_CONFIG` file is never rewritten
+  (doc/TINYKG_INTEGRATION.md, "A stale pin").
+- **A KG client given its service explicitly keeps it.** A client given
+  `daemon_url`/`_api_key`/`_expected_build_id` no longer replaces that
+  service with whatever the environment and `daemon.json` name when it
+  re-reads its configuration after a host start.
 
 ## 0.7.0 — 2026-10-24
 
