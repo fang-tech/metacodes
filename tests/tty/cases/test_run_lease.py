@@ -83,12 +83,12 @@ def _resume_turn(bin_path, env, cwd, sid, events_after_reply=()):
                    env=env, cwd=cwd, base_url=srv.url, extra_args=["--resume", sid])
 
 
-def _signal_mid_run(bin_path, tag, signal_name):
+def _signal_mid_run(bin_path, tag, signals):
     """Signal mid-Run: the Run is stopped and closed, the lease goes away, and
     the REPL leaves by itself (its way out prints the resume hint)."""
     _require_posix()
     env, cwd = _workspace(tag)
-    raw = _start_slow_turn(bin_path, env, cwd, [f"signal:{signal_name}", wait_for("Resume this session with:", 8)])
+    raw = _start_slow_turn(bin_path, env, cwd, [f"signal:{signals}", wait_for("Resume this session with:", 8)])
     session = _session_dir(env)
     events = _events(session)
     kinds = [next(iter(record["event"])) for record in events]
@@ -103,6 +103,13 @@ def _signal_mid_run(bin_path, tag, signal_name):
 def test_hangup_mid_run_closes_the_journal(bin_path):
     """The terminal closing mid-Run (SIGHUP)."""
     _signal_mid_run(bin_path, "hup", "HUP")
+
+
+def test_closing_terminal_hangup_twice_closes_the_journal(bin_path):
+    """A terminal closing under a shell sends SIGHUP twice, milliseconds apart:
+    the shell forwards its own, and the kernel sends another when the shell
+    exits. The second must not cut the first one's shutdown short."""
+    _signal_mid_run(bin_path, "hup2", "HUP+0.02+HUP")
 
 
 def test_terminate_mid_run_closes_the_journal(bin_path):

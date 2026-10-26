@@ -116,16 +116,18 @@ pub fn alive(pid: Pid) bool {
     return true;
 }
 
-/// Whether any process — the caller included — has `path` open now. A caller
-/// asking about holders other than itself closes its own descriptors first.
-/// Best effort like `listUnder`: another user's descriptors may be invisible,
-/// and an open that happens after the scan is not in the answer.
+/// Whether a process other than this one has `path` open now. Windows cannot
+/// tell this process's handles from another's, so there the caller asks while
+/// holding none of its own. Best effort like `listUnder`: another user's
+/// descriptors may be invisible, and an open after the scan is not in the
+/// answer.
 ///
 /// - macOS: `proc_listpidspath` (event-only watchers such as Spotlight's do
 ///   not count).
-/// - Linux: any `/proc/<pid>/fd/<n>` naming the same device and inode.
+/// - Linux: any `/proc/<pid>/fd/<n>` whose link names the file. Only the link
+///   is read, never the file it names, so a hung network mount cannot stall it.
 /// - Windows: an open that shares nothing fails with a sharing violation.
-pub fn heldOpen(path: [*:0]const u8) error{ Unsupported, ScanFailed }!bool {
+pub fn heldOpenByOthers(path: [*:0]const u8) error{ Unsupported, ScanFailed }!bool {
     return switch (native_os) {
         .macos => heldOpenMacos(path),
         .linux => heldOpenLinux(path),
@@ -136,20 +138,26 @@ pub fn heldOpen(path: [*:0]const u8) error{ Unsupported, ScanFailed }!bool {
 
 fn heldOpenMacos(path: [*:0]const u8) error{ScanFailed}!bool {
     if (native_os != .macos) return error.ScanFailed;
-    // Only "any at all" matters, so a buffer that fills up is already a yes.
+    const own: c_int = std.c.getpid();
+    // A full buffer of other holders is already a yes.
     var pids: [256]c_int = undefined;
     const bytes = proc_listpidspath(PROC_ALL_PIDS, 0, path, PROC_LISTPIDSPATH_EXCLUDE_EVTONLY, &pids, @sizeOf(@TypeOf(pids)));
     if (bytes < 0) return error.ScanFailed;
-    return bytes > 0;
+    const count = @min(@as(usize, @intCast(bytes)) / @sizeOf(c_int), pids.len);
+    for (pids[0..count]) |pid| if (pid > 0 and pid != own) return true;
+    return false;
 }
 
 fn heldOpenLinux(path: [*:0]const u8) error{ScanFailed}!bool {
     if (native_os != .linux) return error.ScanFailed;
-    const target = linuxIdentity(path) orelse return error.ScanFailed;
+    var target_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const target = std.mem.span(std.c.realpath(path, &target_buf) orelse return error.ScanFailed);
+    const own: Pid = @intCast(std.c.getpid());
     const proc = std.c.opendir("/proc") orelse return error.ScanFailed;
     defer _ = std.c.closedir(proc);
     while (std.c.readdir(proc)) |entry| {
         const pid = std.fmt.parseInt(Pid, std.mem.sliceTo(&entry.name, 0), 10) catch continue;
+        if (pid == own) continue;
         var dir_buf: [64]u8 = undefined;
         const fd_dir = std.fmt.bufPrintZ(&dir_buf, "/proc/{d}/fd", .{pid}) catch continue;
         // Another user's table, or a process that exited since the listing.
@@ -160,24 +168,13 @@ fn heldOpenLinux(path: [*:0]const u8) error{ScanFailed}!bool {
             if (name.len == 0 or name[0] == '.') continue;
             var link_buf: [96]u8 = undefined;
             const link = std.fmt.bufPrintZ(&link_buf, "/proc/{d}/fd/{s}", .{ pid, name }) catch continue;
-            const identity = linuxIdentity(link) orelse continue;
-            if (identity.device == target.device and identity.inode == target.inode) return true;
+            var named_buf: [std.fs.max_path_bytes]u8 = undefined;
+            const n = std.c.readlink(link, &named_buf, named_buf.len);
+            if (n <= 0) continue;
+            if (std.mem.eql(u8, named_buf[0..@intCast(n)], target)) return true;
         }
     }
     return false;
-}
-
-const FileIdentity = struct { device: u64, inode: u64 };
-
-/// The file `path` names, following links (a `/proc/<pid>/fd/<n>` entry
-/// resolves to the open file itself).
-fn linuxIdentity(path: [*:0]const u8) ?FileIdentity {
-    if (native_os != .linux) return null;
-    var stx: std.os.linux.Statx = undefined;
-    const AT_FDCWD: i32 = -100;
-    const rc = std.os.linux.statx(AT_FDCWD, path, 0, std.os.linux.STATX.BASIC_STATS, &stx);
-    if (@as(isize, @bitCast(rc)) < 0) return null;
-    return .{ .device = (@as(u64, stx.dev_major) << 32) | @as(u64, stx.dev_minor), .inode = stx.ino };
 }
 
 fn heldOpenWindows(path: [*:0]const u8) error{ScanFailed}!bool {
@@ -463,7 +460,7 @@ test "listUnder finds a child running from a prefix, with its parent, and termin
     try testing.expect(!alive(child_pid));
 }
 
-test "heldOpen sees this process and a child holding a file, and nobody after they close it" {
+test "heldOpenByOthers sees a child holding a file, not this process, and nobody once it exits" {
     if (native_os != .macos and native_os != .linux and !is_windows) return error.SkipZigTest;
     const pfs = @import("fs.zig");
     var tmp = testing.tmpDir(.{});
@@ -472,11 +469,12 @@ test "heldOpen sees this process and a child holding a file, and nobody after th
     const root = root_buf[0..try tmp.dir.realPath(testing.io, &root_buf)];
     const path = try std.fmt.allocPrintSentinel(testing.allocator, "{s}/marker", .{root}, 0);
     defer testing.allocator.free(path);
-    const created = pfs.open(path.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true }, 0o600);
-    try testing.expect(created >= 0);
-    try testing.expect(try heldOpen(path.ptr));
-    pfs.close(created);
-    try testing.expect(!try heldOpen(path.ptr));
+    const own = pfs.open(path.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true }, 0o600);
+    try testing.expect(own >= 0);
+    // POSIX leaves this process out; Windows cannot, and says so.
+    try testing.expectEqual(is_windows, try heldOpenByOthers(path.ptr));
+    pfs.close(own);
+    try testing.expect(!try heldOpenByOthers(path.ptr));
 
     if (is_windows) return;
     // The marker of a process that is still running: a child keeps it open
@@ -490,12 +488,12 @@ test "heldOpen sees this process and a child holding a file, and nobody after th
     var held = false;
     var tries: usize = 0;
     while (!held and tries < 200) : (tries += 1) {
-        held = try heldOpen(path.ptr);
+        held = try heldOpenByOthers(path.ptr);
         if (!held) sleepMs(10);
     }
     try testing.expect(held);
     child.kill(testing.io);
-    try testing.expect(!try heldOpen(path.ptr));
+    try testing.expect(!try heldOpenByOthers(path.ptr));
 }
 
 extern "kernel32" fn GetCurrentProcessId() callconv(.winapi) u32;

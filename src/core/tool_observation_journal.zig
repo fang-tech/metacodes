@@ -26,7 +26,7 @@ pub const FILE_NAME = "tool-observations.jsonl";
 /// exits, by any signal, so a free lock proves the previous owner gone. The
 /// file names its owner in a `LeaseRecord`; an empty one was left by a
 /// metacodes that predates the record and the lock, and is judged by whether
-/// any process still has it open (`process_scan.heldOpen`).
+/// any other process still has it open (`process_scan.heldOpenByOthers`).
 pub const LOCK_FILE_NAME = "tool-observations.lock";
 const LEASE_SCHEMA_VERSION = "metacodes-run-lease-v1";
 /// Lease records are rewritten in place at this fixed width, so a rewrite never
@@ -445,7 +445,9 @@ pub const Journal = struct {
             "{s}/{s}\x00",
             .{ session_dir, LOCK_FILE_NAME },
         );
-        var lease = try Lease.acquire(@ptrCast(lock_path.ptr), options.report);
+        const run_id = session_id_mod.gen();
+        const started_wall_ns = util_time.nowWallNs();
+        var lease = try Lease.acquire(@ptrCast(lock_path.ptr), options.report, run_id, started_wall_ns);
         errdefer lease.giveUp(@ptrCast(lock_path.ptr));
 
         var path_buf: [std.fs.max_path_bytes + 1]u8 = undefined;
@@ -479,12 +481,13 @@ pub const Journal = struct {
         }
         if (pfs.lseek(fd, 0, .end) < 0) return error.SeekFailed;
 
-        const run_id = session_id_mod.gen();
-        const started_wall_ns = util_time.nowWallNs();
-        // From here a crash leaves a lease naming this process, which the next
-        // owner judges by its lock alone.
-        try writeLeaseRecord(lease.fd, run_id, started_wall_ns, .running);
-        lease.recorded = true;
+        // Taking the Run: from here a crash leaves a lease naming this process,
+        // which the next owner judges by its lock alone. (A lease this init
+        // published names it already.)
+        if (!lease.recorded) {
+            try writeLeaseRecord(lease.fd, run_id, started_wall_ns, .running);
+            lease.recorded = true;
+        }
 
         var journal = Journal{
             .fd = fd,
@@ -641,11 +644,13 @@ pub const Journal = struct {
             // opened it before then holds a file nobody can name, which
             // `Lease.acquire` notices, never a second live lease.
             const removed = if (pfs.unlinkPath(path)) true else |err| err == error.NotFound;
+            // Still named and still locked by this process: a retry may unlink
+            // it. Once the name is gone it may belong to a successor at any
+            // moment, so nothing below may fail into a retry.
             if (!recorded and !removed) return error.LeaseReleaseFailed;
             if (removed) {
-                const directory = std.fs.path.dirname(self.lock_path[0..self.lock_path_len]) orelse
-                    return error.InvalidLockPath;
-                fsyncDirectory(directory) catch |err| if (!recorded) return err;
+                if (std.fs.path.dirname(self.lock_path[0..self.lock_path_len])) |directory|
+                    fsyncDirectory(directory) catch {};
             }
             _ = pfs.close(self.lock_fd);
             self.lock_fd = -1;
@@ -763,15 +768,20 @@ const is_windows = @import("builtin").os.tag == .windows;
 /// session is reported busy, which is what such contention is.
 const MAX_LEASE_ATTEMPTS: usize = 16;
 
+/// How long an older metacodes' marker must stay named, once nobody holds it,
+/// to count as kept rather than mid-release (its close and unlink are
+/// microseconds apart).
+const LEGACY_RELEASE_SETTLE_MS: u64 = 100;
+
 /// The session's Run lease while `init` decides whether to take the Run.
 const Lease = struct {
     fd: pfs.Fd,
     prior: Prior,
-    /// This acquisition wrote its own record over whatever it found.
-    recorded: bool = false,
+    /// The file holds this acquisition's own record.
+    recorded: bool,
 
     const Prior = union(enum) {
-        /// No lease existed; this acquisition created the file.
+        /// No lease existed; this acquisition published its own.
         created,
         /// An empty lease that no process holds: an older metacodes' marker.
         legacy,
@@ -789,20 +799,28 @@ const Lease = struct {
         }
     };
 
-    fn acquire(path: [*:0]const u8, report: ?*OpenReport) !Lease {
+    /// Take the lease at `path` for the Run `run_id`. A new lease is written
+    /// under a name of its own first and published by a link (Windows: move)
+    /// that refuses to replace one, so the name never shows an empty file: an
+    /// owner dying at any instant leaves either no lease or a record naming it.
+    fn acquire(
+        path: [*:0]const u8,
+        report: ?*OpenReport,
+        run_id: session_id_mod.SessionId,
+        acquired_wall_ns: i128,
+    ) !Lease {
+        var staged_buf: [std.fs.max_path_bytes + 1]u8 = undefined;
+        const staged = std.fmt.bufPrintZ(&staged_buf, "{s}.{s}", .{ std.mem.span(path), run_id.asSlice() }) catch
+            return error.NameTooLong;
         var legacy_unheld = false;
         var attempt: usize = 0;
         while (attempt < MAX_LEASE_ATTEMPTS) : (attempt += 1) {
-            var created = true;
-            var fd = pfs.open(path, .{ .ACCMODE = .RDWR, .CREAT = true, .EXCL = true, .NOFOLLOW = true }, @as(std.c.mode_t, 0o600));
+            if (try publish(path, staged, run_id, acquired_wall_ns)) |fd|
+                return .{ .fd = fd, .prior = .created, .recorded = true };
+            const fd = pfs.open(path, leaseOpenFlags(.{ .ACCMODE = .RDWR, .NOFOLLOW = true }), @as(std.c.mode_t, 0));
             if (fd < 0) {
-                if (!pfs.lastErrnoIs(.EXIST)) return error.LeaseOpenFailed;
-                created = false;
-                fd = pfs.open(path, .{ .ACCMODE = .RDWR, .NOFOLLOW = true }, @as(std.c.mode_t, 0));
-                if (fd < 0) {
-                    if (pfs.lastErrnoIs(.NOENT)) continue; // released between the two opens
-                    return error.LeaseOpenFailed;
-                }
+                if (pfs.lastErrnoIs(.NOENT)) continue; // released since: publish again
+                return error.LeaseOpenFailed;
             }
             pfs.makeCloseOnExec(fd) catch |err| {
                 _ = pfs.close(fd);
@@ -818,7 +836,6 @@ const Lease = struct {
                 _ = pfs.close(fd);
                 return if (err == error.WouldBlock) error.JournalBusy else error.LeaseLockFailed;
             };
-            if (created) return .{ .fd = fd, .prior = .created };
             // A lock taken through a name the owner has since removed guards a
             // file nobody else can reach: start over with the name as it is now.
             const same = namesFile(path, fd) catch |err| {
@@ -830,16 +847,49 @@ const Lease = struct {
                 continue;
             }
             switch (readLease(fd)) {
-                .record => |owner| return .{ .fd = fd, .prior = .{ .record = owner.state } },
-                .unreadable => return .{ .fd = fd, .prior = .unreadable },
+                // Windows publishes by a move, before it can lock: the record
+                // found may be the one it just put there.
+                .record => |owner| return .{
+                    .fd = fd,
+                    .prior = if (std.mem.eql(u8, owner.runId(), run_id.asSlice())) .created else .{ .record = owner.state },
+                    .recorded = std.mem.eql(u8, owner.runId(), run_id.asSlice()),
+                },
+                .unreadable => return .{ .fd = fd, .prior = .unreadable, .recorded = false },
                 .empty => {
-                    if (legacy_unheld) return .{ .fd = fd, .prior = .legacy };
                     // An older metacodes takes no lock; it holds its marker open
-                    // until it is done. Ask about every holder with ours closed
-                    // (Windows counts this process's own handle), then take the
-                    // lease again: a marker cannot reappear once its owner is gone.
+                    // until it is done.
+                    if (legacy_unheld) return .{ .fd = fd, .prior = .legacy, .recorded = false };
+                    if (!is_windows) {
+                        // Asked while this lease stays locked: the file judged
+                        // is the file taken.
+                        const held = process_scan.heldOpenByOthers(path) catch {
+                            _ = pfs.close(fd);
+                            if (report) |r| r.holder = .unknown;
+                            return error.JournalBusy;
+                        };
+                        if (!held) {
+                            // An older metacodes releases by closing its marker,
+                            // then unlinking it: one caught between the two is
+                            // not a marker it kept. Give it the moment to go.
+                            util_time.sleepMs(LEGACY_RELEASE_SETTLE_MS);
+                            const still = namesFile(path, fd) catch |err| {
+                                _ = pfs.close(fd);
+                                return err;
+                            };
+                            if (still) return .{ .fd = fd, .prior = .legacy, .recorded = false };
+                            _ = pfs.close(fd);
+                            continue;
+                        }
+                        _ = pfs.close(fd);
+                        if (report) |r| r.holder = .unnamed;
+                        return error.JournalBusy;
+                    }
+                    // Windows counts this process's own handle: ask with ours
+                    // closed, then take the lease again. (A marker that a full
+                    // Run of a new metacodes and a fresh older one replaced in
+                    // that gap would pass unseen; the gap is one scan long.)
                     _ = pfs.close(fd);
-                    const held = process_scan.heldOpen(path) catch {
+                    const held = process_scan.heldOpenByOthers(path) catch {
                         if (report) |r| r.holder = .unknown;
                         return error.JournalBusy;
                     };
@@ -855,11 +905,49 @@ const Lease = struct {
         return error.JournalBusy;
     }
 
-    /// `init` failed after acquiring: leave the lease as found, except a file
-    /// this acquisition created and never wrote, which would otherwise pass for
-    /// an older metacodes' marker.
+    /// Write this Run's record under `staged` and publish it at `path`. Null
+    /// when a lease already exists there. POSIX keeps the staged descriptor,
+    /// locked before the link, as the published lease; Windows cannot move a
+    /// file it holds open, and leaves the taking to `acquire`.
+    fn publish(
+        path: [*:0]const u8,
+        staged: [:0]const u8,
+        run_id: session_id_mod.SessionId,
+        acquired_wall_ns: i128,
+    ) !?pfs.Fd {
+        const fd = pfs.open(staged.ptr, leaseOpenFlags(.{ .ACCMODE = .RDWR, .CREAT = true, .EXCL = true, .NOFOLLOW = true }), @as(std.c.mode_t, 0o600));
+        if (fd < 0) return error.LeaseOpenFailed;
+        var keep = false;
+        defer if (!keep) {
+            _ = pfs.close(fd);
+            pfs.unlinkPath(staged.ptr) catch {};
+        };
+        try pfs.makeCloseOnExec(fd);
+        if (!is_windows) pfs.tryLockExclusive(fd) catch return error.LeaseLockFailed;
+        try writeLeaseRecord(fd, run_id, acquired_wall_ns, .running);
+        if (is_windows) {
+            _ = pfs.close(fd);
+            keep = true;
+            const installed = pfs.installNoReplace(staged.ptr, path) catch {
+                pfs.unlinkPath(staged.ptr) catch {};
+                return error.LeasePublishFailed;
+            };
+            if (installed == .already_exists) pfs.unlinkPath(staged.ptr) catch {};
+            return null;
+        }
+        const installed = pfs.installNoReplace(staged.ptr, path) catch return error.LeasePublishFailed;
+        if (installed == .already_exists) return null;
+        // Linked: the lease is published and this descriptor holds its lock.
+        keep = true;
+        pfs.unlinkPath(staged.ptr) catch {};
+        return fd;
+    }
+
+    /// `init` failed after acquiring. A lease it published says nothing a
+    /// successor needs, so it goes (POSIX: while still locked); any other is
+    /// left as found.
     fn giveUp(self: *Lease, path: [*:0]const u8) void {
-        if (self.prior == .created and !self.recorded) {
+        if (self.prior == .created) {
             if (is_windows) {
                 _ = pfs.close(self.fd);
                 pfs.unlinkPath(path) catch {};
@@ -871,9 +959,26 @@ const Lease = struct {
     }
 };
 
+/// Lease descriptors never outlive an exec: a child holding one would hold
+/// its lock past its owner's death.
+fn leaseOpenFlags(flags: pfs.O) pfs.O {
+    var with_cloexec = flags;
+    if (!is_windows) with_cloexec.CLOEXEC = true;
+    return with_cloexec;
+}
+
 const LeaseContent = union(enum) {
     empty,
-    record: struct { pid: i64, acquired_wall_ns: i128, state: LeaseState },
+    record: struct {
+        pid: i64,
+        acquired_wall_ns: i128,
+        state: LeaseState,
+        run_id: @FieldType(session_id_mod.SessionId, "bytes"),
+
+        fn runId(self: *const @This()) []const u8 {
+            return &self.run_id;
+        }
+    },
     unreadable,
 };
 
@@ -894,10 +999,14 @@ fn readLease(fd: pfs.Fd) LeaseContent {
         .ignore_unknown_fields = false,
         .duplicate_field_behavior = .@"error",
     }) catch return .unreadable;
-    if (!std.mem.eql(u8, record.schema_version, LEASE_SCHEMA_VERSION) or
-        session_id_mod.SessionId.fromSlice(record.run_id) == null)
-        return .unreadable;
-    return .{ .record = .{ .pid = record.pid, .acquired_wall_ns = record.acquired_wall_ns, .state = record.state } };
+    if (!std.mem.eql(u8, record.schema_version, LEASE_SCHEMA_VERSION)) return .unreadable;
+    const owner_run = session_id_mod.SessionId.fromSlice(record.run_id) orelse return .unreadable;
+    return .{ .record = .{
+        .pid = record.pid,
+        .acquired_wall_ns = record.acquired_wall_ns,
+        .state = record.state,
+        .run_id = owner_run.bytes,
+    } };
 }
 
 /// Rewrite the lease record in place, at its fixed width, durably.
@@ -3615,13 +3724,31 @@ test "an older metacodes' empty marker is busy while a process holds it and aban
     // open, under no lock and naming no owner.
     const marker = pfs.open(lease_path.ptr, .{ .ACCMODE = .WRONLY, .TRUNC = true }, @as(std.c.mode_t, 0));
     try std.testing.expect(marker >= 0);
+    // Its holder is another process (POSIX leaves this one out of the
+    // question; Windows cannot, so there this process's handle stands in).
+    var holder: ?std.process.Child = if (is_windows) null else try std.process.spawn(std.testing.io, .{
+        .argv = &.{ "/bin/sh", "-c", "exec 3<\"$0\"; exec sleep 60", lease_path },
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .ignore,
+    });
+    defer if (holder) |*child| child.kill(std.testing.io);
+    if (holder != null) {
+        _ = pfs.close(marker);
+        var tries: usize = 0;
+        while (!(try process_scan.heldOpenByOthers(lease_path.ptr)) and tries < 200) : (tries += 1)
+            util_time.sleepMs(10);
+    }
     var report: OpenReport = .{};
     try std.testing.expectError(error.JournalBusy, Journal.initWithOptions(root, sid, .{
         .abandoned_run = .record_abandoned,
         .report = &report,
     }));
     try std.testing.expect(report.holder == .unnamed);
-    _ = pfs.close(marker);
+    if (holder) |*child| {
+        child.kill(std.testing.io);
+        holder = null;
+    } else _ = pfs.close(marker);
 
     var next = try Journal.initWithOptions(root, sid, .{ .abandoned_run = .record_abandoned });
     defer next.deinit();
@@ -3710,6 +3837,72 @@ test "a run_abandoned record must match the Run it closes" {
     defer std.testing.allocator.free(orphan_file);
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = FILE_NAME, .data = orphan_file });
     try std.testing.expectError(error.InvalidRecord, validate(root, sid));
+}
+
+test "an owner that dies the instant it takes the lease does not close the session" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buffer[0..try tmp.dir.realPath(std.testing.io, &root_buffer)];
+    const sid = session_id_mod.SessionId.fromSlice("0123456789abcdef01234567").?;
+    var lease_buf: [std.fs.max_path_bytes + 1]u8 = undefined;
+    const lease_path = try testLeasePath(&lease_buf, root);
+
+    {
+        var finished = try Journal.init(root, sid);
+        defer finished.deinit();
+        try finished.finishRun("end_turn");
+    }
+    // The next owner takes the lease and dies before anything else: the lease
+    // it leaves already names it, so it never passes for an older metacodes'
+    // empty marker (which, beside a finished Run, would close the session).
+    const dead = try Lease.acquire(lease_path.ptr, null, session_id_mod.gen(), util_time.nowWallNs());
+    _ = pfs.close(dead.fd);
+    try std.testing.expect(dead.prior == .created);
+    var next = try Journal.init(root, sid);
+    defer next.deinit();
+    try next.finishRun("end_turn");
+
+    // Publishing leaves no staged lease behind, won or lost.
+    var holder = try Journal.init(root, sid);
+    defer holder.deinit();
+    try std.testing.expectError(error.JournalBusy, Journal.init(root, sid));
+    try holder.finishRun("end_turn");
+    var entries = tmp.dir.iterate();
+    while (try entries.next(std.testing.io)) |entry|
+        try std.testing.expect(!std.mem.startsWith(u8, entry.name, LOCK_FILE_NAME ++ "."));
+}
+
+test "an older metacodes' marker caught mid-release is not taken for a kept one" {
+    if (is_windows) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buffer[0..try tmp.dir.realPath(std.testing.io, &root_buffer)];
+    const sid = session_id_mod.SessionId.fromSlice("0123456789abcdef01234567").?;
+    var lease_buf: [std.fs.max_path_bytes + 1]u8 = undefined;
+    const lease_path = try testLeasePath(&lease_buf, root);
+
+    {
+        var finished = try Journal.init(root, sid);
+        defer finished.deinit();
+        try finished.finishRun("end_turn");
+    }
+    // An older metacodes finishing: its marker closed, its unlink a moment away.
+    const marker = pfs.open(lease_path.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true }, @as(std.c.mode_t, 0o600));
+    try std.testing.expect(marker >= 0);
+    _ = pfs.close(marker);
+    const Release = struct {
+        fn run(path: [*:0]const u8) void {
+            util_time.sleepMs(20);
+            pfs.unlinkPath(path) catch {};
+        }
+    };
+    const releaser = try std.Thread.spawn(.{}, Release.run, .{lease_path.ptr});
+    defer releaser.join();
+    var next = try Journal.init(root, sid);
+    defer next.deinit();
+    try next.finishRun("end_turn");
 }
 
 test "a lease reached through a name that has since moved is not the lease" {

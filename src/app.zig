@@ -4160,27 +4160,25 @@ var g_terminate_requested = std.atomic.Value(bool).init(false);
 /// long that a process whose terminal is gone outlives it noticeably.
 const terminate_grace_s: c_uint = 10;
 
-/// The first termination request stops the process as Ctrl+C does (abort the
-/// Run, request shutdown) and bounds how long that may take; a second one ends
-/// the process at once. async-signal-safe: atomics, `alarm`, `_exit`.
+/// A termination request stops the process as Ctrl+C does (abort the Run,
+/// request shutdown) and bounds how long that may take. Only the first one
+/// acts: a terminal closing under a shell delivers SIGHUP twice, milliseconds
+/// apart (the shell forwards its own; the kernel sends another as the shell
+/// exits), and the second must not cut the first's shutdown short — nor
+/// extend its bound. async-signal-safe: atomics and `alarm`.
 fn onTerminate() void {
     const is_windows = @import("builtin").os.tag == .windows;
-    if (g_terminate_requested.swap(true, .seq_cst)) {
-        if (is_windows) ExitProcess(143) else std.c._exit(143);
-    }
-    onSigint();
-    if (is_windows) {
-        // The console handler runs on its own thread, and Windows ends the
-        // process as soon as it returns: wait here while the main thread
-        // stops the Run; the process exits under it when that is done.
-        Sleep(terminate_grace_s * 1000);
-    } else {
+    if (!g_terminate_requested.swap(true, .seq_cst)) {
+        onSigint();
         // SIGALRM's default action ends the process should the Run not stop.
-        _ = std.c.alarm(terminate_grace_s);
+        if (!is_windows) _ = std.c.alarm(terminate_grace_s);
     }
+    // The console handler runs on its own thread, and Windows ends the process
+    // as soon as it returns (or, for a closed console, after about 5 s): wait
+    // here while the main thread stops the Run; the process exits under it.
+    if (is_windows) Sleep(terminate_grace_s * 1000);
 }
 
-extern "kernel32" fn ExitProcess(exit_code: u32) callconv(.winapi) noreturn;
 extern "kernel32" fn Sleep(milliseconds: u32) callconv(.winapi) void;
 
 pub fn shouldQueueModelSwitchCompact(
