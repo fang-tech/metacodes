@@ -113,13 +113,17 @@ pub const RunControl = struct {
         try self.journal.sealRun(stop_reason);
         const binding = try self.journal.finishedRunBinding();
         // Re-attest the active pointer after the durable Run close. A bundle
-        // change during the Run is not attributed to either identity.
+        // change during the Run is not attributed to either identity. The
+        // Run's abort signal is not passed: it stopped the Run (Esc, Ctrl+C,
+        // SIGTERM/SIGHUP), and an aborted Run's evidence must still publish,
+        // or the lease stays publication-pending and the session closed for
+        // good. The kernel's own timeout bounds this call.
         var current = (try bundle.loadVerifiedActive(
             self.allocator,
             gate.directory,
             gate.active.project_sha256,
             gate.runtime.config,
-            gate.runtime.abort,
+            null,
         )) orelse return error.ActivePointerDisappeared;
         defer current.deinit();
         if (current.revision != gate.active.revision or

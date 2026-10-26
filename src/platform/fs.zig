@@ -50,6 +50,9 @@ const WindowsO = struct {
     APPEND: bool = false,
     EXCL: bool = false,
     NOFOLLOW: bool = false,
+    /// `_O_NOINHERIT`: the handle is never inheritable, not even between the
+    /// open and a later `makeCloseOnExec`.
+    CLOEXEC: bool = false,
 
     pub const AccessMode = enum(u2) { RDONLY = 0, WRONLY = 1, RDWR = 2 };
 };
@@ -63,6 +66,7 @@ const _O_CREAT: c_int = 0x0100;
 const _O_TRUNC: c_int = 0x0200;
 const _O_EXCL: c_int = 0x0400;
 const _O_BINARY: c_int = 0x8000; // 必须：关掉 CRLF 文本翻译，保字节精确
+const _O_NOINHERIT: c_int = 0x0080;
 
 extern "c" fn _read(fd: c_int, buf: [*]u8, count: c_uint) c_int;
 extern "c" fn _write(fd: c_int, buf: [*]const u8, count: c_uint) c_int;
@@ -166,6 +170,7 @@ fn windowsOflag(flags: WindowsO) c_int {
     if (flags.TRUNC) o |= _O_TRUNC;
     if (flags.APPEND) o |= _O_APPEND;
     if (flags.EXCL) o |= _O_EXCL;
+    if (flags.CLOEXEC) o |= _O_NOINHERIT;
     return o;
 }
 

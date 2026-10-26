@@ -79,6 +79,8 @@ pub const OpenReport = struct {
     /// The previous Run that never finished: closed as abandoned on success
     /// under `record_abandoned`, or the reason for `UnfinishedRun`.
     unfinished: ?OpenRun = null,
+    /// A half-written last record `init` cut (`record_abandoned` only).
+    discarded_tail: ?DiscardedTail = null,
 
     pub const Holder = union(enum) {
         none,
@@ -211,9 +213,12 @@ pub const RunStarted = struct {
     started_wall_ns: i128,
     /// Present when the Session rendered the Run's system prompt.
     prompt: ?PromptRecord = null,
+    /// Present when this Run's `init` cut a half-written record a dead owner
+    /// left at the end of the journal.
+    discarded_tail: ?DiscardedTail = null,
 
-    /// `prompt` is written only when present, so a Run without one keeps the
-    /// historical record bytes.
+    /// Optional members are written only when present, so a Run without them
+    /// keeps the historical record bytes.
     pub fn jsonStringify(self: RunStarted, jws: anytype) !void {
         try jws.beginObject();
         try jws.objectField("started_wall_ns");
@@ -222,8 +227,19 @@ pub const RunStarted = struct {
             try jws.objectField("prompt");
             try jws.write(prompt);
         }
+        if (self.discarded_tail) |tail| {
+            try jws.objectField("discarded_tail");
+            try jws.write(tail);
+        }
         try jws.endObject();
     }
+};
+
+/// The bytes of a record a dead owner never finished writing, cut from the
+/// journal end: how many, and their digest.
+pub const DiscardedTail = struct {
+    bytes: u64,
+    sha256: [64]u8,
 };
 
 pub const JournalEvent = union(enum) {
@@ -465,7 +481,16 @@ pub const Journal = struct {
         errdefer _ = pfs.close(fd);
         try pfs.makeCloseOnExec(fd);
 
-        const summary = try validateFd(fd, session_id, null, null);
+        // The lease is ours, so no writer is mid-record: a last record without
+        // its newline belongs to a dead owner.
+        var discarded_tail: ?DiscardedTail = null;
+        const summary = validateFd(fd, session_id, null, null) catch |err| blk: {
+            if (err != error.PartialRecord or options.abandoned_run != .record_abandoned) return err;
+            const cut = try cutTornTail(fd, session_id);
+            discarded_tail = cut.tail;
+            if (options.report) |report| report.discarded_tail = cut.tail;
+            break :blk cut.summary;
+        };
         var abandon: ?OwnerEvidence = null;
         if (summary.open_run) |open_run| {
             if (options.report) |report| report.unfinished = open_run;
@@ -526,6 +551,7 @@ pub const Journal = struct {
         try journal.appendEvent(.{ .run_started = .{
             .started_wall_ns = started_wall_ns,
             .prompt = prompt_record,
+            .discarded_tail = discarded_tail,
         } });
         try fsyncDirectory(session_dir);
         return journal;
@@ -623,8 +649,8 @@ pub const Journal = struct {
     }
 
     /// Give the lease up: say `released` durably, then remove the file. Either
-    /// alone lets the next Run start. On POSIX, when both fail, the descriptor
-    /// stays open so `deinit` can try again.
+    /// alone lets the next Run start (on Windows only the record counts). A
+    /// failure keeps the descriptor open so `deinit` can try again.
     fn releaseLease(self: *Journal) !void {
         if (self.lock_released) return;
         if (self.lock_fd < 0) return error.LeaseLost;
@@ -633,12 +659,13 @@ pub const Journal = struct {
         const path: [*:0]const u8 = @ptrCast(&self.lock_path);
         if (is_windows) {
             // Windows refuses to delete a file anyone has open, and a successor
-            // may hold this one the moment ours closes: close, then remove it
-            // unless someone does.
+            // may hold this one the moment ours closes: the record must say
+            // `released` before the handle goes (a retry needs the handle),
+            // and the delete is then a courtesy.
+            if (!recorded) return error.LeaseReleaseFailed;
             _ = pfs.close(self.lock_fd);
             self.lock_fd = -1;
-            if (pfs.unlinkPath(path)) {} else |err| if (!recorded and err != error.NotFound)
-                return error.LeaseReleaseFailed;
+            pfs.unlinkPath(path) catch {};
         } else {
             // Remove the name while still holding the lock: a process that
             // opened it before then holds a file nobody can name, which
@@ -773,6 +800,19 @@ const MAX_LEASE_ATTEMPTS: usize = 16;
 /// microseconds apart).
 const LEGACY_RELEASE_SETTLE_MS: u64 = 100;
 
+/// Pause between attempts on a Windows lease whose deletion is pending.
+const WINDOWS_RELEASE_RETRY_MS: u64 = 20;
+
+/// Sleep at least `ms`: a signal (SIGWINCH, SIGTERM, ...) ends one sleep early.
+fn settleMs(ms: u64) void {
+    const deadline = util_time.nowNs() + @as(i128, ms) * std.time.ns_per_ms;
+    while (true) {
+        const now = util_time.nowNs();
+        if (now >= deadline) return;
+        util_time.sleepMs(@intCast(@divTrunc(deadline - now + std.time.ns_per_ms - 1, std.time.ns_per_ms)));
+    }
+}
+
 /// The session's Run lease while `init` decides whether to take the Run.
 const Lease = struct {
     fd: pfs.Fd,
@@ -820,6 +860,12 @@ const Lease = struct {
             const fd = pfs.open(path, leaseOpenFlags(.{ .ACCMODE = .RDWR, .NOFOLLOW = true }), @as(std.c.mode_t, 0));
             if (fd < 0) {
                 if (pfs.lastErrnoIs(.NOENT)) continue; // released since: publish again
+                // Windows refuses to open a file whose deletion is pending
+                // until its last handle closes: a release in progress.
+                if (is_windows and pfs.lastErrnoIs(.ACCES)) {
+                    util_time.sleepMs(WINDOWS_RELEASE_RETRY_MS);
+                    continue;
+                }
                 return error.LeaseOpenFailed;
             }
             pfs.makeCloseOnExec(fd) catch |err| {
@@ -871,7 +917,7 @@ const Lease = struct {
                             // An older metacodes releases by closing its marker,
                             // then unlinking it: one caught between the two is
                             // not a marker it kept. Give it the moment to go.
-                            util_time.sleepMs(LEGACY_RELEASE_SETTLE_MS);
+                            settleMs(LEGACY_RELEASE_SETTLE_MS);
                             const still = namesFile(path, fd) catch |err| {
                                 _ = pfs.close(fd);
                                 return err;
@@ -885,9 +931,10 @@ const Lease = struct {
                         return error.JournalBusy;
                     }
                     // Windows counts this process's own handle: ask with ours
-                    // closed, then take the lease again. (A marker that a full
-                    // Run of a new metacodes and a fresh older one replaced in
-                    // that gap would pass unseen; the gap is one scan long.)
+                    // closed, give an owner mid-release the moment to delete it
+                    // (it cannot while anyone has it open), then take the lease
+                    // again. (A marker that a full Run of a new metacodes and a
+                    // fresh older one replaced in that gap would pass unseen.)
                     _ = pfs.close(fd);
                     const held = process_scan.heldOpenByOthers(path) catch {
                         if (report) |r| r.holder = .unknown;
@@ -897,6 +944,7 @@ const Lease = struct {
                         if (report) |r| r.holder = .unnamed;
                         return error.JournalBusy;
                     }
+                    settleMs(LEGACY_RELEASE_SETTLE_MS);
                     legacy_unheld = true;
                 },
             }
@@ -928,18 +976,48 @@ const Lease = struct {
         if (is_windows) {
             _ = pfs.close(fd);
             keep = true;
-            const installed = pfs.installNoReplace(staged.ptr, path) catch {
-                pfs.unlinkPath(staged.ptr) catch {};
-                return error.LeasePublishFailed;
-            };
+            // Anything but a move leaves the name to `acquire`, which retries a
+            // lease whose deletion is still pending.
+            const installed = pfs.installNoReplace(staged.ptr, path) catch .already_exists;
             if (installed == .already_exists) pfs.unlinkPath(staged.ptr) catch {};
             return null;
         }
-        const installed = pfs.installNoReplace(staged.ptr, path) catch return error.LeasePublishFailed;
+        const installed = pfs.installNoReplace(staged.ptr, path) catch {
+            // A filesystem without hard links (FAT, exFAT, many network
+            // mounts): create the lease in place. There the record follows
+            // the create closely, not atomically with it.
+            if (pfs.lastErrnoIs(.PERM) or pfs.lastErrnoIs(.OPNOTSUPP) or pfs.lastErrnoIs(.MLINK))
+                return publishInPlace(path, run_id, acquired_wall_ns);
+            return error.LeasePublishFailed;
+        };
         if (installed == .already_exists) return null;
         // Linked: the lease is published and this descriptor holds its lock.
         keep = true;
         pfs.unlinkPath(staged.ptr) catch {};
+        return fd;
+    }
+
+    /// `publish` where the lease cannot be staged and linked: create it at
+    /// `path` directly, lock it, and write the record. Null when a lease
+    /// already exists, or someone locked this one first.
+    fn publishInPlace(path: [*:0]const u8, run_id: session_id_mod.SessionId, acquired_wall_ns: i128) !?pfs.Fd {
+        const fd = pfs.open(path, leaseOpenFlags(.{ .ACCMODE = .RDWR, .CREAT = true, .EXCL = true, .NOFOLLOW = true }), @as(std.c.mode_t, 0o600));
+        if (fd < 0) {
+            if (pfs.lastErrnoIs(.EXIST)) return null;
+            return error.LeaseOpenFailed;
+        }
+        pfs.tryLockExclusive(fd) catch |err| {
+            _ = pfs.close(fd);
+            // Whoever locked it first decides about it.
+            if (err == error.WouldBlock) return null;
+            return error.LeaseLockFailed;
+        };
+        errdefer {
+            pfs.unlinkPath(path) catch {};
+            _ = pfs.close(fd);
+        }
+        try pfs.makeCloseOnExec(fd);
+        try writeLeaseRecord(fd, run_id, acquired_wall_ns, .running);
         return fd;
     }
 
@@ -963,7 +1041,7 @@ const Lease = struct {
 /// its lock past its owner's death.
 fn leaseOpenFlags(flags: pfs.O) pfs.O {
     var with_cloexec = flags;
-    if (!is_windows) with_cloexec.CLOEXEC = true;
+    with_cloexec.CLOEXEC = true;
     return with_cloexec;
 }
 
@@ -1406,21 +1484,62 @@ fn validateFd(
     expected_binding: ?RunBinding,
     interval_sha256_out: ?*[64]u8,
 ) !ValidationSummary {
+    const bytes = try readArtifact(fd);
+    defer std.heap.c_allocator.free(bytes);
+    if (bytes.len > 0 and bytes[bytes.len - 1] != '\n')
+        return error.PartialRecord;
+    return validateBytes(bytes, expected_session, expected_binding, interval_sha256_out);
+}
+
+/// The whole journal behind `fd`, from its start; the caller frees it with
+/// `std.heap.c_allocator`.
+fn readArtifact(fd: pfs.Fd) ![]u8 {
     const info = pfs.fileInfo(fd) catch return error.StatFailed;
     if (!info.is_regular or info.link_count != 1) return error.NotRegularFile;
     if (info.size > MAX_ARTIFACT_BYTES) return error.ArtifactTooLarge;
     const size: usize = @intCast(info.size);
     if (pfs.lseek(fd, 0, .set) < 0) return error.SeekFailed;
     const bytes = try std.heap.c_allocator.alloc(u8, size);
-    defer std.heap.c_allocator.free(bytes);
+    errdefer std.heap.c_allocator.free(bytes);
     var offset: usize = 0;
     while (offset < bytes.len) {
         const n = pfs.read(fd, bytes[offset..]);
         if (n <= 0) return error.ReadFailed;
         offset += @intCast(n);
     }
-    if (bytes.len > 0 and bytes[bytes.len - 1] != '\n')
-        return error.PartialRecord;
+    return bytes;
+}
+
+/// Cut the record a dead owner left half-written at the end of the journal.
+/// It was never acknowledged — a record is acknowledged only once written
+/// whole and flushed — so it is no evidence; what it was is kept as its length
+/// and digest (`RunStarted.discarded_tail`). Everything before it must
+/// validate first: a damaged journal is not this repair's to make.
+fn cutTornTail(fd: pfs.Fd, session_id: session_id_mod.SessionId) !struct {
+    summary: ValidationSummary,
+    tail: DiscardedTail,
+} {
+    const bytes = try readArtifact(fd);
+    defer std.heap.c_allocator.free(bytes);
+    const kept = if (std.mem.lastIndexOfScalar(u8, bytes, '\n')) |index| index + 1 else 0;
+    if (kept == bytes.len) return error.PartialRecord;
+    const summary = try validateBytes(bytes[0..kept], session_id, null, null);
+    const tail: DiscardedTail = .{
+        .bytes = bytes.len - kept,
+        .sha256 = observation.sha256Hex(bytes[kept..]),
+    };
+    pfs.setSize(fd, kept) catch return error.TruncateFailed;
+    try pfs.fsyncChecked(fd);
+    return .{ .summary = summary, .tail = tail };
+}
+
+fn validateBytes(
+    bytes: []const u8,
+    expected_session: session_id_mod.SessionId,
+    expected_binding: ?RunBinding,
+    interval_sha256_out: ?*[64]u8,
+) !ValidationSummary {
+    const size = bytes.len;
 
     var expected_sequence: u64 = 0;
     var active_run: ?session_id_mod.SessionId = null;
@@ -1492,6 +1611,9 @@ fn validateFd(
                     return error.InvalidRecord;
                 if (started.prompt) |prompt| {
                     if (!validPromptRecord(prompt)) return error.InvalidRecord;
+                }
+                if (started.discarded_tail) |tail| {
+                    if (tail.bytes == 0 or !validHex(tail.sha256)) return error.InvalidRecord;
                 }
                 active_run = run_id;
                 active_started_wall_ns = started.started_wall_ns;
@@ -3903,6 +4025,110 @@ test "an older metacodes' marker caught mid-release is not taken for a kept one"
     var next = try Journal.init(root, sid);
     defer next.deinit();
     try next.finishRun("end_turn");
+}
+
+fn testAppendBytes(root: []const u8, bytes: []const u8) !void {
+    var path_buf: [std.fs.max_path_bytes + 1]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, "{s}/{s}", .{ root, FILE_NAME });
+    const fd = pfs.open(path.ptr, .{ .ACCMODE = .WRONLY, .APPEND = true }, @as(std.c.mode_t, 0));
+    if (fd < 0) return error.TestOpenFailed;
+    defer _ = pfs.close(fd);
+    try writeAll(fd, bytes);
+}
+
+fn testJournalSize(root: []const u8) !u64 {
+    var path_buf: [std.fs.max_path_bytes + 1]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, "{s}/{s}", .{ root, FILE_NAME });
+    const fd = pfs.open(path.ptr, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+    if (fd < 0) return error.TestOpenFailed;
+    defer _ = pfs.close(fd);
+    return (try pfs.fileInfo(fd)).size;
+}
+
+test "a record a dead owner left half-written is cut, recorded, and the Run abandoned" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buffer[0..try tmp.dir.realPath(std.testing.io, &root_buffer)];
+    const sid = session_id_mod.SessionId.fromSlice("0123456789abcdef01234567").?;
+
+    _ = try testDieMidRun(root, sid);
+    // SIGKILL inside write(2): the kernel may stop between pages.
+    const fragment = "{\"schema_version\":\"metacodes-tool-observation-journal-v2\",\"seq";
+    try testAppendBytes(root, fragment);
+    const torn_size = try testJournalSize(root);
+    try std.testing.expectError(error.PartialRecord, Journal.init(root, sid));
+    try std.testing.expectEqual(torn_size, try testJournalSize(root));
+
+    var report: OpenReport = .{};
+    var next = try Journal.initWithOptions(root, sid, .{ .abandoned_run = .record_abandoned, .report = &report });
+    defer next.deinit();
+    try next.finishRun("end_turn");
+    const tail = report.discarded_tail.?;
+    try std.testing.expectEqual(@as(u64, fragment.len), tail.bytes);
+    try std.testing.expectEqualStrings(&observation.sha256Hex(fragment), &tail.sha256);
+    try std.testing.expect(report.unfinished != null);
+    try std.testing.expect((try validate(root, sid)).complete);
+    const bytes = try tmp.dir.readFileAlloc(std.testing.io, FILE_NAME, std.testing.allocator, .unlimited);
+    defer std.testing.allocator.free(bytes);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "\"run_abandoned\"") != null);
+    const recorded = try std.fmt.allocPrint(std.testing.allocator, "\"discarded_tail\":{{\"bytes\":{d},\"sha256\":\"{s}\"}}", .{ fragment.len, &tail.sha256 });
+    defer std.testing.allocator.free(recorded);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, recorded) != null);
+}
+
+test "a half-written record after a finished Run is cut; a damaged journal is left alone" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buffer[0..try tmp.dir.realPath(std.testing.io, &root_buffer)];
+    const sid = session_id_mod.SessionId.fromSlice("0123456789abcdef01234567").?;
+
+    {
+        var finished = try Journal.init(root, sid);
+        defer finished.deinit();
+        try finished.finishRun("end_turn");
+    }
+    // The next owner died writing its very first record.
+    try testAppendBytes(root, "{\"schema_version\":");
+    var report: OpenReport = .{};
+    var next = try Journal.initWithOptions(root, sid, .{ .abandoned_run = .record_abandoned, .report = &report });
+    try next.finishRun("end_turn");
+    next.deinit();
+    try std.testing.expect(report.discarded_tail != null and report.unfinished == null);
+    try std.testing.expect((try validate(root, sid)).complete);
+
+    // Anything wrong before the half-written record is not this repair's.
+    try testAppendBytes(root, "not a record\n{\"half");
+    const damaged = try testJournalSize(root);
+    try std.testing.expectError(
+        error.InvalidRecord,
+        Journal.initWithOptions(root, sid, .{ .abandoned_run = .record_abandoned }),
+    );
+    try std.testing.expectEqual(damaged, try testJournalSize(root));
+}
+
+test "a lease created in place, where links are unsupported, is locked and names its owner" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buffer[0..try tmp.dir.realPath(std.testing.io, &root_buffer)];
+    var lease_buf: [std.fs.max_path_bytes + 1]u8 = undefined;
+    const lease_path = try testLeasePath(&lease_buf, root);
+    const run_id = session_id_mod.gen();
+
+    const fd = (try Lease.publishInPlace(lease_path.ptr, run_id, 7)).?;
+    defer _ = pfs.close(fd);
+    switch (readLease(fd)) {
+        .record => |owner| try std.testing.expectEqualStrings(run_id.asSlice(), owner.runId()),
+        else => return error.TestUnexpectedResult,
+    }
+    const other = pfs.open(lease_path.ptr, .{ .ACCMODE = .RDWR }, @as(std.c.mode_t, 0));
+    try std.testing.expect(other >= 0);
+    defer _ = pfs.close(other);
+    try std.testing.expectError(error.WouldBlock, pfs.tryLockExclusive(other));
+    // A second in-place create finds the lease and leaves it alone.
+    try std.testing.expect((try Lease.publishInPlace(lease_path.ptr, session_id_mod.gen(), 8)) == null);
 }
 
 test "a lease reached through a name that has since moved is not the lease" {

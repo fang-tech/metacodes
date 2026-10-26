@@ -9,14 +9,18 @@
     leaves, once no process has it open.
   - While another process holds the lease, a turn is refused with that
     process's pid, and the REPL stays up.
+  - A hangup inherited as ignored (`nohup`) stays ignored.
 """
 import fcntl
 import glob
 import json
 import os
 import re
+import signal
+import subprocess
+import time
 
-from tty_driver import run, READY, IDLE, wait_for, case_tmpdir
+from tty_driver import run, READY, IDLE, wait_for, case_tmpdir, _build_env
 from asserts import TTYAssert
 from slow_mock_server import SlowMockServer, simple_text, slow_text_then_end
 
@@ -185,3 +189,28 @@ def test_a_held_lease_refuses_the_turn_and_names_its_process(bin_path):
     # The REPL outlived the refusal: /exit still printed its resume hint.
     assert a.final.find_last_row("Resume this session with:") is not None, a.final.render_ascii()
     assert "SHOULD_NOT_REACH" not in raw.decode("utf-8", "replace")
+
+
+def test_nohup_keeps_a_headless_run_through_a_hangup(bin_path):
+    """`nohup metacodes -p ...`: SIGHUP inherited as ignored stays ignored."""
+    _require_posix()
+    env, cwd = _workspace("nohup")
+    with SlowMockServer([slow_text_then_end(n_chunks=6, delay=0.5)]) as srv:
+        full_env, _ = _build_env(srv.url, env)
+        proc = subprocess.Popen(
+            [os.path.abspath(bin_path), "--permission", "bypassPermissions", "--base-url", srv.url,
+             "-p", "count slowly"],
+            cwd=cwd, env=full_env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            preexec_fn=lambda: signal.signal(signal.SIGHUP, signal.SIG_IGN),
+        )
+        try:
+            time.sleep(1.5)  # inside the ~3 s reply
+            proc.send_signal(signal.SIGHUP)
+            out, err = proc.communicate(timeout=30)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+    assert proc.returncode == 0, (proc.returncode, err.decode("utf-8", "replace"))
+    assert b"tok5" in out, out
+    finished = _events(_session_dir(env))[-1]["event"]["run_finished"]
+    assert finished["stop_reason"] == "end_turn", finished

@@ -4062,7 +4062,8 @@ pub const App = struct {
         // A closed terminal (SIGHUP) or a `kill` (SIGTERM) would otherwise end
         // the process mid-Run by default, leaving the Run for the next process
         // to close as abandoned. Stop the Run so it closes itself, then leave.
-        platform_signal.installTerminate(onTerminate);
+        // A disposition inherited as ignored (`nohup`) is kept.
+        platform_signal.installTerminateUnlessIgnored(onTerminate);
     }
 
     /// Stop SIGINT from aborting this App's run; SIGINT still requests process

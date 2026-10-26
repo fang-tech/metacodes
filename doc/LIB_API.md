@@ -274,6 +274,15 @@ prompt 或工具 schema，因此启用 durability 不改变 prompt-cache key。
   `RunBinding` 证据，`validateRunBinding` / `loadRunDispatches` 一律拒绝。
 - 上一个 Run 已终止但 `sealRun` 之后没走到 `releaseFinishedRun`（派生产物未发布）：
   `RunPublicationPending`，两种策略都不放行。
+- 死掉的 owner 写到一半的最后一条记录（没有换行）从未被确认过——记录要整条写完并刷盘才
+  算确认——所以 `record_abandoned` 下把它从 journal 末尾截掉，长度与 SHA-256 记进新 Run
+  的 `run_started.discarded_tail`；截掉之前，前面的全部记录必须先通过校验。`fail_closed`
+  下仍是 `PartialRecord`。
+
+新 lease 先以 `<lock>.<run_id>` 写好记录再用不覆盖的 link（Windows：move）发布，所以
+锁文件名下永远不会出现空文件；不支持硬链接的文件系统退回原地创建。产品宿主在 Run
+被中止（Esc、Ctrl+C、SIGTERM/SIGHUP）后发布派生产物时不再沿用该中止信号，由 kernel
+自身的超时兜底，否则 lease 会停在 `publication_pending`。
 
 旧版 metacodes 留下的空标记文件不加锁、不记 owner：有任何进程仍打开着它就视为 busy
 （`holder = .unnamed`），无人打开才视为 owner 已死（`evidence = legacy_lease_unheld`）。
