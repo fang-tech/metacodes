@@ -83,7 +83,28 @@ pub const Outcome = union(enum) {
     login: Slug,
     /// Esc in the credential stage: the host aborts the running login.
     cancel_login,
+    /// Enter on a pasted key (`credential_mode == .paste_key`): the host checks
+    /// and stores `keyText()` for `credential_provider`, then retries the
+    /// pending commit.
+    submit_key,
+    /// Tab on the key step: the host opens the chosen key page.
+    open_key_page,
 };
+
+/// A page an API key is created on, as the credential stage shows it. The
+/// host maps its provider's key pages to these; the strings are borrowed from
+/// the provider registry for as long as the stage is shown.
+pub const KeyChoice = struct {
+    label: []const u8,
+    url: []const u8,
+};
+
+pub const MAX_KEY_CHOICES: usize = 8;
+pub const MAX_KEY_LEN: usize = 512;
+
+/// What the credential stage is doing: following an OAuth sign-in, or taking
+/// a pasted API key for a provider that has no OAuth grant.
+pub const CredentialMode = enum { sign_in, paste_key };
 
 pub const Key = union(enum) {
     up,
@@ -136,6 +157,16 @@ pub const Picker = struct {
     credential_failed: bool = false,
     credential_lines: [MAX_CREDENTIAL_LINES]u8 = undefined,
     credential_lines_len: usize = 0,
+    credential_mode: CredentialMode = .sign_in,
+    key_choices: [MAX_KEY_CHOICES]KeyChoice = undefined,
+    key_choice_count: usize = 0,
+    key_choice: usize = 0,
+    /// What the provider asks the user to know before creating a key.
+    key_note: ?[]const u8 = null,
+    key_buffer: [MAX_KEY_LEN]u8 = undefined,
+    key_len: usize = 0,
+    /// The pasted key is being checked; typing waits for the answer.
+    key_checking: bool = false,
 
     provider: ?Slug = null,
     group_key_buffer: [MAX_GROUP_KEY]u8 = undefined,
@@ -243,6 +274,103 @@ pub const Picker = struct {
         self.credential_return_stage = .model;
         self.credential_failed = false;
         self.credential_lines_len = 0;
+        self.leaveKeyMode();
+    }
+
+    /// A commit that needs an API key the provider has no OAuth grant for:
+    /// show its key pages and take the pasted key in place of the list. The
+    /// choices are copied (at most `MAX_KEY_CHOICES`); their strings are
+    /// borrowed.
+    pub fn enterKeyStage(
+        self: *Picker,
+        provider: Slug,
+        commit: Commit,
+        choices: []const KeyChoice,
+        default_choice: usize,
+        note: ?[]const u8,
+    ) Outcome {
+        _ = self.enterCredentialStage(provider, commit);
+        self.credential_mode = .paste_key;
+        self.key_choice_count = @min(choices.len, MAX_KEY_CHOICES);
+        @memcpy(self.key_choices[0..self.key_choice_count], choices[0..self.key_choice_count]);
+        self.key_choice = @min(default_choice, self.key_choice_count -| 1);
+        self.key_note = note;
+        self.clearKey();
+        return .redraw;
+    }
+
+    pub fn keyText(self: *const Picker) []const u8 {
+        return self.key_buffer[0..self.key_len];
+    }
+
+    pub fn keyChoices(self: *const Picker) []const KeyChoice {
+        return self.key_choices[0..self.key_choice_count];
+    }
+
+    /// The key is handed to the host (which copies it); the field is wiped.
+    pub fn clearKey(self: *Picker) void {
+        std.crypto.secureZero(u8, self.key_buffer[0..self.key_len]);
+        self.key_len = 0;
+    }
+
+    fn leaveKeyMode(self: *Picker) void {
+        self.clearKey();
+        self.credential_mode = .sign_in;
+        self.key_choice_count = 0;
+        self.key_choice = 0;
+        self.key_note = null;
+        self.key_checking = false;
+    }
+
+    /// Keys on the paste-a-key step.
+    fn onKeyStep(self: *Picker, key: Key) Outcome {
+        if (key == .escape) return self.back();
+        // While the key is being checked, only Esc (above) does anything.
+        if (self.key_checking) return .ignored;
+        switch (key) {
+            .up, .down => {
+                if (self.key_choice_count == 0) return .ignored;
+                self.key_choice = if (key == .down)
+                    (self.key_choice + 1) % self.key_choice_count
+                else if (self.key_choice == 0) self.key_choice_count - 1 else self.key_choice - 1;
+                return .redraw;
+            },
+            .cycle_scope => return if (self.key_choice_count == 0) .ignored else .open_key_page,
+            .backspace => {
+                if (self.key_len == 0) return .ignored;
+                self.key_len -= 1;
+                self.key_buffer[self.key_len] = 0;
+                return .redraw;
+            },
+            .char => |byte| {
+                // A paste arrives as characters; whitespace and controls a
+                // terminal adds around it are not part of a key.
+                if (byte <= ' ' or byte == 0x7f) return .ignored;
+                if (self.key_len == self.key_buffer.len) return .ignored;
+                if (self.credential_failed) {
+                    // A new attempt after a refused key starts clean.
+                    self.credential_failed = false;
+                    self.notice_len = 0;
+                    self.credential_lines_len = 0;
+                }
+                self.key_buffer[self.key_len] = byte;
+                self.key_len += 1;
+                return .redraw;
+            },
+            .enter => {
+                if (self.key_len == 0) return .ignored;
+                return .submit_key;
+            },
+            else => return .ignored,
+        }
+    }
+
+    /// The host started checking the key: show the check, not the field.
+    pub fn keySubmitted(self: *Picker) void {
+        self.clearKey();
+        self.key_checking = true;
+        self.credential_failed = false;
+        self.credential_lines_len = 0;
     }
 
     /// A commit the host could not perform for want of a credential (#67):
@@ -278,6 +406,15 @@ pub const Picker = struct {
     /// read why, and Esc returns without a further notice.
     pub fn credentialFailed(self: *Picker, error_name: []const u8) void {
         self.credential_failed = true;
+        if (self.credential_mode == .paste_key) {
+            self.key_checking = false;
+            if (std.mem.eql(u8, error_name, "KeyRefused")) {
+                self.setNotice("the provider refused that key; paste another, or Esc returns to the route list", .{});
+            } else {
+                self.setNotice("the key was not stored ({s}); paste it again, or Esc returns to the route list", .{error_name});
+            }
+            return;
+        }
         self.setNotice("sign-in failed ({s}); Esc returns to the route list", .{error_name});
     }
 
@@ -295,6 +432,7 @@ pub const Picker = struct {
         self.credential_provider = null;
         self.credential_failed = false;
         self.credential_lines_len = 0;
+        self.leaveKeyMode();
         self.cursor = 0;
         self.window_top = 0;
     }
@@ -439,9 +577,12 @@ pub const Picker = struct {
     // ── key handling ────────────────────────────────────────────────────────
 
     pub fn onKey(self: *Picker, key: Key) Outcome {
-        // The credential stage has no list to move in and nothing to type:
-        // only Esc, which ends the sign-in.
-        if (self.stage == .credential) return if (key == .escape) self.back() else .ignored;
+        // The credential stage has no list to move in: a sign-in takes only
+        // Esc; the paste-a-key step takes the key.
+        if (self.stage == .credential) {
+            if (self.credential_mode == .paste_key) return self.onKeyStep(key);
+            return if (key == .escape) self.back() else .ignored;
+        }
         var buffer = RowBuffer.init(self.allocator);
         defer buffer.deinit();
         // Without its rows a key cannot be interpreted; nothing changes.
@@ -581,7 +722,13 @@ pub const Picker = struct {
             .credential => {
                 // Esc ends the sign-in: the host aborts the worker on
                 // `.cancel_login`; the draft route stays selectable.
-                if (self.credential_failed) self.notice_len = 0 else self.setNotice("sign-in cancelled; the previous route is still active", .{});
+                if (self.credential_failed) {
+                    self.notice_len = 0;
+                } else if (self.credential_mode == .paste_key) {
+                    self.setNotice("no key was stored; the previous route is still active", .{});
+                } else {
+                    self.setNotice("sign-in cancelled; the previous route is still active", .{});
+                }
                 self.leaveCredentialStage();
                 return .cancel_login;
             },
@@ -1388,4 +1535,63 @@ test "a failed sign-in explains itself and Esc then leaves no notice" {
     try testing.expect(picker.onKey(.escape) == .cancel_login);
     try testing.expectEqual(@as(usize, 0), picker.notice_len);
     try testing.expect(!picker.credential_failed);
+}
+
+test "a pasted key is typed blind, chosen per plan, and handed over once" {
+    var picker = Picker.init(testing.allocator);
+    defer picker.deinit();
+    const offers = [_]OfferSummary{
+        fixtureOffer("zai-coding-plan", "cn-anthropic", "GLM-5.3", "zai/glm-5.3", "glm-5.3", "anthropic_messages"),
+    };
+    try loadFixture(&picker, &offers, null);
+    _ = picker.onKey(.enter);
+    const outcome = picker.onKey(.enter);
+    try testing.expect(outcome == .commit);
+    const came_from = picker.stage;
+    const choices = [_]KeyChoice{
+        .{ .label = "China · Personal", .url = "https://example.test/cn" },
+        .{ .label = "Global · Personal", .url = "https://example.test/global" },
+    };
+    try testing.expect(picker.enterKeyStage(Slug.lit("zai-coding-plan"), outcome.commit, &choices, 1, "plan keys only") == .redraw);
+    try testing.expectEqual(Stage.credential, picker.stage);
+    try testing.expectEqual(CredentialMode.paste_key, picker.credential_mode);
+    try testing.expectEqual(@as(usize, 1), picker.key_choice);
+
+    // Nothing to submit yet; Tab opens the chosen page; arrows choose a plan.
+    try testing.expect(picker.onKey(.enter) == .ignored);
+    try testing.expect(picker.onKey(.cycle_scope) == .open_key_page);
+    try testing.expect(picker.onKey(.down) == .redraw);
+    try testing.expectEqual(@as(usize, 0), picker.key_choice);
+    try testing.expect(picker.onKey(.up) == .redraw);
+    try testing.expectEqual(@as(usize, 1), picker.key_choice);
+
+    // Characters are the key, not a filter; whitespace from a paste is dropped.
+    for (" plan-key\t") |byte| _ = picker.onKey(.{ .char = byte });
+    try testing.expectEqualStrings("plan-key", picker.keyText());
+    try testing.expectEqual(@as(usize, 0), picker.filter_len);
+    try testing.expect(picker.onKey(.backspace) == .redraw);
+    try testing.expectEqualStrings("plan-ke", picker.keyText());
+    try testing.expect(picker.onKey(.enter) == .submit_key);
+
+    // Handed over: the field is wiped and only Esc acts while it is checked.
+    picker.keySubmitted();
+    try testing.expectEqual(@as(usize, 0), picker.key_len);
+    for (picker.key_buffer[0..7]) |byte| try testing.expectEqual(@as(u8, 0), byte);
+    try testing.expect(picker.onKey(.{ .char = 'x' }) == .ignored);
+    try testing.expect(picker.onKey(.enter) == .ignored);
+
+    // A refused key asks for another on the same plan.
+    picker.credentialFailed("KeyRefused");
+    try testing.expect(!picker.key_checking);
+    try testing.expect(std.mem.indexOf(u8, picker.notice(), "refused that key") != null);
+    try testing.expect(picker.onKey(.{ .char = 'k' }) == .redraw);
+    try testing.expect(!picker.credential_failed);
+    try testing.expectEqual(@as(usize, 1), picker.key_choice);
+
+    // Esc gives up: nothing stored, the previous route kept, key mode left.
+    try testing.expect(picker.onKey(.escape) == .cancel_login);
+    try testing.expectEqual(came_from, picker.stage);
+    try testing.expectEqual(CredentialMode.sign_in, picker.credential_mode);
+    try testing.expectEqual(@as(usize, 0), picker.key_len);
+    try testing.expect(std.mem.indexOf(u8, picker.notice(), "no key was stored") != null);
 }

@@ -45,6 +45,9 @@ pub const LoginWorker = struct {
     transcript: [TRANSCRIPT_CAPACITY]u8 = undefined,
     transcript_len: usize = 0,
     transcript_truncated: bool = false,
+    /// The pasted key now points into `owned` (set by `ownFlow`); only then
+    /// is it this worker's to zero.
+    owns_secret: bool = false,
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, prepared: provider_login.Prepared) LoginWorker {
         return initFlow(allocator, io, .{ .oauth = prepared });
@@ -63,6 +66,16 @@ pub const LoginWorker = struct {
         if (options.client_id) |id| options.client_id = try a.dupe(u8, id);
         switch (self.flow) {
             .metask => {},
+            .api_key => |*prepared| {
+                prepared.provider_label = try a.dupe(u8, prepared.provider_label);
+                prepared.secret = try a.dupe(u8, prepared.secret);
+                self.owns_secret = true;
+                const page = &prepared.page;
+                page.label = try a.dupe(u8, page.label);
+                page.url = try a.dupe(u8, page.url);
+                if (page.check_url) |url| page.check_url = try a.dupe(u8, url);
+                if (page.region) |region| page.region = try a.dupe(u8, region);
+            },
             .oauth => |*prepared| {
                 const source = prepared.profile;
                 const copy = try a.create(provider_profile.ProviderProfile);
@@ -93,12 +106,14 @@ pub const LoginWorker = struct {
         // A worker that never starts is destroyed without `join`: release the
         // copies on every failure here.
         self.ownFlow() catch {
+            self.wipeSecret();
             _ = self.owned.reset(.free_all);
             self.state.store(idle, .release);
             return error.ThreadSpawnFailed;
         };
         self.flow.options().abort_signal = &self.abort_signal;
         self.thread = std.Thread.spawn(.{}, run, .{self}) catch {
+            self.wipeSecret();
             _ = self.owned.reset(.free_all);
             self.state.store(idle, .release);
             return error.ThreadSpawnFailed;
@@ -145,7 +160,19 @@ pub const LoginWorker = struct {
             self.thread = null;
         }
         // The thread no longer reads the copies.
+        self.wipeSecret();
         _ = self.owned.reset(.free_all);
+    }
+
+    /// A pasted key is zeroed before its copy is released, as every other
+    /// secret buffer here is.
+    fn wipeSecret(self: *LoginWorker) void {
+        if (!self.owns_secret) return;
+        switch (self.flow) {
+            .api_key => |prepared| std.crypto.secureZero(u8, @constCast(prepared.secret)),
+            else => {},
+        }
+        self.owns_secret = false;
     }
 
     /// Valid after the state read `failed`.

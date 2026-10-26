@@ -590,7 +590,7 @@ fn parseStored(allocator: std.mem.Allocator, text: []const u8) OAuthError!Stored
 /// Temp file + fsync + rename, 0600, with the parent created on demand — the
 /// same durability contract `config_store` uses, for the same reason: a partial
 /// write here costs the user their login.
-fn writeAtomicPrivate(allocator: std.mem.Allocator, path: []const u8, bytes: []const u8) !void {
+pub fn writeAtomicPrivate(allocator: std.mem.Allocator, path: []const u8, bytes: []const u8) !void {
     ensureParent(allocator, path) catch {};
     const temp = try std.fmt.allocPrint(allocator, "{s}.tmp", .{path});
     defer allocator.free(temp);
@@ -653,7 +653,7 @@ fn ensureParent(allocator: std.mem.Allocator, path: []const u8) !void {
     try @import("../util/fs.zig").mkdirParents(dir);
 }
 
-fn readFile(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+pub fn readFile(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
     const path_z = try allocator.dupeZ(u8, path);
     defer allocator.free(path_z);
     const fd = try pfs.openZ(path_z, .{ .ACCMODE = .RDONLY }, 0);
@@ -683,7 +683,7 @@ fn stringOf(value: ?std.json.Value) ?[]const u8 {
     };
 }
 
-fn secureFree(allocator: std.mem.Allocator, bytes: []u8) void {
+pub fn secureFree(allocator: std.mem.Allocator, bytes: []u8) void {
     std.crypto.secureZero(u8, bytes);
     allocator.free(bytes);
 }

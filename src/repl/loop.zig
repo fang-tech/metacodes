@@ -2950,7 +2950,11 @@ fn handleLoginDialog(app: *app_mod.App, rest: []const u8) !void {
         return;
     };
 
-    var dialog: dialogs.LoginDialog = .{ .allocator = app.allocator, .io = app.io };
+    var dialog: dialogs.LoginDialog = .{
+        .allocator = app.allocator,
+        .io = app.io,
+        .key_options = .{ .state_root = app.stateRoot(), .open_browser = options.open_browser },
+    };
     defer dialog.deinit();
     var start_at: ?usize = null;
     for (host.registry.profiles.items) |*profile| {
@@ -2958,6 +2962,15 @@ fn handleLoginDialog(app: *app_mod.App, rest: []const u8) !void {
         var profile_options = options;
         if (named == null or !profile.matchesName(named.?)) profile_options.client_id = null;
         const flow = provider_login.prepareFlow(profile, profile_options, host.oauthClientIdFor(profile.id)) catch |err| {
+            // No grant to run, but a page to create a key on: the user pastes
+            // the key here (`ProviderProfile.api_key_setup`).
+            if (profile.api_key_setup != null) {
+                if (named) |name| if (profile.matchesName(name)) {
+                    start_at = dialog.choices_len;
+                };
+                dialog.add(.{ .profile = profile, .method = .api_key });
+                continue;
+            }
             if (named) |name| if (profile.matchesName(name)) {
                 cmd_output.print("{s}Cannot sign in to {s}: {s}{s}\n", .{ th.danger, profile.display_name, provider_login.refusalText(err, profile_options.method), th.reset });
                 return;
@@ -2967,7 +2980,7 @@ fn handleLoginDialog(app: *app_mod.App, rest: []const u8) !void {
         if (named) |name| if (profile.matchesName(name)) {
             start_at = dialog.choices_len;
         };
-        dialog.add(.{ .profile = profile, .flow = flow });
+        dialog.add(.{ .profile = profile, .method = .{ .flow = flow } });
     }
     if (named) |name| if (start_at == null) {
         cmd_output.print("{s}Unknown provider '{s}'{s}\n", .{ th.danger, name, th.reset });
@@ -2980,8 +2993,12 @@ fn handleLoginDialog(app: *app_mod.App, rest: []const u8) !void {
     switch (dialog.outcome) {
         .interrupted => cmd_output.print("Login interrupted\n", .{}),
         .failed => |why| cmd_output.print("{s}Login failed: {s}{s}\n", .{ th.danger, why, th.reset }),
-        .signed_in => |label| {
-            cmd_output.print("Signed in to {s} · /model to choose a model\n", .{label});
+        .signed_in, .key_stored => |label| {
+            if (dialog.outcome == .key_stored) {
+                cmd_output.print("Stored the key for {s} · /model to choose a model\n", .{label});
+            } else {
+                cmd_output.print("Signed in to {s} · /model to choose a model\n", .{label});
+            }
             // A route on this provider may have been unusable for want of a
             // credential; the picker catalog is rebuilt so it reflects the login.
             app.refreshModelPicker() catch |err| {
@@ -3013,6 +3030,12 @@ fn handleLogin(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u8
         return;
     };
     const flow = provider_login.prepareFlow(built, options, host.oauthClientIdFor(built.id)) catch |err| {
+        if (built.api_key_setup != null) {
+            // A pasted key needs a hidden prompt; without a dialog there is
+            // no safe place to type one here.
+            cmd_output.print("{s} signs in with an API key: run `metacodes login --provider {s}`.\n", .{ built.display_name, built.id.slice() });
+            return;
+        }
         cmd_output.print("\x1b[31mCannot sign in to {s}: {s}\x1b[0m\n", .{ built.display_name, provider_login.refusalText(err, options.method) });
         return;
     };

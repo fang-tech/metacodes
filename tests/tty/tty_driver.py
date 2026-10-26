@@ -329,6 +329,11 @@ def _build_env(base_url, env):
     # 占着 HOME(Windows 上因此删不掉)。默认关掉;真要测 KG 的用例经 env 参数传
     # METACODES_KG_AUTOSTART 覆盖,并自己负责停掉它拉起的服务。
     full_env["METACODES_KG_AUTOSTART"] = "0"
+    # A sign-in or key page opens through $BROWSER (core/auth.zig openBrowser).
+    # Unconditionally a no-op here, as with HOME: a case must never open a
+    # window on the machine running the suite. A case that checks which page
+    # was opened passes its own recorder through env.
+    full_env["BROWSER"] = "true"
     if env:
         for k, v in env.items():
             if v is None:

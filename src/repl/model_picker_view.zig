@@ -24,7 +24,10 @@ pub fn render(picker: *const Picker, w: *std.Io.Writer, th: Theme, cols: usize) 
     var rows: u16 = 0;
     rows += header(picker, w, th);
 
-    if (picker.stage == .credential) return rows + credentialBody(picker, w, th, cols);
+    if (picker.stage == .credential) {
+        if (picker.credential_mode == .paste_key) return rows + keyBody(picker, w, th, cols);
+        return rows + credentialBody(picker, w, th, cols);
+    }
 
     var buffer = Picker.RowBuffer.init(picker.allocator);
     defer buffer.deinit();
@@ -80,10 +83,12 @@ fn header(picker: *const Picker, w: *std.Io.Writer, th: Theme) u16 {
         .model => "Model",
         .offer => "Channel / offer",
         .options => "Options",
-        .credential => "sign in",
+        .credential => if (picker.credential_mode == .paste_key) "API key" else "sign in",
     };
     w.print("  {s}{s}{s}", .{ th.accent, title, th.reset }) catch {};
-    if (picker.stage == .credential) if (picker.credential_provider) |p| w.print(" to {s}", .{p.slice()}) catch {};
+    if (picker.stage == .credential) if (picker.credential_provider) |p| {
+        w.print(" {s} {s}", .{ if (picker.credential_mode == .paste_key) "for" else "to", p.slice() }) catch {};
+    };
     if (picker.filter_len > 0) {
         w.print(" {s}/{s}{s}", .{ th.dim, picker.filter(), th.reset }) catch {};
     }
@@ -291,6 +296,75 @@ fn footer(picker: *const Picker, w: *std.Io.Writer, th: Theme) u16 {
 /// The sign-in transcript in place of the list (#67): the flow's lines — the
 /// URL to open, a device code — wrapped to the width so a URL stays readable,
 /// oldest dropped when they do not fit the window, then how to leave.
+/// The paste-a-key step: what to know, which plan's page, the page itself
+/// (whole, so it can be copied), the key as dots, and the check once it runs.
+fn keyBody(picker: *const Picker, w: *std.Io.Writer, th: Theme, cols: usize) u16 {
+    var rows: u16 = 0;
+    if (picker.key_note) |note| {
+        // Word-wrapped: it is the one line saying which key to create, and a
+        // narrow terminal cut it mid-sentence.
+        const width = @max(cols -| 2, 8);
+        var words = std.mem.tokenizeScalar(u8, note, ' ');
+        var used: usize = 0;
+        line(w);
+        w.print("  {s}", .{th.warn}) catch {};
+        while (words.next()) |word| {
+            if (used > 0 and used + 1 + word.len > width) {
+                w.print("{s}", .{th.reset}) catch {};
+                newline(w);
+                rows += 1;
+                line(w);
+                w.print("  {s}", .{th.warn}) catch {};
+                used = 0;
+            }
+            if (used > 0) {
+                w.writeAll(" ") catch {};
+                used += 1;
+            }
+            w.writeAll(word) catch {};
+            used += word.len;
+        }
+        w.print("{s}", .{th.reset}) catch {};
+        newline(w);
+        rows += 1;
+    }
+    const choices = picker.keyChoices();
+    for (choices, 0..) |choice, index| {
+        line(w);
+        paint(w, th, index == picker.key_choice, false);
+        w.print("{s}{s}", .{ choice.label, th.reset }) catch {};
+        newline(w);
+        rows += 1;
+    }
+    if (choices.len > 0) {
+        line(w);
+        // The page is written whole even when it overflows: a truncated URL
+        // cannot be copied.
+        w.print("  {s}{s}{s}", .{ th.accent, choices[picker.key_choice].url, th.reset }) catch {};
+        newline(w);
+        rows += 1;
+    }
+    line(w);
+    if (picker.key_checking) {
+        w.print("  {s}checking the key…{s}", .{ th.dim, th.reset }) catch {};
+    } else if (picker.key_len == 0) {
+        w.print("  key: {s}(paste it; it is not shown){s}", .{ th.dim, th.reset }) catch {};
+    } else {
+        w.writeAll("  key: ") catch {};
+        for (0..@min(picker.key_len, 24)) |_| w.writeAll("\u{2022}") catch {};
+        w.print("  {s}({d} characters){s}", .{ th.dim, picker.key_len, th.reset }) catch {};
+    }
+    newline(w);
+    rows += 1;
+    if (picker.credentialLines().len > 0 or picker.credential_failed) rows += credentialBody(picker, w, th, cols) else {
+        line(w);
+        w.print("  {s}↑/↓ plan · tab opens the page · enter checks and stores · esc cancels{s}", .{ th.dim, th.reset }) catch {};
+        newline(w);
+        rows += 1;
+    }
+    return rows;
+}
+
 fn credentialBody(picker: *const Picker, w: *std.Io.Writer, th: Theme, cols: usize) u16 {
     const width = @max(cols -| 2, 8);
     const budget = @max(picker.page_rows, 1);
@@ -321,6 +395,8 @@ fn credentialBody(picker: *const Picker, w: *std.Io.Writer, th: Theme, cols: usi
     line(w);
     if (picker.credential_failed) {
         w.print("  {s}{s}{s}", .{ th.warn, picker.notice(), th.reset }) catch {};
+    } else if (picker.credential_mode == .paste_key) {
+        w.print("  {s}Esc cancels{s}", .{ th.dim, th.reset }) catch {};
     } else {
         w.print("  {s}Esc cancels the sign-in{s}", .{ th.dim, th.reset }) catch {};
     }
@@ -646,4 +722,50 @@ test "the credential stage draws the sign-in transcript, wrapped, and the Esc hi
     const failed_text = draw(&picker, &buffer);
     try testing.expect(std.mem.indexOf(u8, failed_text, "sign-in failed (ConnectionRefused)") != null);
     try testing.expect(std.mem.indexOf(u8, failed_text, "Esc cancels the sign-in") == null);
+}
+
+test "the key step names the plan, writes its page whole, and never the key" {
+    var picker = Picker.init(testing.allocator);
+    defer picker.deinit();
+    var offers = [_]control_plane.OfferSummary{richOffer()};
+    try seed(&picker, &offers, null);
+    picker.page_rows = 6;
+    _ = picker.onKey(.enter);
+    const outcome = picker.onKey(.enter);
+    try testing.expect(outcome == .commit);
+    const choices = [_]picker_mod.KeyChoice{
+        .{ .label = "China · Personal Coding Plan", .url = "https://bigmodel.cn/coding-plan/personal/overview?long=0123456789abcdef0123456789abcdef" },
+        .{ .label = "Global · Personal Coding Plan", .url = "https://z.ai/manage-apikey/apikey-list" },
+    };
+    _ = picker.enterKeyStage(ids.Slug.lit("zai"), outcome.commit, &choices, 0, "A standard key bills your balance.");
+
+    var buffer: [8192]u8 = undefined;
+    const empty = draw(&picker, &buffer);
+    try testing.expect(std.mem.indexOf(u8, empty, "API key") != null);
+    try testing.expect(std.mem.indexOf(u8, empty, " for zai") != null);
+    try testing.expect(std.mem.indexOf(u8, empty, "A standard key bills your balance.") != null);
+    try testing.expect(std.mem.indexOf(u8, empty, "Global · Personal Coding Plan") != null);
+    try testing.expect(std.mem.indexOf(u8, empty, "0123456789abcdef0123456789abcdef") != null);
+    try testing.expect(std.mem.indexOf(u8, empty, "it is not shown") != null);
+    try testing.expect(std.mem.indexOf(u8, empty, "tab opens the page") != null);
+
+    for ("secret-plan-key") |byte| _ = picker.onKey(.{ .char = byte });
+    const typed = draw(&picker, &buffer);
+    try testing.expect(std.mem.indexOf(u8, typed, "secret") == null);
+    try testing.expect(std.mem.indexOf(u8, typed, "(15 characters)") != null);
+
+    // A narrow terminal wraps the note at a word instead of cutting it.
+    var narrow_buffer: [8192]u8 = undefined;
+    var narrow_writer = std.Io.Writer.fixed(&narrow_buffer);
+    const narrow_rows = render(&picker, &narrow_writer, theme_mod.monochrome, 24);
+    const narrow = narrow_writer.buffered();
+    try testing.expect(std.mem.indexOf(u8, narrow, "A standard key bills") != null);
+    try testing.expect(std.mem.indexOf(u8, narrow, "your balance.") != null);
+    var wide_buffer: [8192]u8 = undefined;
+    var wide_writer = std.Io.Writer.fixed(&wide_buffer);
+    try testing.expect(narrow_rows > render(&picker, &wide_writer, theme_mod.monochrome, 100));
+
+    picker.keySubmitted();
+    const checking = draw(&picker, &buffer);
+    try testing.expect(std.mem.indexOf(u8, checking, "checking the key") != null);
 }

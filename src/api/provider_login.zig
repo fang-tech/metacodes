@@ -24,6 +24,8 @@ const provider_oauth = @import("../provider/oauth.zig");
 const provider_profile = @import("../provider/profile.zig");
 const time = @import("../util/time.zig");
 const AbortSignal = @import("../util/abort.zig").AbortSignal;
+const api_key_store = @import("../provider/api_key_store.zig");
+const catalog_fetch = @import("catalog_fetch.zig");
 
 pub const Method = oauth_login.Method;
 
@@ -208,16 +210,173 @@ fn hostName(buffer: *HostNameBuffer) []const u8 {
     };
 }
 
+/// Longest API key a login accepts from a paste or a prompt.
+pub const MAX_KEY_LEN = 512;
+
+/// Why a pasted key was not stored.
+pub const KeyError = error{
+    /// The provider answered the check with 401/403.
+    KeyRefused,
+    /// The check could not be made (network, an unexpected status); nothing
+    /// was learned about the key.
+    KeyCheckFailed,
+};
+
+/// A key the user pasted for a provider with a guided key setup
+/// (`ProviderProfile.api_key_setup`). Running it checks the key where the key
+/// page says — a GET the provider does not bill — and stores it in the
+/// provider's own key file. Every string is borrowed; the login worker copies
+/// them (`LoginWorker.ownFlow`).
+pub const ApiKeyPrepared = struct {
+    options: Options,
+    provider_id: provider_ids.Slug,
+    provider_label: []const u8,
+    kind: provider_profile.CredentialKind,
+    page: provider_profile.KeyPage,
+    secret: []const u8,
+    /// False stores the key without the check (`login --no-check`).
+    check: bool = true,
+
+    pub fn run(
+        self: ApiKeyPrepared,
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        notify: oauth_login.Notify,
+        diagnostic: ?*ImportDiagnostic,
+    ) !Outcome {
+        _ = diagnostic;
+        if (self.check) if (keyCheckOverride() orelse self.page.check_url) |url| {
+            var line: [512]u8 = undefined;
+            notify.say(std.fmt.bufPrint(&line, "Checking the key with {s}\n", .{url}) catch "Checking the key\n");
+            if (self.aborted()) return error.Aborted;
+            const answer = catalog_fetch.fetch(allocator, io, .{ .url = url, .bearer = self.secret }) catch |err| switch (err) {
+                error.Unauthorized => return error.KeyRefused,
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return error.KeyCheckFailed,
+            };
+            defer allocator.free(answer.body);
+            if (!checkAnswered(allocator, answer.body)) return error.KeyCheckFailed;
+            if (self.aborted()) return error.Aborted;
+        };
+        try api_key_store.save(
+            allocator,
+            self.options.state_root,
+            self.provider_id,
+            self.kind,
+            self.secret,
+            self.page.id.slice(),
+            time.nowUnix(),
+        );
+        var line: [256]u8 = undefined;
+        notify.say(std.fmt.bufPrint(&line, "Stored the key for {s}.\n", .{self.provider_label}) catch "Stored the key.\n");
+        return .{ .provider_id = self.provider_id, .client_id_source = .declared };
+    }
+
+    fn aborted(self: ApiKeyPrepared) bool {
+        const signal = self.options.abort_signal orelse return false;
+        return signal.isAborted();
+    }
+};
+
+/// A 2xx from the check is a pass only when it is the provider answering: a
+/// JSON object that does not report failure. A captive portal or proxy page
+/// answers 200 with HTML, and Z.AI answers some failures with 200 and
+/// `"success": false`; neither says anything about the key.
+fn checkAnswered(allocator: std.mem.Allocator, body: []const u8) bool {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch return false;
+    defer parsed.deinit();
+    if (parsed.value != .object) return false;
+    const object = parsed.value.object;
+    if (object.get("error")) |value| if (value != .null) return false;
+    if (object.get("success")) |value| if (value == .bool and !value.bool) return false;
+    return true;
+}
+
+test "a key check passes only on the provider's own answer" {
+    const a = std.testing.allocator;
+    try std.testing.expect(checkAnswered(a, "{\"object\":\"list\",\"data\":[{\"id\":\"glm-5.3\"}]}"));
+    try std.testing.expect(checkAnswered(a, "{\"data\":[],\"error\":null}"));
+    try std.testing.expect(!checkAnswered(a, "<html><body>Sign in to the Wi-Fi</body></html>"));
+    try std.testing.expect(!checkAnswered(a, "{\"success\":false,\"msg\":\"token invalid\"}"));
+    try std.testing.expect(!checkAnswered(a, "{\"error\":{\"code\":\"1000\"}}"));
+    try std.testing.expect(!checkAnswered(a, "[1,2]"));
+    try std.testing.expect(!checkAnswered(a, ""));
+}
+
+/// `METACODES_KEY_CHECK_URL` replaces every key page's check (development and
+/// tests: a local mock, the way `METASK_GATEWAY_URL` points Metask at one).
+/// Only https or plain http to a loopback address is accepted: the check
+/// carries the key.
+pub fn keyCheckOverride() ?[]const u8 {
+    const raw = std.c.getenv("METACODES_KEY_CHECK_URL") orelse return null;
+    const url = std.mem.span(raw);
+    return if (keyCheckUrlAccepted(url)) url else null;
+}
+
+fn keyCheckUrlAccepted(url: []const u8) bool {
+    if (std.mem.startsWith(u8, url, "https://")) return true;
+    const rest = if (std.mem.startsWith(u8, url, "http://")) url["http://".len..] else return false;
+    // The host exactly, not a prefix: `localhost.example.com` is not local.
+    const end = std.mem.indexOfAny(u8, rest, ":/") orelse rest.len;
+    const host = if (std.mem.startsWith(u8, rest, "[::1]")) rest[0.."[::1]".len] else rest[0..end];
+    return std.mem.eql(u8, host, "127.0.0.1") or std.mem.eql(u8, host, "localhost") or std.mem.eql(u8, host, "[::1]");
+}
+
+test "the key check override takes https or a loopback host, nothing else" {
+    try std.testing.expect(keyCheckUrlAccepted("https://relay.example/v4/models"));
+    try std.testing.expect(keyCheckUrlAccepted("http://127.0.0.1:9123/api/coding/paas/v4/models"));
+    try std.testing.expect(keyCheckUrlAccepted("http://localhost/models"));
+    try std.testing.expect(keyCheckUrlAccepted("http://[::1]:8080/models"));
+    try std.testing.expect(!keyCheckUrlAccepted("http://localhost.example.com/models"));
+    try std.testing.expect(!keyCheckUrlAccepted("http://127.0.0.1.example.com/models"));
+    try std.testing.expect(!keyCheckUrlAccepted("http://example.com/models"));
+    try std.testing.expect(!keyCheckUrlAccepted("ftp://127.0.0.1/models"));
+}
+
+pub const KeySetupError = error{
+    /// The profile declares no guided key setup.
+    NoKeySetup,
+    UnknownKeyPage,
+    EmptyKey,
+};
+
+/// The key flow for `profile`: the page `page_id` names, else the default page
+/// for `channel_id`'s region. The key is trimmed of surrounding whitespace,
+/// which a paste routinely carries.
+pub fn prepareApiKey(
+    profile: *const provider_profile.ProviderProfile,
+    page_id: ?[]const u8,
+    channel_id: ?provider_ids.Slug,
+    secret: []const u8,
+    options: Options,
+) KeySetupError!ApiKeyPrepared {
+    const setup = profile.api_key_setup orelse return error.NoKeySetup;
+    const page = if (page_id) |id| profile.keyPage(id) orelse return error.UnknownKeyPage else profile.defaultKeyPage(channel_id) orelse return error.NoKeySetup;
+    const key = std.mem.trim(u8, secret, " \t\r\n");
+    if (key.len == 0) return error.EmptyKey;
+    return .{
+        .options = options,
+        .provider_id = profile.id,
+        .provider_label = profile.display_name,
+        .kind = setup.kind,
+        .page = page,
+        .secret = key,
+    };
+}
+
 /// A sign-in that passed every refusal check: the generic OAuth grant for a
-/// profile, or Metask's own device grant. The TUI's login worker runs either.
+/// profile, Metask's own device grant, or a pasted API key. The TUI's login
+/// worker runs any of them.
 pub const Flow = union(enum) {
     oauth: Prepared,
     metask: MetaskPrepared,
+    api_key: ApiKeyPrepared,
 
     pub fn options(self: *Flow) *Options {
         return switch (self.*) {
             .oauth => |*prepared| &prepared.options,
             .metask => |*prepared| &prepared.options,
+            .api_key => |*prepared| &prepared.options,
         };
     }
 
@@ -231,6 +390,7 @@ pub const Flow = union(enum) {
         return switch (self) {
             .oauth => |prepared| prepared.run(allocator, io, notify, diagnostic),
             .metask => |prepared| prepared.run(allocator, io, notify, diagnostic),
+            .api_key => |prepared| prepared.run(allocator, io, notify, diagnostic),
         };
     }
 };

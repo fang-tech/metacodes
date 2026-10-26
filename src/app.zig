@@ -104,6 +104,7 @@ const openai_mod = @import("api/openai_client.zig");
 const gemini_mod = @import("api/gemini_client.zig");
 const provider_host_mod = @import("provider/host.zig");
 const provider_binding_mod = @import("provider/runtime_binding.zig");
+const provider_api_key_store = @import("provider/api_key_store.zig");
 const provider_control_plane = @import("provider/control_plane.zig");
 const provider_config_store = @import("provider/config_store.zig");
 const provider_selection_mod = @import("provider/selection.zig");
@@ -1903,12 +1904,24 @@ pub const App = struct {
         else
             &.{};
 
+        // The key the user stored for this provider (`login --provider`), in
+        // that provider's own file: it can only ever answer for that provider.
+        var stored_key: ?provider_api_key_store.Stored = if (committed_provider) |id|
+            provider_api_key_store.load(app.allocator, app.stateRoot(), id) catch |err| blk: {
+                @import("util/log.zig").warn("provider", "the stored key for {s} cannot be used: {s}", .{ id.slice(), @errorName(err) });
+                break :blk null;
+            }
+        else
+            null;
+        defer if (stored_key) |*key| key.deinit();
+
         const binding = try provider_binding_mod.bind(
             &host.registry,
             host.kernel.catalogSnapshot(),
             selection,
             .{
                 .pool = pool,
+                .stored_api_key = if (stored_key) |*key| key.entry() else null,
                 // On the Metask API-key route the session's own key — stored
                 // by `metacodes login`, picked in `/models`, or `--api-key` —
                 // authenticates a Metask offer, ahead of the environment, as

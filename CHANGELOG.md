@@ -12,6 +12,20 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Added
 
+- **Guided API-key login for the GLM Coding Plan.** Zhipu offers no
+  third-party sign-in, so a Z.AI key could only come from `ZAI_API_KEY`, and
+  `login --provider zai-coding-plan` refused. Now `metacodes login --provider
+  zai-coding-plan`, `/login` and a `/model` pick without a key list the four
+  Coding Plan key pages (China / Global, personal / team, the one for the
+  chosen channel's region first), open the chosen page, take the pasted key
+  without showing it, check it with the plan's model list (a GET that is not
+  billed) and store it in `<state root>/keys/zai-coding-plan.json` (0600,
+  never `config.json`). A refused key, or one that could not be checked, is
+  not stored. The stored key is used only for Z.AI, after `ZAI_API_KEY` and
+  its aliases; `metacodes logout --provider zai-coding-plan` removes it.
+  Scripted: `--api-key-stdin`, `--key-page <id>`, `--no-check`. The note on
+  every key page says why a standard API key is the wrong one: since
+  2026-10-16 it bills the account balance even on the Coding Plan endpoints.
 - **`metacodes update`** brings an install up to date from where it came
   from (doc/UPDATE_DESIGN.md). A release install moves to the latest
   published release, or `--version X.Y.Z`. The archive is downloaded, checked
@@ -84,6 +98,10 @@ status, compatibility boundaries, and entry points are defined by
   with `HttpRedirectLocationOversize`; MCP reports `McpRedirected` instead of
   "the server answered with an HTTP 5xx error". A public catalog still
   follows redirects.
+- **Sign-in pages open on macOS.** With no `BROWSER` set the opener was
+  `xdg-open`, which macOS does not have; the launch failed after the fork, so
+  no OAuth or device-code page ever opened there and nothing said so. macOS
+  now uses `open`.
 - **Every model of a long list can be picked.** The `/model` picker built at
   most 256 rows per step, so a gateway listing 300 models showed `[1/256]` and
   the last 44 could be reached only by typing their names; the `/models` menu
