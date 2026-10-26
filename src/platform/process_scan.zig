@@ -116,8 +116,100 @@ pub fn alive(pid: Pid) bool {
     return true;
 }
 
+/// Whether any process — the caller included — has `path` open now. A caller
+/// asking about holders other than itself closes its own descriptors first.
+/// Best effort like `listUnder`: another user's descriptors may be invisible,
+/// and an open that happens after the scan is not in the answer.
+///
+/// - macOS: `proc_listpidspath` (event-only watchers such as Spotlight's do
+///   not count).
+/// - Linux: any `/proc/<pid>/fd/<n>` naming the same device and inode.
+/// - Windows: an open that shares nothing fails with a sharing violation.
+pub fn heldOpen(path: [*:0]const u8) error{ Unsupported, ScanFailed }!bool {
+    return switch (native_os) {
+        .macos => heldOpenMacos(path),
+        .linux => heldOpenLinux(path),
+        .windows => heldOpenWindows(path),
+        else => error.Unsupported,
+    };
+}
+
+fn heldOpenMacos(path: [*:0]const u8) error{ScanFailed}!bool {
+    if (native_os != .macos) return error.ScanFailed;
+    // Only "any at all" matters, so a buffer that fills up is already a yes.
+    var pids: [256]c_int = undefined;
+    const bytes = proc_listpidspath(PROC_ALL_PIDS, 0, path, PROC_LISTPIDSPATH_EXCLUDE_EVTONLY, &pids, @sizeOf(@TypeOf(pids)));
+    if (bytes < 0) return error.ScanFailed;
+    return bytes > 0;
+}
+
+fn heldOpenLinux(path: [*:0]const u8) error{ScanFailed}!bool {
+    if (native_os != .linux) return error.ScanFailed;
+    const target = linuxIdentity(path) orelse return error.ScanFailed;
+    const proc = std.c.opendir("/proc") orelse return error.ScanFailed;
+    defer _ = std.c.closedir(proc);
+    while (std.c.readdir(proc)) |entry| {
+        const pid = std.fmt.parseInt(Pid, std.mem.sliceTo(&entry.name, 0), 10) catch continue;
+        var dir_buf: [64]u8 = undefined;
+        const fd_dir = std.fmt.bufPrintZ(&dir_buf, "/proc/{d}/fd", .{pid}) catch continue;
+        // Another user's table, or a process that exited since the listing.
+        const fds = std.c.opendir(fd_dir) orelse continue;
+        defer _ = std.c.closedir(fds);
+        while (std.c.readdir(fds)) |fd_entry| {
+            const name = std.mem.sliceTo(&fd_entry.name, 0);
+            if (name.len == 0 or name[0] == '.') continue;
+            var link_buf: [96]u8 = undefined;
+            const link = std.fmt.bufPrintZ(&link_buf, "/proc/{d}/fd/{s}", .{ pid, name }) catch continue;
+            const identity = linuxIdentity(link) orelse continue;
+            if (identity.device == target.device and identity.inode == target.inode) return true;
+        }
+    }
+    return false;
+}
+
+const FileIdentity = struct { device: u64, inode: u64 };
+
+/// The file `path` names, following links (a `/proc/<pid>/fd/<n>` entry
+/// resolves to the open file itself).
+fn linuxIdentity(path: [*:0]const u8) ?FileIdentity {
+    if (native_os != .linux) return null;
+    var stx: std.os.linux.Statx = undefined;
+    const AT_FDCWD: i32 = -100;
+    const rc = std.os.linux.statx(AT_FDCWD, path, 0, std.os.linux.STATX.BASIC_STATS, &stx);
+    if (@as(isize, @bitCast(rc)) < 0) return null;
+    return .{ .device = (@as(u64, stx.dev_major) << 32) | @as(u64, stx.dev_minor), .inode = stx.ino };
+}
+
+fn heldOpenWindows(path: [*:0]const u8) error{ScanFailed}!bool {
+    if (!is_windows) return error.ScanFailed;
+    const utf8 = std.mem.span(path);
+    var wide: [win.PATH_MAX_WIDE + 1]u16 = undefined;
+    if (utf8.len >= wide.len) return error.ScanFailed;
+    const len = std.unicode.utf8ToUtf16Le(&wide, utf8) catch return error.ScanFailed;
+    wide[len] = 0;
+    const handle = CreateFileW(wide[0..len :0].ptr, GENERIC_READ, 0, null, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, null);
+    if (handle == win.INVALID_HANDLE_VALUE) {
+        return switch (GetLastError()) {
+            ERROR_SHARING_VIOLATION => true,
+            else => error.ScanFailed,
+        };
+    }
+    win.CloseHandle(handle);
+    return false;
+}
+
 // ── macOS ────────────────────────────────────────────────────────────────────
 
+extern "c" fn proc_listpidspath(
+    type: u32,
+    typeinfo: u32,
+    path: [*:0]const u8,
+    pathflags: u32,
+    buffer: ?*anyopaque,
+    buffersize: c_int,
+) c_int;
+const PROC_ALL_PIDS: u32 = 1;
+const PROC_LISTPIDSPATH_EXCLUDE_EVTONLY: u32 = 2;
 extern "c" fn proc_listallpids(buffer: ?*anyopaque, buffersize: c_int) c_int;
 extern "c" fn proc_pidpath(pid: c_int, buffer: *anyopaque, buffersize: u32) c_int;
 extern "c" fn proc_pidinfo(pid: c_int, flavor: c_int, arg: u64, buffer: ?*anyopaque, buffersize: c_int) c_int;
@@ -242,6 +334,20 @@ extern "kernel32" fn OpenProcess(dwDesiredAccess: u32, bInheritHandle: c_int, dw
 extern "kernel32" fn QueryFullProcessImageNameW(hProcess: win.HANDLE, dwFlags: u32, lpExeName: [*]u16, lpdwSize: *u32) callconv(.winapi) c_int;
 extern "kernel32" fn TerminateProcess(hProcess: win.HANDLE, uExitCode: u32) callconv(.winapi) c_int;
 extern "kernel32" fn WaitForSingleObject(hHandle: win.HANDLE, dwMilliseconds: u32) callconv(.winapi) u32;
+extern "kernel32" fn CreateFileW(
+    lpFileName: [*:0]const u16,
+    dwDesiredAccess: u32,
+    dwShareMode: u32,
+    lpSecurityAttributes: ?*anyopaque,
+    dwCreationDisposition: u32,
+    dwFlagsAndAttributes: u32,
+    hTemplateFile: ?win.HANDLE,
+) callconv(.winapi) win.HANDLE;
+extern "kernel32" fn GetLastError() callconv(.winapi) u32;
+const GENERIC_READ: u32 = 0x8000_0000;
+const OPEN_EXISTING: u32 = 3;
+const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
+const ERROR_SHARING_VIOLATION: u32 = 32;
 
 fn listWindows(arena: std.mem.Allocator, prefix: []const u8, out: *std.ArrayList(Process)) Error!void {
     if (!is_windows) return error.Unsupported;
@@ -355,6 +461,41 @@ test "listUnder finds a child running from a prefix, with its parent, and termin
     try testing.expect(!alive(child_pid));
     _ = try child.wait(testing.io);
     try testing.expect(!alive(child_pid));
+}
+
+test "heldOpen sees this process and a child holding a file, and nobody after they close it" {
+    if (native_os != .macos and native_os != .linux and !is_windows) return error.SkipZigTest;
+    const pfs = @import("fs.zig");
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buf[0..try tmp.dir.realPath(testing.io, &root_buf)];
+    const path = try std.fmt.allocPrintSentinel(testing.allocator, "{s}/marker", .{root}, 0);
+    defer testing.allocator.free(path);
+    const created = pfs.open(path.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true }, 0o600);
+    try testing.expect(created >= 0);
+    try testing.expect(try heldOpen(path.ptr));
+    pfs.close(created);
+    try testing.expect(!try heldOpen(path.ptr));
+
+    if (is_windows) return;
+    // The marker of a process that is still running: a child keeps it open
+    // across exec, as an older metacodes keeps its lease marker.
+    var child = try std.process.spawn(testing.io, .{
+        .argv = &.{ "/bin/sh", "-c", "exec 3<\"$0\"; exec sleep 60", path },
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .ignore,
+    });
+    var held = false;
+    var tries: usize = 0;
+    while (!held and tries < 200) : (tries += 1) {
+        held = try heldOpen(path.ptr);
+        if (!held) sleepMs(10);
+    }
+    try testing.expect(held);
+    child.kill(testing.io);
+    try testing.expect(!try heldOpen(path.ptr));
 }
 
 extern "kernel32" fn GetCurrentProcessId() callconv(.winapi) u32;

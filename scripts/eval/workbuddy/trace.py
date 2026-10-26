@@ -1287,6 +1287,10 @@ def _journal_control_metrics(rows: Iterable[Mapping[str, Any]]) -> Dict[str, Any
                 open_provider_attempts.remove(attempt_id)
             else:
                 raise TraceError("provider attempt phase is unsupported")
+        elif kind == "run_abandoned":
+            # A later process closed this Run after its own process died: the
+            # effects it left open have no result, so it measures nothing.
+            raise TraceError("tool observation journal holds a Run its process abandoned")
         elif kind != "tool_observation":
             raise TraceError("tool observation journal event kind is unsupported")
         else:

@@ -18,6 +18,7 @@ const std = @import("std");
 const app_mod = @import("../app.zig");
 const agent_loop = @import("../core/agent_loop.zig");
 const project_activation = @import("../core/project_rule_activation.zig");
+const run_journal = @import("../core/tool_observation_journal.zig");
 const web_session = @import("../web/session.zig");
 const WebBackend = @import("../web/backend.zig").WebBackend;
 const registry = @import("registry.zig");
@@ -112,6 +113,8 @@ pub fn driverFn(host: *SessionHost, ctx: *anyopaque) void {
             if (!web_session.startSubmission(app, &host.journal, infra, &msg)) continue;
         }
 
+        var lease_report: run_journal.OpenReport = .{};
+        var lease_text: [512]u8 = undefined;
         const run_control: ?*project_activation.RunControl = if (app.sessionDir()) |dir|
             project_activation.RunControl.init(
                 app_alloc,
@@ -119,14 +122,20 @@ pub fn driverFn(host: *SessionHost, ctx: *anyopaque) void {
                 app.session_id,
                 if (app.project_dir_or_empty().len > 0) app.project_dir_or_empty() else app.cwdAbs(),
                 &app.abort,
+                &lease_report,
             ) catch |err| {
-                log.err("daemon", "run control failed closed: {s}", .{@errorName(err)});
+                log.err("daemon", "run control failed closed: {s}: {s}", .{
+                    @errorName(err),
+                    run_journal.describeRefusal(&lease_text, err, &lease_report) orelse "",
+                });
                 web_session.announceRunDone(&host.journal, infra, "error", @errorName(err));
                 continue;
             }
         else
             null;
         defer if (run_control) |control| control.deinit();
+        if (run_control != null) if (lease_report.unfinished) |abandoned|
+            log.warn("daemon", "{s}", .{run_journal.describeAbandoned(&lease_text, &abandoned)});
         if (run_control) |control| control.requireDetachedIdle(
             (if (app.jobs) |*jobs| jobs.runningCountForOwner(app.session_id) else 0) +|
                 (if (app.agent_jobs) |*jobs| jobs.runningCountForSession(app.session_id) else 0),

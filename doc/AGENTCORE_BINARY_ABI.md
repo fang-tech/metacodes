@@ -1137,8 +1137,10 @@ downgraded to never.
 
 The journal is outside Conversation and provider request projection. Enabling
 it therefore does not insert prompt bytes, reorder history, or invalidate a
-warm prompt-cache prefix. An unfinished pair or retained crash marker fails
-closed; revision 24 does **not** expose in-place active-Run resume, automatic
+warm prompt-cache prefix. An unfinished pair fails closed, and so does a Run
+whose process exited before its terminal record (the next Run reports
+`UnfinishedRun`; a Run still held by a live process reports `JournalBusy`);
+revision 24 does **not** expose in-place active-Run resume, automatic
 tool replay, or exactly-once external effects. It provides durable evidence
 and deterministic recovery classification for a later explicit recovery API,
 not authority to guess whether an external side effect occurred.

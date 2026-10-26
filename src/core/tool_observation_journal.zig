@@ -8,6 +8,7 @@
 
 const std = @import("std");
 const pfs = @import("platform").fs;
+const process_scan = @import("platform").process_scan;
 const sync = @import("platform").sync;
 const observation = @import("../tools/observation.zig");
 const session_id_mod = @import("session_id.zig");
@@ -20,7 +21,167 @@ const prompt_sections = @import("prompt_sections.zig");
 pub const SCHEMA_VERSION_V1 = "metacodes-tool-observation-journal-v1";
 pub const SCHEMA_VERSION = "metacodes-tool-observation-journal-v2";
 pub const FILE_NAME = "tool-observations.jsonl";
+/// The Run lease. Whoever holds the system lock on this file (`tryLockExclusive`)
+/// owns the session's next Run; the system drops that lock when the owner
+/// exits, by any signal, so a free lock proves the previous owner gone. The
+/// file names its owner in a `LeaseRecord`; an empty one was left by a
+/// metacodes that predates the record and the lock, and is judged by whether
+/// any process still has it open (`process_scan.heldOpen`).
 pub const LOCK_FILE_NAME = "tool-observations.lock";
+const LEASE_SCHEMA_VERSION = "metacodes-run-lease-v1";
+/// Lease records are rewritten in place at this fixed width, so a rewrite never
+/// leaves the tail of a longer previous record behind.
+const LEASE_RECORD_BYTES: usize = 256;
+
+pub const LeaseState = enum {
+    /// The owner's Run is open (or about to be).
+    running,
+    /// The Run's terminal record is durable but a derived artifact bound to it
+    /// is not published yet. An owner that exits here leaves the session closed
+    /// (`RunPublicationPending`) instead of silently losing that artifact.
+    publication_pending,
+    /// The Run and everything bound to it is published; the file is about to
+    /// disappear, and says so durably in case removing it fails.
+    released,
+};
+
+pub const LeaseRecord = struct {
+    schema_version: []const u8 = LEASE_SCHEMA_VERSION,
+    pid: i64,
+    run_id: []const u8,
+    acquired_wall_ns: i128,
+    state: LeaseState,
+};
+
+/// What `init` does when the previous Run never reached its terminal record and
+/// its owner is proven gone.
+pub const AbandonedRunPolicy = enum {
+    /// Keep the session closed (`UnfinishedRun`). The durable-profile contract
+    /// of AgentCore and library hosts, which offer no recovery API.
+    fail_closed,
+    /// Close that Run with a `run_abandoned` record, then start the next one.
+    /// Interactive product sessions, whose user decides what to do about a tool
+    /// the dead process left running.
+    record_abandoned,
+};
+
+pub const OpenOptions = struct {
+    prompt: ?prompt_sections.Manifest = null,
+    abandoned_run: AbandonedRunPolicy = .fail_closed,
+    /// Filled on the outcomes it describes, success or not.
+    report: ?*OpenReport = null,
+};
+
+/// What `init` learned beyond its result, for the host to tell its user.
+pub const OpenReport = struct {
+    /// Who holds the session when `init` answers `JournalBusy`.
+    holder: Holder = .none,
+    /// The previous Run that never finished: closed as abandoned on success
+    /// under `record_abandoned`, or the reason for `UnfinishedRun`.
+    unfinished: ?OpenRun = null,
+
+    pub const Holder = union(enum) {
+        none,
+        /// The lease record names this owner.
+        process: struct { pid: i64, acquired_wall_ns: i128 },
+        /// A process keeps open a lease left by an older metacodes, which does
+        /// not record its owner.
+        unnamed,
+        /// Whether anyone holds the old-style lease could not be determined.
+        unknown,
+    };
+};
+
+/// The Run still open at the end of a journal.
+pub const OpenRun = struct {
+    run_id: session_id_mod.SessionId,
+    started_wall_ns: i128,
+    /// Monotonic time of its last record, relative to its start.
+    last_elapsed_ns: u64,
+    open_dispatches: u64,
+    open_provider_attempts: u64,
+    /// The tool of the most recently started dispatch, when it is still open.
+    open_tool_buf: [64]u8 = undefined,
+    open_tool_len: usize = 0,
+
+    pub fn openTool(self: *const OpenRun) ?[]const u8 {
+        return if (self.open_tool_len == 0) null else self.open_tool_buf[0..self.open_tool_len];
+    }
+
+    /// Wall time of its last record.
+    pub fn lastActivityWallNs(self: *const OpenRun) i128 {
+        return self.started_wall_ns + self.last_elapsed_ns;
+    }
+};
+
+/// What to tell the person whose message `init` turned away with `err`, or
+/// null when `err` is not one of the lease outcomes.
+pub fn describeRefusal(buf: []u8, err: anyerror, report: *const OpenReport) ?[]const u8 {
+    var since: [32]u8 = undefined;
+    return switch (err) {
+        error.JournalBusy => switch (report.holder) {
+            .process => |holder| std.fmt.bufPrint(buf, "Another metacodes process (pid {d}) has been running a turn in this session since {s}. " ++
+                "Wait for it to finish or stop it there, then send another message.", .{ holder.pid, localClock(&since, holder.acquired_wall_ns) }) catch null,
+            .unnamed => "Another metacodes process, an older version that does not record its pid, is running a turn in this session. " ++
+                "Wait for it to finish or stop it there, then send another message.",
+            .none, .unknown => "This session's previous turn may still be running in another metacodes process, and whether that process is alive " ++
+                "could not be determined. Close any other metacodes window on this session, then send another message.",
+        },
+        error.UnfinishedRun => if (report.unfinished) |run|
+            std.fmt.bufPrint(buf, "This session's previous turn, started {s}, ended when its process exited without finishing, " ++
+                "and this host does not reopen such a session.", .{localClock(&since, run.started_wall_ns)}) catch null
+        else
+            null,
+        error.RunPublicationPending => "This session's previous turn finished, but evidence derived from it was never written. " ++
+            "The session stays closed rather than lose that evidence silently; start a new session to continue.",
+        else => null,
+    };
+}
+
+/// What to tell the person about the Run `init` closed as abandoned.
+pub fn describeAbandoned(buf: []u8, run: *const OpenRun) []const u8 {
+    var started: [32]u8 = undefined;
+    var last: [32]u8 = undefined;
+    const when = .{ localClock(&started, run.started_wall_ns), localClock(&last, run.lastActivityWallNs()) };
+    const fallback = "The previous turn in this session ended when its process exited; it is now closed as abandoned.";
+    if (run.open_dispatches == 0) return std.fmt.bufPrint(buf, "The previous turn in this session (started {s}, last active {s}) " ++
+        "ended when its process exited. It is now closed as abandoned.", when) catch fallback;
+    const tool = run.openTool() orelse "a tool";
+    return std.fmt.bufPrint(buf, "The previous turn in this session (started {s}, last active {s}) ended when its process exited " ++
+        "while {s} was running. It is now closed as abandoned; what that tool did was never recorded, so check its effects " ++
+        "before relying on them.", .{ when[0], when[1], tool }) catch fallback;
+}
+
+/// `2026-10-26 21:57` in the local zone (UTC when the zone is unknown).
+fn localClock(buf: *[32]u8, wall_ns: i128) []const u8 {
+    // The time comes from a journal record: anything out of range is unknown.
+    const utc_seconds = std.math.cast(i64, @divFloor(wall_ns, std.time.ns_per_s)) orelse return "an unknown time";
+    if (utc_seconds < 0 or utc_seconds > std.math.maxInt(u32)) return "an unknown time";
+    const offset: i64 = if (@import("platform").timezone.local(utc_seconds)) |zone| zone.offset_minutes else 0;
+    const local_seconds = utc_seconds + offset * 60;
+    if (local_seconds < 0) return "an unknown time";
+    const epoch: std.time.epoch.EpochSeconds = .{ .secs = @intCast(local_seconds) };
+    const year_day = epoch.getEpochDay().calculateYearDay();
+    const month_day = year_day.calculateMonthDay();
+    const day_seconds = epoch.getDaySeconds();
+    return std.fmt.bufPrint(buf, "{d}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}", .{
+        year_day.year,
+        month_day.month.numeric(),
+        month_day.day_index + 1,
+        day_seconds.getHoursIntoDay(),
+        day_seconds.getMinutesIntoHour(),
+    }) catch "an unknown time";
+}
+
+/// How `init` proved the owner of an abandoned Run gone.
+pub const OwnerEvidence = enum {
+    /// Its lease named it and the lease's lock was free.
+    lease_unlocked,
+    /// It predates the lease record, and no process kept its lease open.
+    legacy_lease_unheld,
+    /// There was no lease at all.
+    no_lease,
+};
 pub const MAX_ARTIFACT_BYTES: usize = 64 * 1024 * 1024;
 /// Maximum simultaneously open effects in one durable root Run. This is a
 /// logical guard only: the reducer allocates in proportion to actual overlap.
@@ -73,6 +234,18 @@ pub const JournalEvent = union(enum) {
         stop_reason: []const u8,
         finished_wall_ns: i128,
     },
+    /// The terminal record of a Run whose process died before its own: written
+    /// by the process that proved it gone, carrying that Run's `run_id` and its
+    /// last monotonic time. The effects it left open stay unresolved, so the
+    /// Run is never evidence (`RunBinding` refuses it).
+    run_abandoned: struct {
+        evidence: OwnerEvidence,
+        recovered_wall_ns: i128,
+        /// The Run whose `init` wrote this record.
+        recovered_by_run_id: []const u8,
+        open_dispatches: u64,
+        open_provider_attempts: u64,
+    },
 };
 
 pub const Envelope = struct {
@@ -89,6 +262,8 @@ pub const ValidationSummary = struct {
     bytes: usize,
     complete: bool,
     artifact_sha256: [64]u8,
+    /// Set exactly when `complete` is false.
+    open_run: ?OpenRun = null,
 };
 
 /// Immutable source interval for a later reflection/counterexample candidate.
@@ -216,6 +391,7 @@ pub const LoadedRunDispatches = struct {
 pub const Journal = struct {
     mutex: sync.Mutex = .{},
     fd: pfs.Fd,
+    /// The lease file, open and locked for this Journal's whole life.
     lock_fd: pfs.Fd,
     lock_path: [std.fs.max_path_bytes + 1]u8,
     lock_path_len: usize,
@@ -225,20 +401,18 @@ pub const Journal = struct {
     sequence: u64,
     file_bytes: usize,
     started_ns: i128,
+    started_wall_ns: i128,
     recovery: run_recovery.Reducer,
     finished: bool = false,
     failed: bool = false,
     release_requested: bool = false,
     lock_released: bool = false,
 
-    /// Open the session-owned append-only artifact, validate every existing
-    /// record, then durably publish this run's identity before any provider or
-    /// tool action can use the returned sink.
     pub fn init(
         session_dir: []const u8,
         session_id: session_id_mod.SessionId,
     ) !Journal {
-        return initWithPrompt(session_dir, session_id, null);
+        return initWithOptions(session_dir, session_id, .{});
     }
 
     /// `init`, recording in `run_started` the manifest of the system prompt
@@ -248,24 +422,31 @@ pub const Journal = struct {
         session_id: session_id_mod.SessionId,
         prompt: ?prompt_sections.Manifest,
     ) !Journal {
+        return initWithOptions(session_dir, session_id, .{ .prompt = prompt });
+    }
+
+    /// Take the session's Run lease, validate every existing record, settle a
+    /// Run its dead owner left open (`AbandonedRunPolicy`), then durably
+    /// publish this Run's identity before any provider or tool action can use
+    /// the returned sink.
+    ///
+    /// `JournalBusy`: a live process holds the lease. `UnfinishedRun`: the
+    /// previous Run's owner is gone without its terminal record, under
+    /// `fail_closed`. `RunPublicationPending`: the previous Run finished but an
+    /// artifact bound to it was never published.
+    pub fn initWithOptions(
+        session_dir: []const u8,
+        session_id: session_id_mod.SessionId,
+        options: OpenOptions,
+    ) !Journal {
         var lock_path_buf: [std.fs.max_path_bytes + 1]u8 = undefined;
         const lock_path = try std.fmt.bufPrint(
             &lock_path_buf,
             "{s}/{s}\x00",
             .{ session_dir, LOCK_FILE_NAME },
         );
-        const lock_fd = pfs.open(
-            @ptrCast(lock_path.ptr),
-            .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true, .NOFOLLOW = true },
-            @as(std.c.mode_t, 0o600),
-        );
-        if (lock_fd < 0) return error.JournalBusy;
-        errdefer {
-            _ = pfs.close(lock_fd);
-            pfs.unlinkPath(@ptrCast(lock_path.ptr)) catch {};
-        }
-        try pfs.makeCloseOnExec(lock_fd);
-        try pfs.fsyncChecked(lock_fd);
+        var lease = try Lease.acquire(@ptrCast(lock_path.ptr), options.report);
+        errdefer lease.giveUp(@ptrCast(lock_path.ptr));
 
         var path_buf: [std.fs.max_path_bytes + 1]u8 = undefined;
         const path = try std.fmt.bufPrint(
@@ -283,25 +464,49 @@ pub const Journal = struct {
         try pfs.makeCloseOnExec(fd);
 
         const summary = try validateFd(fd, session_id, null, null);
-        if (!summary.complete) return error.UnfinishedRun;
+        var abandon: ?OwnerEvidence = null;
+        if (summary.open_run) |open_run| {
+            if (options.report) |report| report.unfinished = open_run;
+            if (options.abandoned_run == .fail_closed) return error.UnfinishedRun;
+            abandon = lease.prior.evidence();
+        } else switch (lease.prior) {
+            .record => |state| if (state == .publication_pending) return error.RunPublicationPending,
+            // An older metacodes kept its marker past the terminal record only
+            // when publication failed, or when it died in the instant between.
+            // It recorded nothing to tell the two apart.
+            .legacy => return error.RunPublicationPending,
+            .created, .unreadable => {},
+        }
         if (pfs.lseek(fd, 0, .end) < 0) return error.SeekFailed;
+
+        const run_id = session_id_mod.gen();
+        const started_wall_ns = util_time.nowWallNs();
+        // From here a crash leaves a lease naming this process, which the next
+        // owner judges by its lock alone.
+        try writeLeaseRecord(lease.fd, run_id, started_wall_ns, .running);
+        lease.recorded = true;
 
         var journal = Journal{
             .fd = fd,
-            .lock_fd = lock_fd,
+            .lock_fd = lease.fd,
             .lock_path = lock_path_buf,
             .lock_path_len = lock_path.len - 1,
             .session_id = session_id,
-            .run_id = session_id_mod.gen(),
+            .run_id = run_id,
             .run_first_sequence = summary.records,
             .sequence = summary.records,
             .file_bytes = summary.bytes,
             .started_ns = util_time.nowNs(),
+            .started_wall_ns = started_wall_ns,
             .recovery = run_recovery.Reducer.init(std.heap.c_allocator, MAX_PENDING_EFFECTS),
         };
         errdefer journal.recovery.deinit();
+        if (abandon) |evidence| {
+            try journal.appendAbandoned(summary.open_run.?, evidence);
+            journal.run_first_sequence = journal.sequence;
+        }
         var prompt_sections_buf: [MAX_PROMPT_RECORD_SECTIONS]PromptSectionRecord = undefined;
-        const prompt_record: ?PromptRecord = if (prompt) |manifest| blk: {
+        const prompt_record: ?PromptRecord = if (options.prompt) |manifest| blk: {
             if (manifest.entries.len > MAX_PROMPT_RECORD_SECTIONS) return error.PromptRecordTooLarge;
             for (manifest.entries, prompt_sections_buf[0..manifest.entries.len]) |entry, *record| record.* = .{
                 .id = entry.id,
@@ -316,7 +521,7 @@ pub const Journal = struct {
             };
         } else null;
         try journal.appendEvent(.{ .run_started = .{
-            .started_wall_ns = util_time.nowWallNs(),
+            .started_wall_ns = started_wall_ns,
             .prompt = prompt_record,
         } });
         try fsyncDirectory(session_dir);
@@ -327,13 +532,13 @@ pub const Journal = struct {
         self.recovery.deinit();
         if (self.fd >= 0) _ = pfs.close(self.fd);
         self.fd = -1;
+        // Only a released Run gives the lease up. Any other exit leaves the
+        // file naming this process, and closing it drops the lock, which is
+        // what proves this owner gone to the next one.
+        if (self.finished and self.release_requested and !self.lock_released)
+            self.releaseLease() catch {};
         if (self.lock_fd >= 0) _ = pfs.close(self.lock_fd);
         self.lock_fd = -1;
-        // A clean terminal record releases the lease. Any other path leaves the
-        // marker behind so a later process cannot mistake a crash window for a
-        // safely closed Run. Recovery is an explicit audit action, not init().
-        if (self.finished and self.release_requested and !self.lock_released)
-            self.unlinkLock() catch {};
     }
 
     pub fn sink(self: *Journal) observation.Sink {
@@ -358,7 +563,7 @@ pub const Journal = struct {
     }
 
     /// Return the exact durable interval after `sealRun` but before releasing
-    /// the crash marker.  This is intentionally separate from `runBinding`:
+    /// the lease.  This is intentionally separate from `runBinding`:
     /// ordinary consumers must only observe a completely published Run.
     pub fn finishedRunBinding(self: *const Journal) !RunBinding {
         if (!self.finished or self.sequence == 0) return error.RunNotFinished;
@@ -371,18 +576,28 @@ pub const Journal = struct {
     }
 
     pub fn finishRun(self: *Journal, stop_reason: []const u8) !void {
-        try self.sealRun(stop_reason);
+        try self.seal(stop_reason, .running);
         try self.releaseFinishedRun();
     }
 
-    /// Durably append the terminal record while deliberately retaining the
-    /// exclusive marker. A caller that must publish a derived artifact can do
-    /// so without opening a crash window in which the next Run starts first.
+    /// Durably append the terminal record while keeping the lease, marked
+    /// `publication_pending`. A caller that must publish a derived artifact
+    /// does so before `releaseFinishedRun`, without opening a window in which
+    /// the next Run starts first; should it never get there, the next `init`
+    /// keeps the session closed instead of silently losing that artifact.
     pub fn sealRun(self: *Journal, stop_reason: []const u8) !void {
+        return self.seal(stop_reason, .publication_pending);
+    }
+
+    fn seal(self: *Journal, stop_reason: []const u8, lease_state: LeaseState) !void {
         self.mutex.lock();
         defer self.mutex.unlock();
         if (self.failed) return error.JournalFailed;
         if (self.finished) return error.RunAlreadyFinished;
+        // Before the terminal record: an owner that dies between the two has
+        // left its Run unfinished, which needs no publication either way.
+        if (lease_state != .running)
+            try writeLeaseRecord(self.lock_fd, self.run_id, self.started_wall_ns, lease_state);
         self.appendEventLocked(.{ .run_finished = .{
             .stop_reason = stop_reason,
             .finished_wall_ns = util_time.nowWallNs(),
@@ -394,16 +609,70 @@ pub const Journal = struct {
     }
 
     /// Complete publication and allow the next Run. Once requested, deinit
-    /// retries marker removal if the first unlink/fsync attempt fails.
+    /// retries the release if this attempt fails.
     pub fn releaseFinishedRun(self: *Journal) !void {
         self.mutex.lock();
         defer self.mutex.unlock();
         if (!self.finished) return error.RunNotFinished;
         if (self.lock_released) return;
         self.release_requested = true;
-        if (self.lock_fd >= 0) _ = pfs.close(self.lock_fd);
-        self.lock_fd = -1;
-        try self.unlinkLock();
+        try self.releaseLease();
+    }
+
+    /// Give the lease up: say `released` durably, then remove the file. Either
+    /// alone lets the next Run start. On POSIX, when both fail, the descriptor
+    /// stays open so `deinit` can try again.
+    fn releaseLease(self: *Journal) !void {
+        if (self.lock_released) return;
+        if (self.lock_fd < 0) return error.LeaseLost;
+        const recorded = if (writeLeaseRecord(self.lock_fd, self.run_id, self.started_wall_ns, .released)) true else |_| false;
+        self.lock_path[self.lock_path_len] = 0;
+        const path: [*:0]const u8 = @ptrCast(&self.lock_path);
+        if (is_windows) {
+            // Windows refuses to delete a file anyone has open, and a successor
+            // may hold this one the moment ours closes: close, then remove it
+            // unless someone does.
+            _ = pfs.close(self.lock_fd);
+            self.lock_fd = -1;
+            if (pfs.unlinkPath(path)) {} else |err| if (!recorded and err != error.NotFound)
+                return error.LeaseReleaseFailed;
+        } else {
+            // Remove the name while still holding the lock: a process that
+            // opened it before then holds a file nobody can name, which
+            // `Lease.acquire` notices, never a second live lease.
+            const removed = if (pfs.unlinkPath(path)) true else |err| err == error.NotFound;
+            if (!recorded and !removed) return error.LeaseReleaseFailed;
+            if (removed) {
+                const directory = std.fs.path.dirname(self.lock_path[0..self.lock_path_len]) orelse
+                    return error.InvalidLockPath;
+                fsyncDirectory(directory) catch |err| if (!recorded) return err;
+            }
+            _ = pfs.close(self.lock_fd);
+            self.lock_fd = -1;
+        }
+        self.lock_released = true;
+    }
+
+    /// Close the Run `init` found open with its owner gone. The record carries
+    /// that Run's identity and last monotonic time, not this process's: it is
+    /// the dead Run's terminal record. It bypasses `recovery`, which never saw
+    /// that Run start; every later `validateFd` replays it with the rest.
+    fn appendAbandoned(self: *Journal, run: OpenRun, evidence: OwnerEvidence) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        try self.writeEnvelopeLocked(.{
+            .sequence = self.sequence,
+            .monotonic_elapsed_ns = run.last_elapsed_ns,
+            .session_id = self.session_id.asSlice(),
+            .run_id = run.run_id.asSlice(),
+            .event = .{ .run_abandoned = .{
+                .evidence = evidence,
+                .recovered_wall_ns = util_time.nowWallNs(),
+                .recovered_by_run_id = self.run_id.asSlice(),
+                .open_dispatches = run.open_dispatches,
+                .open_provider_attempts = run.open_provider_attempts,
+            } },
+        });
     }
 
     fn emitThunk(raw: *anyopaque, event: observation.Event) bool {
@@ -455,13 +724,17 @@ pub const Journal = struct {
         // authorize later work; it only lets illegal live sequences fail now
         // instead of on the next process's validation pass.
         try applyRecoveryEvent(&self.recovery, self.run_id, event);
-        const envelope = Envelope{
+        return self.writeEnvelopeLocked(.{
             .sequence = self.sequence,
             .monotonic_elapsed_ns = elapsedNs(self.started_ns),
             .session_id = self.session_id.asSlice(),
             .run_id = self.run_id.asSlice(),
             .event = event,
-        };
+        });
+    }
+
+    fn writeEnvelopeLocked(self: *Journal, envelope: Envelope) !void {
+        if (self.failed) return error.JournalFailed;
         const line = try std.json.Stringify.valueAlloc(std.heap.c_allocator, envelope, .{});
         // realloc +1 通常原地扩(单分配),失败路径下面手动释放——不能用 defer free(line):
         // realloc 成功后 line 已失效。
@@ -482,16 +755,189 @@ pub const Journal = struct {
         self.file_bytes += record.len;
         self.sequence += 1;
     }
+};
 
-    fn unlinkLock(self: *Journal) !void {
-        self.lock_path[self.lock_path_len] = 0;
-        try pfs.unlinkPath(@ptrCast(&self.lock_path));
-        const directory = std.fs.path.dirname(self.lock_path[0..self.lock_path_len]) orelse
-            return error.InvalidLockPath;
-        try fsyncDirectory(directory);
-        self.lock_released = true;
+const is_windows = @import("builtin").os.tag == .windows;
+
+/// Bounds the retries when releases keep racing this acquisition; past it the
+/// session is reported busy, which is what such contention is.
+const MAX_LEASE_ATTEMPTS: usize = 16;
+
+/// The session's Run lease while `init` decides whether to take the Run.
+const Lease = struct {
+    fd: pfs.Fd,
+    prior: Prior,
+    /// This acquisition wrote its own record over whatever it found.
+    recorded: bool = false,
+
+    const Prior = union(enum) {
+        /// No lease existed; this acquisition created the file.
+        created,
+        /// An empty lease that no process holds: an older metacodes' marker.
+        legacy,
+        /// A lease record, in the state its now-gone owner left it.
+        record: LeaseState,
+        /// Bytes that are not a record: an owner died while writing one.
+        unreadable,
+
+        fn evidence(self: Prior) OwnerEvidence {
+            return switch (self) {
+                .created => .no_lease,
+                .legacy => .legacy_lease_unheld,
+                .record, .unreadable => .lease_unlocked,
+            };
+        }
+    };
+
+    fn acquire(path: [*:0]const u8, report: ?*OpenReport) !Lease {
+        var legacy_unheld = false;
+        var attempt: usize = 0;
+        while (attempt < MAX_LEASE_ATTEMPTS) : (attempt += 1) {
+            var created = true;
+            var fd = pfs.open(path, .{ .ACCMODE = .RDWR, .CREAT = true, .EXCL = true, .NOFOLLOW = true }, @as(std.c.mode_t, 0o600));
+            if (fd < 0) {
+                if (!pfs.lastErrnoIs(.EXIST)) return error.LeaseOpenFailed;
+                created = false;
+                fd = pfs.open(path, .{ .ACCMODE = .RDWR, .NOFOLLOW = true }, @as(std.c.mode_t, 0));
+                if (fd < 0) {
+                    if (pfs.lastErrnoIs(.NOENT)) continue; // released between the two opens
+                    return error.LeaseOpenFailed;
+                }
+            }
+            pfs.makeCloseOnExec(fd) catch |err| {
+                _ = pfs.close(fd);
+                return err;
+            };
+            pfs.tryLockExclusive(fd) catch |err| {
+                if (err == error.WouldBlock) {
+                    if (report) |r| r.holder = switch (readLease(fd)) {
+                        .record => |owner| .{ .process = .{ .pid = owner.pid, .acquired_wall_ns = owner.acquired_wall_ns } },
+                        .empty, .unreadable => .unknown,
+                    };
+                }
+                _ = pfs.close(fd);
+                return if (err == error.WouldBlock) error.JournalBusy else error.LeaseLockFailed;
+            };
+            if (created) return .{ .fd = fd, .prior = .created };
+            // A lock taken through a name the owner has since removed guards a
+            // file nobody else can reach: start over with the name as it is now.
+            const same = namesFile(path, fd) catch |err| {
+                _ = pfs.close(fd);
+                return err;
+            };
+            if (!same) {
+                _ = pfs.close(fd);
+                continue;
+            }
+            switch (readLease(fd)) {
+                .record => |owner| return .{ .fd = fd, .prior = .{ .record = owner.state } },
+                .unreadable => return .{ .fd = fd, .prior = .unreadable },
+                .empty => {
+                    if (legacy_unheld) return .{ .fd = fd, .prior = .legacy };
+                    // An older metacodes takes no lock; it holds its marker open
+                    // until it is done. Ask about every holder with ours closed
+                    // (Windows counts this process's own handle), then take the
+                    // lease again: a marker cannot reappear once its owner is gone.
+                    _ = pfs.close(fd);
+                    const held = process_scan.heldOpen(path) catch {
+                        if (report) |r| r.holder = .unknown;
+                        return error.JournalBusy;
+                    };
+                    if (held) {
+                        if (report) |r| r.holder = .unnamed;
+                        return error.JournalBusy;
+                    }
+                    legacy_unheld = true;
+                },
+            }
+        }
+        if (report) |r| r.holder = .unknown;
+        return error.JournalBusy;
+    }
+
+    /// `init` failed after acquiring: leave the lease as found, except a file
+    /// this acquisition created and never wrote, which would otherwise pass for
+    /// an older metacodes' marker.
+    fn giveUp(self: *Lease, path: [*:0]const u8) void {
+        if (self.prior == .created and !self.recorded) {
+            if (is_windows) {
+                _ = pfs.close(self.fd);
+                pfs.unlinkPath(path) catch {};
+                return;
+            }
+            pfs.unlinkPath(path) catch {};
+        }
+        _ = pfs.close(self.fd);
     }
 };
+
+const LeaseContent = union(enum) {
+    empty,
+    record: struct { pid: i64, acquired_wall_ns: i128, state: LeaseState },
+    unreadable,
+};
+
+fn readLease(fd: pfs.Fd) LeaseContent {
+    var buf: [LEASE_RECORD_BYTES * 2]u8 = undefined;
+    if (pfs.lseek(fd, 0, .set) < 0) return .unreadable;
+    var len: usize = 0;
+    while (len < buf.len) {
+        const n = pfs.read(fd, buf[len..]);
+        if (n < 0) return .unreadable;
+        if (n == 0) break;
+        len += @intCast(n);
+    }
+    if (len == 0) return .empty;
+    var scratch: [LEASE_RECORD_BYTES * 2]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&scratch);
+    const record = std.json.parseFromSliceLeaky(LeaseRecord, fixed.allocator(), buf[0..len], .{
+        .ignore_unknown_fields = false,
+        .duplicate_field_behavior = .@"error",
+    }) catch return .unreadable;
+    if (!std.mem.eql(u8, record.schema_version, LEASE_SCHEMA_VERSION) or
+        session_id_mod.SessionId.fromSlice(record.run_id) == null)
+        return .unreadable;
+    return .{ .record = .{ .pid = record.pid, .acquired_wall_ns = record.acquired_wall_ns, .state = record.state } };
+}
+
+/// Rewrite the lease record in place, at its fixed width, durably.
+fn writeLeaseRecord(
+    fd: pfs.Fd,
+    run_id: session_id_mod.SessionId,
+    acquired_wall_ns: i128,
+    state: LeaseState,
+) !void {
+    var buf: [LEASE_RECORD_BYTES]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(buf[0 .. buf.len - 1]);
+    std.json.Stringify.value(LeaseRecord{
+        .pid = @import("platform").process.currentPid(),
+        .run_id = run_id.asSlice(),
+        .acquired_wall_ns = acquired_wall_ns,
+        .state = state,
+    }, .{}, &writer) catch return error.LeaseRecordTooLarge;
+    const used = writer.buffered().len;
+    @memset(buf[used .. buf.len - 1], ' ');
+    buf[buf.len - 1] = '\n';
+    if (pfs.lseek(fd, 0, .set) < 0) return error.SeekFailed;
+    try writeAll(fd, &buf);
+    pfs.setSize(fd, buf.len) catch return error.LeaseWriteFailed;
+    try pfs.fsyncChecked(fd);
+}
+
+/// Whether `path` still names the file open at `fd`. Windows deletes no file
+/// that is open, so there the name cannot have moved.
+fn namesFile(path: [*:0]const u8, fd: pfs.Fd) !bool {
+    if (is_windows) return true;
+    const by_name = pfs.open(path, .{ .ACCMODE = .RDONLY, .NOFOLLOW = true }, @as(std.c.mode_t, 0));
+    if (by_name < 0) {
+        if (pfs.lastErrnoIs(.NOENT)) return false;
+        return error.LeaseOpenFailed;
+    }
+    defer _ = pfs.close(by_name);
+    const named = pfs.fileInfo(by_name) catch return error.StatFailed;
+    const held = pfs.fileInfo(fd) catch return error.StatFailed;
+    return named.device == held.device and named.inode == held.inode;
+}
 
 /// Validate a journal without mutating it. Useful for replay admission and L2.
 pub fn validate(
@@ -602,6 +1048,7 @@ pub fn loadRunDispatches(
                     return error.InvalidRunBinding;
                 stop_reason = finished.stop_reason;
             },
+            .run_abandoned => return error.InvalidRunBinding,
             .provider_attempt => |provider_event| switch (provider_event) {
                 .started => |started| {
                     const key = dispatchKey(&started.attempt_id);
@@ -840,6 +1287,7 @@ fn applyRecoveryEvent(
             try reducer.apply(.run_closing);
             try reducer.apply(.run_finished);
         },
+        .run_abandoned => try reducer.apply(.run_abandoned),
     }
 }
 
@@ -867,6 +1315,12 @@ fn validateFd(
 
     var expected_sequence: u64 = 0;
     var active_run: ?session_id_mod.SessionId = null;
+    var active_started_wall_ns: i128 = 0;
+    // The most recently started dispatch of the active Run, to name the tool a
+    // dead owner left running.
+    var last_dispatch_key: ?[32]u8 = null;
+    var last_dispatch_name_buf: [64]u8 = undefined;
+    var last_dispatch_name_len: usize = 0;
     var recovery = run_recovery.Reducer.init(std.heap.c_allocator, MAX_PENDING_EFFECTS);
     defer recovery.deinit();
     var active_elapsed_ns: u64 = 0;
@@ -931,6 +1385,8 @@ fn validateFd(
                     if (!validPromptRecord(prompt)) return error.InvalidRecord;
                 }
                 active_run = run_id;
+                active_started_wall_ns = started.started_wall_ns;
+                last_dispatch_key = null;
                 active_elapsed_ns = envelope.monotonic_elapsed_ns;
                 if (expected_binding) |binding| {
                     if (std.mem.eql(u8, binding.run_id.asSlice(), run_id.asSlice())) {
@@ -1139,6 +1595,9 @@ fn validateFd(
                         }
                         const entry = try open_dispatches.getOrPut(key);
                         if (entry.found_existing) return error.InvalidRecord;
+                        last_dispatch_key = key;
+                        last_dispatch_name_len = @min(started.dispatched_name.len, last_dispatch_name_buf.len);
+                        @memcpy(last_dispatch_name_buf[0..last_dispatch_name_len], started.dispatched_name[0..last_dispatch_name_len]);
                         entry.value_ptr.* = .{
                             .identity = dispatchIdentity(
                                 started.requested_name,
@@ -1220,6 +1679,36 @@ fn validateFd(
                 rule_filter_identities.clearRetainingCapacity();
                 seen_provider_attempts.clearRetainingCapacity();
             },
+            .run_abandoned => |abandoned| {
+                // Written by a later process for exactly the Run still open,
+                // at that Run's last monotonic time, counting what it left open.
+                const current = active_run orelse return error.InvalidRecord;
+                const recovered_by = session_id_mod.SessionId.fromSlice(abandoned.recovered_by_run_id) orelse
+                    return error.InvalidRecord;
+                if (!std.mem.eql(u8, envelope.schema_version, SCHEMA_VERSION) or
+                    !std.mem.eql(u8, current.asSlice(), run_id.asSlice()) or
+                    std.mem.eql(u8, recovered_by.asSlice(), run_id.asSlice()) or
+                    envelope.monotonic_elapsed_ns != active_elapsed_ns or
+                    abandoned.open_dispatches != open_dispatches.count() or
+                    abandoned.open_provider_attempts != open_provider_attempts.count())
+                    return error.InvalidRecord;
+                // Its open effects stay unresolved: never an evidence interval.
+                if (expected_binding) |binding| {
+                    if (std.mem.eql(u8, binding.run_id.asSlice(), run_id.asSlice()))
+                        return error.InvalidRunBinding;
+                }
+                active_run = null;
+                active_elapsed_ns = 0;
+                open_dispatches.clearRetainingCapacity();
+                open_provider_attempts.clearRetainingCapacity();
+                pending_rule_filters.clearRetainingCapacity();
+                seen_dispatches.clearRetainingCapacity();
+                formal_events.clearRetainingCapacity();
+                pre_decisions.clearRetainingCapacity();
+                formal_dispatches.clearRetainingCapacity();
+                rule_filter_identities.clearRetainingCapacity();
+                seen_provider_attempts.clearRetainingCapacity();
+            },
         }
         expected_sequence += 1;
     }
@@ -1232,11 +1721,26 @@ fn validateFd(
     }
     const reducer_complete = recovery.state == .idle;
     if (reducer_complete != (active_run == null)) return error.InvalidRecord;
+    const open_run: ?OpenRun = if (active_run) |run_id| blk: {
+        var run: OpenRun = .{
+            .run_id = run_id,
+            .started_wall_ns = active_started_wall_ns,
+            .last_elapsed_ns = active_elapsed_ns,
+            .open_dispatches = open_dispatches.count(),
+            .open_provider_attempts = open_provider_attempts.count(),
+        };
+        if (last_dispatch_key) |key| if (open_dispatches.contains(key)) {
+            @memcpy(run.open_tool_buf[0..last_dispatch_name_len], last_dispatch_name_buf[0..last_dispatch_name_len]);
+            run.open_tool_len = last_dispatch_name_len;
+        };
+        break :blk run;
+    } else null;
     return .{
         .records = expected_sequence,
         .bytes = size,
         .complete = reducer_complete,
         .artifact_sha256 = observation.sha256Hex(bytes),
+        .open_run = open_run,
     };
 }
 
@@ -2993,4 +3497,268 @@ test "tool observation journal rejects a partial existing record" {
         error.PartialRecord,
         Journal.init(root_buffer[0..root_len], sid),
     );
+    // The lease this failed init created never named anyone: it must not stay
+    // behind looking like an older metacodes' marker.
+    var lease_buf: [std.fs.max_path_bytes + 1]u8 = undefined;
+    try std.testing.expect(!pfs.exists((try testLeasePath(&lease_buf, root_buffer[0..root_len])).ptr));
+}
+
+fn testLeasePath(buf: []u8, root: []const u8) ![:0]const u8 {
+    return std.fmt.bufPrintZ(buf, "{s}/{s}", .{ root, LOCK_FILE_NAME });
+}
+
+/// A Run whose process dies mid-dispatch: the Journal goes away without its
+/// terminal record, which closes the lease file and so drops its lock.
+fn testDieMidRun(root: []const u8, sid: session_id_mod.SessionId) !session_id_mod.SessionId {
+    var journal = try Journal.init(root, sid);
+    defer journal.deinit();
+    if (!journal.sink().emit(testDispatchStart("in-flight"))) return error.TestJournalRejected;
+    return journal.run_id;
+}
+
+test "a Run whose owner died stays closed under fail_closed and is abandoned under record_abandoned" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buffer[0..try tmp.dir.realPath(std.testing.io, &root_buffer)];
+    const sid = session_id_mod.SessionId.fromSlice("0123456789abcdef01234567").?;
+    var lease_buf: [std.fs.max_path_bytes + 1]u8 = undefined;
+    const lease_path = try testLeasePath(&lease_buf, root);
+
+    const dead_run = try testDieMidRun(root, sid);
+    var refused: OpenReport = .{};
+    try std.testing.expectError(error.UnfinishedRun, Journal.initWithOptions(root, sid, .{ .report = &refused }));
+    const unfinished = refused.unfinished.?;
+    try std.testing.expectEqualStrings(dead_run.asSlice(), unfinished.run_id.asSlice());
+    try std.testing.expectEqual(@as(u64, 1), unfinished.open_dispatches);
+    try std.testing.expectEqual(@as(u64, 0), unfinished.open_provider_attempts);
+    try std.testing.expectEqualStrings("Write", unfinished.openTool().?);
+    try std.testing.expect(refused.holder == .none);
+    // Refusing leaves the dead owner's lease as it found it.
+    try std.testing.expect(pfs.exists(lease_path.ptr));
+
+    var report: OpenReport = .{};
+    var next = try Journal.initWithOptions(root, sid, .{ .abandoned_run = .record_abandoned, .report = &report });
+    defer next.deinit();
+    try std.testing.expect(report.holder == .none);
+    try std.testing.expectEqualStrings(dead_run.asSlice(), report.unfinished.?.run_id.asSlice());
+    try next.finishRun("end_turn");
+    try std.testing.expect(!pfs.exists(lease_path.ptr));
+    try std.testing.expect((try validate(root, sid)).complete);
+
+    // The abandoned Run is closed but is never evidence; the next Run is.
+    try std.testing.expectError(error.InvalidRunBinding, validateRunBinding(root, .{
+        .session_id = sid,
+        .run_id = dead_run,
+        .first_sequence = 0,
+        .last_sequence = 2,
+    }));
+    const binding = try next.runBinding();
+    try std.testing.expectEqual(@as(u64, 3), binding.first_sequence);
+    var loaded = try loadRunDispatches(std.testing.allocator, root, binding);
+    defer loaded.deinit();
+    try std.testing.expectEqual(@as(usize, 0), loaded.dispatches.len);
+
+    // The record is the dead Run's own: its id, its last time, what it left open.
+    const bytes = try tmp.dir.readFileAlloc(std.testing.io, FILE_NAME, std.testing.allocator, .unlimited);
+    defer std.testing.allocator.free(bytes);
+    var lines = std.mem.splitScalar(u8, bytes, '\n');
+    _ = lines.next().?; // run_started (dead)
+    const in_flight = try std.json.parseFromSlice(Envelope, std.testing.allocator, lines.next().?, .{});
+    defer in_flight.deinit();
+    const abandoned = try std.json.parseFromSlice(Envelope, std.testing.allocator, lines.next().?, .{});
+    defer abandoned.deinit();
+    try std.testing.expectEqualStrings(dead_run.asSlice(), abandoned.value.run_id);
+    try std.testing.expectEqual(in_flight.value.monotonic_elapsed_ns, abandoned.value.monotonic_elapsed_ns);
+    const record = abandoned.value.event.run_abandoned;
+    try std.testing.expectEqual(OwnerEvidence.lease_unlocked, record.evidence);
+    try std.testing.expectEqual(@as(u64, 1), record.open_dispatches);
+    try std.testing.expectEqualStrings(next.run_id.asSlice(), record.recovered_by_run_id);
+}
+
+test "a live owner keeps the session busy and the report names its process" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buffer[0..try tmp.dir.realPath(std.testing.io, &root_buffer)];
+    const sid = session_id_mod.SessionId.fromSlice("0123456789abcdef01234567").?;
+
+    var owner = try Journal.init(root, sid);
+    defer owner.deinit();
+    var report: OpenReport = .{};
+    try std.testing.expectError(error.JournalBusy, Journal.initWithOptions(root, sid, .{
+        .abandoned_run = .record_abandoned,
+        .report = &report,
+    }));
+    switch (report.holder) {
+        .process => |holder| {
+            try std.testing.expectEqual(@as(i64, @import("platform").process.currentPid()), holder.pid);
+            try std.testing.expectEqual(owner.started_wall_ns, holder.acquired_wall_ns);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expect(report.unfinished == null);
+    try owner.finishRun("end_turn");
+}
+
+test "an older metacodes' empty marker is busy while a process holds it and abandoned once none does" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buffer[0..try tmp.dir.realPath(std.testing.io, &root_buffer)];
+    const sid = session_id_mod.SessionId.fromSlice("0123456789abcdef01234567").?;
+    var lease_buf: [std.fs.max_path_bytes + 1]u8 = undefined;
+    const lease_path = try testLeasePath(&lease_buf, root);
+
+    _ = try testDieMidRun(root, sid);
+    // What an older metacodes leaves while it runs: an empty marker it keeps
+    // open, under no lock and naming no owner.
+    const marker = pfs.open(lease_path.ptr, .{ .ACCMODE = .WRONLY, .TRUNC = true }, @as(std.c.mode_t, 0));
+    try std.testing.expect(marker >= 0);
+    var report: OpenReport = .{};
+    try std.testing.expectError(error.JournalBusy, Journal.initWithOptions(root, sid, .{
+        .abandoned_run = .record_abandoned,
+        .report = &report,
+    }));
+    try std.testing.expect(report.holder == .unnamed);
+    _ = pfs.close(marker);
+
+    var next = try Journal.initWithOptions(root, sid, .{ .abandoned_run = .record_abandoned });
+    defer next.deinit();
+    try next.finishRun("end_turn");
+    const bytes = try tmp.dir.readFileAlloc(std.testing.io, FILE_NAME, std.testing.allocator, .unlimited);
+    defer std.testing.allocator.free(bytes);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "\"evidence\":\"legacy_lease_unheld\"") != null);
+    try std.testing.expect((try validate(root, sid)).complete);
+}
+
+test "a Run sealed for publication whose owner never released it keeps the session closed" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buffer[0..try tmp.dir.realPath(std.testing.io, &root_buffer)];
+    const sid = session_id_mod.SessionId.fromSlice("0123456789abcdef01234567").?;
+    var lease_buf: [std.fs.max_path_bytes + 1]u8 = undefined;
+    const lease_path = try testLeasePath(&lease_buf, root);
+
+    {
+        var sealed = try Journal.init(root, sid);
+        defer sealed.deinit();
+        try sealed.sealRun("end_turn");
+    }
+    try std.testing.expectError(
+        error.RunPublicationPending,
+        Journal.initWithOptions(root, sid, .{ .abandoned_run = .record_abandoned }),
+    );
+    // An older metacodes' marker kept past the terminal record says the same.
+    const marker = pfs.open(lease_path.ptr, .{ .ACCMODE = .WRONLY, .TRUNC = true }, @as(std.c.mode_t, 0));
+    try std.testing.expect(marker >= 0);
+    _ = pfs.close(marker);
+    try std.testing.expectError(
+        error.RunPublicationPending,
+        Journal.initWithOptions(root, sid, .{ .abandoned_run = .record_abandoned }),
+    );
+}
+
+test "a plain finish that died before its release lets the next Run start" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buffer[0..try tmp.dir.realPath(std.testing.io, &root_buffer)];
+    const sid = session_id_mod.SessionId.fromSlice("0123456789abcdef01234567").?;
+
+    {
+        var finished = try Journal.init(root, sid);
+        defer finished.deinit();
+        // `finishRun` without its release: nothing was bound to this Run.
+        try finished.seal("end_turn", .running);
+    }
+    var next = try Journal.init(root, sid);
+    defer next.deinit();
+    try next.finishRun("end_turn");
+}
+
+test "a run_abandoned record must match the Run it closes" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buffer[0..try tmp.dir.realPath(std.testing.io, &root_buffer)];
+    const sid = session_id_mod.SessionId.fromSlice("0123456789abcdef01234567").?;
+
+    _ = try testDieMidRun(root, sid);
+    var next = try Journal.initWithOptions(root, sid, .{ .abandoned_run = .record_abandoned });
+    try next.finishRun("end_turn");
+    next.deinit();
+    const bytes = try tmp.dir.readFileAlloc(std.testing.io, FILE_NAME, std.testing.allocator, .unlimited);
+    defer std.testing.allocator.free(bytes);
+
+    // Claiming fewer open effects than the Run left.
+    const undercount = try std.mem.replaceOwned(u8, std.testing.allocator, bytes, "\"open_dispatches\":1", "\"open_dispatches\":0");
+    defer std.testing.allocator.free(undercount);
+    try std.testing.expect(!std.mem.eql(u8, undercount, bytes));
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = FILE_NAME, .data = undercount });
+    try std.testing.expectError(error.InvalidRecord, validate(root, sid));
+
+    // Closing a Run that is not open: the abandoned record first, renumbered.
+    var lines = std.mem.splitScalar(u8, bytes, '\n');
+    _ = lines.next().?;
+    _ = lines.next().?;
+    const abandoned_line = lines.next().?;
+    const orphan = try std.mem.replaceOwned(u8, std.testing.allocator, abandoned_line, "\"sequence\":2", "\"sequence\":0");
+    defer std.testing.allocator.free(orphan);
+    const orphan_file = try std.fmt.allocPrint(std.testing.allocator, "{s}\n", .{orphan});
+    defer std.testing.allocator.free(orphan_file);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = FILE_NAME, .data = orphan_file });
+    try std.testing.expectError(error.InvalidRecord, validate(root, sid));
+}
+
+test "a lease reached through a name that has since moved is not the lease" {
+    if (is_windows) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buffer[0..try tmp.dir.realPath(std.testing.io, &root_buffer)];
+    var lease_buf: [std.fs.max_path_bytes + 1]u8 = undefined;
+    const lease_path = try testLeasePath(&lease_buf, root);
+
+    const fd = pfs.open(lease_path.ptr, .{ .ACCMODE = .RDWR, .CREAT = true, .EXCL = true }, @as(std.c.mode_t, 0o600));
+    try std.testing.expect(fd >= 0);
+    defer _ = pfs.close(fd);
+    try std.testing.expect(try namesFile(lease_path.ptr, fd));
+    try pfs.unlinkPath(lease_path.ptr);
+    try std.testing.expect(!try namesFile(lease_path.ptr, fd));
+    const successor = pfs.open(lease_path.ptr, .{ .ACCMODE = .RDWR, .CREAT = true, .EXCL = true }, @as(std.c.mode_t, 0o600));
+    try std.testing.expect(successor >= 0);
+    defer _ = pfs.close(successor);
+    try std.testing.expect(!try namesFile(lease_path.ptr, fd));
+}
+
+test "lease outcomes are described for the person who sent the message" {
+    var buf: [512]u8 = undefined;
+    var report: OpenReport = .{ .holder = .{ .process = .{ .pid = 4242, .acquired_wall_ns = 1_793_020_790_000_000_000 } } };
+    const busy = describeRefusal(&buf, error.JournalBusy, &report).?;
+    try std.testing.expect(std.mem.indexOf(u8, busy, "pid 4242") != null);
+    report.holder = .unnamed;
+    try std.testing.expect(std.mem.indexOf(u8, describeRefusal(&buf, error.JournalBusy, &report).?, "older version") != null);
+    try std.testing.expect(describeRefusal(&buf, error.RunPublicationPending, &report) != null);
+    try std.testing.expect(describeRefusal(&buf, error.OutOfMemory, &report) == null);
+
+    var run: OpenRun = .{
+        .run_id = session_id_mod.SessionId.fromSlice("0123456789abcdef01234567").?,
+        .started_wall_ns = 1_793_020_790_000_000_000,
+        .last_elapsed_ns = 2_252_220_732_000,
+        .open_dispatches = 1,
+        .open_provider_attempts = 0,
+    };
+    @memcpy(run.open_tool_buf[0..4], "Bash");
+    run.open_tool_len = 4;
+    const closed = describeAbandoned(&buf, &run);
+    try std.testing.expect(std.mem.indexOf(u8, closed, "while Bash was running") != null);
+    try std.testing.expect(std.mem.indexOf(u8, closed, "check its effects") != null);
+    run.open_dispatches = 0;
+    try std.testing.expect(std.mem.indexOf(u8, describeAbandoned(&buf, &run), "Bash") == null);
+    // Times come from journal records; out-of-range ones are not trusted.
+    var clock: [32]u8 = undefined;
+    try std.testing.expectEqualStrings("an unknown time", localClock(&clock, std.math.maxInt(i128)));
+    try std.testing.expectEqualStrings("an unknown time", localClock(&clock, -1));
 }

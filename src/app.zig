@@ -4059,6 +4059,10 @@ pub const App = struct {
         @atomicStore(?*AbortSignal, &g_abort_signal, &app.abort, .seq_cst);
         // 可移植:POSIX=SIGINT sigaction;Windows=SetConsoleCtrlHandler(见 platform/signal.zig)。
         platform_signal.installInterrupt(onSigint);
+        // A closed terminal (SIGHUP) or a `kill` (SIGTERM) would otherwise end
+        // the process mid-Run by default, leaving the Run for the next process
+        // to close as abandoned. Stop the Run so it closes itself, then leave.
+        platform_signal.installTerminate(onTerminate);
     }
 
     /// Stop SIGINT from aborting this App's run; SIGINT still requests process
@@ -4142,6 +4146,42 @@ fn onSigint() void {
         s.abort(.user_ctrl_c);
     }
 }
+
+/// SIGTERM / SIGHUP (Windows: console close, logoff, shutdown) arrived: the
+/// interactive loop leaves at its next turn boundary instead of reading input.
+pub fn terminateRequested() bool {
+    return g_terminate_requested.load(.seq_cst);
+}
+
+var g_terminate_requested = std.atomic.Value(bool).init(false);
+
+/// How long a requested termination may take before the process is ended
+/// outright: enough for a Run to stop its tools and close its journal, not so
+/// long that a process whose terminal is gone outlives it noticeably.
+const terminate_grace_s: c_uint = 10;
+
+/// The first termination request stops the process as Ctrl+C does (abort the
+/// Run, request shutdown) and bounds how long that may take; a second one ends
+/// the process at once. async-signal-safe: atomics, `alarm`, `_exit`.
+fn onTerminate() void {
+    const is_windows = @import("builtin").os.tag == .windows;
+    if (g_terminate_requested.swap(true, .seq_cst)) {
+        if (is_windows) ExitProcess(143) else std.c._exit(143);
+    }
+    onSigint();
+    if (is_windows) {
+        // The console handler runs on its own thread, and Windows ends the
+        // process as soon as it returns: wait here while the main thread
+        // stops the Run; the process exits under it when that is done.
+        Sleep(terminate_grace_s * 1000);
+    } else {
+        // SIGALRM's default action ends the process should the Run not stop.
+        _ = std.c.alarm(terminate_grace_s);
+    }
+}
+
+extern "kernel32" fn ExitProcess(exit_code: u32) callconv(.winapi) noreturn;
+extern "kernel32" fn Sleep(milliseconds: u32) callconv(.winapi) void;
 
 pub fn shouldQueueModelSwitchCompact(
     previous_model: []const u8,

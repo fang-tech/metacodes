@@ -436,6 +436,52 @@ pub fn makeCloseOnExec(fd: Fd) error{CloseOnExecFailed}!void {
         return error.CloseOnExecFailed;
 }
 
+/// Take an exclusive advisory lock that lasts exactly as long as this open
+/// file: the system drops it when the descriptor is closed, which includes the
+/// process dying by any signal. `WouldBlock` means another open of the same
+/// file holds it now — in another process or in this one, since the lock
+/// belongs to the open file, not to the process.
+///
+/// POSIX `flock(LOCK_EX | LOCK_NB)`. Windows `LockFileEx` on one byte far past
+/// any content: a Windows byte-range lock is mandatory for its range, and a
+/// reader that finds the lock taken must still read what the file says.
+pub fn tryLockExclusive(fd: Fd) error{ WouldBlock, LockFailed }!void {
+    if (is_windows) {
+        const raw = _get_osfhandle(fd);
+        if (raw == -1) return error.LockFailed;
+        var overlapped: Overlapped = .{ .OffsetHigh = lock_range_offset_high };
+        const flags = LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY;
+        if (LockFileEx(@ptrFromInt(@as(usize, @bitCast(raw))), flags, 0, 1, 0, &overlapped) == 0)
+            return if (GetLastError() == ERROR_LOCK_VIOLATION) error.WouldBlock else error.LockFailed;
+        return;
+    }
+    while (std.c.flock(fd, std.c.LOCK.EX | std.c.LOCK.NB) != 0) {
+        if (lastErrnoIs(.INTR)) continue;
+        return if (lastErrnoIs(.AGAIN)) error.WouldBlock else error.LockFailed;
+    }
+}
+
+/// 4 GiB × 0x4000_0000: past any file this lock guards.
+const lock_range_offset_high: u32 = 0x4000_0000;
+const LOCKFILE_FAIL_IMMEDIATELY: u32 = 0x1;
+const LOCKFILE_EXCLUSIVE_LOCK: u32 = 0x2;
+const ERROR_LOCK_VIOLATION: u32 = 33;
+const Overlapped = extern struct {
+    Internal: usize = 0,
+    InternalHigh: usize = 0,
+    Offset: u32 = 0,
+    OffsetHigh: u32 = 0,
+    hEvent: ?*anyopaque = null,
+};
+extern "kernel32" fn LockFileEx(
+    hFile: *anyopaque,
+    dwFlags: u32,
+    dwReserved: u32,
+    nNumberOfBytesToLockLow: u32,
+    nNumberOfBytesToLockHigh: u32,
+    lpOverlapped: *Overlapped,
+) callconv(.winapi) c_int;
+
 const Stat64 = extern struct {
     st_dev: u32,
     st_ino: u16,
@@ -791,6 +837,32 @@ test "openReadShared: a reader holding the file does not block renameReplace and
     defer allocator.free(missing);
     try std.testing.expectEqual(@as(c_int, -1), openReadShared(missing.ptr));
     try std.testing.expect(lastErrnoIs(.NOENT));
+}
+
+test "tryLockExclusive: one open file holds the lock until it is closed" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const path = try std.fmt.allocPrintSentinel(allocator, "{s}/lease", .{root_buffer[0..root_len]}, 0);
+    defer allocator.free(path);
+    try writeWholeFile(path, "owner");
+
+    const first = open(path.ptr, .{ .ACCMODE = .RDWR }, 0);
+    try std.testing.expect(first >= 0);
+    try tryLockExclusive(first);
+    // A second open of the same file is a second holder, even in this process.
+    const second = open(path.ptr, .{ .ACCMODE = .RDWR }, 0);
+    try std.testing.expect(second >= 0);
+    defer close(second);
+    try std.testing.expectError(error.WouldBlock, tryLockExclusive(second));
+    // The lock does not cover the content: the loser can still read the owner.
+    var buf: [16]u8 = undefined;
+    const n = read(second, buf[0..]);
+    try std.testing.expectEqualStrings("owner", buf[0..@intCast(n)]);
+    close(first);
+    try tryLockExclusive(second);
 }
 
 test "Windows: a plain open reader (no FILE_SHARE_DELETE) does block renameReplace" {
