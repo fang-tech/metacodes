@@ -10,6 +10,8 @@ status, compatibility boundaries, and entry points are defined by
 
 ## Unreleased
 
+## 0.8.0 — 2026-10-26
+
 ### Added
 
 - **Guided API-key login for the GLM Coding Plan.** Zhipu offers no
