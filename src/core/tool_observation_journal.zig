@@ -4061,7 +4061,9 @@ test "a run_abandoned record must match the Run it closes" {
 }
 
 test "an owner that dies the instant it takes the lease does not close the session" {
-    var tmp = std.testing.tmpDir(.{});
+    // Iterable: otherwise Linux opens the directory O_PATH and Windows
+    // without list access, and neither handle can be listed.
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
     var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const root = root_buffer[0..try tmp.dir.realPath(std.testing.io, &root_buffer)];
@@ -4090,8 +4092,12 @@ test "an owner that dies the instant it takes the lease does not close the sessi
     try std.testing.expectError(error.JournalBusy, Journal.init(root, sid));
     try holder.finishRun("end_turn");
     var entries = tmp.dir.iterate();
-    while (try entries.next(std.testing.io)) |entry|
+    var saw_journal = false;
+    while (try entries.next(std.testing.io)) |entry| {
         try std.testing.expect(!std.mem.startsWith(u8, entry.name, LOCK_FILE_NAME ++ "."));
+        if (std.mem.eql(u8, entry.name, FILE_NAME)) saw_journal = true;
+    }
+    try std.testing.expect(saw_journal);
 }
 
 test "an older metacodes' marker caught mid-release is not taken for a kept one" {

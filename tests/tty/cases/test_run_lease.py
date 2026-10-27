@@ -11,7 +11,6 @@
     process's pid, and the REPL stays up.
   - A hangup inherited as ignored (`nohup`) stays ignored.
 """
-import fcntl
 import glob
 import json
 import os
@@ -19,6 +18,9 @@ import re
 import signal
 import subprocess
 import time
+
+if os.name != "nt":
+    import fcntl
 
 from tty_driver import run, READY, IDLE, wait_for, case_tmpdir, _build_env
 from asserts import TTYAssert
