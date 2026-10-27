@@ -245,6 +245,11 @@ def _journal_events(path: Path) -> List[Mapping[str, Any]]:
         value = json.loads(line)
         if not isinstance(value, dict) or value.get("sequence") != index:
             raise BoundaryError("tool observation journal sequence drift")
+        event = value.get("event")
+        if isinstance(event, dict) and "run_abandoned" in event:
+            # Its dispatches never finished: summarizing them as the trial's
+            # would count effects nobody observed.
+            raise BoundaryError("tool observation journal holds a Run its process abandoned")
         events.append(value)
     if len(events) < 3:
         raise BoundaryError("tool observation journal is incomplete")

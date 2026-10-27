@@ -155,6 +155,33 @@ pub fn installTerminate(comptime callback: fn () void) void {
     }
 }
 
+/// `installTerminate`, except that a signal this process inherited as ignored
+/// stays ignored: `nohup` sets SIGHUP to SIG_IGN so a command outlives its
+/// terminal, and a handler installed over it would undo that. Windows has no
+/// inherited disposition for console events; there it is `installTerminate`.
+pub fn installTerminateUnlessIgnored(comptime callback: fn () void) void {
+    if (is_windows) {
+        installTerminate(callback);
+    } else {
+        const P = struct {
+            fn h(_: std.posix.SIG) callconv(.c) void {
+                callback();
+            }
+        };
+        var act: std.posix.Sigaction = .{
+            .handler = .{ .handler = P.h },
+            .mask = std.posix.sigemptyset(),
+            .flags = 0,
+        };
+        for ([_]std.posix.SIG{ .TERM, .HUP }) |sig| {
+            var previous: std.posix.Sigaction = undefined;
+            std.posix.sigaction(sig, null, &previous);
+            if (previous.handler.handler == std.posix.SIG.IGN) continue;
+            std.posix.sigaction(sig, &act, null);
+        }
+    }
+}
+
 /// 安装窗口 resize 回调。POSIX=SIGWINCH sigaction；Windows no-op（resize 归 W4 终端 ConsoleInput）。
 pub fn installResize(comptime callback: fn () void) void {
     if (is_windows) return; // TODO(W4)：WINDOW_BUFFER_SIZE_EVENT via ReadConsoleInput

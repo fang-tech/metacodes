@@ -50,6 +50,7 @@ const tee_backend_mod = @import("../core/tee_backend.zig");
 const diagnostics_backend_mod = @import("../core/diagnostics_backend.zig");
 const evaluation_backend_mod = @import("../core/evaluation_backend.zig");
 const project_activation = @import("../core/project_rule_activation.zig");
+const run_journal = @import("../core/tool_observation_journal.zig");
 const tui_backend_mod = @import("tui/tui_backend.zig");
 const terminal_title = @import("tui/terminal_title.zig");
 const goal_mod = @import("../core/goal.zig");
@@ -216,6 +217,10 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, startup: Startup) !v
     };
 
     while (true) {
+        // SIGTERM or SIGHUP stopped the last Run, which closed its journal on
+        // the way out; nothing more is read from a terminal that may be gone.
+        if (app_mod.terminateRequested()) break;
+
         // Idle point: nothing reads the model catalog between turns.
         app.adoptModelCatalogRefresh();
 
@@ -963,19 +968,36 @@ fn runTurn(host: *const TurnHost, kind: TurnKind, synthetic_user_input: ?[]const
     // UI projection and not an evaluation-only stream. Open and validate it
     // before the provider can run; corruption or durability failure ends
     // the run fail-closed.
+    // A session another process is running, or whose last Run left evidence
+    // unpublished, refuses this turn and says why; the REPL stays up. A Run
+    // whose process died is closed as abandoned first, and said so.
+    var lease_report: run_journal.OpenReport = .{};
     const run_control: ?*project_activation.RunControl = if (kind == .macro)
         null
     else if (app.sessionDir()) |dir|
-        try project_activation.RunControl.init(
+        project_activation.RunControl.init(
             allocator,
             dir,
             app.session_id,
             if (app.project_dir_or_empty().len > 0) app.project_dir_or_empty() else app.cwdAbs(),
             &app.abort,
-        )
+            &lease_report,
+        ) catch |err| {
+            var text_buf: [512]u8 = undefined;
+            const text = run_journal.describeRefusal(&text_buf, err, &lease_report) orelse
+                std.fmt.bufPrint(&text_buf, "This turn could not start: the session's run journal failed to open ({s}).", .{@errorName(err)}) catch @errorName(err);
+            if (gen_region) |r| leaveGenerationRegion(app, r);
+            if (host.tty) terminal_title.setFromApp(app, .idle);
+            printNotice(app, app.theme.danger, text);
+            return;
+        }
     else
         null;
     defer if (run_control) |control| control.deinit();
+    if (run_control != null) if (lease_report.unfinished) |abandoned| {
+        var text_buf: [512]u8 = undefined;
+        printNotice(app, app.theme.warn, run_journal.describeAbandoned(&text_buf, &abandoned));
+    };
     if (run_control) |control| control.requireDetachedIdle(
         (if (app.jobs) |*jobs| jobs.runningCountForOwner(app.session_id) else 0) +|
             (if (app.agent_jobs) |*jobs| jobs.runningCountForSession(app.session_id) else 0),
