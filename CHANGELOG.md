@@ -41,6 +41,16 @@ status, compatibility boundaries, and entry points are defined by
   later is cut off. A second signal changes nothing, because closing a
   terminal sends SIGHUP twice milliseconds apart. A SIGHUP ignored on entry
   (`nohup`) stays ignored.
+- **WebFetch decodes compressed pages, or says it cannot** (#358). curl ran
+  without `--compressed`, so a server that compressed its response anyway
+  (gzip, deflate, Brotli) handed the HTML extractor the compressed bytes, and
+  WebFetch returned the garbage as a successful page, in the host's
+  `tool_result` and in the next provider request. WebFetch now asks for the
+  encodings the system curl decodes and decodes the body before extracting
+  text. An encoding that curl cannot decode (Brotli or zstd on a curl built
+  without them, such as the one Windows ships, or an unknown token) and a
+  corrupt compressed body fail the call with curl's reason instead; that
+  failure does not count toward the offline breaker.
 
 ## 0.8.0 — 2026-10-26
 

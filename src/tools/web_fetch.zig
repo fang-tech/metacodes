@@ -2,6 +2,8 @@
 //!
 //! 实现策略：
 //! - 用系统 curl（已有 vendor/curl 或 /usr/bin/curl）抓 HTML
+//! - curl `--compressed`：服务端压缩的响应（gzip/deflate，及该 curl 支持的 br/zstd）先解码再抽文本；
+//!   curl 解不了的编码或损坏的压缩体是显式失败，绝不当作页面文本返回（#358）
 //! - 简单 HTML-to-text：strip <script>/<style>/标签 + HTML entity decode
 //! - **返回全文**（受 128MiB artifact 上界）。**不再自截 8KB**——由 Tool Result 内核的 Session CAS
 //!   统一处理三件套：小页 inline 全文，大页进入 Session CAS 并返回无路径 artifact receipt，
@@ -51,6 +53,44 @@ pub fn offlineBreakerTripped() bool {
     return consecutive_failures.load(.acquire) >= OFFLINE_BREAKER_THRESHOLD;
 }
 
+/// curl's CURLE_BAD_CONTENT_ENCODING: the response named a Content-Encoding
+/// this curl cannot decode (br or zstd on a curl built without them, or an
+/// unknown token), or the compressed body was corrupt.
+const CURL_BAD_CONTENT_ENCODING: i32 = 61;
+
+/// The curl command line both paths run. `--compressed` advertises the
+/// encodings this curl can decode and decodes the body before HTML
+/// extraction; without it a server that compresses anyway handed the
+/// extractor raw gzip/deflate/br bytes, returned as a successful page (#358).
+/// `-S` keeps curl's one-line reason on stderr under `-s`.
+fn curlArgv(url_z: [*:0]const u8) [11]?[*:0]const u8 {
+    const argv0: [*:0]const u8 = if (builtin.os.tag == .windows) "curl" else "/usr/bin/curl";
+    return .{
+        argv0,
+        "-s", // silent
+        "-S", // but still name the error
+        "-L", // follow redirects
+        "--compressed",
+        "--max-time",
+        "15",
+        "--user-agent",
+        user_agent,
+        url_z,
+        null,
+    };
+}
+
+/// A body curl could not decode is a failed fetch, never page text. Nor is it
+/// a network failure: the server answered, so the offline breaker resets
+/// instead of counting toward OFFLINE.
+fn undecodableBody(ctx: *const ToolContext, curl_stderr: []const u8) error{FetchFailed} {
+    consecutive_failures.store(0, .release);
+    const trimmed = std.mem.trim(u8, curl_stderr, " \t\r\n");
+    const reason = std.mem.trimEnd(u8, trimmed[0 .. std.mem.indexOfScalar(u8, trimmed, '\n') orelse trimmed.len], "\r");
+    common.setErrorDetail(ctx.error_detail, ctx.allocator, "WebFetch could not decode the response body: {s}. The server sent a Content-Encoding this system's curl cannot decode, or a corrupt compressed body; no page text was returned, and fetching the same URL again will fail the same way.", .{if (reason.len != 0) reason else "curl exit 61"});
+    return error.FetchFailed;
+}
+
 /// Production byte-zero path. curl stdout first lands in a private Capture;
 /// HTML stripping and JSON encoding each stream through bounded captures, so
 /// no stage owns the full downloaded page or the full encoded tool result.
@@ -71,18 +111,7 @@ pub fn executeBody(ctx: *const ToolContext, args: []const u8) anyerror!ToolResul
 
     const url_z = try allocator.dupeZ(u8, url);
     defer allocator.free(url_z);
-    const argv0: [*:0]const u8 = if (builtin.os.tag == .windows) "curl" else "/usr/bin/curl";
-    var argv: [9]?[*:0]const u8 = .{
-        argv0,
-        "-s",
-        "-L",
-        "--max-time",
-        "15",
-        "--user-agent",
-        user_agent,
-        url_z.ptr,
-        null,
-    };
+    var argv = curlArgv(url_z.ptr);
     var spawned = try common.spawnCaptureToSpoolTimed(
         argv[0..],
         allocator,
@@ -95,6 +124,13 @@ pub fn executeBody(ctx: *const ToolContext, args: []const u8) anyerror!ToolResul
         null,
     );
     defer spawned.deinit();
+    // Before the generic check: a corrupt body exits 61 after part of it was
+    // decoded, and that partial page must not pass as the result.
+    if (spawned.exit_code == CURL_BAD_CONTENT_ENCODING) {
+        const curl_stderr = try spawned.stderr.readRangeAlloc(allocator, 0, @intCast(@min(spawned.stderr.bytes, 300)));
+        defer allocator.free(curl_stderr);
+        return undecodableBody(ctx, curl_stderr);
+    }
     if (spawned.exit_code != 0 and (spawned.capture_complete or spawned.stdout.bytes == 0)) {
         const failures = consecutive_failures.fetchAdd(1, .acq_rel) + 1;
         if (failures >= OFFLINE_BREAKER_THRESHOLD) {
@@ -315,23 +351,13 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     const url_z = try allocator.dupeZ(u8, url);
     defer allocator.free(url_z);
 
-    // curl -s -L --max-time 15 --user-agent "..." "<url>"
-    const argv0: [*:0]const u8 = if (builtin.os.tag == .windows) "curl" else "/usr/bin/curl";
-    var argv: [9]?[*:0]const u8 = .{
-        argv0,
-        "-s", // silent
-        "-L", // follow redirects
-        "--max-time",
-        "15",
-        "--user-agent",
-        user_agent,
-        url_z.ptr,
-        null,
-    };
+    var argv = curlArgv(url_z.ptr);
     const out = try common.spawnCaptureWithStderrTimed(argv[0..argv.len], allocator, ctx.abort, 20_000, ctx.spawn_tick_fn, common.MAX_SPAWN_CAPTURE_BYTES, null);
     defer allocator.free(out.stdout);
     defer allocator.free(out.stderr);
 
+    if (out.exit_code == CURL_BAD_CONTENT_ENCODING)
+        return undecodableBody(ctx, out.stderr[0..@min(out.stderr.len, 300)]);
     if (out.exit_code != 0) {
         const n = consecutive_failures.fetchAdd(1, .acq_rel) + 1;
         if (n >= OFFLINE_BREAKER_THRESHOLD) {
@@ -556,4 +582,42 @@ test "v39 offline breaker trips after threshold and rejects before spawn" {
     try std.testing.expectError(error.FetchFailed, r);
     try std.testing.expect(detail != null);
     try std.testing.expect(std.mem.indexOf(u8, detail.?, "OFFLINE") != null);
+}
+
+test "WebFetch #358: curl asks for and decodes compressed responses" {
+    const argv = curlArgv("http://example.com/");
+    var compressed = false;
+    var show_error = false;
+    for (argv[1 .. argv.len - 1]) |arg| {
+        const text = std.mem.span(arg.?);
+        if (std.mem.eql(u8, text, "--compressed")) compressed = true;
+        if (std.mem.eql(u8, text, "-S")) show_error = true;
+    }
+    try std.testing.expect(compressed);
+    try std.testing.expect(show_error);
+    try std.testing.expectEqualStrings("http://example.com/", std.mem.span(argv[argv.len - 2].?));
+    try std.testing.expect(argv[argv.len - 1] == null);
+}
+
+test "WebFetch #358: an undecodable body fails with curl's reason and does not count toward OFFLINE" {
+    resetOfflineBreakerForTest();
+    defer resetOfflineBreakerForTest();
+    var i: u32 = 0;
+    while (i < OFFLINE_BREAKER_THRESHOLD - 1) : (i += 1) _ = noteFetchFailureForTest();
+
+    var detail: ?[]const u8 = null;
+    const ctx = ToolContext{ .allocator = std.testing.allocator, .error_detail = &detail };
+    defer if (detail) |d| std.testing.allocator.free(d);
+    try std.testing.expectEqual(error.FetchFailed, undecodableBody(&ctx, "curl: (61) Unrecognized content encoding type\r\nsecond line\n"));
+    try std.testing.expect(std.mem.indexOf(u8, detail.?, "could not decode the response body: curl: (61) Unrecognized content encoding type. ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, detail.?, "second line") == null);
+    try std.testing.expect(std.mem.indexOf(u8, detail.?, "OFFLINE") == null);
+    // The server answered: the streak of network failures is broken.
+    try std.testing.expectEqual(@as(u32, 0), consecutive_failures.load(.acquire));
+    try std.testing.expectEqual(@as(u32, 1), noteFetchFailureForTest());
+
+    std.testing.allocator.free(detail.?);
+    detail = null;
+    try std.testing.expectEqual(error.FetchFailed, undecodableBody(&ctx, ""));
+    try std.testing.expect(std.mem.indexOf(u8, detail.?, "body: curl exit 61.") != null);
 }
