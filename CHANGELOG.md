@@ -10,6 +10,38 @@ status, compatibility boundaries, and entry points are defined by
 
 ## Unreleased
 
+### Fixed
+
+- **A session whose turn was killed can be resumed.** A turn's lease on
+  `<session>/tool-observations.lock` was a file created with `O_EXCL` and
+  deleted at the end of the turn, so a process killed mid-turn (a closed
+  terminal, `kill`, an OOM kill) left it behind, and every later turn in that
+  session failed with `error: JournalBusy`, which also exited the REPL. The
+  lease is now held under a lock the kernel drops when its owner dies (`flock`
+  on macOS and Linux, `LockFileEx` on Windows) and names its owner's pid, its
+  Run and when it started. A turn that finds the lease held by a live process
+  is refused with who holds it and since when ("Another metacodes process (pid
+  4242) has been running a turn in this session since 21:19 …"), and the REPL
+  stays up. A turn that finds the previous Run's process gone closes that Run
+  with a `run_abandoned` record (its run id, its open tool calls and provider
+  attempts, and why its owner is known to be dead), says so ("… ended when its
+  process exited while Bash was running … check its effects before relying on
+  them"), and starts. Nothing is replayed, and an abandoned Run is never rule
+  evidence. The REPL, `-p`, the web UI and the daemon recover this way;
+  AgentCore and `AgentSession` keep failing closed (`UnfinishedRun`). An empty marker left by an older binary counts as
+  abandoned only when no process has it open and it is not one that binary
+  kept after its last Run finished. When a Run is recovered, a record
+  half-written as its process died is cut, and the cut is recorded in the next
+  `run_started`. 0.8.0 and earlier cannot open a session holding these
+  records.
+- **SIGTERM and SIGHUP end a turn cleanly.** The REPL used the default action,
+  so closing the terminal or `kill` killed it mid-turn without closing the
+  Run. Both signals now interrupt the turn as Ctrl+C does, let it close its
+  journal and release its lease, and exit; a turn that has not finished 45 s
+  later is cut off. A second signal changes nothing, because closing a
+  terminal sends SIGHUP twice milliseconds apart. A SIGHUP ignored on entry
+  (`nohup`) stays ignored.
+
 ## 0.8.0 — 2026-10-26
 
 ### Added
