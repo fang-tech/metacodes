@@ -1444,6 +1444,23 @@ noinline fn recordVerificationFinalGate(opts: *const Options, verification: *con
     }
 }
 
+// Cleanup of the per-turn buffers, out of line for the same reason: their
+// `defer`s run at each exit of the turn loop's body.
+
+noinline fn freeOwnedSlice(comptime T: type, allocator: std.mem.Allocator, owned: ?[]T) void {
+    if (owned) |slice| allocator.free(slice);
+}
+
+noinline fn freeBlockList(allocator: std.mem.Allocator, blocks: *std.ArrayList(msg.Block)) void {
+    for (blocks.items) |b| b.deinit(allocator);
+    blocks.deinit(allocator);
+}
+
+noinline fn freeItemList(allocator: std.mem.Allocator, items: *std.ArrayList([]u8)) void {
+    for (items.items) |item| allocator.free(item);
+    items.deinit(allocator);
+}
+
 fn runCounted(
     conversation: *Conversation,
     provider: provider_mod.Provider,
@@ -1555,7 +1572,7 @@ fn runCounted(
     // only; the rejecting repair below stays bound to the deterministic hints,
     // so a judge false positive can cost one reminder but never end a run.
     const kg_enumeration_text: ?[]u8 = if (opts.jev != null) try allocator.dupe(u8, latestUserText(conversation)) else null;
-    defer if (kg_enumeration_text) |text| allocator.free(text);
+    defer freeOwnedSlice(u8, allocator, kg_enumeration_text);
     var kg_enumeration_judged = false;
     var kg_enumeration_soft_hint = false;
     var kg_coverage_reminder_emitted = false;
@@ -1773,7 +1790,7 @@ fn runCounted(
         // host-only metadata: serialized tool schemas and capability prompt
         // bytes remain identical, which keeps the provider cache prefix stable.
         var provider_tool_defs_owned: ?[]json_mod.ToolDefinition = null;
-        defer if (provider_tool_defs_owned) |defs| allocator.free(defs);
+        defer freeOwnedSlice(json_mod.ToolDefinition, allocator, provider_tool_defs_owned);
         const provider_tool_defs: []const json_mod.ToolDefinition = blk: {
             const route = required_first_route orelse break :blk gated_tool_defs;
             if (required_first_pending) break :blk gated_tool_defs;
@@ -1804,7 +1821,7 @@ fn runCounted(
         // 必须用 SendMessage;对齐 cc teammate addendum,Linus/PM SW2 F3)。lead 与 teammate 都注入。
         // turn 作用域 alloc,用后 free;无 team 直接用 opts.system_prompt(零开销)。
         var sys_prompt_owned: ?[]u8 = null;
-        defer if (sys_prompt_owned) |p| allocator.free(p);
+        defer freeOwnedSlice(u8, allocator, sys_prompt_owned);
         const augmented_system_prompt: ?[]const u8 = blk: {
             const in_swarm = if (opts.swarm) |s| s.hasTeam() else false;
             if (!in_swarm) break :blk opts.system_prompt;
@@ -1814,11 +1831,11 @@ fn runCounted(
             break :blk if (sys_prompt_owned) |p| p else opts.system_prompt;
         };
         var projected_guidance_owned: ?[]u8 = null;
-        defer if (projected_guidance_owned) |p| allocator.free(p);
+        defer freeOwnedSlice(u8, allocator, projected_guidance_owned);
         var projected_deferred_owned: ?[]u8 = null;
-        defer if (projected_deferred_owned) |p| allocator.free(p);
+        defer freeOwnedSlice(u8, allocator, projected_deferred_owned);
         var projected_capabilities_owned: ?[]u8 = null;
-        defer if (projected_capabilities_owned) |p| allocator.free(p);
+        defer freeOwnedSlice(u8, allocator, projected_capabilities_owned);
         const effective_system_prompt: ?[]const u8 = blk: {
             const base = augmented_system_prompt orelse break :blk null;
             const system_prompt_mod = @import("system_prompt.zig");
@@ -2065,10 +2082,7 @@ fn runCounted(
         // 3. 收集响应 blocks。声明在 request_recovery 外层，使 SSE context
         // recovery 可以清空临时状态后重试同一 turn。
         var assistant_blocks = std.ArrayList(msg.Block).empty;
-        errdefer {
-            for (assistant_blocks.items) |b| b.deinit(allocator);
-            assistant_blocks.deinit(allocator);
-        }
+        errdefer freeBlockList(allocator, &assistant_blocks);
         var assistant_text = std.ArrayList(u8).empty;
         defer assistant_text.deinit(allocator);
         // 进度更新传感器(#114)的输入:本轮用户看到的模型文本里非空白的字节数(host 渲染的
@@ -2084,10 +2098,7 @@ fn runCounted(
         // 按到达顺序收集 owned item JSON,turn 末转成 reasoning_item block 存进
         // assistant message,下轮同模型请求逐字节回传。丢弃残缺回合时随之释放。
         var reasoning_items = std.ArrayList([]u8).empty;
-        defer {
-            for (reasoning_items.items) |item| allocator.free(item);
-            reasoning_items.deinit(allocator);
-        }
+        defer freeItemList(allocator, &reasoning_items);
 
         var tool_uses = std.ArrayList(msg.ToolUse).empty;
         defer tool_uses.deinit(allocator);

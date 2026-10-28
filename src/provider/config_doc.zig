@@ -587,9 +587,17 @@ fn writeJsonString(
 pub fn parse(allocator: std.mem.Allocator, text: []const u8) DocumentError!Document {
     var document = Document.init(allocator);
     errdefer document.deinit();
+    try parseInto(&document, allocator, text);
+    return document;
+}
 
+/// `parse` filling `document` in place. Every `return error.X` in a function
+/// whose result is a Document would copy an 8 KiB constant, one per error
+/// name (doc/PERF_MEMORY_PRINCIPLES.md §3g); returning the error from here
+/// stores just the error.
+fn parseInto(document: *Document, allocator: std.mem.Allocator, text: []const u8) DocumentError!void {
     const trimmed = std.mem.trim(u8, text, " \t\r\n");
-    if (trimmed.len == 0) return document;
+    if (trimmed.len == 0) return;
 
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
@@ -651,8 +659,6 @@ pub fn parse(allocator: std.mem.Allocator, text: []const u8) DocumentError!Docum
         // Documents written before the ring existed carry a single key.
         try document.recordOperation(operation_text);
     }
-
-    return document;
 }
 
 fn parseProvider(key: []const u8, value: std.json.Value) DocumentError!ProviderEntry {

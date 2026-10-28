@@ -129,8 +129,19 @@ pub fn listExecuteBody(ctx: *const ToolContext, args: []const u8) anyerror!ToolR
 }
 
 pub fn readExecuteBody(ctx: *const ToolContext, args: []const u8) anyerror!ToolResultBody {
-    if (ctx.artifact_root.len == 0)
-        return ToolResultBody.initInline(try readExecute(ctx, args));
+    var body: ToolResultBody = undefined;
+    try readExecuteBodyInto(&body, ctx, args);
+    return body;
+}
+
+/// `readExecuteBody` writing its result to `out`. In a function returning a
+/// ToolResultBody, each `return error.X` would copy a 3.7 KiB constant, one
+/// per error name (doc/PERF_MEMORY_PRINCIPLES.md §3g).
+fn readExecuteBodyInto(out: *ToolResultBody, ctx: *const ToolContext, args: []const u8) anyerror!void {
+    if (ctx.artifact_root.len == 0) {
+        out.* = .initInline(try readExecute(ctx, args));
+        return;
+    }
     const allocator = ctx.allocator;
     const sessions = ctx.mcp_sessions orelse return error.NoMcpSessions;
     const uri = (try extractDecodedField(allocator, args, "uri")) orelse return error.MissingUri;
@@ -141,7 +152,7 @@ pub fn readExecuteBody(ctx: *const ToolContext, args: []const u8) anyerror!ToolR
 
     if (server_hint) |hint| {
         for (sessions.*) |*entry| if (std.mem.eql(u8, hint, entry.name)) {
-            return entry.client.readResourceBodyAbortable(uri, ctx.artifact_root, ctx.result_budget, ctx.abort) catch |err| blk: {
+            out.* = entry.client.readResourceBodyAbortable(uri, ctx.artifact_root, ctx.result_budget, ctx.abort) catch |err| blk: {
                 var failed: std.Io.Writer.Allocating = .init(allocator);
                 errdefer failed.deinit();
                 try failed.writer.writeAll("{\"error\":\"read_failed\",\"server\":");
@@ -151,13 +162,15 @@ pub fn readExecuteBody(ctx: *const ToolContext, args: []const u8) anyerror!ToolR
                 try failed.writer.writeByte('}');
                 break :blk ToolResultBody.initInline(try failed.toOwnedSlice());
             };
+            return;
         };
         var missing: std.Io.Writer.Allocating = .init(allocator);
         errdefer missing.deinit();
         try missing.writer.writeAll("{\"error\":\"server_not_found\",\"server\":");
         try util_json.writeJsonString(&missing.writer, hint);
         try missing.writer.writeByte('}');
-        return ToolResultBody.initInline(try missing.toOwnedSlice());
+        out.* = .initInline(try missing.toOwnedSlice());
+        return;
     }
 
     var last_error: ?[]const u8 = null;
@@ -173,7 +186,10 @@ pub fn readExecuteBody(ctx: *const ToolContext, args: []const u8) anyerror!ToolR
             continue;
         };
         if (body == .structured_error) {
-            if (body.structured_error.category == .system_error) return body;
+            if (body.structured_error.category == .system_error) {
+                out.* = body;
+                return;
+            }
             const detail = duplicateStructuredErrorDetail(
                 allocator,
                 body.structured_error.encoded,
@@ -187,7 +203,8 @@ pub fn readExecuteBody(ctx: *const ToolContext, args: []const u8) anyerror!ToolR
             last_error = "remote_error";
             continue;
         }
-        return body;
+        out.* = body;
+        return;
     }
     var output: std.Io.Writer.Allocating = .init(allocator);
     defer output.deinit();
@@ -200,7 +217,7 @@ pub fn readExecuteBody(ctx: *const ToolContext, args: []const u8) anyerror!ToolR
         try util_json.writeJsonString(&output.writer, detail);
     }
     try output.writer.writeByte('}');
-    return ToolResultBody.initInline(try output.toOwnedSlice());
+    out.* = .initInline(try output.toOwnedSlice());
 }
 
 fn duplicateStructuredErrorDetail(

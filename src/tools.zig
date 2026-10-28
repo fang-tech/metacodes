@@ -1009,6 +1009,15 @@ fn jsonValueKind(args: []const u8, key: []const u8) ?JsonKind {
 /// 找不到时先做 P0.6 弱模型工具名修复(归一化 + 模糊匹配),命中则改派到真工具;仍找不到
 /// 返 error.UnknownTool —— 由 agent_loop 转 tool_error 给模型。
 pub fn dispatch(ctx: *const ToolContext, name: []const u8, args: []const u8) anyerror!ToolDispatchOutcome {
+    var outcome: ToolDispatchOutcome = undefined;
+    try dispatchInto(&outcome, ctx, name, args);
+    return outcome;
+}
+
+/// `dispatch` writing its outcome to `out`. In a function returning a
+/// ToolDispatchOutcome, each `return error.X` would copy a 3.7 KiB constant,
+/// one per error name (doc/PERF_MEMORY_PRINCIPLES.md §3g).
+fn dispatchInto(out: *ToolDispatchOutcome, ctx: *const ToolContext, name: []const u8, args: []const u8) anyerror!void {
     // Defense in depth: agent_loop/tool_exec normally checks this first, but
     // dispatch is also a public L2 seam and dynamic tools can be called through
     // it directly.  Never let a guessed name bypass a child execution ceiling.
@@ -1017,14 +1026,21 @@ pub fn dispatch(ctx: *const ToolContext, name: []const u8, args: []const u8) any
     }
     // An embedding Session's immutable directory is an authority boundary, not
     // a lookup hint. Do not fall through to the process-wide registry on miss.
-    if (ctx.tool_dispatcher) |dispatcher| return dispatcher.dispatch(ctx, name, args);
+    if (ctx.tool_dispatcher) |dispatcher| {
+        out.* = try dispatcher.dispatch(ctx, name, args);
+        return;
+    }
     if (getTool(name)) |t| {
         try validateRequired(name, args); // schema 层:缺 required 字段 → 早拦
         try validateTypes(name, args); // schema 层:字段类型不匹配 → 早拦
-        return .{ .ok = try t.execute.run(ctx, args) };
+        out.* = .{ .ok = try t.execute.run(ctx, args) };
+        return;
     }
     if (ctx.dyn_registry) |dr| {
-        if (dr.find(name)) |de| return .{ .ok = try de.execute(ctx, args) };
+        if (dr.find(name)) |de| {
+            out.* = .{ .ok = try de.execute(ctx, args) };
+            return;
+        }
     }
     // P0.6:弱模型幻觉工具名修复。**只**用确定性无损归一化(大小写/`-`/空格/CamelCase→snake/剥
     // `_tool` 尾缀)自动改派——这些是安全的等价变换。**不**用模糊编辑距离自动执行(那会把 "Wrote"
@@ -1036,10 +1052,14 @@ pub fn dispatch(ctx: *const ToolContext, name: []const u8, args: []const u8) any
             if (getTool(repaired)) |t| {
                 try validateRequired(repaired, args);
                 try validateTypes(repaired, args);
-                return .{ .ok = try t.execute.run(ctx, args) };
+                out.* = .{ .ok = try t.execute.run(ctx, args) };
+                return;
             }
             if (ctx.dyn_registry) |dr| {
-                if (dr.find(repaired)) |de| return .{ .ok = try de.execute(ctx, args) };
+                if (dr.find(repaired)) |de| {
+                    out.* = .{ .ok = try de.execute(ctx, args) };
+                    return;
+                }
             }
         }
     }
@@ -1054,6 +1074,14 @@ pub fn dispatchProjectExactEdit(
     ctx: *const ToolContext,
     args: []const u8,
 ) anyerror!ToolDispatchOutcome {
+    try admitProjectExactEdit(ctx, args);
+    return .{ .ok = ToolResultBody.initInline(try edit_tool.execute(ctx, args)) };
+}
+
+/// The checks before `dispatchProjectExactEdit` runs the native Edit. Apart
+/// from it so that its refusals are not literal `return error.X` in a function
+/// returning a ToolDispatchOutcome (doc/PERF_MEMORY_PRINCIPLES.md §3g).
+fn admitProjectExactEdit(ctx: *const ToolContext, args: []const u8) anyerror!void {
     if (ctx.project_edit_mode != .whole_file_exact)
         return error.ProjectExactEditNotAuthorized;
     if (ctx.execution_policy) |policy| {
@@ -1064,7 +1092,6 @@ pub fn dispatchProjectExactEdit(
         return error.ProjectExactEditNativeUnavailable;
     try validateRequired("Edit", args);
     try validateTypes("Edit", args);
-    return .{ .ok = ToolResultBody.initInline(try edit_tool.execute(ctx, args)) };
 }
 
 /// 逗号分隔的所有真实工具名(静态 + dyn),供 UnknownTool 错误引导模型。caller free。

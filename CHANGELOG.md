@@ -193,6 +193,21 @@ status, compatibility boundaries, and entry points are defined by
   `error.InvalidCredentialByte`. A fixed (CLI) credential is checked before
   every request and fails that request instead of sending it.
 
+- **The Linux binary is back under 6 MiB** (246 KB more off, no change in
+  behavior). Functions that return a large result (the provider config
+  document, an HTTP request result, a tool result, a tool-dispatch
+  outcome) no longer return literal errors directly. Each such return used
+  to copy a read-only constant the size of the result, one per error name.
+  - **Large results:** the work is now done in a function that fills the
+    result through a pointer, wrapped by the original signature.
+  - **Up-front checks:** they return no result, and the caller uses `try`.
+
+  The agent loop's per-turn buffers are also freed out of line.
+
+  The native build is now 6098 KB and the glibc 2.31 baseline build
+  6078 KB, 0.7% and 1.1% under the red line; idle RSS is 2272 and 2620 KB
+  (`doc/PERF_MEMORY_PRINCIPLES.md` §1, §3g).
+
 ## 0.8.1 — 2026-10-28
 
 ### Fixed

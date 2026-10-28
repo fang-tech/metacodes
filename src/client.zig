@@ -142,6 +142,31 @@ pub fn retryDelayMsWithSample(attempt: u32, base_ms: u64, sample: u64) u64 {
     return base + jitter;
 }
 
+/// The wait before connect attempt `attempt + 1`: the reporter hears of the
+/// failure, the sleep checks `abort` every 50 ms, and the reporter is asked
+/// before the next attempt; error.Aborted when either says stop. Kept out of
+/// sendMessageStreamFullRetry, where each `return error.Aborted` cost a
+/// constant the size of StreamResponse (doc/PERF_MEMORY_PRINCIPLES.md §3g).
+fn backOffBeforeRetry(
+    reporter: ?RetryReporter,
+    attempt: u32,
+    max_attempts: u32,
+    delay_ms: u64,
+    abort: ?*const AbortSignal,
+    failure: []const u8,
+) error{Aborted}!void {
+    if (reporter) |rep| {
+        if (!rep.failed(attempt, max_attempts, delay_ms))
+            return error.Aborted;
+    }
+    log.warn("client", "stream connect retry {d}/{d} after {s}; sleeping {d}ms", .{ attempt, max_attempts, failure, delay_ms });
+    if (!interruptibleSleepMs(delay_ms, abort)) return error.Aborted;
+    if (reporter) |rep| {
+        if (!rep.beforeAttempt(attempt + 1, max_attempts))
+            return error.Aborted;
+    }
+}
+
 /// 重试退避(对齐 CC getRetryDelay):min(base * 2^(attempt-1), 32000) + 真随机 jitter(0~25%)。
 /// attempt 从 1 起。若系统熵源罕见失败，以单调时间 + 栈地址混合作为降级，避免退回所有
 /// session 按 attempt 同步重试的确定性羊群行为。
@@ -860,30 +885,37 @@ pub const Client = struct {
         max_tokens: u32,
     ) !RequestResult {
         client.last_retry_attempt = 0;
+        // The error paths below return an error held in a variable, never a
+        // literal `error.X`: in a function returning the 8 KiB RequestResult a
+        // literal costs a constant that size (doc/PERF_MEMORY_PRINCIPLES.md §3g).
         var result = client.doRequest(body, streaming, abort, retry_hint, max_tokens) catch |err| {
             if (err != error.TokenExpired) return err;
-            const callback = client.refresh_fn orelse return error.Unauthorized;
-            const ctx = client.refresh_ctx orelse return error.Unauthorized;
-            // Refresh replaces fixed bytes the client owns; a Session's
-            // replaceable credential is rotated by its Host instead.
-            const stale = client.credential.lendable() orelse return error.Unauthorized;
-            const token = callback(ctx, stale) catch return error.Unauthorized;
-            client.replaceRefreshToken(token) catch {
-                secureFree(client.allocator, token);
-                return error.Unauthorized;
-            };
+            try client.refreshExpiredToken();
             client.last_retry_attempt = 1;
             // No event has been delivered: the body is still the exact slice
             // produced by the serializer, so this is a byte-for-byte replay.
-            var replay_result = client.doRequest(body, streaming, abort, retry_hint, max_tokens) catch |replay_err| {
-                if (replay_err == error.TokenExpired) return error.Unauthorized;
-                return replay_err;
-            };
+            var replay_result = client.doRequest(body, streaming, abort, retry_hint, max_tokens) catch |replay_err|
+                return if (replay_err == error.TokenExpired) error.Unauthorized else replay_err;
             if (streaming) replay_result.streaming_response.retry_attempt = 1;
             return replay_result;
         };
         if (streaming) result.streaming_response.retry_attempt = 0;
         return result;
+    }
+
+    /// Replaces an expired OAuth token through the refresh callback; any
+    /// failure is `error.Unauthorized`.
+    fn refreshExpiredToken(client: *Client) error{Unauthorized}!void {
+        const callback = client.refresh_fn orelse return error.Unauthorized;
+        const ctx = client.refresh_ctx orelse return error.Unauthorized;
+        // Refresh replaces fixed bytes the client owns; a Session's
+        // replaceable credential is rotated by its Host instead.
+        const stale = client.credential.lendable() orelse return error.Unauthorized;
+        const token = callback(ctx, stale) catch return error.Unauthorized;
+        client.replaceRefreshToken(token) catch {
+            secureFree(client.allocator, token);
+            return error.Unauthorized;
+        };
     }
 
     /// 建连阶段重试包装(对齐 CC withRetry)。仅覆盖 sendMessageStreamFull(建连+收头),
@@ -936,17 +968,7 @@ pub const Client = struct {
                     return err;
                 }
                 const delay = retry_hint.delay_ms orelse retryDelayMs(attempt, base_ms);
-                if (reporter) |rep| {
-                    if (!rep.failed(attempt, effective_max_attempts, delay))
-                        return error.Aborted;
-                }
-                log.warn("client", "stream connect retry {d}/{d} after {s}; sleeping {d}ms", .{ attempt, effective_max_attempts, @errorName(err), delay });
-                // 可中断 sleep:每 50ms 查一次 abort。
-                if (!interruptibleSleepMs(delay, abort)) return error.Aborted;
-                if (reporter) |rep| {
-                    if (!rep.beforeAttempt(attempt + 1, effective_max_attempts))
-                        return error.Aborted;
-                }
+                try backOffBeforeRetry(reporter, attempt, effective_max_attempts, delay, abort, @errorName(err));
             }
         }
     }
@@ -960,6 +982,23 @@ pub const Client = struct {
         retry_hint: ?*RetryHint,
         max_tokens: u32,
     ) !RequestResult {
+        var result: RequestResult = undefined;
+        try client.doRequestInto(&result, body, streaming, abort, retry_hint, max_tokens);
+        return result;
+    }
+
+    /// `doRequest` writing its result to `out`. In a function returning the
+    /// 8 KiB RequestResult, each `return error.X` would copy a constant of
+    /// that size, one per error name (doc/PERF_MEMORY_PRINCIPLES.md §3g).
+    fn doRequestInto(
+        client: *Client,
+        out: *RequestResult,
+        body: []const u8,
+        streaming: bool,
+        abort: ?*const AbortSignal,
+        retry_hint: ?*RetryHint,
+        max_tokens: u32,
+    ) !void {
         const rid = log.genRequestId();
         client.last_request_id = rid;
         const t_start = timestampMs();
@@ -1123,7 +1162,7 @@ pub const Client = struct {
         if (streaming) {
             // 所有权转给调用方：StreamResult.request 拥有 req_ptr，StreamResponse.deinit
             // 负责 req_ptr.deinit() + destroy。
-            return RequestResult{
+            out.* = .{
                 .streaming_response = .{
                     .request = req_ptr,
                     .response = http_response,
@@ -1135,6 +1174,7 @@ pub const Client = struct {
                     .http_status = status.code,
                 },
             };
+            return;
         }
 
         // 非流式：读取完整 body；结束后立即 deinit+destroy req_ptr（不再返回）
@@ -1160,7 +1200,7 @@ pub const Client = struct {
         req_ptr.deinit();
         client.allocator.destroy(req_ptr);
         log.infoId("client", rid, "response complete bytes={d} total_ms={d}", .{ response_body.len, timestampMs() - t_start });
-        return RequestResult{ .full_body = .{ .body = response_body, .id = rid, .server_request_id = client.serverRequestId() } };
+        out.* = .{ .full_body = .{ .body = response_body, .id = rid, .server_request_id = client.serverRequestId() } };
     }
 };
 
