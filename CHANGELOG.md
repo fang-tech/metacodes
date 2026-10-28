@@ -57,30 +57,7 @@ status, compatibility boundaries, and entry points are defined by
   `SCHEMA_VERSION` are in the new [doc/WIRE_PROTOCOL.md](doc/WIRE_PROTOCOL.md);
   `tests/fixtures/wire/v1` pins the frames and replies.
 
-### Changed
-
-- **The TUI's turn phase now owns every widget it opens (#330).** The agent
-  switcher, `?` help, the Ctrl+X prefix, the slash/`@` menu highlight, the
-  paste hint, the double-press windows, the model picker, the input box
-  projection, the spinner and the tool cards used to live side by side in one
-  session-long `UiState`, kept from leaking into the next prompt or reply by a
-  reset list at every boundary (#298). They now live in the payload of the
-  phase they belong to (`idle`/`input`/`generating`), which a single typed
-  `phase_change` event replaces wholesale, so nothing a reply or a read opened
-  can outlive it and a new widget is torn down without being listed anywhere.
-  A top-level field without a declared reason to outlive phases fails the
-  build, and a debug build panics on a phase that opens before the previous
-  one closed. The picker still crosses a boundary, but only through its
-  explicit `pending_overlay` hand-off (#220). No visible behaviour changes.
-
 ### Fixed
-
-- **A draft typed during a reply survives a permission or question dialog.**
-  The keyboard watcher owned the draft, and a dialog stops the watcher and
-  starts a new one when it closes. So the input box went on showing a buffer
-  that had already been freed, and the next key or Enter dropped what had been
-  typed. The draft now belongs to the reply: after the dialog the box still
-  shows it, the cursor is where it was, and Enter queues all of it.
 
 - **Ctrl+L during a reply clears the screen through the renderer** (#320).
   The keyboard watcher sent `ESC[2J` straight to the terminal, outside the
@@ -119,6 +96,13 @@ status, compatibility boundaries, and entry points are defined by
   permission-target test compares paths as paths, since AgentCore names
   Windows paths with forward slashes.
 
+- **A draft typed during a reply survives a permission or question dialog.**
+  The keyboard watcher owned the draft, and a dialog stops the watcher and
+  starts a new one when it closes. So the input box went on showing a buffer
+  that had already been freed, and the next key or Enter dropped what had been
+  typed. The draft now belongs to the reply: after the dialog the box still
+  shows it, the cursor is where it was, and Enter queues all of it.
+
 ### Changed
 
 - **Smaller Linux footprint: idle RSS back under its red line, binary
@@ -146,6 +130,19 @@ status, compatibility boundaries, and entry points are defined by
   aggregates copied from zero-filled constants, and `defer` bodies copied
   into every exit.
 
+- **The TUI's turn phase now owns every widget it opens (#330).** The agent
+  switcher, `?` help, the Ctrl+X prefix, the slash/`@` menu highlight, the
+  paste hint, the double-press windows, the model picker, the input box
+  projection, the spinner and the tool cards used to live side by side in one
+  session-long `UiState`, kept from leaking into the next prompt or reply by a
+  reset list at every boundary (#298). They now live in the payload of the
+  phase they belong to (`idle`/`input`/`generating`), which a single typed
+  `phase_change` event replaces wholesale, so nothing a reply or a read opened
+  can outlive it and a new widget is torn down without being listed anywhere.
+  A top-level field without a declared reason to outlive phases fails the
+  build, and a debug build panics on a phase that opens before the previous
+  one closed. The picker still crosses a boundary, but only through its
+  explicit `pending_overlay` hand-off (#220). No visible behaviour changes.
 
 ## 0.8.1 — 2026-10-28
 
