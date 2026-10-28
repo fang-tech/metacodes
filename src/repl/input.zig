@@ -228,7 +228,8 @@ pub const KeyParser = struct {
             },
             .csi_num1 => {
                 if (b >= '0' and b <= '9') {
-                    self.num1 = self.num1 * 10 + (b - '0');
+                    // 饱和:十位以上的参数不是任何认得的键,停在上限仍是 .unknown(不溢出 panic)。
+                    self.num1 = self.num1 *| 10 +| (b - '0');
                     return null;
                 }
                 if (b == ';') {
@@ -287,7 +288,7 @@ pub const KeyParser = struct {
             },
             .csi_num2 => {
                 if (b >= '0' and b <= '9') {
-                    self.num2 = self.num2 * 10 + (b - '0');
+                    self.num2 = self.num2 *| 10 +| (b - '0');
                     return null;
                 }
                 if (rxvtShiftFinal(b)) {
@@ -1889,6 +1890,15 @@ test "KeyParser: 读到一半的序列等不来后半截 → 超时兑现时丢�
     try testing.expect(p.pendingEsc());
     try testing.expect(p.flushEsc().? == .esc);
     try testing.expectEqual(@as(u8, 'a'), p.feed('a').?.char);
+}
+
+test "KeyParser: 超长的数字参数饱和而不溢出,整条仍是一个认不出的键" {
+    // `ESC [` 后十位以上数字:u32 累加在 Safe 构建里溢出 panic。
+    var buf: [8]Key = undefined;
+    const keys = parseAll("\x1b[99999999999999999999~\x1b[1;99999999999999999999u\x1b[4294967296ua", &buf);
+    try testing.expectEqual(@as(usize, 4), keys.len);
+    for (keys[0..3]) |k| try testing.expect(k == .unknown);
+    try testing.expectEqual(@as(u8, 'a'), keys[3].char);
 }
 
 test "KeyParser: rxvt 用 `$` 结尾的 Shift 组合键仍是一个键,不吞下一个键" {
