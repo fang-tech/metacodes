@@ -411,14 +411,20 @@ pub fn probe(want: Want, hand_over: bool) Result {
         round.result.background != null,
         round.typed_len,
     });
-    if (fd == 0) platform_term.replayInput(0, round.typedBytes());
+    // The scanner holds at most replay_capacity typed bytes: all of it fits.
+    if (fd == 0) _ = platform_term.replayInput(0, round.typedBytes());
     if (late) {
         round.clearTyped();
         platform_term.restoreAtExit(fd, saved);
-        g_late = .{ .fd = fd, .original = saved, .scanner = round };
+        g_late = Late.init(fd, saved, round);
     } else platform_term.restoreModeKeepingInput(fd, saved);
     return round.result;
 }
+
+/// How long an open answer may wait for the rest of it in `Late`: one read
+/// wait of the REPL's key loop. A terminal writes an answer in one piece; a
+/// tail that has not come by then was discarded or never sent.
+const late_tail_ms: i64 = 200;
 
 /// A round the deadline ended, on the REPL's terminal: its answers may still
 /// be on their way (a slow link). Until the REPL takes the terminal
@@ -437,28 +443,69 @@ const Late = struct {
     original: platform_term.SavedMode,
     /// The round's scanner, with any sequence the deadline cut still open.
     scanner: Scanner,
+    /// `platform.terminal.discardCount` when the terminal was last read: a
+    /// different count means input was thrown away since (a TCSAFLUSH mode
+    /// switch), possibly the rest of the open sequence.
+    discards: u32,
+    /// When the open sequence last grew.
+    progress_ms: i64,
+
+    fn init(fd: c_int, original: platform_term.SavedMode, scanner: Scanner) Late {
+        return .{
+            .fd = fd,
+            .original = original,
+            .scanner = scanner,
+            .discards = platform_term.discardCount(),
+            .progress_ms = util_time.nowMs(),
+        };
+    }
+
+    /// The open sequence's tail will not come: input was discarded since it
+    /// was read, or it has not grown for a read wait. It is resolved now
+    /// (`Scanner.finish`: a cut answer is dropped, a cut key is typed), so the
+    /// keys typed next are not fed to it as its tail.
+    fn expireOpen(self: *Late) void {
+        const discards = platform_term.discardCount();
+        const discarded = discards != self.discards;
+        self.discards = discards;
+        if (self.scanner.seq_len == 0) return;
+        if (discarded or util_time.nowMs() - self.progress_ms >= late_tail_ms) self.scanner.finish();
+    }
+
+    /// Hand the typed bytes to stdin. Every byte read adds at most one to
+    /// typed + open sequence, and reads are bounded so both fit the replay
+    /// (`absorb`): nothing is cut.
+    fn replayTyped(self: *Late) bool {
+        if (self.scanner.typed_len == 0) return false;
+        _ = platform_term.replayInput(self.fd, self.scanner.typedBytes());
+        self.scanner.clearTyped();
+        return true;
+    }
+
+    /// Read what the terminal queued since the round ended through its
+    /// scanner: answers are dropped, the rest goes back to stdin
+    /// (`replayInput`). True when some of it was typed. Reading stops while
+    /// the replay could not take what the next bytes may produce (the open
+    /// sequence included): the rest stays with the terminal, in order, for
+    /// stdin's next reader.
+    fn absorb(self: *Late) bool {
+        self.expireOpen();
+        var typed = self.replayTyped();
+        var chunk: [256]u8 = undefined;
+        while (true) {
+            const room = platform_term.replayRoom(self.fd) -| self.scanner.seq_len;
+            const limit = @min(chunk.len, self.scanner.room(), room);
+            if (limit == 0) break;
+            const n = platform_term.readPending(self.fd, chunk[0..limit]);
+            if (n <= 0) break;
+            self.scanner.feed(chunk[0..@intCast(n)]);
+            if (self.scanner.seq_len > 0) self.progress_ms = util_time.nowMs();
+            if (self.replayTyped()) typed = true;
+        }
+        return typed;
+    }
 };
 var g_late: ?Late = null;
-
-/// Read what the terminal queued since the round ended through its scanner:
-/// answers are dropped, the rest goes back to stdin (`replayInput`). True
-/// when some of it was typed.
-fn absorbLate(late: *Late) bool {
-    var typed = false;
-    var chunk: [256]u8 = undefined;
-    while (true) {
-        const limit = @min(chunk.len, late.scanner.room(), platform_term.replayRoom(late.fd));
-        if (limit == 0) break;
-        const n = platform_term.readPending(late.fd, chunk[0..limit]);
-        if (n <= 0) break;
-        late.scanner.feed(chunk[0..@intCast(n)]);
-        if (late.scanner.typed_len == 0) continue;
-        typed = true;
-        platform_term.replayInput(late.fd, late.scanner.typedBytes());
-        late.scanner.clearTyped();
-    }
-    return typed;
-}
 
 /// Whether what stdin has pending is only the late answers of a round the
 /// deadline ended (they are read and dropped here). False when something was
@@ -467,7 +514,7 @@ fn absorbLate(late: *Late) bool {
 pub fn lateAnswersOnly(fd: c_int) bool {
     const late = if (g_late) |*l| l else return false;
     if (late.fd != fd or platform_term.replayRoom(fd) < platform_term.replay_capacity) return false;
-    return !absorbLate(late);
+    return !late.absorb();
 }
 
 /// The REPL takes stdin's terminal. After a round the deadline ended, what is
@@ -478,9 +525,9 @@ pub fn lateAnswersOnly(fd: c_int) bool {
 pub fn handOver(fd: c_int) ?platform_term.SavedMode {
     const late = if (g_late) |*l| l else return null;
     if (late.fd != fd) return null;
-    _ = absorbLate(late);
+    _ = late.absorb();
     late.scanner.finish();
-    platform_term.replayInput(fd, late.scanner.typedBytes());
+    _ = late.replayTyped();
     const original = late.original;
     g_late = null;
     platform_term.cancelRestoreAtExit();
@@ -861,7 +908,7 @@ test "Late: answers that come after the deadline are dropped, keys are kept, a c
     defer _ = std.c.close(fds[1]);
     const r = fds[0];
     // The deadline cut the round inside DA1.
-    g_late = .{ .fd = r, .original = std.mem.zeroes(platform_term.SavedMode), .scanner = scan(both, "\x1b[?62;") };
+    g_late = Late.init(r, std.mem.zeroes(platform_term.SavedMode), scan(both, "\x1b[?62;"));
     defer g_late = null;
     var buf: [32]u8 = undefined;
 
@@ -884,6 +931,99 @@ test "Late: answers that come after the deadline are dropped, keys are kept, a c
     try testing.expectEqual(@as(isize, 2), platform_term.readInput(r, &buf));
     try testing.expectEqualStrings("xy", buf[0..2]);
     try testing.expectEqual(@as(i32, 0), platform_term.waitReadable(r, 0));
+}
+
+/// Read everything `replayInput` owes `fd`, then what the pipe still holds.
+fn drainForTest(fd: c_int, owed: []u8, rest: []u8) struct { owed: []u8, rest: []u8 } {
+    var o: usize = 0;
+    while (platform_term.replayRoom(fd) < platform_term.replay_capacity) {
+        const n = platform_term.readInput(fd, owed[o..]); // no EINTR: the replay buffer, no syscall
+        if (n <= 0) break;
+        o += @intCast(n);
+    }
+    var r: usize = 0;
+    while (platform_term.waitReadable(fd, 0) > 0) {
+        const n = platform_term.readInput(fd, rest[r..]); // no EINTR: a test pipe that poll reported readable
+        if (n <= 0) break;
+        r += @intCast(n);
+    }
+    return .{ .owed = owed[0..o], .rest = rest[0..r] };
+}
+
+test "Late: a cut answer whose tail a mode switch discarded does not swallow the keys typed after it" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest; // a pipe stands in for the terminal
+    var fds: [2]c_int = undefined;
+    try testing.expectEqual(@as(c_int, 0), std.c.pipe(&fds));
+    defer _ = std.c.close(fds[0]);
+    defer _ = std.c.close(fds[1]);
+    const r = fds[0];
+    g_late = Late.init(r, std.mem.zeroes(platform_term.SavedMode), scan(both, "\x1b[?62;"));
+    defer g_late = null;
+    // The tail arrives and a TCSAFLUSH mode switch (the splash's raw entry,
+    // a resume) discards it.
+    try testing.expect(pfs.writeAll(fds[1], "22c"));
+    platform_term.discardPendingInput(r);
+    // What is typed next is typed, all of it.
+    try testing.expect(pfs.writeAll(fds[1], "ls"));
+    try testing.expect(!lateAnswersOnly(r));
+    try testing.expect(handOver(r) != null);
+    var owed: [16]u8 = undefined;
+    var rest: [16]u8 = undefined;
+    const got = drainForTest(r, &owed, &rest);
+    try testing.expectEqualStrings("ls", got.owed);
+}
+
+test "Late: a cut answer that waited a read wait for its tail is given up, and the text typed next is typed" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var fds: [2]c_int = undefined;
+    try testing.expectEqual(@as(c_int, 0), std.c.pipe(&fds));
+    defer _ = std.c.close(fds[0]);
+    defer _ = std.c.close(fds[1]);
+    const r = fds[0];
+    // An OSC 11 answer cut inside its colour; nothing discarded the tail,
+    // it just never came.
+    g_late = Late.init(r, std.mem.zeroes(platform_term.SavedMode), scan(both, "\x1b]11;rgb:1e1e/"));
+    defer g_late = null;
+    g_late.?.progress_ms -= late_tail_ms;
+    // Text the OSC body would have taken as its payload.
+    try testing.expect(pfs.writeAll(fds[1], "fix the bug"));
+    try testing.expect(!lateAnswersOnly(r));
+    try testing.expect(pfs.writeAll(fds[1], " now"));
+    try testing.expect(handOver(r) != null);
+    var owed: [32]u8 = undefined;
+    var rest: [8]u8 = undefined;
+    const got = drainForTest(r, &owed, &rest);
+    try testing.expectEqualStrings("fix the bug now", got.owed);
+}
+
+test "Late: absorbing stops where stdin's replay is full, and what is left stays queued in order" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var fds: [2]c_int = undefined;
+    try testing.expectEqual(@as(c_int, 0), std.c.pipe(&fds));
+    defer _ = std.c.close(fds[0]);
+    defer _ = std.c.close(fds[1]);
+    const r = fds[0];
+    g_late = Late.init(r, std.mem.zeroes(platform_term.SavedMode), Scanner.init(both));
+    defer g_late = null;
+    // One byte short of a full replay, then a Left arrow that straddles the
+    // limit, then a key.
+    var paste: [platform_term.replay_capacity - 1]u8 = undefined;
+    @memset(&paste, 'p');
+    try testing.expect(pfs.writeAll(fds[1], &paste));
+    try testing.expect(pfs.writeAll(fds[1], "\x1b[Dd"));
+    try testing.expect(handOver(r) != null);
+    var owed: [platform_term.replay_capacity]u8 = undefined;
+    var rest: [16]u8 = undefined;
+    const got = drainForTest(r, &owed, &rest);
+    // Everything arrives once, in order: what fitted was handed back, the
+    // rest was left with the terminal.
+    var all: [platform_term.replay_capacity + 16]u8 = undefined;
+    @memcpy(all[0..got.owed.len], got.owed);
+    @memcpy(all[got.owed.len..][0..got.rest.len], got.rest);
+    const whole = all[0 .. got.owed.len + got.rest.len];
+    try testing.expectEqual(paste.len + 4, whole.len);
+    try testing.expectEqualStrings("\x1b[Dd", whole[paste.len..]);
+    try testing.expect(got.owed.len <= platform_term.replay_capacity);
 }
 
 test "runRound: a paste larger than stdin can be handed stays with the terminal" {

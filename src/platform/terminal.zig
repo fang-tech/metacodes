@@ -128,11 +128,12 @@ var g_replay_pos: usize = 0;
 
 /// Hand `bytes`, read from `fd` but not meant for the reader that took them,
 /// back to the next `readInput(fd, …)`, ahead of anything the terminal sends
-/// later. They append to what is still owed; at most `replay_capacity` bytes
-/// are ever owed, and the startup probe that calls this never takes more (a
-/// caller that did would lose the excess, never overrun the buffer).
-pub fn replayInput(fd: c_int, bytes: []const u8) void {
-    if (bytes.len == 0) return;
+/// later. They append to what is still owed. At most `replay_capacity` bytes
+/// are owed: this takes what fits (`replayRoom`) and returns how many bytes
+/// it took. Callers read no more from the terminal than fits, so nothing is
+/// cut; one that passed more would lose the excess, never the buffer.
+pub fn replayInput(fd: c_int, bytes: []const u8) usize {
+    if (bytes.len == 0) return 0;
     if (g_replay_pos >= g_replay_len or g_replay_fd != fd) {
         g_replay_len = 0;
         g_replay_pos = 0;
@@ -140,12 +141,22 @@ pub fn replayInput(fd: c_int, bytes: []const u8) void {
     // Move what is still owed to the front, then append.
     const owed = g_replay_len - g_replay_pos;
     std.mem.copyForwards(u8, g_replay_buf[0..owed], g_replay_buf[g_replay_pos..g_replay_len]);
-    std.debug.assert(owed + bytes.len <= replay_capacity);
     const n = @min(bytes.len, replay_capacity - owed);
     @memcpy(g_replay_buf[owed..][0..n], bytes[0..n]);
     g_replay_fd = fd;
     g_replay_pos = 0;
     g_replay_len = owed + n;
+    return n;
+}
+
+/// How many times input the terminal had received was thrown away: a POSIX
+/// mode switch with TCSAFLUSH, or `discardPendingInput`. A reader holding the
+/// first half of a sequence compares two counts to learn that its second
+/// half may be gone.
+var g_discards = std.atomic.Value(u32).init(0);
+
+pub fn discardCount() u32 {
+    return g_discards.load(.acquire);
 }
 
 fn replayOwed(fd: c_int) []const u8 {
@@ -279,6 +290,7 @@ fn waitTerminal(fd: c_int, timeout_ms: i32) i32 {
 /// them from the terminal and owes them to the input parser, they are not
 /// pending there.
 pub fn discardPendingInput(fd: c_int) void {
+    _ = g_discards.fetchAdd(1, .acq_rel);
     if (is_windows and fd == 0) {
         const h = GetStdHandle(STD_INPUT_HANDLE);
         var mode: win.DWORD = 0;
@@ -429,6 +441,7 @@ fn enterRawWith(fd: c_int, pending: PendingInput) ?SavedMode {
     raw.cc[@intFromEnum(std.c.V.MIN)] = 1;
     raw.cc[@intFromEnum(std.c.V.TIME)] = 0;
     if (std.c.tcsetattr(fd, tcsaction(pending), &raw) != 0) return null;
+    if (pending == .discard) _ = g_discards.fetchAdd(1, .acq_rel);
     return orig;
 }
 
@@ -498,6 +511,7 @@ fn restoreModeWith(fd: c_int, saved: SavedMode, pending: PendingInput) void {
         if (saved.stdin_fmode > 0) _ = _setmode(0, saved.stdin_fmode);
     } else {
         _ = std.c.tcsetattr(fd, tcsaction(pending), &saved);
+        if (pending == .discard) _ = g_discards.fetchAdd(1, .acq_rel);
     }
 }
 
@@ -582,7 +596,7 @@ test "replayInput: owed bytes come first, in order, survive a discard and only f
     defer _ = std.c.close(fds[0]);
     defer _ = std.c.close(fds[1]);
 
-    replayInput(fds[0], "ab\x1b");
+    try std.testing.expectEqual(@as(usize, 3), replayInput(fds[0], "ab\x1b"));
     // Readable without waiting, though the terminal sent nothing.
     try std.testing.expectEqual(@as(i32, 1), waitReadable(fds[0], 0));
     // Another descriptor is not owed them.
@@ -592,7 +606,7 @@ test "replayInput: owed bytes come first, in order, survive a discard and only f
     try std.testing.expectEqual(@as(isize, 1), readInput(fds[0], buf[0..1]));
     try std.testing.expectEqual(@as(u8, 'a'), buf[0]);
     // More owed later goes after what is still owed.
-    replayInput(fds[0], "[A");
+    _ = replayInput(fds[0], "[A");
     // A discard drops what the terminal has pending, not what is owed.
     try std.testing.expectEqual(@as(isize, 3), std.c.write(fds[1], "zzz", 3));
     discardPendingInput(fds[0]);

@@ -232,3 +232,22 @@ def test_late_answers_do_not_skip_the_splash(bin_path):
     a, screen = _screen_sized(raw, 30, 100)
     a.assert_input_echo("")
     assert "62;22c" not in screen
+
+
+def test_a_flood_typed_after_a_timed_out_round_does_not_crash(bin_path):
+    _posix_only()
+    # The probe gave up (nothing answers); then more is typed during startup than stdin's
+    # replay holds (4096 bytes): one byte short of it, then a Left arrow that straddles the
+    # limit. Reading it out used to overrun the replay and panic (the Debug binary;
+    # ReleaseSafe likewise) at the REPL's first raw-mode entry.
+    flood = "p" * 4095
+    raw = _slow_startup(bin_path, [
+        QUERY_SENT,
+        "strictsleep:0.3",
+        "raw:" + flood + "\\x1b[Dd",
+        IDLE,
+    ], _unknown_terminal(), per_key_drain=0.01)
+    assert b"panic" not in raw and b"unreachable" not in raw, raw[-400:].decode("utf-8", "replace")
+    # The prompt is up (the flood makes the box taller than the screen; its footer is the last row).
+    _, screen = _screen(raw)
+    assert "bypass permissions on" in screen.splitlines()[-1], screen
