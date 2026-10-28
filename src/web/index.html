@@ -169,6 +169,22 @@ function basename(p) { p = String(p || ""); const i = p.lastIndexOf("/"); return
 function esc(s) { const d = document.createElement("div"); d.textContent = String(s ?? ""); return d.innerHTML; }
 function jparse(s) { try { return JSON.parse(s); } catch { return null; } }
 
+// ── 能力声明(doc/WIRE_PROTOCOL.md §2)───────────────────────────────────────
+// 本页能渲染的 UI 请求:permission + ask_question,不渲染任何 custom kind——声明后 core
+// 不再把它们通告过来,工具立即拿到 unavailable(而不是弹"Unsupported"对话框再失败一次)。
+// events 只作诊断:coreEvent() 里有分支的那些。
+const CAPABILITIES = {
+  v: 1, type: "capabilities", ui_requests: ["permission", "ask_question"], custom: [],
+  events: ["text_chunk", "thinking_chunk", "stream_begin", "stream_done", "tool_start", "tool_progress",
+    "tool_result", "set_current_tool", "clear_current_tool", "progress", "config_changed", "usage",
+    "context_warning", "auto_compact", "retry_notice"],
+};
+function declareCapabilities() {
+  api("/capabilities", { method: "POST", body: JSON.stringify(CAPABILITIES) })
+    .then(r => { if (!r.ok) r.text().then(t => sysline("capabilities refused: " + t, true)); })
+    .catch(() => {});
+}
+
 // ── SSE ─────────────────────────────────────────────────────────────────────
 function connect() {
   // EventSource cannot send headers: the token rides in the query (GET only, server side).
@@ -186,7 +202,8 @@ function connect() {
   // start the view over. "evicted" only means old events fell out of the window.
   es.addEventListener("resync", (m) => {
     const r = jparse(m.data) || {};
-    if (r.reason && r.reason !== "evicted") { resetView(); lastEpoch = r.epoch || ""; lastSeq = (r.from || 0) - 1; }
+    // Another journal is another host or session: its declaration is gone, declare again.
+    if (r.reason && r.reason !== "evicted") { resetView(); lastEpoch = r.epoch || ""; lastSeq = (r.from || 0) - 1; declareCapabilities(); }
     refreshState();
   });
   es.onerror = () => {
@@ -201,6 +218,9 @@ function dispatch(ev) {
   if (ev.v === 1) {
     if (ev.type === "ui_request") return showDialog(ev.id, ev.kind, ev.request);
     if (ev.type === "ui_request_closed") return hideDialog();
+    if (ev.type === "capabilities_accepted") return;
+    if (ev.type === "ui_request_unavailable")
+      return sysline("· a tool asked for " + (ev.custom_kind || ev.kind) + ", which this page does not render (" + ev.reason + ")", true);
     return coreEvent(ev.type, ev.data);
   }
   if ("user_message" in ev) { endAssistant(); unqueue(ev.user_message); scroll.appendChild(el("msg-user", ev.user_message)); return; }
@@ -702,7 +722,7 @@ function renderMarkdown(src) {
   return html;
 }
 
-connect(); refreshState(); setInterval(refreshState, 5000);
+declareCapabilities(); connect(); refreshState(); setInterval(refreshState, 5000);
 </script>
 </body>
 </html>

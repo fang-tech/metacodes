@@ -97,6 +97,14 @@ stateB="$("${CURL[@]}" "${auth[@]}" "$url/s/$B/state")" || fail "GET B's /state 
 if grep -q '"permission_mode":"dont_ask"' <<<"$stateB"; then
   fail "A's /mode changed B"
 fi
+# A capability frame (doc/WIRE_PROTOCOL.md §2) belongs to its session alone.
+capsA="$("${CURL[@]}" "${auth[@]}" -X POST "$url/s/$A/capabilities" -H "Origin: $url" \
+  -d '{"v":1,"type":"capabilities","ui_requests":["permission"]}')" || fail "POST A's /capabilities failed"
+grep -q '"type":"capabilities_accepted","ui_requests":\["permission"\]' <<<"$capsA" || fail "A's frame not accepted: $capsA"
+stateA="$("${CURL[@]}" "${auth[@]}" "$url/s/$A/state")" || fail "GET A's /state failed"
+grep -q '"frontend_capabilities":{"v":1,"type":"capabilities_accepted"' <<<"$stateA" || fail "A's /state lacks its declaration"
+stateB="$("${CURL[@]}" "${auth[@]}" "$url/s/$B/state")" || fail "GET B's /state failed"
+grep -q '"frontend_capabilities":null' <<<"$stateB" || fail "A's declaration reached B: $stateB"
 
 # ── UDS + NDJSON: no token; the socket file's 0600 mode is the access control ─
 [[ -S "$usock" ]] || fail "UDS socket not created: $usock"

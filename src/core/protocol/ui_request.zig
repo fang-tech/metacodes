@@ -31,8 +31,10 @@ pub const UiRequest = union(enum) {
     ///
     /// **schema 责任**:kind 的 payload_json 与响应 result JSON 的 schema **由发起 tool 与 renderer
     /// 双方约定**——core 不校验(它不懂任何 kind,这是 opaque passthrough 的代价与本分)。两端
-    /// 跨进程时尤其要**版本化**(kind 内嵌版本号 / 共享 schema 声明),否则 JSON 在 tool↔renderer
-    /// 间裸奔会 schema drift。当前(L2)仅协议合约就位,首个真实生产负载待 L3 挂起路径接入。
+    /// 跨进程时尤其要**版本化**,否则 JSON 在 tool↔renderer 间裸奔会 schema drift:kind 写成
+    /// `<name>@<major>`,跨进程前端在能力帧里逐个声明它能渲染的 kind(frontend_capabilities.zig,
+    /// doc/WIRE_PROTOCOL.md §3),core 精确匹配,不匹配的请求不通告、直接 unavailable。未带版本的
+    /// kind 只送得到未声明能力的前端。当前(L2)仅协议合约就位,首个真实生产负载待 L3 挂起路径接入。
     custom: struct { kind: []const u8, payload_json: []const u8 },
 };
 
@@ -62,7 +64,10 @@ pub const SessionId = @import("../session_id.zig").SessionId;
 ///   工具据此返 error.UiPending,agent_loop 挂起(stop_reason=.suspended),响应到达后
 ///   经 resumeWithResponse 注入 tool_result 续跑。**out 未写,工具不得读。**
 /// - unavailable:无 requester(headless/单测/子 agent)→ 工具按语义兜底(ask→NotATty 等)。
-pub const RequestOutcome = enum { answered, pending, unavailable };
+/// - unrenderable:有前端连着,但它的能力帧声明了渲染不了这个请求(frontend_capabilities.zig,
+///   doc/WIRE_PROTOCOL.md §2.2)——请求从未展示给用户。工具照 unavailable 兜底(权限照样
+///   fail closed),但给模型的文字必须如实:是前端渲染不了,不是用户的回答或拒绝。**out 未写。**
+pub const RequestOutcome = enum { answered, pending, unavailable, unrenderable };
 
 pub const UiRequestFn = *const fn (
     state: *anyopaque,

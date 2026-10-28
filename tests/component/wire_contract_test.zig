@@ -8,9 +8,16 @@
 //! fixture directory, or keep the old spelling in wire.zig. Adding a CoreEvent
 //! tag without a sample fails too.
 //!
+//! The capability exchange (doc/WIRE_PROTOCOL.md §2) is pinned the same way:
+//! capability_frames.jsonl holds frontend frames, capability_replies.jsonl
+//! core's reply to each (accepted or refused), and requests.jsonl ends with
+//! one `ui_request_unavailable` line per routing reason. Every refusal reason
+//! but FrameTooLarge (a 64 KiB frame; wire.zig tests it) has a frame.
+//!
 //! Regenerating after a deliberate change:
 //!   METACODES_WIRE_FIXTURE_DUMP=<dir> zig build test:integration-times -Dtfilter=wire_contract
-//! writes events.jsonl/requests.jsonl/host_events.jsonl to <dir> instead of comparing.
+//! writes events.jsonl/requests.jsonl/host_events.jsonl/capability_replies.jsonl
+//! to <dir> instead of comparing.
 
 const std = @import("std");
 const cc = @import("cc");
@@ -21,6 +28,8 @@ const UiRequest = cc.ui_request.UiRequest;
 const EVENTS_FIXTURE = @embedFile("../fixtures/wire/v1/events.jsonl");
 const REQUESTS_FIXTURE = @embedFile("../fixtures/wire/v1/requests.jsonl");
 const HOST_FIXTURE = @embedFile("../fixtures/wire/v1/host_events.jsonl");
+const FRAMES_FIXTURE = @embedFile("../fixtures/wire/v1/capability_frames.jsonl");
+const REPLIES_FIXTURE = @embedFile("../fixtures/wire/v1/capability_replies.jsonl");
 
 const trace: [12]u8 = "0123456789ab".*;
 
@@ -181,9 +190,18 @@ test "wire_contract: every CoreEvent tag has a pinned v1 line" {
     try compareOrDump(a, &lines, EVENTS_FIXTURE, "events.jsonl");
 }
 
-test "wire_contract: every UiRequest kind and close outcome has a pinned v1 line" {
+/// What a frontend that renders permission prompts and video_timeline@1 is
+/// spared: one request per `Unavailable` reason, in its order.
+const routed_away = [_]UiRequest{
+    .{ .ask_question = &questions },
+    .{ .custom = .{ .kind = "video_timeline@2", .payload_json = "{\"clips\":[]}" } },
+    .{ .custom = .{ .kind = "video_timeline", .payload_json = "{\"clips\":[]}" } },
+};
+
+test "wire_contract: every UiRequest kind, close outcome and unavailable reason has a pinned v1 line" {
     const a = std.testing.allocator;
-    var lines: [requests.len + std.meta.fields(cc.wire.RequestClosed).len][]u8 = undefined;
+    const closed_count = std.meta.fields(cc.wire.RequestClosed).len;
+    var lines: [requests.len + closed_count + routed_away.len][]u8 = undefined;
     var written: usize = 0;
     defer for (lines[0..written]) |line| a.free(line);
 
@@ -204,7 +222,57 @@ test "wire_contract: every UiRequest kind and close outcome has a pinned v1 line
         lines[requests.len + index] = try cc.wire.writeRequestClosed(a, index + 1, @enumFromInt(field.value));
         written += 1;
     }
+
+    // The unavailable lines come from routing, not from naming a reason.
+    var declaration = try cc.wire.parseCapabilities(a, "{\"v\":1,\"type\":\"capabilities\",\"ui_requests\":[\"permission\"],\"custom\":[\"video_timeline@1\"]}");
+    defer declaration.deinit();
+    const capabilities = &declaration.capabilities;
+    try std.testing.expectEqual(cc.frontend_capabilities.Route.deliver, cc.frontend_capabilities.route(capabilities, &requests[0]));
+    const timeline_v1 = UiRequest{ .custom = .{ .kind = "video_timeline@1", .payload_json = "{}" } };
+    try std.testing.expectEqual(cc.frontend_capabilities.Route.deliver, cc.frontend_capabilities.route(capabilities, &timeline_v1));
+    inline for (std.meta.fields(cc.frontend_capabilities.Unavailable), 0..) |field, index| {
+        const route = cc.frontend_capabilities.route(capabilities, &routed_away[index]);
+        try std.testing.expectEqual(cc.frontend_capabilities.Route{ .unavailable = @enumFromInt(field.value) }, route);
+        lines[requests.len + closed_count + index] = try cc.wire.writeRequestUnavailable(a, &routed_away[index], route.unavailable);
+        written += 1;
+    }
     try compareOrDump(a, &lines, REQUESTS_FIXTURE, "requests.jsonl");
+}
+
+test "wire_contract: each capability frame gets its pinned reply; every refusal reason has a frame" {
+    const a = std.testing.allocator;
+    var replies: std.ArrayList([]u8) = .empty;
+    defer {
+        for (replies.items) |line| a.free(line);
+        replies.deinit(a);
+    }
+    var refused: std.ArrayList([]const u8) = .empty;
+    defer refused.deinit(a);
+    var frames = std.mem.splitScalar(u8, fixtureLines(FRAMES_FIXTURE), '\n');
+    while (frames.next()) |frame| {
+        const reply = if (cc.wire.acceptCapabilities(a, frame)) |accepted| blk: {
+            var declaration = accepted.declaration;
+            declaration.deinit();
+            break :blk accepted.line;
+        } else |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => |reason| blk: {
+                try refused.append(a, @errorName(reason));
+                break :blk try cc.wire.writeCapabilitiesRefused(a, reason);
+            },
+        };
+        try replies.append(a, reply);
+    }
+    try compareOrDump(a, replies.items, REPLIES_FIXTURE, "capability_replies.jsonl");
+
+    inline for (@typeInfo(cc.wire.RefusalError).error_set.?) |reason| {
+        var seen = std.mem.eql(u8, reason.name, "FrameTooLarge");
+        for (refused.items) |name| seen = seen or std.mem.eql(u8, name, reason.name);
+        if (!seen) {
+            std.debug.print("capability_frames.jsonl has no frame refused as {s}\n", .{reason.name});
+            return error.MissingWireSample;
+        }
+    }
 }
 
 const host_events = [_]cc.wire.HostEvent{

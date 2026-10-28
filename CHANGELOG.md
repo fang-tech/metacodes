@@ -10,17 +10,6 @@ status, compatibility boundaries, and entry points are defined by
 
 ## Unreleased
 
-### Fixed
-
-- **Ctrl+L during a reply clears the screen through the renderer** (#320).
-  The keyboard watcher sent `ESC[2J` straight to the terminal, outside the
-  render lock and between two frames, while the agent loop could be printing,
-  and kept the half-line continuation whose text the clear had just removed.
-  Ctrl+L, `/clear` and `/resume` now share `RenderRegion.resetScreen`: it
-  erases the region, clears the screen and, during a reply, draws the region
-  again on the top row, in one synchronized frame, and drops the
-  continuation. The scrollback is never wiped (no `ESC[3J`).
-
 ### Added
 
 - **The TUI's screen ownership is written down and enforced** (#332, #320).
@@ -34,6 +23,78 @@ status, compatibility boundaries, and entry points are defined by
   function in `src/repl/` that is not listed with its reason. The unused
   DECSC/DECRC constants left `ansi.zig`, and `src/repl/statusline.zig`, which
   no build imported, is gone with its direct write to stderr.
+- A virtual terminal for component tests (`tests/component/vterm.zig`, a Zig
+  port of `tests/tty/screen.py` pinned to it by golden vectors, with bounded
+  scrollback content) and the first tests that drive the real render region
+  through it: emit/erase pairing, half-line continuation, phase hand-off,
+  narrow strict-autowrap terminals (#319); and convergence of the streamed
+  assistant markdown under token, line, byte, every-single-cut and seeded
+  random chunkings, tables cut mid-row or never confirmed, with and without
+  the live region redrawn between chunks (#318).
+- **Cross-process frontends declare which UI requests they render (#329).**
+  A frontend opens its channel with a capability frame
+  (`{"v":1,"type":"capabilities","ui_requests":[...],"custom":["<name>@<major>"],"events":[...]}`):
+  `POST /capabilities` on `--web` and `serve` (`/s/<id>/capabilities` per
+  session), `HostedSession.declareCapabilities` for a `SessionHost` Host. A
+  UI request the frame leaves out is no longer announced and failed by a
+  round trip: the Host journals `ui_request_unavailable` and the requester
+  answers the new `RequestOutcome.unrenderable` at once. The tool fails as
+  without a UI — AskUserQuestion with `FrontendCannotRender`
+  (`capability_unsupported`), `requestUiCustom` with `CustomUiUnsupported`, a
+  permission prompt denied with no terminal fallback — and the tool result
+  says the connected frontend cannot render the request and that the user
+  never saw it, instead of "failed with NotATty" or "user declined … via
+  prompt"; those texts are unchanged where they are true. Custom kinds carry
+  their version and match exactly. The reply is a journaled
+  `capabilities_accepted` line, or `capabilities_refused` for a frame of
+  another schema version or a malformed one, which changes nothing; `GET
+  /state` reports the declaration as `frontend_capabilities`. A frontend that
+  never declares receives every request as before, and in-process backends
+  (TUI, headless, the C ABI) are unchanged. The bundled browser UI declares
+  `permission` and `ask_question`, so a custom UI request no longer opens an
+  "Unsupported UI request" dialog there. The wire contract, the compatibility
+  rules and the policy on which `CoreEvent`/`UiRequest` changes bump
+  `SCHEMA_VERSION` are in the new [doc/WIRE_PROTOCOL.md](doc/WIRE_PROTOCOL.md);
+  `tests/fixtures/wire/v1` pins the frames and replies.
+
+### Fixed
+
+- **Ctrl+L during a reply clears the screen through the renderer** (#320).
+  The keyboard watcher sent `ESC[2J` straight to the terminal, outside the
+  render lock and between two frames, while the agent loop could be printing,
+  and kept the half-line continuation whose text the clear had just removed.
+  Ctrl+L, `/clear` and `/resume` now share `RenderRegion.resetScreen`: it
+  erases the region, clears the screen and, during a reply, draws the region
+  again on the top row, in one synchronized frame, and drops the
+  continuation. The scrollback is never wiped (no `ESC[3J`).
+- **Code blocks in a streamed reply are highlighted for their fence's
+  language.** The live markdown renderer kept the language as a slice of the
+  line buffer the reply streams through; by the block's first code line that
+  buffer had been shifted to the next line (and sometimes reallocated), so
+  the slice read other bytes and blocks were highlighted with the generic
+  keyword set (a Python `lambda` or `None` stayed plain). The renderer now
+  keeps its own copy of the language name.
+- **The footer no longer wraps on a narrow terminal.** The mode and key-hint
+  line (`⏵⏵ accept edits on (shift+tab to cycle) · esc to interrupt`) was
+  never cut to the terminal width. On a terminal narrower than it, the
+  terminal wrapped it onto rows the input box does not count, and with the
+  box at the bottom of the screen every redraw pushed the spinner, border
+  and prompt rows into the scrollback. It is now cut with an ellipsis, like
+  the MCP notice on the same line.
+- **Python package: a host tool can run a child Session on Windows.** A Run
+  executed on the thread that called `Session.run`; on Windows the main
+  thread of python.exe reserves 2 MB, and a Run that a tool started from
+  inside another Run overflowed it. ctypes reported the overflow as
+  `OSError: exception: stack overflow`, the child's Run never finished, and
+  closing the child failed with `BUSY`. Every Run now executes on its own
+  thread with an 8 MiB stack, the size the Node addon gives its Run threads,
+  so nesting no longer depends on the caller's stack. The thread is not a
+  daemon, and an interrupt (Ctrl+C) while `run()` waits for it aborts the Run
+  and waits for it to end before it propagates; a second interrupt stops the
+  wait and leaves the Session busy until the Run ends, so `abort()` and
+  `close()` still reach it. The suite's
+  permission-target test compares paths as paths, since AgentCore names
+  Windows paths with forward slashes.
 
 ### Changed
 
