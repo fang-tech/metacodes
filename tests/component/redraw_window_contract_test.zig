@@ -170,6 +170,40 @@ test "panic: the text still waiting in the merge window is written before the pa
     try testing.expectEqual(harness.vterm.Pos{ .row = last + 1, .col = 0 }, t.screen.cursor());
 }
 
+// The terminal can change size inside that last window. The hook measures it
+// before erasing, as every frame does: rows drawn at the old width re-wrap,
+// and an erase that climbed the old row count would leave the top of the
+// region on the screen above the panic message.
+test "panic: after a resize in the last window, the region is erased at the new width" {
+    const fx = try harness.AppFixture.create(gpa);
+    defer fx.destroy();
+    for ([_]bool{ true, false }) |reflow| {
+        const t = try mergingTerm(.{ .rows = 14, .cols = 80 });
+        defer t.destroy();
+        const r = &t.region;
+        r.enableMergeWindow();
+        r.enterGenerating(fx.app, null);
+        r.tickSpinner(fx.app);
+        r.writeGenText("before the resize\n");
+        Clock.now += 16;
+        try testing.expect(r.pumpFrame());
+        try expectRegionOnScreenOnce(t);
+        r.writeGenText("last words\n"); // inside the window: not on screen yet
+        try t.resize(14, 50, reflow);
+        try testing.expect((try t.screen.findRow("last words")) == null);
+
+        try testing.expect(cc.tui_render_region.flushPendingOnPanic());
+        defer r.mutex.unlock();
+        expectTranscript(t, "before the resize\nlast words") catch |err| {
+            std.debug.print("reflow={}\n", .{reflow});
+            return err;
+        };
+        try testing.expectEqual(@as(usize, 0), try t.screen.countRows(.screen, harness.isRegionRow));
+        const last = (try t.screen.findRow("last words")).?;
+        try testing.expectEqual(harness.vterm.Pos{ .row = last + 1, .col = 0 }, t.screen.cursor());
+    }
+}
+
 test "panic: a region whose lock is held is left alone, and a freed one is forgotten" {
     const fx = try harness.AppFixture.create(gpa);
     defer fx.destroy();

@@ -393,20 +393,28 @@ pub const RenderRegion = struct {
     /// **不分配**:panic 可能正来自分配器——Zig 的 DebugAllocator 持着自己的锁报 invalid free /
     /// double free——这时让 scratch 扩容会永远等那把锁,崩溃变成挂死。擦除字节拼在栈上的固定
     /// 缓冲里(装不下就整个放弃),文本原样写出。这条路径上若再 panic,默认 handler 只报"panic
-    /// 期间又 panic",原来的信息就丢了;所以这里只做 tryLock、拼固定字节、写。
+    /// 期间又 panic",原来的信息就丢了;所以这里只做 tryLock、量尺寸、拼固定字节、写。
+    /// 擦前先量终端(与 paintLocked 开头同一步 observeResize:一次 ioctl / 控制台查询,不分配,
+    /// 量不到沿用旧值):最后一个窗口里 resize 过,climb 要按现在的宽度数行,否则重排后的区行
+    /// 留在屏上;画区时记的半行续接列也随重排失效,作废后按 paintLocked 的规矩封口。
     /// 返回 true 时锁**仍被持有**:panic 信息打完之前,定时线程和别的线程不会再画区盖住它
     /// (进程随后 abort,不放)。
     pub fn flushForPanic(self: *RenderRegion) bool {
         if (!self.mutex.tryLock()) return false;
         const text = self.pending_scroll.items;
         if (text.len == 0) return true;
-        var erase_buf: [128]u8 = undefined;
-        var erase: std.Io.Writer = .fixed(&erase_buf);
+        self.observeResize();
+        var head_buf: [128]u8 = undefined;
+        var head: std.Io.Writer = .fixed(&head_buf);
         if (self.region_drawn and self.prev_rows > 0) {
-            self.writeErase(&erase) catch return true;
+            self.writeErase(&head) catch return true;
             self.region_drawn = false;
         }
-        self.flush(erase.buffered());
+        if (self.resize_seal_pending) {
+            head.writeAll("\n") catch return true;
+            self.resize_seal_pending = false;
+        }
+        self.flush(head.buffered());
         self.flush(text);
         return true;
     }
@@ -3729,6 +3737,47 @@ test "a seal after a generation resize is written once when the region is not dr
     // Before #328 the seal flushed its newline and stayed in the scratch, so it
     // went out twice: a blank line after a resize.
     try std.testing.expectEqualStrings("\nnext\n", out.written());
+}
+
+// The panic flush handles a resize the way a frame does: the half-line column
+// saved when the region was drawn is stale once the line re-wraps, and a half
+// line with no region under it is sealed before the pending text.
+test "the panic flush measures a resize before it erases" {
+    var nb: [16]u8 = undefined;
+    for ([_]bool{ true, false }) |drawn| {
+        var r = RenderRegion.init(std.testing.allocator, -1, theme_mod.select(.monochrome, .none), .none);
+        defer r.deinit();
+        var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer out.deinit();
+        r.sink = &out.writer;
+        r.changePhaseLocked(.{ .generating = .{} });
+        r.cols = 80;
+        r.rows = 24;
+        r.reflows = true;
+        r.text_pending_newline = true;
+        r.pending_col = 70;
+        if (drawn) {
+            r.region_drawn = true;
+            r.region_drawn_pending_nl = true;
+            r.region_drawn_pending_col = 70;
+            r.prev_rows = 2;
+            r.anchor = .{ .rows_above = 1 };
+        }
+        try r.pending_scroll.appendSlice(std.testing.allocator, "rest\n");
+        r.size_override = .{ .rows = 24, .cols = 50 }; // narrowed inside the window
+
+        try std.testing.expect(r.flushForPanic());
+        defer r.unlock();
+        try std.testing.expectEqual(@as(u16, 50), r.cols);
+        if (drawn) {
+            // Erased back to the region's top row, a fresh line: no move to
+            // the stale column, no extra newline.
+            try std.testing.expect(std.mem.indexOf(u8, out.written(), ansi.cursor.forward(70, &nb)) == null);
+            try std.testing.expect(std.mem.endsWith(u8, out.written(), ansi.cursor.show ++ "rest\n"));
+        } else {
+            try std.testing.expectEqualStrings("\nrest\n", out.written());
+        }
+    }
 }
 
 test "merge window: the timer thread paints a deferred frame and deinit joins it" {
