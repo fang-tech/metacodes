@@ -1355,7 +1355,7 @@ pub const App = struct {
     /// (owned; `freeRouteAuthHeader`). Null when it cannot build one, as the
     /// client's own requests would then fail.
     fn routeAuthHeader(app: *App) ?@import("api/auth_header.zig").Header {
-        return @import("api/auth_header.zig").build(app.allocator, app.api_client.auth_scheme, app.api_client.api_key) catch null;
+        return app.api_client.credential.header(app.allocator, app.api_client.auth_scheme) catch null;
     }
 
     fn freeRouteAuthHeader(app: *App, header: @import("api/auth_header.zig").Header) void {
@@ -2038,17 +2038,17 @@ pub const App = struct {
         // the previous provider's endpoint.
         app.config.base_url = endpoint;
         app.api_key = secret;
-        app.api_client.api_key = secret;
+        app.api_client.credential = .{ .fixed = secret };
         app.api_client.base_url = endpoint;
         app.api_client.auth_scheme = binding.auth_scheme;
         if (app.openai_client) |*client| {
-            client.api_key = secret;
+            client.credential = .{ .fixed = secret };
             client.base_url = endpoint;
             client.protocol = binding.openai_protocol;
             client.auth_scheme = binding.auth_scheme;
         }
         if (app.gemini_client) |*client| {
-            client.api_key = secret;
+            client.credential = .{ .fixed = secret };
             client.base_url = endpoint;
         }
         // Every out-of-process UI learns the *route*, not just the model name: a
@@ -2095,9 +2095,9 @@ pub const App = struct {
         }
         app.selected_api_key_owned = owned;
         app.api_key = owned;
-        app.api_client.api_key = owned;
-        if (app.openai_client) |*oc| oc.api_key = owned;
-        if (app.gemini_client) |*gc| gc.api_key = owned;
+        app.api_client.credential = .{ .fixed = owned };
+        if (app.openai_client) |*oc| oc.credential = .{ .fixed = owned };
+        if (app.gemini_client) |*gc| gc.credential = .{ .fixed = owned };
         if (app.agent_jobs) |*aj| try aj.setApiKey(owned);
 
         app.api_client.catalog.deinit();
@@ -2711,9 +2711,9 @@ pub const App = struct {
         // request may still be reading it.
         app.route_strings.installSecret(token);
         app.api_key = token;
-        app.api_client.api_key = token;
-        if (app.openai_client) |*client| client.api_key = token;
-        if (app.gemini_client) |*client| client.api_key = token;
+        app.api_client.credential = .{ .fixed = token };
+        if (app.openai_client) |*client| client.credential = .{ .fixed = token };
+        if (app.gemini_client) |*client| client.credential = .{ .fixed = token };
         app.swarm.api_key = token;
         return true;
     }
