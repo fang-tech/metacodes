@@ -62,6 +62,12 @@
 ### 3f. 二进制体积:ReleaseSmall + 按需链接
 - 默认 ReleaseSmall(已 1.29 MB)。新依赖/大表(verb 库/工具 schema)评估体积。vendor 工具(ripgrep)进程外调用,不进二进制。
 
+### 3g. 大值类型的初始化与 `defer`(Zig 0.16 代码生成)
+- **现象**(2026-10-29 Linux x86_64 ReleaseSmall 实测):编译期整体已知的聚合值——字段默认值 `= .{}`、具名常量、带类型字面量 `T{ … }`、以及大载荷错误联合/optional/union 的 `return error.X` / `return null` / `return .tag`——被降级成"从只读常量 memcpy",其中 `undefined` 字节按 0 写进 `.rodata`。这类常量当时约 600 KB,最大一处是控制面事件环 138 KiB。
+- **写法**:含 KB 级数组/缓冲区的值,在构造点用结果位置写法并点名 `undefined` 字段:`var x: T = .{ .buf = undefined }`、`return .{ …, .journal = .{ .entries = undefined } }`;不用 `T{ … }`、`.{}` 或具名常量。必要时去掉大数组字段的默认值,让 `.{}` 编译不过。
+- **`defer` 体复制到作用域的每个出口**:出口多(几十上百个 `try`/`return`/`break`)的函数里,非平凡的 `defer` 块放进 `noinline` 函数,或 `defer @call(.never_inline, …)`。`runCounted` 的九个运行结束记录曾因此占 270 KB。
+- **已知未解**:返回大载荷错误联合的 `return error.X`(每个错误码一份常量,合计约 320 KB)。源码侧只能改返回类型或载荷布局,留待 Zig 上游或单独设计。
+
 ## §4 验证机制
 
 - **基线脚本**(scripts/perf_baseline.sh):量二进制体积 + 启动时间 + --help RSS,输出对比上次。每阶段/release 跑。
