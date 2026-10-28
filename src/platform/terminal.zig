@@ -321,11 +321,13 @@ pub fn discardPendingInput(fd: c_int) void {
 
 /// Drop, without blocking, the pending input events at the head of the
 /// queue that type nothing, and keep everything from the first one that
-/// does. A Windows console queues a key-down for a bare Shift, Ctrl, Alt, Win
-/// or lock key; `waitReadable` reports it, and `ReadConsoleW` would then
-/// block until the next key that types something. For a reader that reacts
-/// to "a key was pressed" but leaves the key to the next reader (the startup
-/// animation skips on it). POSIX: every pending byte is input; nothing goes.
+/// does. A Windows console can queue a key-down that carries no character
+/// (a bare Shift, Ctrl, Alt, Win or lock key; whatever else a host passes on
+/// without one); `waitReadable` reports it, and `ReadConsoleW` would then
+/// block until the next key that types something. For the readers of startup
+/// input, which keep only what types: the startup animation skips on a key
+/// and leaves it for the prompt, and the first prompt reads all of it.
+/// POSIX: every pending byte is input; nothing goes.
 pub fn dropSilentInput(fd: c_int) void {
     if (!is_windows or fd != 0) return;
     const h = GetStdHandle(STD_INPUT_HANDLE);
@@ -336,20 +338,14 @@ pub fn dropSilentInput(fd: c_int) void {
         var got: win.DWORD = 0;
         if (PeekConsoleInputW(h, &rec, 1, &got) == 0 or got == 0) return;
         if (rec.EventType == KEY_EVENT and rec.Event.KeyEvent.bKeyDown != 0 and
-            !typesNothing(rec.Event.KeyEvent.wVirtualKeyCode)) return;
+            !typesNothing(rec.Event.KeyEvent)) return;
         _ = ReadConsoleInputW(h, &rec, 1, &got);
     }
 }
 
-/// Virtual keys whose key-down never types: the modifiers and the locks.
-fn typesNothing(vk: u16) bool {
-    return switch (vk) {
-        0x10, 0x11, 0x12 => true, // VK_SHIFT, VK_CONTROL, VK_MENU
-        0xA0...0xA5 => true, // VK_LSHIFT .. VK_RMENU
-        0x5B, 0x5C => true, // VK_LWIN, VK_RWIN
-        0x14, 0x90, 0x91 => true, // VK_CAPITAL, VK_NUMLOCK, VK_SCROLL
-        else => false,
-    };
+/// A key-down that carries no character types nothing.
+fn typesNothing(key: KEY_EVENT_RECORD) bool {
+    return key.uChar.UnicodeChar == 0;
 }
 
 pub const TermSize = struct { rows: u16, cols: u16 };
@@ -634,10 +630,13 @@ test "replayInput: owed bytes come first, in order, survive a discard and only f
     try std.testing.expectEqual(@as(u8, 'c'), buf[0]);
 }
 
-test "dropSilentInput: modifiers and locks type nothing, every other key does" {
-    for ([_]u16{ 0x10, 0x11, 0x12, 0xA0, 0xA5, 0x5B, 0x5C, 0x14, 0x90, 0x91 }) |vk| try std.testing.expect(typesNothing(vk));
-    // Letters, Enter, Esc, arrows, F1: the console turns them into input.
-    for ([_]u16{ 0x41, 0x0D, 0x1B, 0x26, 0x70 }) |vk| try std.testing.expect(!typesNothing(vk));
+test "dropSilentInput: a key-down without a character types nothing, whatever the key" {
+    // Modifiers, locks, Pause, Apps, a dead key: no character.
+    for ([_]u16{ 0x10, 0x11, 0xA0, 0x5B, 0x14, 0x13, 0x5D, 0xDE }) |vk|
+        try std.testing.expect(typesNothing(.{ .bKeyDown = 1, .wRepeatCount = 1, .wVirtualKeyCode = vk, .wVirtualScanCode = 0, .uChar = .{ .UnicodeChar = 0 }, .dwControlKeyState = 0 }));
+    // A letter, Enter, Esc, and VT input's synthesized keys (no virtual key).
+    for ([_][2]u16{ .{ 0x41, 'a' }, .{ 0x0D, '\r' }, .{ 0x1B, 0x1b }, .{ 0, '[' } }) |kc|
+        try std.testing.expect(!typesNothing(.{ .bKeyDown = 1, .wRepeatCount = 1, .wVirtualKeyCode = kc[0], .wVirtualScanCode = 0, .uChar = .{ .UnicodeChar = kc[1] }, .dwControlKeyState = 0 }));
     if (is_windows) return;
     // POSIX: a pending byte is input and stays.
     var fds: [2]c_int = undefined;

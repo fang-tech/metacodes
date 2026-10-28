@@ -104,7 +104,8 @@ status, compatibility boundaries, and entry points are defined by
   animation while startup still ran (connecting MCP servers, fetching the
   model list). The animation still ends on the first key, but leaves the key
   for the prompt (only a key that types nothing, a bare modifier on Windows,
-  is dropped); it enters and leaves raw mode without discarding input; and
+  is dropped: a console read would wait behind it for the next key that
+  types); it enters and leaves raw mode without discarding input; and
   the process's first raw-mode entry keeps what the terminal has received.
   Later entries still drop keys typed between two prompts, as before.
 - **A multi-line paste made before the first prompt lands in it as one paste
