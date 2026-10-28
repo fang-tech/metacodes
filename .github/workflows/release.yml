@@ -46,22 +46,36 @@ env:
 
 jobs:
   build-posix:
-    name: Release (${{ matrix.os }})
+    name: Release (${{ matrix.os }} ${{ matrix.arch }})
     timeout-minutes: 90
     strategy:
-      # Every platform reports its own verdict: a rehearsal needs all three,
+      # Every platform reports its own verdict: a rehearsal needs all of them,
       # and the publish job already waits for all of them.
       fail-fast: false
+      # Each unit is built and verified natively on its own architecture: the
+      # Lean kernels, release:verify and the AgentCore gate all run what they
+      # build (doc/INSTALL_DESIGN.md §5, #307). aarch64-linux runs on GitHub's
+      # hosted arm64 Linux runner, x86_64-macos on its Intel macOS runner
+      # (macos-13 is retired; macos-15-intel is the oldest Intel image GitHub
+      # still hosts, and few Intel Macs run macOS 26).
       matrix:
         include:
           - os: Linux
             arch: X64
             runner: ubuntu-latest
             zig_target: x86_64-linux-gnu
+          - os: Linux
+            arch: ARM64
+            runner: ubuntu-24.04-arm
+            zig_target: aarch64-linux-gnu
           - os: macOS
             arch: ARM64
             runner: macos-latest
             zig_target: aarch64-macos
+          - os: macOS
+            arch: X64
+            runner: macos-15-intel
+            zig_target: x86_64-macos
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -131,10 +145,28 @@ jobs:
         run: |
           zig build release:archive -Drelease-layout=true -Doptimize=ReleaseSafe --prefix "$RUNNER_TEMP/release" $KERNEL_PINS -Drelease-archive-dir="$RUNNER_TEMP/dist-again"
           cmp "$RUNNER_TEMP"/dist/metacodes-*.tar.gz "$RUNNER_TEMP"/dist-again/metacodes-*.tar.gz
-      # aarch64-linux has a vendored musl ripgrep since #86 and ci.yml proves
-      # the cross-staged assets. A release unit for it also needs both Lean
-      # kernels, which only a native aarch64 runner can build: adding it is a
-      # matrix change for a later issue (doc/INSTALL_DESIGN.md §5).
+      # What `curl … install.sh | sh` does on this machine: no archive named,
+      # so install.sh picks one by the host's target (host_target) from a
+      # release's SHA256SUMS. A loopback mirror serves this job's archives
+      # under their version as a release would, holding only this platform's
+      # unit, so a wrong pick fails the download; the note must also name the
+      # matrix target. The SDK is picked by the same target.
+      - name: install.sh picks this platform's archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["release"]["version"])' "$RUNNER_TEMP/release/manifest.json")
+          mkdir -p "$RUNNER_TEMP/mirror/download/$version"
+          cp "$RUNNER_TEMP"/dist/* "$RUNNER_TEMP/mirror/download/$version/"
+          python3 scripts/release_sums.py "$RUNNER_TEMP/mirror/download/$version" "$version"
+          python3 -m http.server 8765 --bind 127.0.0.1 --directory "$RUNNER_TEMP/mirror" > "$RUNNER_TEMP/mirror.log" 2>&1 &
+          server=$!
+          trap 'kill "$server" 2>/dev/null || true' EXIT
+          for _ in $(seq 50); do curl -fsS -o /dev/null http://127.0.0.1:8765/ && break; sleep 0.2; done
+          sh scripts/install.sh --no-link --prefix "$RUNNER_TEMP/installed-release" --release-base http://127.0.0.1:8765 --version "$version" 2> "$RUNNER_TEMP/install.log" || { cat "$RUNNER_TEMP/install.log" "$RUNNER_TEMP/mirror.log"; exit 1; }
+          cat "$RUNNER_TEMP/install.log"
+          grep -F "metacodes $version for ${{ matrix.zig_target }} from" "$RUNNER_TEMP/install.log"
+          "$RUNNER_TEMP/installed-release/bin/metacodes" doctor --strict
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: archives-${{ matrix.os }}-${{ matrix.arch }}

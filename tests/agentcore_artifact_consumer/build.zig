@@ -77,6 +77,7 @@ fn rustTarget(arch: std.Target.Cpu.Arch, os: std.Target.Os.Tag, abi: std.Target.
     if (arch == .aarch64 and os == .windows and abi == .msvc) return "aarch64-pc-windows-msvc";
     if (arch == .aarch64 and os == .windows and abi == .gnu) return "aarch64-pc-windows-gnullvm";
     if (arch == .x86_64 and os == .linux and abi == .gnu) return "x86_64-unknown-linux-gnu";
+    if (arch == .aarch64 and os == .linux and abi == .gnu) return "aarch64-unknown-linux-gnu";
     if (arch == .x86_64 and os == .macos) return "x86_64-apple-darwin";
     if (arch == .aarch64 and os == .macos) return "aarch64-apple-darwin";
     @panic("unsupported AgentCore target");

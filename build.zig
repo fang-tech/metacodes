@@ -664,6 +664,8 @@ fn agentcoreRustTarget(target: std.Target) ?[]const u8 {
     }
     if (target.cpu.arch == .x86_64 and target.os.tag == .linux and target.abi == .gnu)
         return "x86_64-unknown-linux-gnu";
+    if (target.cpu.arch == .aarch64 and target.os.tag == .linux and target.abi == .gnu)
+        return "aarch64-unknown-linux-gnu";
     if (target.cpu.arch == .x86_64 and target.os.tag == .macos) return "x86_64-apple-darwin";
     if (target.cpu.arch == .aarch64 and target.os.tag == .macos) return "aarch64-apple-darwin";
     return null;

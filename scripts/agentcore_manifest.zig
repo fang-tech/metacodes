@@ -292,6 +292,8 @@ fn rustTarget(architecture: []const u8, os: []const u8, abi: []const u8) ![]cons
     }
     if (std.mem.eql(u8, architecture, "x86_64") and std.mem.eql(u8, os, "linux") and std.mem.eql(u8, abi, "gnu"))
         return "x86_64-unknown-linux-gnu";
+    if (std.mem.eql(u8, architecture, "aarch64") and std.mem.eql(u8, os, "linux") and std.mem.eql(u8, abi, "gnu"))
+        return "aarch64-unknown-linux-gnu";
     if (std.mem.eql(u8, architecture, "x86_64") and std.mem.eql(u8, os, "macos"))
         return "x86_64-apple-darwin";
     if (std.mem.eql(u8, architecture, "aarch64") and std.mem.eql(u8, os, "macos"))
@@ -479,5 +481,20 @@ test "Windows ARM64 targets project to supported Rust targets" {
     try std.testing.expectError(
         error.UnsupportedAgentCoreTarget,
         rustTarget("aarch64", "windows", "itanium"),
+    );
+}
+
+test "Linux targets project to glibc Rust targets only" {
+    try std.testing.expectEqualStrings(
+        "x86_64-unknown-linux-gnu",
+        try rustTarget("x86_64", "linux", "gnu"),
+    );
+    try std.testing.expectEqualStrings(
+        "aarch64-unknown-linux-gnu",
+        try rustTarget("aarch64", "linux", "gnu"),
+    );
+    try std.testing.expectError(
+        error.UnsupportedAgentCoreTarget,
+        rustTarget("aarch64", "linux", "musl"),
     );
 }
