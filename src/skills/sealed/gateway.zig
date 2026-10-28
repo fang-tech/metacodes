@@ -793,7 +793,7 @@ pub const Gateway = struct {
             const owned = try provider_factory.makeProviderWithOptions(
                 self.allocator,
                 kept.kind,
-                secret,
+                .{ .fixed = secret },
                 model,
                 if (kept.base_url.len != 0) kept.base_url else null,
                 kept.openai_protocol,
@@ -1413,6 +1413,14 @@ const RemoteDispatcher = struct {
                 return .{ .ok = body };
             }
         }
+        return handToClient(tool_ctx, name, args);
+    }
+
+    /// Records the call as a pending request for the client and answers
+    /// `error.UiPending`. Apart from dispatchFn so that the error is not a
+    /// literal `return error.X` in a function returning a ToolDispatchOutcome,
+    /// which would copy a 3.7 KiB constant (doc/PERF_MEMORY_PRINCIPLES.md §3g).
+    fn handToClient(tool_ctx: *const tool_context.ToolContext, name: []const u8, args: []const u8) error{ UiPending, OutOfMemory } {
         const kind: []const u8 = if (std.mem.eql(u8, name, ASK_USER_TOOL)) PENDING_QUESTION_KIND else PENDING_REMOTE_KIND;
         if (tool_ctx.pending_request) |slot| slot.* = .{
             .kind = try tool_ctx.allocator.dupe(u8, kind),

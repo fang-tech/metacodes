@@ -333,6 +333,46 @@ class PythonSdkTest(unittest.TestCase):
                 caller.join(30)
         self.assertEqual(box["result"].text, "saw: child said: child answer")
 
+    def test_a_child_runs_callbacks_cannot_close_the_parent_session(self) -> None:
+        # The child's Run executes inside the parent's tool, on a thread of
+        # its own: closing the parent from the child's callbacks is refused,
+        # as from the parent's, and leaves the parent's Run alone. Closing an
+        # unrelated Session there works.
+        box = {}
+        outcomes = []
+
+        def close_parent_then_other(_event):
+            if outcomes:
+                return
+            try:
+                box["parent"].close(timeout=2)
+                outcomes.append("parent closed")
+            except RuntimeError:
+                outcomes.append("parent refused")
+            except TimeoutError:  # not refused: it aborted the parent's Run and waited
+                outcomes.append("parent waited")
+            box["other"].close(timeout=2)
+            outcomes.append("other closed")
+
+        @metacodes.tool(description="Asks a child session.")
+        def delegate(_arguments):
+            with self.session(box["runtime"], box["provider"]) as child:
+                return "child said: " + child.run("sub task", on_event=close_parent_then_other).text
+
+        script = [("tool", "delegate", {}), ("text", "child answer"), ("echo",)]
+        with MockProvider(script) as provider:
+            with metacodes.Runtime(tools=(), host_tools=[delegate]) as runtime:
+                box.update(runtime=runtime, provider=provider)
+                session = self.session(runtime, provider, permission_mode="full_access")
+                other = self.session(runtime, provider)
+                box.update(parent=session, other=other)
+                result = session.run("delegate it")
+                self.assertEqual(outcomes, ["parent refused", "other closed"])
+                self.assertTrue(session._handle)
+                self.assertFalse(other._handle)
+        self.assertEqual(result.stop_reason, "end_turn")
+        self.assertEqual(result.text, "saw: child said: child answer")
+
     def test_close_with_a_timeout_leaves_a_blocked_run_open(self) -> None:
         wait, started, release = self.blocking_tool()
         with MockProvider([("tool", "wait", {}), ("text", "done")]) as provider:
@@ -378,6 +418,35 @@ class PythonSdkTest(unittest.TestCase):
         result = box["result"]
         self.assertEqual((result.input_accepted, result.input_adopted), (1, 1))
         self.assertIn("and mention the weather", str(provider.requests[1]["messages"]))
+
+    def test_update_credential_from_a_tool_changes_the_next_request(self) -> None:
+        @metacodes.tool(
+            description="Rotate the provider key.",
+            input_schema={"type": "object", "properties": {}, "required": []},
+        )
+        def rotate(_arguments):
+            session.update_credential("rotated-key")
+            return "rotated"
+
+        script = [("tool", "rotate", {}), ("text", "done"), ("text", "again")]
+        with MockProvider(script) as provider:
+            with metacodes.Runtime(tools=(), host_tools=[rotate]) as runtime:
+                session = self.session(runtime, provider, permission_mode="full_access", api_key="first-key")
+                result = session.run("rotate the key")
+                with self.assertRaises(metacodes.AgentCoreError) as refused:
+                    session.update_credential("bad key")
+                session.run("once more")
+                session.close()
+                with self.assertRaises(RuntimeError):
+                    session.update_credential("after-close")
+        self.assertEqual(result.text, "done")
+        self.assertEqual(refused.exception.status_name, "INVALID_ARGUMENT")
+        self.assertNotIn("bad key", str(refused.exception))
+        # The Run's first request used the creation key; the turn after the
+        # tool, and the next Run after the refused update, the rotated one.
+        self.assertEqual(
+            provider.authorizations, ["Bearer first-key", "Bearer rotated-key", "Bearer rotated-key"]
+        )
 
     def interrupting_join(self, started, interrupts):
         """A _RunThread._join that raises KeyboardInterrupt, as Ctrl+C does

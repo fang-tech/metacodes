@@ -17,6 +17,10 @@
 //!     row, no overwrite — wherever the region sits on the screen.
 //!   - phase hand-off: the input box erased by enterGenerating and the region
 //!     erased by leaveGenerating leave nothing behind.
+//!
+//! Every contract is checked twice: with the merge window off (each request
+//! paints at once) and on (#328: requests wait for the window, and the
+//! harness's `sync` paints the merged frame, as the timer thread would).
 
 const std = @import("std");
 const harness = @import("region_harness.zig");
@@ -25,6 +29,16 @@ const testing = std.testing;
 const gpa = testing.allocator;
 
 const POINTER = "❯";
+
+/// Run `contract` with the merge window off, then on.
+fn inBothModes(comptime contract: fn (merge: bool) anyerror!void) !void {
+    for ([_]bool{ false, true }) |merge| {
+        contract(merge) catch |err| {
+            std.debug.print("merge window {s}\n", .{if (merge) "on" else "off"});
+            return err;
+        };
+    }
+}
 
 fn expectRegionOnScreenOnce(t: *harness.Term) !void {
     try t.sync();
@@ -57,9 +71,13 @@ fn expectTranscript(t: *harness.Term, expected: []const u8) !void {
 }
 
 test "emit/erase pairing: streamed lines reach the scrollback once, the live region never does" {
+    try inBothModes(emitErasePairing);
+}
+
+fn emitErasePairing(merge: bool) !void {
     const fx = try harness.AppFixture.create(gpa);
     defer fx.destroy();
-    const t = try harness.Term.create(gpa, .{ .rows = 12, .cols = 60 });
+    const t = try harness.Term.create(gpa, .{ .rows = 12, .cols = 60, .merge_window = merge });
     defer t.destroy();
     const r = &t.region;
 
@@ -75,17 +93,32 @@ test "emit/erase pairing: streamed lines reach the scrollback once, the live reg
     for (0..30) |i| {
         var buf: [32]u8 = undefined;
         const line = try std.fmt.bufPrint(&buf, "line {d}\n", .{i});
+        const written = t.written().len;
         r.writeGenText(line);
-        try expectRegionOnScreenOnce(t);
-        if (i % 3 == 0) {
-            r.tickSpinner(fx.app);
+        if (merge) {
+            // Inside the window: nothing reaches the terminal yet, and the
+            // tick rides on the same frame as the line.
+            try testing.expectEqual(written, t.written().len);
+            if (i % 3 == 0) r.tickSpinner(fx.app);
+            try testing.expectEqual(written, t.written().len);
             try expectRegionOnScreenOnce(t);
+        } else {
+            try expectRegionOnScreenOnce(t);
+            if (i % 3 == 0) {
+                r.tickSpinner(fx.app);
+                try expectRegionOnScreenOnce(t);
+            }
         }
         if (i > 0) try expected.append(gpa, '\n');
         try expected.appendSlice(gpa, line[0 .. line.len - 1]);
     }
-    // Every erase+redraw above was one closed frame.
-    try testing.expect(t.screen.sync_frames >= frames_before + 30 + 10);
+    // Every erase+redraw above was one closed frame: one per request, or,
+    // with the merge window, one per window.
+    if (merge) {
+        try testing.expectEqual(frames_before + 30, t.screen.sync_frames);
+    } else {
+        try testing.expect(t.screen.sync_frames >= frames_before + 30 + 10);
+    }
 
     r.leaveGenerating(fx.app);
     try expectRegionGone(t);
@@ -96,12 +129,16 @@ test "emit/erase pairing: streamed lines reach the scrollback once, the live reg
 }
 
 test "half-line continuation: the next line starts right below, wherever the region sits" {
+    try inBothModes(halfLineContinuation);
+}
+
+fn halfLineContinuation(merge: bool) !void {
     const fx = try harness.AppFixture.create(gpa);
     defer fx.destroy();
     // Above the region at the top, in the middle, and with the region
     // pinned to the bottom (its draw scrolls the half line up).
     for ([_]usize{ 0, 4, 25 }) |lines_before| {
-        const t = try harness.Term.create(gpa, .{ .rows = 12, .cols = 60 });
+        const t = try harness.Term.create(gpa, .{ .rows = 12, .cols = 60, .merge_window = merge });
         defer t.destroy();
         const r = &t.region;
         r.enterGenerating(fx.app, null);
@@ -144,17 +181,24 @@ test "half-line continuation: the next line starts right below, wherever the reg
 }
 
 test "phase hand-off: the input box and the live region leave nothing behind" {
+    try inBothModes(phaseHandOff);
+}
+
+fn phaseHandOff(merge: bool) !void {
     const fx = try harness.AppFixture.create(gpa);
     defer fx.destroy();
-    const t = try harness.Term.create(gpa, .{ .rows = 10, .cols = 50 });
+    const t = try harness.Term.create(gpa, .{ .rows = 10, .cols = 50, .merge_window = merge });
     defer t.destroy();
     const r = &t.region;
 
     for (0..3) |turn| {
+        // A read is an input phase (#330): readLineRaw opens and closes it.
+        r.beginInput(.builtin);
         r.setInput("draft", 5);
         r.render(fx.app);
         try expectRegionOnScreenOnce(t);
         try t.screen.expectLine((try t.screen.findRow(POINTER)).?, "❯ draft");
+        r.endInput();
 
         r.enterGenerating(fx.app, null);
         try expectRegionGone(t);
@@ -170,6 +214,10 @@ test "phase hand-off: the input box and the live region leave nothing behind" {
 }
 
 test "a strict-autowrap terminal shows the same reply as an ideal one" {
+    try inBothModes(strictAutowrap);
+}
+
+fn strictAutowrap(merge: bool) !void {
     const fx = try harness.AppFixture.create(gpa);
     defer fx.destroy();
     // Lines exactly as wide as the terminal arm the DEC pending wrap on a
@@ -177,7 +225,7 @@ test "a strict-autowrap terminal shows the same reply as an ideal one" {
     var transcripts: [2][]u8 = .{ &.{}, &.{} };
     defer for (transcripts) |tr| gpa.free(tr);
     for ([_]bool{ false, true }, 0..) |autowrap, k| {
-        const t = try harness.Term.create(gpa, .{ .rows = 8, .cols = 20, .autowrap = autowrap });
+        const t = try harness.Term.create(gpa, .{ .rows = 8, .cols = 20, .autowrap = autowrap, .merge_window = merge });
         defer t.destroy();
         const r = &t.region;
         r.enterGenerating(fx.app, null);
@@ -205,16 +253,22 @@ test "a strict-autowrap terminal shows the same reply as an ideal one" {
 // count; at the bottom of the screen every frame then pushed the spinner,
 // border and prompt rows into the scrollback.
 test "the footer is cut to the terminal width, in both phases, instead of wrapping" {
+    try inBothModes(footerFits);
+}
+
+fn footerFits(merge: bool) !void {
     const fx = try harness.AppFixture.create(gpa);
     defer fx.destroy();
-    const t = try harness.Term.create(gpa, .{ .rows = 10, .cols = 30, .autowrap = true });
+    const t = try harness.Term.create(gpa, .{ .rows = 10, .cols = 30, .autowrap = true, .merge_window = merge });
     defer t.destroy();
     const r = &t.region;
 
+    r.beginInput(.builtin);
     r.setInput("", 0);
     r.render(fx.app);
     try expectRegionOnScreenOnce(t);
     try expectFooterFits(t, 30);
+    r.endInput();
 
     r.enterGenerating(fx.app, null);
     for (0..15) |i| {

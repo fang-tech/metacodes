@@ -78,3 +78,61 @@ archive by the host's target. The
 and sums to a draft release created with `--verify-tag`. A consumer verifies an
 unpacked archive on a clean machine with `scripts/verify_release_bundle.py
 --native <dir>`.
+
+## Debug symbols
+
+A Linux unit ships its executable stripped and its debug symbols as a separate
+release asset, `metacodes-<version>-<target-id>-debug.tar.gz`.
+
+**How they are built.** `release.yml`'s Linux units, and the `release` leg of
+`ci.yml` on Linux, build with `-Drelease-symbols=true`. The release executable
+is linked once, with DWARF and a GNU build ID. Then binutils splits it:
+`objcopy --only-keep-debug` writes `metacodes.debug`, and `objcopy --strip-all
+--add-gnu-debuglink=metacodes.debug` writes the `bin/metacodes` the unit ships.
+Zig 0.16's own `objcopy --extract-to` reports "unimplemented" for this
+executable.
+
+`src/main.zig` keeps stack tracing off in every ReleaseSmall build. Without
+that, DWARF would link in about 100 KB of unwinding code; with it, a stripped
+build is byte-identical whether the line is there or not. Measured on x86_64
+Linux, the shipped executable is 256 bytes larger than a release-layout link
+without DWARF: the build-ID note, the debug link and alignment. Its `.text`
+differs by 14 bytes. The two halves come from one link, and the build ID and
+the debug link's CRC-32 prove it.
+
+**What the asset holds.** `release:archive` writes it beside the unit's
+archive. It holds a single file, `metacodes-<version>-<target-id>-debug/bin/metacodes.debug`.
+
+**How it is checked.** `scripts/release_archive.py --kind symbols` refuses to
+write it unless the unit's `bin/metacodes` names that exact file: the same
+build ID, and a `.gnu_debuglink` whose name and CRC-32 match. Two runs produce
+the same bytes, and the reproducibility step compares the symbols archive with
+the unit's archive.
+
+**Where it goes.** `SHA256SUMS` lists it, and the draft release carries it as
+an asset. It is never part of the unit's own archive. Neither `install.sh` nor
+`metacodes update` downloads it.
+
+### Reading a core dump
+
+Use the symbols of the release that crashed: `readelf -n` prints the same
+`Build ID` for the executable and for its `metacodes.debug`.
+
+```sh
+tar -xzf metacodes-<version>-<target-id>-debug.tar.gz
+gdb -s metacodes-<version>-<target-id>-debug/bin/metacodes.debug \
+    -e ~/.local/opt/metacodes/bin/metacodes -c core -ex 'thread apply all bt'
+```
+
+gdb can also find the symbols by itself, in either of two places:
+
+- `metacodes.debug` copied beside the executable that crashed. gdb follows
+  `.gnu_debuglink` and checks the CRC.
+- The build-ID tree: `<dir>/.build-id/<first two hex digits>/<rest>.debug`,
+  with `set debug-file-directory <dir>:/usr/lib/debug`. Keep `/usr/lib/debug`
+  in that list so the C library's frames stay named.
+
+**Why the symbols matter.** Without them a stripped executable's frames have
+no names. Once the executable also drops `.eh_frame`, gdb cannot unwind past
+the first frame either. The symbol file carries `.debug_frame`, from which gdb
+rebuilds every thread's whole stack with function names and source lines.

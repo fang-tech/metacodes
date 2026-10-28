@@ -1,6 +1,6 @@
 fn main() {
     let api = metask_agentcore_sys::Api::discover()
-        .expect("AgentCore Revision 24 exact discovery failed");
+        .expect("AgentCore Revision 25 exact discovery failed");
     let output = api.owned_buffer();
     assert!(output
         .as_bytes()
@@ -32,6 +32,8 @@ fn main() {
     assert_slot!(api.session().destroy(), session.destroy);
     assert_slot!(api.session().run_input(), session.run_input);
     assert_slot!(api.session().abort(), session.abort);
+    assert_slot!(api.session().submit_input(), session.submit_input);
+    assert_slot!(api.session().update_credential(), session.update_credential);
     assert_slot!(api.session_control().restore(), session_control.restore);
     assert_slot!(api.session_control().describe(), session_control.describe);
     assert_slot!(api.session_control().set_model(), session_control.set_model);

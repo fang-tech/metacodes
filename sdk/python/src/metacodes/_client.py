@@ -22,7 +22,10 @@ DEFAULT_MAX_TURNS = 400
 # host tool) are running on this thread. close() waits for the Session's
 # active Run to return, which a callback of that Run would wait for in turn,
 # so it refuses there instead of deadlocking. Closing any other Session from
-# a callback (a tool that opens and closes a child Session) is fine.
+# a callback (a tool that opens and closes a child Session) is fine. A Run's
+# thread starts with the marks of the thread that started it: a child Run that
+# a tool starts runs inside that tool's callback, so its callbacks cannot
+# close the parent Session either.
 _CALLBACK = threading.local()
 
 
@@ -85,6 +88,9 @@ class _RunThread:
         self._abandoned = False
         self.status: Optional[int] = None
         self.error: Optional[BaseException] = None
+        # The callbacks the caller is inside, as when the Run executed on its
+        # thread (a copy: each thread pushes and pops its own list).
+        self._callbacks = list(getattr(_CALLBACK, "handles", ()))
         self._thread = threading.Thread(target=self._run, name="metacodes-run")
 
     def start(self) -> None:
@@ -96,6 +102,7 @@ class _RunThread:
                 threading.stack_size(previous)
 
     def _run(self) -> None:
+        _CALLBACK.handles = self._callbacks
         try:
             self.status = self._call()
         except BaseException as error:  # the caller reports it
@@ -454,6 +461,9 @@ class Session:
         self._on_event = on_event
         self._on_ui_request = on_ui_request
         self._run_lock = threading.Lock()
+        # Held around update_credential's call and around destroy, so a
+        # credential update never races the handle's release.
+        self._handle_lock = threading.Lock()
         self._next_run_id = 1
         self._active_run_id = 0
         self._next_input_id = 1
@@ -701,6 +711,27 @@ class Session:
         self._lib.check("session.submit_input", status, diagnostic)
         return receipt.sequence
 
+    def update_credential(self, api_key: str) -> None:
+        """Replace the provider credential in place (AgentCore Revision 25).
+
+        Every request sent after this returns uses ``api_key``: the next turn
+        of a Run already going, a retry, a compaction, a Skill, a request
+        still waiting for a connection. A request already sent keeps the old
+        key and is not interrupted. Safe from any thread and from this Session's own
+        callbacks (a host tool, ``on_event``, ``on_ui_request``). The provider,
+        endpoint and model stay. ``api_key`` is 1 to 16384 bytes of printable
+        ASCII; anything else raises AgentCoreError and keeps the previous key.
+        """
+        arena = n.ViewArena()
+        diagnostic = n.OwnedBytes()
+        with self._handle_lock:
+            if not self._handle:
+                raise RuntimeError("the Session is closed")
+            status = self._lib.api.session.contents.update_credential(
+                self._handle, arena.view(api_key), ctypes.byref(diagnostic)
+            )
+        self._lib.check("session.update_credential", status, diagnostic)
+
     def describe(self) -> Dict[str, Any]:
         """The Session's description as AgentCore reports it (JSON)."""
         output = n.OwnedBytes()
@@ -744,7 +775,9 @@ class Session:
         ``aborted``. The handle is dropped only once AgentCore has destroyed
         the Session; on a refusal it is kept, so the Session stays usable and
         ``close()`` can be retried. Calling it from one of this Session's own
-        callbacks raises RuntimeError: that callback's Run could never return.
+        callbacks, or from a callback of a child Session's Run that one of
+        them started, raises RuntimeError: that callback's Run could never
+        return.
         """
         if not self._handle:
             return
@@ -761,9 +794,11 @@ class Session:
             if not self._handle:
                 return
             diagnostic = n.OwnedBytes()
-            status = self._lib.api.session.contents.destroy(self._handle, ctypes.byref(diagnostic))
+            with self._handle_lock:
+                status = self._lib.api.session.contents.destroy(self._handle, ctypes.byref(diagnostic))
+                if status == n.STATUS_OK:
+                    self._handle = ctypes.c_void_p()
             if status == n.STATUS_OK:
-                self._handle = ctypes.c_void_p()
                 if self in self._runtime._sessions:
                     self._runtime._sessions.remove(self)
             self._lib.check("session.destroy", status, diagnostic)

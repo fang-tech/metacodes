@@ -807,6 +807,19 @@ pub fn build(b: *std.Build) void {
         "release-layout",
         "Record the release runtime layout in the build identity (#47; the layout's asset resolution lands in a later stage)",
     ) orelse false;
+    // A Linux release unit ships a stripped executable and, as a separate
+    // asset, its debug symbols (doc/RELEASE_RUNNER.md, "Debug symbols"): the
+    // executable is linked once with DWARF and a build ID, then split with
+    // binutils' objcopy, so the stripped file and `metacodes.debug` come from
+    // the same link and name each other (.gnu_debuglink and the build ID).
+    // `zig objcopy --extract-to` reports "unimplemented" for this executable
+    // in Zig 0.16, hence the external tool.
+    const release_symbols = b.option(
+        bool,
+        "release-symbols",
+        "Split the release executable's debug symbols into metacodes.debug with objcopy (Linux, -Drelease-layout=true)",
+    ) orelse false;
+    const objcopy_tool = b.option([]const u8, "objcopy", "objcopy used by -Drelease-symbols (default: objcopy on PATH)") orelse "objcopy";
     // One options module per app module, because each reports its own
     // optimize mode; git is asked once.
     const build_identity = gitIdentity(b);
@@ -826,6 +839,11 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = .ReleaseSmall,
         .link_libc = true,
+        // With symbols the link keeps DWARF for the split below. src/main.zig
+        // turns stack tracing off for every ReleaseSmall build, which DWARF
+        // would otherwise switch on (~100 KB), so the code stays within a few
+        // bytes of a stripped link's.
+        .strip = if (release_symbols) false else null,
     });
     addHl(b, release_mod);
     release_mod.addOptions("build_info", build_info);
@@ -833,8 +851,25 @@ pub fn build(b: *std.Build) void {
         .name = "metacodes",
         .root_module = release_mod,
     });
-    const install_cli = b.addInstallArtifact(exe, .{});
-    b.getInstallStep().dependOn(&install_cli.step);
+    // What installs bin/metacodes: the linked executable, or with
+    // -Drelease-symbols its stripped half; `debug_file` is the other half,
+    // for the symbols archive (release:archive).
+    const cli_install: struct { step: *std.Build.Step, debug_file: ?std.Build.LazyPath } = if (release_symbols) blk: {
+        if (target.result.os.tag != .linux)
+            break :blk .{ .step = &b.addFail("-Drelease-symbols splits ELF symbols with objcopy: Linux targets only").step, .debug_file = null };
+        exe.build_id = .sha1;
+        const keep_debug = b.addSystemCommand(&.{ objcopy_tool, "--only-keep-debug" });
+        keep_debug.addArtifactArg(exe);
+        const debug_file = keep_debug.addOutputFileArg("metacodes.debug");
+        // --add-gnu-debuglink records the symbol file's basename and CRC-32.
+        const strip_cmd = b.addSystemCommand(&.{ objcopy_tool, "--strip-all" });
+        strip_cmd.addPrefixedFileArg("--add-gnu-debuglink=", debug_file);
+        strip_cmd.addArtifactArg(exe);
+        const stripped = strip_cmd.addOutputFileArg("metacodes");
+        break :blk .{ .step = &b.addInstallBinFile(stripped, exe.out_filename).step, .debug_file = debug_file };
+    } else .{ .step = &b.addInstallArtifact(exe, .{}).step, .debug_file = null };
+    const install_cli = cli_install.step;
+    b.getInstallStep().dependOn(install_cli);
 
     // E3 causal evaluation only: same product root/provider/agent/tool path,
     // but formal blocks are observed rather than actuated.  There is no env or
@@ -1545,6 +1580,26 @@ pub fn build(b: *std.Build) void {
     release_archive_cmd.step.dependOn(if (release_target_is_native) release_verify_step else release_check_step);
     const release_archive_step = b.step("release:archive", "Create the immutable CLI release archive plus .sha256 (after release:verify, or release:check for a cross target)");
     release_archive_step.dependOn(&release_archive_cmd.step);
+    // With -Drelease-symbols the split's symbol file becomes its own archive
+    // beside the unit's, `metacodes-<version>-<target-id>-debug.tar.gz`; the
+    // packager refuses it unless the unit's bin/metacodes names that file.
+    if (cli_install.debug_file) |debug_file| {
+        const symbols_archive_cmd = b.addSystemCommand(&.{
+            release_python,
+            "scripts/release_archive.py",
+            "--kind",
+            "symbols",
+            b.install_path,
+            release_archive_dir,
+            "--debug-file",
+        });
+        symbols_archive_cmd.addFileArg(debug_file);
+        symbols_archive_cmd.setCwd(b.path("."));
+        symbols_archive_cmd.has_side_effects = true;
+        symbols_archive_cmd.step.dependOn(&release_archive_test_cmd.step);
+        symbols_archive_cmd.step.dependOn(if (release_target_is_native) release_verify_step else release_check_step);
+        release_archive_step.dependOn(&symbols_archive_cmd.step);
+    }
 
     const release_sums_test_cmd = b.addSystemCommand(&.{ release_python, "scripts/release_sums.py", "--self-test" });
     release_sums_test_cmd.setCwd(b.path("."));
@@ -1552,7 +1607,8 @@ pub fn build(b: *std.Build) void {
     release_sums_cmd.setCwd(b.path("."));
     release_sums_cmd.has_side_effects = true;
     release_sums_cmd.step.dependOn(&release_sums_test_cmd.step);
-    release_sums_cmd.step.dependOn(&release_archive_cmd.step);
+    // Every archive of the unit, the symbols one included, before the sums.
+    release_sums_cmd.step.dependOn(release_archive_step);
     const release_sums_step = b.step("release:sums", "Join the .sha256 sidecars under the archive directory into metacodes-<version>-SHA256SUMS");
     release_sums_step.dependOn(&release_sums_cmd.step);
     const agentcore_symbol_gate_mod = b.createModule(.{
@@ -2845,7 +2901,7 @@ pub fn build(b: *std.Build) void {
         run_shard.setEnvironmentVariable("METACODES_TEST_SHARD_INDEX", b.fmt("{}", .{shard_index}));
         run_shard.setEnvironmentVariable("METACODES_TEST_CLI_BIN", b.getInstallPath(.bin, exe.out_filename));
         run_shard.expectExitCode(0);
-        run_shard.step.dependOn(&install_cli.step);
+        run_shard.step.dependOn(install_cli);
         run_shard.step.dependOn(&install_mock_mcp.step);
         run_shard.step.dependOn(&install_selfexe_probe.step);
         run_shard.step.dependOn(&install_update_unit_probe.step);
@@ -2864,7 +2920,7 @@ pub fn build(b: *std.Build) void {
     integration_monolithic_run.setEnvironmentVariable("METACODES_TEST_SHARD_COUNT", "1");
     integration_monolithic_run.setEnvironmentVariable("METACODES_TEST_SHARD_INDEX", "0");
     integration_monolithic_run.setEnvironmentVariable("METACODES_TEST_CLI_BIN", b.getInstallPath(.bin, exe.out_filename));
-    integration_monolithic_run.step.dependOn(&install_cli.step);
+    integration_monolithic_run.step.dependOn(install_cli);
     integration_monolithic_run.step.dependOn(&install_mock_mcp.step);
     integration_monolithic_run.step.dependOn(&install_selfexe_probe.step);
     integration_monolithic_run.step.dependOn(&install_update_unit_probe.step);
@@ -2885,7 +2941,7 @@ pub fn build(b: *std.Build) void {
     });
     const integration_timed_run = addTestRunArtifact(b, integration_timed_test);
     integration_timed_run.setEnvironmentVariable("METACODES_TEST_CLI_BIN", b.getInstallPath(.bin, exe.out_filename));
-    integration_timed_run.step.dependOn(&install_cli.step);
+    integration_timed_run.step.dependOn(install_cli);
     integration_timed_run.step.dependOn(&install_mock_mcp.step);
     integration_timed_run.step.dependOn(&install_selfexe_probe.step);
     integration_timed_run.step.dependOn(&install_update_unit_probe.step);

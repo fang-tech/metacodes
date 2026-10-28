@@ -8,6 +8,7 @@ const std = @import("std");
 const sync = @import("platform").sync;
 const types = @import("../types.zig");
 const provider_factory = @import("../api/provider_factory.zig");
+const credential_cell = @import("../api/credential_cell.zig");
 const image_capability = @import("../api/image_capability.zig");
 const provider_mod = @import("../api/provider.zig");
 const Conversation = @import("conversation.zig").Conversation;
@@ -888,6 +889,13 @@ pub const ModelMutationError = error{
     OutOfMemory,
 };
 
+/// `updateCredential` refusals (issue #336). `InvalidSessionState`: the
+/// Session is poisoned or being destroyed. The rest are the candidate's own
+/// (`credential_cell.ReplacementError`). Every refusal leaves the credential
+/// as it was. There is no `SessionBusy`: an update is admitted in every other
+/// state.
+pub const CredentialUpdateError = error{InvalidSessionState} || credential_cell.ReplacementError;
+
 pub const PermissionRuleMutationError = error{
     SessionBusy,
     InvalidSessionState,
@@ -1369,7 +1377,11 @@ pub const AgentSession = struct {
     allocator: std.mem.Allocator,
     runtime: *AgentRuntime,
     session_id: SessionId,
-    api_key: []u8,
+    /// The provider credential (issue #336), owned. Every provider this
+    /// Session builds — its own, a `setModel` replacement, a tool's per-call
+    /// provider — reads it at each request, so `updateCredential` reaches them
+    /// all. Destroyed after the last of them.
+    credential: *credential_cell.Cell,
     model: []u8,
     base_url: ?[]u8,
     openai_protocol: types.OpenAIProtocol,
@@ -1469,7 +1481,7 @@ pub const AgentSession = struct {
         return provider_factory.makeProviderWithOptions(
             std.heap.c_allocator,
             self.provider.kind(),
-            self.api_key,
+            .{ .replaceable = self.credential },
             self.model,
             self.base_url,
             self.openai_protocol,
@@ -1545,8 +1557,8 @@ pub const AgentSession = struct {
                 null;
         errdefer if (imported_permission_rules) |*rules| rules.deinit();
 
-        const api_key = try allocator.dupe(u8, config.api_key);
-        errdefer secureFree(allocator, api_key);
+        const credential = try credential_cell.Cell.create(allocator, config.api_key);
+        errdefer credential.destroy();
         const model = try allocator.dupe(u8, config.model);
         errdefer allocator.free(model);
         const base_url = if (config.base_url) |url| try allocator.dupe(u8, url) else null;
@@ -1570,7 +1582,7 @@ pub const AgentSession = struct {
         var owned_provider = try provider_factory.makeProviderWithOptions(
             allocator,
             config.provider_kind,
-            api_key,
+            .{ .replaceable = credential },
             model,
             base_url,
             config.openai_protocol,
@@ -1619,7 +1631,7 @@ pub const AgentSession = struct {
             .allocator = allocator,
             .runtime = runtime,
             .session_id = session_id,
-            .api_key = api_key,
+            .credential = credential,
             .model = model,
             .base_url = base_url,
             .openai_protocol = config.openai_protocol,
@@ -1730,7 +1742,9 @@ pub const AgentSession = struct {
         allocator.free(self.run_journal_root);
         if (self.base_url) |url| allocator.free(url);
         allocator.free(self.model);
-        secureFree(allocator, self.api_key);
+        // After every provider that read it: `provider` above, and each tool
+        // provider, which lives within a Run.
+        self.credential.destroy();
         self.* = undefined;
         allocator.destroy(self);
         // destroy 成功必须注销(先于 releaseSession:live==0 时 registry 必须已空)。
@@ -1851,7 +1865,7 @@ pub const AgentSession = struct {
         var replacement_provider = provider_factory.makeProviderWithOptions(
             self.allocator,
             provider_kind,
-            self.api_key,
+            .{ .replaceable = self.credential },
             replacement_model,
             self.base_url,
             self.openai_protocol,
@@ -2483,6 +2497,57 @@ pub const AgentSession = struct {
         defer self.mutex.unlock();
         self.run_input_admission = null;
         _ = self.run_inputs.close();
+    }
+
+    /// Replace the provider credential in place (issue #336). A request reads
+    /// the credential when it is sent (once it holds its connection slot), so
+    /// every request sent after this returns uses the new credential: later
+    /// turns, retries of a request already under way, a compaction summary, a
+    /// Skill Run, every provider this Session built earlier, tool providers
+    /// included, and a request still waiting for a connection slot. A request
+    /// already sent keeps the old credential and is not touched; nothing is
+    /// cancelled or replayed. Provider, authentication scheme, base URL and
+    /// model are unchanged.
+    ///
+    /// Safe from any thread and from inside the active Run's callbacks: it
+    /// never waits for a Run, compaction, checkpoint or mutation, and it never
+    /// takes `callback_mutex`. Updates are linearized at the swap under the
+    /// credential's own lock; the returned generation orders them (the
+    /// creation credential is generation 1). Lock order is `mutex` then the
+    /// credential lock, whose holders only copy bytes through an allocator,
+    /// so the swap is atomic with respect to poisoning and cannot deadlock.
+    ///
+    /// The candidate is validated and copied before any lock is taken. A
+    /// refusal, out of memory included, changes nothing. A poisoned Session
+    /// refuses before looking at the candidate. The previous bytes are erased
+    /// and freed before this returns. The caller must let it return before
+    /// destroying the Session.
+    pub fn updateCredential(self: *AgentSession, candidate: []const u8) CredentialUpdateError!u64 {
+        try self.checkCredentialUpdateState();
+        var replacement = try self.credential.prepare(candidate);
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        switch (self.state) {
+            .poisoned, .destroying => {
+                replacement.discard();
+                return error.InvalidSessionState;
+            },
+            .idle, .running, .abort_requested, .compacting, .compact_finishing, .mutating, .checkpointing => {},
+        }
+        return replacement.publish();
+    }
+
+    /// The state `updateCredential` checks before it looks at the candidate:
+    /// `InvalidSessionState` once the Session is poisoned or being destroyed.
+    /// A facade that validates the candidate itself calls this first, so the
+    /// state outranks the candidate there too.
+    pub fn checkCredentialUpdateState(self: *AgentSession) error{InvalidSessionState}!void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        switch (self.state) {
+            .poisoned, .destroying => return error.InvalidSessionState,
+            .idle, .running, .abort_requested, .compacting, .compact_finishing, .mutating, .checkpointing => {},
+        }
     }
 
     /// Hand the active Run more user text (#270). Safe from any thread while
@@ -3139,6 +3204,102 @@ test "AgentSession zeroes the copied API key when later construction fails" {
     try std.testing.expectEqual(@as(usize, 1), observer.target_hits);
     try std.testing.expect(observer.target_freed);
     try std.testing.expect(observer.target_was_zero);
+}
+
+/// Watches every free for the bytes of `secrets` (issue #336): a block freed
+/// while it still holds one is a leak; a block of a secret's length freed as
+/// zeros is that secret's erased copy.
+const SecretFreeObserver = struct {
+    backing: std.mem.Allocator,
+    secrets: []const []const u8,
+    leaked: usize = 0,
+    erased: [4]usize = .{0} ** 4,
+
+    fn allocator(self: *SecretFreeObserver) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *SecretFreeObserver = @ptrCast(@alignCast(ctx));
+        return self.backing.rawAlloc(len, alignment, ret_addr);
+    }
+
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        const self: *SecretFreeObserver = @ptrCast(@alignCast(ctx));
+        return self.backing.rawResize(memory, alignment, new_len, ret_addr);
+    }
+
+    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        const self: *SecretFreeObserver = @ptrCast(@alignCast(ctx));
+        return self.backing.rawRemap(memory, alignment, new_len, ret_addr);
+    }
+
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *SecretFreeObserver = @ptrCast(@alignCast(ctx));
+        for (self.secrets, 0..) |secret, index| {
+            if (std.mem.indexOf(u8, memory, secret) != null) self.leaked += 1;
+            if (memory.len == secret.len and std.mem.allEqual(u8, memory, 0)) self.erased[index] += 1;
+        }
+        self.backing.rawFree(memory, alignment, ret_addr);
+    }
+};
+
+test "AgentSession erases each replaced credential when it is replaced and the last one at destroy" {
+    // 1009, 1013 and 1019 bytes: lengths no path, catalog entry or buffer shares (#70).
+    const first = "erase-first-" ++ ("k" ** 997);
+    const second = "erase-second-" ++ ("k" ** 1000);
+    const third = "erase-third-" ++ ("k" ** 1007);
+    var observer = SecretFreeObserver{ .backing = std.testing.allocator, .secrets = &.{ first, second, third } };
+    const runtime = try AgentRuntime.create(observer.allocator(), .{ .builtin_tools = &.{} });
+    defer runtime.destroy() catch unreachable;
+    const cwd = try testCwd();
+    defer std.testing.allocator.free(cwd);
+    const self = try runtime.createSession(.{
+        .provider_kind = .anthropic,
+        .api_key = first,
+        .model = "m",
+        .workspace = .{ .root = cwd },
+        .allowed_tools = &.{},
+    });
+
+    try std.testing.expectEqual(@as(u64, 2), try self.updateCredential(second));
+    try std.testing.expectEqual([4]usize{ 1, 0, 0, 0 }, observer.erased);
+    // A refusal keeps `second` and erases nothing.
+    try std.testing.expectError(error.InvalidCredentialByte, self.updateCredential("erase third"));
+    try std.testing.expectEqual(@as(u64, 3), try self.updateCredential(third));
+    try std.testing.expectEqual([4]usize{ 1, 1, 0, 0 }, observer.erased);
+    try std.testing.expect(self.credential.matches(third));
+
+    try self.destroy();
+    try std.testing.expectEqual([4]usize{ 1, 1, 1, 0 }, observer.erased);
+    try std.testing.expectEqual(@as(usize, 0), observer.leaked);
+}
+
+test "AgentSession refuses a credential update once poisoned or destroying, before reading it" {
+    const runtime = try createTestRuntime(std.testing.allocator);
+    defer runtime.destroy() catch unreachable;
+    const cwd = try testCwd();
+    defer std.testing.allocator.free(cwd);
+    const self = try createTestSession(runtime, .default, cwd);
+    defer self.destroy() catch unreachable;
+    try std.testing.expectEqual(@as(u64, 2), try self.updateCredential("replacement-key"));
+    for ([_]State{ .poisoned, .destroying }) |terminal| {
+        self.mutex.lock();
+        self.state = terminal;
+        self.mutex.unlock();
+        try std.testing.expectError(error.InvalidSessionState, self.updateCredential("later-key"));
+        try std.testing.expectError(error.InvalidSessionState, self.updateCredential(""));
+        try std.testing.expect(self.credential.matches("replacement-key"));
+    }
+    // Every other state admits the update: it waits for no Run, compaction,
+    // checkpoint export or mutation.
+    for ([_]State{ .running, .abort_requested, .compacting, .compact_finishing, .mutating, .checkpointing, .idle }) |state| {
+        self.mutex.lock();
+        self.state = state;
+        self.mutex.unlock();
+        _ = try self.updateCredential("busy-state-key");
+    }
+    try std.testing.expectEqual(@as(u64, 9), self.credential.currentGeneration());
 }
 
 test "AgentSession initializes per-session permission state" {
