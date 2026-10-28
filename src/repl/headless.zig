@@ -24,6 +24,7 @@ const output_semantics = @import("../core/output_semantics.zig");
 const evaluation_backend_mod = @import("../core/evaluation_backend.zig");
 const permission_mod = @import("../permission.zig");
 const project_activation = @import("../core/project_rule_activation.zig");
+const run_journal = @import("../core/tool_observation_journal.zig");
 const self_evolution_mod = @import("../core/self_evolution.zig");
 const request_gate_mod = @import("../core/request_gate.zig");
 const tee_backend_mod = @import("../core/tee_backend.zig");
@@ -202,13 +203,7 @@ pub fn run(
     var stream_tee = tee_backend_mod.TeeBackend{ .primary = &wb_be, .secondary = &sjb_be };
     var be = if (app.config.stream_json) stream_tee.backend() else wb_be;
     const run_control: ?*project_activation.RunControl = if (app.sessionDir()) |dir|
-        try project_activation.RunControl.init(
-            allocator,
-            dir,
-            app.session_id,
-            if (app.project_dir_or_empty().len > 0) app.project_dir_or_empty() else app.cwdAbs(),
-            &app.abort,
-        )
+        openRunControl(app, allocator, dir) orelse return 1
     else
         null;
     defer if (run_control) |control| control.deinit();
@@ -684,13 +679,7 @@ pub fn resumeSuspended(
 
     var wb = writer_backend.WriterBackend.initNullWithUsage(&app.usage);
     const be = wb.backend();
-    var run_control = try project_activation.RunControl.init(
-        allocator,
-        dir,
-        app.session_id,
-        if (app.project_dir_or_empty().len > 0) app.project_dir_or_empty() else app.cwdAbs(),
-        &app.abort,
-    );
+    var run_control = openRunControl(app, allocator, dir) orelse return 1;
     defer run_control.deinit();
     run_control.requireDetachedIdle(
         (if (app.jobs) |*jobs| jobs.runningCountForOwner(app.session_id) else 0) +|
@@ -786,6 +775,28 @@ pub fn resumeSuspended(
 /// Install the process-input ownership boundary used by both fresh headless
 /// runs and subprocess resume.  The previous value is returned so library
 /// consumers that reuse an App can restore their session exactly.
+/// The Run's control for a headless turn, or null once it has said on stderr
+/// why the session cannot run one (another process holds it, its journal is
+/// unusable). A previous Run whose process died is closed as abandoned first,
+/// and noted.
+fn openRunControl(app: *app_mod.App, allocator: std.mem.Allocator, dir: []const u8) ?*project_activation.RunControl {
+    var report: run_journal.OpenReport = .{};
+    var text_buf: [512]u8 = undefined;
+    const control = project_activation.RunControl.init(
+        allocator,
+        dir,
+        app.session_id,
+        if (app.project_dir_or_empty().len > 0) app.project_dir_or_empty() else app.cwdAbs(),
+        &app.abort,
+        &report,
+    ) catch |err| {
+        std.debug.print("error: {s}\n", .{run_journal.describeRefusal(&text_buf, err, &report) orelse @errorName(err)});
+        return null;
+    };
+    if (report.unfinished) |abandoned| std.debug.print("note: {s}\n", .{run_journal.describeAbandoned(&text_buf, &abandoned)});
+    return control;
+}
+
 fn enterNonInteractivePermissionBoundary(ctx: *permission_mod.PermissionContext) bool {
     const previous = ctx.no_interactive_prompt;
     ctx.no_interactive_prompt = true;

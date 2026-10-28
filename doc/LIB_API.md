@@ -259,6 +259,40 @@ result 的闭合对；fork Skill 也通过 `RunExecutionEvidence` 进入同一�
 原地恢复。journal、replay metadata 和 effect driver 都不进入 Conversation、system
 prompt 或工具 schema，因此启用 durability 不改变 prompt-cache key。
 
+**Run 租约。** 同一 session 同一时刻只有一个 Run：持有者在整个 Run 期间对 session 目录下
+的 `tool-observations.lock` 持系统锁（POSIX `flock`、Windows `LockFileEx`），进程以任何
+方式退出时锁随之释放；文件本身记 owner 的 pid、run id、获取时间和状态（`running` /
+`publication_pending` / `released`）。`Journal.initWithOptions` 据此区分三种情况：
+
+- 锁被占：`JournalBusy`，`OpenReport.holder` 给出 owner 的 pid。
+- 锁空闲而上一个 Run 没有终止记录（owner 已死）：按 `OpenOptions.abandoned_run` 处理。
+  默认 `fail_closed` 返回 `UnfinishedRun`，AgentCore 与库宿主沿用这一契约；产品会话
+  （REPL、headless、web、daemon 经 `project_rule_activation.RunControl`）用
+  `record_abandoned`，追加一条 `run_abandoned` 记录——带那个 Run 的 run id 和最后单调
+  时间、它留下的未闭合 dispatch / provider attempt 计数、以及判定 owner 已死的依据
+  `evidence`——然后开始新 Run。不重放、不合成任何工具结果；被放弃的 Run 不能成为
+  `RunBinding` 证据，`validateRunBinding` / `loadRunDispatches` 一律拒绝。
+- 上一个 Run 已终止但 `sealRun` 之后没走到 `releaseFinishedRun`（派生产物未发布）：
+  `RunPublicationPending`，两种策略都不放行。
+- 死掉的 owner 写到一半的最后一条记录（没有换行）从未被确认过——记录要整条写完并刷盘才
+  算确认——所以 `record_abandoned` 下把它从 journal 末尾截掉，长度与 SHA-256 记进新 Run
+  的 `run_started.discarded_tail`；截掉之前，前面的全部记录必须先通过校验，而且只在
+  init 决定接手这个 Run 之后才真正截断，拒绝时 journal 原样保留。`fail_closed` 下仍是
+  `PartialRecord`。
+
+新 lease 先以 `<lock>.<run_id>.<attempt>` 写好记录再用不覆盖的 link（Windows：move）发布，所以
+锁文件名下永远不会出现空文件；不支持硬链接的文件系统退回原地创建。产品宿主在 Run
+被中止（Esc、Ctrl+C、SIGTERM/SIGHUP）后发布派生产物时不再沿用该中止信号，由 kernel
+自身的超时兜底，否则 lease 会停在 `publication_pending`。
+
+旧版 metacodes 留下的空标记文件不加锁、不记 owner：有任何进程仍打开着它就视为 busy
+（`holder = .unnamed`），无人打开才视为 owner 已死（`evidence = legacy_lease_unheld`）。
+journal 已完整时，空文件按修改时间区分：早于最后一个已结束 Run 的开始，是旧版在发布
+失败后保留的标记（`RunPublicationPending`）；不早于它，是写下记录前就死掉的 owner 的
+残留，不挡下一个 Run。以 Run 的开始而非结束为界，把整个 Run 的时长留作粗粒度文件时钟
+的余量。
+宿主用 `describeRefusal` / `describeAbandoned` 把这些结果说给用户听。
+
 ### System prompt profile
 
 `SessionConfig.prompt_profile`（`core.prompt_sections.Profile`）按 id 编辑内核的命名

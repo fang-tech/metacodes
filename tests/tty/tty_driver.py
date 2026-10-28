@@ -352,7 +352,7 @@ def _build_env(base_url, env):
     return full_env, ephemeral_home
 
 
-def _drive(key_events, write, cap, set_size, per_key_drain, signal_child=None):
+def _drive(key_events, write, cap, set_size, per_key_drain, signal_child=None, send_signal=None):
     """按 key_events 驱动(两后端共用)。write 收 bytes;set_size 收 (rows, cols)。"""
     # signal:stopcont is a POSIX-only regression hook that stops and continues
     # the child through the real PTY.
@@ -399,6 +399,11 @@ def _drive(key_events, write, cap, set_size, per_key_drain, signal_child=None):
                 raise RuntimeError("signal:stopcont is only supported by the POSIX PTY driver")
             signal_child(cooked=ev.endswith(":cooked"))
             cap.drain_settle(per_key_drain, QUIET_KEY)
+        elif ev.startswith("signal:"):
+            if send_signal is None:
+                raise RuntimeError(f"{ev} is only supported by the POSIX PTY driver")
+            send_signal(ev[7:])
+            cap.drain_settle(per_key_drain, QUIET_KEY)
 
 
 def run(bin_path, key_events, term_size=(24, 80), env=None,
@@ -430,6 +435,8 @@ def run(bin_path, key_events, term_size=(24, 80), env=None,
       "raw:..."          原样字节(用 \\xNN 转义)
       "signal:stopcont"  POSIX-only: stop and continue the child process
       "signal:stopcont:cooked"  同上,停住期间把 pty 改回 canonical(像 shell 那样)
+      "signal:NAME"      POSIX-only: send SIGNAME (HUP, TERM, KILL) to the child;
+                         "signal:HUP+0.02+HUP" sends several, sleeping the given seconds between
     """
     rows, cols = term_size
     # bin_path 转绝对路径:cwd 非 None 时子进程会 chdir,相对 bin_path 会失效。
@@ -548,8 +555,18 @@ def _run_posix(bin_path, key_events, term_size, full_env,
             _set_child_canonical(pid)
         os.kill(pid, signal.SIGCONT)
 
+    def send_signal(spec):
+        import signal
+        # "HUP+0.02+HUP": names are sent, numbers are seconds slept between them
+        # (two kills of one signal sent with no gap coalesce into one delivery).
+        for token in spec.split("+"):
+            try:
+                time.sleep(float(token))
+            except ValueError:
+                os.kill(pid, getattr(signal, "SIG" + token))
+
     cap.drain(startup_drain)
-    _drive(key_events, write, cap, set_size, per_key_drain, signal_child=stop_continue)
+    _drive(key_events, write, cap, set_size, per_key_drain, signal_child=stop_continue, send_signal=send_signal)
 
     cap.finish()
     try:

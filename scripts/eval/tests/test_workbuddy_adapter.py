@@ -972,6 +972,25 @@ class WorkBuddyTraceTest(unittest.TestCase):
             with self.assertRaises(TraceError):
                 load_control_metrics(transcript, observation)
 
+    def test_journal_with_an_abandoned_run_is_rejected_by_name(self):
+        rows = self._journal({
+            "run_abandoned": {
+                "evidence": "lease_unlocked",
+                "recovered_wall_ns": 1,
+                "recovered_by_run_id": "3" * 24,
+                "open_dispatches": 1,
+                "open_provider_attempts": 0,
+            }
+        })
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            transcript = root / "transcript.jsonl"
+            observation = root / "tool-observations.jsonl"
+            transcript.write_text("", encoding="utf-8")
+            self._write_jsonl(observation, rows)
+            with self.assertRaisesRegex(TraceError, "abandoned"):
+                load_control_metrics(transcript, observation)
+
     def test_zig_rule_filter_proof_literal_is_in_the_python_roster(self):
         zig = (
             Path(__file__).resolve().parents[3] / "src" / "tools" / "observation.zig"

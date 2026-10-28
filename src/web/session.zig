@@ -20,6 +20,7 @@ const time = @import("../util/time.zig");
 const app_mod = @import("../app.zig");
 const agent_loop = @import("../core/agent_loop.zig");
 const project_activation = @import("../core/project_rule_activation.zig");
+const run_journal = @import("../core/tool_observation_journal.zig");
 const journal_mod = @import("../core/event_journal.zig");
 const backend_mod = @import("backend.zig");
 const server_mod = @import("server.zig");
@@ -473,6 +474,8 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, surface: server_mod.
         generating_flag.store(true, .release);
         defer generating_flag.store(false, .release);
 
+        var lease_report: run_journal.OpenReport = .{};
+        var lease_text: [512]u8 = undefined;
         const run_control: ?*project_activation.RunControl = if (app.sessionDir()) |dir|
             project_activation.RunControl.init(
                 allocator,
@@ -480,8 +483,12 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, surface: server_mod.
                 app.session_id,
                 if (app.project_dir_or_empty().len > 0) app.project_dir_or_empty() else app.cwdAbs(),
                 &app.abort,
+                &lease_report,
             ) catch |err| {
-                log.err("web", "run control failed closed: {s}", .{@errorName(err)});
+                log.err("web", "run control failed closed: {s}: {s}", .{
+                    @errorName(err),
+                    run_journal.describeRefusal(&lease_text, err, &lease_report) orelse "",
+                });
                 announceRunDone(&journal, web_alloc, "error", @errorName(err));
                 exit_code = 1;
                 continue;
@@ -489,6 +496,8 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, surface: server_mod.
         else
             null;
         defer if (run_control) |control| control.deinit();
+        if (run_control != null) if (lease_report.unfinished) |abandoned|
+            log.warn("web", "{s}", .{run_journal.describeAbandoned(&lease_text, &abandoned)});
         if (run_control) |control| control.requireDetachedIdle(
             (if (app.jobs) |*jobs| jobs.runningCountForOwner(app.session_id) else 0) +|
                 (if (app.agent_jobs) |*jobs| jobs.runningCountForSession(app.session_id) else 0),
