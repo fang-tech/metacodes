@@ -71,8 +71,9 @@ The handle is dropped only once AgentCore has destroyed the Session. If
 AgentCore refuses, `close()` raises and the Session stays usable. One of the
 Session's own callbacks (its event listener, `on_ui_request`, or a tool
 running in its run) cannot close it, since that run could never return:
-`close()` raises RuntimeError there. Opening and closing a different Session
-from a tool is fine.
+`close()` raises RuntimeError there. The same holds for the callbacks of a
+child Session's run that such a tool started. Opening and closing a different
+Session from a tool is fine.
 
 ## Permissions
 

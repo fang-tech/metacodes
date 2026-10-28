@@ -22,7 +22,10 @@ DEFAULT_MAX_TURNS = 400
 # host tool) are running on this thread. close() waits for the Session's
 # active Run to return, which a callback of that Run would wait for in turn,
 # so it refuses there instead of deadlocking. Closing any other Session from
-# a callback (a tool that opens and closes a child Session) is fine.
+# a callback (a tool that opens and closes a child Session) is fine. A Run's
+# thread starts with the marks of the thread that started it: a child Run that
+# a tool starts runs inside that tool's callback, so its callbacks cannot
+# close the parent Session either.
 _CALLBACK = threading.local()
 
 
@@ -85,6 +88,9 @@ class _RunThread:
         self._abandoned = False
         self.status: Optional[int] = None
         self.error: Optional[BaseException] = None
+        # The callbacks the caller is inside, as when the Run executed on its
+        # thread (a copy: each thread pushes and pops its own list).
+        self._callbacks = list(getattr(_CALLBACK, "handles", ()))
         self._thread = threading.Thread(target=self._run, name="metacodes-run")
 
     def start(self) -> None:
@@ -96,6 +102,7 @@ class _RunThread:
                 threading.stack_size(previous)
 
     def _run(self) -> None:
+        _CALLBACK.handles = self._callbacks
         try:
             self.status = self._call()
         except BaseException as error:  # the caller reports it
@@ -744,7 +751,9 @@ class Session:
         ``aborted``. The handle is dropped only once AgentCore has destroyed
         the Session; on a refusal it is kept, so the Session stays usable and
         ``close()`` can be retried. Calling it from one of this Session's own
-        callbacks raises RuntimeError: that callback's Run could never return.
+        callbacks, or from a callback of a child Session's Run that one of
+        them started, raises RuntimeError: that callback's Run could never
+        return.
         """
         if not self._handle:
             return
