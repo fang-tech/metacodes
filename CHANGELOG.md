@@ -50,6 +50,13 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- **A draft typed during a reply survives a permission or question dialog.**
+  The keyboard watcher owned the draft, and a dialog stops the watcher and
+  starts a new one when it closes. So the input box went on showing a buffer
+  that had already been freed, and the next key or Enter dropped what had been
+  typed. The draft now belongs to the reply: after the dialog the box still
+  shows it, the cursor is where it was, and Enter queues all of it.
+
 - **Ctrl+L during a reply clears the screen through the renderer** (#320).
   The keyboard watcher sent `ESC[2J` straight to the terminal, outside the
   render lock and between two frames, while the agent loop could be printing,

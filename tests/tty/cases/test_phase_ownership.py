@@ -28,6 +28,11 @@ def _frame_text(sc):
     return "\n".join(sc.line_text(r) for r in range(sc.rows))
 
 
+def _box_lines(frame):
+    """The prompt rows of a frame (`❯ …`), trimmed."""
+    return [line.strip() for line in frame.split("\n") if line.startswith("❯ ")]
+
+
 def test_agent_list_opened_in_a_reply_does_not_swallow_the_next_prompt(bin_path):
     from slow_mock_server import SlowMockServer, slow_text_then_end
 
@@ -80,3 +85,55 @@ def test_help_opened_in_a_reply_is_closed_at_the_next_prompt(bin_path):
     assert shown, "help never opened during the reply; the case did not reach the boundary:\n" + text
     assert "tok9" in text, "the reply has not finished; wrong moment:\n" + text
     assert "ctrl + o to choose a model" not in text, "the reply's help reached the next prompt:\n" + text
+
+
+def test_reply_draft_survives_a_permission_dialog(bin_path):
+    # A permission dialog stops the keyboard watcher and starts a new one when
+    # it closes, while the reply (the generating phase) goes on. The draft is
+    # the reply's, not the watcher's: after the dialog the box still shows it,
+    # the next key extends it, and Enter queues all of it.
+    import json
+    from tty_driver import case_tmpdir
+    from slow_mock_server import SlowMockServer, slow_text_then_tooluse, slow_text_then_end, simple_text
+
+    target = os.path.join(case_tmpdir("cc-tty-draft-perm-"), "draft.txt")
+    turns = [
+        # Long enough that the draft is typed before the tool asks.
+        slow_text_then_tooluse(n_chunks=16, delay=0.4, tool="Write",
+                               tool_input=json.dumps({"file_path": target, "content": "x"})),
+        slow_text_then_end(n_chunks=12, delay=0.3),
+        simple_text("queued draft answered"),
+    ]
+    with SlowMockServer(turns) as srv:
+        raw = run(
+            bin_path,
+            [READY, "type:go", "key:enter", wait_for("esc to interrupt"),
+             "type:keep me", wait_for("❯ keep me"),
+             wait_for("Permission required", 20), "type:y",
+             # The dialog erased the region; the box drawn again after it is the signal.
+             wait_for("❯ keep me", 20),
+             "type:!", wait_for("❯ keep me!", 10), "key:enter",
+             wait_for("queued draft answered", 30), "sleep:2"],
+            term_size=(24, 80),
+            base_url=srv.url,
+            permission="default",
+            startup_drain=0.8,
+            per_key_drain=0.08,
+        )
+        requests = list(srv.requests)
+    a, text = _screen_text(raw, 24, 80)
+    frames = [_frame_text(sc) for sc in a.frame_screens]
+    asked = [i for i, f in enumerate(frames) if "Permission required" in f]
+    assert asked, "the permission dialog never opened; the case did not reach the boundary:\n" + text
+    before = frames[:asked[0]]
+    assert any("❯ keep me" in _box_lines(f) for f in before), "the draft was not typed before the dialog:\n" + text
+    # The dialog stays in the scrollback, so "after" is every later frame that
+    # shows the reply's region again.
+    after = [f for f in frames[asked[0] + 1:] if "esc to interrupt" in f]
+    assert any("❯ keep me" in _box_lines(f) for f in after), \
+        "after the dialog the box lost the draft (or showed stale bytes):\n" + text
+    assert any("❯ keep me!" in _box_lines(f) for f in after), "the next key did not extend the draft:\n" + text
+    assert os.path.exists(target), "the dialog's 'y' did not reach the tool"
+    queued = [m for body in requests[2:] for m in json.loads(body)["messages"] if m.get("role") == "user"]
+    sent = json.dumps(queued)
+    assert "keep me!" in sent, f"Enter after the dialog did not queue the whole draft: {sent[-300:]}"
