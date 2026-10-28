@@ -54,6 +54,7 @@ const dialect_mod = @import("dialect.zig");
 const catalog_mod = @import("catalog.zig");
 const image_capability = @import("image_capability.zig");
 const auth_header_mod = @import("auth_header.zig");
+const credential_mod = @import("credential_cell.zig");
 const AbortSignal = @import("../util/abort.zig").AbortSignal;
 const model_context_mod = @import("../app/model_context.zig");
 
@@ -68,7 +69,8 @@ pub const DEFAULT_OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses";
 pub const OpenAIClient = struct {
     pub const RefreshFn = *const fn (ctx: *anyopaque, stale_access_token: []const u8) anyerror![]u8;
     allocator: std.mem.Allocator,
-    api_key: []const u8,
+    /// Read when each request's header is built (see `client_mod.Client.credential`).
+    credential: credential_mod.Credential,
     /// 完整端点 URL 覆盖(可指向 MockServer / 自建中转站)。null = 按 protocol 选官方端点
     /// (effectiveUrl)。存 init 入参原样——protocol 可在 init 后设置(precedent app.zig)。
     base_url: ?[]const u8,
@@ -110,7 +112,7 @@ pub const OpenAIClient = struct {
     pub fn init(allocator: std.mem.Allocator, io: std.Io, api_key: []const u8, model: []const u8, base_url: ?[]const u8) OpenAIClient {
         return .{
             .allocator = allocator,
-            .api_key = api_key,
+            .credential = .{ .fixed = api_key },
             .base_url = base_url,
             .model = model,
             .http_client = http.Client{ .allocator = allocator, .io = io },
@@ -140,7 +142,7 @@ pub const OpenAIClient = struct {
     fn replaceRefreshToken(self: *OpenAIClient, token: []u8) !void {
         if (self.refresh_token_owned) |old| try self.refresh_token_history.append(self.allocator, old);
         self.refresh_token_owned = token;
-        self.api_key = token;
+        self.credential = .{ .fixed = token };
     }
 
     /// 本次请求的实际端点:显式 base_url 优先,否则按 protocol 选官方端点。
@@ -191,7 +193,8 @@ pub const OpenAIClient = struct {
             .kind = .openai,
             .base_url = self.base_url orelse "",
             .model = self.model,
-            .credential = self.api_key,
+            // A replaceable credential is never lent: no delegable route.
+            .credential = self.credential.lendable() orelse return null,
             .auth_scheme = self.auth_scheme,
             .openai_protocol = self.protocol,
         };
@@ -341,7 +344,13 @@ pub const OpenAIClient = struct {
                 self.allocator.free(image_placeholder_ids);
                 return error.RequestFailed;
             };
-            const token = callback(ctx, self.api_key) catch {
+            // Refresh replaces fixed bytes the client owns; a Session's
+            // replaceable credential is rotated by its Host instead.
+            const stale = self.credential.lendable() orelse {
+                self.allocator.free(image_placeholder_ids);
+                return error.RequestFailed;
+            };
+            const token = callback(ctx, stale) catch {
                 self.allocator.free(image_placeholder_ids);
                 return error.RequestFailed;
             };
@@ -379,16 +388,18 @@ pub const OpenAIClient = struct {
             .{ self.effectiveUrl(), self.model, body.len, cache.modeFor(.openai).label(), if (self.reasoning_effort) |effort| effort.name() else "default" },
         );
         const uri = std.Uri.parse(self.effectiveUrl()) catch return error.InvalidUrl;
-        const auth = auth_header_mod.build(self.allocator, self.auth_scheme, self.api_key) catch |err| {
-            log.errId("openai", rid, "auth header materialization failed: {s}", .{@errorName(err)});
-            return error.RequestFailed;
-        };
-        defer secureFree(self.allocator, auth.value);
 
         const req_ptr = try self.allocator.create(http.Client.Request);
         errdefer self.allocator.destroy(req_ptr); // 唯一 destroy:所有错误路径靠它(不手动 destroy,否则 double-free)
         var connection_lease = try connection_gate.acquire(abort);
         defer connection_lease.release();
+        // Read with the connection slot held, right before the request opens
+        // (see client_mod.Client.doRequest).
+        const auth = self.credential.header(self.allocator, self.auth_scheme) catch |err| {
+            log.errId("openai", rid, "auth header materialization failed: {s}", .{@errorName(err)});
+            return credential_mod.requestError(err);
+        };
+        defer secureFree(self.allocator, auth.value);
         req_ptr.* = self.http_client.request(.POST, uri, .{
             // 保持禁用陈旧池连接；跨 provider 的 process-wide connection_gate 限制并发握手。
             .keep_alive = false,

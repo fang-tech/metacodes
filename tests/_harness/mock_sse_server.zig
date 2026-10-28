@@ -97,6 +97,9 @@ pub const MockServer = struct {
     gate_next_response: std.atomic.Value(bool) = .init(false),
     response_gate_entered: std.atomic.Value(bool) = .init(false),
     release_response_gate: std.atomic.Value(bool) = .init(false),
+    /// `gateResponseAt`: the 0-based response held before any of its bytes
+    /// are sent (maxInt = none).
+    gate_response_index: std.atomic.Value(usize) = .init(std.math.maxInt(usize)),
     /// 停机标志:stop() 先置位、再自连唤醒 accept。Windows 上 closesocket **不可靠唤醒**
     /// 已阻塞的 accept(实测 join 永挂,竞态:线程先进 accept 则挂);POSIX close 同样无保证。
     /// 自连是跨平台确定性唤醒;accept 线程醒来见标志立即退出。
@@ -314,6 +317,27 @@ pub const MockServer = struct {
         self.gate_next_response.store(true, .release);
     }
 
+    /// Hold the response with this 0-based index after its request is
+    /// captured and before any byte of the response is sent, whatever its
+    /// status: the client is still waiting for the head. `gateNextResponse`
+    /// instead holds the next 200 body after its head. Released, and waited
+    /// for, the same way.
+    pub fn gateResponseAt(self: *MockServer, index: usize) void {
+        self.release_response_gate.store(false, .release);
+        self.response_gate_entered.store(false, .release);
+        self.gate_response_index.store(index, .release);
+    }
+
+    fn waitAtGate(self: *MockServer) void {
+        self.response_gate_entered.store(true, .release);
+        while (!self.release_response_gate.load(.acquire) and
+            !self.closing.load(.acquire))
+        {
+            std.Thread.yield() catch {};
+        }
+        self.response_gate_entered.store(false, .release);
+    }
+
     /// `waitUntilResponseGated` 的上限:服务线程要先 accept、读完请求才进闸门,满载 CI 上给足余量。
     const RESPONSE_GATE_WAIT_MS: i64 = 10_000;
 
@@ -400,6 +424,11 @@ pub const MockServer = struct {
             const total = readRequest(conn, buf);
             self.captureRequest(buf[0..total]);
             std.heap.page_allocator.free(buf);
+
+            if (self.gate_response_index.load(.acquire) == response_index) {
+                self.gate_response_index.store(std.math.maxInt(usize), .release);
+                self.waitAtGate();
+            }
 
             // flaky:前 N 个连接读完请求后直接断开(不写响应)→ 客户端 receiveHead 失败。
             if (self.flaky_close_remaining > 0) {
@@ -528,15 +557,7 @@ pub const MockServer = struct {
         sendAll(conn, self.extra_response_headers);
         sendAll(conn, "\r\n");
 
-        if (self.gate_next_response.swap(false, .acq_rel)) {
-            self.response_gate_entered.store(true, .release);
-            while (!self.release_response_gate.load(.acquire) and
-                !self.closing.load(.acquire))
-            {
-                std.Thread.yield() catch {};
-            }
-            self.response_gate_entered.store(false, .release);
-        }
+        if (self.gate_next_response.swap(false, .acq_rel)) self.waitAtGate();
 
         const effective_body = if (self.current_response_cut)
             self.body[0 .. self.body.len / 2]

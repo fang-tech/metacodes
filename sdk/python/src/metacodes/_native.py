@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Optional
 
 ABI_V1 = 1
-ABI_REVISION = 24
+ABI_REVISION = 25
 
 # Status codes (METASK_AGENTCORE_STATUS_*).
 STATUS_NAMES = {
@@ -331,6 +331,7 @@ SessionSubmitInputFn = ctypes.CFUNCTYPE(
     ctypes.POINTER(InputReceipt),
     _DIAG,
 )
+SessionUpdateCredentialFn = ctypes.CFUNCTYPE(ctypes.c_uint32, _P, BytesView, _DIAG)
 SessionDescribeFn = ctypes.CFUNCTYPE(ctypes.c_uint32, _P, ctypes.POINTER(OwnedBytes), _DIAG)
 SessionSetModelFn = ctypes.CFUNCTYPE(ctypes.c_uint32, _P, BytesView, _DIAG)
 SessionUpdateRulesFn = ctypes.CFUNCTYPE(
@@ -358,6 +359,7 @@ class SessionApi(ctypes.Structure):
         ("run_input", SessionRunInputFn),
         ("abort", SessionAbortFn),
         ("submit_input", SessionSubmitInputFn),
+        ("update_credential", SessionUpdateCredentialFn),
     ]
 
 
@@ -408,7 +410,8 @@ class ApiV1(ctypes.Structure):
     ]
 
 
-assert ctypes.sizeof(ApiV1) == 80, "AgentCore Revision 24 root is 80 bytes"
+assert ctypes.sizeof(ApiV1) == 80, "AgentCore Revision 25 root is 80 bytes"
+assert ctypes.sizeof(SessionApi) == 56, "AgentCore Revision 25 Session table is 56 bytes"
 
 
 class AgentCoreError(RuntimeError):

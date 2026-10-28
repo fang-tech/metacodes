@@ -252,7 +252,7 @@ pub const Refresh = struct {
         var http_client = std.http.Client{ .allocator = gpa, .io = threaded.io() };
         defer http_client.deinit();
         var status: u16 = 0;
-        const body = try client_mod.getModelsList(gpa, &http_client, self.messages_url, .{ .name = self.auth_name, .value = self.auth_value }, &status);
+        const body = try client_mod.getModelsList(gpa, &http_client, self.messages_url, .{ .header = .{ .name = self.auth_name, .value = self.auth_value } }, &status);
         errdefer gpa.free(body);
         // Only an answer the catalog accepts replaces the stored one.
         var check = Catalog.init(gpa);

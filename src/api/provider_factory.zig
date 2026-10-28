@@ -19,6 +19,7 @@ const dialect_mod = @import("dialect.zig");
 const auth_header_mod = @import("auth_header.zig");
 const limits_mod = @import("model_limits.zig");
 const image_capability = @import("image_capability.zig");
+const credential_mod = @import("credential_cell.zig");
 
 /// 三选一具体 client。tagged union(ProviderKind)→ "kind 说 X 但字段 null" 的非法态
 /// 编译期不可表示(遵 CLAUDE.md "Make Illegal States Unrepresentable")。
@@ -132,13 +133,15 @@ pub fn makeProviderWithDialectResolver(
     openai_protocol: types.OpenAIProtocol,
     dialect_resolver: dialect_mod.Resolver,
 ) !OwnedProvider {
-    return makeProviderWithOptions(a, kind, api_key, model, base_url, openai_protocol, dialect_resolver, .{});
+    return makeProviderWithOptions(a, kind, .{ .fixed = api_key }, model, base_url, openai_protocol, dialect_resolver, .{});
 }
 
+/// `credential` is borrowed: fixed bytes or a replaceable cell must outlive
+/// the returned provider.
 pub fn makeProviderWithOptions(
     a: std.mem.Allocator,
     kind: types.ProviderKind,
-    api_key: []const u8,
+    credential: credential_mod.Credential,
     model: []const u8,
     base_url: ?[]const u8,
     openai_protocol: types.OpenAIProtocol,
@@ -160,7 +163,8 @@ pub fn makeProviderWithOptions(
                 c.deinit();
                 a.destroy(c);
             }
-            c.* = client_mod.Client.initWithBaseUrl(a, io_rt.io(), api_key, model, base_url);
+            c.* = client_mod.Client.initWithBaseUrl(a, io_rt.io(), "", model, base_url);
+            c.credential = credential;
             c.dialect_resolver = dialect_resolver;
             c.auth_scheme = options.auth_scheme;
             if (options.stream_idle_timeout_ms) |idle| c.stream_idle_timeout_ms = idle;
@@ -176,7 +180,8 @@ pub fn makeProviderWithOptions(
         .openai => blk: {
             const c = try a.create(openai_mod.OpenAIClient);
             errdefer a.destroy(c);
-            c.* = openai_mod.OpenAIClient.init(a, io_rt.io(), api_key, model, base_url);
+            c.* = openai_mod.OpenAIClient.init(a, io_rt.io(), "", model, base_url);
+            c.credential = credential;
             errdefer c.deinit();
             c.protocol = openai_protocol;
             c.dialect_resolver = dialect_resolver;
@@ -193,7 +198,8 @@ pub fn makeProviderWithOptions(
         .gemini => blk: {
             const c = try a.create(gemini_mod.GeminiClient);
             errdefer a.destroy(c);
-            c.* = gemini_mod.GeminiClient.init(a, io_rt.io(), api_key, model, base_url);
+            c.* = gemini_mod.GeminiClient.init(a, io_rt.io(), "", model, base_url);
+            c.credential = credential;
             errdefer c.deinit();
             c.dialect_resolver = dialect_resolver;
             if (options.stream_idle_timeout_ms) |idle| c.stream_idle_timeout_ms = idle;
@@ -237,17 +243,17 @@ test "provider factory limits inherit and defaults remain provider specific" {
     context.parse("[models]\n\"gpt-5\" = 400000\n");
 
     const limits = limits_mod.ModelLimitsSource{ .catalog = &catalog, .model_context = &context };
-    var anthropic = try makeProviderWithOptions(a, .anthropic, "test-key", "GLM-5.2", null, .chat_completions, .builtin(), .{ .limits = limits });
+    var anthropic = try makeProviderWithOptions(a, .anthropic, .{ .fixed = "test-key" }, "GLM-5.2", null, .chat_completions, .builtin(), .{ .limits = limits });
     defer anthropic.deinit();
     try std.testing.expectEqual(@as(u32, 64000), anthropic.provider().maxTokensFor("glm-5.2"));
     try std.testing.expectEqual(@as(u32, 1048576), anthropic.provider().maxInputTokensFor("GLM-5.2"));
 
-    var openai = try makeProviderWithOptions(a, .openai, "test-key", "gpt-5", null, .chat_completions, .builtin(), .{ .limits = limits });
+    var openai = try makeProviderWithOptions(a, .openai, .{ .fixed = "test-key" }, "gpt-5", null, .chat_completions, .builtin(), .{ .limits = limits });
     defer openai.deinit();
     try std.testing.expectEqual(@as(u32, 400000), openai.provider().maxInputTokensFor("GPT-5-mini"));
     try std.testing.expectEqual(@as(u32, 4096), openai.provider().maxTokensFor("gpt-5"));
 
-    var overridden = try makeProviderWithOptions(a, .anthropic, "test-key", "GLM-5.2", null, .chat_completions, .builtin(), .{ .limits = .{ .catalog = &catalog, .max_tokens_override = 1234 } });
+    var overridden = try makeProviderWithOptions(a, .anthropic, .{ .fixed = "test-key" }, "GLM-5.2", null, .chat_completions, .builtin(), .{ .limits = .{ .catalog = &catalog, .max_tokens_override = 1234 } });
     defer overridden.deinit();
     try std.testing.expectEqual(@as(u32, 1234), overridden.provider().maxTokensFor("GLM-5.2"));
 

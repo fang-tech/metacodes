@@ -22,6 +22,7 @@ const connection_gate = @import("api/connection_gate.zig");
 const models_pages = @import("api/models_pages.zig");
 const dialect_mod = @import("api/dialect.zig");
 const auth_header_mod = @import("api/auth_header.zig");
+const credential_mod = @import("api/credential_cell.zig");
 
 /// P0:AnthropicProvider 复用中立 Provider 接口(非 generic)。Client.provider() 产出它
 /// (thunk 转调 + StreamResponse.handle() 中立化)。P1 起 agent_loop 等收 Provider 类型。
@@ -108,6 +109,7 @@ pub fn requestSetupError(err: anyerror, os_tag: std.Target.Os.Tag) anyerror {
 pub fn connectErrorDetail(err: anyerror) []const u8 {
     return switch (err) {
         error.ConnectFailed => "ConnectFailed(连接被拒绝、不可达或超时;Zig 0.16 在 Windows 上不区分)",
+        error.InvalidCredential => "InvalidCredential(凭据为空、超过 16 KiB,或含请求头不能携带的字节:控制字符、空格、非 ASCII;请求未发出)",
         else => @errorName(err),
     };
 }
@@ -409,7 +411,10 @@ pub const Client = struct {
     pub const RefreshFn = *const fn (ctx: *anyopaque, stale_access_token: []const u8) anyerror![]u8;
     allocator: std.mem.Allocator,
     http_client: http.Client,
-    api_key: []const u8,
+    /// What every request authenticates with, read when its header is built
+    /// (each attempt, retries included). A Session's clients share its
+    /// replaceable cell (issue #336); the CLI's borrow fixed bytes.
+    credential: credential_mod.Credential,
     /// **写务必走 setModel、跨线程读走 modelSnapshot(task#13)**:model 是 []const u8(ptr+len 两字),
     /// 非原子写。lead 主线程 switchModel(app.setModel→api_client.setModel)与后台 subagent 降级路径
     /// (owned_prov OOM 回退共享 api_client)的请求体读并发 → 撕裂 {new_ptr,old_len} 可致 OOB。mutex 串行。
@@ -472,7 +477,7 @@ pub const Client = struct {
         return .{
             .allocator = allocator,
             .http_client = http.Client{ .allocator = allocator, .io = io },
-            .api_key = api_key,
+            .credential = .{ .fixed = api_key },
             .model = model,
             .base_url = base_url_override orelse ANTHROPIC_API_URL,
             .catalog = Catalog.init(allocator),
@@ -507,7 +512,7 @@ pub const Client = struct {
     fn replaceRefreshToken(client: *Client, token: []u8) !void {
         if (client.refresh_token_owned) |old| try client.refresh_token_history.append(client.allocator, old);
         client.refresh_token_owned = token;
-        client.api_key = token;
+        client.credential = .{ .fixed = token };
     }
 
     // ── P0:Provider vtable 包装(AnthropicProvider = Client 的 thunk)─────────
@@ -548,7 +553,8 @@ pub const Client = struct {
             .kind = .anthropic,
             .base_url = client.base_url,
             .model = client.modelSnapshot(),
-            .credential = client.api_key,
+            // A replaceable credential is never lent: no delegable route.
+            .credential = client.credential.lendable() orelse return null,
             .auth_scheme = client.auth_scheme,
         };
     }
@@ -710,13 +716,14 @@ pub const Client = struct {
     /// GET <base>/v1/models with this client's route and credential: the body,
     /// owned by `client.allocator`.
     pub fn fetchModelsList(client: *Client) ![]u8 {
-        const auth = auth_header_mod.build(client.allocator, client.auth_scheme, client.api_key) catch return error.RequestFailed;
-        defer secureFree(client.allocator, auth.value);
         var status: u16 = 0;
         defer if (status != 0) {
             client.last_http_status = status;
         };
-        return getModelsList(client.allocator, &client.http_client, client.base_url, .{ .name = auth.name, .value = auth.value }, &status);
+        return getModelsList(client.allocator, &client.http_client, client.base_url, .{ .credential = .{
+            .credential = client.credential,
+            .scheme = client.auth_scheme,
+        } }, &status);
     }
 
     /// 发送非流式消息请求
@@ -857,7 +864,10 @@ pub const Client = struct {
             if (err != error.TokenExpired) return err;
             const callback = client.refresh_fn orelse return error.Unauthorized;
             const ctx = client.refresh_ctx orelse return error.Unauthorized;
-            const token = callback(ctx, client.api_key) catch return error.Unauthorized;
+            // Refresh replaces fixed bytes the client owns; a Session's
+            // replaceable credential is rotated by its Host instead.
+            const stale = client.credential.lendable() orelse return error.Unauthorized;
+            const token = callback(ctx, stale) catch return error.Unauthorized;
             client.replaceRefreshToken(token) catch {
                 secureFree(client.allocator, token);
                 return error.Unauthorized;
@@ -972,14 +982,6 @@ pub const Client = struct {
             return error.InvalidUrl;
         };
 
-        // OAuth access tokens can be longer than a small stack buffer. Allocate
-        // the header value and scrub it after request setup.
-        const auth = auth_header_mod.build(client.allocator, client.auth_scheme, client.api_key) catch |err| {
-            log.errId("client", rid, "auth header materialization failed: {s}", .{@errorName(err)});
-            return error.RequestFailed;
-        };
-        defer secureFree(client.allocator, auth.value);
-
         // Request 必须 heap-allocate：Response 内含 *Request，生命周期要覆盖 stream
         // 读取过程。若放栈上，doRequest 返回后 *Request 悬挂 → stream.next() 踩到
         // 新栈内容 segfault（ReleaseSmall 紧凑栈 reuse 下必炸）。
@@ -1003,6 +1005,17 @@ pub const Client = struct {
                 return error.RequestFailed;
             }
         }
+
+        // The credential is read now, with the connection slot held and the
+        // request about to open (issue #336): a request that waited for a slot
+        // carries a credential published while it waited. OAuth access tokens
+        // can be longer than a small stack buffer, so the header value is
+        // allocated and scrubbed after request setup.
+        const auth = client.credential.header(client.allocator, client.auth_scheme) catch |err| {
+            log.errId("client", rid, "auth header materialization failed: {s}", .{@errorName(err)});
+            return credential_mod.requestError(err);
+        };
+        defer secureFree(client.allocator, auth.value);
 
         // keep_alive=false:长驻(serve/--web)复用连接池,空闲后服务端关连接,首个 sendBody 撞
         // WriteFailed → 重试风暴(isTransientNetworkError 注释的病根)。新连接的握手洪峰由
@@ -1155,11 +1168,22 @@ pub const Client = struct {
 /// `<base>/v1/messages`: the body, owned by `allocator`. `status` receives the
 /// HTTP status once a response head arrived. Free of `Client` state, so a
 /// background refresh can run it on an HTTP client of its own.
+/// How a models-list request authenticates: a header its caller built (the
+/// models cache), or a client's credential, read for each page once that
+/// page's connection slot is held, as every other request reads it.
+pub const ModelsAuth = union(enum) {
+    header: http.Header,
+    credential: struct {
+        credential: credential_mod.Credential,
+        scheme: ?auth_header_mod.AuthScheme,
+    },
+};
+
 pub fn getModelsList(
     allocator: std.mem.Allocator,
     http_client: *http.Client,
     messages_url: []const u8,
-    auth: http.Header,
+    auth: ModelsAuth,
     status: *u16,
 ) ![]u8 {
     const suffix = "/v1/messages";
@@ -1207,19 +1231,28 @@ fn getModelsPage(
     allocator: std.mem.Allocator,
     http_client: *http.Client,
     url: []const u8,
-    auth: http.Header,
+    auth: ModelsAuth,
     status: *u16,
 ) ![]u8 {
     const uri = std.Uri.parse(url) catch return error.InvalidUrl;
 
     var connection_lease = connection_gate.acquire(null) catch return error.RequestFailed;
     defer connection_lease.release();
+    var built: ?auth_header_mod.Header = null;
+    defer if (built) |header| secureFree(allocator, header.value);
+    const header: http.Header = switch (auth) {
+        .header => |fixed| fixed,
+        .credential => |source| blk: {
+            built = source.credential.header(allocator, source.scheme) catch return error.RequestFailed;
+            break :blk .{ .name = built.?.name, .value = built.?.value };
+        },
+    };
     var req = http_client.request(.GET, uri, .{
         .keep_alive = false, // 同 POST:不复用陈旧连接
         .redirect_behavior = no_redirects, // 同 POST:key 不随重定向去别的主机
         .extra_headers = &.{
             .{ .name = "anthropic-version", .value = "2023-06-01" },
-            auth,
+            header,
         },
     }) catch return error.RequestFailed;
     defer req.deinit();

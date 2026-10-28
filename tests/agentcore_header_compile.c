@@ -1,13 +1,15 @@
 #include <metask/agentcore.h>
 
-_Static_assert(METASK_AGENTCORE_ABI_REVISION == 24,
+_Static_assert(METASK_AGENTCORE_ABI_REVISION == 25,
                "AgentCore revision changed");
 _Static_assert(sizeof(metask_agentcore_api_v1) == 80,
                "AgentCore root layout changed");
 _Static_assert(sizeof(metask_agentcore_runtime_api_v1) == 24,
                "Runtime table layout changed");
-_Static_assert(sizeof(metask_agentcore_session_api_v1) == 48,
+_Static_assert(sizeof(metask_agentcore_session_api_v1) == 56,
                "Session table layout changed");
+_Static_assert(METASK_AGENTCORE_MAX_CREDENTIAL_BYTES_V1 == 16384ULL,
+               "credential byte limit changed");
 _Static_assert(sizeof(metask_agentcore_session_control_api_v1) == 80,
                "Session Control table layout changed");
 _Static_assert(sizeof(metask_agentcore_skill_api_v1) == 32,
@@ -184,6 +186,9 @@ void agentcore_revision_fifteen_call_shape_probe(
         (void)api->session->submit_input((metask_agentcore_session *)0, 1, &input,
                                          &receipt, diagnostic);
     }
+    (void)api->session->update_credential(
+        (metask_agentcore_session *)0,
+        metask_agentcore_bytes_view_v1_from("sk-next", 7), diagnostic);
     (void)api->session_control->restore;
     (void)api->session_control->describe;
     (void)api->session_control->set_model;
