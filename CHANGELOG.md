@@ -31,47 +31,52 @@ status, compatibility boundaries, and entry points are defined by
   assistant markdown under token, line, byte, every-single-cut and seeded
   random chunkings, tables cut mid-row or never confirmed, with and without
   the live region redrawn between chunks (#318).
-
-### Changed
-
-- **The TUI's turn phase now owns every widget it opens (#330).** The agent
-  switcher, `?` help, the Ctrl+X prefix, the slash/`@` menu highlight, the
-  paste hint, the double-press windows, the model picker, the input box
-  projection, the spinner and the tool cards used to live side by side in one
-  session-long `UiState`, kept from leaking into the next prompt or reply by a
-  reset list at every boundary (#298). They now live in the payload of the
-  phase they belong to (`idle`/`input`/`generating`), which a single typed
-  `phase_change` event replaces wholesale, so nothing a reply or a read opened
-  can outlive it and a new widget is torn down without being listed anywhere.
-  A top-level field without a declared reason to outlive phases fails the
-  build, and a debug build panics on a phase that opens before the previous
-  one closed. The picker still crosses a boundary, but only through its
-  explicit `pending_overlay` hand-off (#220). No visible behaviour changes.
-- **Busy replies write far fewer terminal frames (#328).** Each streamed line,
-  spinner tick, tool progress update and key typed during a reply used to be
-  its own erase-and-redraw frame of the fixed region, so a model writing many
-  short lines made the terminal parse a full region redraw per line. Redraws
-  now go through a 16 ms merge window: a request with nothing painted in the
-  last window still paints at once, and requests inside the window share one
-  frame at its end that shows the state at that moment. Streamed text is
-  queued in order and never dropped. Submitting, a tool finishing, an
-  interrupt and phase or dialog boundaries still paint immediately, and a
-  WebSearch result line is always painted before its card goes. The end of
-  each provider turn is now one synchronized frame instead of three writes,
-  and a resize while the region was hidden no longer printed a blank line.
-  If metacodes panics mid-reply, the lines still waiting for the window are
-  written before the panic message, and the live region no longer draws
-  over the stack trace.
+- **Cross-process frontends declare which UI requests they render (#329).**
+  A frontend opens its channel with a capability frame
+  (`{"v":1,"type":"capabilities","ui_requests":[...],"custom":["<name>@<major>"],"events":[...]}`):
+  `POST /capabilities` on `--web` and `serve` (`/s/<id>/capabilities` per
+  session), `HostedSession.declareCapabilities` for a `SessionHost` Host. A
+  UI request the frame leaves out is no longer announced and failed by a
+  round trip: the Host journals `ui_request_unavailable` and the requester
+  answers the new `RequestOutcome.unrenderable` at once. The tool fails as
+  without a UI — AskUserQuestion with `FrontendCannotRender`
+  (`capability_unsupported`), `requestUiCustom` with `CustomUiUnsupported`, a
+  permission prompt denied with no terminal fallback — and the tool result
+  says the connected frontend cannot render the request and that the user
+  never saw it, instead of "failed with NotATty" or "user declined … via
+  prompt"; those texts are unchanged where they are true. Custom kinds carry
+  their version and match exactly. The reply is a journaled
+  `capabilities_accepted` line, or `capabilities_refused` for a frame of
+  another schema version or a malformed one, which changes nothing; `GET
+  /state` reports the declaration as `frontend_capabilities`. A frontend that
+  never declares receives every request as before, and in-process backends
+  (TUI, headless, the C ABI) are unchanged. The bundled browser UI declares
+  `permission` and `ask_question`, so a custom UI request no longer opens an
+  "Unsupported UI request" dialog there. The wire contract, the compatibility
+  rules and the policy on which `CoreEvent`/`UiRequest` changes bump
+  `SCHEMA_VERSION` are in the new [doc/WIRE_PROTOCOL.md](doc/WIRE_PROTOCOL.md);
+  `tests/fixtures/wire/v1` pins the frames and replies.
 
 ### Fixed
 
-- **A draft typed during a reply survives a permission or question dialog.**
-  The keyboard watcher owned the draft, and a dialog stops the watcher and
-  starts a new one when it closes. So the input box went on showing a buffer
-  that had already been freed, and the next key or Enter dropped what had been
-  typed. The draft now belongs to the reply: after the dialog the box still
-  shows it, the cursor is where it was, and Enter queues all of it.
+- **Release executables run beyond machines like the build runner.**
+  `release.yml` built the CLI executable without `-Dtarget`, so zig targeted
+  the runner: its CPU, glibc and macOS. Every published release from 0.4.0 to
+  0.8.0 is affected:
+  - The x86_64 Linux executable needs GLIBC_2.36 and an AVX2 CPU. On Ubuntu
+    22.04 the 0.8.0 one exits with "version `GLIBC_2.36' not found".
+  - The Windows executable needs AVX2, and AVX-512 in 0.4.0, 0.6.0 and 0.8.0.
+  - The aarch64 macOS executable declares macOS 26.6.2 as its minimum.
 
+  Each unit is now built for an explicit target (`cli_target`): the baseline
+  CPU and the oldest system it supports. Those targets are
+  `x86_64-linux-gnu.2.31`, `aarch64-macos.13.0` and `x86_64-windows-gnu`.
+  The new `scripts/check_binary_baseline.py` step fails a release whose
+  executable needs more. It disassembles the executable (no AVX, AVX2 or
+  AVX-512 on x86_64; no SVE or Armv8.6 matrix instructions on aarch64) and
+  reads the GLIBC symbol versions and the Mach-O minimum macOS. The Lean
+  kernels were never affected: they are built for the baseline CPU and need
+  GLIBC_2.14.
 - **Ctrl+L during a reply clears the screen through the renderer** (#320).
   The keyboard watcher sent `ESC[2J` straight to the terminal, outside the
   render lock and between two frames, while the agent loop could be printing,
@@ -94,7 +99,84 @@ status, compatibility boundaries, and entry points are defined by
   box at the bottom of the screen every redraw pushed the spinner, border
   and prompt rows into the scrollback. It is now cut with an ellipsis, like
   the MCP notice on the same line.
+- **Python package: a host tool can run a child Session on Windows.** A Run
+  executed on the thread that called `Session.run`; on Windows the main
+  thread of python.exe reserves 2 MB, and a Run that a tool started from
+  inside another Run overflowed it. ctypes reported the overflow as
+  `OSError: exception: stack overflow`, the child's Run never finished, and
+  closing the child failed with `BUSY`. Every Run now executes on its own
+  thread with an 8 MiB stack, the size the Node addon gives its Run threads,
+  so nesting no longer depends on the caller's stack. The thread is not a
+  daemon, and an interrupt (Ctrl+C) while `run()` waits for it aborts the Run
+  and waits for it to end before it propagates; a second interrupt stops the
+  wait and leaves the Session busy until the Run ends, so `abort()` and
+  `close()` still reach it. The suite's
+  permission-target test compares paths as paths, since AgentCore names
+  Windows paths with forward slashes.
 
+- **A draft typed during a reply survives a permission or question dialog.**
+  The keyboard watcher owned the draft, and a dialog stops the watcher and
+  starts a new one when it closes. So the input box went on showing a buffer
+  that had already been freed, and the next key or Enter dropped what had been
+  typed. The draft now belongs to the reply: after the dialog the box still
+  shows it, the cursor is where it was, and Enter queues all of it.
+
+### Changed
+
+- **Smaller Linux footprint: idle RSS back under its red line, binary
+  433 KB smaller.** On x86_64 Linux, the ReleaseSmall binary was 6.60 MB
+  (red line 6 MiB) and `metacodes --help` peaked at 3120 KB RSS (red line
+  3 MB; `doc/PERF_MEMORY_PRINCIPLES.md` §2). Nothing a user sees changes;
+  measured in WSL on x86_64:
+  - **Signal stack.** The release binary no longer reserves std's 256 KiB
+    alternate signal stack. It is thread-local, and glibc zeroes it for
+    every thread, the main one included. Only std's segfault handler uses
+    it, and the release build does not install that handler, so sessions
+    also save 256 KiB per thread.
+  - **`--help` first.** `metacodes --help` (or `-h`) as the first argument
+    prints before the rest of startup runs, with byte-identical output.
+  - **No zero-filled constants.** The provider control plane's event ring is
+    no longer copied out of a 138 KiB read-only constant.
+  - **Run-end records out of line.** The agent loop's nine run-end records
+    run as functions instead of being copied into every exit of the loop
+    (−277 KB).
+
+  Result: 6.19 MB binary and 2564 KB RSS for the native build; 6.16 MB and
+  2920 KB for the glibc 2.31 baseline-CPU build. RSS is now under its red
+  line, but the binary is still about 195 KB over 6 MiB. The macOS binary
+  is 283 KB smaller. §3g records the Zig 0.16 patterns behind the waste:
+  aggregates copied from zero-filled constants, and `defer` bodies copied
+  into every exit.
+
+- **The TUI's turn phase now owns every widget it opens (#330).** The agent
+  switcher, `?` help, the Ctrl+X prefix, the slash/`@` menu highlight, the
+  paste hint, the double-press windows, the model picker, the input box
+  projection, the spinner and the tool cards used to live side by side in one
+  session-long `UiState`, kept from leaking into the next prompt or reply by a
+  reset list at every boundary (#298). They now live in the payload of the
+  phase they belong to (`idle`/`input`/`generating`), which a single typed
+  `phase_change` event replaces wholesale, so nothing a reply or a read opened
+  can outlive it and a new widget is torn down without being listed anywhere.
+  A top-level field without a declared reason to outlive phases fails the
+  build, and a debug build panics on a phase that opens before the previous
+  one closed. The picker still crosses a boundary, but only through its
+  explicit `pending_overlay` hand-off (#220). No visible behaviour changes.
+
+- **Busy replies write far fewer terminal frames (#328).** Each streamed line,
+  spinner tick, tool progress update and key typed during a reply used to be
+  its own erase-and-redraw frame of the fixed region, so a model writing many
+  short lines made the terminal parse a full region redraw per line. Redraws
+  now go through a 16 ms merge window: a request with nothing painted in the
+  last window still paints at once, and requests inside the window share one
+  frame at its end that shows the state at that moment. Streamed text is
+  queued in order and never dropped. Submitting, a tool finishing, an
+  interrupt and phase or dialog boundaries still paint immediately, and a
+  WebSearch result line is always painted before its card goes. The end of
+  each provider turn is now one synchronized frame instead of three writes,
+  and a resize while the region was hidden no longer printed a blank line.
+  If metacodes panics mid-reply, the lines still waiting for the window are
+  written before the panic message, and the live region no longer draws
+  over the stack trace.
 
 ## 0.8.1 — 2026-10-28
 

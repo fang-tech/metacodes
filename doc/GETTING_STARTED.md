@@ -18,6 +18,12 @@ macOS (aarch64) and Linux (x86_64), the latest release:
 curl -fsSL https://raw.githubusercontent.com/metask-ai/metacodes/main/scripts/install.sh | sh
 ```
 
+A release runs on macOS 13 or newer and on Linux with glibc 2.31 or newer
+(Ubuntu 20.04, Debian 11, RHEL 9 and later), on any x86-64 or Apple Silicon
+CPU. Releases 0.4.0 to 0.8.0 need more: glibc 2.36 and a CPU with AVX2 on
+Linux, AVX2 on Windows, and AVX-512 in the 0.4.0, 0.6.0 and 0.8.0 Windows
+builds, which many desktop and laptop CPUs lack.
+
 This installs into `~/.local/opt/metacodes` with a `metacodes` launcher in
 `~/.local/bin`, the AgentCore SDK included; rerunning it upgrades in place and
 keeps the state. `| sh -s -- --version X.Y.Z` picks a release, `--help` lists

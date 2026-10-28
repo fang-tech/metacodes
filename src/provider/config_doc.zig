@@ -764,7 +764,9 @@ pub fn parseSelection(value: std.json.Value) DocumentError!RuntimeSelection {
     if (target_value != .object) return error.InvalidDocument;
     const kind = stringOf(target_value.object.get("kind")) orelse return error.InvalidDocument;
 
-    var out = RuntimeSelection{ .target = undefined };
+    // A typed literal (`RuntimeSelection{ … }`) would be copied out of a 4 KiB
+    // read-only constant (doc/PERF_MEMORY_PRINCIPLES.md §3g).
+    var out: RuntimeSelection = .{ .target = undefined };
     if (std.mem.eql(u8, kind, "pinned_offer")) {
         const offer_text = stringOf(target_value.object.get("offer_id")) orelse return error.InvalidDocument;
         const revision: OfferRevision = if (target_value.object.get("offer_revision")) |number|
