@@ -18,6 +18,8 @@ const PermissionContext = @import("../permission.zig").PermissionContext;
 /// 阻塞式询问用户。返回 true = 允许。ctx 携带 session 记忆 / UI runner / persist 路径。
 /// **ctx 非 const**:本函数有副作用(写 session 记忆 rememberAllow/Deny、写 settings.local.json)。
 /// 线程契约:M6 前假设单线程调用(SessionRules 无锁);M6 多 session 多线程化时给 SessionRules 加锁。
+/// error.PromptUnrenderable:连着的前端声明了渲染不了权限请求,谁都没问——调用方必须拒绝,
+/// 且不能把它说成用户的回答。
 pub fn ask(ctx: *PermissionContext, tool_name: []const u8, args: []const u8) !bool {
     return askWith(ctx, tool_name, args, false);
 }
@@ -66,7 +68,14 @@ fn askWith(ctx: *PermissionContext, tool_name: []const u8, args: []const u8, for
                 // permission 门是 executeSlots 前的同步门,不支持挂起(out of scope)——
                 // 仅 .answered 读 resp;.pending/.unavailable 落文字 prompt 兜底。
                 const outcome = runner.request(ctx.session, arena.allocator(), &req, &resp) catch break :blk null;
-                if (outcome != .answered) break :blk null;
+                switch (outcome) {
+                    .answered => {},
+                    // 连着的前端声明了渲染不了权限请求(doc/WIRE_PROTOCOL.md §2.2):没人能答,
+                    // 终端也不是这个前端——不落文字 prompt,直接拒绝。调用方据此如实告诉模型
+                    // 不是用户拒绝的。
+                    .unrenderable => return error.PromptUnrenderable,
+                    .pending, .unavailable => break :blk null,
+                }
                 break :blk switch (resp) {
                     .permission => |c| c,
                     else => null,
@@ -232,6 +241,36 @@ test "no_interactive_prompt: requester non-answer never falls back to process an
     try testing.expectEqual(@as(usize, 1), unavailable.calls);
     // The process-global answer was not consumed by the embedded Session.
     try testing.expectEqualStrings("y", answer_queue.pop().?);
+}
+
+test "a frontend that cannot render permission prompts denies without any fallback prompt" {
+    const testing = std.testing;
+    const Unrenderable = struct {
+        calls: usize = 0,
+
+        fn request(
+            raw: *anyopaque,
+            _: ui_request.SessionId,
+            _: std.mem.Allocator,
+            _: *const ui_request.UiRequest,
+            _: *ui_request.UiResponse,
+        ) anyerror!ui_request.RequestOutcome {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            return .unrenderable;
+        }
+    };
+    var unrenderable = Unrenderable{};
+    // A product context (not `no_interactive_prompt`): even here no terminal
+    // prompt is the frontend, so nothing falls back to one.
+    var ctx = PermissionContext{
+        .allocator = testing.allocator,
+        .ui_requester = .{ .ctx = &unrenderable, .requestFn = Unrenderable.request },
+    };
+    ctx.setMode(.default);
+    try testing.expectError(error.PromptUnrenderable, ask(&ctx, "Write", "{\"file_path\":\"/x\"}"));
+    try testing.expectError(error.PromptUnrenderable, askForced(&ctx, "Write", "{\"file_path\":\"/x\"}"));
+    try testing.expectEqual(@as(usize, 2), unrenderable.calls);
 }
 
 const AllowAlwaysAnswer = struct {

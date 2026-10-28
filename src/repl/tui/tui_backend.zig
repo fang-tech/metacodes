@@ -695,8 +695,7 @@ pub const TuiBackend = struct {
                 return;
             },
             .redraw_screen => {
-                std.debug.print("\x1b[2J\x1b[H", .{});
-                self.region.redrawGen(app);
+                self.region.resetScreen(); // draws the region again in the same frame
                 return;
             },
             .kill_background => {

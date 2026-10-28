@@ -588,6 +588,7 @@ unless noted.
 | `GET /events` | SSE stream of the session's wire lines ([Wire lines](#wire-lines-for-out-of-process-hosts): ids `<epoch>-<seq>`, `Last-Event-ID` or `?since=<seq>&epoch=<epoch>`, `event: resync`). |
 | `POST /message` | `{"text":"..."}`: queue a prompt; echoed as `user_message`. |
 | `POST /respond` | `{"id":N,...}`: answer the pending `ui_request` N; 409 when N is not pending. |
+| `POST /capabilities` | The frontend's [capability frame](WIRE_PROTOCOL.md#2-capability-exchange): `200` with the `capabilities_accepted` line (also journaled), `400` with `capabilities_refused` (nothing changes). From then on a UI request the frame leaves out is journaled as `ui_request_unavailable` and never announced. |
 | `POST /command` | `{"cmd":"/verb ..."}`: queue a [service verb](#session-command-surface-ui-neutral); the result arrives as `command_result`. |
 | `POST /interrupt` | Interrupt the running generation; 409 when idle. |
 | `GET /state` | Session snapshot (model, mode, usage, journal epoch and seq, ...). |
@@ -763,15 +764,45 @@ with the schema version `v` (currently 1) and a `type`:
 {"v":1,"type":"<CoreEvent tag>","data":<payload or null>}
 {"v":1,"type":"ui_request","id":N,"kind":"permission|ask_question|custom","request":{...}}
 {"v":1,"type":"ui_request_closed","id":N,"outcome":"answered|cancelled|malformed"}
+{"v":1,"type":"ui_request_unavailable","kind":"...","custom_kind":"...","reason":"..."}
+{"v":1,"type":"capabilities_accepted",...}
 ```
+
+The normative contract, including which changes keep v1 and which bump
+`SCHEMA_VERSION`, is [WIRE_PROTOCOL.md](WIRE_PROTOCOL.md).
+
+A frontend may open its channel with a **capability frame** naming the UI
+requests it renders (`wire.parseCapabilities`, `wire.acceptCapabilities`):
+
+```json
+{"v":1,"type":"capabilities","ui_requests":["permission","ask_question"],"custom":["video_timeline@1"],"events":["text_chunk"]}
+```
+
+Custom kinds carry their version (`<name>@<major>`) and match exactly. Once a
+frame is installed, a request it leaves out is not announced: the Host
+journals `ui_request_unavailable` (reason `kind_not_declared`,
+`custom_kind_not_declared` or `custom_kind_unversioned`) and the tool gets
+`RequestOutcome.unrenderable` at once: it fails as without a UI
+(`AskUserQuestion` fails with `FrontendCannotRender`, `requestUiCustom`
+returns `CustomUiUnsupported`, a permission prompt is denied with no terminal
+fallback), and the tool result tells the model the frontend cannot render the
+request rather than that the user refused it. A Zig Host that switches over
+`RequestOutcome` handles the fourth value. A frame of another version, or a malformed one,
+is answered `{"v":1,"type":"capabilities_refused","reason":"<RefusalError>"}`
+and changes nothing. A frontend that never declares receives every request,
+as before; in-process backends (TUI, headless, the C ABI) never declare.
+`frontend_capabilities.route` is the routing rule and `Slot` the per-Session
+holder a Host keeps.
 
 `wire.parseResponse` turns the client's answer (`{"choice":...}`,
 `{"answers":[...]}` or `{"result":...}`) back into a `UiResponse`; anything
 malformed or of another version is answered as a cancellation, never as a
 grant, and closes as `malformed`. An answer that races an interrupt or close
 loses: it is refused or discarded and the request closes as `cancelled`. `tests/fixtures/wire/v1` pins one line for every event tag and request
-kind and doubles as conformance vectors for Hosts in other languages. The
-bundled `--web` UI consumes exactly these lines.
+kind, plus capability frames with core's reply to each, and doubles as
+conformance vectors for Hosts in other languages. The bundled `--web` UI
+consumes exactly these lines and declares `permission` and `ask_question`
+when it loads.
 
 The `--web` server streams these lines over SSE with ids `<epoch>-<seq>`. The
 epoch names the event journal; a restarted host or a rebuilt session has a new
@@ -858,6 +889,7 @@ connecting or reconnecting:
 | `model`, `permission_mode` | In force now; the mode as `default`, `accept_edits`, `auto`, `dont_ask` or `bypass_permissions`. |
 | `generating` | A turn or a command is running. |
 | `pending_request_id` | The UI request waiting for `POST /respond`, `0` when none. |
+| `frontend_capabilities` | The declaration in force (the last `capabilities_accepted` object), `null` while no frontend declared: every request is then announced. |
 
 It also carries `session_id`, `additional_dirs`, token usage and cost, the
 agent roster, tasks and `plugin_inventory`.
@@ -886,6 +918,12 @@ leaving every Host to rebuild them:
   Session's `journal` as a wire line; CoreEvents carry `run_id` and the
   submission's `trace_id`. `respond(id, json)` answers a UI request;
   anything but the pending id is `error.NoSuchRequest`.
+- `declareCapabilities(allocator, frame)` installs the client's capability
+  frame ([WIRE_PROTOCOL.md](WIRE_PROTOCOL.md#2-capability-exchange)) and
+  returns, and journals, its `capabilities_accepted` line; a refused frame
+  is a `wire.DeclareError` and changes nothing. A UI request the declaration
+  leaves out is journaled as `ui_request_unavailable` and answered
+  `unavailable` without waiting.
 - `interrupt` aborts the Run (or the one being admitted) and answers a
   pending UI request as cancelled. A Session the kernel poisoned reports
   `session_poisoned`, drops its queue and refuses further work; close and
