@@ -323,24 +323,59 @@ test "TuiBackend.poll: 取走的消息进 readline 历史(与 Run 之间消费�
     try testing.expectEqualStrings("remember me", back);
 }
 
-test "TuiBackend: 回复草稿归 backend,stopInput 不动它;deinit 先撤 region 投影再释放" {
+/// Hands every allocation to `backing`; on each free, counts whether the
+/// region's generating input box was still showing a draft at that moment.
+const DraftFreeProbe = struct {
+    backing: std.mem.Allocator,
+    region: *render_region.RenderRegion,
+    frees: usize = 0,
+    freed_while_shown: usize = 0,
+
+    fn allocator(self: *DraftFreeProbe) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *DraftFreeProbe = @ptrCast(@alignCast(ctx));
+        return self.backing.rawAlloc(len, alignment, ret_addr);
+    }
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        const self: *DraftFreeProbe = @ptrCast(@alignCast(ctx));
+        return self.backing.rawResize(memory, alignment, new_len, ret_addr);
+    }
+    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        const self: *DraftFreeProbe = @ptrCast(@alignCast(ctx));
+        return self.backing.rawRemap(memory, alignment, new_len, ret_addr);
+    }
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *DraftFreeProbe = @ptrCast(@alignCast(ctx));
+        self.frees += 1;
+        if (self.region.ui.phase.generating.interaction.editor.view.len != 0) self.freed_while_shown += 1;
+        self.backing.rawFree(memory, alignment, ret_addr);
+    }
+};
+
+// On an error return the turn's deferred TuiBackend.deinit runs before the
+// generating phase is left, so the box may still be drawn after it. deinit
+// must take the draft off the box before freeing it: the probe sees every
+// free of the draft's buffers and checks the box at that moment. (A dialog's
+// stop and restart of the watcher is the pty case
+// test_reply_draft_survives_a_permission_dialog.)
+test "TuiBackend.deinit: the box no longer shows the draft when its buffers are freed" {
     var region = try makeRegion(testing.allocator);
     defer region.deinit();
+    var probe: DraftFreeProbe = .{ .backing = testing.allocator, .region = &region };
     var tb = tui_backend.TuiBackend.init(&region);
-    // 等同 startInput 建的草稿 + watcher 打过字后交给 region 的投影。
-    tb.draft = cc.repl_input.LineEditor.init(testing.allocator);
+    // What startInput creates and a watcher publishes after typing.
+    tb.draft = cc.repl_input.LineEditor.init(probe.allocator());
     try tb.draft.?.setLine("keep me");
     region.setGenInput(tb.draft.?.view(), tb.draft.?.cursor);
-
-    // 对话框:停 watcher。草稿和投影都留着,重启的 watcher 接着用。
-    tb.stopInput();
-    try testing.expectEqualStrings("keep me", tb.draft.?.view());
     try testing.expectEqualStrings("keep me", region.ui.phase.generating.interaction.editor.view);
+    const frees_before = probe.frees;
 
-    // 出错返回时 deinit 先于离开生成阶段:投影不能再指着要释放的缓冲。
     tb.deinit();
     try testing.expect(tb.draft == null);
-    try testing.expectEqual(@as(usize, 0), region.ui.phase.generating.interaction.editor.view.len);
+    try testing.expect(probe.frees > frees_before); // the draft really went through the probe
+    try testing.expectEqual(@as(usize, 0), probe.freed_while_shown);
 }
 
 // ---------------------------------------------------------------------------
