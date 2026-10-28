@@ -304,20 +304,20 @@ test "L2 key login: a /model pick without a key takes the pasted key, stores it,
     defer app.deinit();
 
     var ui: cc.tui_ui_state.UiState = .{};
-    picker_host.open(app, &ui);
-    for ("zai-coding-plan") |byte| _ = picker_host.onKey(app, &ui, .{ .char = byte });
-    _ = picker_host.onKey(app, &ui, .enter); // provider
-    _ = picker_host.onKey(app, &ui, .enter); // GLM-5.3, listed first
-    _ = picker_host.onKey(app, &ui, .enter); // its first channel (cn-anthropic)
-    _ = picker_host.onKey(app, &ui, .enter); // options: apply → no key
+    picker_host.open(app, &ui, .unguarded);
+    for ("zai-coding-plan") |byte| _ = picker_host.onKey(app, &ui, .{ .char = byte }, .unguarded);
+    _ = picker_host.onKey(app, &ui, .enter, .unguarded); // provider
+    _ = picker_host.onKey(app, &ui, .enter, .unguarded); // GLM-5.3, listed first
+    _ = picker_host.onKey(app, &ui, .enter, .unguarded); // its first channel (cn-anthropic)
+    _ = picker_host.onKey(app, &ui, .enter, .unguarded); // options: apply → no key
     const picker = &app.model_picker;
     try std.testing.expectEqual(cc.repl_model_picker.Stage.credential, picker.stage);
     try std.testing.expectEqual(cc.repl_model_picker.CredentialMode.paste_key, picker.credential_mode);
     // The plan page for the channel's region is the one offered first.
     try std.testing.expectEqualStrings("China · Personal Coding Plan", picker.keyChoices()[picker.key_choice].label);
 
-    for (GOOD_KEY) |byte| _ = picker_host.onKey(app, &ui, .{ .char = byte });
-    try std.testing.expectEqual(picker_host.Result.redraw, picker_host.onKey(app, &ui, .enter));
+    for (GOOD_KEY) |byte| _ = picker_host.onKey(app, &ui, .{ .char = byte }, .unguarded);
+    try std.testing.expectEqual(picker_host.Result.redraw, picker_host.onKey(app, &ui, .enter, .unguarded));
     // The field is wiped as soon as the worker has its copy.
     try std.testing.expectEqual(@as(usize, 0), picker.key_len);
 
@@ -327,7 +327,7 @@ test "L2 key login: a /model pick without a key takes the pasted key, stores it,
     while (app.login_worker != null) : (waited_ms += 10) {
         if (waited_ms > 10_000) return error.KeyLoginTimedOut;
         std.Io.sleep(std.testing.io, .fromMilliseconds(10), .awake) catch {};
-        result = picker_host.poll(app, &ui);
+        result = picker_host.poll(app, &ui, .unguarded);
     }
     try std.testing.expectEqual(picker_host.Result.committed, result);
     try std.testing.expectEqualStrings("glm-5.3", app.activeModel());
@@ -355,12 +355,12 @@ test "L2 key login: Esc during a key check that does not answer returns at once 
     defer if (app_alive) app.deinit();
 
     var ui: cc.tui_ui_state.UiState = .{};
-    picker_host.open(app, &ui);
-    for ("zai-coding-plan") |byte| _ = picker_host.onKey(app, &ui, .{ .char = byte });
-    for (0..4) |_| _ = picker_host.onKey(app, &ui, .enter);
+    picker_host.open(app, &ui, .unguarded);
+    for ("zai-coding-plan") |byte| _ = picker_host.onKey(app, &ui, .{ .char = byte }, .unguarded);
+    for (0..4) |_| _ = picker_host.onKey(app, &ui, .enter, .unguarded);
     try std.testing.expectEqual(cc.repl_model_picker.CredentialMode.paste_key, app.model_picker.credential_mode);
-    for (GOOD_KEY) |byte| _ = picker_host.onKey(app, &ui, .{ .char = byte });
-    _ = picker_host.onKey(app, &ui, .enter);
+    for (GOOD_KEY) |byte| _ = picker_host.onKey(app, &ui, .{ .char = byte }, .unguarded);
+    _ = picker_host.onKey(app, &ui, .enter, .unguarded);
     // The check is on the wire and the server holds its answer.
     try check.waitUntilResponseGated();
     // Should Esc wait on the worker, it waits ~3 s for this and the timing
@@ -382,7 +382,7 @@ test "L2 key login: Esc during a key check that does not answer returns at once 
     }
 
     const before = cc.util_time.nowMs();
-    _ = picker_host.onKey(app, &ui, .escape);
+    _ = picker_host.onKey(app, &ui, .escape, .unguarded);
     try std.testing.expect(cc.util_time.nowMs() - before < 1_000);
     try std.testing.expect(app.login_worker == null);
     try std.testing.expect(app.model_picker.stage != cc.repl_model_picker.Stage.credential);

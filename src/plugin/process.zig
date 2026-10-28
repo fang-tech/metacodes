@@ -273,17 +273,20 @@ fn executeTool(
     const arguments = std.json.parseFromSliceLeaky(std.json.Value, parse_arena.allocator(), args, .{
         .allocate = .alloc_always,
         .duplicate_field_behavior = .@"error",
-    }) catch |err| return if (err == error.OutOfMemory)
-        error.OutOfMemory
-    else
-        failed(tool_ctx.allocator, "plugin_arguments_invalid");
+    }) catch |err| {
+        // `err`, not a literal `error.OutOfMemory`: a literal error in a
+        // function returning a ToolDispatchOutcome copies a 3.7 KiB constant
+        // (doc/PERF_MEMORY_PRINCIPLES.md §3g).
+        if (err == error.OutOfMemory) return err;
+        return failed(tool_ctx.allocator, "plugin_arguments_invalid");
+    };
     if (arguments != .object) return failed(tool_ctx.allocator, "plugin_arguments_invalid");
 
     var external_spool: ?artifact_store.ExternalSpool = if (package.supports_artifact_spool and tool_ctx.artifact_root.len != 0) artifact_store.ExternalSpool.begin(
         tool_ctx.allocator,
         tool_ctx.artifact_root,
     ) catch |err| {
-        if (err == error.OutOfMemory) return error.OutOfMemory;
+        if (err == error.OutOfMemory) return err;
         return failed(tool_ctx.allocator, "plugin_spool_unavailable");
     } else null;
     defer if (external_spool) |*spool| spool.deinit();

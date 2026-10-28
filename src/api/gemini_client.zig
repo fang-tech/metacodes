@@ -54,6 +54,8 @@ const dialect_mod = @import("dialect.zig");
 const catalog_mod = @import("catalog.zig");
 const image_capability = @import("image_capability.zig");
 const gemini_signatures = @import("gemini_signatures.zig");
+const credential_mod = @import("credential_cell.zig");
+const secure = @import("../util/secure.zig");
 const AbortSignal = @import("../util/abort.zig").AbortSignal;
 const model_context_mod = @import("../app/model_context.zig");
 
@@ -83,7 +85,8 @@ var g_call_serial = std.atomic.Value(u64).init(1);
 
 pub const GeminiClient = struct {
     allocator: std.mem.Allocator,
-    api_key: []const u8,
+    /// Read when each request's header is built (see `client_mod.Client.credential`).
+    credential: credential_mod.Credential,
     base_url: []const u8, // 基址(可指向 MockServer);doStream 拼 model + :streamGenerateContent
     model: []const u8,
     http_client: http.Client,
@@ -121,7 +124,7 @@ pub const GeminiClient = struct {
     pub fn init(allocator: std.mem.Allocator, io: std.Io, api_key: []const u8, model: []const u8, base_url: ?[]const u8) GeminiClient {
         return .{
             .allocator = allocator,
-            .api_key = api_key,
+            .credential = .{ .fixed = api_key },
             .base_url = base_url orelse DEFAULT_GEMINI_BASE,
             .model = model,
             .http_client = http.Client{ .allocator = allocator, .io = io },
@@ -208,7 +211,8 @@ pub const GeminiClient = struct {
             .kind = .gemini,
             .base_url = self.base_url,
             .model = self.model,
-            .credential = self.api_key,
+            // A replaceable credential is never lent: no delegable route.
+            .credential = self.credential.lendable() orelse return null,
         };
     }
     /// Provider.requestOverrides() 返回 Client.overrides;镜像 reasoning_effort 兜底。
@@ -339,6 +343,14 @@ pub const GeminiClient = struct {
         errdefer self.allocator.destroy(req_ptr); // 唯一 destroy:所有错误路径都靠它(不手动 destroy,否则 double-free)
         var connection_lease = try connection_gate.acquire(abort);
         defer connection_lease.release();
+        // This request's own copy of the key, read with the connection slot
+        // held, right before the request opens (see client_mod.Client.doRequest),
+        // and erased once the request is set up.
+        const auth = self.credential.header(self.allocator, .{ .api_key_header = "x-goog-api-key" }) catch |err| {
+            log.errId("gemini", rid, "auth header materialization failed: {s}", .{@errorName(err)});
+            return credential_mod.requestError(err);
+        };
+        defer secure.free(self.allocator, auth.value);
         req_ptr.* = self.http_client.request(.POST, uri, .{
             // 每请求独立连接:不复用 pooled 连接，避免"干净 EOF→连接入池→复用已弃连接
             // →HttpConnectionClosing"；process-wide connection_gate 负责限制握手洪峰。
@@ -347,7 +359,7 @@ pub const GeminiClient = struct {
             .redirect_behavior = no_redirects,
             .extra_headers = &.{
                 .{ .name = "content-type", .value = "application/json" },
-                .{ .name = "x-goog-api-key", .value = self.api_key },
+                .{ .name = auth.name, .value = auth.value },
             },
         }) catch |err| {
             log.errId("gemini", rid, "request init failed: {s}", .{@errorName(err)});

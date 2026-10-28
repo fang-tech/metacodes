@@ -22,7 +22,10 @@ DEFAULT_MAX_TURNS = 400
 # host tool) are running on this thread. close() waits for the Session's
 # active Run to return, which a callback of that Run would wait for in turn,
 # so it refuses there instead of deadlocking. Closing any other Session from
-# a callback (a tool that opens and closes a child Session) is fine.
+# a callback (a tool that opens and closes a child Session) is fine. A Run's
+# thread starts with the marks of the thread that started it: a child Run that
+# a tool starts runs inside that tool's callback, so its callbacks cannot
+# close the parent Session either.
 _CALLBACK = threading.local()
 
 
@@ -41,6 +44,99 @@ class _InCallback:
 
 def _in_callback_of(handle: Optional[int]) -> bool:
     return handle is not None and handle in getattr(_CALLBACK, "handles", ())
+
+
+# The stack each Run executes on, the size the Node addon gives its Run
+# threads. A Run needs more than some callers' threads have: on Windows the
+# main thread of python.exe reserves 2 MB, and a Run that a host tool starts
+# from inside another Run (a child Session) overflowed it. The overflow was a
+# structured exception ctypes turned into OSError, leaving the child Session's
+# Run unfinished, so it could not be closed. Each Run getting its own thread
+# also makes nesting depth independent of the caller's stack.
+RUN_STACK_BYTES = 8 * 1024 * 1024
+# threading.stack_size() is process-wide and read when a thread starts, so it
+# is set and restored around one start() under this lock. A thread that other
+# code starts inside that window also gets RUN_STACK_BYTES; that is harmless.
+_RUN_THREAD_START = threading.Lock()
+
+
+class _RunThread:
+    """One Run's native call on its own thread with ``RUN_STACK_BYTES`` of
+    stack, and who closes the Run when it returns.
+
+    The thread is not a daemon: the native call always runs to its end, as it
+    did when it ran on the caller's thread, and the interpreter waits for it
+    at exit. The caller waits with ``wait``. If that wait is interrupted
+    (Ctrl+C raises KeyboardInterrupt out of the join), ``wait`` asks the Run to
+    abort and waits for it to end before re-raising, so the Session never
+    reports idle while its Run goes on. If the second wait is interrupted too,
+    the Run's own thread closes the Run when the native call returns: until
+    then the Session stays busy, ``abort()`` still reaches the Run, and
+    ``close()`` aborts and waits for it.
+    """
+
+    def __init__(self, call: Callable[[], int], close_interrupted: Callable[[], None], keep: Any) -> None:
+        self._call = call
+        # The buffers the native call borrows (the prompt's arena, the option
+        # and result structs): alive until the call returns, also when the
+        # caller stopped waiting for it.
+        self._keep = keep
+        # Closes the Run when the caller stopped waiting for its result.
+        self._close_interrupted = close_interrupted
+        self._lock = threading.Lock()
+        self._returned = False
+        self._abandoned = False
+        self.status: Optional[int] = None
+        self.error: Optional[BaseException] = None
+        # The callbacks the caller is inside, as when the Run executed on its
+        # thread (a copy: each thread pushes and pops its own list).
+        self._callbacks = list(getattr(_CALLBACK, "handles", ()))
+        self._thread = threading.Thread(target=self._run, name="metacodes-run")
+
+    def start(self) -> None:
+        with _RUN_THREAD_START:
+            previous = threading.stack_size(RUN_STACK_BYTES)
+            try:
+                self._thread.start()
+            finally:
+                threading.stack_size(previous)
+
+    def _run(self) -> None:
+        _CALLBACK.handles = self._callbacks
+        try:
+            self.status = self._call()
+        except BaseException as error:  # the caller reports it
+            self.error = error
+        finally:
+            with self._lock:
+                self._returned = True
+                abandoned = self._abandoned
+            if abandoned:
+                self._close_interrupted()
+
+    def _join(self) -> None:
+        self._thread.join()
+
+    def wait(self, abort: Callable[[], None]) -> None:
+        """Return once the native call has returned. On an interrupt, abort,
+        wait again, close the Run and re-raise; on a second interrupt, leave
+        closing to the Run's thread and re-raise."""
+        try:
+            self._join()
+            return
+        except BaseException:
+            abort()
+            try:
+                self._join()
+            except BaseException:
+                with self._lock:
+                    self._abandoned = not self._returned
+                    abandoned = self._abandoned
+                if not abandoned:
+                    self._close_interrupted()
+                raise
+            self._close_interrupted()
+            raise
 
 
 SHELL_TOOLS = ("Bash", "BashOutput", "KillShell")
@@ -365,6 +461,9 @@ class Session:
         self._on_event = on_event
         self._on_ui_request = on_ui_request
         self._run_lock = threading.Lock()
+        # Held around update_credential's call and around destroy, so a
+        # credential update never races the handle's release.
+        self._handle_lock = threading.Lock()
         self._next_run_id = 1
         self._active_run_id = 0
         self._next_input_id = 1
@@ -487,6 +586,16 @@ class Session:
             )
             self._lib.take_diagnostic(diagnostic)
 
+    def _finish_run(self) -> None:
+        """End the active Run's bookkeeping and free the Session for the next
+        Run or close(). Called exactly once per Run, after its native call
+        returned."""
+        self._active_run_id = 0
+        self._run_on_event = None
+        self._state = None
+        self._callback_error = None
+        self._run_lock.release()
+
     def run(
         self,
         prompt: str,
@@ -494,11 +603,18 @@ class Session:
         max_turns: Optional[int] = None,
         on_event: Optional[Callable[[Dict[str, Any]], None]] = None,
     ) -> RunResult:
-        """Run one prompt to completion and return the final answer."""
+        """Run one prompt to completion and return the final answer.
+
+        The Run executes on its own thread (``RUN_STACK_BYTES`` of stack);
+        this call waits for it. An interrupt while waiting (Ctrl+C) aborts the
+        Run and waits for it to end before it propagates; a second interrupt
+        stops the wait, and the Session stays busy until the Run ends.
+        """
         if not self._handle:
             raise RuntimeError("session is closed")
         if not self._run_lock.acquire(blocking=False):
             raise RuntimeError("a Run is already active on this session")
+        started = False
         try:
             arena = n.ViewArena()
             run_input = n.RunInput(struct_size=ctypes.sizeof(n.RunInput), kind_code=n.RUN_INPUT_TEXT)
@@ -516,36 +632,54 @@ class Session:
             self._run_on_event = on_event
             self._callback_error = None
             self._active_run_id = run_id
-            try:
-                status = self._lib.api.session.contents.run_input(
-                    self._handle,
+            handle = self._handle
+
+            def close_interrupted() -> None:
+                self._lib.take_diagnostic(diagnostic)  # nobody reads this Run's result
+                self._finish_run()
+
+            call = _RunThread(
+                lambda: self._lib.api.session.contents.run_input(
+                    handle,
                     run_id,
                     ctypes.byref(run_input),
                     ctypes.byref(options),
                     ctypes.byref(result),
                     ctypes.byref(diagnostic),
-                )
-            finally:
-                self._active_run_id = 0
-                self._run_on_event = None
-            state, self._state = self._state, None
-            if self._callback_error is not None:
-                self._lib.take_diagnostic(diagnostic)
-                error, self._callback_error = self._callback_error, None
-                raise error
-            self._lib.check("session.run_input", status, diagnostic)
-            return RunResult(
-                text=state.final_text,
-                stop_reason=n.STOP_REASONS.get(result.stop_reason_code, str(result.stop_reason_code)),
-                turns=result.turns,
-                tool_calls=result.tool_calls,
-                usage=state.usage,
-                segments=state.segments,
-                input_accepted=result.input_accepted_count,
-                input_adopted=result.input_adopted_count,
+                ),
+                close_interrupted,
+                keep=(arena, run_input, options, result, diagnostic),
             )
+            call.start()
+            started = True
         finally:
-            self._run_lock.release()
+            if not started:
+                self._finish_run()
+        # From here the Run is closed exactly once: by _RunThread on an
+        # interrupt, otherwise below.
+        call.wait(self._abort_active)
+        try:
+            state = self._state
+            callback_error = self._callback_error
+        finally:
+            self._finish_run()
+        if call.error is not None:
+            self._lib.take_diagnostic(diagnostic)
+            raise call.error
+        if callback_error is not None:
+            self._lib.take_diagnostic(diagnostic)
+            raise callback_error
+        self._lib.check("session.run_input", call.status, diagnostic)
+        return RunResult(
+            text=state.final_text,
+            stop_reason=n.STOP_REASONS.get(result.stop_reason_code, str(result.stop_reason_code)),
+            turns=result.turns,
+            tool_calls=result.tool_calls,
+            usage=state.usage,
+            segments=state.segments,
+            input_accepted=result.input_accepted_count,
+            input_adopted=result.input_adopted_count,
+        )
 
     def stream(self, prompt: str, *, max_turns: Optional[int] = None) -> "EventStream":
         """Run ``prompt`` on a background thread and iterate over its events.
@@ -576,6 +710,27 @@ class Session:
         )
         self._lib.check("session.submit_input", status, diagnostic)
         return receipt.sequence
+
+    def update_credential(self, api_key: str) -> None:
+        """Replace the provider credential in place (AgentCore Revision 25).
+
+        Every request sent after this returns uses ``api_key``: the next turn
+        of a Run already going, a retry, a compaction, a Skill, a request
+        still waiting for a connection. A request already sent keeps the old
+        key and is not interrupted. Safe from any thread and from this Session's own
+        callbacks (a host tool, ``on_event``, ``on_ui_request``). The provider,
+        endpoint and model stay. ``api_key`` is 1 to 16384 bytes of printable
+        ASCII; anything else raises AgentCoreError and keeps the previous key.
+        """
+        arena = n.ViewArena()
+        diagnostic = n.OwnedBytes()
+        with self._handle_lock:
+            if not self._handle:
+                raise RuntimeError("the Session is closed")
+            status = self._lib.api.session.contents.update_credential(
+                self._handle, arena.view(api_key), ctypes.byref(diagnostic)
+            )
+        self._lib.check("session.update_credential", status, diagnostic)
 
     def describe(self) -> Dict[str, Any]:
         """The Session's description as AgentCore reports it (JSON)."""
@@ -620,7 +775,9 @@ class Session:
         ``aborted``. The handle is dropped only once AgentCore has destroyed
         the Session; on a refusal it is kept, so the Session stays usable and
         ``close()`` can be retried. Calling it from one of this Session's own
-        callbacks raises RuntimeError: that callback's Run could never return.
+        callbacks, or from a callback of a child Session's Run that one of
+        them started, raises RuntimeError: that callback's Run could never
+        return.
         """
         if not self._handle:
             return
@@ -637,9 +794,11 @@ class Session:
             if not self._handle:
                 return
             diagnostic = n.OwnedBytes()
-            status = self._lib.api.session.contents.destroy(self._handle, ctypes.byref(diagnostic))
+            with self._handle_lock:
+                status = self._lib.api.session.contents.destroy(self._handle, ctypes.byref(diagnostic))
+                if status == n.STATUS_OK:
+                    self._handle = ctypes.c_void_p()
             if status == n.STATUS_OK:
-                self._handle = ctypes.c_void_p()
                 if self in self._runtime._sessions:
                     self._runtime._sessions.remove(self)
             self._lib.check("session.destroy", status, diagnostic)

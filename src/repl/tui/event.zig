@@ -115,7 +115,6 @@ pub const SetToolEvent = struct { name: []const u8, start_ms: i64 };
 pub const ToolCardEvent = struct { id: []const u8, name: []const u8, input: []const u8 = "", start_ms: i64 };
 pub const ClearCardEvent = struct { id: []const u8 };
 pub const ToolProgressEvent = struct { id: []const u8, text: []const u8 };
-pub const PhaseChangeEvent = struct { to: ui_state.Phase };
 pub const EditorViewEvent = struct { view: []const u8, cursor: usize };
 
 /// 所有 UI 事件。闭合 union → dispatch 的 switch 漏分支编译报错(漏接线编译失败,非运行时静默)。
@@ -131,7 +130,8 @@ pub const Event = union(enum) {
     clear_current_tool,
     add_tool_card: ToolCardEvent,
     clear_tool_card: ClearCardEvent,
-    phase_change: PhaseChangeEvent,
+    /// 阶段边界(#330):旧阶段拥有的全部状态随它的 payload 一起销毁,新阶段从 entry 参数重建。
+    phase_change: ui_state.PhaseEntry,
     editor_view: EditorViewEvent,
 };
 
@@ -141,8 +141,6 @@ pub const Effect = struct {
     redraw_region: bool = false,
     /// 有文本进 scrollback(text_chunk);Renderer 负责 erase→print→redraw。
     emit_scroll: ?[]const u8 = null,
-    /// 立即重画(不被 tick/队列延迟)——工具进度快速路径。
-    immediate: bool = false,
     /// 非渲染语义动作,交主循环处理。
     action: LoopAction = .none,
     /// nav 方向:true=down(下/选下一个),false=up。仅 action==.at_nav/.model_nav 时有意义。

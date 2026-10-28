@@ -269,7 +269,12 @@ pub const ControlPlaneEvent = struct {
 /// window is told so, and re-reads a fresh snapshot instead of receiving a
 /// silently incomplete replay.
 pub const EventJournal = struct {
-    entries: [MAX_EVENTS]ControlPlaneEvent = undefined,
+    /// No default, so a journal is spelled `.{ .entries = undefined }`. A
+    /// `.{}` journal is one comptime-known value, which Zig 0.16 copies from
+    /// a read-only constant the size of the whole ring (138 KiB, the undefined
+    /// slots written out as zeros); naming the field makes it store the
+    /// header fields one by one and leave the ring alone.
+    entries: [MAX_EVENTS]ControlPlaneEvent,
     len: usize = 0,
     next_sequence: u64 = 1,
     /// Sequence of the oldest retained event.
@@ -378,10 +383,10 @@ pub const Kernel = struct {
     /// change it.
     turn_snapshot: ?RuntimeSelection = null,
 
-    journal: EventJournal = .{},
+    journal: EventJournal,
 
     pub fn init(allocator: std.mem.Allocator, catalog: *const OfferCatalog) Kernel {
-        return .{ .allocator = allocator, .catalog = catalog };
+        return .{ .allocator = allocator, .catalog = catalog, .journal = .{ .entries = undefined } };
     }
 
     pub fn deinit(self: *Kernel) void {

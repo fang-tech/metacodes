@@ -11,7 +11,7 @@ artifact store, and TinyKG admission are not replaceable extensions.
 | CLI | `metacodes-<version>-<target-id>/bin/metacodes` (the release unit, `release/LAYOUT.md`; `zig-out/bin/metacodes` in a development tree) | pre-1.0 | flags may evolve with changelog notice; `manifest.json` records version, commit, target, contract numbers and every file's digest |
 | Provider control plane | `src/provider/` kernel API | experimental | schema-versioned documents and revisioned mutations |
 | Zig source API | `@import("metacodes-core")` | experimental | pin repository commit and Zig toolchain |
-| AgentCore C ABI | `metask_agentcore_get_api(1)` | experimental rev 24 | exact root/child layouts and bundle manifest |
+| AgentCore C ABI | `metask_agentcore_get_api(1)` | experimental rev 25 | exact root/child layouts and bundle manifest |
 | Python package | `import metacodes` ([sdk/python](../sdk/python/README.md)) | experimental, unpublished | speaks exactly the AgentCore ABI revision it was built for and refuses any other |
 | Node package | `require('metacodes')` ([sdk/node](../sdk/node/README.md)) | experimental, unpublished; macOS and Linux | same exact-revision rule; the addon is rebuilt per platform |
 | Process plugins | strict manifest + stdio protocol | versioned v1 | reject unknown fields and digest drift |
@@ -588,6 +588,7 @@ unless noted.
 | `GET /events` | SSE stream of the session's wire lines ([Wire lines](#wire-lines-for-out-of-process-hosts): ids `<epoch>-<seq>`, `Last-Event-ID` or `?since=<seq>&epoch=<epoch>`, `event: resync`). |
 | `POST /message` | `{"text":"..."}`: queue a prompt; echoed as `user_message`. |
 | `POST /respond` | `{"id":N,...}`: answer the pending `ui_request` N; 409 when N is not pending. |
+| `POST /capabilities` | The frontend's [capability frame](WIRE_PROTOCOL.md#2-capability-exchange): `200` with the `capabilities_accepted` line (also journaled), `400` with `capabilities_refused` (nothing changes). From then on a UI request the frame leaves out is journaled as `ui_request_unavailable` and never announced. |
 | `POST /command` | `{"cmd":"/verb ..."}`: queue a [service verb](#session-command-surface-ui-neutral); the result arrives as `command_result`. |
 | `POST /interrupt` | Interrupt the running generation; 409 when idle. |
 | `GET /state` | Session snapshot (model, mode, usage, journal epoch and seq, ...). |
@@ -703,13 +704,14 @@ mutate a live Session's tool catalog directly.
 ### Session configuration classes
 
 Each setting belongs to the Session that was configured with it, and changes
-in one of four ways:
+in one of five ways:
 
 | Class | Settings | How it changes |
 |---|---|---|
 | Idle-mutable | model, permission mode, imported permission rules, prompt profile, reasoning effort, additional directories | `setModel`, `setPermissionMode`, `updatePermissionRules`, `setPromptProfile`, `setReasoningEffort`, `setAdditionalDirectories`. Only while idle (`error.SessionBusy` otherwise). Input is validated before the Session changes; on error the previous value stays in force. The next Run uses the new value. |
+| Live-replaceable | API key (the provider credential) | `updateCredential`, idle or during a Run, from any thread or from the Session's own callbacks; never `error.SessionBusy`, and refused only for a poisoned Session or an invalid candidate. Create and restore apply the same rule to `SessionConfig.api_key` (1 to 16 KiB of printable ASCII; `error.InvalidCredentialByte`, `error.EmptyCredential`, `error.CredentialTooLong`). The candidate is validated and copied before anything changes; a refusal keeps the previous credential. A request reads the credential when it is sent (once it holds its connection slot), so every request sent after the call returns uses the new credential, retries, tool providers built earlier and requests still waiting for a connection included; one already sent keeps the old one. See [Credential updates](AGENTCORE_BINARY_ABI.md#credential-updates). |
 | Runtime generation | built-in tool set, static and process plugins, provider dialects | `RuntimeHost.replace`. Sessions created afterwards use the new generation; existing Sessions stay on theirs. To move a Session, persist it and restore it with `createRestoredSession` on the new generation. |
-| Fixed at create | provider kind, OpenAI protocol, auth scheme, API key, base URL, workspace root/home/state root/shell, artifact store, run journal | Create a new Session, restoring the conversation from a checkpoint or transcript. |
+| Fixed at create | provider kind, OpenAI protocol, auth scheme, base URL, workspace root/home/state root/shell, artifact store, run journal | Create a new Session, restoring the conversation from a checkpoint or transcript. |
 | Identity | Session ID | Never; a restore reuses it. |
 
 `SessionConfig.reasoning_effort` is carried by every provider request and kept
@@ -718,7 +720,7 @@ non-null value with `error.AgentEffortUnsupportedProvider`.
 `WorkspaceConfig.additional_dirs` widens exactly what the workspace root grants:
 `accept_edits` auto-approval of Write/Edit/NotebookEdit and sandboxed shell
 writes. It is not named in the system prompt. These two are source-level only;
-AgentCore revision 24 does not carry them.
+AgentCore revision 25 does not carry them.
 
 ### Permission modes the settings disable
 
@@ -763,15 +765,45 @@ with the schema version `v` (currently 1) and a `type`:
 {"v":1,"type":"<CoreEvent tag>","data":<payload or null>}
 {"v":1,"type":"ui_request","id":N,"kind":"permission|ask_question|custom","request":{...}}
 {"v":1,"type":"ui_request_closed","id":N,"outcome":"answered|cancelled|malformed"}
+{"v":1,"type":"ui_request_unavailable","kind":"...","custom_kind":"...","reason":"..."}
+{"v":1,"type":"capabilities_accepted",...}
 ```
+
+The normative contract, including which changes keep v1 and which bump
+`SCHEMA_VERSION`, is [WIRE_PROTOCOL.md](WIRE_PROTOCOL.md).
+
+A frontend may open its channel with a **capability frame** naming the UI
+requests it renders (`wire.parseCapabilities`, `wire.acceptCapabilities`):
+
+```json
+{"v":1,"type":"capabilities","ui_requests":["permission","ask_question"],"custom":["video_timeline@1"],"events":["text_chunk"]}
+```
+
+Custom kinds carry their version (`<name>@<major>`) and match exactly. Once a
+frame is installed, a request it leaves out is not announced: the Host
+journals `ui_request_unavailable` (reason `kind_not_declared`,
+`custom_kind_not_declared` or `custom_kind_unversioned`) and the tool gets
+`RequestOutcome.unrenderable` at once: it fails as without a UI
+(`AskUserQuestion` fails with `FrontendCannotRender`, `requestUiCustom`
+returns `CustomUiUnsupported`, a permission prompt is denied with no terminal
+fallback), and the tool result tells the model the frontend cannot render the
+request rather than that the user refused it. A Zig Host that switches over
+`RequestOutcome` handles the fourth value. A frame of another version, or a malformed one,
+is answered `{"v":1,"type":"capabilities_refused","reason":"<RefusalError>"}`
+and changes nothing. A frontend that never declares receives every request,
+as before; in-process backends (TUI, headless, the C ABI) never declare.
+`frontend_capabilities.route` is the routing rule and `Slot` the per-Session
+holder a Host keeps.
 
 `wire.parseResponse` turns the client's answer (`{"choice":...}`,
 `{"answers":[...]}` or `{"result":...}`) back into a `UiResponse`; anything
 malformed or of another version is answered as a cancellation, never as a
 grant, and closes as `malformed`. An answer that races an interrupt or close
 loses: it is refused or discarded and the request closes as `cancelled`. `tests/fixtures/wire/v1` pins one line for every event tag and request
-kind and doubles as conformance vectors for Hosts in other languages. The
-bundled `--web` UI consumes exactly these lines.
+kind, plus capability frames with core's reply to each, and doubles as
+conformance vectors for Hosts in other languages. The bundled `--web` UI
+consumes exactly these lines and declares `permission` and `ask_question`
+when it loads.
 
 The `--web` server streams these lines over SSE with ids `<epoch>-<seq>`. The
 epoch names the event journal; a restarted host or a rebuilt session has a new
@@ -858,6 +890,7 @@ connecting or reconnecting:
 | `model`, `permission_mode` | In force now; the mode as `default`, `accept_edits`, `auto`, `dont_ask` or `bypass_permissions`. |
 | `generating` | A turn or a command is running. |
 | `pending_request_id` | The UI request waiting for `POST /respond`, `0` when none. |
+| `frontend_capabilities` | The declaration in force (the last `capabilities_accepted` object), `null` while no frontend declared: every request is then announced. |
 
 It also carries `session_id`, `additional_dirs`, token usage and cost, the
 agent roster, tasks and `plugin_inventory`.
@@ -886,6 +919,12 @@ leaving every Host to rebuild them:
   Session's `journal` as a wire line; CoreEvents carry `run_id` and the
   submission's `trace_id`. `respond(id, json)` answers a UI request;
   anything but the pending id is `error.NoSuchRequest`.
+- `declareCapabilities(allocator, frame)` installs the client's capability
+  frame ([WIRE_PROTOCOL.md](WIRE_PROTOCOL.md#2-capability-exchange)) and
+  returns, and journals, its `capabilities_accepted` line; a refused frame
+  is a `wire.DeclareError` and changes nothing. A UI request the declaration
+  leaves out is journaled as `ui_request_unavailable` and answered
+  `unavailable` without waiting.
 - `interrupt` aborts the Run (or the one being admitted) and answers a
   pending UI request as cancelled. A Session the kernel poisoned reports
   `session_poisoned`, drops its queue and refuses further work; close and
@@ -918,14 +957,14 @@ The source-free bundle is one coordinate root: `sdk/metask/agentcore.h`
 (C11/C++17), the `sdk/zig` and `sdk/rust` bindings, one target-specific static
 library, the manifest-pinned ripgrep runtime asset, and a manifest whose file
 allow-list and SHA-256 values are mandatory. Consumers call only
-`metask_agentcore_get_api(METASK_AGENTCORE_ABI_V1)` and must validate ABI revision 24,
+`metask_agentcore_get_api(METASK_AGENTCORE_ABI_V1)` and must validate ABI revision 25,
 the exact 80-byte root, all seven mandatory typed tables, reserved zeros, function
 slots, and the schema-1 bundle manifest. The ABI is experimental, with no
 compatibility shim between revisions: pin a bundle, not only a semantic version.
 What the seven tables cover, provider protocol selection, the `on_event`
 observation stream and its visible-output tags, input submitted to an active
 Run (`session->submit_input`, the `input_adopted` event and the `RunResultV1`
-input counts), the Session goal (the `goal` table, goal-continuation Runs, the
+input counts), the in-place credential update (`session->update_credential`), the Session goal (the `goal` table, goal-continuation Runs, the
 `goal_updated` event), the host-scheduled team (`enable_teams`, the `team`
 config, and the `team` table's `describe` and `poll`), process plugins, Host streaming tools, journal profiles,
 and the Completion boundary are specified once in

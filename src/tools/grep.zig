@@ -16,10 +16,20 @@ const STDERR_CAPTURE_BYTES: usize = 64 * 1024;
 /// pagination and navigation prefixes are rendered into a second bounded
 /// capture, while an unmodified full result can become a CAS receipt directly.
 pub fn executeBody(ctx: *const ToolContext, args: []const u8) anyerror!ToolResultBody {
+    var body: ToolResultBody = undefined;
+    try executeBodyInto(&body, ctx, args);
+    return body;
+}
+
+/// `executeBody` writing its result to `out`. In a function returning a
+/// ToolResultBody, each `return error.X` would copy a 3.7 KiB constant, one
+/// per error name (doc/PERF_MEMORY_PRINCIPLES.md §3g).
+fn executeBodyInto(out: *ToolResultBody, ctx: *const ToolContext, args: []const u8) anyerror!void {
     const artifact_id = common.extractJsonArg(args, "artifact_id");
     if (ctx.artifact_root.len == 0) {
         if (artifact_id != null) return error.ArtifactStoreRequired;
-        return ToolResultBody.initInline(try execute(ctx, args));
+        out.* = .initInline(try execute(ctx, args));
+        return;
     }
 
     const allocator = ctx.allocator;
@@ -200,7 +210,7 @@ pub fn executeBody(ctx: *const ToolContext, args: []const u8) anyerror!ToolResul
     defer if (prefix) |value| allocator.free(value);
     const needs_projection = used_note != null or prefix != null or head_limit != 0 or offset != 0;
     if (!needs_projection) {
-        return result_spool.finishCaptureAsBody(
+        out.* = try result_spool.finishCaptureAsBody(
             allocator,
             ctx.artifact_root,
             &spawned.stdout,
@@ -208,6 +218,7 @@ pub fn executeBody(ctx: *const ToolContext, args: []const u8) anyerror!ToolResul
             spawned.capture_complete,
             ctx.result_budget,
         );
+        return;
     }
 
     var projected = try artifact_store.Capture.begin(
@@ -224,7 +235,7 @@ pub fn executeBody(ctx: *const ToolContext, args: []const u8) anyerror!ToolResul
         try paginateCapture(&spawned.stdout, &projected, offset, head_limit);
     }
     try projected.seal();
-    return result_spool.finishCaptureAsBody(
+    out.* = try result_spool.finishCaptureAsBody(
         allocator,
         ctx.artifact_root,
         &projected,

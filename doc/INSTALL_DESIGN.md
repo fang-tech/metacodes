@@ -187,7 +187,13 @@ Git Bash on Windows), builds both kernels natively with their scripts (axiom
 audit, native smoke, `check_kernel_self_contained.py`, provenance), and builds
 the executable with the kernel digests pinned (`scripts/kernel_pins.py`). The
 kernels link the Lean runtime, GMP and libuv statically; their licence texts
-ship under `share/licenses/` (vendor/lean-runtime/). aarch64-linux stays a
+ship under `share/licenses/` (vendor/lean-runtime/). The executable is built
+for an explicit target, not the runner's own: the baseline CPU and the oldest
+glibc or macOS the platform supports (`doc/RELEASE_RUNNER.md`, "CLI target").
+Built for the runner, the 0.8.0 units needed GLIBC_2.36 and AVX2 on x86_64
+Linux, AVX-512 on Windows and macOS 26.6 on aarch64 macOS. The kernels were
+never affected: Lean builds them for the baseline CPU, and they need GLIBC_2.14
+at most. aarch64-linux stays a
 cross-staged asset check until a native aarch64 runner can build its kernels. `release/LAYOUT.md`,
 `release/manifest.schema.json` and `scripts/verify_install_prefix.py` list the
 kernels and `tinykgd` as required runtime assets.

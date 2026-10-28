@@ -112,6 +112,17 @@ pub fn isRegionRow(text: []const u8) bool {
     return isPromptRow(text) or isRuleRow(text);
 }
 
+/// The clock of every `Term` that runs with the merge window on. Only
+/// `Term.sync` moves it, and only to the deadline of a frame that waits: a
+/// frame is painted at the clock's time, so the next request after it always
+/// falls inside the window.
+pub const MergeClock = struct {
+    var now: i64 = 1_000_000;
+    pub fn read() i64 {
+        return now;
+    }
+};
+
 /// A RenderRegion wired to a virtual terminal of the given size.
 /// Heap-pinned: the region's sink points into it.
 pub const Term = struct {
@@ -120,11 +131,22 @@ pub const Term = struct {
     region: RenderRegion,
     screen: vterm.Screen,
     fed: usize = 0,
+    merging: bool = false,
 
     pub const Options = struct {
         rows: usize = 24,
         cols: usize = 80,
         autowrap: bool = false,
+        /// Run the generating region with the merge window on (#328), on
+        /// `MergeClock` and without the timer thread. Every request after a
+        /// painted frame waits for the window (only a phase's first frame and
+        /// the immediate channel paint at once), and `sync` paints it, as the
+        /// timer would at the window's end: what a test sees after a sync is
+        /// the merged frame, not each request's own.
+        merge_window: bool = false,
+        /// The region's own allocator (its frame buffer, pending text);
+        /// `gpa` when null. The screen and the byte sink always use `gpa`.
+        region_gpa: ?std.mem.Allocator = null,
     };
 
     pub fn create(gpa: std.mem.Allocator, opts: Options) !*Term {
@@ -135,7 +157,7 @@ pub const Term = struct {
             .out = .init(gpa),
             // fd -1 has no size: the region keeps the geometry set below and
             // never sees a resize.
-            .region = RenderRegion.init(gpa, -1, cc.tui_theme.select(.dark, .basic_16), .basic_16),
+            .region = RenderRegion.init(opts.region_gpa orelse gpa, -1, cc.tui_theme.select(.dark, .basic_16), .basic_16),
             .screen = undefined,
         };
         errdefer {
@@ -146,6 +168,10 @@ pub const Term = struct {
         self.region.rows = @intCast(opts.rows);
         self.region.cols = @intCast(opts.cols);
         self.region.sink = &self.out.writer;
+        if (opts.merge_window) {
+            self.region.merge = .{ .now_ms = MergeClock.read, .timer = false };
+            self.merging = true;
+        }
         return self;
     }
 
@@ -159,8 +185,15 @@ pub const Term = struct {
     /// Replay what the region wrote since the last sync, through the tty's
     /// output processing: the REPL's raw mode keeps OPOST|ONLCR (and the
     /// Windows console auto-returns on LF), so every LF reaches the terminal
-    /// as CR LF.
+    /// as CR LF. With the merge window on, a frame waiting for the window is
+    /// painted first, at the window's end.
     pub fn sync(self: *Term) !void {
+        if (self.merging) {
+            if (self.region.merge) |m| if (m.sched.deadline()) |due| {
+                MergeClock.now = @max(MergeClock.now, due);
+            };
+            _ = self.region.pumpFrame();
+        }
         const bytes = self.out.written();
         var rest = bytes[self.fed..];
         self.fed = bytes.len;
@@ -170,6 +203,16 @@ pub const Term = struct {
             rest = rest[nl + 1 ..];
         }
         try self.screen.feed(rest);
+    }
+
+    /// Resize the terminal, as a SIGWINCH would: the screen reflows (or clips)
+    /// what it shows now, and the region sees the new size the next time it
+    /// measures (`RenderRegion.size_override`).
+    pub fn resize(self: *Term, rows: usize, cols: usize, reflow: bool) !void {
+        try self.sync();
+        try self.screen.resize(rows, cols, reflow);
+        self.region.reflows = reflow;
+        self.region.size_override = .{ .rows = @intCast(rows), .cols = @intCast(cols) };
     }
 
     /// Every byte the region has written so far.

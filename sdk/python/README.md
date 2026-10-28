@@ -54,7 +54,12 @@ callback. `RunResult.text` is the final answer rebuilt from the
 event vocabulary is listed in
 [doc/AGENTCORE_BINARY_ABI.md](../../doc/AGENTCORE_BINARY_ABI.md).
 `session.abort()` stops the active run and `session.submit(text)` adds user
-input to it; both may be called from another thread.
+input to it; both may be called from another thread. Each run executes on its
+own thread; Ctrl+C while `run()` waits aborts the run and waits for it to stop.
+`session.update_credential(api_key)` replaces the provider key in place, while
+idle or during a run, from any thread or from inside a tool or handler: every
+request sent afterwards (the run's next turn, a retry) carries it, and a
+request already sent keeps the old one. The provider, endpoint and model stay.
 
 `session.close()`, and leaving a `with` block, aborts a run that is still going
 and waits for it first. That includes a `stream()` the loop stopped early with
@@ -70,8 +75,9 @@ The handle is dropped only once AgentCore has destroyed the Session. If
 AgentCore refuses, `close()` raises and the Session stays usable. One of the
 Session's own callbacks (its event listener, `on_ui_request`, or a tool
 running in its run) cannot close it, since that run could never return:
-`close()` raises RuntimeError there. Opening and closing a different Session
-from a tool is fine.
+`close()` raises RuntimeError there. The same holds for the callbacks of a
+child Session's run that such a tool started. Opening and closing a different
+Session from a tool is fine.
 
 ## Permissions
 
@@ -119,5 +125,5 @@ network, no API key. Without a library they skip, unless
 
 Experimental, like the AgentCore ABI it wraps: the package pins one exact ABI
 revision and follows it. Not yet published to PyPI; build the wheel as above.
-Windows is untested. Skills, MCP, checkpoints, goals and teams exist in
+Windows is not covered by CI. Skills, MCP, checkpoints, goals and teams exist in
 the ABI but are not wrapped yet; contributions welcome.

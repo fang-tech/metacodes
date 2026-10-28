@@ -107,11 +107,19 @@ test "mock backend: poll 按序产出 UiEvent" {
 // ---------------------------------------------------------------------------
 
 fn makeRegion(allocator: std.mem.Allocator) !render_region.RenderRegion {
-    // /dev/null fd:getSize 失败回退 24x80;generating=false 故 emit 不写终端。
+    // /dev/null fd:getSize 失败回退 24x80。固定区从未画过(无 gen_app),emit 不重画区。
     const fd = pfs.open(ppaths.null_device, .{ .ACCMODE = .WRONLY }, 0);
     if (fd < 0) return error.OpenDevNull;
     const th = theme_mod.select(.dark, .none);
-    return render_region.RenderRegion.init(allocator, fd, th, .none);
+    var region = render_region.RenderRegion.init(allocator, fd, th, .none);
+    // 工具事件只在回复期间到达,工具状态归生成期所有(#330):进入一个回复阶段,
+    // 走公开的 phase_change 事件(enterGenerating 需要真 App)。
+    _ = cc.tui_ui.dispatch(&region.ui, .{ .phase_change = .{ .generating = .{} } });
+    return region;
+}
+
+fn tools(region: *render_region.RenderRegion) *cc.tui_ui_state.ToolsState {
+    return &region.ui.phase.generating.tools;
 }
 
 test "TuiBackend.emit: set_current_tool / clear_current_tool → spinner 状态" {
@@ -121,10 +129,10 @@ test "TuiBackend.emit: set_current_tool / clear_current_tool → spinner 状态"
     const be = tb.backend();
 
     be.emitEvent(S, .{ .set_current_tool = .{ .name = "Grep" } });
-    try testing.expectEqualStrings("Grep", region.ui.tools.currentSlice());
+    try testing.expectEqualStrings("Grep", tools(&region).currentSlice());
 
     be.emitEvent(S, .clear_current_tool);
-    try testing.expectEqual(@as(usize, 0), region.ui.tools.currentSlice().len);
+    try testing.expectEqual(@as(usize, 0), tools(&region).currentSlice().len);
 }
 
 test "TuiBackend.emit: tool_start(普通工具)→ backend 自决喂 spinner(spinner_fed)" {
@@ -134,10 +142,10 @@ test "TuiBackend.emit: tool_start(普通工具)→ backend 自决喂 spinner(spi
     const be = tb.backend();
     be.emitEvent(S, .{ .tool_start = .{ .id = "x", .name = "Grep", .input = "{}" } });
     // 层泄漏修复后:spinner 喂归 backend。普通工具(showStartCard,非进度卡)→ 喂第一个。
-    try testing.expectEqualStrings("Grep", region.ui.tools.currentSlice());
+    try testing.expectEqualStrings("Grep", tools(&region).currentSlice());
     // clear_current_tool 重置 spinner_fed,清当前工具。
     be.emitEvent(S, .clear_current_tool);
-    try testing.expectEqual(@as(usize, 0), region.ui.tools.currentSlice().len);
+    try testing.expectEqual(@as(usize, 0), tools(&region).currentSlice().len);
 }
 
 test "TuiBackend.emit: tool_start(WebSearch) → backend 自决进度卡 addToolCard + progress + clear" {
@@ -147,14 +155,14 @@ test "TuiBackend.emit: tool_start(WebSearch) → backend 自决进度卡 addTool
     const be = tb.backend();
 
     be.emitEvent(S, .{ .tool_start = .{ .id = "ws1", .name = "WebSearch", .input = "{}" } });
-    try testing.expectEqual(@as(u8, 1), region.ui.tools.cards_len);
-    try testing.expectEqualStrings("WebSearch", region.ui.tools.cards[0].nameSlice());
+    try testing.expectEqual(@as(u8, 1), tools(&region).cards_len);
+    try testing.expectEqualStrings("WebSearch", tools(&region).cards[0].nameSlice());
 
     be.emitEvent(S, .{ .tool_progress = .{ .id = "ws1", .text = "Found 3" } });
-    try testing.expectEqualStrings("Found 3", region.ui.tools.cards[0].progressSlice());
+    try testing.expectEqualStrings("Found 3", tools(&region).cards[0].progressSlice());
 
     be.emitEvent(S, .{ .tool_result = .{ .id = "ws1", .name = "WebSearch", .input = "{}", .content = "", .is_error = false } });
-    try testing.expectEqual(@as(u8, 0), region.ui.tools.cards_len);
+    try testing.expectEqual(@as(u8, 0), tools(&region).cards_len);
 }
 
 test "TuiBackend.emit: 类A(Bash)live card 两态 + 单条 tool_result 即 commit(P2.1 收敛)" {
@@ -173,9 +181,9 @@ test "TuiBackend.emit: 类A(Bash)live card 两态 + 单条 tool_result 即 commi
     be.emitEvent(S, .{ .tool_start = .{ .id = "b1", .name = "Bash", .input =
         \\{"command":"echo hi"}
     } });
-    try testing.expectEqual(@as(u8, 1), region.ui.tools.cards_len);
-    try testing.expectEqualStrings("Bash", region.ui.tools.cards[0].nameSlice());
-    try testing.expectEqualStrings("Bash", region.ui.tools.currentSlice()); // spinner 也喂了
+    try testing.expectEqual(@as(u8, 1), tools(&region).cards_len);
+    try testing.expectEqualStrings("Bash", tools(&region).cards[0].nameSlice());
+    try testing.expectEqualStrings("Bash", tools(&region).currentSlice()); // spinner 也喂了
 
     // 单条 tool_result(真 content)→ commit + 清卡。
     be.emitEvent(S, .{ .tool_result = .{ .id = "b1", .name = "Bash", .input =
@@ -183,7 +191,7 @@ test "TuiBackend.emit: 类A(Bash)live card 两态 + 单条 tool_result 即 commi
     , .content =
         \\{"stdout":"hi\n","exit_code":0}
     , .is_error = false, .elapsed_ms = 100 } });
-    try testing.expectEqual(@as(u8, 0), region.ui.tools.cards_len); // 卡已 commit 移除
+    try testing.expectEqual(@as(u8, 0), tools(&region).cards_len); // 卡已 commit 移除
 }
 
 test "TuiBackend.emit: 空 content 的类A tool_result 也 commit(P2.1 修空输出工具不渲染的潜藏坑)" {
@@ -199,13 +207,13 @@ test "TuiBackend.emit: 空 content 的类A tool_result 也 commit(P2.1 修空输
     be.emitEvent(S, .{ .tool_start = .{ .id = "b2", .name = "Bash", .input =
         \\{"command":"true"}
     } });
-    try testing.expectEqual(@as(u8, 1), region.ui.tools.cards_len);
+    try testing.expectEqual(@as(u8, 1), tools(&region).cards_len);
 
     // 空 content 的单条 tool_result 也应 commit(不再被吞)。
     be.emitEvent(S, .{ .tool_result = .{ .id = "b2", .name = "Bash", .input =
         \\{"command":"true"}
     , .content = "", .is_error = false, .elapsed_ms = 5 } });
-    try testing.expectEqual(@as(u8, 0), region.ui.tools.cards_len); // 空输出也 commit 移除
+    try testing.expectEqual(@as(u8, 0), tools(&region).cards_len); // 空输出也 commit 移除
 }
 
 test "TuiBackend.emit: usage 累加进 usage_acc" {
@@ -313,6 +321,61 @@ test "TuiBackend.poll: 取走的消息进 readline 历史(与 Run 之间消费�
     try testing.expectEqual(@as(usize, 1), hist.len());
     const back = (try hist.prev("")) orelse return error.NoEvent;
     try testing.expectEqualStrings("remember me", back);
+}
+
+/// Hands every allocation to `backing`; on each free, counts whether the
+/// region's generating input box was still showing a draft at that moment.
+const DraftFreeProbe = struct {
+    backing: std.mem.Allocator,
+    region: *render_region.RenderRegion,
+    frees: usize = 0,
+    freed_while_shown: usize = 0,
+
+    fn allocator(self: *DraftFreeProbe) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *DraftFreeProbe = @ptrCast(@alignCast(ctx));
+        return self.backing.rawAlloc(len, alignment, ret_addr);
+    }
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        const self: *DraftFreeProbe = @ptrCast(@alignCast(ctx));
+        return self.backing.rawResize(memory, alignment, new_len, ret_addr);
+    }
+    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        const self: *DraftFreeProbe = @ptrCast(@alignCast(ctx));
+        return self.backing.rawRemap(memory, alignment, new_len, ret_addr);
+    }
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *DraftFreeProbe = @ptrCast(@alignCast(ctx));
+        self.frees += 1;
+        if (self.region.ui.phase.generating.interaction.editor.view.len != 0) self.freed_while_shown += 1;
+        self.backing.rawFree(memory, alignment, ret_addr);
+    }
+};
+
+// On an error return the turn's deferred TuiBackend.deinit runs before the
+// generating phase is left, so the box may still be drawn after it. deinit
+// must take the draft off the box before freeing it: the probe sees every
+// free of the draft's buffers and checks the box at that moment. (A dialog's
+// stop and restart of the watcher is the pty case
+// test_reply_draft_survives_a_permission_dialog.)
+test "TuiBackend.deinit: the box no longer shows the draft when its buffers are freed" {
+    var region = try makeRegion(testing.allocator);
+    defer region.deinit();
+    var probe: DraftFreeProbe = .{ .backing = testing.allocator, .region = &region };
+    var tb = tui_backend.TuiBackend.init(&region);
+    // What startInput creates and a watcher publishes after typing.
+    tb.draft = cc.repl_input.LineEditor.init(probe.allocator());
+    try tb.draft.?.setLine("keep me");
+    region.setGenInput(tb.draft.?.view(), tb.draft.?.cursor);
+    try testing.expectEqualStrings("keep me", region.ui.phase.generating.interaction.editor.view);
+    const frees_before = probe.frees;
+
+    tb.deinit();
+    try testing.expect(tb.draft == null);
+    try testing.expect(probe.frees > frees_before); // the draft really went through the probe
+    try testing.expectEqual(@as(usize, 0), probe.freed_while_shown);
 }
 
 // ---------------------------------------------------------------------------

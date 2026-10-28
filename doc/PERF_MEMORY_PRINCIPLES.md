@@ -17,6 +17,13 @@
 两列都是 macOS Apple Silicon 上单机单次实测;10-18 一列的方法见
 [BENCHMARKS.md](BENCHMARKS.md#footprint-snapshot)。
 
+**Linux x86_64(2026-10-29,WSL2 Ubuntu 22.04,`scripts/perf_baseline.sh` 各 5 次)**:`main` @ `8060498d` 本机构建
+6.60 MB / `--help` RSS 3120 KB,glibc 2.31 + baseline CPU 构建 6.56 MB / 3088 KB,体积与 RSS 两条红线均超。
+按 §3g 修完(#379 与其后续)后分别为 6098 KB / 2272 KB 与 6078 KB / 2620 KB,两条红线都回到线内,但体积余量只有 0.7% / 1.1%;
+再去掉 Linux 的 `.eh_frame`(#381,§3f)后为 5797 KB / 2516 KB 与 5777 KB / 2684 KB,体积余量 5.6% / 6.0%。
+同一提交 Linux 比 macOS 大约 1 MB:arm64 默认开 LLVM MachineOutliner(x86_64 不开),`__text` 比 `.text` 小 1.6 MiB;
+macOS 保留的符号表(约 0.6 MB)抵掉一部分。`--help` RSS 的文件页部分随代码布局和内核页缓存而变(±0.2 MB)。
+
 对比 Claude Code(Node/TS):同机 2026-10-18 实测 Claude Code 2.1.278 `--help` 峰值 RSS 121 MB(仅进程底座,非会话)。cc-zig 已是**数量级优势**——目标是**守住并扩大**,绝不因功能堆叠回退。
 
 ## §2 量化目标指标(后续对标)
@@ -31,7 +38,11 @@
 
 > **重新标定(2026-10-18,owner 决定按实际情况)**:二进制已从 1.29 MB 长到 5.50 MB,超出初版
 > 1.5 MB 体积红线;体积红线改为 6 MiB,`scripts/perf_baseline.sh` 同步。启动(≤ 20 ms)、
-> 空闲 RSS(≤ 3 MB)与典型会话(≤ 30 MB)三条红线不变,实测均在线内。脚本仍未接入 CI。
+> 空闲 RSS(≤ 3 MB)与典型会话(≤ 30 MB)三条红线不变,实测均在线内。
+
+**CI 报告(#303)**:`ci.yml` 的 Linux 与 macOS `release` leg 各跑一次 `scripts/perf_baseline.sh --build`
+(体积、暖启动、空闲 RSS 三条红线),输出写进该 job 的 summary。目前只报告不阻塞
+(`continue-on-error`):超线或量不到时该 step 标红并发 warning,leg 仍为绿;攒够几周数据再决定是否改为阻塞。
 
 ## §3 设计原则(所有改动遵守)
 
@@ -65,6 +76,17 @@
   - 程序自身从不读它:ReleaseSmall 默认 strip,`std.Options.allow_stack_tracing` 因此为 false,panic 只打印消息;没有任何依赖导入 `_Unwind_*` / `pthread_cancel` / `pthread_exit`。帧指针保留,`libc.so.6` 自带 `.eh_frame`。
   - 取舍在外部调试工具:**没有符号文件时**,gdb 看 core 只能展开到第一个 Zig 帧,`perf --call-graph=dwarf`、systemd-coredump 这类靠 CFI 的展开也会退化;`perf --call-graph=fp` 照常可用。**有发布的同布局符号文件时**(同一次不 strip 构建,`objcopy --only-keep-debug` 留符号,`--strip-all` 出发布件),gdb 能完整展开、带函数名和源码行。
   - macOS 与 Windows 不变(Windows x64 的 SEH 必须有 unwind 数据)。
+
+### 3g. 大值类型的初始化与 `defer`(Zig 0.16 代码生成)
+- **现象**(2026-10-29 Linux x86_64 ReleaseSmall 实测):编译期整体已知的聚合值——字段默认值 `= .{}`、具名常量、带类型字面量 `T{ … }`、以及大载荷错误联合/optional/union 的 `return error.X` / `return null` / `return .tag`——被降级成"从只读常量 memcpy",其中 `undefined` 字节按 0 写进 `.rodata`。这类常量当时约 600 KB,最大一处是控制面事件环 138 KiB。
+- **写法**:含 KB 级数组/缓冲区的值,在构造点用结果位置写法并点名 `undefined` 字段:`var x: T = .{ .buf = undefined }`、`return .{ …, .journal = .{ .entries = undefined } }`;不用 `T{ … }`、`.{}` 或具名常量。必要时去掉大数组字段的默认值,让 `.{}` 编译不过。
+- **`defer` 体复制到作用域的每个出口**:出口多(几十上百个 `try`/`return`/`break`)的函数里,非平凡的 `defer` 块放进 `noinline` 函数,defer 只调用它。`runCounted` 的九个运行结束记录曾因此占 270 KB。改完以 `scripts/perf_baseline.sh` 实测为准:DWARF 行归因会把一个出口的整条清理链记在一行 `defer` 上。
+- **返回 KB 级结果的函数里不写字面量错误**:`ToolResultBody`、`RequestResult`、配置 `Document` 这类结果,每个 `return error.X`(以及 `orelse`/`catch` 里的)按错误名各落一份常量,当时合计约 320 KB。写法有三种:
+  - 主体写成 `fn fooInto(out: *T, …) !void`,成功时写 `out.*`;原函数留作 `var r: T = undefined; try fooInto(&r, …); return r;` 的包装。
+  - 前置检查放进不带载荷的 helper,用 `try`。
+  - 已在变量里的错误直接 `return err`,它不产生常量。
+
+  载荷较小(1–2 KiB)的这类常量仍有一些;新代码按上面写。
 
 ## §4 验证机制
 

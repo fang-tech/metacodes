@@ -124,6 +124,7 @@ pub const api_http_status = @import("api/http_status.zig");
 pub const api_error_class = @import("api/error_class.zig");
 pub const api_provider = @import("api/provider.zig"); // 多 provider vtable
 pub const api_provider_factory = @import("api/provider_factory.zig");
+pub const api_credential_cell = @import("api/credential_cell.zig"); // a Session's replaceable provider credential (#336)
 pub const api_metask_oauth = @import("api/metask_oauth.zig");
 pub const api_login_worker = @import("api/login_worker.zig"); // picker credential stage: a prepared login on a worker thread (#67)
 pub const api_capability = @import("api/capability.zig");
@@ -197,6 +198,7 @@ pub const protocol = struct {
     pub const ui_event = @import("core/protocol/ui_event.zig"); // CoreEvent, UiEvent, ConfigChange
     pub const ui_request = @import("core/protocol/ui_request.zig"); // UiRequest, UiResponse, UiRequestFn
     pub const wire = @import("core/protocol/wire.zig"); // versioned JSON lines for out-of-process Hosts
+    pub const frontend_capabilities = @import("core/protocol/frontend_capabilities.zig"); // what a cross-process frontend renders; request routing
     pub const PermissionChoice = @import("core/protocol/permission_choice.zig").PermissionChoice;
     pub const CHAT_SENTINEL = @import("core/protocol/chat_sentinel.zig").CHAT_SENTINEL;
 };

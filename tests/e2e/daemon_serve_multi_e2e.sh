@@ -97,6 +97,14 @@ stateB="$("${CURL[@]}" "${auth[@]}" "$url/s/$B/state")" || fail "GET B's /state 
 if grep -q '"permission_mode":"dont_ask"' <<<"$stateB"; then
   fail "A's /mode changed B"
 fi
+# A capability frame (doc/WIRE_PROTOCOL.md §2) belongs to its session alone.
+capsA="$("${CURL[@]}" "${auth[@]}" -X POST "$url/s/$A/capabilities" -H "Origin: $url" \
+  -d '{"v":1,"type":"capabilities","ui_requests":["permission"]}')" || fail "POST A's /capabilities failed"
+grep -q '"type":"capabilities_accepted","ui_requests":\["permission"\]' <<<"$capsA" || fail "A's frame not accepted: $capsA"
+stateA="$("${CURL[@]}" "${auth[@]}" "$url/s/$A/state")" || fail "GET A's /state failed"
+grep -q '"frontend_capabilities":{"v":1,"type":"capabilities_accepted"' <<<"$stateA" || fail "A's /state lacks its declaration"
+stateB="$("${CURL[@]}" "${auth[@]}" "$url/s/$B/state")" || fail "GET B's /state failed"
+grep -q '"frontend_capabilities":null' <<<"$stateB" || fail "A's declaration reached B: $stateB"
 
 # ── UDS + NDJSON: no token; the socket file's 0600 mode is the access control ─
 [[ -S "$usock" ]] || fail "UDS socket not created: $usock"
@@ -145,8 +153,14 @@ assert MARK not in "\n".join(bl), "UDS routing leak: A's message is in B's journ
 it = req({"op":"interrupt","session":B})
 assert '"ok":false' in it and "not generating" in it, "idle interrupt gate (S1) broken: "+it
 sg = req({"op":"message","session":B,"text":"SLOWGEN interrupt-me"}); assert '"ok":true' in sg
-time.sleep(0.7)  # the driver is now inside the mock's 2 s hold: B is generating
-it2 = req({"op":"interrupt","session":B})
+# Retried until the driver is inside the mock's 2 s hold: a loaded runner may
+# start the run later than any fixed sleep allows, and the gate refuses an
+# interrupt until B is generating.
+deadline = time.time() + 15
+while True:
+    it2 = req({"op":"interrupt","session":B})
+    if '"ok":true' in it2 or "not generating" not in it2 or time.time() >= deadline: break
+    time.sleep(0.2)
 assert '"ok":true' in it2, "interrupt while generating was refused: "+it2
 
 # The interrupt really ends the run as aborted.
@@ -162,9 +176,15 @@ rd_before = sum(1 for l in attach_lines(A, 0, 1) if '"run_done"' in l)
 assert '"ok":true' in req({"op":"message","session":A,"text":"multi-one-abc"})
 time.sleep(0.5)
 assert '"ok":true' in req({"op":"message","session":A,"text":"multi-two-def"})
-time.sleep(1.0)
-allA = attach_lines(A, 0, 2); joinedA = "\n".join(allA)
-rd_after = sum(1 for l in allA if '"run_done"' in l)
+# Polled to a deadline rather than read after a fixed sleep: two runs back to
+# back can take longer than a second on a loaded runner (#372's CI saw 2→2).
+deadline = time.time() + 20
+while True:
+    allA = attach_lines(A, 0, 1)
+    rd_after = sum(1 for l in allA if '"run_done"' in l)
+    if rd_after >= rd_before + 2 or time.time() >= deadline: break
+    time.sleep(0.3)
+joinedA = "\n".join(allA)
 assert rd_after >= rd_before + 2, "consecutive messages did not each run: %d→%d" % (rd_before, rd_after)
 assert "multi-one-abc" in joinedA and "multi-two-def" in joinedA, "a consecutive message echo is missing"
 

@@ -243,8 +243,16 @@ fn executeMcpTool(ctx: *const ToolContext, args: []const u8, ctx_ptr: ?*anyopaqu
     return try binding.client.callToolAbortable(binding.mcp_tool_name, args, ctx.abort);
 }
 
+/// The binding behind a registered MCP tool. Its own function so that the
+/// missing case is not a literal `return error.X` in a function returning a
+/// ToolResultBody, which would copy a 3.7 KiB constant
+/// (doc/PERF_MEMORY_PRINCIPLES.md §3g).
+fn mcpToolBinding(ctx_ptr: ?*anyopaque) error{MissingMcpBinding}!*McpToolBinding {
+    return @ptrCast(@alignCast(ctx_ptr orelse return error.MissingMcpBinding));
+}
+
 fn executeMcpToolBody(ctx: *const ToolContext, args: []const u8, ctx_ptr: ?*anyopaque) anyerror!ToolResultBody {
-    const binding: *McpToolBinding = @ptrCast(@alignCast(ctx_ptr orelse return error.MissingMcpBinding));
+    const binding = try mcpToolBinding(ctx_ptr);
     var scratch = std.heap.ArenaAllocator.init(ctx.allocator);
     defer scratch.deinit();
     const headers = try param_headers.headersForCall(scratch.allocator(), binding.param_headers, args);

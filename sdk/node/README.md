@@ -54,7 +54,10 @@ every event of a Run arrives before its promise settles. `result.text` is the
 final answer rebuilt from the `output_segment_*` events. The event vocabulary
 is listed in [doc/AGENTCORE_BINARY_ABI.md](../../doc/AGENTCORE_BINARY_ABI.md).
 `session.abort()` stops the active run; `session.submit(text)` adds user input
-to it. Separate sessions run concurrently; one session runs one prompt at a
+to it. `session.updateCredential(apiKey)` replaces the provider key in place,
+also during a run and from inside a tool or handler: every request sent
+afterwards (the run's next turn, a retry) carries it, and a request already
+sent keeps the old one. Separate sessions run concurrently; one session runs one prompt at a
 time. `session.close()` throws while a run is active, and the session stays
 open; await the run, or `abort()` it, first.
 

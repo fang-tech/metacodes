@@ -4468,6 +4468,20 @@ fn parsePromptProfile(
     return .{ .sections = sections };
 }
 
+/// The one credential rule (`credential_cell.validate`) applied to a
+/// Session's create and restore before anything is built, as
+/// `update_credential` applies it: a refusal names the rule, never the
+/// bytes. A credential the rule refuses could never authenticate, and one
+/// with CR LF would trip the HTTP client's header assertion on the first
+/// request.
+fn refuseInvalidCredential(api_key: []const u8, out_error: ?*wire.OwnedBytesV1) ?u32 {
+    core.api_credential_cell.validate(api_key) catch |err| return failError(switch (err) {
+        error.CredentialTooLong => wire.STATUS_RESOURCE_LIMIT,
+        error.EmptyCredential, error.InvalidCredentialByte => wire.STATUS_INVALID_ARGUMENT,
+    }, err, out_error);
+    return null;
+}
+
 /// INVALID_ARGUMENT naming the entry and the rule when the kernel refuses the
 /// profile, else null.
 fn refusePromptProfile(profile: core.prompt_sections.Profile, out_error: ?*wire.OwnedBytesV1) ?u32 {
@@ -4760,7 +4774,10 @@ fn sessionCreateErrorStatus(err: anyerror) u32 {
         error.ToolNotInRuntime,
         error.DuplicateToolName,
         error.ShellToolDisabled,
+        error.EmptyCredential,
+        error.InvalidCredentialByte,
         => wire.STATUS_INVALID_ARGUMENT,
+        error.CredentialTooLong => wire.STATUS_RESOURCE_LIMIT,
         error.RuntimeUnavailable => wire.STATUS_INVALID_STATE,
         else => wire.STATUS_CORE_ERROR,
     };
@@ -6949,6 +6966,7 @@ fn sessionCreate(runtime_handle: ?*wire.RuntimeHandle, config_ptr: ?*const wire.
     const root = text(host.workspace_root) catch |err| return failError(wire.STATUS_INVALID_ARGUMENT, err, out_error);
     const home = text(host.workspace_home) catch |err| return failError(wire.STATUS_INVALID_ARGUMENT, err, out_error);
     if (api_key.len == 0 or model.len == 0 or root.len == 0) return fail(wire.STATUS_INVALID_ARGUMENT, "api_key, model and workspace_root are required", out_error);
+    if (refuseInvalidCredential(api_key, out_error)) |status| return status;
     var workspace = skill_catalog_handles.CanonicalWorkspace.init(
         allocator,
         root,
@@ -7133,6 +7151,7 @@ fn sessionRestore(
         return failError(wire.STATUS_INVALID_ARGUMENT, err, out_error);
     if (api_key.len == 0 or root.len == 0)
         return fail(wire.STATUS_INVALID_ARGUMENT, "api_key and workspace_root are required", out_error);
+    if (refuseInvalidCredential(api_key, out_error)) |status| return status;
     var workspace = skill_catalog_handles.CanonicalWorkspace.init(
         allocator,
         root,
@@ -8031,6 +8050,49 @@ fn sessionSubmitInput(
     return wire.STATUS_OK;
 }
 
+/// Revision 25 (#336): replace the Session's provider credential in place.
+/// Like abort and submit_input it bypasses the facade call gate and never
+/// takes the callback mutex, so a Host may call it from another thread or
+/// from inside the matching Run's own callbacks, while idle, during a Run,
+/// compaction or checkpoint export. It is never BUSY. A refusal keeps the
+/// previous credential and never ends, aborts or poisons a Run; the
+/// diagnostic names the rule, never the bytes.
+fn sessionUpdateCredential(
+    handle: ?*wire.SessionHandle,
+    credential_view: wire.BytesViewV1,
+    out_error: ?*wire.OwnedBytesV1,
+) callconv(.c) u32 {
+    emptyError(out_error);
+    const self = sessionFrom(handle orelse return fail(wire.STATUS_INVALID_ARGUMENT, "session is required", out_error));
+    const runtime = self.runtime orelse
+        return fail(wire.STATUS_INVALID_STATE, "Session has no owning Runtime", out_error);
+    var runtime_call = runtime.catalogs.enterCall() catch |err|
+        return failError(catalogLifecycleStatus(err), err, out_error);
+    defer runtime_call.deinit();
+    if (self.facade_poisoned.load(.acquire))
+        return fail(wire.STATUS_INVALID_STATE, "Session is poisoned by a previous admitted Run failure", out_error);
+    // The Core poisons a failed Run before the Run's thread sets the facade
+    // flag; in that window the state must still outrank the candidate.
+    self.core_session.checkCredentialUpdateState() catch
+        return fail(wire.STATUS_INVALID_STATE, "Session is poisoned or being destroyed", out_error);
+    if (credential_view.len > wire.MAX_CREDENTIAL_BYTES_V1)
+        return fail(wire.STATUS_RESOURCE_LIMIT, "credential exceeds AgentCore ABI v1 limit", out_error);
+    const candidate = borrowed(credential_view) catch |err|
+        return failError(wire.STATUS_INVALID_ARGUMENT, err, out_error);
+    _ = self.core_session.updateCredential(candidate) catch |err| return failError(switch (err) {
+        error.EmptyCredential, error.InvalidCredentialByte => wire.STATUS_INVALID_ARGUMENT,
+        error.CredentialTooLong => wire.STATUS_RESOURCE_LIMIT,
+        error.OutOfMemory => wire.STATUS_OUT_OF_MEMORY,
+        error.InvalidSessionState => wire.STATUS_INVALID_STATE,
+    }, err, out_error);
+    return wire.STATUS_OK;
+}
+
+comptime {
+    // One limit, enforced where it is published and where the bytes are kept.
+    std.debug.assert(wire.MAX_CREDENTIAL_BYTES_V1 == core.api_credential_cell.MAX_CREDENTIAL_BYTES);
+}
+
 comptime {
     // The Core queue's defaults are the published per-Run limits; a drift
     // would make the ABI enforce something other than what it documents.
@@ -8198,6 +8260,7 @@ const session_api_v1 = wire.SessionApiV1{
     .run_input = sessionRunInput,
     .abort = sessionAbort,
     .submit_input = sessionSubmitInput,
+    .update_credential = sessionUpdateCredential,
 };
 
 const session_control_api_v1 = wire.SessionControlApiV1{
@@ -8505,8 +8568,10 @@ test "ABI discovery is versioned" {
     try std.testing.expect(metask_agentcore_get_api(0) == null);
     const raw = metask_agentcore_get_api(wire.ABI_VERSION_V1) orelse return error.MissingApi;
     const api: *const wire.ApiV1 = @ptrCast(@alignCast(raw));
-    try std.testing.expectEqual(@as(u32, 24), api.abi_revision);
+    try std.testing.expectEqual(@as(u32, 25), api.abi_revision);
     try std.testing.expectEqual(@as(usize, 80), api.struct_size);
+    try std.testing.expectEqual(@as(u32, 56), api.session.?.struct_size);
+    try std.testing.expect(api.session.?.update_credential != null);
     try std.testing.expect(api.runtime != null);
     try std.testing.expect(api.session != null);
     try std.testing.expect(api.session_control != null);
@@ -10443,7 +10508,7 @@ test "checkpoint restores compatible MCP view and exact Session grant" {
         )).decision,
     );
     try std.testing.expectEqual(@as(usize, 1), restored.session.core_session.conversation.len());
-    try std.testing.expectEqualStrings("current-key", restored.session.core_session.api_key);
+    try std.testing.expect(restored.session.core_session.credential.matches("current-key"));
 
     Cleanup.session(restored.session);
     restored_live = false;
@@ -10960,6 +11025,93 @@ test "reconcileRunFailure: a Host rejecting the poisoned terminal fails the Run 
     try std.testing.expectEqual(@as(usize, 1), fatal.calls);
     try std.testing.expectEqual(public_protocol.RunStatePhase.poisoned, session.run_state_projector.phase);
     try std.testing.expect(session.facade_poisoned.load(.acquire));
+}
+
+test "update_credential: a Core poisoned before the facade flag outranks an invalid candidate (#336)" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const cwd = root_buffer[0..root_len];
+    const native_runtime = try core.agent_session.AgentRuntime.create(
+        std.testing.allocator,
+        .{ .builtin_tools = &.{} },
+    );
+    defer native_runtime.destroy() catch unreachable;
+    var runtime = AbiRuntime{
+        .core_runtime = native_runtime,
+        .host_tools = &.{},
+        .catalogs = skill_catalog_handles.RuntimeCatalogs.initWithSecret(
+            std.testing.allocator,
+            [_]u8{0x76} ** 32,
+        ),
+        .materializations = undefined,
+        .mcp_manager = null,
+    };
+    defer {
+        runtime.catalogs.tryBeginDestroy() catch unreachable;
+        runtime.catalogs.finishDestroy();
+    }
+    const session = try buildAbiSession(&runtime, .{
+        .callbacks = std.mem.zeroes(wire.SessionCallbacksV1),
+        .provider_kind = .anthropic,
+        .api_key = "test-key",
+        .model = "test-model",
+        .base_url = null,
+        .permission_mode = .default,
+        .permission_rules = null,
+        .workspace = .{ .root = cwd, .home = cwd },
+        .allowed_tools = &.{},
+        .workspace_scope_id = [_]u8{0} ** 64,
+        .skill_binding = null,
+        .mcp_selectors = &.{},
+    });
+    defer {
+        var diagnostic = std.mem.zeroes(wire.OwnedBytesV1);
+        const status = sessionDestroy(session.handle(), &diagnostic);
+        bufferRelease(&diagnostic);
+        std.debug.assert(status == wire.STATUS_OK);
+    }
+
+    // The window a failed Run opens: `poisonRun` has set the Core state, and
+    // the Run's thread has not yet reached `reconcileRunFailure`, which sets
+    // the facade flag.
+    const core_session = session.core_session;
+    core_session.mutex.lock();
+    core_session.state = .poisoned;
+    core_session.mutex.unlock();
+    try std.testing.expect(!session.facade_poisoned.load(.acquire));
+
+    var oversized: u8 = 'k';
+    const candidates = [_]wire.BytesViewV1{
+        .{ .ptr = @ptrCast(&oversized), .len = wire.MAX_CREDENTIAL_BYTES_V1 + 1 },
+        .{ .ptr = null, .len = 4 },
+        .{ .ptr = null, .len = 0 },
+        wire.BytesViewV1{ .ptr = "fresh-key".ptr, .len = "fresh-key".len },
+    };
+    for (candidates) |candidate| {
+        var diagnostic = std.mem.zeroes(wire.OwnedBytesV1);
+        defer bufferRelease(&diagnostic);
+        try std.testing.expectEqual(
+            wire.STATUS_INVALID_STATE,
+            sessionUpdateCredential(session.handle(), candidate, &diagnostic),
+        );
+    }
+    try std.testing.expect(core_session.credential.matches("test-key"));
+
+    // Back to idle (destroy accepts a poisoned Session too, but this proves
+    // the same candidates are judged on their own merits once it is usable).
+    core_session.mutex.lock();
+    core_session.state = .idle;
+    core_session.mutex.unlock();
+    var diagnostic = std.mem.zeroes(wire.OwnedBytesV1);
+    defer bufferRelease(&diagnostic);
+    try std.testing.expectEqual(wire.STATUS_RESOURCE_LIMIT, sessionUpdateCredential(session.handle(), candidates[0], &diagnostic));
+    bufferRelease(&diagnostic);
+    try std.testing.expectEqual(wire.STATUS_INVALID_ARGUMENT, sessionUpdateCredential(session.handle(), candidates[1], &diagnostic));
+    bufferRelease(&diagnostic);
+    try std.testing.expectEqual(wire.STATUS_OK, sessionUpdateCredential(session.handle(), candidates[3], &diagnostic));
+    try std.testing.expect(core_session.credential.matches("fresh-key"));
 }
 
 test "Host schema admission rejects ambiguous object contracts" {
@@ -11504,7 +11656,7 @@ test "Revision 6 AgentCore restore is atomic and continues logical operation IDs
     );
     try std.testing.expectEqual(@as(usize, 1), restored.session.core_session.conversation.len());
     try std.testing.expectEqualStrings("checkpoint-model", restored.session.core_session.model);
-    try std.testing.expectEqualStrings("new-key", restored.session.core_session.api_key);
+    try std.testing.expect(restored.session.core_session.credential.matches("new-key"));
     try std.testing.expectError(
         error.StaleRun,
         restored.session.core_session.admitRun(7, TestEventSink.sink(&event_ctx)),

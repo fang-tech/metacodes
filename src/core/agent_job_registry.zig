@@ -815,7 +815,7 @@ pub const AgentJobRegistry = struct {
         var owned = pf.makeProviderWithOptions(
             self.allocator,
             self.provider_kind,
-            self.api_key,
+            .{ .fixed = self.api_key },
             self.model,
             self.base_url,
             self.openai_protocol,
@@ -1394,7 +1394,7 @@ pub const AgentJobRegistry = struct {
         return pf.makeProviderWithOptions(
             std.heap.c_allocator,
             self.provider_kind,
-            self.api_key,
+            .{ .fixed = self.api_key },
             self.model,
             self.base_url,
             self.openai_protocol,
