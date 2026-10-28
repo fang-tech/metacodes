@@ -178,6 +178,31 @@ pub const Scanner = struct {
         return std.mem.startsWith(u8, seq, "\x1b[?") or std.mem.startsWith(u8, seq, "\x1b]" ++ osc11_prefix);
     }
 
+    /// The bytes an OSC 11 answer's colour is written with (`rgb:RRRR/GGGG/BBBB`).
+    const osc11_colour = "rgb:0123456789abcdefABCDEF/";
+
+    /// Whether `next` can be the rest of the open answer: only the bytes its
+    /// shape allows, up to its terminator (or as far as `next` goes). A DA1
+    /// or Kitty answer continues with digits and `;` up to `c` or `u`; an OSC
+    /// 11 answer with its colour up to BEL or ST. The tail of a cut answer
+    /// fits (`22c`); keys typed after it do not (`ls`, `fix the bug`). An open
+    /// sequence a key could be is not judged: true.
+    pub fn tailFits(self: *const Scanner, next: []const u8) bool {
+        if (!self.openAnswer()) return true;
+        if (self.state == .osc_esc) return next.len == 0 or next[0] == '\\';
+        const csi = self.seq[1] == '[';
+        for (next) |b| {
+            if (csi) {
+                if (b == 'c' or b == 'u') return true;
+                if (std.mem.indexOfScalar(u8, "0123456789;", b) == null) return false;
+            } else {
+                if (b == 0x07 or b == 0x1b) return true;
+                if (std.mem.indexOfScalar(u8, osc11_colour, b) == null) return false;
+            }
+        }
+        return true;
+    }
+
     /// The typed bytes so far were handed on; collect afresh.
     pub fn clearTyped(self: *Scanner) void {
         self.typed_len = 0;
@@ -421,9 +446,9 @@ pub fn probe(want: Want, hand_over: bool) Result {
     return round.result;
 }
 
-/// How long an open answer may wait for the rest of it in `Late`: one read
-/// wait of the REPL's key loop. A terminal writes an answer in one piece; a
-/// tail that has not come by then was discarded or never sent.
+/// How long an open answer in `Late` waits for the rest of it before what
+/// comes next must prove to be that rest (`Scanner.tailFits`): one read wait
+/// of the REPL's key loop. A terminal writes an answer in one piece.
 const late_tail_ms: i64 = 200;
 
 /// A round the deadline ended, on the REPL's terminal: its answers may still
@@ -460,16 +485,24 @@ const Late = struct {
         };
     }
 
-    /// The open sequence's tail will not come: input was discarded since it
-    /// was read, or it has not grown for a read wait. It is resolved now
-    /// (`Scanner.finish`: a cut answer is dropped, a cut key is typed), so the
-    /// keys typed next are not fed to it as its tail.
-    fn expireOpen(self: *Late) void {
+    /// Input was discarded since the open sequence was read: its tail may be
+    /// gone with it, so it is resolved now (`Scanner.finish`: a cut answer is
+    /// dropped, a cut key is typed) and the keys typed next are not fed to it.
+    fn expireDiscarded(self: *Late) void {
         const discards = platform_term.discardCount();
         const discarded = discards != self.discards;
         self.discards = discards;
+        if (discarded and self.scanner.seq_len > 0) self.scanner.finish();
+    }
+
+    /// The open sequence has not grown for a read wait and `next` (read now)
+    /// cannot be its tail: it is given up the same way. The tail may well
+    /// have arrived in time and only been read late (nothing reads between
+    /// the splash and the REPL), so the time alone does not decide.
+    fn expireStale(self: *Late, next: []const u8) void {
         if (self.scanner.seq_len == 0) return;
-        if (discarded or util_time.nowMs() - self.progress_ms >= late_tail_ms) self.scanner.finish();
+        if (util_time.nowMs() - self.progress_ms < late_tail_ms) return;
+        if (!self.scanner.tailFits(next)) self.scanner.finish();
     }
 
     /// Hand the typed bytes to stdin. Every byte read adds at most one to
@@ -489,7 +522,7 @@ const Late = struct {
     /// sequence included): the rest stays with the terminal, in order, for
     /// stdin's next reader.
     fn absorb(self: *Late) bool {
-        self.expireOpen();
+        self.expireDiscarded();
         var typed = self.replayTyped();
         var chunk: [256]u8 = undefined;
         while (true) {
@@ -498,7 +531,11 @@ const Late = struct {
             if (limit == 0) break;
             const n = platform_term.readPending(self.fd, chunk[0..limit]);
             if (n <= 0) break;
-            self.scanner.feed(chunk[0..@intCast(n)]);
+            const next = chunk[0..@intCast(n)];
+            // Resolving the open sequence moves its bytes to the typed ones:
+            // the bound above still holds.
+            self.expireStale(next);
+            self.scanner.feed(next);
             if (self.scanner.seq_len > 0) self.progress_ms = util_time.nowMs();
             if (self.replayTyped()) typed = true;
         }
@@ -994,6 +1031,41 @@ test "Late: a cut answer that waited a read wait for its tail is given up, and t
     var rest: [8]u8 = undefined;
     const got = drainForTest(r, &owed, &rest);
     try testing.expectEqualStrings("fix the bug now", got.owed);
+}
+
+test "Late: a cut answer read only after a read wait still takes the tail that completes it" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var fds: [2]c_int = undefined;
+    try testing.expectEqual(@as(c_int, 0), std.c.pipe(&fds));
+    defer _ = std.c.close(fds[0]);
+    defer _ = std.c.close(fds[1]);
+    const r = fds[0];
+    // The tail came right after the deadline and sat in the queue; nothing
+    // read it until the REPL took over, seconds later (App.init).
+    g_late = Late.init(r, std.mem.zeroes(platform_term.SavedMode), scan(both, "\x1b[?62;"));
+    defer g_late = null;
+    g_late.?.progress_ms -= 10 * late_tail_ms;
+    try testing.expect(pfs.writeAll(fds[1], "22cls"));
+    try testing.expect(handOver(r) != null);
+    var owed: [16]u8 = undefined;
+    var rest: [8]u8 = undefined;
+    const got = drainForTest(r, &owed, &rest);
+    try testing.expectEqualStrings("ls", got.owed);
+}
+
+test "Scanner.tailFits: an answer's own bytes fit it, typed text does not" {
+    try testing.expect(scan(both, "\x1b[?62;").tailFits("22c"));
+    try testing.expect(scan(both, "\x1b[?62;").tailFits("2")); // as far as it goes
+    try testing.expect(scan(both, "\x1b[?").tailFits("1u"));
+    try testing.expect(!scan(both, "\x1b[?62;").tailFits("ls"));
+    try testing.expect(!scan(both, "\x1b[?62;").tailFits("4x"));
+    try testing.expect(scan(both, "\x1b]11;rgb:1e1e/").tailFits("1e1e/2e2e\x07"));
+    try testing.expect(scan(both, "\x1b]11;rgb:1e1e/").tailFits("2e2e\x1b\\"));
+    try testing.expect(!scan(both, "\x1b]11;rgb:1e1e/").tailFits("fix the bug"));
+    try testing.expect(scan(both, "\x1b]11;rgb:1e1e/2e2e/2e2e\x1b").tailFits("\\"));
+    try testing.expect(!scan(both, "\x1b]11;rgb:1e1e/2e2e/2e2e\x1b").tailFits("[A"));
+    // A sequence a key could be is not judged here.
+    try testing.expect(scan(both, "\x1b[").tailFits("ls"));
 }
 
 test "Late: absorbing stops where stdin's replay is full, and what is left stays queued in order" {
