@@ -18,6 +18,7 @@ const app_mod = @import("../../app.zig");
 const types = @import("../../types.zig");
 const ansi = @import("ansi.zig");
 const term = @import("term.zig");
+const reflow = @import("reflow.zig");
 const theme_mod = @import("theme.zig");
 const verbs = @import("verbs.zig");
 const StatusBar = @import("widget/status_bar.zig").StatusBar;
@@ -51,13 +52,14 @@ pub const RenderRegion = struct {
     rows: u16 = 24,
     prev_rows: u16 = 0, // 上一帧固定区总行数;0=未画。eraseRegion 用它擦旧区。
     overlay_region_height: u16 = 0, // enterExclusiveOverlay 捕获的 erase 前区高(viewer anchor 兜底用)
-    // 【仅输入期】上帧结束光标在区内第几行(从区顶 0 算)——输入期回顶支点。相对移动随滚屏
-    // 一起走:区画在屏底时帧内 \r\n 会滚屏,DECSC 保存的绝对位置不跟着滚(且 Warp 不还原 DECRC),
-    // 故不用 ESC 7/ESC 8 锚点。
-    input_cursor_row: u16 = 0,
-    // 生成期:drawGenRegion 末尾把光标停在 editor 编辑点(供 IME),并记 cursor_in_region_row
-    // (光标距区顶行数);eraseRegion 擦区前先 UP(cursor_in_region_row)+\r 回区顶再 ED0。
-    cursor_in_region_row: u16 = 0,
+    // 回顶支点:上帧结束时光标在区内第几行、第几列,以及它上方每行的显示宽度(两期共用,
+    // 两期时间互斥)。输入期 renderFrameInner/clearInner、生成期 eraseRegion 都从光标相对上移
+    // anchor.climb() 行回区顶:区画在屏底时帧内 \r\n 会滚屏,DECSC 保存的绝对位置不跟着滚
+    // (且 Warp 不还原 DECRC),故不用 ESC 7/ESC 8。终端变窄会把宽行重排成多行,climb 按
+    // 新宽度数行(见 reflow.zig)。
+    anchor: reflow.Anchor = .{},
+    // 终端变窄时是否重排已显示的行(term.detectReflow;xterm/GNU screen 裁剪不重排)。
+    reflows: bool = true,
     visible: bool = false,
     theme: Theme,
     color_cap: ColorCapability,
@@ -206,7 +208,7 @@ pub const RenderRegion = struct {
         // 区状态清零:exit 从干净态 drawGenRegion 重画(对话由 alt-screen 退出自动恢复)。
         self.region_drawn = false;
         self.prev_rows = 0;
-        self.cursor_in_region_row = 0;
+        self.anchor = .{};
     }
 
     /// **DEAD since 2026-06-13 alt-screen 切换**:旧 inline 模式的区顶 anchor 兜底(DSR 不可用时用)。
@@ -280,6 +282,7 @@ pub const RenderRegion = struct {
             .fd = fd,
             .cols = sz.cols,
             .rows = sz.rows,
+            .reflows = term.reflowFromEnv(),
             .theme = theme,
             .color_cap = cap,
             .use_unicode = themeUsesUnicode(theme),
@@ -412,6 +415,16 @@ pub const RenderRegion = struct {
         return false;
     }
 
+    /// Move from the cursor of the last frame to column 1 of the region's top
+    /// row. Callers measure the terminal first: the climb counts the rows the
+    /// last frame takes at the current width (reflow.zig).
+    fn climbToTop(self: *RenderRegion, w: *std.Io.Writer) void {
+        var nbuf: [16]u8 = undefined;
+        const up = self.anchor.climb(self.cols, self.reflows);
+        if (up > 0) w.writeAll(ansi.cursor.up(up, &nbuf)) catch {};
+        w.writeAll("\r") catch {};
+    }
+
     /// Detect a terminal resize before any operation that relies on the
     /// cursor's pre-resize position. Scrollback reflow makes the saved
     /// `pending_col` stale; discard that continuation and seal the old line
@@ -462,8 +475,8 @@ pub const RenderRegion = struct {
     }
 
     /// 【仅输入期】重画输入框:上边框 + ❯content(多行)+ 下边框 + [slash 菜单] + footer。
-    /// 输入期无 print(text) 滚动,故可安全用 input_cursor_row(光标实际所在区内行)回顶。
-    /// 末尾把光标停在 content 供编辑,并记 input_cursor_row。
+    /// 输入期无 print(text) 滚动,故可安全用 anchor(光标实际所在区内行)回顶。
+    /// 末尾把光标停在 content 供编辑,并记 anchor。
     /// TaskTab:输入框上方的面板(drawPanel):后台 subagent 进度树 + Task 清单。
     /// 无内容 → 不画,返回 0 行。
     fn drawTaskTab(self: *RenderRegion, w: *std.Io.Writer, app: *const app_mod.App) u16 {
@@ -615,11 +628,15 @@ pub const RenderRegion = struct {
         }
         var nbuf: [16]u8 = undefined;
 
-        // 1. hide + 回区顶 + 行首。相对上移 input_cursor_row 行:框画在屏底时帧内 \r\n 会滚屏,
-        // 相对位移随之滚动仍指向框顶;DECSC 存的绝对行不随滚屏移动,恢复会落在框顶下方 → 框叠框。
+        // 1. hide + 回区顶 + 行首 + 清到屏底。相对上移 anchor.climb() 行:框画在屏底时帧内 \r\n
+        // 会滚屏,相对位移随之滚动仍指向框顶;DECSC 存的绝对行不随滚屏移动,恢复会落在框顶下方
+        // → 框叠框。终端变窄后上一帧的宽行已被重排成多行,climb 按新宽度数(reflow.zig),否则
+        // 停在旧框里:框上方留旧横线、下方留旧 footer,每次 resize 各多一条。区是屏上最后的内容,
+        // 区顶起一次 ED 0 清掉旧帧在新帧下方多出的行(收缩、重排都会多出来),不碰 scrollback。
         w.writeAll(ansi.cursor.hide) catch {};
-        if (self.input_cursor_row > 0) w.writeAll(ansi.cursor.up(self.input_cursor_row, &nbuf)) catch {};
-        w.writeAll(ansi.cursor.column(1, &nbuf)) catch {};
+        self.climbToTop(w);
+        w.writeAll(ansi.clear.to_end_of_screen) catch {};
+        const rows_start = self.scratch.writer.end;
 
         const inner_w: usize = self.innerWidth();
         const border_color = self.borderColor(app.permMode());
@@ -722,7 +739,7 @@ pub const RenderRegion = struct {
             new_rows += hrows;
             // renderHelpLines 末行也带 \r\n → 光标停在末行下一行行首,比 footer 分支多下移 1 行。
             // 补 up(1) 把光标拉回区内最后一行,与 footer 分支"光标停在区内最后一行"约定一致——
-            // 否则下方 footer_row/input_cursor_row 全部偏移 1,下一帧回区顶少 1 行 → 顶边框残留。
+            // 否则下方 footer_row/anchor 全部偏移 1,下一帧回区顶少 1 行 → 顶边框残留。
             if (hrows > 0) w.writeAll(ansi.cursor.up(1, &nbuf)) catch {};
         } else {
             w.writeAll(ansi.clear.line) catch {};
@@ -736,22 +753,12 @@ pub const RenderRegion = struct {
             new_rows += 1;
         }
 
-        // Agent switcher(区域2):footer 下方,占额外行。在收缩擦除前累加进 new_rows。
+        // Agent switcher(区域2):footer 下方,占额外行。
         new_rows += self.drawAgentSwitcher(w, app);
-        // 此刻光标在 footer 行末 = 区内最后一行(行号 new_rows-1)。
+        // 此刻光标在 footer 行末 = 区内最后一行(行号 new_rows-1)。比上一帧矮时下方的旧行
+        // 已由开头的 ED 0 清掉。
 
-        // 3. 收缩残留擦除
-        if (new_rows < self.prev_rows) {
-            const diff = self.prev_rows - new_rows;
-            var k: u16 = 0;
-            while (k < diff) : (k += 1) {
-                w.writeAll("\r\n") catch {};
-                w.writeAll(ansi.clear.line) catch {};
-            }
-            w.writeAll(ansi.cursor.up(diff, &nbuf)) catch {};
-        }
-
-        // 4. 光标移到内容行(区内行号:TaskTab(0/1) + paste提示(0/1) + 上边框(1) + loc.vline)。
+        // 3. 光标移到内容行(区内行号:TaskTab(0/1) + paste提示(0/1) + 上边框(1) + loc.vline)。
         // shell 模式:cursor 是相对完整 content(含 `!`)的;body 去掉了 `!` → body_cursor = cursor-1。
         const body_cursor: usize = if (shell and cursor > 0) cursor - 1 else cursor;
         const loc = RenderRegion.locateCursor(body, body_cursor, &vlines);
@@ -764,13 +771,14 @@ pub const RenderRegion = struct {
         }
         w.writeAll(ansi.cursor.column(1, &nbuf)) catch {};
         const prefix_w: u32 = 2;
-        w.writeAll(ansi.cursor.forward(prefix_w + @as(u32, @intCast(loc.vcol)), &nbuf)) catch {};
+        const cursor_col: u16 = @intCast(prefix_w + loc.vcol);
+        w.writeAll(ansi.cursor.forward(cursor_col, &nbuf)) catch {};
 
-        // 5. show + 记不变式
+        // 4. show + 记不变式
         w.writeAll(ansi.cursor.show) catch {};
 
         self.prev_rows = new_rows;
-        self.input_cursor_row = target_row;
+        self.anchor = reflow.Anchor.measure(self.scratch.written()[rows_start..], target_row, cursor_col, self.cols);
         self.visible = true;
         if (own_frame) {
             self.frame_active = false;
@@ -1517,14 +1525,11 @@ pub const RenderRegion = struct {
             w.writeAll(ansi.sync.begin) catch {};
             self.frame_active = true;
         }
-        var nbuf: [16]u8 = undefined;
-
         w.writeAll(ansi.cursor.hide) catch {};
-        // 回区顶:光标当前在区内第 input_cursor_row 行(不一定最后一行)。相对上移,随滚屏有效。
-        if (self.input_cursor_row > 0) {
-            w.writeAll(ansi.cursor.up(self.input_cursor_row, &nbuf)) catch {};
-        }
-        w.writeAll(ansi.cursor.column(1, &nbuf)) catch {};
+        // 回区顶:光标当前在区内第 anchor.rows_above 行(不一定最后一行)。相对上移,随滚屏有效。
+        // 提交可能紧跟在 resize 之后、重画之前:先量尺寸,climb 才按终端现在的宽度数行。
+        _ = self.measureSize();
+        self.climbToTop(w);
         // 光标已在固定区顶行。一次 ED 0 清到屏底,不逐行用 \r\n/CUU 穿过屏幕底部;
         // Windows Console 在逐行移动时可能把旧顶线脱离固定区,进入后续 scrollback。
         // ED 0 不写换行,也不会清除 scrollback。光标留在区顶第一行行首——后续消息从这里打。
@@ -1532,7 +1537,7 @@ pub const RenderRegion = struct {
         w.writeAll(ansi.cursor.show) catch {};
 
         self.prev_rows = 0;
-        self.input_cursor_row = 0;
+        self.anchor = .{};
         self.visible = false;
         if (own_frame) {
             self.frame_active = false;
@@ -1560,7 +1565,7 @@ pub const RenderRegion = struct {
         self.generating = true;
         self.region_drawn = false; // 区不在屏:首个 tick 才画区
         self.prev_rows = 0; // 生成期 prev_rows = 上次 drawGenRegion 画的 R(eraseRegion 用)
-        self.cursor_in_region_row = 0;
+        self.anchor = .{};
         self.text_pending_newline = false;
         self.pending_col = 0;
         self.resize_seal_pending = false;
@@ -1610,8 +1615,7 @@ pub const RenderRegion = struct {
         self.gen_view = "";
         self.gen_cursor = 0;
         self.prev_rows = 0;
-        self.input_cursor_row = 0;
-        self.cursor_in_region_row = 0;
+        self.anchor = .{};
         self.region_drawn_pending_nl = false;
         self.region_drawn_pending_col = 0;
         self.resize_seal_pending = false;
@@ -1997,9 +2001,10 @@ pub const RenderRegion = struct {
     }
 
     /// 擦掉固定区(R 行),光标回"文本续接点"。
-    /// **不变式**:drawGenRegion 末尾把光标停在 editor 编辑点,并记 cursor_in_region_row(距区顶行数);
-    /// 此处先 UP(cursor_in_region_row)+\r 回区顶,再 ED0 一次清到屏底。draw/erase 之间无 print 滚动
-    /// → cursor_in_region_row 不失效(只 writeGenText 的 print 滚动,且发生在 erase 之后,区已不在屏)。
+    /// **不变式**:drawGenRegion 末尾把光标停在 editor 编辑点,并记 anchor(距区顶行数 + 上方各行宽);
+    /// 此处先 UP(anchor.climb())+\r 回区顶,再 ED0 一次清到屏底。draw/erase 之间无 print 滚动
+    /// → anchor 不失效(只 writeGenText 的 print 滚动,且发生在 erase 之后,区已不在屏)。resize 不滚动
+    /// 但会把宽行重排成多行:climb 按终端现在的宽度数(调用方先 observeResize 量过)。
     /// 画区本身在屏底 \r\n 滚屏时相对行数随之滚动仍有效;DECSC/DECRC 存的是绝对屏幕行,不随滚屏
     /// 移动(Warp 也不还原 DECRC),故不用。
     fn eraseRegion(self: *RenderRegion) void {
@@ -2013,9 +2018,8 @@ pub const RenderRegion = struct {
         if (!self.frame_active) self.resetScratch(); // 帧内:接续 frame 已写的 sync_begin,勿清
         var nb: [16]u8 = undefined;
         w.writeAll(ansi.cursor.hide) catch {};
-        // 光标当前在区内 cursor_in_region_row 行(编辑点)→ 先回区顶行首。
-        if (self.cursor_in_region_row > 0) w.writeAll(ansi.cursor.up(self.cursor_in_region_row, &nb)) catch {};
-        w.writeAll("\r") catch {};
+        // 光标当前在区内 anchor.rows_above 行(编辑点)→ 先回区顶行首。
+        self.climbToTop(w);
         // 区顶起一次 ED 0 清到屏底:不逐行 \r\n 穿过屏幕底部,不改变 scrollback。
         // 光标留在区顶行首(= 文本末尾的下一行)。
         w.writeAll(ansi.clear.to_end_of_screen) catch {};
@@ -2032,7 +2036,7 @@ pub const RenderRegion = struct {
 
     /// 画生成期固定区(spinner + 队列预览 + 上框 + ❯editor(多行) + 下框 + footer),文本流末尾下方。
     /// 前置 region_drawn=false;后置 region_drawn=true,**光标停在 editor 编辑点**(供 IME 候选窗对齐),
-    /// 并记 cursor_in_region_row(距区顶行数)供 eraseRegion 回顶。半行文本尾先 \n 封口让区独占整行。
+    /// 并记 anchor(距区顶行数 + 上方各行宽)供 eraseRegion 回顶。半行文本尾先 \n 封口让区独占整行。
     fn drawGenRegion(self: *RenderRegion, app: *const app_mod.App) void {
         const w = &self.scratch.writer;
         if (!self.frame_active) self.resetScratch(); // 帧内:接续 frame(sync_begin + erase),勿清
@@ -2054,6 +2058,7 @@ pub const RenderRegion = struct {
         // (注:曾试图用它修 Warp 的 alt-screen `?1049l` footer 残影,但真机诊断证明那是 Warp 渲染 bug,
         //  ESC[0J 治不了——见 commit message 的根因诊断;此处保留仅因它是正确的区收缩自清单一机制。)
         w.writeAll(ansi.clear.to_end_of_screen) catch {};
+        const rows_start = self.scratch.writer.end;
 
         const inner_w: usize = self.innerWidth();
         const border_color = self.borderColor(app.permMode());
@@ -2158,19 +2163,17 @@ pub const RenderRegion = struct {
         }
         w.writeAll(ansi.cursor.column(1, &nb)) catch {};
         const prefix_w: u32 = 2;
-        w.writeAll(ansi.cursor.forward(prefix_w + @as(u32, @intCast(loc.vcol)), &nb)) catch {};
+        const cursor_col: u16 = @intCast(prefix_w + loc.vcol);
+        w.writeAll(ansi.cursor.forward(cursor_col, &nb)) catch {};
 
         w.writeAll(ansi.cursor.show) catch {};
 
         self.prev_rows = R;
-        self.cursor_in_region_row = edit_row;
+        self.anchor = reflow.Anchor.measure(self.scratch.written()[rows_start..], edit_row, cursor_col, self.cols);
         self.region_drawn = true;
         if (!self.frame_active) self.flush(); // 帧内:由外层 frame 统一 flush(原子帧)
     }
 
-    /// 生成期 transcript 模态帧(对应输入期 renderOverlayInner,但记 cursor_in_region_row 而非
-    /// input_cursor_row——生成期 eraseRegion 读前者)。调用前 drawGenRegion 已 hide+封口,
-    /// 最多 MAX 条,超出补一行 ` +N more`。
     /// 执行中 per-toolUse 进度卡(动态区,可刷新):⏺ <Tool> / ⎿ <progress>。对齐 cc 双段卡。
     /// 随每次 tickSpinner 重画。card 是某张 tool_cards 条目。
     fn drawToolProgressCard(self: *RenderRegion, w: *std.Io.Writer, card: *const ui_state_mod.ToolCardState) u16 {
@@ -2657,7 +2660,7 @@ test "input-phase clear walks up the tracked rows and erases with ED0" {
     var r = RenderRegion.init(std.testing.allocator, 2, theme_mod.select(.dark, .none), .none);
     defer r.deinit();
     r.prev_rows = 5;
-    r.input_cursor_row = 2;
+    r.anchor = .{ .rows_above = 2 };
     r.visible = true;
     // Caller-owned frame: clearInner neither resets nor flushes the scratch.
     r.frame_active = true;
@@ -2669,7 +2672,7 @@ test "input-phase clear walks up the tracked rows and erases with ED0" {
     try std.testing.expect(std.mem.indexOf(u8, out, ansi.cursor.save) == null);
     try std.testing.expect(std.mem.indexOf(u8, out, ansi.cursor.restore) == null);
     try std.testing.expect(std.mem.indexOfScalar(u8, out, '\n') == null);
-    try std.testing.expectEqual(@as(u16, 0), r.input_cursor_row);
+    try std.testing.expectEqual(@as(u16, 0), r.anchor.rows_above);
     try std.testing.expectEqual(@as(u16, 0), r.prev_rows);
     try std.testing.expect(!r.visible);
 }
@@ -2679,7 +2682,7 @@ test "generation erase walks up from the edit row, clears with ED0, returns to t
     defer r.deinit();
     r.region_drawn = true;
     r.prev_rows = 6;
-    r.cursor_in_region_row = 3;
+    r.anchor = .{ .rows_above = 3 };
     r.region_drawn_pending_nl = true;
     r.region_drawn_pending_col = 7;
     r.frame_active = true;
@@ -2695,6 +2698,42 @@ test "generation erase walks up from the edit row, clears with ED0, returns to t
     try std.testing.expect(!r.region_drawn);
 }
 
+// A frame drawn at 100 columns: its top rule is 99 wide. At 60 columns a
+// re-wrapping terminal holds that rule on two rows, so a climb by the frame's
+// own row count stops on the rule's second half and every resize leaves the
+// first half above the box (and the old footer below it).
+test "after the terminal narrows, both erase paths climb the rows it re-wrapped the last frame into" {
+    var r = RenderRegion.init(std.testing.allocator, -1, theme_mod.select(.dark, .none), .none);
+    defer r.deinit();
+    const frame = "\x1b[2K\x1b[36m" ++ "─" ** 99 ++ "\x1b[0m\r\n\x1b[2K\x1b[36m❯ \x1b[0mhi\r\n";
+    r.cols = 60;
+
+    r.reflows = true;
+    r.prev_rows = 4;
+    r.visible = true;
+    r.anchor = reflow.Anchor.measure(frame, 1, 4, 100);
+    r.frame_active = true;
+    r.clearInner();
+    try std.testing.expect(std.mem.indexOf(u8, r.scratch.written(), "\x1b[2A\r" ++ ansi.clear.to_end_of_screen) != null);
+
+    r.resetScratch();
+    r.region_drawn = true;
+    r.prev_rows = 4;
+    r.anchor = reflow.Anchor.measure(frame, 1, 4, 100);
+    r.eraseRegion();
+    try std.testing.expect(std.mem.indexOf(u8, r.scratch.written(), "\x1b[2A\r" ++ ansi.clear.to_end_of_screen) != null);
+
+    // A terminal that clips (xterm, GNU screen) keeps the rule on one row:
+    // climbing two would erase a line of the conversation above the box.
+    r.resetScratch();
+    r.reflows = false;
+    r.prev_rows = 4;
+    r.visible = true;
+    r.anchor = reflow.Anchor.measure(frame, 1, 4, 100);
+    r.clearInner();
+    try std.testing.expect(std.mem.indexOf(u8, r.scratch.written(), "\x1b[1A\r" ++ ansi.clear.to_end_of_screen) != null);
+}
+
 test "a generation resize invalidates the saved half-line cursor before erase" {
     var r = RenderRegion.init(std.testing.allocator, 2, theme_mod.select(.dark, .none), .none);
     defer r.deinit();
@@ -2707,7 +2746,7 @@ test "a generation resize invalidates the saved half-line cursor before erase" {
     r.region_drawn_pending_nl = true;
     r.region_drawn_pending_col = 37;
     r.prev_rows = 2;
-    r.cursor_in_region_row = 1;
+    r.anchor = .{ .rows_above = 1 };
 
     r.invalidateContinuationForResize();
 
@@ -2757,14 +2796,14 @@ test "leaveGenerating is idempotent so a deferred fallback cannot double-finish"
     r.generating = true;
     r.ui.phase = .generating;
     r.prev_rows = 4;
-    r.cursor_in_region_row = 2;
+    r.anchor = .{ .rows_above = 2 };
     // leaveGenerating ignores its App argument; the region is not drawn, so
     // nothing reaches the terminal.
     r.leaveGenerating(undefined);
     try std.testing.expect(!r.isGenerating());
     try std.testing.expect(r.ui.phase == .input);
     try std.testing.expectEqual(@as(u16, 0), r.prev_rows);
-    try std.testing.expectEqual(@as(u16, 0), r.cursor_in_region_row);
+    try std.testing.expectEqual(@as(u16, 0), r.anchor.rows_above);
     // A second call (the loop's defer after the explicit hand-off) is a no-op.
     r.text_pending_newline = true;
     r.leaveGenerating(undefined);

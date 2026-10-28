@@ -18,6 +18,7 @@ const input_mod = @import("../../input.zig");
 const theme_mod = @import("../theme.zig");
 const layout = @import("../layout.zig");
 const term = @import("../term.zig");
+const reflow = @import("../reflow.zig");
 const ctx = @import("../../../tools/context.zig");
 const Theme = theme_mod.Theme;
 
@@ -57,7 +58,7 @@ fn pointer(th: Theme) []const u8 {
 
 pub const Rendered = struct {
     frame: []u8, // owned,caller free
-    rows: usize, // frame 占的终端行数(= frame 内 '\n' 数),run 用它 cursor.up 回顶
+    rows: usize, // frame 内 '\n' 数(run 回顶按 reflow.Anchor 数终端里实际占的行)
 };
 
 /// 多问导航信息(阶段2):画顶部 `←  chip… ✔ Submit  →` 导航条。
@@ -534,6 +535,7 @@ const QState = struct {
 /// 视图:0..N-1 = 第 N 问;N = Submit 确认。←→ 切视图,↑↓ 选项,space toggle,数字跳选,
 /// Other 项直接打字内联编辑,enter 确定本问(单选自动→下一视图);Submit 视图选 Submit answers 完成。
 /// esc/Ctrl+C → InputAborted(整个工具放弃)。每问一条答案 append 到 out(owned)。
+/// 每帧按终端现在的宽度画;cols 只在量不到终端尺寸时用。
 pub fn run(
     alloc: std.mem.Allocator,
     th: Theme,
@@ -561,7 +563,8 @@ pub fn run(
     var answered_flags: [MAX_Q]bool = undefined;
     for (questions[0..nq], 0..) |q, qi| headers[qi] = q.header;
 
-    var prev_rows: usize = 0;
+    var drawn: ?reflow.Anchor = null;
+    const reflows = term.reflowFromEnv();
     while (true) {
         for (qs[0..nq], 0..) |s, qi| answered_flags[qi] = s.answered;
         // 单问完成:advanceView 把 view 推过末尾(== nq)→ finalize 返回(无 Submit 视图)。
@@ -578,9 +581,12 @@ pub fn run(
         // 回顶重画:回到上一帧首行行首,再 clear-to-end-of-screen 抹掉整帧足迹。
         // 不擦会留下旧帧残字——新帧某行比旧行短时尾部旧字符不被覆盖(实测乱码
         // `Esc to cancelt in Vim`),且旧 REPL 输入框/分隔线残影会冒出来(实测多出一个输入框)。
-        if (prev_rows > 0) {
+        // 每帧按终端现在的宽度画;回顶按现在的宽度数上一帧占的行——终端变窄会把上一帧
+        // 画满一行的分隔线重排成两行(reflow.zig),按旧行数回顶会停在旧帧里、叠出第二个对话框。
+        const frame_cols: u16 = if (term.getSize(out_fd)) |size| size.cols else @intCast(@min(cols, std.math.maxInt(u16)));
+        if (drawn) |anchor| {
             var up_buf: [16]u8 = undefined;
-            writeAll(out_fd, ansi.cursor.up(@intCast(prev_rows), &up_buf));
+            writeAll(out_fd, ansi.cursor.up(anchor.climb(frame_cols, reflows), &up_buf));
             writeAll(out_fd, "\r");
             writeAll(out_fd, ansi.clear.to_end_of_screen);
         }
@@ -591,18 +597,18 @@ pub fn run(
             for (qs[0..nq]) |s| {
                 if (!s.answered) all = false;
             }
-            break :blk try renderSubmit(alloc, th, nav.?, all, submit_sel, cols);
+            break :blk try renderSubmit(alloc, th, nav.?, all, submit_sel, frame_cols);
         } else blk: {
             const q = questions[view];
             const st = &qs[view];
             break :blk try render(alloc, th, q, nav, st.selected, st.checked[0 .. q.options.len + 2], st.other_buf[0..st.other_len], .{
                 .text = if (st.selected < q.options.len) st.note_buf[st.selected][0..st.note_len[st.selected]] else "",
                 .editing = st.editing_note,
-            }, cols);
+            }, frame_cols);
         };
         defer alloc.free(r.frame);
         writeAll(out_fd, r.frame);
-        prev_rows = r.rows;
+        drawn = reflow.Anchor.atEnd(r.frame, frame_cols);
 
         var buf: [8]u8 = undefined;
         const n = pfs.read(in_fd, &buf);

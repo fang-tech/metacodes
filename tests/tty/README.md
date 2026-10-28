@@ -50,7 +50,14 @@ python3 tests/tty/run_tty_tests.py --bin zig-out/bin/metacodes-debug --shard 2/3
   ConPTY 等静默,同一用例在两个平台上断言的是不同时刻。POSIX 关掉终端后至多等子进程 15s,
   不退出就 SIGKILL 并判该用例失败(以前无超时 `waitpid`,会挂死整个 runner)。
 - `asserts.py` —— 切帧(`ESC[?25l`..`ESC[?25h` 光标对)+ `TTYAssert`
-  (box_at_bottom/no_jitter/input_echo/border_class/footer_mode/box_height/clean_exit/...)。
+  (box_at_bottom/single_box/no_jitter/input_echo/border_class/footer_mode/box_height/clean_exit/...)。
+- **resize 回放**:默认整条流按最终尺寸回放,看不到 resize 那一刻终端对旧画面做了什么。
+  `run(..., resizes=lst)` 记下起始尺寸和每个 `resize:` 落在输出流的字节偏移,
+  `TTYAssert(raw, resizes=lst)` 从起始尺寸回放、在同一偏移调 `Screen.resize`:默认按现代终端
+  (iTerm2、Terminal.app、kitty、xterm.js、tmux……)把软折的行拼成逻辑行再按新宽度重排,
+  `reflow=False` 是 xterm / GNU screen 式裁剪;`autowrap=True` 让比终端宽的行在画的那一刻就折行。
+  Windows 上忽略:resize 后 ConPTY 的 conhost 自己重画整屏;它裁剪、不重排已显示的行,
+  metacodes 在 Windows 上也就按裁剪终端爬行(`term.reflowFromEnv`)。
 - `cases/*.py` —— T01-T13 用例(每个 `def test_*(bin_path)`)。用例自建的临时目录(工作目录、
   指定的 HOME)用 `tty_driver.case_tmpdir(prefix)`,runner 在每个用例结束后删,失败也删;
   缺依赖(replay_server、mock_mcp_server)时 `raise SkipTest`,不要 `return`。
@@ -73,6 +80,7 @@ python3 tests/tty/run_tty_tests.py --bin zig-out/bin/metacodes-debug --shard 2/3
 | T11 退出清理 | 无残留边框、show cursor、Goodbye |
 | T12 resize 自适应 | SIGWINCH → 框自动变宽(不按键) |
 | T13 提交回显 | 提交后用户输入留在 scrollback(❯ 行) |
+| T43/T44 缩窄不叠框 | 空闲框 100→60 列分四步缩窄:重排终端里只剩一个框(上方无旧横线、下方无旧 footer);裁剪终端(`XTERM_VERSION`)里框上方一行不丢 |
 | startup_splash | 启动动画原地重绘、定格字标在 banner 上方且只用 Metask Lab 的字母、任意键跳过且吃掉该键、env/config 开关、窄终端不播(帧字节类断言 Windows 跳过:ConPTY 重编码) |
 | e2e_metask_device(真模型) | Metask 设备码登录(程序化确认)→ 经网关请求真实模型 → 本地账本每请求带 X-Metask-Request-Id → `scripts/metask_reconcile.py` 与网关 /v1/usage 对账零差异;需 METASK_WEB_SESSION_TOKEN、METASK_SITE_URL、METASK_MODELS |
 | T45-T47 resize 打断按键 | ESC、resize、`[A` 在一次 ESC 等待内先后到达:反向搜索不被取消、transcript viewer 不被关掉,`[A` 不漏进输入框(#340);单按 Esc 不等下一个键就关 viewer(POSIX;ConPTY 无 SIGWINCH,T45/T46 跳过) |
@@ -81,6 +89,10 @@ python3 tests/tty/run_tty_tests.py --bin zig-out/bin/metacodes-debug --shard 2/3
 - **输入框跳动**(T07):回顶用 `prev_rows`(总行数)而非 `cursor_row`(光标实际行)→ 逐帧上漂。
 - **resize 不生效**(T12):无 SIGWINCH handler,要按键才刷新 → 装 handler + poll 循环。
 - **提交后用户输入消失**(T13):commit 只清框不回显 → 加 `❯ <输入>` 回显到 scrollback。
+- **缩窄窗口后横线和 footer 越叠越多**(T43,`test_wrap_resize` 的 T13/T14/T15):终端把画满一行的
+  横线重排成两行,回顶仍按画的时候的行数爬 → 停在旧框里,上方留旧横线、下方留旧 footer(生成期留旧
+  spinner 行,对话框叠第二份)→ 每帧记下光标上方各行宽度,按现在的宽度数行回顶(`tui/reflow.zig`),
+  回顶后 ED 0 清到屏底;xterm/GNU screen/Linux 控制台不重排,仍按画的时候的行数(T44)。
 - (澄清)中文 `�` 是旧 pty_probe 逐字节 write 拆断 UTF-8 所致,非 cc-zig bug。
 
 新增/改渲染逻辑后,跑本框架 + 真机确认。渲染架构见 `doc/TUI_STATE_ARCHITECTURE.md`。

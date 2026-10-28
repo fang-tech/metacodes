@@ -54,19 +54,23 @@ def str_width(s: str) -> int:
 
 
 class Cell:
-    __slots__ = ("ch", "width", "cont", "border_class")
+    __slots__ = ("ch", "width", "cont", "border_class", "written")
 
     def __init__(self):
         self.ch = " "
         self.width = 1
         self.cont = False  # 宽字符的续格(占位,不重复显示)
         self.border_class = "plain"
+        # 写过字符(含显式空格)。resize 重排按它算一行的长度:擦掉的格子不算,
+        # 写进去的空格算(xterm.js 的 getTrimmedLength 同此)。
+        self.written = False
 
     def clear(self):
         self.ch = " "
         self.width = 1
         self.cont = False
         self.border_class = "plain"
+        self.written = False
 
 
 class Screen:
@@ -78,6 +82,11 @@ class Screen:
         #   (DEC Last-Column Flag),下个可打印字符才真换行。用于复现"终端 autowrap 致框线错位"。
         self.autowrap = autowrap
         self.grid = [[Cell() for _ in range(cols)] for _ in range(rows)]
+        # wrapped[r]:第 r 行是上一行的软折续行(xterm.js 的 isWrapped)。resize 重排时
+        # 软折的几行合成一条逻辑行;EL 2 / ED 擦过的行重新算独立一行。
+        self.wrapped = [False] * rows
+        # 滚出屏顶的行 [(cells, wrapped)]。resize 重排要它:变宽时终端把它们拉回屏上。
+        self.history = []
         self.row = 0
         self.col = 0
         self.cursor_visible = True
@@ -229,14 +238,15 @@ class Screen:
             # 真实终端行为——transcript viewer 靠它保护 scrollback、退出原样恢复输入框。
             elif private == b"?" and ps and ps[0] == 1049:
                 if f == "h":
-                    self._alt_saved = ([row[:] for row in self.grid], self.row, self.col, self.scrolled)
+                    self._alt_saved = ([row[:] for row in self.grid], self.wrapped[:], self.row, self.col, self.scrolled)
                     self.grid = [[Cell() for _ in range(self.cols)] for _ in range(self.rows)]
+                    self.wrapped = [False] * self.rows
                     self.row = 0
                     self.col = 0
                 elif f == "l":
                     saved = getattr(self, "_alt_saved", None)
                     if saved is not None:
-                        self.grid, self.row, self.col, self.scrolled = saved
+                        self.grid, self.wrapped, self.row, self.col, self.scrolled = saved
                         self._alt_saved = None
             return
         if f == "A":  # up
@@ -265,9 +275,12 @@ class Screen:
             if mode == 2:
                 for cell in self.grid[self.row]:
                     cell.clear()
+                self.wrapped[self.row] = False
             elif mode == 0:
                 for c in range(self.col, self.cols):
                     self.grid[self.row][c].clear()
+                if self.col == 0:
+                    self.wrapped[self.row] = False
             elif mode == 1:
                 for c in range(0, self.col + 1):
                     self.grid[self.row][c].clear()
@@ -276,18 +289,23 @@ class Screen:
                 for rowcells in self.grid:
                     for cell in rowcells:
                         cell.clear()
+                self.wrapped = [False] * self.rows
             elif n1 == 0:
                 # 光标到屏幕末:当前行光标后 + 下方所有行(transcript viewer inline 退出 \x1b[J 用)。
                 for c in range(self.col, self.cols):
                     self.grid[self.row][c].clear()
+                if self.col == 0:
+                    self.wrapped[self.row] = False
                 for r in range(self.row + 1, self.rows):
                     for cell in self.grid[r]:
                         cell.clear()
+                    self.wrapped[r] = False
             elif n1 == 1:
                 # 屏顶到光标。
                 for r in range(0, self.row):
                     for cell in self.grid[r]:
                         cell.clear()
+                    self.wrapped[r] = False
                 for c in range(0, self.col + 1):
                     self.grid[self.row][c].clear()
         elif f == "m":  # SGR → border_class
@@ -379,10 +397,12 @@ class Screen:
                 self._pending_wrap = False
                 self.col = 0
                 self._newline()
+                self.wrapped[self.row] = True
             # 宽字符放不下当前行尾 → 也触发换行(简化:宽字符不跨行折半)。
             if w == 2 and self.col == self.cols - 1:
                 self.col = 0
                 self._newline()
+                self.wrapped[self.row] = True
         else:
             if self.col >= self.cols:
                 return  # 理想终端:实现端软折,不写溢出;防御性截断
@@ -393,12 +413,14 @@ class Screen:
         cell.width = max(1, w)
         cell.cont = False
         cell.border_class = self.cur_class
+        cell.written = True
         if w == 2 and self.col + 1 < self.cols:
             cont = self.grid[self.row][self.col + 1]
             cont.clear()
             cont.cont = True
             cont.ch = ""
             cont.border_class = self.cur_class
+            cont.written = True
         self.col += max(1, w)
         if self.autowrap:
             # 写到最后一列:进入 pending-wrap(光标停在末列,不立即换行)。
@@ -417,9 +439,111 @@ class Screen:
 
     def _scroll_up(self, n: int):
         for _ in range(n):
-            self.grid.pop(0)
+            top = (self.grid.pop(0), self.wrapped.pop(0))
+            if getattr(self, "_alt_saved", None) is None:  # alt-screen 没有 scrollback
+                self.history.append(top)
             self.grid.append([Cell() for _ in range(self.cols)])
+            self.wrapped.append(False)
             self.scrolled += 1
+
+    # ---------------- 改尺寸 ----------------
+
+    def resize(self, rows: int, cols: int, reflow: bool = True) -> None:
+        """终端窗口改尺寸(SIGWINCH 那一刻终端对已显示内容做的事)。
+
+        reflow=True:现代终端(iTerm2、Terminal.app、kitty、Ghostty、WezTerm、Windows
+        Terminal、xterm.js、tmux)按逻辑行重排——变窄时长行折成多行,变宽时软折的行
+        合回去;内容没满屏时贴屏顶,满屏时贴屏底(多出的行进 scrollback,少了从
+        scrollback 拉回)。光标跟着它所在的那一格走。
+        reflow=False:xterm / GNU screen 式裁剪——每行截断或补齐,行数不变,光标列夹到行内。
+        """
+        if getattr(self, "_alt_saved", None) is not None:
+            raise NotImplementedError("resize while the alternate screen is active is not modeled")
+        self._pending_wrap = False
+        if reflow:
+            self._reflow(rows, cols)
+        else:
+            self._clip(rows, cols)
+        self.rows = rows
+        self.cols = cols
+
+    def _clip(self, rows: int, cols: int) -> None:
+        for r, cells in enumerate(self.grid):
+            self.grid[r] = (cells + [Cell() for _ in range(cols - len(cells))])[:cols]
+            # 截断落在宽字符中间:那半个字符不再显示。
+            if cols < len(cells) and cells[cols].cont:
+                self.grid[r][cols - 1].clear()
+        if rows < self.rows:
+            # 屏幕变矮:保住光标所在行,顶上的行滚进 scrollback。
+            drop = max(0, self.row - (rows - 1))
+            for _ in range(drop):
+                self.history.append((self.grid.pop(0), self.wrapped.pop(0)))
+            self.row -= drop
+            del self.grid[rows:]
+            del self.wrapped[rows:]
+        else:
+            self.grid += [[Cell() for _ in range(cols)] for _ in range(rows - self.rows)]
+            self.wrapped += [False] * (rows - self.rows)
+        self.col = min(self.col, cols - 1)
+
+    def _reflow(self, rows: int, cols: int) -> None:
+        old = self.history + list(zip(self.grid, self.wrapped))
+        cursor_at = len(self.history) + self.row
+        # 内容到最后一个写过字符的行或光标所在行为止,其下的空行不参与重排。
+        last = cursor_at
+        for i in range(len(old) - 1, cursor_at, -1):
+            if any(cell.written for cell in old[i][0]):
+                last = i
+                break
+        # 软折的行拼成逻辑行,记下光标在逻辑行里的格子偏移。
+        lines = []  # [cells, cursor_offset or None]
+        for i, (cells, wrapped) in enumerate(old[: last + 1]):
+            if not wrapped or not lines:
+                lines.append([[], None])
+            if i == cursor_at:
+                lines[-1][1] = len(lines[-1][0]) + self.col
+            lines[-1][0].extend(cells)
+        out = []
+        new_cursor = (0, 0)
+        for cells, cursor in lines:
+            end = len(cells)
+            while end > 0 and not cells[end - 1].written:
+                end -= 1
+            chunks = [[]]
+            at = []  # 每个格子落在 (第几段, 段内列)
+            i = 0
+            while i < end:
+                width = 2 if i + 1 < end and cells[i + 1].cont else 1
+                if len(chunks[-1]) + width > cols:
+                    chunks.append([])
+                for k in range(width):
+                    at.append((len(chunks) - 1, len(chunks[-1])))
+                    chunks[-1].append(cells[i + k])
+                i += width
+            if cursor is not None:
+                if cursor < len(at):
+                    seg, col = at[cursor]
+                elif cursor == end and end > 0 and len(chunks[-1]) == cols:
+                    # 刚写满最后一段:停在段尾等折行(DEC pending wrap),不落到下一行。
+                    seg, col = len(chunks) - 1, cols - 1
+                else:
+                    # 光标在内容之后:接着最后一段往后数。
+                    past = len(chunks[-1]) + cursor - end
+                    seg, col = len(chunks) - 1 + past // cols, past % cols
+                while len(chunks) <= seg:
+                    chunks.append([])
+                new_cursor = (len(out) + seg, col)
+            for k, chunk in enumerate(chunks):
+                out.append((chunk + [Cell() for _ in range(cols - len(chunk))], k > 0))
+        # 满屏时贴底,但光标总在屏上。
+        top = min(max(0, len(out) - rows), new_cursor[0])
+        self.history = out[:top]
+        screen = out[top : top + rows]
+        screen += [([Cell() for _ in range(cols)], False) for _ in range(rows - len(screen))]
+        self.grid = [cells for cells, _ in screen]
+        self.wrapped = [wrapped for _, wrapped in screen]
+        self.row = new_cursor[0] - top
+        self.col = min(new_cursor[1], cols - 1)
 
     # ---------------- 读出路径 ----------------
 

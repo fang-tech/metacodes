@@ -38,7 +38,7 @@ cc-zig UI 现状 = **命令式 + 散点重绘**:
 - footer:mode/total_tokens/cost/bg_count/cron_count(快照,收口跨线程裸读)
 - panel:task_list_visible 等 toggle 位
 - transcript_top(Ctrl+O 滚动)、hint(瞬时提示)
-- **不进 UiState**:prev_rows/region_drawn/cursor_in_region_row/mutex/line_buf/pending 快照——属 Renderer(是"上一帧物理痕迹",非逻辑状态)。
+- **不进 UiState**:prev_rows/region_drawn/anchor(回顶支点,见 `tui/reflow.zig`)/mutex/line_buf/pending 快照——属 Renderer(是"上一帧物理痕迹",非逻辑状态)。
 
 ### render 的大数据靠注入(纯函数)
 `RenderInputs{ state, now_ms, theme, use_unicode, agent_snaps[], tasks?, queue_preview[], transcript_lines[] }`——时间注入、大数据只读借用,不拷进 UiState。测试传空/mock 即可。

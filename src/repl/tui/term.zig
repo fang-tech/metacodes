@@ -113,6 +113,37 @@ pub fn getSize(fd: c_int) ?TermSize {
 }
 
 // ============================================================================
+// resize 重排
+// ============================================================================
+
+/// Whether the terminal re-wraps the lines it shows when the window narrows.
+/// Most POSIX terminals do (iTerm2, Terminal.app, kitty, Ghostty, WezTerm,
+/// Alacritty, VTE, xterm.js, tmux); xterm, GNU screen and the Linux console
+/// clip instead. tmux re-wraps whatever runs inside it, so its marker wins over
+/// the outer terminal's. See reflow.zig for what the answer changes.
+pub fn detectReflow(tmux: bool, screen: bool, xterm: bool, term: ?[]const u8) bool {
+    if (tmux) return true;
+    if (screen or xterm) return false;
+    if (term) |t| if (std.mem.eql(u8, t, "linux")) return false;
+    return true;
+}
+
+/// detectReflow over the process environment: `TMUX`, GNU screen's `STY`,
+/// xterm's `XTERM_VERSION`, and `TERM`. Where the platform's console decides
+/// (Windows: conhost clips, platform.terminal.console_reflows), the
+/// environment is not consulted.
+pub fn reflowFromEnv() bool {
+    if (platform_term.console_reflows) |reflows| return reflows;
+    const term = if (std.c.getenv("TERM")) |t| std.mem.span(t) else null;
+    return detectReflow(envSet("TMUX"), envSet("STY"), envSet("XTERM_VERSION"), term);
+}
+
+fn envSet(name: [*:0]const u8) bool {
+    const v = std.c.getenv(name) orelse return false;
+    return std.mem.span(v).len > 0;
+}
+
+// ============================================================================
 // UTF-8 + CJK 显示宽度(从 loop.zig 抽出,共享)
 // ============================================================================
 
@@ -227,6 +258,25 @@ test "detectColor: TERM=dumb / 无 TERM → none" {
 test "detectColor: TERM=xterm → basic_16" {
     try testing.expectEqual(ColorCapability.basic_16, detectColor(false, null, "xterm", null, true));
     try testing.expectEqual(ColorCapability.basic_16, detectColor(false, null, "tmux-direct", null, true));
+}
+
+test "detectReflow: xterm, GNU screen and the Linux console clip; tmux re-wraps inside them" {
+    try testing.expect(detectReflow(false, false, false, "xterm-256color"));
+    try testing.expect(detectReflow(false, false, false, null));
+    try testing.expect(!detectReflow(false, false, true, "xterm-256color"));
+    try testing.expect(!detectReflow(false, true, false, "screen-256color"));
+    try testing.expect(!detectReflow(false, false, false, "linux"));
+    // tmux running in xterm or in screen still re-wraps its own panes.
+    try testing.expect(detectReflow(true, false, true, "tmux-256color"));
+    try testing.expect(detectReflow(true, true, false, "screen-256color"));
+}
+
+test "reflowFromEnv: the platform's console answer wins over the environment" {
+    const reflows = platform_term.console_reflows orelse return error.SkipZigTest;
+    // Windows: no TMUX, STY, XTERM_VERSION or TERM=linux is set by a console,
+    // so detectReflow alone would answer true.
+    try testing.expectEqual(reflows, reflowFromEnv());
+    try testing.expect(!reflows);
 }
 
 test "displayWidth: ASCII" {

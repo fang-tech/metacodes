@@ -22,6 +22,7 @@ const pfs = @import("platform").fs;
 const platform_term = @import("platform").terminal;
 const ansi = @import("../ansi.zig");
 const term = @import("../term.zig");
+const reflow = @import("../reflow.zig");
 const input = @import("../../input.zig");
 const Theme = @import("../theme.zig").Theme;
 
@@ -47,9 +48,11 @@ pub const Pane = struct {
     cols: usize,
     bytes: std.ArrayList(u8) = .empty,
     rows: usize = 0,
+    /// Lines written (a `raw` line the terminal wraps is one line, several rows).
+    lines: usize = 0,
     /// Display column the cursor should rest on in the last row that asked
-    /// for it (a search box); null leaves the cursor hidden.
-    cursor: ?struct { row: usize, col: usize } = null,
+    /// for it (a search box), with that row's line; null leaves the cursor hidden.
+    cursor: ?struct { row: usize, col: usize, line: usize } = null,
 
     pub fn init(allocator: std.mem.Allocator, th: Theme, cols: usize) Pane {
         return .{ .allocator = allocator, .th = th, .cols = @max(cols, 20) };
@@ -62,6 +65,7 @@ pub const Pane = struct {
     fn newline(self: *Pane) !void {
         if (self.rows > 0) try self.bytes.appendSlice(self.allocator, "\r\n");
         try self.bytes.appendSlice(self.allocator, ansi.clear.line);
+        self.lines += 1;
     }
 
     /// The rule that opens the pane.
@@ -200,10 +204,10 @@ pub const Pane = struct {
             try self.bytes.appendSlice(self.allocator, self.th.dim);
             _ = try self.appendClipped(placeholder, self.cols -| (prefix + 1));
             try self.bytes.appendSlice(self.allocator, self.th.reset);
-            self.cursor = .{ .row = self.rows, .col = prefix };
+            self.cursor = .{ .row = self.rows, .col = prefix, .line = self.lines - 1 };
         } else {
             const shown = try self.appendClipped(query, self.cols -| (prefix + 1));
-            self.cursor = .{ .row = self.rows, .col = prefix + shown };
+            self.cursor = .{ .row = self.rows, .col = prefix + shown, .line = self.lines - 1 };
         }
         self.rows += 1;
     }
@@ -271,18 +275,21 @@ pub fn run(comptime D: type, dialog: *D, allocator: std.mem.Allocator, th: Theme
     defer if (saved) |mode| input.restoreMode(in_fd, mode);
 
     var parser = input.KeyParser{};
-    var drawn_rows: usize = 0;
-    var drawn_cols: usize = 0;
-    var cursor_row: usize = 0;
+    var drawn_cols: u16 = 0;
+    // Where the last frame left the cursor. A narrower terminal re-wraps the
+    // pane's full-width rule onto two rows, so the climb back to the frame's
+    // first row counts the rows it takes now (reflow.zig).
+    var drawn: reflow.Anchor = .{};
+    const reflows = term.reflowFromEnv();
     var dirty = true;
     defer {
-        erase(out_fd, cursor_row);
+        erase(out_fd, drawn.climb(terminalCols(out_fd), reflows));
         writeAll(out_fd, ansi.cursor.show);
     }
 
     while (true) {
         if (dirty) {
-            const cols: usize = if (term.getSize(out_fd)) |size| size.cols else 80;
+            const cols = terminalCols(out_fd);
             drawn_cols = cols;
             var pane = Pane.init(allocator, th, cols);
             defer pane.deinit();
@@ -291,18 +298,18 @@ pub fn run(comptime D: type, dialog: *D, allocator: std.mem.Allocator, th: Theme
             defer frame.deinit(allocator);
             try frame.appendSlice(allocator, ansi.sync.begin);
             try frame.appendSlice(allocator, ansi.cursor.hide);
-            try appendErase(&frame, allocator, cursor_row);
+            try appendErase(&frame, allocator, drawn.climb(cols, reflows));
             try frame.appendSlice(allocator, pane.bytes.items);
             try frame.appendSlice(allocator, ansi.clear.to_end_of_screen);
-            drawn_rows = pane.rows;
-            cursor_row = drawn_rows -| 1;
+            drawn = reflow.Anchor.atEnd(pane.bytes.items, cols);
             if (pane.cursor) |at| {
                 var buf: [16]u8 = undefined;
-                if (cursor_row > at.row) try frame.appendSlice(allocator, ansi.cursor.up(@intCast(cursor_row - at.row), &buf));
+                const last_row = pane.rows -| 1;
+                if (last_row > at.row) try frame.appendSlice(allocator, ansi.cursor.up(@intCast(last_row - at.row), &buf));
                 try frame.appendSlice(allocator, "\r");
                 if (at.col > 0) try frame.appendSlice(allocator, ansi.cursor.forward(@intCast(at.col), &buf));
                 try frame.appendSlice(allocator, ansi.cursor.show);
-                cursor_row = at.row;
+                drawn = reflow.Anchor.measure(pane.bytes.items, @intCast(at.line), @intCast(at.col), cols);
             }
             try frame.appendSlice(allocator, ansi.sync.end);
             writeAll(out_fd, frame.items);
@@ -316,8 +323,7 @@ pub fn run(comptime D: type, dialog: *D, allocator: std.mem.Allocator, th: Theme
                 if (parser.flushEsc()) |esc| break :key esc;
                 // A resize interrupts the wait (or shows on the next tick):
                 // draw again at the new width.
-                const now_cols: usize = if (term.getSize(out_fd)) |size| size.cols else 80;
-                if (now_cols != drawn_cols) dirty = true;
+                if (terminalCols(out_fd) != drawn_cols) dirty = true;
                 switch (dialog.tick()) {
                     .none => {},
                     .redraw => dirty = true,
@@ -339,19 +345,23 @@ pub fn run(comptime D: type, dialog: *D, allocator: std.mem.Allocator, th: Theme
     }
 }
 
-/// Move from the cursor's row inside the frame to the frame's first row and
-/// clear everything below.
-fn appendErase(frame: *std.ArrayList(u8), allocator: std.mem.Allocator, cursor_row: usize) !void {
+fn terminalCols(out_fd: c_int) u16 {
+    return if (term.getSize(out_fd)) |size| size.cols else 80;
+}
+
+/// Climb `rows` from the cursor to the frame's first row and clear
+/// everything below.
+fn appendErase(frame: *std.ArrayList(u8), allocator: std.mem.Allocator, rows: u16) !void {
     var buf: [16]u8 = undefined;
     try frame.appendSlice(allocator, "\r");
-    if (cursor_row > 0) try frame.appendSlice(allocator, ansi.cursor.up(@intCast(cursor_row), &buf));
+    if (rows > 0) try frame.appendSlice(allocator, ansi.cursor.up(rows, &buf));
     try frame.appendSlice(allocator, ansi.clear.to_end_of_screen);
 }
 
-fn erase(out_fd: c_int, cursor_row: usize) void {
+fn erase(out_fd: c_int, rows: u16) void {
     var frame: std.ArrayList(u8) = .empty;
     defer frame.deinit(std.heap.c_allocator);
-    appendErase(&frame, std.heap.c_allocator, cursor_row) catch return;
+    appendErase(&frame, std.heap.c_allocator, rows) catch return;
     writeAll(out_fd, frame.items);
 }
 
@@ -445,4 +455,25 @@ test "pane: the search box places the cursor after the query" {
     try pane.search("rev", "Search skills…");
     try testing.expectEqual(@as(usize, 2), pane.cursor.?.row);
     try testing.expectEqual(@as(usize, 7), pane.cursor.?.col);
+    try testing.expectEqual(@as(usize, 2), pane.cursor.?.line);
+}
+
+// The loop climbs from the search box to the pane's first row by lines, and
+// a `raw` line the terminal wraps is one line on several rows: at a narrower
+// width the climb still lands on the rule.
+test "pane: the climb from the search box counts the rows a wrapped line takes" {
+    var pane = Pane.init(testing.allocator, theme_mod.monochrome, 40);
+    defer pane.deinit();
+    try pane.rule();
+    try pane.raw("https://auth.example.test/device?code=ABCD-1234-EFGH-5678");
+    try pane.search("", "Search…");
+    const at = pane.cursor.?;
+    try testing.expectEqual(@as(usize, 3), at.row);
+    try testing.expectEqual(@as(usize, 2), at.line);
+    const anchor = reflow.Anchor.measure(pane.bytes.items, @intCast(at.line), @intCast(at.col), 40);
+    // Drawn at 40: rule 1 row, URL (57) 2 rows.
+    try testing.expectEqual(@as(u16, 3), anchor.climb(40, true));
+    try testing.expectEqual(@as(u16, 3), anchor.climb(40, false));
+    // At 20 columns: rule 2 rows, URL 3 rows.
+    try testing.expectEqual(@as(u16, 5), anchor.climb(20, true));
 }
