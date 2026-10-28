@@ -469,8 +469,8 @@ const Late = struct {
     /// The round's scanner, with any sequence the deadline cut still open.
     scanner: Scanner,
     /// `platform.terminal.discardCount` when the terminal was last read: a
-    /// different count means input was thrown away since (a TCSAFLUSH mode
-    /// switch), possibly the rest of the open sequence.
+    /// different count means queued input was thrown away since (a TCSAFLUSH
+    /// mode switch), and what came right after the open sequence is its rest.
     discards: u32,
     /// When the open sequence last grew.
     progress_ms: i64,
@@ -944,6 +944,7 @@ test "Late: answers that come after the deadline are dropped, keys are kept, a c
     defer _ = std.c.close(fds[0]);
     defer _ = std.c.close(fds[1]);
     const r = fds[0];
+    defer forgetOwedForTest(r);
     // The deadline cut the round inside DA1.
     g_late = Late.init(r, std.mem.zeroes(platform_term.SavedMode), scan(both, "\x1b[?62;"));
     defer g_late = null;
@@ -970,6 +971,15 @@ test "Late: answers that come after the deadline are dropped, keys are kept, a c
     try testing.expectEqual(@as(i32, 0), platform_term.waitReadable(r, 0));
 }
 
+/// A test that stops early leaves bytes owed to its pipe's fd, which the
+/// next test's pipe may reuse.
+fn forgetOwedForTest(fd: c_int) void {
+    var sink: [256]u8 = undefined;
+    while (platform_term.replayRoom(fd) < platform_term.replay_capacity) {
+        if (platform_term.readInput(fd, &sink) <= 0) break; // no EINTR: the replay buffer, no syscall
+    }
+}
+
 /// Read everything `replayInput` owes `fd`, then what the pipe still holds.
 fn drainForTest(fd: c_int, owed: []u8, rest: []u8) struct { owed: []u8, rest: []u8 } {
     var o: usize = 0;
@@ -994,6 +1004,7 @@ test "Late: a cut answer whose tail a mode switch discarded does not swallow the
     defer _ = std.c.close(fds[0]);
     defer _ = std.c.close(fds[1]);
     const r = fds[0];
+    defer forgetOwedForTest(r);
     g_late = Late.init(r, std.mem.zeroes(platform_term.SavedMode), scan(both, "\x1b[?62;"));
     defer g_late = null;
     // The tail arrives and a TCSAFLUSH mode switch (the splash's raw entry,
@@ -1010,6 +1021,30 @@ test "Late: a cut answer whose tail a mode switch discarded does not swallow the
     try testing.expectEqualStrings("ls", got.owed);
 }
 
+test "Late: a discard that found nothing queued leaves a cut answer to the tail that comes after it" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var fds: [2]c_int = undefined;
+    try testing.expectEqual(@as(c_int, 0), std.c.pipe(&fds));
+    defer _ = std.c.close(fds[0]);
+    defer _ = std.c.close(fds[1]);
+    const r = fds[0];
+    defer forgetOwedForTest(r);
+    g_late = Late.init(r, std.mem.zeroes(platform_term.SavedMode), scan(both, "\x1b[?62;"));
+    defer g_late = null;
+    // The splash enters raw mode (TCSAFLUSH) right after the probe, before
+    // the tail; the tail comes while it plays, then a key.
+    platform_term.discardPendingInput(r);
+    try testing.expect(pfs.writeAll(fds[1], "22c"));
+    try testing.expect(lateAnswersOnly(r));
+    try testing.expect(pfs.writeAll(fds[1], "ls"));
+    try testing.expect(!lateAnswersOnly(r));
+    try testing.expect(handOver(r) != null);
+    var owed: [16]u8 = undefined;
+    var rest: [16]u8 = undefined;
+    const got = drainForTest(r, &owed, &rest);
+    try testing.expectEqualStrings("ls", got.owed);
+}
+
 test "Late: a cut answer that waited a read wait for its tail is given up, and the text typed next is typed" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
     var fds: [2]c_int = undefined;
@@ -1017,6 +1052,7 @@ test "Late: a cut answer that waited a read wait for its tail is given up, and t
     defer _ = std.c.close(fds[0]);
     defer _ = std.c.close(fds[1]);
     const r = fds[0];
+    defer forgetOwedForTest(r);
     // An OSC 11 answer cut inside its colour; nothing discarded the tail,
     // it just never came.
     g_late = Late.init(r, std.mem.zeroes(platform_term.SavedMode), scan(both, "\x1b]11;rgb:1e1e/"));
@@ -1040,6 +1076,7 @@ test "Late: a cut answer read only after a read wait still takes the tail that c
     defer _ = std.c.close(fds[0]);
     defer _ = std.c.close(fds[1]);
     const r = fds[0];
+    defer forgetOwedForTest(r);
     // The tail came right after the deadline and sat in the queue; nothing
     // read it until the REPL took over, seconds later (App.init).
     g_late = Late.init(r, std.mem.zeroes(platform_term.SavedMode), scan(both, "\x1b[?62;"));
@@ -1075,6 +1112,7 @@ test "Late: absorbing stops where stdin's replay is full, and what is left stays
     defer _ = std.c.close(fds[0]);
     defer _ = std.c.close(fds[1]);
     const r = fds[0];
+    defer forgetOwedForTest(r);
     g_late = Late.init(r, std.mem.zeroes(platform_term.SavedMode), Scanner.init(both));
     defer g_late = null;
     // One byte short of a full replay, then a Left arrow that straddles the

@@ -51,11 +51,11 @@ status, compatibility boundaries, and entry points are defined by
   (`^[[?62;22c`) or end the startup animation as if it were the key that
   skips it. An answer the deadline cut in half is dropped rather than handed
   to the prompt, where its missing tail took the user's next key; one still
-  open when input was discarded since (a `TCSAFLUSH` mode switch) is given
-  up, and after a read wait without its tail, what follows is taken for its
-  tail only if it completes it (digits up to `c`/`u`, a colour up to BEL),
-  so the text typed next is not read as its tail. Reading what queued up
-  stops where stdin's replay is full
+  open when queued input was thrown away since (a `TCSAFLUSH` mode switch
+  that found input waiting) is given up, and after a read wait without its
+  tail, what follows is taken for its tail only if it completes it (digits
+  up to `c`/`u`, a colour up to BEL), so the text typed next is not read as
+  its tail. Reading what queued up stops where stdin's replay is full
   instead of overrunning it (a 4 KiB burst typed during such a startup
   crashed a Debug or ReleaseSafe build). The key
   parser also consumes a whole private-marker CSI (`ESC [ ? … c`,
