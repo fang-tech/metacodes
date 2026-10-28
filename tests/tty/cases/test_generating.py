@@ -395,9 +395,12 @@ def test_A6_narrow_terminal_no_wrap(bin_path):
               term_size=(24, 40), per_key_drain=0.05)
     a = TTYAssert(raw, rows=24, cols=40)
     bad = []
-    for sc in a.frame_screens:
-        if sc.find_last_row("esc to interrupt") is None:
-            continue  # 只看生成期帧
+    # 只看生成期帧。40 列下 footer 被截断(`⏵⏵ bypass permissions on (shift+t…`),
+    # 'esc to interrupt' 不会出现,按 spinner 行的 '…' 认生成期帧。
+    gens = _gen_frames(a)
+    if not gens:
+        a._fail("没有捕获到生成期帧")
+    for sc in gens:
         for r in range(sc.rows):
             if str_width(sc.line_text(r)) > 40:
                 bad.append((r, sc.line_text(r)))
