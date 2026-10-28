@@ -93,17 +93,32 @@ fn emitErasePairing(merge: bool) !void {
     for (0..30) |i| {
         var buf: [32]u8 = undefined;
         const line = try std.fmt.bufPrint(&buf, "line {d}\n", .{i});
+        const written = t.written().len;
         r.writeGenText(line);
-        try expectRegionOnScreenOnce(t);
-        if (i % 3 == 0) {
-            r.tickSpinner(fx.app);
+        if (merge) {
+            // Inside the window: nothing reaches the terminal yet, and the
+            // tick rides on the same frame as the line.
+            try testing.expectEqual(written, t.written().len);
+            if (i % 3 == 0) r.tickSpinner(fx.app);
+            try testing.expectEqual(written, t.written().len);
             try expectRegionOnScreenOnce(t);
+        } else {
+            try expectRegionOnScreenOnce(t);
+            if (i % 3 == 0) {
+                r.tickSpinner(fx.app);
+                try expectRegionOnScreenOnce(t);
+            }
         }
         if (i > 0) try expected.append(gpa, '\n');
         try expected.appendSlice(gpa, line[0 .. line.len - 1]);
     }
-    // Every erase+redraw above was one closed frame.
-    try testing.expect(t.screen.sync_frames >= frames_before + 30 + 10);
+    // Every erase+redraw above was one closed frame: one per request, or,
+    // with the merge window, one per window.
+    if (merge) {
+        try testing.expectEqual(frames_before + 30, t.screen.sync_frames);
+    } else {
+        try testing.expect(t.screen.sync_frames >= frames_before + 30 + 10);
+    }
 
     r.leaveGenerating(fx.app);
     try expectRegionGone(t);

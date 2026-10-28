@@ -895,7 +895,7 @@ fn runTurn(host: *const TurnHost, kind: TurnKind, synthetic_user_input: ?[]const
         // between, so the picker the last reply left open comes here.
         if (app.pending_overlay == .model_picker_kept) {
             app.pending_overlay = .none;
-            picker_host.keep(app, &r.ui);
+            picker_host.keep(app, &r.ui, .of(r));
         }
     }
     // The region is shared by the whole session: an exit from this
@@ -1682,11 +1682,11 @@ fn readLineRaw(
         .none => {},
         .model_picker => {
             app.pending_overlay = .none;
-            picker_host.open(app, &region.ui);
+            picker_host.open(app, &region.ui, .of(region));
         },
         .model_picker_kept => {
             app.pending_overlay = .none;
-            picker_host.keep(app, &region.ui);
+            picker_host.keep(app, &region.ui, .of(region));
         },
         .transcript => {
             app.pending_overlay = .none;
@@ -1768,7 +1768,7 @@ fn readLineRaw(
                 }
                 // The picker's sign-in runs on a worker thread (#67); the idle
                 // tick is where its transcript reaches the overlay.
-                if (region.pickerOpen()) switch (picker_host.poll(app, &region.ui)) {
+                if (region.pickerOpen()) switch (picker_host.poll(app, &region.ui, .of(region))) {
                     .committed => {
                         region.clear();
                         region.emitTerminalFmt("{s}\n", .{picker_host.lastNotice(app)});
@@ -2081,12 +2081,12 @@ fn readLineRaw(
                     continue;
                 },
                 .open_model_picker => {
-                    picker_host.open(app, &region.ui);
+                    picker_host.open(app, &region.ui, .of(region));
                     redraw(region, &editor, app);
                     continue;
                 },
                 .picker_key => {
-                    if (picker_host.onKey(app, &region.ui, eff.picker_key) == .committed) {
+                    if (picker_host.onKey(app, &region.ui, eff.picker_key, .of(region)) == .committed) {
                         // The overlay is gone; the confirmation has to survive
                         // it or the user cannot tell which route was chosen.
                         region.clear();

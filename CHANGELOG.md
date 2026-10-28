@@ -121,6 +121,15 @@ status, compatibility boundaries, and entry points are defined by
   typed. The draft now belongs to the reply: after the dialog the box still
   shows it, the cursor is where it was, and Enter queues all of it.
 
+- **The model picker no longer races the reply's frames.** A picker opened
+  during a reply is written by the keyboard thread while the reply's text
+  frames are drawn on another; a catalog refresh with the picker open (a
+  sign-in landing, or a commit that met a configuration change) rebuilt the
+  offer list under a frame that was still indexing it, which a safe build
+  reports as an out-of-bounds panic. Every change to the picker now holds the
+  render lock for the change alone; committing a route, signing in and
+  listing the catalog run outside it.
+
 ### Changed
 
 - **Smaller Linux footprint: idle RSS back under its red line, binary

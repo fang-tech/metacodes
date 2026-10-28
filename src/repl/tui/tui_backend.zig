@@ -630,7 +630,7 @@ pub const TuiBackend = struct {
                     // The picker's sign-in runs on a worker thread (#67);
                     // this tick moves its transcript into the overlay and
                     // commits the pending route once the login lands.
-                    if (self.region.pickerOpen()) switch (picker_host.poll(app, &self.region.ui)) {
+                    if (self.region.pickerOpen()) switch (picker_host.poll(app, &self.region.ui, .of(self.region))) {
                         .committed => {
                             self.region.writeGenText(picker_host.lastNotice(app));
                             self.region.writeGenText("\n");
@@ -735,14 +735,14 @@ pub const TuiBackend = struct {
             .open_model_picker => {
                 // 生成期也能开(要求:picker 在流式回复期间可用)。不碰 alt-screen:
                 // picker 画在固定区内,回复继续往 scrollback 走;改动只影响下一轮。
-                // picker_host 的三个入口不持 region 锁(会做网络/文件 IO),别的线程可能同时在画
-                // picker:已知残留,见 doc/TUI_STATE_ARCHITECTURE.md §9.2「picker」。
-                picker_host.open(app, &self.region.ui);
+                // picker 的写者是本线程;agent 线程的帧、合并窗口的定时线程同时在读它。
+                // picker_host 只在内存修改时持 region 锁(Guard),IO 在锁外(§9.2「picker」)。
+                picker_host.open(app, &self.region.ui, .of(self.region));
                 self.region.redrawGen(app);
                 return;
             },
             .picker_key => {
-                if (picker_host.onKey(app, &self.region.ui, eff.picker_key) == .committed) {
+                if (picker_host.onKey(app, &self.region.ui, eff.picker_key, .of(self.region)) == .committed) {
                     // Mid-stream the confirmation goes into scrollback through
                     // the same path streamed text uses, so it survives the
                     // overlay closing without fighting the region for stdout.

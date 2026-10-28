@@ -171,6 +171,18 @@ pub const RenderRegion = struct {
         _ = self.mutex.unlock();
     }
 
+    /// The region lock, for a writer of state that frames read but the region
+    /// does not own (`app.model_picker`, see picker_host.Guard). Hold it for
+    /// the in-memory write only: never across IO, never with another lock
+    /// taken inside, never around a call into the region (it is not
+    /// recursive).
+    pub fn lockUi(self: *RenderRegion) void {
+        self.lock();
+    }
+    pub fn unlockUi(self: *RenderRegion) void {
+        self.unlock();
+    }
+
     /// 生成期 overlay(全屏 transcript viewer,alt-screen)用:持渲染锁,使 agent_loop emit 线程
     /// 阻塞在锁上、不与 viewer 抢 stdout。enter/exit 必须配对。viewer 自身不请求本锁(无死锁)。
     /// viewer 自己进/出 alt-screen 独立缓冲(ESC[?1049h/l)全屏画 transcript,退出由终端**自动恢复主
@@ -241,7 +253,7 @@ pub const RenderRegion = struct {
             const w = &self.scratch.writer;
             self.resetScratch();
             w.writeAll("\n") catch {};
-            self.flush();
+            self.flushScratch();
             self.text_pending_newline = false;
             self.pending_col = 0;
         }
@@ -376,13 +388,26 @@ pub const RenderRegion = struct {
     /// 合并窗口最多压着一个窗口(~16 ms)已经发出、还没写到终端的文本。进程 panic 时它们随进程
     /// 一起丢掉,而它们常常正是 panic 之前最后发生的事。panic 钩子(main.zig)先调这里:
     /// 拿得到锁才写——锁被占着(panic 的正是持锁画帧的线程,或别的线程正画到一半)时帧状态
-    /// 不可信,放弃,宁可少几行也不把屏幕写乱。写的是 `.hidden` 帧:擦掉固定区、写出文本、
+    /// 不可信,放弃,宁可少几行也不把屏幕写乱。写的是擦掉固定区、再按序写出攒着的文本,
     /// 不再画区,panic 信息接着打在文本下面。
+    /// **不分配**:panic 可能正来自分配器——Zig 的 DebugAllocator 持着自己的锁报 invalid free /
+    /// double free——这时让 scratch 扩容会永远等那把锁,崩溃变成挂死。擦除字节拼在栈上的固定
+    /// 缓冲里(装不下就整个放弃),文本原样写出。这条路径上若再 panic,默认 handler 只报"panic
+    /// 期间又 panic",原来的信息就丢了;所以这里只做 tryLock、拼固定字节、写。
     /// 返回 true 时锁**仍被持有**:panic 信息打完之前,定时线程和别的线程不会再画区盖住它
     /// (进程随后 abort,不放)。
     pub fn flushForPanic(self: *RenderRegion) bool {
         if (!self.mutex.tryLock()) return false;
-        if (self.pending_scroll.items.len > 0) self.paintLocked(.hidden, "");
+        const text = self.pending_scroll.items;
+        if (text.len == 0) return true;
+        var erase_buf: [128]u8 = undefined;
+        var erase: std.Io.Writer = .fixed(&erase_buf);
+        if (self.region_drawn and self.prev_rows > 0) {
+            self.writeErase(&erase) catch return true;
+            self.region_drawn = false;
+        }
+        self.flush(erase.buffered());
+        self.flush(text);
         return true;
     }
 
@@ -443,7 +468,7 @@ pub const RenderRegion = struct {
         if (draw) self.drawGenRegion(self.gen_app.?);
         if (framed) w.writeAll(ansi.sync.end) catch {};
         self.frame_active = false;
-        self.flush();
+        self.flushScratch();
         self.pending_scroll.clearRetainingCapacity();
     }
 
@@ -623,9 +648,14 @@ pub const RenderRegion = struct {
         self.scratch.writer.end = 0;
     }
 
-    /// 把 scratch 已写字节一次性输出(走 std.debug.print → lockStdErr;设了 sink 则写 sink)。
-    fn flush(self: *RenderRegion) void {
-        const bytes = self.scratch.written();
+    /// 把 scratch 已写字节一次性输出。
+    fn flushScratch(self: *RenderRegion) void {
+        self.flush(self.scratch.written());
+    }
+
+    /// 写终端的唯一出口(走 std.debug.print → lockStdErr;设了 sink 则写 sink)。不分配:
+    /// panic 钩子也经这里写(flushForPanic)。
+    fn flush(self: *RenderRegion, bytes: []const u8) void {
         if (bytes.len == 0) return;
         if (self.sink) |out| {
             out.writeAll(bytes) catch {};
@@ -644,7 +674,7 @@ pub const RenderRegion = struct {
         if (!self.frame_active and self.pending_scroll.items.len > 0) self.paintLocked(.as_needed, "");
         if (!self.frame_active) self.resetScratch();
         self.scratch.writer.writeAll(bytes) catch return;
-        if (!self.frame_active) self.flush();
+        if (!self.frame_active) self.flushScratch();
     }
 
     /// 将格式化后的终端字节交给唯一 Renderer 输出，避免 TUI 调用点旁路
@@ -655,7 +685,7 @@ pub const RenderRegion = struct {
         if (!self.frame_active and self.pending_scroll.items.len > 0) self.paintLocked(.as_needed, "");
         if (!self.frame_active) self.resetScratch();
         self.scratch.writer.print(fmt, args) catch return;
-        if (!self.frame_active) self.flush();
+        if (!self.frame_active) self.flushScratch();
     }
 
     /// 将已经排版好的 scrollback 文本交给唯一 Renderer 输出。
@@ -676,11 +706,11 @@ pub const RenderRegion = struct {
     /// Move from the cursor of the last frame to column 1 of the region's top
     /// row. Callers measure the terminal first: the climb counts the rows the
     /// last frame takes at the current width (reflow.zig).
-    fn climbToTop(self: *RenderRegion, w: *std.Io.Writer) void {
+    fn climbToTop(self: *const RenderRegion, w: *std.Io.Writer) std.Io.Writer.Error!void {
         var nbuf: [16]u8 = undefined;
         const up = self.anchor.climb(self.cols, self.reflows);
-        if (up > 0) w.writeAll(ansi.cursor.up(up, &nbuf)) catch {};
-        w.writeAll("\r") catch {};
+        if (up > 0) try w.writeAll(ansi.cursor.up(up, &nbuf));
+        try w.writeAll("\r");
     }
 
     /// Detect a terminal resize before any operation that relies on the
@@ -715,7 +745,7 @@ pub const RenderRegion = struct {
         if (!self.frame_active) self.resetScratch();
         self.scratch.writer.writeAll("\n") catch {};
         self.resize_seal_pending = false;
-        if (!self.frame_active) self.flush();
+        if (!self.frame_active) self.flushScratch();
     }
 
     // =====================================================================
@@ -894,7 +924,7 @@ pub const RenderRegion = struct {
         // 停在旧框里:框上方留旧横线、下方留旧 footer,每次 resize 各多一条。区是屏上最后的内容,
         // 区顶起一次 ED 0 清掉旧帧在新帧下方多出的行(收缩、重排都会多出来),不碰 scrollback。
         w.writeAll(ansi.cursor.hide) catch {};
-        self.climbToTop(w);
+        self.climbToTop(w) catch {};
         w.writeAll(ansi.clear.to_end_of_screen) catch {};
         const rows_start = self.scratch.writer.end;
 
@@ -1043,7 +1073,7 @@ pub const RenderRegion = struct {
         if (own_frame) {
             self.frame_active = false;
             w.writeAll(ansi.sync.end) catch {};
-            self.flush();
+            self.flushScratch();
         }
     }
 
@@ -1803,7 +1833,7 @@ pub const RenderRegion = struct {
         // 回区顶:光标当前在区内第 anchor.rows_above 行(不一定最后一行)。相对上移,随滚屏有效。
         // 提交可能紧跟在 resize 之后、重画之前:先量尺寸,climb 才按终端现在的宽度数行。
         _ = self.measureSize();
-        self.climbToTop(w);
+        self.climbToTop(w) catch {};
         // 光标已在固定区顶行。一次 ED 0 清到屏底,不逐行用 \r\n/CUU 穿过屏幕底部;
         // Windows Console 在逐行移动时可能把旧顶线脱离固定区,进入后续 scrollback。
         // ED 0 不写换行,也不会清除 scrollback。光标留在区顶第一行行首——后续消息从这里打。
@@ -1816,7 +1846,7 @@ pub const RenderRegion = struct {
         if (own_frame) {
             self.frame_active = false;
             w.writeAll(ansi.sync.end) catch {};
-            self.flush();
+            self.flushScratch();
         }
     }
 
@@ -1840,7 +1870,7 @@ pub const RenderRegion = struct {
         self.resetScreenInFrame();
         self.frame_active = false;
         self.scratch.writer.writeAll(ansi.sync.end) catch {};
-        self.flush();
+        self.flushScratch();
         // The reset redrew the generating region with the current state, which
         // is what a pending frame would have shown.
         if (self.inGeneration()) {
@@ -1921,7 +1951,7 @@ pub const RenderRegion = struct {
             const w = &self.scratch.writer;
             self.resetScratch();
             w.writeAll("\n") catch {}; // 半行文本尾补换行,下一轮从干净行起
-            self.flush();
+            self.flushScratch();
             self.text_pending_newline = false;
             self.pending_col = 0;
         }
@@ -2329,24 +2359,28 @@ pub const RenderRegion = struct {
             self.region_drawn = false;
             return;
         }
-        const w = &self.scratch.writer;
         if (!self.frame_active) self.resetScratch(); // 帧内:接续 frame 已写的 sync_begin,勿清
+        self.writeErase(&self.scratch.writer) catch {};
+        if (!self.frame_active) self.flushScratch(); // 帧内:由外层 frame 统一 flush(原子帧)
+        self.region_drawn = false;
+    }
+
+    /// eraseRegion 的字节,写进调用方给的 writer:不分配,panic 钩子给的是栈上的固定缓冲。
+    fn writeErase(self: *const RenderRegion, w: *std.Io.Writer) std.Io.Writer.Error!void {
         var nb: [16]u8 = undefined;
-        w.writeAll(ansi.cursor.hide) catch {};
+        try w.writeAll(ansi.cursor.hide);
         // 光标当前在区内 anchor.rows_above 行(编辑点)→ 先回区顶行首。
-        self.climbToTop(w);
+        try self.climbToTop(w);
         // 区顶起一次 ED 0 清到屏底:不逐行 \r\n 穿过屏幕底部,不改变 scrollback。
         // 光标留在区顶行首(= 文本末尾的下一行)。
-        w.writeAll(ansi.clear.to_end_of_screen) catch {};
+        try w.writeAll(ansi.clear.to_end_of_screen);
         // 半行续接:按"画区那一刻"的快照还原(不读 live flag)。区顶上一行是文本末尾半行,回其末尾列。
         if (self.region_drawn_pending_nl) {
-            w.writeAll(ansi.cursor.up(1, &nb)) catch {};
-            w.writeAll("\r") catch {};
-            if (self.region_drawn_pending_col > 0) w.writeAll(ansi.cursor.forward(self.region_drawn_pending_col, &nb)) catch {};
+            try w.writeAll(ansi.cursor.up(1, &nb));
+            try w.writeAll("\r");
+            if (self.region_drawn_pending_col > 0) try w.writeAll(ansi.cursor.forward(self.region_drawn_pending_col, &nb));
         }
-        w.writeAll(ansi.cursor.show) catch {};
-        if (!self.frame_active) self.flush(); // 帧内:由外层 frame 统一 flush(原子帧)
-        self.region_drawn = false;
+        try w.writeAll(ansi.cursor.show);
     }
 
     /// 画生成期固定区(spinner + 队列预览 + 上框 + ❯editor(多行) + 下框 + footer),文本流末尾下方。
@@ -2488,7 +2522,7 @@ pub const RenderRegion = struct {
         self.prev_rows = R;
         self.anchor = reflow.Anchor.measure(self.scratch.written()[rows_start..], edit_row, cursor_col, self.cols);
         self.region_drawn = true;
-        if (!self.frame_active) self.flush(); // 帧内:由外层 frame 统一 flush(原子帧)
+        if (!self.frame_active) self.flushScratch(); // 帧内:由外层 frame 统一 flush(原子帧)
     }
 
     /// 执行中 per-toolUse 进度卡(动态区,可刷新):⏺ <Tool> / ⎿ <progress>。对齐 cc 双段卡。

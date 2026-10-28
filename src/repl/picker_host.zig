@@ -5,6 +5,15 @@
 //! through the kernel, rebind the live route. Both phases share it: the input
 //! loop and the streaming watcher call the same two entry points, so a picker
 //! opened mid-reply behaves exactly like one opened at the prompt.
+//!
+//! Threads: the picker has one writer, the thread running the phase's key loop
+//! (the input loop, or a reply's keyboard watcher). Frames other threads draw
+//! (a reply's agent thread, the merge window's timer, #328) only read it. So
+//! every write to `app.model_picker` and to `picker_open` happens under the
+//! caller's `Guard`, the region lock: held for an in-memory update, never
+//! across IO and never with another lock taken inside it. The writer's own
+//! reads need no lock. Committing a route, a sign-in, opening a browser and
+//! listing the catalog all run outside it.
 
 const std = @import("std");
 const app_mod = @import("../app.zig");
@@ -14,8 +23,30 @@ const view_mod = @import("model_picker_view.zig");
 const provider_login = @import("../api/provider_login.zig");
 const provider_host_mod = @import("../provider/host.zig");
 const login_worker_mod = @import("../api/login_worker.zig");
+const RenderRegion = @import("tui/render_region.zig").RenderRegion;
 
 pub const Key = picker_mod.Key;
+
+/// The lock a picker write takes so that no frame drawn on another thread
+/// reads the picker halfway through it (see the module header).
+pub const Guard = struct {
+    region: ?*RenderRegion = null,
+
+    /// No other thread draws the picker (component tests driving it alone).
+    pub const unguarded: Guard = .{};
+
+    pub fn of(region: *RenderRegion) Guard {
+        return .{ .region = region };
+    }
+
+    fn lock(guard: Guard) void {
+        if (guard.region) |region| region.lockUi();
+    }
+
+    fn unlock(guard: Guard) void {
+        if (guard.region) |region| region.unlockUi();
+    }
+};
 
 /// Rows the list may occupy. Kept well inside the fixed region so the picker
 /// never pushes the input box off a short terminal.
@@ -25,12 +56,10 @@ fn pageRowsFor(rows: u16) usize {
     return @min(@as(usize, @intCast(third)), 12);
 }
 
-pub fn open(app: *app_mod.App, ui: *ui_state.UiState) void {
-    app.refreshModelPicker() catch {
-        // A catalog that cannot be built is shown as a failed picker rather
-        // than as silence: the user pressed a key and deserves an answer.
-        app.model_picker.markFailed();
-    };
+pub fn open(app: *app_mod.App, ui: *ui_state.UiState, guard: Guard) void {
+    refresh(app, guard);
+    guard.lock();
+    defer guard.unlock();
     app.model_picker.restart();
     // The level the session runs with starts selected on any route that
     // offers it, so applying a route does not quietly drop it.
@@ -45,15 +74,19 @@ pub fn open(app: *app_mod.App, ui: *ui_state.UiState) void {
 /// the snapshot and the half-finished browse; only the page height, which
 /// belongs to the new region, is recomputed. The overlay itself died with
 /// that phase (#330), so this is what carries it across the boundary.
-pub fn keep(app: *app_mod.App, ui: *ui_state.UiState) void {
+pub fn keep(app: *app_mod.App, ui: *ui_state.UiState, guard: Guard) void {
+    guard.lock();
+    defer guard.unlock();
     app.model_picker.page_rows = pageRowsFor(ui.rows);
     setOpen(ui, true);
 }
 
-pub fn close(app: *app_mod.App, ui: *ui_state.UiState) void {
+pub fn close(app: *app_mod.App, ui: *ui_state.UiState, guard: Guard) void {
     // A picker that closes mid sign-in must not leave a thread waiting on
     // a socket.
     cancelLogin(app);
+    guard.lock();
+    defer guard.unlock();
     setOpen(ui, false);
     app.model_picker.clearNotice();
 }
@@ -63,6 +96,31 @@ pub fn close(app: *app_mod.App, ui: *ui_state.UiState) void {
 fn setOpen(ui: *ui_state.UiState, open_now: bool) void {
     const ix = ui.interaction() orelse return;
     ix.picker_open = open_now;
+}
+
+/// Rebuild the snapshot from the kernel: the listing (which may first build
+/// the provider host) outside the guard, the snapshot swap under it.
+fn refresh(app: *app_mod.App, guard: Guard) void {
+    var listing = app.listModelOffers() catch {
+        guard.lock();
+        defer guard.unlock();
+        // A catalog that cannot be built is shown as a failed picker rather
+        // than as silence: the user pressed a key and deserves an answer.
+        app.model_picker.markFailed();
+        return;
+    };
+    defer listing.deinit(app.allocator);
+    publishListing(app, &listing, guard);
+}
+
+/// The locked half of a refresh: `listing` becomes the picker's snapshot.
+/// This swap is what a frame must not see halfway: `adopt` clears the offer
+/// list and refills it, possibly into a new buffer, while the view indexes
+/// it by the rows it grouped.
+pub fn publishListing(app: *app_mod.App, listing: *const app_mod.App.ModelListing, guard: Guard) void {
+    guard.lock();
+    defer guard.unlock();
+    app.adoptModelListing(listing) catch app.model_picker.markFailed();
 }
 
 /// One line describing the last commit. Stable until the picker is reopened,
@@ -84,25 +142,30 @@ pub const Result = enum {
 };
 
 /// Feed one key.
-pub fn onKey(app: *app_mod.App, ui: *ui_state.UiState, key: Key) Result {
-    // The window can have changed since the picker opened; recompute before
-    // the key moves the cursor so scrolling uses the current geometry.
-    app.model_picker.page_rows = pageRowsFor(ui.rows);
-    switch (app.model_picker.onKey(key)) {
+pub fn onKey(app: *app_mod.App, ui: *ui_state.UiState, key: Key, guard: Guard) Result {
+    const outcome = step: {
+        guard.lock();
+        defer guard.unlock();
+        // The window can have changed since the picker opened; recompute before
+        // the key moves the cursor so scrolling uses the current geometry.
+        app.model_picker.page_rows = pageRowsFor(ui.rows);
+        break :step app.model_picker.onKey(key);
+    };
+    switch (outcome) {
         .ignored => return .ignored,
         .redraw => return .redraw,
         .closed => {
-            close(app, ui);
+            close(app, ui, guard);
             return .redraw;
         },
-        .commit => |commit| return apply(app, ui, commit),
+        .commit => |commit| return apply(app, ui, commit, guard),
         // Only `enterCredentialStage` produces `.login`, never a key.
         .login => unreachable,
         .cancel_login => {
             cancelLogin(app);
             return .redraw;
         },
-        .submit_key => return submitKey(app),
+        .submit_key => return submitKey(app, guard),
         .open_key_page => {
             const choices = app.model_picker.keyChoices();
             if (app.model_picker.key_choice < choices.len) {
@@ -117,15 +180,24 @@ pub fn onKey(app: *app_mod.App, ui: *ui_state.UiState, key: Key) Result {
 /// moves the worker's transcript into the picker and settles a finished
 /// login. A landed login refreshes the catalog and retries the pending commit,
 /// so the route the user chose is the one that becomes active.
-pub fn poll(app: *app_mod.App, ui: *ui_state.UiState) Result {
+pub fn poll(app: *app_mod.App, ui: *ui_state.UiState, guard: Guard) Result {
     const worker = app.login_worker orelse return .ignored;
     var transcript: [login_worker_mod.TRANSCRIPT_CAPACITY]u8 = undefined;
-    const changed = app.model_picker.setCredentialLines(worker.copyTranscript(&transcript));
+    const lines = worker.copyTranscript(&transcript);
+    const changed = shown: {
+        guard.lock();
+        defer guard.unlock();
+        break :shown app.model_picker.setCredentialLines(lines);
+    };
     switch (worker.currentState()) {
         .idle => return .ignored,
         .running => return if (changed) .redraw else .ignored,
         .failed => {
-            app.model_picker.credentialFailed(worker.failureName());
+            {
+                guard.lock();
+                defer guard.unlock();
+                app.model_picker.credentialFailed(worker.failureName());
+            }
             finishLogin(app);
             return .redraw;
         },
@@ -137,8 +209,13 @@ pub fn poll(app: *app_mod.App, ui: *ui_state.UiState) Result {
             finishLogin(app);
             // The catalog is rebuilt so the route's credential is seen, then
             // the commit the user asked for goes through the normal path.
-            app.refreshModelPicker() catch app.model_picker.markFailed();
-            if (app.model_picker.takePendingCommit()) |commit| return apply(app, ui, commit);
+            refresh(app, guard);
+            const pending = taken: {
+                guard.lock();
+                defer guard.unlock();
+                break :taken app.model_picker.takePendingCommit();
+            };
+            if (pending) |commit| return apply(app, ui, commit, guard);
             return .redraw;
         },
     }
@@ -149,11 +226,13 @@ pub fn poll(app: *app_mod.App, ui: *ui_state.UiState) Result {
 /// login `/login` runs (so every refusal is the typed one), a worker thread
 /// runs it, and the picker enters its credential stage with the commit
 /// pending. Returns false when nothing was started and no notice was set.
-fn startLogin(app: *app_mod.App, commit: picker_mod.Commit) bool {
+fn startLogin(app: *app_mod.App, commit: picker_mod.Commit, guard: Guard) bool {
     const host = app.providerHost() catch return false;
     const provider = missingCredentialPointer(host, commit.offer_id) orelse return false;
     const profile = host.registry.findById(provider) orelse return false;
     const prepared = provider_login.prepareProfileWith(profile, .{ .state_root = app.stateRoot() }, host.oauthClientIdFor(provider)) catch |err| {
+        guard.lock();
+        defer guard.unlock();
         app.model_picker.setNotice("no credential for {s}, and /login {s} cannot start: {s}; the previous route is still active", .{
             provider.slice(),
             provider.slice(),
@@ -168,6 +247,8 @@ fn startLogin(app: *app_mod.App, commit: picker_mod.Commit) bool {
         return false;
     };
     app.login_worker = worker;
+    guard.lock();
+    defer guard.unlock();
     switch (app.model_picker.enterCredentialStage(provider, commit)) {
         .login => {},
         else => unreachable,
@@ -180,7 +261,7 @@ fn startLogin(app: *app_mod.App, commit: picker_mod.Commit) bool {
 /// (`ProviderProfile.api_key_setup`): the picker shows those pages and takes
 /// the pasted key, with the commit pending. False when the provider declares
 /// no such pages.
-fn startKeyEntry(app: *app_mod.App, commit: picker_mod.Commit) bool {
+fn startKeyEntry(app: *app_mod.App, commit: picker_mod.Commit, guard: Guard) bool {
     const host = app.providerHost() catch return false;
     const offer = host.kernel.catalogSnapshot().find(commit.offer_id) orelse return false;
     const profile = host.registry.findById(offer.provider_id) orelse return false;
@@ -196,13 +277,15 @@ fn startKeyEntry(app: *app_mod.App, commit: picker_mod.Commit) bool {
             default_index = index;
         };
     }
+    guard.lock();
+    defer guard.unlock();
     _ = app.model_picker.enterKeyStage(profile.id, commit, choices[0..count], default_index, setup.note);
     return true;
 }
 
 /// Enter on a pasted key: check and store it on the login worker. `poll`
 /// then retries the pending commit, which finds the stored key.
-fn submitKey(app: *app_mod.App) Result {
+fn submitKey(app: *app_mod.App, guard: Guard) Result {
     const picker = &app.model_picker;
     const provider = picker.credential_provider orelse return .ignored;
     const host = app.providerHost() catch return .ignored;
@@ -213,11 +296,15 @@ fn submitKey(app: *app_mod.App) Result {
         .state_root = app.stateRoot(),
         .open_browser = false,
     }) catch |err| {
+        guard.lock();
+        defer guard.unlock();
         picker.credentialFailed(@errorName(err));
         return .redraw;
     };
     cancelLogin(app);
     const worker = app.allocator.create(login_worker_mod.LoginWorker) catch {
+        guard.lock();
+        defer guard.unlock();
         picker.credentialFailed("OutOfMemory");
         return .redraw;
     };
@@ -225,10 +312,14 @@ fn submitKey(app: *app_mod.App) Result {
     // `start` copies the key into the worker; only then is the field wiped.
     worker.start() catch |err| {
         app.allocator.destroy(worker);
+        guard.lock();
+        defer guard.unlock();
         picker.credentialFailed(@errorName(err));
         return .redraw;
     };
     app.login_worker = worker;
+    guard.lock();
+    defer guard.unlock();
     picker.keySubmitted();
     return .redraw;
 }
@@ -250,24 +341,32 @@ fn cancelLogin(app: *app_mod.App) void {
     app.parkLoginWorker(worker);
 }
 
-fn apply(app: *app_mod.App, ui: *ui_state.UiState, commit: picker_mod.Commit) Result {
+/// Commit through the kernel (IO, outside the guard), then say how it went
+/// in the picker (under it).
+fn apply(app: *app_mod.App, ui: *ui_state.UiState, commit: picker_mod.Commit, guard: Guard) Result {
     const outcome = app.commitModelSelection(commit) catch |err| {
         // issue #33: the route resolved; what is missing is a credential for
         // its provider. When the provider can be signed in to, say how.
         if (err == error.MissingCredentials) {
-            if (startLogin(app, commit)) return .redraw;
-            if (startKeyEntry(app, commit)) return .redraw;
+            if (startLogin(app, commit, guard)) return .redraw;
+            if (startKeyEntry(app, commit, guard)) return .redraw;
             const host = app.providerHost() catch null;
             if (host) |value| if (missingCredentialPointer(value, commit.offer_id)) |provider| {
+                guard.lock();
+                defer guard.unlock();
                 app.model_picker.setNotice("no credential for {s}; sign in with /login {s}; the previous route is still active", .{ provider.slice(), provider.slice() });
                 return .redraw;
             };
         }
+        guard.lock();
+        defer guard.unlock();
         app.model_picker.setNotice("switch failed ({s}); the previous route is still active", .{@errorName(err)});
         return .redraw;
     };
     switch (outcome) {
         .committed => |accepted| {
+            guard.lock();
+            defer guard.unlock();
             if (app.last_persist_error) |why| {
                 // The route is live; what failed is making it survive a
                 // `/resume`. Saying "switched" alone would be true and
@@ -286,6 +385,8 @@ fn apply(app: *app_mod.App, ui: *ui_state.UiState, commit: picker_mod.Commit) Re
             return .committed;
         },
         .rejected => |reason| {
+            guard.lock();
+            defer guard.unlock();
             app.model_picker.setNotice("{s}; the previous route is still active", .{rejectionText(reason)});
             return .redraw;
         },
@@ -293,7 +394,9 @@ fn apply(app: *app_mod.App, ui: *ui_state.UiState, commit: picker_mod.Commit) Re
             // Another writer moved the configuration under us. Re-read rather
             // than overwrite: last-writer-wins is exactly what the revision
             // check exists to prevent.
-            app.refreshModelPicker() catch app.model_picker.markFailed();
+            refresh(app, guard);
+            guard.lock();
+            defer guard.unlock();
             app.model_picker.setNotice("configuration changed elsewhere; the list was reloaded", .{});
             return .redraw;
         },

@@ -113,8 +113,9 @@ pub fn isRegionRow(text: []const u8) bool {
 }
 
 /// The clock of every `Term` that runs with the merge window on. Only
-/// `Term.sync` moves it, so between two syncs every request falls inside
-/// one window.
+/// `Term.sync` moves it, and only to the deadline of a frame that waits: a
+/// frame is painted at the clock's time, so the next request after it always
+/// falls inside the window.
 pub const MergeClock = struct {
     var now: i64 = 1_000_000;
     pub fn read() i64 {
@@ -137,11 +138,15 @@ pub const Term = struct {
         cols: usize = 80,
         autowrap: bool = false,
         /// Run the generating region with the merge window on (#328), on
-        /// `MergeClock` and without the timer thread. A request after a
-        /// painted frame then waits for the window, and `sync` paints it, as
-        /// the timer would 16 ms later: what a test sees after a sync is the
-        /// merged frame, not each request's own.
+        /// `MergeClock` and without the timer thread. Every request after a
+        /// painted frame waits for the window (only a phase's first frame and
+        /// the immediate channel paint at once), and `sync` paints it, as the
+        /// timer would at the window's end: what a test sees after a sync is
+        /// the merged frame, not each request's own.
         merge_window: bool = false,
+        /// The region's own allocator (its frame buffer, pending text);
+        /// `gpa` when null. The screen and the byte sink always use `gpa`.
+        region_gpa: ?std.mem.Allocator = null,
     };
 
     pub fn create(gpa: std.mem.Allocator, opts: Options) !*Term {
@@ -152,7 +157,7 @@ pub const Term = struct {
             .out = .init(gpa),
             // fd -1 has no size: the region keeps the geometry set below and
             // never sees a resize.
-            .region = RenderRegion.init(gpa, -1, cc.tui_theme.select(.dark, .basic_16), .basic_16),
+            .region = RenderRegion.init(opts.region_gpa orelse gpa, -1, cc.tui_theme.select(.dark, .basic_16), .basic_16),
             .screen = undefined,
         };
         errdefer {
@@ -180,11 +185,13 @@ pub const Term = struct {
     /// Replay what the region wrote since the last sync, through the tty's
     /// output processing: the REPL's raw mode keeps OPOST|ONLCR (and the
     /// Windows console auto-returns on LF), so every LF reaches the terminal
-    /// as CR LF. With the merge window on, the window runs out first and the
-    /// frame waiting for it is painted.
+    /// as CR LF. With the merge window on, a frame waiting for the window is
+    /// painted first, at the window's end.
     pub fn sync(self: *Term) !void {
         if (self.merging) {
-            if (self.region.merge) |m| MergeClock.now += m.sched.window_ms;
+            if (self.region.merge) |m| if (m.sched.deadline()) |due| {
+                MergeClock.now = @max(MergeClock.now, due);
+            };
             _ = self.region.pumpFrame();
         }
         const bytes = self.out.written();
