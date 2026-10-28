@@ -9,6 +9,7 @@
 const std = @import("std");
 const pfs = @import("platform").fs;
 const platform_term = @import("platform").terminal;
+const shutdown = @import("../core/shutdown.zig");
 const category = @import("category.zig");
 const PermissionChoice = @import("../core/protocol/permission_choice.zig").PermissionChoice;
 const ui_request = @import("../core/protocol/ui_request.zig");
@@ -152,13 +153,42 @@ fn askText(tool_name: []const u8, args: []const u8) !bool {
     std.debug.print("Allow? [y/N]: ", .{});
 
     var buf: [10]u8 = undefined;
-    const n = platform_term.readInput(0, &buf); // console 宽读统一入口(review-2 F4)
+    const n = while (true) {
+        const got = platform_term.readInput(0, &buf); // console 宽读统一入口(review-2 F4)
+        if (got < 0 and readInterrupted()) continue;
+        break got;
+    };
     if (n > 0 and (buf[0] == 'y' or buf[0] == 'Y')) return true;
     return false;
 }
 
+/// Whether a failed answer read only lost a race with a signal. The REPL's
+/// SIGWINCH handler has no SA_RESTART, so a resize turns the blocked read into
+/// EINTR, which is no answer (it used to be a silent deny). A requested
+/// shutdown still ends the prompt. This module is exported by lib.zig and
+/// cannot use repl/'s `input.retryInterruptedRead`; same rule, minus the
+/// terminal-mode reconcile that only raw mode needs. Windows console reads do
+/// not set errno.
+fn readInterrupted() bool {
+    if (@import("builtin").os.tag == .windows) return false;
+    return pfs.lastErrnoIs(.INTR) and !shutdown.requested();
+}
+
 // session 记忆的单测在 session_rules.zig;ask 的真链路(answer_queue → ask → askText)
 // 在 tests/component/answer_queue_test.zig 覆盖。
+
+test "an answer read a resize interrupted is read again unless the process is shutting down" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    defer shutdown.resetForTesting();
+    std.c._errno().* = @intFromEnum(std.c.E.INTR);
+    try std.testing.expect(readInterrupted());
+    // A real read failure is still no answer: deny.
+    std.c._errno().* = @intFromEnum(std.c.E.IO);
+    try std.testing.expect(!readInterrupted());
+    shutdown.request();
+    std.c._errno().* = @intFromEnum(std.c.E.INTR);
+    try std.testing.expect(!readInterrupted());
+}
 
 test "no_interactive_prompt: 无 ui_requester 时 .ask 直接 deny(绝不读 fd 0,PM SW4 3c)" {
     const testing = std.testing;

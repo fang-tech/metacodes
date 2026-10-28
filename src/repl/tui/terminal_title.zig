@@ -138,12 +138,7 @@ fn isDisallowed(cp: u21) bool {
 }
 
 fn writeAll(fd: c_int, bytes: []const u8) void {
-    var total: usize = 0;
-    while (total < bytes.len) {
-        const n = pfs.write(fd, bytes[total..]);
-        if (n <= 0) return; // 写不进就放弃(标题非关键)
-        total += @as(usize, @intCast(n));
-    }
+    _ = pfs.writeAll(fd, bytes); // 写不进就放弃(标题非关键);resize 打断(EINTR)会重试
 }
 
 test "sanitize collapses whitespace and strips controls" {

@@ -19,7 +19,6 @@
 const std = @import("std");
 const host_injection_meter = @import("../core/host_injection_meter.zig");
 const pfs = @import("platform").fs;
-const platform_term = @import("platform").terminal; // console 宽读统一入口(review-2 F4)
 const input = @import("input.zig");
 const Conversation = @import("../core/conversation.zig").Conversation;
 const Overlay = @import("tui/overlay.zig").Overlay;
@@ -253,60 +252,35 @@ pub fn runWithThemeAnchor(fd: c_int, allocator: std.mem.Allocator, conv: *const 
     const max_top = if (lines.len > view_rows) lines.len - view_rows else 0;
     top = max_top; // 对齐 cc:打开时定位到底部(最新)
 
-    // 简单 ESC 序列解析:↑=\x1b[A ↓=\x1b[B。esc 单独=退出。
+    // 键经 input.readKey 拼出(KeyParser:↑↓、PgUp/PgDn、Kitty CSI-u 的 Ctrl+O/Esc 都还原成键)。
+    // resize 打断在 ESC 与 `[` 之间时序列留在 parser 里接着读——旧版逐字节读,第二字节被
+    // EINTR 打断就当裸 Esc 退出;裸 Esc 等满一个 tick 即退出,不再等下一个键。
+    var parser = input.KeyParser{};
     while (true) {
         drawScreen(lines, top, view_rows, rows, cols, th);
-        var b: [1]u8 = undefined;
-        const n = platform_term.readInput(fd, &b);
-        if (n < 0 and input.retryInterruptedRead(fd)) continue;
-        if (n <= 0) break;
-        const c = b[0];
-        if (c == 0x1b) {
-            // 可能是方向键 CSI 或单 Esc。读后续两字节判定。
-            var s0: [1]u8 = undefined;
-            const n2 = platform_term.readInput(fd, &s0);
-            if (n2 <= 0) break; // 裸 Esc → 退出
-            if (s0[0] == '[') {
-                var s1: [1]u8 = undefined;
-                const n3 = platform_term.readInput(fd, &s1);
-                if (n3 <= 0) break;
-                switch (s1[0]) {
-                    'A' => top = if (top > 0) top - 1 else 0, // ↑
-                    'B' => top = @min(top + 1, max_top), // ↓
-                    '5' => { // PageUp(ESC[5~)——读掉结尾 ~
-                        var s2: [1]u8 = undefined;
-                        _ = platform_term.readInput(fd, &s2);
-                        top = if (top > view_rows) top - view_rows else 0;
-                    },
-                    '6' => { // PageDown(ESC[6~)
-                        var s2: [1]u8 = undefined;
-                        _ = platform_term.readInput(fd, &s2);
-                        top = @min(top + view_rows, max_top);
-                    },
-                    '0'...'4', '7'...'9' => {
-                        // Kitty/modifyOtherKeys CSI-u:ESC[<cp>;<mod>u(白名单终端把 Ctrl+O 编成
-                        // ESC[111;5u 而非裸 0x0f → 旧 viewer 不退出,toggle 失效)。读完整序列到终止字母,
-                        // 取 codepoint(';' 前的数字)。Ctrl+O(111)/q(113)/Esc(27)→ 退出(对称开关)。
-                        const cp = readCsiCodepoint(fd, s1[0] - '0');
-                        if (cp == 111 or cp == 113 or cp == 27) break;
-                        // 其余 CSI-u(功能键等)忽略。
-                    },
-                    else => {},
-                }
-                continue;
-            }
-            break; // Esc + 非 [ → 退出
-        }
-        switch (c) {
-            'q', 0x03, 0x0f => break, // q / Ctrl+C / Ctrl+O(对称开关)
-            'j', ' ' => top = @min(top + 1, max_top),
-            'k' => top = if (top > 0) top - 1 else 0,
-            'g' => top = 0,
-            'G' => top = max_top,
-            'd' => top = @min(top + view_rows / 2, max_top),
-            'u' => top = if (top > view_rows / 2) top - view_rows / 2 else 0,
-            '}' => top = @min(nextPrompt(prompts, top), max_top),
-            '{' => top = prevPrompt(prompts, top),
+        const key = switch (input.readKey(fd, &parser)) {
+            .key => |key| key,
+            .interrupted => continue,
+            .closed => break,
+        };
+        switch (key) {
+            .esc, .ctrl_c, .ctrl_o => break, // Esc / Ctrl+C / Ctrl+O(对称开关)
+            .up => top = if (top > 0) top - 1 else 0,
+            .down => top = @min(top + 1, max_top),
+            .page_up => top = if (top > view_rows) top - view_rows else 0,
+            .page_down => top = @min(top + view_rows, max_top),
+            .char => |c| switch (c) {
+                'q' => break,
+                'j', ' ' => top = @min(top + 1, max_top),
+                'k' => top = if (top > 0) top - 1 else 0,
+                'g' => top = 0,
+                'G' => top = max_top,
+                'd' => top = @min(top + view_rows / 2, max_top),
+                'u' => top = if (top > view_rows / 2) top - view_rows / 2 else 0,
+                '}' => top = @min(nextPrompt(prompts, top), max_top),
+                '{' => top = prevPrompt(prompts, top),
+                else => {},
+            },
             else => {},
         }
     }
@@ -314,26 +288,6 @@ pub fn runWithThemeAnchor(fd: c_int, allocator: std.mem.Allocator, conv: *const 
     // 退出:alt-screen(defer ov.exit() → \x1b[?1049l)由终端**自动逐字节恢复主缓冲**——banner+对话+
     // 输入框原样回来,零工作、零漂移。不再手动 \x1b[2J 清屏 + \n 重发对话尾(那是 inline 模式产物,
     // 会把框推走、重引 box_top 漂移)。caller(tui_backend/loop)在 ov.exit() 后 redraw 画固定区/输入框。
-}
-
-/// 读完一段 CSI 序列(已读到 ESC[<first_digit>),返回 ';' 前的 codepoint(如 Ctrl+O=111),
-/// 并把剩余字节(mod 数字 + 终止字母 u/~/letter)读干净,不污染下一轮 read。
-fn readCsiCodepoint(fd: c_int, first_digit: u8) u32 {
-    var cp: u32 = first_digit;
-    var in_mod = false; // 进入 ';' 后是 modifier 段,后续数字不计入 codepoint
-    while (true) {
-        var sx: [1]u8 = undefined;
-        const nx = platform_term.readInput(fd, &sx);
-        if (nx <= 0) return cp;
-        const ch = sx[0];
-        if (ch >= '0' and ch <= '9') {
-            if (!in_mod) cp = cp * 10 + (ch - '0');
-        } else if (ch == ';') {
-            in_mod = true;
-        } else {
-            return cp; // 终止字母(u / ~ / A-Z / a-z)
-        }
-    }
 }
 
 fn nextPrompt(prompts: []const usize, cur: usize) usize {
@@ -384,12 +338,7 @@ fn drawScreen(lines: []const []const u8, top: usize, view_rows: usize, rows: usi
 }
 
 fn writeAll(fd: c_int, bytes: []const u8) void {
-    var total: usize = 0;
-    while (total < bytes.len) {
-        const n = pfs.write(fd, bytes[total..]);
-        if (n <= 0) return;
-        total += @intCast(n);
-    }
+    _ = pfs.writeAll(fd, bytes); // resize 打断(EINTR)重试,不丢半帧
 }
 
 // ============================================================================

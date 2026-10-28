@@ -154,7 +154,7 @@ pub const History = struct {
             util_json.writeJsonString(&line.writer, entry) catch continue;
             line.writer.writeByte('\n') catch continue;
             const bytes = line.written();
-            _ = pfs.write(fd, bytes);
+            _ = pfs.write(fd, bytes); // no EINTR: regular file
         }
         _ = pfs.fsync(fd);
     }

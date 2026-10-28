@@ -155,12 +155,7 @@ pub fn promptLoop(alloc: std.mem.Allocator, th: Theme, in_fd: c_int, out_fd: c_i
 }
 
 fn writeAll(fd: c_int, bytes: []const u8) void {
-    var total: usize = 0;
-    while (total < bytes.len) {
-        const w = pfs.write(fd, bytes[total..]);
-        if (w <= 0) return;
-        total += @as(usize, @intCast(w));
-    }
+    _ = pfs.writeAll(fd, bytes); // resize 打断(EINTR)重试,不丢半帧
 }
 
 // ============================================================================

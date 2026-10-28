@@ -28,6 +28,11 @@ These rules apply to the entire repository.
   `std.Io.Threaded.init`: std's init replaces the ignored SIGPIPE with a
   handler, and a delivered SIGPIPE turns any thread's blocked syscall into
   EINTR (`zig build test:io-threaded` enforces it).
+- The REPL's SIGWINCH handler has no SA_RESTART either. In `src/repl/`, read
+  keys through `input.readKey` or check `input.retryInterruptedRead` right
+  after a raw read, and write to the terminal through `pfs.writeAll`; a call
+  that cannot see EINTR says `// no EINTR: <reason>` on its line
+  (`zig build test:terminal-io` enforces it).
 - Preserve the kernel boundaries: plugins cannot replace the AgentLoop or bypass
   permission, sandbox, budget, formal verdicts, TinyKG admission, or artifact CAS.
 - Provider-visible bytes are a cache contract. Runtime generation, plugin paths,

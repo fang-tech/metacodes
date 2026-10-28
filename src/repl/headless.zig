@@ -1007,12 +1007,7 @@ pub fn exitCodeFor(stop_reason: agent_loop.StopReason) u8 {
 }
 
 fn writeStdout(bytes: []const u8) void {
-    var pos: usize = 0;
-    while (pos < bytes.len) {
-        const n = pfs.write(1, bytes[pos..]); // 可移植(POSIX write / Windows _write),fd 1=stdout
-        if (n <= 0) break;
-        pos += @as(usize, @intCast(n));
-    }
+    _ = pfs.writeAll(1, bytes); // 可移植(POSIX write / Windows _write),fd 1=stdout
 }
 
 /// --stream-json 的 stdout sink(fd 1 直写,一行一次调用,无缓冲即最实时)。

@@ -199,6 +199,88 @@ test "L2 AgentLoop journals every physical provider attempt before retry" {
     try std.testing.expectEqualSlices(u8, &first.request_sha256, &second.request_sha256);
 }
 
+// A mid-stream failure re-issues the same turn through agent_loop's own
+// retry (not the client connect retry), which restarts the provider budget at
+// physical_attempt 1. Without a per-re-issue discriminator in the recorded
+// generation, both attempts derive the SAME id — a duplicate that a later
+// /resume's journal validation once rejected with InvalidRecord. Guard that
+// the two journaled attempts carry DISTINCT ids end to end.
+test "L2 a same-turn mid-stream re-issue journals two distinct provider attempt ids" {
+    const a = std.testing.allocator;
+    // Response 1 is cut mid-stream (head + partial body, no terminator) → the
+    // agent loop sees a stream error with no committed output; response 2
+    // answers fully. cut_index 0 cuts only the first response.
+    const bodies = [_][]const u8{ OK_SSE, OK_SSE };
+    var srv = try harness.MockServer.startCassetteMidStreamCut(&bodies, 0);
+    defer srv.stop();
+    const url = try srv.urlOwned(a);
+    defer a.free(url);
+
+    var io_runtime = @import("platform").signal.threadedIo(a, .{});
+    defer io_runtime.deinit();
+    var client = mkClient(a, io_runtime.io(), url);
+    defer client.deinit();
+    var conversation = cc.conversation.Conversation.init(a);
+    defer conversation.deinit();
+    try conversation.appendText(.user, "return ok");
+    const permission = cc.permission.createContext(.bypass_permissions, a);
+    const definitions: []const cc.json_mod.ToolDefinition = &.{};
+    var writer = cc.writer_backend.WriterBackend.initNull();
+    const backend = writer.backend();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const root = root_buffer[0..root_len];
+    const sid = cc.session_id.SessionId.fromSlice("3123456789abcdef01234567").?;
+    var journal = try cc.tool_observation_journal.Journal.init(root, sid);
+    defer journal.deinit();
+
+    const result = try cc.agent_loop.run(
+        &conversation,
+        client.provider(),
+        definitions,
+        &permission,
+        .{
+            .max_turns = 1,
+            .emit_tool_cards = false,
+            // Force the same-turn re-issue regardless of silent-retry heuristics.
+            .max_stream_turn_retries = 1,
+            .execution_boundary = journal.executionBoundary(),
+            .cwd_abs = root,
+            .home_dir = root,
+        },
+        &backend,
+        a,
+    );
+    try journal.finishRun(@tagName(result.stop_reason));
+
+    // The journal is resumable: validation accepts the re-issue.
+    const summary = try cc.tool_observation_journal.validate(root, sid);
+    try std.testing.expect(summary.complete);
+
+    var loaded = try cc.tool_observation_journal.loadRunDispatches(
+        a,
+        root,
+        try journal.runBinding(),
+    );
+    defer loaded.deinit();
+
+    try std.testing.expect(result.stop_reason == .end_turn);
+    try std.testing.expectEqual(@as(usize, 2), srv.requestCount());
+    try std.testing.expectEqual(@as(usize, 2), loaded.provider_attempts.len);
+    const first = loaded.provider_attempts[0];
+    const second = loaded.provider_attempts[1];
+    try std.testing.expect(first.outcome == .stream_error);
+    try std.testing.expect(second.outcome == .succeeded);
+    // Each outer re-issue restarts the provider budget at physical_attempt 1,
+    // so uniqueness comes from the recorded generation, not the attempt index.
+    try std.testing.expectEqual(@as(u32, 1), first.physical_attempt);
+    try std.testing.expectEqual(@as(u32, 1), second.physical_attempt);
+    try std.testing.expect(first.context_generation != second.context_generation);
+    try std.testing.expect(!std.mem.eql(u8, &first.attempt_id, &second.attempt_id));
+}
+
 // ③ 退避公式:min(base*2^(n-1),32000)+jitter(0~25%)。
 test "L2: retryDelayMs 指数退避 + cap + jitter 范围" {
     const base: u64 = 500;

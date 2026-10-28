@@ -9,6 +9,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const platform_term = @import("platform").terminal;
+const pfs = @import("platform").fs;
 
 pub const Rgb = struct { r: u8, g: u8, b: u8 };
 
@@ -69,7 +70,7 @@ pub fn probeBackground(fd: c_int) ?Rgb {
     defer platform_term.restoreMode(fd, orig);
 
     const query = "\x1b]11;?\x07";
-    if (std.c.write(fd, query.ptr, query.len) < 0) return null;
+    if (!pfs.writeAll(fd, query)) return null;
 
     // poll 等响应,总超时 ~120ms,分多次(终端可能分片回)。
     var buf: [256]u8 = undefined;
@@ -84,7 +85,7 @@ pub fn probeBackground(fd: c_int) ?Rgb {
             if (len > 0) break; // 已有数据且不再来 → 收尾
             continue;
         }
-        const n = std.c.read(fd, buf[len..].ptr, buf.len - len);
+        const n = std.c.read(fd, buf[len..].ptr, buf.len - len); // no EINTR: poll reported data
         if (n <= 0) break;
         len += @intCast(n);
         // 收到结束符(BEL 或 ST 的 \)即可停。

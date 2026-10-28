@@ -100,14 +100,9 @@ pub fn teamSegmentForSession(
     return swarmSegment(buf, live, working);
 }
 
-/// 循环写入直到完成或 write 返 0/错误。保证不短写造成行混乱。
+/// 循环写入直到完成或 write 返 0/错误。保证不短写造成行混乱;resize 打断(EINTR)会重试。
 fn writeAll(fd: std.c.fd_t, bytes: []const u8) void {
-    var total: usize = 0;
-    while (total < bytes.len) {
-        const n = std.c.write(fd, bytes.ptr + total, bytes.len - total);
-        if (n <= 0) return; // 无法进一步写入就放弃（status line 不关键）
-        total += @as(usize, @intCast(n));
-    }
+    _ = @import("platform").fs.writeAll(fd, bytes); // 无法进一步写入就放弃（status line 不关键）
 }
 
 /// 把 token 数格式成紧凑字符串：< 1K → 原样；< 1M → "1.2K"；>= 1M → "1.23M"。

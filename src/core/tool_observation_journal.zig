@@ -1603,8 +1603,6 @@ fn validateBytes(
     defer open_dispatches.deinit();
     var open_provider_attempts = std.AutoHashMap([32]u8, void).init(std.heap.c_allocator);
     defer open_provider_attempts.deinit();
-    var seen_provider_attempts = std.AutoHashMap([32]u8, void).init(std.heap.c_allocator);
-    defer seen_provider_attempts.deinit();
     var seen_dispatches = std.AutoHashMap([32]u8, u8).init(std.heap.c_allocator);
     defer seen_dispatches.deinit();
     var formal_events = std.AutoHashMap([32]u8, u8).init(std.heap.c_allocator);
@@ -1692,8 +1690,17 @@ fn validateBytes(
                 switch (provider_event) {
                     .started => |started| {
                         const key = dispatchKey(&started.attempt_id);
-                        if (seen_provider_attempts.contains(key)) return error.InvalidRecord;
-                        try seen_provider_attempts.put(key, {});
+                        // Only a *still-open* attempt id is a real overlap. A
+                        // bounded same-turn mid-stream re-issue legitimately
+                        // reopens an attempt id whose prior physical attempt
+                        // already closed (started → finished → started →
+                        // finished): a balanced pair the recovery reducer and
+                        // loadRunDispatches both accept positionally. Rejecting
+                        // a merely once-seen id instead made such a journal
+                        // permanently unresumable. Uniqueness across closed
+                        // attempts is the writer's job (see agent_loop's
+                        // per-turn re-issue generation), not an interval
+                        // invariant: nothing downstream keys a run by it.
                         const entry = try open_provider_attempts.getOrPut(key);
                         if (entry.found_existing) return error.InvalidRecord;
                     },
@@ -1953,7 +1960,6 @@ fn validateBytes(
                 pre_decisions.clearRetainingCapacity();
                 formal_dispatches.clearRetainingCapacity();
                 rule_filter_identities.clearRetainingCapacity();
-                seen_provider_attempts.clearRetainingCapacity();
             },
             .run_abandoned => |abandoned| {
                 // Written by a later process for exactly the Run still open,
@@ -1984,7 +1990,6 @@ fn validateBytes(
                 pre_decisions.clearRetainingCapacity();
                 formal_dispatches.clearRetainingCapacity();
                 rule_filter_identities.clearRetainingCapacity();
-                seen_provider_attempts.clearRetainingCapacity();
             },
         }
         expected_sequence += 1;
@@ -3628,6 +3633,102 @@ test "provider physical attempt shares run journal and preserves unknown versus 
         &loaded.provider_attempts[0].request_sha256,
         &loaded.provider_attempts[1].request_sha256,
     );
+}
+
+test "a bounded same-turn re-issue reopens one provider attempt id and still validates" {
+    // Reproduces a pre-fix journal: a mid-stream failure re-issues the same
+    // turn, and because the writer restarted the provider budget at physical
+    // attempt 1 the two attempts derived the *same* id. The record is a
+    // balanced started → finished → started → finished, so validation must
+    // accept it and the Run must stay resumable.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const root = root_buffer[0..root_len];
+    const sid = session_id_mod.SessionId.fromSlice("0123456789abcdef01234567").?;
+
+    var journal = try Journal.init(root, sid);
+    defer journal.deinit();
+    const boundary = journal.executionBoundary();
+    const request_sha256 = execution_effect.sha256Hex(&.{"canonical-request"});
+    const attempt_id = execution_effect.providerAttemptId(sid.bytes, request_sha256, 1, 0, 1);
+    try std.testing.expect(boundary.emit(.{ .before = .{ .provider_request = .{
+        .attempt_id = attempt_id,
+        .actor_id = sid.bytes,
+        .request_sha256 = request_sha256,
+        .logical_turn = 1,
+        .context_generation = 0,
+        .physical_attempt = 1,
+        .max_attempts = 1,
+    } } }));
+    try std.testing.expect(boundary.emit(.{ .after = .{ .provider_request = .{
+        .attempt_id = attempt_id,
+        .outcome = .stream_error,
+        .metering = .unknown,
+    } } }));
+    // The re-issue reopens the same id only after the first attempt closed.
+    try std.testing.expect(boundary.emit(.{ .before = .{ .provider_request = .{
+        .attempt_id = attempt_id,
+        .actor_id = sid.bytes,
+        .request_sha256 = request_sha256,
+        .logical_turn = 1,
+        .context_generation = 0,
+        .physical_attempt = 1,
+        .max_attempts = 1,
+    } } }));
+    try std.testing.expect(boundary.emit(.{ .after = .{ .provider_request = .{
+        .attempt_id = attempt_id,
+        .outcome = .succeeded,
+        .metering = .unknown,
+    } } }));
+    try journal.finishRun("end_turn");
+
+    const summary = try validate(root, sid);
+    try std.testing.expect(summary.complete);
+
+    var loaded = try loadRunDispatches(std.testing.allocator, root, try journal.runBinding());
+    defer loaded.deinit();
+    try std.testing.expectEqual(@as(usize, 2), loaded.provider_attempts.len);
+    try std.testing.expect(loaded.provider_attempts[0].outcome == .stream_error);
+    try std.testing.expect(loaded.provider_attempts[1].outcome == .succeeded);
+    // Both resolve positionally even though they share an id.
+    try std.testing.expectEqualSlices(
+        u8,
+        &loaded.provider_attempts[0].attempt_id,
+        &loaded.provider_attempts[1].attempt_id,
+    );
+}
+
+test "an overlapping provider attempt id is refused at write time" {
+    // The relaxed read invariant still forbids a *genuine* overlap: a second
+    // start of an id whose first attempt has not closed. The write boundary
+    // rejects it (the recovery reducer's DuplicateIntent), so such a record can
+    // never reach the journal in the first place.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const root = root_buffer[0..root_len];
+    const sid = session_id_mod.SessionId.fromSlice("0123456789abcdef01234567").?;
+
+    var journal = try Journal.init(root, sid);
+    defer journal.deinit();
+    const boundary = journal.executionBoundary();
+    const request_sha256 = execution_effect.sha256Hex(&.{"canonical-request"});
+    const attempt_id = execution_effect.providerAttemptId(sid.bytes, request_sha256, 1, 0, 1);
+    const started = execution_effect.BoundaryEvent{ .before = .{ .provider_request = .{
+        .attempt_id = attempt_id,
+        .actor_id = sid.bytes,
+        .request_sha256 = request_sha256,
+        .logical_turn = 1,
+        .context_generation = 0,
+        .physical_attempt = 1,
+        .max_attempts = 1,
+    } } };
+    try std.testing.expect(boundary.emit(started));
+    // Second start while the first is still open: refused.
+    try std.testing.expect(!boundary.emit(started));
 }
 
 test "run cannot seal while a provider intent has no durable result" {

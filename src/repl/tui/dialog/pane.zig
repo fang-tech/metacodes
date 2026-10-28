@@ -366,12 +366,7 @@ fn erase(out_fd: c_int, rows: u16) void {
 }
 
 fn writeAll(fd: c_int, bytes: []const u8) void {
-    var total: usize = 0;
-    while (total < bytes.len) {
-        const n = pfs.write(fd, bytes[total..]);
-        if (n <= 0) return;
-        total += @intCast(n);
-    }
+    _ = pfs.writeAll(fd, bytes); // a resize (EINTR) is retried, not half a frame
 }
 
 // ── tests ───────────────────────────────────────────────────────────────────

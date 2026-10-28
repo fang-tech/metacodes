@@ -51,7 +51,7 @@ pub fn store(allocator: std.mem.Allocator, state_root: []const u8, id: usize, te
     defer _ = pfs.close(fd);
     var pos: usize = 0;
     while (pos < text.len) {
-        const n = pfs.write(fd, text[pos..][0 .. text.len - pos]);
+        const n = pfs.write(fd, text[pos..][0 .. text.len - pos]); // no EINTR: regular file
         if (n <= 0) return null;
         pos += @intCast(n);
     }

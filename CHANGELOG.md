@@ -10,8 +10,24 @@ status, compatibility boundaries, and entry points are defined by
 
 ## Unreleased
 
+## 0.8.1 — 2026-10-28
+
 ### Fixed
 
+- **A resumed session no longer fails with `error: InvalidRecord` on the next
+  turn.** When a provider stream died mid-turn, the agent loop re-issued the
+  same request within the turn and restarted the provider retry budget at
+  physical attempt 1. The attempt id is derived from the request, the logical
+  turn and the attempt number, so the re-issue collided with the attempt it
+  replaced, writing two `provider_attempt` records with the same id. The
+  writer never re-reads its own journal, so the duplicate rode along for the
+  rest of the session; only a fresh process validating the journal on the
+  first new Run (a `/resume` followed by a message) rejected it. The journal
+  reader now treats a balanced started → finished → started → finished as the
+  legitimate re-issue it is (a still-open duplicate id is still refused), so
+  sessions already carrying one open again; and the writer folds every
+  same-turn re-issue into the recorded generation, so a new re-issue always
+  gets a distinct id.
 - **A session whose turn was killed can be resumed.** A turn's lease on
   `<session>/tool-observations.lock` was a file created with `O_EXCL` and
   deleted at the end of the turn, so a process killed mid-turn (a closed
@@ -41,6 +57,16 @@ status, compatibility boundaries, and entry points are defined by
   later is cut off. A second signal changes nothing, because closing a
   terminal sends SIGHUP twice milliseconds apart. A SIGHUP ignored on entry
   (`nohup`) stays ignored.
+- **WebFetch decodes compressed pages, or says it cannot** (#358). curl ran
+  without `--compressed`, so a server that compressed its response anyway
+  (gzip, deflate, Brotli) handed the HTML extractor the compressed bytes, and
+  WebFetch returned the garbage as a successful page, in the host's
+  `tool_result` and in the next provider request. WebFetch now asks for the
+  encodings the system curl decodes and decodes the body before extracting
+  text. An encoding that curl cannot decode (Brotli or zstd on a curl built
+  without them, such as the one Windows ships, or an unknown token) and a
+  corrupt compressed body fail the call with curl's reason instead; that
+  failure does not count toward the offline breaker.
 
 ## 0.8.0 — 2026-10-26
 

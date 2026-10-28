@@ -45,12 +45,7 @@ pub const Overlay = struct {
 };
 
 fn writeAll(fd: c_int, bytes: []const u8) void {
-    var total: usize = 0;
-    while (total < bytes.len) {
-        const n = pfs.write(fd, bytes[total..][0 .. bytes.len - total]);
-        if (n <= 0) return; // 终端关闭等异常:静默放弃
-        total += @as(usize, @intCast(n));
-    }
+    _ = pfs.writeAll(fd, bytes); // 终端关闭等异常:静默放弃;resize 打断(EINTR)会重试
 }
 
 // ============================================================================
