@@ -2207,10 +2207,22 @@ fn runCounted(
                 })
             else
                 [_]u8{'0'} ** 64;
+            // The provider attempt id must be unique within a Run. A mid-stream
+            // failure re-issues the same request bytes (same request_sha256,
+            // same logical turn) and `prepare` restarts the provider retry
+            // budget at physical_attempt 1, so without a per-re-issue
+            // discriminator the second attempt's id collides with the first's
+            // — and a later resume's journal validation rejects the duplicate.
+            // Fold every same-turn re-issue (context recovery *and* bounded
+            // mid-stream retry) into the recorded generation; each outer
+            // `continue :request_recovery` advances exactly one of the two, so
+            // the sum strictly increases per turn.
+            const attempt_generation = context_recovery.attempts +
+                @as(usize, stream_turn_retries);
             if (!retry_ui.prepare(
                 request_sha256,
                 turns + 1,
-                @intCast(@min(context_recovery.attempts, std.math.maxInt(u32))),
+                @intCast(@min(attempt_generation, std.math.maxInt(u32))),
                 max_provider_attempts,
             )) return finishRun(backend, sess, trace_id, depth, .{
                 .stop_reason = .api_error,
