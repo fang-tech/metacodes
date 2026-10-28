@@ -109,6 +109,7 @@ pub fn requestSetupError(err: anyerror, os_tag: std.Target.Os.Tag) anyerror {
 pub fn connectErrorDetail(err: anyerror) []const u8 {
     return switch (err) {
         error.ConnectFailed => "ConnectFailed(连接被拒绝、不可达或超时;Zig 0.16 在 Windows 上不区分)",
+        error.InvalidCredential => "InvalidCredential(凭据为空、超过 16 KiB,或含请求头不能携带的字节:控制字符、空格、非 ASCII;请求未发出)",
         else => @errorName(err),
     };
 }
@@ -984,7 +985,7 @@ pub const Client = struct {
         // the header value and scrub it after request setup.
         const auth = client.credential.header(client.allocator, client.auth_scheme) catch |err| {
             log.errId("client", rid, "auth header materialization failed: {s}", .{@errorName(err)});
-            return error.RequestFailed;
+            return credential_mod.requestError(err);
         };
         defer secureFree(client.allocator, auth.value);
 

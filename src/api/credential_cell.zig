@@ -18,25 +18,54 @@
 //!
 //! The bytes never leave this file except as a header value; the caller
 //! erases that copy once the request is set up (`auth_header.Header`).
+//!
+//! `validate` is the one rule for credential bytes. A cell refuses anything
+//! else at creation (a Session's create and restore) and at replacement, and
+//! a fixed credential is checked before every header is built, so no
+//! credential the HTTP client would reject (it asserts on CR LF) or that a
+//! header cannot carry ever reaches it.
 
 const std = @import("std");
 const sync = @import("platform").sync;
 const auth_header = @import("auth_header.zig");
 const secure = @import("../util/secure.zig");
 
-/// The longest replacement accepted. It is above any request header a
+/// The longest credential accepted. It is above any request header a
 /// provider accepts, so nothing usable is refused.
-pub const MAX_REPLACEMENT_BYTES: usize = 16 * 1024;
+pub const MAX_CREDENTIAL_BYTES: usize = 16 * 1024;
 
-pub const ReplacementError = error{
+pub const ValidationError = error{
     EmptyCredential,
     /// A byte outside printable ASCII (0x21-0x7E). A control byte would split
     /// the header (the HTTP client asserts on CR LF), and no provider issues a
     /// key or token with a space or a non-ASCII byte.
     InvalidCredentialByte,
     CredentialTooLong,
-    OutOfMemory,
 };
+
+pub const ReplacementError = ValidationError || error{OutOfMemory};
+pub const CreateError = ValidationError || error{OutOfMemory};
+pub const HeaderError = ValidationError || auth_header.Error;
+
+/// The error a transport returns when it cannot build a request's header:
+/// `InvalidCredential` when the credential broke `validate` (nothing was
+/// sent, and retrying cannot help), `RequestFailed` otherwise.
+pub fn requestError(err: HeaderError) error{ InvalidCredential, RequestFailed } {
+    return switch (err) {
+        error.EmptyCredential, error.InvalidCredentialByte, error.CredentialTooLong => error.InvalidCredential,
+        error.SignedAdapterRequired, error.EmptyCredentialMaterial, error.OutOfMemory => error.RequestFailed,
+    };
+}
+
+/// Whether `candidate` can be a credential: 1 to `MAX_CREDENTIAL_BYTES`
+/// bytes, each printable ASCII (0x21-0x7E).
+pub fn validate(candidate: []const u8) ValidationError!void {
+    if (candidate.len == 0) return error.EmptyCredential;
+    if (candidate.len > MAX_CREDENTIAL_BYTES) return error.CredentialTooLong;
+    for (candidate) |byte| {
+        if (byte < 0x21 or byte > 0x7e) return error.InvalidCredentialByte;
+    }
+}
 
 /// What a client authenticates with.
 pub const Credential = union(enum) {
@@ -49,13 +78,19 @@ pub const Credential = union(enum) {
 
     /// The request header for this credential under `scheme`, as
     /// `auth_header.build` renders it. The value is the caller's to erase.
+    /// Fixed bytes come from wherever the owner got them (a flag, the
+    /// environment, a key file, a token response), so they are validated
+    /// here, before anything is sent; a cell's bytes already were.
     pub fn header(
         self: Credential,
         allocator: std.mem.Allocator,
         scheme: ?auth_header.AuthScheme,
-    ) auth_header.Error!auth_header.Header {
+    ) HeaderError!auth_header.Header {
         return switch (self) {
-            .fixed => |bytes| auth_header.build(allocator, scheme, bytes),
+            .fixed => |bytes| {
+                try validate(bytes);
+                return auth_header.build(allocator, scheme, bytes);
+            },
             .replaceable => |cell| cell.header(allocator, scheme),
         };
     }
@@ -79,9 +114,9 @@ pub const Cell = struct {
     /// 1 at creation, plus one per published replacement.
     generation: u64 = 1,
 
-    /// Copy `initial` into a new cell. It is not validated: a Session's
-    /// creation and restore accept the credential they always accepted.
-    pub fn create(allocator: std.mem.Allocator, initial: []const u8) error{OutOfMemory}!*Cell {
+    /// Validate `initial` and copy it into a new cell.
+    pub fn create(allocator: std.mem.Allocator, initial: []const u8) CreateError!*Cell {
+        try validate(initial);
         const self = try allocator.create(Cell);
         errdefer allocator.destroy(self);
         self.* = .{ .allocator = allocator, .bytes = try allocator.dupe(u8, initial) };
@@ -99,11 +134,7 @@ pub const Cell = struct {
     /// Validate and copy `candidate` for this cell. Nothing is locked or
     /// changed: a refusal, including OutOfMemory, leaves the cell as it was.
     pub fn prepare(self: *Cell, candidate: []const u8) ReplacementError!Replacement {
-        if (candidate.len == 0) return error.EmptyCredential;
-        if (candidate.len > MAX_REPLACEMENT_BYTES) return error.CredentialTooLong;
-        for (candidate) |byte| {
-            if (byte < 0x21 or byte > 0x7e) return error.InvalidCredentialByte;
-        }
+        try validate(candidate);
         return .{ .cell = self, .bytes = try self.allocator.dupe(u8, candidate) };
     }
 
@@ -237,9 +268,9 @@ test "refused replacements leave the cell and its generation unchanged" {
     try std.testing.expectError(error.InvalidCredentialByte, cell.prepare("sk-\x00"));
     try std.testing.expectError(error.InvalidCredentialByte, cell.prepare("sk-\x7f"));
     try std.testing.expectError(error.InvalidCredentialByte, cell.prepare("sk-\xc3\xa9"));
-    const long = "k" ** (MAX_REPLACEMENT_BYTES + 1);
+    const long = "k" ** (MAX_CREDENTIAL_BYTES + 1);
     try std.testing.expectError(error.CredentialTooLong, cell.prepare(long));
-    var longest = try cell.prepare("k" ** MAX_REPLACEMENT_BYTES);
+    var longest = try cell.prepare("k" ** MAX_CREDENTIAL_BYTES);
     longest.discard();
 
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
@@ -334,4 +365,23 @@ test "concurrent publishers are linearized: the highest generation's bytes win" 
     try std.testing.expectEqual(@as(u64, 1 + publishers.len * rounds), cell.currentGeneration());
     try std.testing.expectEqual(cell.currentGeneration(), last.last_generation);
     try std.testing.expect(cell.matches(last.last[0..last.last_len]));
+}
+
+test "creation and fixed credentials apply the same rule as a replacement" {
+    const a = std.testing.allocator;
+    try std.testing.expectError(error.InvalidCredentialByte, Cell.create(a, "sk-a\r\nx-injected: 1"));
+    try std.testing.expectError(error.InvalidCredentialByte, Cell.create(a, "sk a"));
+    try std.testing.expectError(error.EmptyCredential, Cell.create(a, ""));
+    try std.testing.expectError(error.CredentialTooLong, Cell.create(a, "k" ** (MAX_CREDENTIAL_BYTES + 1)));
+    const longest = try Cell.create(a, "k" ** MAX_CREDENTIAL_BYTES);
+    longest.destroy();
+
+    // A fixed credential is checked before its header is built, so the HTTP
+    // client never sees CR LF (it asserts on it) or any other refused byte.
+    try std.testing.expectError(error.InvalidCredentialByte, (Credential{ .fixed = "sk-a\r\nx-injected: 1" }).header(a, null));
+    try std.testing.expectError(error.InvalidCredentialByte, (Credential{ .fixed = "sk-\x7f" }).header(a, .{ .api_key_header = "x-api-key" }));
+    try std.testing.expectError(error.EmptyCredential, (Credential{ .fixed = "" }).header(a, null));
+    const accepted = try (Credential{ .fixed = "sk-fine" }).header(a, null);
+    defer a.free(accepted.value);
+    try std.testing.expectEqualStrings("Bearer sk-fine", accepted.value);
 }

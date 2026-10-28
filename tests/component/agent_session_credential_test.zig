@@ -8,9 +8,13 @@
 //! - An update refused for its bytes, its length, or memory during a Run
 //!   changes nothing: the Run goes on and its next turn carries the old
 //!   credential; the same candidate is accepted once memory allows.
+//! - The same rule guards a credential at a Session's creation, and a fixed
+//!   (CLI) credential before each request: a byte a header cannot carry is
+//!   refused with an error instead of reaching the HTTP client, which asserts
+//!   on CR LF, and nothing is sent.
 //!
 //! Cross-module: agent_session + credential_cell + provider factory +
-//! Anthropic transport.
+//! Anthropic, OpenAI and Gemini transports.
 
 const std = @import("std");
 const harness = @import("harness");
@@ -275,4 +279,78 @@ test "L2 AgentSession refuses an invalid or unallocatable credential mid-Run and
     var quiet: u8 = 0;
     _ = try session.runText(2, "again", 2, .{ .ctx = &quiet, .emit = AcceptAll.emit });
     try expectBearer(server, 2, UNALLOCATABLE);
+}
+
+test "L2 AgentSession creation refuses a credential a request header cannot carry" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var workspace_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const workspace = try subdir(&tmp, "workspace", &workspace_buf);
+    const runtime = try cc.agent_session.AgentRuntime.create(std.testing.allocator, .{ .builtin_tools = &.{} });
+    defer runtime.destroy() catch unreachable;
+    const Refusal = struct { key: []const u8, err: anyerror };
+    const refusals = [_]Refusal{
+        .{ .key = "create-key\r\nx-injected: 1", .err = error.InvalidCredentialByte },
+        .{ .key = "create key", .err = error.InvalidCredentialByte },
+        .{ .key = "create-key-\xc3\xa9", .err = error.InvalidCredentialByte },
+        .{ .key = "", .err = error.EmptyCredential },
+        .{ .key = "k" ** (16 * 1024 + 1), .err = error.CredentialTooLong },
+    };
+    for (refusals) |refusal| {
+        try std.testing.expectError(refusal.err, runtime.createSession(.{
+            .provider_kind = .anthropic,
+            .api_key = refusal.key,
+            .model = "test-model",
+            .workspace = .{ .root = workspace },
+            .allowed_tools = &.{},
+        }));
+    }
+    const session = try runtime.createSession(.{
+        .provider_kind = .anthropic,
+        .api_key = "k" ** (16 * 1024),
+        .model = "test-model",
+        .workspace = .{ .root = workspace },
+        .allowed_tools = &.{},
+    });
+    try session.destroy();
+}
+
+fn sendOnce(provider: cc.api_provider.Provider) !void {
+    const types = cc.types_mod;
+    const messages = [_]types.ApiMessage{.{ .role = .user, .content = &[_]types.ApiContent{.{ .text = "hi" }} }};
+    const handle = try provider.sendStream(&messages, null, null, null, null, null, "hi");
+    handle.deinit();
+}
+
+test "L2 a fixed credential a header cannot carry fails its request before anything is sent, on every transport" {
+    const a = std.testing.allocator;
+    const bodies = [_][]const u8{ FINAL_SSE, FINAL_SSE, FINAL_SSE };
+    var server = try harness.MockServer.startCassette(&bodies, 0);
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+    const kinds = [_]cc.types_mod.ProviderKind{ .anthropic, .openai, .gemini };
+
+    // The CLI's credentials are fixed bytes from a flag, the environment, a
+    // key file or a token response. One with CR LF used to reach the HTTP
+    // client, whose header assertion ends the process.
+    for (kinds) |kind| {
+        for ([_][]const u8{ "fixed-key\r\nx-injected: 1", "fixed\nkey", "fixed key" }) |bad| {
+            var owned = try cc.api_provider_factory.makeProvider(a, kind, bad, "test-model", url);
+            defer owned.deinit();
+            try std.testing.expectError(error.InvalidCredential, sendOnce(owned.provider()));
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 0), server.requestCount());
+
+    for (kinds) |kind| {
+        var owned = try cc.api_provider_factory.makeProvider(a, kind, "fixed-good-key", "test-model", url);
+        defer owned.deinit();
+        try sendOnce(owned.provider());
+    }
+    try std.testing.expectEqual(@as(usize, 3), server.requestCount());
+    try expectBearer(server, 0, "fixed-good-key");
+    try expectBearer(server, 1, "fixed-good-key");
+    const gemini = server.requestAt(2) orelse return error.NoRequestCaptured;
+    try std.testing.expect(std.mem.indexOf(u8, gemini.raw, "x-goog-api-key: fixed-good-key\r\n") != null);
 }

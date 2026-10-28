@@ -10,6 +10,20 @@ status, compatibility boundaries, and entry points are defined by
 
 ## Unreleased
 
+### Fixed
+
+- **A provider credential with a byte a request header cannot carry no longer
+  ends the process.** Session create and restore accepted any UTF-8 as
+  `api_key`, and the CLI sent whatever bytes its flag, environment, key file
+  or token response held; a credential with CR LF reached the HTTP client,
+  whose header assertion ended the process at the first request (a panic in
+  ReleaseSafe). Create and restore now apply the rule `update_credential`
+  applies (1 to 16 KiB of printable ASCII): AgentCore returns
+  `INVALID_ARGUMENT` (`RESOURCE_LIMIT` when too long) with a diagnostic that
+  names the rule and never the bytes, and `AgentSession` creation fails with
+  `error.InvalidCredentialByte`. A fixed (CLI) credential is checked before
+  every request and fails that request instead of sending it.
+
 ### Added
 
 - **An AgentCore Session's provider credential can be replaced in place,

@@ -806,6 +806,8 @@ pub const SessionHostConfigV1 = extern struct {
     provider_kind_code: u32,
     permission_mode_code: u32,
     shell_policy_code: u32,
+    /// 1..MAX_CREDENTIAL_BYTES_V1 bytes of printable ASCII (0x21-0x7E), the
+    /// rule `session.update_credential` applies too.
     api_key: BytesViewV1,
     base_url: BytesViewV1,
     workspace_root: BytesViewV1,

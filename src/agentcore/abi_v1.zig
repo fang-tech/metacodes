@@ -4470,6 +4470,20 @@ fn parsePromptProfile(
 
 /// INVALID_ARGUMENT naming the entry and the rule when the kernel refuses the
 /// profile, else null.
+/// The one credential rule (`credential_cell.validate`) applied to a
+/// Session's create and restore before anything is built, as
+/// `update_credential` applies it: a refusal names the rule, never the
+/// bytes. A credential the rule refuses could never authenticate, and one
+/// with CR LF would trip the HTTP client's header assertion on the first
+/// request.
+fn refuseInvalidCredential(api_key: []const u8, out_error: ?*wire.OwnedBytesV1) ?u32 {
+    core.api_credential_cell.validate(api_key) catch |err| return failError(switch (err) {
+        error.CredentialTooLong => wire.STATUS_RESOURCE_LIMIT,
+        error.EmptyCredential, error.InvalidCredentialByte => wire.STATUS_INVALID_ARGUMENT,
+    }, err, out_error);
+    return null;
+}
+
 fn refusePromptProfile(profile: core.prompt_sections.Profile, out_error: ?*wire.OwnedBytesV1) ?u32 {
     const diagnostic = core.system_prompt.validateProfile(profile) orelse return null;
     var buf: [512]u8 = undefined;
@@ -4760,7 +4774,10 @@ fn sessionCreateErrorStatus(err: anyerror) u32 {
         error.ToolNotInRuntime,
         error.DuplicateToolName,
         error.ShellToolDisabled,
+        error.EmptyCredential,
+        error.InvalidCredentialByte,
         => wire.STATUS_INVALID_ARGUMENT,
+        error.CredentialTooLong => wire.STATUS_RESOURCE_LIMIT,
         error.RuntimeUnavailable => wire.STATUS_INVALID_STATE,
         else => wire.STATUS_CORE_ERROR,
     };
@@ -6949,6 +6966,7 @@ fn sessionCreate(runtime_handle: ?*wire.RuntimeHandle, config_ptr: ?*const wire.
     const root = text(host.workspace_root) catch |err| return failError(wire.STATUS_INVALID_ARGUMENT, err, out_error);
     const home = text(host.workspace_home) catch |err| return failError(wire.STATUS_INVALID_ARGUMENT, err, out_error);
     if (api_key.len == 0 or model.len == 0 or root.len == 0) return fail(wire.STATUS_INVALID_ARGUMENT, "api_key, model and workspace_root are required", out_error);
+    if (refuseInvalidCredential(api_key, out_error)) |status| return status;
     var workspace = skill_catalog_handles.CanonicalWorkspace.init(
         allocator,
         root,
@@ -7133,6 +7151,7 @@ fn sessionRestore(
         return failError(wire.STATUS_INVALID_ARGUMENT, err, out_error);
     if (api_key.len == 0 or root.len == 0)
         return fail(wire.STATUS_INVALID_ARGUMENT, "api_key and workspace_root are required", out_error);
+    if (refuseInvalidCredential(api_key, out_error)) |status| return status;
     var workspace = skill_catalog_handles.CanonicalWorkspace.init(
         allocator,
         root,
@@ -8067,7 +8086,7 @@ fn sessionUpdateCredential(
 
 comptime {
     // One limit, enforced where it is published and where the bytes are kept.
-    std.debug.assert(wire.MAX_CREDENTIAL_BYTES_V1 == core.api_credential_cell.MAX_REPLACEMENT_BYTES);
+    std.debug.assert(wire.MAX_CREDENTIAL_BYTES_V1 == core.api_credential_cell.MAX_CREDENTIAL_BYTES);
 }
 
 comptime {

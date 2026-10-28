@@ -646,6 +646,8 @@ typedef struct {
     uint32_t provider_kind_code;
     uint32_t permission_mode_code;
     uint32_t shell_policy_code;
+    /* 1..MAX_CREDENTIAL_BYTES_V1 bytes of printable ASCII (0x21-0x7E), the
+     * rule session->update_credential applies too. */
     metask_agentcore_bytes_view_v1 api_key;
     metask_agentcore_bytes_view_v1 base_url;
     metask_agentcore_bytes_view_v1 workspace_root;

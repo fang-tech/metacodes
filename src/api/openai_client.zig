@@ -390,7 +390,7 @@ pub const OpenAIClient = struct {
         const uri = std.Uri.parse(self.effectiveUrl()) catch return error.InvalidUrl;
         const auth = self.credential.header(self.allocator, self.auth_scheme) catch |err| {
             log.errId("openai", rid, "auth header materialization failed: {s}", .{@errorName(err)});
-            return error.RequestFailed;
+            return credential_mod.requestError(err);
         };
         defer secureFree(self.allocator, auth.value);
 
