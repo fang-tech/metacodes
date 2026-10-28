@@ -243,6 +243,8 @@ pub const TuiBackend = struct {
                 } else {
                     self.renderCardResult(r);
                 }
+                // 工具完成走立即通道(#328):结果卡与收掉的动态卡当场一帧画出,不等合并窗口。
+                self.region.flushGen();
             },
             .usage => |u| {
                 if (self.usage_acc) |acc| acc.apply(u);
@@ -477,8 +479,9 @@ pub const TuiBackend = struct {
     }
 
     /// 回复结束:停 watcher(若还在),释放草稿。持有 backend 的一方 defer 调它,任何出口都走得到。
-    /// 出错返回时 defer 先跑这里、后离开生成阶段,所以释放前先撤掉 region 上的投影(持锁),
-    /// 免得这之间画出的一帧读到已释放的缓冲。
+    /// 出错返回时 defer 先跑这里、后离开生成阶段,所以释放前先撤掉 region 上的投影(持锁)。
+    /// 投影是 region 自己的副本(gen_editor),不会读到释放的缓冲;撤掉它是让这之间画出的帧
+    /// 不再显示一份已经没有回复接收的草稿。
     pub fn deinit(self: *TuiBackend) void {
         self.stopInput();
         if (self.draft) |*d| {
@@ -627,7 +630,7 @@ pub const TuiBackend = struct {
                     // The picker's sign-in runs on a worker thread (#67);
                     // this tick moves its transcript into the overlay and
                     // commits the pending route once the login lands.
-                    if (self.region.pickerOpen()) switch (picker_host.poll(app, &self.region.ui)) {
+                    if (self.region.pickerOpen()) switch (picker_host.poll(app, &self.region.ui, .of(self.region))) {
                         .committed => {
                             self.region.writeGenText(picker_host.lastNotice(app));
                             self.region.writeGenText("\n");
@@ -732,12 +735,14 @@ pub const TuiBackend = struct {
             .open_model_picker => {
                 // 生成期也能开(要求:picker 在流式回复期间可用)。不碰 alt-screen:
                 // picker 画在固定区内,回复继续往 scrollback 走;改动只影响下一轮。
-                picker_host.open(app, &self.region.ui);
+                // picker 的写者是本线程;agent 线程的帧、合并窗口的定时线程同时在读它。
+                // picker_host 只在内存修改时持 region 锁(Guard),IO 在锁外(§9.2「picker」)。
+                picker_host.open(app, &self.region.ui, .of(self.region));
                 self.region.redrawGen(app);
                 return;
             },
             .picker_key => {
-                if (picker_host.onKey(app, &self.region.ui, eff.picker_key) == .committed) {
+                if (picker_host.onKey(app, &self.region.ui, eff.picker_key, .of(self.region)) == .committed) {
                     // Mid-stream the confirmation goes into scrollback through
                     // the same path streamed text uses, so it survives the
                     // overlay closing without fighting the region for stdout.
@@ -799,18 +804,24 @@ pub const TuiBackend = struct {
                 }
                 ed.clear();
                 self.interruptCurrentRun(app);
-                return; // 中断不重画(主线程很快收尾)
+                // 中断走立即通道(#328):合并窗口里还在等的文本与清空的输入框当场画出,不排在窗口后。
+                self.region.setGenInput(ed.view(), ed.cursor);
+                self.region.flushGen();
+                return;
             },
             .ctrl_c => {
                 ed.clear();
                 self.interruptCurrentRun(app);
+                self.region.setGenInput(ed.view(), ed.cursor);
+                self.region.flushGen();
                 return;
             },
             else => {
-                // 普通编辑键 → 喂 LineEditor,重画生成区输入框。
+                // 普通编辑键 → 喂 LineEditor,重画生成区输入框。普通通道:连打/粘贴/按住键在一个
+                // 窗口内只画一帧(以前每个键一帧)。
                 _ = ed.handle(key) catch {};
                 self.region.setGenInput(ed.view(), ed.cursor);
-                self.region.redrawGen(app);
+                self.region.requestGenRedraw();
             },
         }
     }

@@ -141,8 +141,6 @@ pub const Effect = struct {
     redraw_region: bool = false,
     /// 有文本进 scrollback(text_chunk);Renderer 负责 erase→print→redraw。
     emit_scroll: ?[]const u8 = null,
-    /// 立即重画(不被 tick/队列延迟)——工具进度快速路径。
-    immediate: bool = false,
     /// 非渲染语义动作,交主循环处理。
     action: LoopAction = .none,
     /// nav 方向:true=down(下/选下一个),false=up。仅 action==.at_nav/.model_nav 时有意义。

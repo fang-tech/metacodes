@@ -121,6 +121,15 @@ status, compatibility boundaries, and entry points are defined by
   typed. The draft now belongs to the reply: after the dialog the box still
   shows it, the cursor is where it was, and Enter queues all of it.
 
+- **The model picker no longer races the reply's frames.** A picker opened
+  during a reply is written by the keyboard thread while the reply's text
+  frames are drawn on another; a catalog refresh with the picker open (a
+  sign-in landing, or a commit that met a configuration change) rebuilt the
+  offer list under a frame that was still indexing it, which a safe build
+  reports as an out-of-bounds panic. Every change to the picker now holds the
+  render lock for the change alone; committing a route, signing in and
+  listing the catalog run outside it.
+
 ### Changed
 
 - **Smaller Linux footprint: idle RSS back under its red line, binary
@@ -161,6 +170,22 @@ status, compatibility boundaries, and entry points are defined by
   build, and a debug build panics on a phase that opens before the previous
   one closed. The picker still crosses a boundary, but only through its
   explicit `pending_overlay` hand-off (#220). No visible behaviour changes.
+
+- **Busy replies write far fewer terminal frames (#328).** Each streamed line,
+  spinner tick, tool progress update and key typed during a reply used to be
+  its own erase-and-redraw frame of the fixed region, so a model writing many
+  short lines made the terminal parse a full region redraw per line. Redraws
+  now go through a 16 ms merge window: a request with nothing painted in the
+  last window still paints at once, and requests inside the window share one
+  frame at its end that shows the state at that moment. Streamed text is
+  queued in order and never dropped. Submitting, a tool finishing, an
+  interrupt and phase or dialog boundaries still paint immediately, and a
+  WebSearch result line is always painted before its card goes. The end of
+  each provider turn is now one synchronized frame instead of three writes,
+  and a resize while the region was hidden no longer printed a blank line.
+  If metacodes panics mid-reply, the lines still waiting for the window are
+  written before the panic message, and the live region no longer draws
+  over the stack trace.
 
 ## 0.8.1 — 2026-10-28
 

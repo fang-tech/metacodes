@@ -50,6 +50,16 @@ pub const std_options: std.Options = .{
     .signal_stack_size = if (std.debug.default_enable_segfault_handler) (std.Options{}).signal_stack_size else null,
 };
 
+/// Panics go through the default handler (message, stack trace, abort), after
+/// the TUI writes the reply text its merge window still holds (#328).
+pub const panic = std.debug.FullPanic(panicAfterPendingOutput);
+
+fn panicAfterPendingOutput(msg: []const u8, first_trace_addr: ?usize) noreturn {
+    @branchHint(.cold);
+    _ = tui_render_region.flushPendingOnPanic();
+    std.debug.defaultPanic(msg, first_trace_addr);
+}
+
 // Public re-exports for tests and future consumers.
 pub const api_stream = @import("api/stream.zig");
 pub const api_provider = @import("api/provider.zig");

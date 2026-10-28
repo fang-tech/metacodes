@@ -290,11 +290,11 @@ test "dispatch: text_chunk → emit_scroll(不改固定区)" {
     try testing.expect(!eff.redraw_region);
 }
 
-test "dispatch: tool_progress 走 immediate 快速路径" {
+test "dispatch: tool_progress 更新卡片并要求重画(通道由渲染器定,#328)" {
     var s = replying();
     ui_state.addCard(&s, "id_a", "WebSearch", "", 0);
     const eff = ui.dispatch(&s, .{ .tool_progress = .{ .id = "id_a", .text = "Found 5 results" } });
-    try testing.expect(eff.immediate and eff.redraw_region);
+    try testing.expect(eff.redraw_region);
     try testing.expectEqualStrings("Found 5 results", s.phase.generating.tools.cards[0].progressSlice());
 }
 
@@ -386,7 +386,7 @@ test "dispatch: 回复以外到达的工具事件被丢弃,不要求重画" {
     var s = reading();
     try testing.expect(!ui.dispatch(&s, .{ .add_tool_card = .{ .id = "a", .name = "Bash", .start_ms = 0 } }).redraw_region);
     const late = ui.dispatch(&s, .{ .tool_progress = .{ .id = "a", .text = "Found 5" } });
-    try testing.expect(!late.redraw_region and !late.immediate);
+    try testing.expect(!late.redraw_region);
     try testing.expect(!ui.dispatch(&s, .{ .set_current_tool = .{ .name = "Bash", .start_ms = 0 } }).redraw_region);
     try testing.expect(!ui.dispatch(&s, .spinner_tick).redraw_region);
     try testing.expect(ui_state.findCard(&s, "a") == null);

@@ -67,10 +67,11 @@ pub fn dispatch(state: *UiState, ev: Event) Effect {
         },
         .text_chunk => |t| return .{ .emit_scroll = t.text },
         // 工具状态归生成期所有:回复结束后才到的事件没有可更新的卡片,也不触发重画。
+        // 重画走哪条通道由渲染器按事件来源定(#328):tool progress 走合并窗口,孤立的当场画。
         .tool_progress => |p| {
             if (state.phase != .generating) return .{};
             ui_state.setCardProgress(state, p.id, p.text);
-            return .{ .redraw_region = true, .immediate = true };
+            return .{ .redraw_region = true };
         },
         .set_current_tool => |s| {
             if (state.phase != .generating) return .{};
