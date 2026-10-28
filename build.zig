@@ -2463,6 +2463,19 @@ pub fn build(b: *std.Build) void {
     const terminal_io_test_step = b.step("test:terminal-io", "Test that REPL terminal reads retry EINTR and writes go through pfs.writeAll");
     terminal_io_test_step.dependOn(&terminal_io_test_cmd.step);
     units_test_step.dependOn(&terminal_io_test_cmd.step);
+    // Only the Renderer writes past the inline viewport: no ED 1/2/3 outside
+    // RenderRegion.resetScreen, no cursor save/restore, no direct terminal
+    // write outside the listed functions (doc/TUI_VIEWPORT_OWNERSHIP.md).
+    const scrollback_test_cmd = b.addSystemCommand(&.{
+        if (@import("builtin").os.tag == .windows) "python" else "python3",
+        "-m",
+        "unittest",
+        "scripts.tests.test_scrollback_discipline",
+        "-v",
+    });
+    const scrollback_test_step = b.step("test:scrollback", "Test that only the TUI Renderer erases the screen and writes the scrollback");
+    scrollback_test_step.dependOn(&scrollback_test_cmd.step);
+    units_test_step.dependOn(&scrollback_test_cmd.step);
     const gate_manifest_test_cmd = b.addSystemCommand(&.{
         if (@import("builtin").os.tag == .windows) "python" else "python3",
         "-m",
@@ -2714,6 +2727,19 @@ pub fn build(b: *std.Build) void {
                 daemon_e2e.setEnvironmentVariable("METACODES_DAEMON_E2E_BIN", b.getInstallPath(.bin, exe.out_filename));
                 product_test_step.dependOn(&daemon_e2e.step);
             }
+        }
+        // The capability exchange (doc/WIRE_PROTOCOL.md §2) end to end: the
+        // installed `serve` against the same loopback mock provider, with the
+        // script as the second-process frontend that declares what it renders
+        // and checks what it is then asked. Python and HTTP only, so every host.
+        {
+            const caps_e2e = b.addSystemCommand(&.{
+                if (@import("builtin").os.tag == .windows) "python" else "python3",
+                "tests/e2e/frontend_capabilities_e2e.py",
+            });
+            caps_e2e.step.dependOn(b.getInstallStep());
+            caps_e2e.setEnvironmentVariable("METACODES_DAEMON_E2E_BIN", b.getInstallPath(.bin, exe.out_filename));
+            product_test_step.dependOn(&caps_e2e.step);
         }
         // The native project-Harness suites (E3 runtime and templates, the
         // E2 evolution lifecycle, the calibration matrix) run the installed

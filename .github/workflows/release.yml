@@ -59,24 +59,23 @@ jobs:
       # (macos-13 is retired; macos-15-intel is the oldest Intel image GitHub
       # still hosts, and few Intel Macs run macOS 26).
       #
-      # cli_target: the Zig target the CLI unit is built for, where the
-      # runner's own would not run on the target's machines. Without
-      # -Dtarget the executable is built for the runner's CPU and C library:
-      # the x86_64 Linux unit needs GLIBC_2.36, and carries AVX-512
-      # instructions whenever the job lands on a CPU that has them (dispatch
-      # run 40705387727). An explicit target means the baseline CPU, and its version
-      # suffix is the oldest glibc or macOS the unit runs on. The arm64 unit is
-      # for the Graviton, Ampere, Raspberry Pi 5 and Jetson boards #307 names:
-      # no SVE, and glibc 2.31 (Ubuntu 20.04, Debian 11). The Intel macOS unit
-      # runs on macOS 13 and any Intel Mac's CPU. release:verify still runs the
-      # unit, since the target keeps the runner's OS, architecture and ABI.
-      # The rows without it are built as they always were.
+      # cli_target: the Zig target the CLI executable is built for. Without
+      # -Dtarget zig builds for the runner: its CPU, glibc and macOS. The
+      # published 0.8.0 units needed GLIBC_2.36 and AVX2 (x86_64 Linux),
+      # AVX-512 (Windows) and macOS 26.6 (aarch64 macOS), so they ran only on
+      # machines like the runners. An explicit target means the baseline CPU,
+      # and its version suffix is the oldest glibc or macOS the unit supports;
+      # scripts/check_binary_baseline.py holds the built executable to it. The
+      # arm64 unit is for the Graviton, Ampere, Raspberry Pi 5 and Jetson boards
+      # #307 names: no SVE, and glibc 2.31. release:verify still runs the unit,
+      # because the target keeps the runner's OS, architecture and ABI.
       matrix:
         include:
           - os: Linux
             arch: X64
             runner: ubuntu-latest
             zig_target: x86_64-linux-gnu
+            cli_target: x86_64-linux-gnu.2.31
           - os: Linux
             arch: ARM64
             runner: ubuntu-24.04-arm
@@ -86,14 +85,13 @@ jobs:
             arch: ARM64
             runner: macos-latest
             zig_target: aarch64-macos
+            cli_target: aarch64-macos.13.0
           - os: macOS
             arch: X64
             runner: macos-15-intel
             zig_target: x86_64-macos
             cli_target: x86_64-macos.13.0
     runs-on: ${{ matrix.runner }}
-    env:
-      CLI_TARGET: ${{ matrix.cli_target && format('-Dtarget={0}', matrix.cli_target) || '' }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -158,7 +156,11 @@ jobs:
       - name: Full suite in release configuration
         run: zig build test -Doptimize=ReleaseSafe --test-timeout 5m -Dlean-kernels=on
       - name: Stage, manifest and verify the release unit
-        run: zig build release:verify -Drelease-layout=true -Doptimize=ReleaseSafe --prefix "$RUNNER_TEMP/release" $KERNEL_PINS $CLI_TARGET
+        run: zig build release:verify -Drelease-layout=true -Doptimize=ReleaseSafe --prefix "$RUNNER_TEMP/release" $KERNEL_PINS -Dtarget=${{ matrix.cli_target }}
+      # The executable needs no CPU feature, glibc or macOS newer than its
+      # cli_target names (see the matrix); it fails here, before it is archived.
+      - name: The executable needs no more than its target
+        run: python3 scripts/check_binary_baseline.py --target ${{ matrix.cli_target }} "$RUNNER_TEMP/release/bin/metacodes"
       - name: Installed prefix matches the release layout
         run: python3 scripts/verify_install_prefix.py "$RUNNER_TEMP/release" --release --doctor
       # The same watchdog again, as agentcore-windows.yml runs this gate: at
@@ -167,7 +169,7 @@ jobs:
       - name: AgentCore gate for the native target
         run: zig build agentcore:gate -Dtarget=${{ matrix.zig_target }} -Doptimize=ReleaseSafe --test-timeout 5m
       - name: Archive (CLI unit)
-        run: zig build release:archive -Drelease-layout=true -Doptimize=ReleaseSafe --prefix "$RUNNER_TEMP/release" $KERNEL_PINS $CLI_TARGET -Drelease-archive-dir="$RUNNER_TEMP/dist"
+        run: zig build release:archive -Drelease-layout=true -Doptimize=ReleaseSafe --prefix "$RUNNER_TEMP/release" $KERNEL_PINS -Dtarget=${{ matrix.cli_target }} -Drelease-archive-dir="$RUNNER_TEMP/dist"
       # What a user does with the archive: scripts/install.sh, then doctor.
       - name: The archive installs
         shell: bash
@@ -179,7 +181,7 @@ jobs:
         run: zig build agentcore:archive -Dtarget=${{ matrix.zig_target }} -Doptimize=ReleaseSafe -Dagentcore-archive-dir="$RUNNER_TEMP/dist"
       - name: Archives are reproducible
         run: |
-          zig build release:archive -Drelease-layout=true -Doptimize=ReleaseSafe --prefix "$RUNNER_TEMP/release" $KERNEL_PINS $CLI_TARGET -Drelease-archive-dir="$RUNNER_TEMP/dist-again"
+          zig build release:archive -Drelease-layout=true -Doptimize=ReleaseSafe --prefix "$RUNNER_TEMP/release" $KERNEL_PINS -Dtarget=${{ matrix.cli_target }} -Drelease-archive-dir="$RUNNER_TEMP/dist-again"
           cmp "$RUNNER_TEMP"/dist/metacodes-*.tar.gz "$RUNNER_TEMP"/dist-again/metacodes-*.tar.gz
       # What `curl … install.sh | sh` does on this machine: no archive named,
       # so install.sh picks one by the host's target (host_target) from a
@@ -257,7 +259,12 @@ jobs:
         run: zig build test -Doptimize=ReleaseSafe --test-timeout 5m -Dlean-kernels=on
       - name: Stage, manifest and verify the release unit
         shell: cmd
-        run: zig build release:verify -Drelease-layout=true -Doptimize=ReleaseSafe --prefix "%RUNNER_TEMP%\release" %KERNEL_PINS%
+        run: zig build release:verify -Drelease-layout=true -Doptimize=ReleaseSafe --prefix "%RUNNER_TEMP%\release" %KERNEL_PINS% -Dtarget=x86_64-windows-gnu
+      # See build-posix: the Windows executable is built for the baseline CPU
+      # (0.8.0's carried AVX-512) and held to it here.
+      - name: The executable needs no more than its target
+        shell: cmd
+        run: python scripts\check_binary_baseline.py --target x86_64-windows-gnu "%RUNNER_TEMP%\release\bin\metacodes.exe"
       - name: Installed prefix matches the release layout
         shell: cmd
         run: python scripts\verify_install_prefix.py "%RUNNER_TEMP%\release" --release --doctor
@@ -266,7 +273,7 @@ jobs:
         run: zig build agentcore:gate -Dtarget=x86_64-windows-gnu -Doptimize=ReleaseSafe --test-timeout 5m
       - name: Archive (CLI unit)
         shell: cmd
-        run: zig build release:archive -Drelease-layout=true -Doptimize=ReleaseSafe --prefix "%RUNNER_TEMP%\release" %KERNEL_PINS% -Drelease-archive-dir="%RUNNER_TEMP%\dist"
+        run: zig build release:archive -Drelease-layout=true -Doptimize=ReleaseSafe --prefix "%RUNNER_TEMP%\release" %KERNEL_PINS% -Dtarget=x86_64-windows-gnu -Drelease-archive-dir="%RUNNER_TEMP%\dist"
       - name: The archive installs
         shell: cmd
         run: for %%F in ("%RUNNER_TEMP%\dist\metacodes-*.zip") do powershell -NoProfile -ExecutionPolicy Bypass -File scripts\install.ps1 "%%F" -Prefix "%RUNNER_TEMP%\installed" -NoPath && "%RUNNER_TEMP%\installed\bin\metacodes.exe" doctor --strict
@@ -275,7 +282,7 @@ jobs:
         run: zig build agentcore:archive -Dtarget=x86_64-windows-gnu -Doptimize=ReleaseSafe -Dagentcore-archive-dir="%RUNNER_TEMP%\dist"
       - name: Archives are reproducible
         shell: cmd
-        run: zig build release:archive -Drelease-layout=true -Doptimize=ReleaseSafe --prefix "%RUNNER_TEMP%\release" %KERNEL_PINS% -Drelease-archive-dir="%RUNNER_TEMP%\dist-again" && for %%F in ("%RUNNER_TEMP%\dist\metacodes-*.zip") do fc /b "%%F" "%RUNNER_TEMP%\dist-again\%%~nxF" > nul
+        run: zig build release:archive -Drelease-layout=true -Doptimize=ReleaseSafe --prefix "%RUNNER_TEMP%\release" %KERNEL_PINS% -Dtarget=x86_64-windows-gnu -Drelease-archive-dir="%RUNNER_TEMP%\dist-again" && for %%F in ("%RUNNER_TEMP%\dist\metacodes-*.zip") do fc /b "%%F" "%RUNNER_TEMP%\dist-again\%%~nxF" > nul
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: archives-Windows-X64

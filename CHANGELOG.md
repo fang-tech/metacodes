@@ -28,6 +28,134 @@ status, compatibility boundaries, and entry points are defined by
   crate tests now know the `aarch64-unknown-linux-gnu` triple. Every POSIX
   release job also installs its own archives the way `curl … install.sh |
   sh` does, from a loopback mirror, so a wrong target pick fails the release.
+- **The TUI's screen ownership is written down and enforced** (#332, #320).
+  [doc/TUI_VIEWPORT_OWNERSHIP.md](doc/TUI_VIEWPORT_OWNERSHIP.md) records who
+  may write past the inline region and how: the scrollback only through the
+  Renderer, erase/print/redraw in pairs inside one frame, the half-line
+  snapshot taken at draw time, ED 0 only, no saved cursor, and the review
+  checklist. `zig build test:scrollback` (part of `zig build test`) fails on
+  `ESC[1J`/`[2J`/`[3J` outside `tui/ansi.zig`, a wide erase outside
+  `resetScreen`, any cursor save/restore, and a direct terminal write from a
+  function in `src/repl/` that is not listed with its reason. The unused
+  DECSC/DECRC constants left `ansi.zig`, and `src/repl/statusline.zig`, which
+  no build imported, is gone with its direct write to stderr.
+- A virtual terminal for component tests (`tests/component/vterm.zig`, a Zig
+  port of `tests/tty/screen.py` pinned to it by golden vectors, with bounded
+  scrollback content) and the first tests that drive the real render region
+  through it: emit/erase pairing, half-line continuation, phase hand-off,
+  narrow strict-autowrap terminals (#319); and convergence of the streamed
+  assistant markdown under token, line, byte, every-single-cut and seeded
+  random chunkings, tables cut mid-row or never confirmed, with and without
+  the live region redrawn between chunks (#318).
+- **Cross-process frontends declare which UI requests they render (#329).**
+  A frontend opens its channel with a capability frame
+  (`{"v":1,"type":"capabilities","ui_requests":[...],"custom":["<name>@<major>"],"events":[...]}`):
+  `POST /capabilities` on `--web` and `serve` (`/s/<id>/capabilities` per
+  session), `HostedSession.declareCapabilities` for a `SessionHost` Host. A
+  UI request the frame leaves out is no longer announced and failed by a
+  round trip: the Host journals `ui_request_unavailable` and the requester
+  answers the new `RequestOutcome.unrenderable` at once. The tool fails as
+  without a UI — AskUserQuestion with `FrontendCannotRender`
+  (`capability_unsupported`), `requestUiCustom` with `CustomUiUnsupported`, a
+  permission prompt denied with no terminal fallback — and the tool result
+  says the connected frontend cannot render the request and that the user
+  never saw it, instead of "failed with NotATty" or "user declined … via
+  prompt"; those texts are unchanged where they are true. Custom kinds carry
+  their version and match exactly. The reply is a journaled
+  `capabilities_accepted` line, or `capabilities_refused` for a frame of
+  another schema version or a malformed one, which changes nothing; `GET
+  /state` reports the declaration as `frontend_capabilities`. A frontend that
+  never declares receives every request as before, and in-process backends
+  (TUI, headless, the C ABI) are unchanged. The bundled browser UI declares
+  `permission` and `ask_question`, so a custom UI request no longer opens an
+  "Unsupported UI request" dialog there. The wire contract, the compatibility
+  rules and the policy on which `CoreEvent`/`UiRequest` changes bump
+  `SCHEMA_VERSION` are in the new [doc/WIRE_PROTOCOL.md](doc/WIRE_PROTOCOL.md);
+  `tests/fixtures/wire/v1` pins the frames and replies.
+
+### Fixed
+
+- **Release executables run beyond machines like the build runner.**
+  `release.yml` built the CLI executable without `-Dtarget`, so zig targeted
+  the runner: its CPU, glibc and macOS. Every published release from 0.4.0 to
+  0.8.0 is affected:
+  - The x86_64 Linux executable needs GLIBC_2.36 and an AVX2 CPU. On Ubuntu
+    22.04 the 0.8.0 one exits with "version `GLIBC_2.36' not found".
+  - The Windows executable needs AVX2, and AVX-512 in 0.4.0, 0.6.0 and 0.8.0.
+  - The aarch64 macOS executable declares macOS 26.6.2 as its minimum.
+
+  Each unit is now built for an explicit target (`cli_target`): the baseline
+  CPU and the oldest system it supports. Those targets are
+  `x86_64-linux-gnu.2.31`, `aarch64-macos.13.0` and `x86_64-windows-gnu`.
+  The new `scripts/check_binary_baseline.py` step fails a release whose
+  executable needs more. It disassembles the executable (no AVX, AVX2 or
+  AVX-512 on x86_64; no SVE or Armv8.6 matrix instructions on aarch64) and
+  reads the GLIBC symbol versions and the Mach-O minimum macOS. The Lean
+  kernels were never affected: they are built for the baseline CPU and need
+  GLIBC_2.14.
+- **Ctrl+L during a reply clears the screen through the renderer** (#320).
+  The keyboard watcher sent `ESC[2J` straight to the terminal, outside the
+  render lock and between two frames, while the agent loop could be printing,
+  and kept the half-line continuation whose text the clear had just removed.
+  Ctrl+L, `/clear` and `/resume` now share `RenderRegion.resetScreen`: it
+  erases the region, clears the screen and, during a reply, draws the region
+  again on the top row, in one synchronized frame, and drops the
+  continuation. The scrollback is never wiped (no `ESC[3J`).
+- **Code blocks in a streamed reply are highlighted for their fence's
+  language.** The live markdown renderer kept the language as a slice of the
+  line buffer the reply streams through; by the block's first code line that
+  buffer had been shifted to the next line (and sometimes reallocated), so
+  the slice read other bytes and blocks were highlighted with the generic
+  keyword set (a Python `lambda` or `None` stayed plain). The renderer now
+  keeps its own copy of the language name.
+- **The footer no longer wraps on a narrow terminal.** The mode and key-hint
+  line (`⏵⏵ accept edits on (shift+tab to cycle) · esc to interrupt`) was
+  never cut to the terminal width. On a terminal narrower than it, the
+  terminal wrapped it onto rows the input box does not count, and with the
+  box at the bottom of the screen every redraw pushed the spinner, border
+  and prompt rows into the scrollback. It is now cut with an ellipsis, like
+  the MCP notice on the same line.
+- **Python package: a host tool can run a child Session on Windows.** A Run
+  executed on the thread that called `Session.run`; on Windows the main
+  thread of python.exe reserves 2 MB, and a Run that a tool started from
+  inside another Run overflowed it. ctypes reported the overflow as
+  `OSError: exception: stack overflow`, the child's Run never finished, and
+  closing the child failed with `BUSY`. Every Run now executes on its own
+  thread with an 8 MiB stack, the size the Node addon gives its Run threads,
+  so nesting no longer depends on the caller's stack. The thread is not a
+  daemon, and an interrupt (Ctrl+C) while `run()` waits for it aborts the Run
+  and waits for it to end before it propagates; a second interrupt stops the
+  wait and leaves the Session busy until the Run ends, so `abort()` and
+  `close()` still reach it. The suite's
+  permission-target test compares paths as paths, since AgentCore names
+  Windows paths with forward slashes.
+
+### Changed
+
+- **Smaller Linux footprint: idle RSS back under its red line, binary
+  433 KB smaller.** On x86_64 Linux, the ReleaseSmall binary was 6.60 MB
+  (red line 6 MiB) and `metacodes --help` peaked at 3120 KB RSS (red line
+  3 MB; `doc/PERF_MEMORY_PRINCIPLES.md` §2). Nothing a user sees changes;
+  measured in WSL on x86_64:
+  - **Signal stack.** The release binary no longer reserves std's 256 KiB
+    alternate signal stack. It is thread-local, and glibc zeroes it for
+    every thread, the main one included. Only std's segfault handler uses
+    it, and the release build does not install that handler, so sessions
+    also save 256 KiB per thread.
+  - **`--help` first.** `metacodes --help` (or `-h`) as the first argument
+    prints before the rest of startup runs, with byte-identical output.
+  - **No zero-filled constants.** The provider control plane's event ring is
+    no longer copied out of a 138 KiB read-only constant.
+  - **Run-end records out of line.** The agent loop's nine run-end records
+    run as functions instead of being copied into every exit of the loop
+    (−277 KB).
+
+  Result: 6.19 MB binary and 2564 KB RSS for the native build; 6.16 MB and
+  2920 KB for the glibc 2.31 baseline-CPU build. RSS is now under its red
+  line, but the binary is still about 195 KB over 6 MiB. The macOS binary
+  is 283 KB smaller. §3g records the Zig 0.16 patterns behind the waste:
+  aggregates copied from zero-filled constants, and `defer` bodies copied
+  into every exit.
 
 ## 0.8.1 — 2026-10-28
 

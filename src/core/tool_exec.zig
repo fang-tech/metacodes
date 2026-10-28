@@ -690,7 +690,9 @@ pub fn executeOne(
     // L3 挂起槽:工具发起 custom UI 拿到 .pending → 写 {kind,payload} 进这里 + 返 error.UiPending。
     var pending_req: ?tools_mod.PendingRequest = null;
     job_ctx.pending_request = &pending_req;
-    var effect_slot = tool_observation.EffectSlot{};
+    // Naming the buffer keeps Zig from copying the slot out of a 4 KiB
+    // read-only constant (doc/PERF_MEMORY_PRINCIPLES.md §3g).
+    var effect_slot: tool_observation.EffectSlot = .{ .file_path = undefined };
     job_ctx.effect_slot = &effect_slot;
     // Per-dispatch file-change collector. It copies into `parent_allocator`, so
     // records outlive the arena above; `defer deinit` covers every early return

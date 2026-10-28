@@ -44,6 +44,23 @@ test "top-level help writes to stdout" {
     try expectHelp(&.{"-h"}, "metacodes — embeddable agent core and coding CLI");
 }
 
+test "top-level help wins over the arguments after it, and is found after others" {
+    // argv[1] answered before the rest of startup: what follows it was never
+    // parsed, so an unknown flag there is not an error.
+    try expectHelp(&.{ "--help", "--no-such-flag" }, "metacodes — embeddable agent core and coding CLI");
+    try expectHelp(&.{ "-h", "--no-such-flag" }, "metacodes — embeddable agent core and coding CLI");
+    // In a later position the argument parser answers it, so an unknown flag
+    // before it is still an error.
+    try expectHelp(&.{ "--model", "help-test-model", "--help" }, "metacodes — embeddable agent core and coding CLI");
+    const a = std.testing.allocator;
+    const refused = try runCli(a, &.{ "--no-such-flag", "--help" });
+    defer a.free(refused.stdout);
+    defer a.free(refused.stderr);
+    try std.testing.expectEqual(@as(i32, 2), refused.exit_code);
+    try std.testing.expectEqual(@as(usize, 0), refused.stdout.len);
+    try std.testing.expect(std.mem.indexOf(u8, refused.stderr, "unknown flag '--no-such-flag'") != null);
+}
+
 test "subcommand help writes to stdout" {
     const cases = [_]struct { command: []const u8, marker: []const u8 }{
         .{ .command = "login", .marker = "metacodes login" },
