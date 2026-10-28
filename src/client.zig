@@ -715,13 +715,14 @@ pub const Client = struct {
     /// GET <base>/v1/models with this client's route and credential: the body,
     /// owned by `client.allocator`.
     pub fn fetchModelsList(client: *Client) ![]u8 {
-        const auth = client.credential.header(client.allocator, client.auth_scheme) catch return error.RequestFailed;
-        defer secureFree(client.allocator, auth.value);
         var status: u16 = 0;
         defer if (status != 0) {
             client.last_http_status = status;
         };
-        return getModelsList(client.allocator, &client.http_client, client.base_url, .{ .name = auth.name, .value = auth.value }, &status);
+        return getModelsList(client.allocator, &client.http_client, client.base_url, .{ .credential = .{
+            .credential = client.credential,
+            .scheme = client.auth_scheme,
+        } }, &status);
     }
 
     /// 发送非流式消息请求
@@ -980,14 +981,6 @@ pub const Client = struct {
             return error.InvalidUrl;
         };
 
-        // OAuth access tokens can be longer than a small stack buffer. Allocate
-        // the header value and scrub it after request setup.
-        const auth = client.credential.header(client.allocator, client.auth_scheme) catch |err| {
-            log.errId("client", rid, "auth header materialization failed: {s}", .{@errorName(err)});
-            return error.RequestFailed;
-        };
-        defer secureFree(client.allocator, auth.value);
-
         // Request 必须 heap-allocate：Response 内含 *Request，生命周期要覆盖 stream
         // 读取过程。若放栈上，doRequest 返回后 *Request 悬挂 → stream.next() 踩到
         // 新栈内容 segfault（ReleaseSmall 紧凑栈 reuse 下必炸）。
@@ -1011,6 +1004,17 @@ pub const Client = struct {
                 return error.RequestFailed;
             }
         }
+
+        // The credential is read now, with the connection slot held and the
+        // request about to open (issue #336): a request that waited for a slot
+        // carries a credential published while it waited. OAuth access tokens
+        // can be longer than a small stack buffer, so the header value is
+        // allocated and scrubbed after request setup.
+        const auth = client.credential.header(client.allocator, client.auth_scheme) catch |err| {
+            log.errId("client", rid, "auth header materialization failed: {s}", .{@errorName(err)});
+            return error.RequestFailed;
+        };
+        defer secureFree(client.allocator, auth.value);
 
         // keep_alive=false:长驻(serve/--web)复用连接池,空闲后服务端关连接,首个 sendBody 撞
         // WriteFailed → 重试风暴(isTransientNetworkError 注释的病根)。新连接的握手洪峰由
@@ -1163,11 +1167,22 @@ pub const Client = struct {
 /// `<base>/v1/messages`: the body, owned by `allocator`. `status` receives the
 /// HTTP status once a response head arrived. Free of `Client` state, so a
 /// background refresh can run it on an HTTP client of its own.
+/// How a models-list request authenticates: a header its caller built (the
+/// models cache), or a client's credential, read for each page once that
+/// page's connection slot is held, as every other request reads it.
+pub const ModelsAuth = union(enum) {
+    header: http.Header,
+    credential: struct {
+        credential: credential_mod.Credential,
+        scheme: ?auth_header_mod.AuthScheme,
+    },
+};
+
 pub fn getModelsList(
     allocator: std.mem.Allocator,
     http_client: *http.Client,
     messages_url: []const u8,
-    auth: http.Header,
+    auth: ModelsAuth,
     status: *u16,
 ) ![]u8 {
     const suffix = "/v1/messages";
@@ -1215,19 +1230,28 @@ fn getModelsPage(
     allocator: std.mem.Allocator,
     http_client: *http.Client,
     url: []const u8,
-    auth: http.Header,
+    auth: ModelsAuth,
     status: *u16,
 ) ![]u8 {
     const uri = std.Uri.parse(url) catch return error.InvalidUrl;
 
     var connection_lease = connection_gate.acquire(null) catch return error.RequestFailed;
     defer connection_lease.release();
+    var built: ?auth_header_mod.Header = null;
+    defer if (built) |header| secureFree(allocator, header.value);
+    const header: http.Header = switch (auth) {
+        .header => |fixed| fixed,
+        .credential => |source| blk: {
+            built = source.credential.header(allocator, source.scheme) catch return error.RequestFailed;
+            break :blk .{ .name = built.?.name, .value = built.?.value };
+        },
+    };
     var req = http_client.request(.GET, uri, .{
         .keep_alive = false, // 同 POST:不复用陈旧连接
         .redirect_behavior = no_redirects, // 同 POST:key 不随重定向去别的主机
         .extra_headers = &.{
             .{ .name = "anthropic-version", .value = "2023-06-01" },
-            auth,
+            header,
         },
     }) catch return error.RequestFailed;
     defer req.deinit();

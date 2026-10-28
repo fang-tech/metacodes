@@ -10,7 +10,8 @@
 //! - `Replacement.publish` swapping the bytes is an update's linearization
 //!   point. A header materialized after it carries the new credential; one
 //!   materialized before it keeps the old one for that request alone, and its
-//!   connection is never touched.
+//!   connection is never touched. The transports materialize a request's
+//!   header as they send it, once they hold its connection slot.
 //! - Once the swap is done, nothing references the previous bytes, so publish
 //!   erases and frees them at once.
 //! - The lock is a leaf: while it is held, nothing is acquired except the

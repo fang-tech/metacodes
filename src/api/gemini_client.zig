@@ -338,17 +338,19 @@ pub const GeminiClient = struct {
         defer self.allocator.free(url);
         log.infoId("gemini", rid, "POST {s} body_bytes={d} cache_mode={s}", .{ url, body.len, cache.modeFor(.gemini).label() });
         const uri = std.Uri.parse(url) catch return error.InvalidUrl;
-        // This request's own copy of the key, erased once the request is set up.
-        const auth = self.credential.header(self.allocator, .{ .api_key_header = "x-goog-api-key" }) catch |err| {
-            log.errId("gemini", rid, "auth header materialization failed: {s}", .{@errorName(err)});
-            return error.RequestFailed;
-        };
-        defer secure.free(self.allocator, auth.value);
 
         const req_ptr = try self.allocator.create(http.Client.Request);
         errdefer self.allocator.destroy(req_ptr); // 唯一 destroy:所有错误路径都靠它(不手动 destroy,否则 double-free)
         var connection_lease = try connection_gate.acquire(abort);
         defer connection_lease.release();
+        // This request's own copy of the key, read with the connection slot
+        // held, right before the request opens (see client_mod.Client.doRequest),
+        // and erased once the request is set up.
+        const auth = self.credential.header(self.allocator, .{ .api_key_header = "x-goog-api-key" }) catch |err| {
+            log.errId("gemini", rid, "auth header materialization failed: {s}", .{@errorName(err)});
+            return error.RequestFailed;
+        };
+        defer secure.free(self.allocator, auth.value);
         req_ptr.* = self.http_client.request(.POST, uri, .{
             // 每请求独立连接:不复用 pooled 连接，避免"干净 EOF→连接入池→复用已弃连接
             // →HttpConnectionClosing"；process-wide connection_gate 负责限制握手洪峰。

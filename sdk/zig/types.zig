@@ -1259,9 +1259,10 @@ pub const SessionSubmitInputFnV1 = *const fn (
     out_diagnostic: ?*OwnedBytesV1,
 ) callconv(.c) u32;
 /// Revision 25 (#336). Replaces the Session's provider credential in place:
-/// every request that builds its authentication header after OK uses it,
-/// retries and requests of providers created earlier included; a request
-/// already sent keeps the old one and is not interrupted. Provider, scheme,
+/// a request reads the credential when it is sent, so every request sent
+/// after OK uses it, retries, requests of providers created earlier and
+/// requests still waiting for a connection included; a request already sent
+/// keeps the old one and is not interrupted. Provider, scheme,
 /// base URL and model stay. Like abort it may overlap a Run, from any thread
 /// or from inside that Run's callbacks; concurrent calls are linearized.
 /// The credential is borrowed for the call: 1..MAX_CREDENTIAL_BYTES_V1 bytes

@@ -8052,6 +8052,10 @@ fn sessionUpdateCredential(
     defer runtime_call.deinit();
     if (self.facade_poisoned.load(.acquire))
         return fail(wire.STATUS_INVALID_STATE, "Session is poisoned by a previous admitted Run failure", out_error);
+    // The Core poisons a failed Run before the Run's thread sets the facade
+    // flag; in that window the state must still outrank the candidate.
+    self.core_session.checkCredentialUpdateState() catch
+        return fail(wire.STATUS_INVALID_STATE, "Session is poisoned or being destroyed", out_error);
     if (credential_view.len > wire.MAX_CREDENTIAL_BYTES_V1)
         return fail(wire.STATUS_RESOURCE_LIMIT, "credential exceeds AgentCore ABI v1 limit", out_error);
     const candidate = borrowed(credential_view) catch |err|
@@ -11002,6 +11006,93 @@ test "reconcileRunFailure: a Host rejecting the poisoned terminal fails the Run 
     try std.testing.expectEqual(@as(usize, 1), fatal.calls);
     try std.testing.expectEqual(public_protocol.RunStatePhase.poisoned, session.run_state_projector.phase);
     try std.testing.expect(session.facade_poisoned.load(.acquire));
+}
+
+test "update_credential: a Core poisoned before the facade flag outranks an invalid candidate (#336)" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const cwd = root_buffer[0..root_len];
+    const native_runtime = try core.agent_session.AgentRuntime.create(
+        std.testing.allocator,
+        .{ .builtin_tools = &.{} },
+    );
+    defer native_runtime.destroy() catch unreachable;
+    var runtime = AbiRuntime{
+        .core_runtime = native_runtime,
+        .host_tools = &.{},
+        .catalogs = skill_catalog_handles.RuntimeCatalogs.initWithSecret(
+            std.testing.allocator,
+            [_]u8{0x76} ** 32,
+        ),
+        .materializations = undefined,
+        .mcp_manager = null,
+    };
+    defer {
+        runtime.catalogs.tryBeginDestroy() catch unreachable;
+        runtime.catalogs.finishDestroy();
+    }
+    const session = try buildAbiSession(&runtime, .{
+        .callbacks = std.mem.zeroes(wire.SessionCallbacksV1),
+        .provider_kind = .anthropic,
+        .api_key = "test-key",
+        .model = "test-model",
+        .base_url = null,
+        .permission_mode = .default,
+        .permission_rules = null,
+        .workspace = .{ .root = cwd, .home = cwd },
+        .allowed_tools = &.{},
+        .workspace_scope_id = [_]u8{0} ** 64,
+        .skill_binding = null,
+        .mcp_selectors = &.{},
+    });
+    defer {
+        var diagnostic = std.mem.zeroes(wire.OwnedBytesV1);
+        const status = sessionDestroy(session.handle(), &diagnostic);
+        bufferRelease(&diagnostic);
+        std.debug.assert(status == wire.STATUS_OK);
+    }
+
+    // The window a failed Run opens: `poisonRun` has set the Core state, and
+    // the Run's thread has not yet reached `reconcileRunFailure`, which sets
+    // the facade flag.
+    const core_session = session.core_session;
+    core_session.mutex.lock();
+    core_session.state = .poisoned;
+    core_session.mutex.unlock();
+    try std.testing.expect(!session.facade_poisoned.load(.acquire));
+
+    var oversized: u8 = 'k';
+    const candidates = [_]wire.BytesViewV1{
+        .{ .ptr = @ptrCast(&oversized), .len = wire.MAX_CREDENTIAL_BYTES_V1 + 1 },
+        .{ .ptr = null, .len = 4 },
+        .{ .ptr = null, .len = 0 },
+        wire.BytesViewV1{ .ptr = "fresh-key".ptr, .len = "fresh-key".len },
+    };
+    for (candidates) |candidate| {
+        var diagnostic = std.mem.zeroes(wire.OwnedBytesV1);
+        defer bufferRelease(&diagnostic);
+        try std.testing.expectEqual(
+            wire.STATUS_INVALID_STATE,
+            sessionUpdateCredential(session.handle(), candidate, &diagnostic),
+        );
+    }
+    try std.testing.expect(core_session.credential.matches("test-key"));
+
+    // Back to idle (destroy accepts a poisoned Session too, but this proves
+    // the same candidates are judged on their own merits once it is usable).
+    core_session.mutex.lock();
+    core_session.state = .idle;
+    core_session.mutex.unlock();
+    var diagnostic = std.mem.zeroes(wire.OwnedBytesV1);
+    defer bufferRelease(&diagnostic);
+    try std.testing.expectEqual(wire.STATUS_RESOURCE_LIMIT, sessionUpdateCredential(session.handle(), candidates[0], &diagnostic));
+    bufferRelease(&diagnostic);
+    try std.testing.expectEqual(wire.STATUS_INVALID_ARGUMENT, sessionUpdateCredential(session.handle(), candidates[1], &diagnostic));
+    bufferRelease(&diagnostic);
+    try std.testing.expectEqual(wire.STATUS_OK, sessionUpdateCredential(session.handle(), candidates[3], &diagnostic));
+    try std.testing.expect(core_session.credential.matches("fresh-key"));
 }
 
 test "Host schema admission rejects ambiguous object contracts" {

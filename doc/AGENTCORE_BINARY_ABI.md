@@ -1148,16 +1148,18 @@ destroy and restore are not needed, also not while a Run is going.
   Every refusal leaves the previous credential in effect and never ends,
   aborts or poisons a Run. A diagnostic names the rule, never the bytes. There
   is no `BUSY`.
-- **Effective point.** Every provider request that builds its authentication
-  header after the call returns `OK` carries the new credential, unless a
-  later update has replaced it: the active Run's next turn, a retry of a
-  request whose earlier attempt failed (each attempt builds its header again),
-  a compaction summary, a Skill Run and its forked child, and a tool's own
-  per-call provider such as `WebSearch`'s, including one built before the
-  update. A request whose header was built before the update keeps the
-  previous credential: AgentCore does not cancel, change, or replay a request
-  already sent or a stream being read, and whether the provider still honors
-  the previous credential is the provider's decision. A request that already
+- **Effective point.** A provider request reads the credential when it is
+  sent: once it holds its connection slot, immediately before it opens the
+  connection. Every request sent after the call returns `OK` carries the new
+  credential, unless a later update has replaced it: the active Run's next
+  turn, a retry of a request whose earlier attempt failed (each attempt is
+  sent anew), a compaction summary, a Skill Run and its forked child, and a
+  tool's own per-call provider such as `WebSearch`'s, including one built
+  before the update, and a request that was already waiting for a connection
+  slot when the update returned. A request already sent keeps the previous
+  credential: AgentCore does not cancel, change, or replay a request already
+  sent or a stream being read, and whether the provider still honors the
+  previous credential is the provider's decision. A request that already
   failed authentication is not replayed.
 - **Concurrency and order.** Like `abort` and `submit_input`,
   `update_credential` bypasses the facade call gate and never takes the
@@ -1168,15 +1170,15 @@ destroy and restore are not needed, also not while a Run is going.
   `submit_input`, the Session Control calls, and other `update_credential`
   calls. It never waits for any of them. Updates are linearized: each one
   takes effect at a single instant before it returns, so updates that overlap
-  take effect in some order, every request that builds its header afterwards
-  uses the last of them, and an update that returned before another began
+  take effect in some order, every request sent afterwards uses the last of
+  them, and an update that returned before another began
   always takes effect first. A Host that updates from several threads and
   cares which credential wins orders those calls itself. The Host must let
   every `update_credential` call return before it destroys the handle.
 - **The bytes.** The Session keeps one copy of its current credential, which
-  every provider it builds reads under a lock when it builds a request header,
-  and each request keeps its own header copy until that request is set up,
-  then erases it. The replaced copy is erased and released before
+  every provider it builds reads under a lock as it sends a request, and each
+  request keeps its own header copy until that request is set up, then erases
+  it. The replaced copy is erased and released before
   `update_credential` returns; the last one is erased when the Session is
   destroyed. The Host may erase its own buffer once the call returns.
 - **Never recorded.** Checkpoints, `describe`, events, diagnostics, and logs

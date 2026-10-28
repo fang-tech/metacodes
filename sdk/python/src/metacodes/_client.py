@@ -583,10 +583,10 @@ class Session:
     def update_credential(self, api_key: str) -> None:
         """Replace the provider credential in place (AgentCore Revision 25).
 
-        Every request that builds its authentication header after this returns
-        uses ``api_key``: the next turn of a Run already going, a retry, a
-        compaction, a Skill. A request already sent keeps the old key and is
-        not interrupted. Safe from any thread and from this Session's own
+        Every request sent after this returns uses ``api_key``: the next turn
+        of a Run already going, a retry, a compaction, a Skill, a request
+        still waiting for a connection. A request already sent keeps the old
+        key and is not interrupted. Safe from any thread and from this Session's own
         callbacks (a host tool, ``on_event``, ``on_ui_request``). The provider,
         endpoint and model stay. ``api_key`` is 1 to 16384 bytes of printable
         ASCII; anything else raises AgentCoreError and keeps the previous key.

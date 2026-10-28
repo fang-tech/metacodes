@@ -57,7 +57,7 @@ event vocabulary is listed in
 input to it; both may be called from another thread.
 `session.update_credential(api_key)` replaces the provider key in place, while
 idle or during a run, from any thread or from inside a tool or handler: every
-request built afterwards (the run's next turn, a retry) carries it, and a
+request sent afterwards (the run's next turn, a retry) carries it, and a
 request already sent keeps the old one. The provider, endpoint and model stay.
 
 `session.close()`, and leaving a `with` block, aborts a run that is still going
