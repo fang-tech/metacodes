@@ -10,6 +10,38 @@ status, compatibility boundaries, and entry points are defined by
 
 ## Unreleased
 
+### Added
+
+- **An AgentCore Session's provider credential can be replaced in place,
+  also during a Run** (#336). An expiring access token used to mean exporting
+  a checkpoint, restoring a new Session and destroying the old one, which only
+  works while idle: a token that expired while a tool ran or a permission
+  request waited ended the Run with `api_error`. AgentCore ABI Revision 25 adds
+  `session->update_credential(session, credential, out_error)` (the Session
+  table grows from 48 to 56 bytes) and the source-level
+  `AgentSession.updateCredential`.
+  - Callable while idle and during a Run, from any thread or from the Run's own
+    callbacks; never `BUSY`. Concurrent updates are linearized, and every
+    request that builds its authentication header after an update returns
+    carries it: the Run's later turns, retries of a request already under way,
+    compaction summaries, Skill Runs and forked Skills, and a tool's own
+    per-call provider (`WebSearch`), including one built before the update. A
+    request already sent and a stream being read are left alone.
+  - Only the credential changes: provider, authentication scheme, `base_url`
+    and model stay. An empty credential, a byte outside printable ASCII, more
+    than `MAX_CREDENTIAL_BYTES_V1` (16 KiB), or an allocation failure is
+    refused and keeps the previous credential; a poisoned Session refuses
+    with `INVALID_STATE`. Diagnostics name the rule, never the bytes.
+  - The replaced credential is erased before the call returns and the last one
+    when the Session is destroyed. No credential reaches checkpoints,
+    `describe`, events or diagnostics; restore still uses the credential in
+    its configuration.
+  - Every Session-owned provider now reads one Session-owned credential at each
+    request instead of borrowing the Session's key bytes. The Python
+    (`Session.update_credential`) and Node (`Session.updateCredential`)
+    packages, the Zig and Rust SDKs, and both source-free consumers carry the
+    slot. SDK 0.12.0-dev.
+
 ## 0.8.1 — 2026-10-28
 
 ### Fixed

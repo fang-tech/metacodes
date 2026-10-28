@@ -7,7 +7,8 @@ Each request pops the next step of the script:
 * ``("echo",)`` answers with the text of the last tool_result it received,
   prefixed by ``"saw: "``, so a test can prove the result reached the model.
 
-Every request body is kept in ``requests`` for assertions.
+Every request body is kept in ``requests`` for assertions, and the
+``authorization`` header each one carried in ``authorizations``.
 """
 
 from __future__ import annotations
@@ -130,6 +131,7 @@ class MockProvider:
     def __init__(self, script: List[tuple]) -> None:
         self.script = list(script)
         self.requests: List[dict] = []
+        self.authorizations: List[str] = []
         self._lock = threading.Lock()
         provider = self
 
@@ -142,6 +144,7 @@ class MockProvider:
                 body = json.loads(self.rfile.read(length) or b"{}")
                 with provider._lock:
                     provider.requests.append(body)
+                    provider.authorizations.append(self.headers.get("authorization", ""))
                     index = len(provider.requests)
                     step = provider.script.pop(0) if provider.script else ("text", "script exhausted")
                 if self.path.endswith("/chat/completions"):

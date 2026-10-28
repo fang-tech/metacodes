@@ -4056,7 +4056,7 @@ test "L2 public MCP checkpoint restore facade preserves Conversation under narro
 
     var abi_revision_bytes: [4]u8 = undefined;
     @memcpy(&abi_revision_bytes, checkpoint.bytes.items[20..24]);
-    try std.testing.expectEqual(@as(u32, 24), wire.ABI_REVISION);
+    try std.testing.expectEqual(@as(u32, 25), wire.ABI_REVISION);
     // A Session without a prompt profile keeps the marker-8 envelope across
     // ABI revisions; the marker is independent of the table revision.
     try std.testing.expectEqual(
@@ -12437,4 +12437,717 @@ test "L2 Revision 24 a host-scheduled lead delegates through the public ABI, des
     );
     const poll_again_text = try sdk.borrowedBytes(.{ .ptr = poll_again.ptr, .len = poll_again.len });
     try std.testing.expectEqualStrings("{\"input\":null}", poll_again_text);
+}
+
+// ── Revision 25: in-place provider credential update (#336) ─────────────────
+
+const CREDENTIAL_A = "credential-a-336";
+const CREDENTIAL_B = "credential-b-336";
+const CREDENTIAL_C = "credential-c-336";
+
+const HOST_ROTATE_SSE =
+    "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_rotate\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n" ++
+    "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"tu_rotate\",\"name\":\"HostRotate\",\"input\":{}}}\n\n" ++
+    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{}\"}}\n\n" ++
+    "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n" ++
+    "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":1}}\n\n" ++
+    "data: {\"type\":\"message_stop\"}\n\n";
+
+const WEB_SEARCH_TOOL_SSE =
+    "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_search\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n" ++
+    "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"tu_search\",\"name\":\"WebSearch\",\"input\":{}}}\n\n" ++
+    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"query\\\":\\\"credential rotation\\\"}\"}}\n\n" ++
+    "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n" ++
+    "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":1}}\n\n" ++
+    "data: {\"type\":\"message_stop\"}\n\n";
+
+const WEB_SEARCH_SUMMARY_SSE =
+    "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_summary\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n" ++
+    "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n" ++
+    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Rotation keeps the Session.\"}}\n\n" ++
+    "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n" ++
+    "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n" ++
+    "data: {\"type\":\"message_stop\"}\n\n";
+
+const SERVICE_UNAVAILABLE_BODY = "{\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"try again\"}}";
+const STATUS_200 = "HTTP/1.1 200 OK";
+const STATUS_503 = "HTTP/1.1 503 Service Unavailable";
+
+/// The authorization header value the provider received in request `index`.
+fn requestAuthorization(server: *harness.MockServer, index: usize) ![]const u8 {
+    const captured = server.requestAt(index) orelse return error.MissingProviderRequest;
+    const head_end = std.mem.indexOf(u8, captured.raw, "\r\n\r\n") orelse return error.MalformedProviderRequest;
+    var lines = std.mem.splitSequence(u8, captured.raw[0..head_end], "\r\n");
+    while (lines.next()) |line| {
+        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, line[0..colon], " \t"), "authorization"))
+            return std.mem.trim(u8, line[colon + 1 ..], " \t");
+    }
+    return error.MissingAuthorization;
+}
+
+fn expectBearer(server: *harness.MockServer, index: usize, credential: []const u8) !void {
+    const value = try requestAuthorization(server, index);
+    if (!std.mem.startsWith(u8, value, "Bearer ") or !std.mem.eql(u8, value["Bearer ".len..], credential)) {
+        std.debug.print("request {d} authorization [{s}], expected Bearer {s}\n", .{ index, value, credential });
+        return error.UnexpectedAuthorization;
+    }
+}
+
+/// Callbacks for the Revision 25 tests. `HostRotate`'s callback first offers
+/// `refuse_first` (which must be refused) and then publishes `rotate_to`;
+/// `on_retry` is published from inside the first `retry_notice` event. With
+/// `block_tool`, `HostRotate` waits for `tool_release` after signalling
+/// `tool_entered`. Wrong outcomes count as mismatches instead of failing the
+/// callback, so they fail the test without poisoning the Session.
+const CredentialProbe = struct {
+    api: sdk.Api,
+    session: ?*wire.SessionHandle = null,
+    refuse_first: ?[]const u8 = null,
+    rotate_to: ?[]const u8 = null,
+    on_retry: ?[]const u8 = null,
+    fatal_events: bool = false,
+    block_tool: bool = false,
+    tool_entered: std.atomic.Value(bool) = .init(false),
+    tool_release: std.atomic.Value(bool) = .init(false),
+    retries: u32 = 0,
+    host_calls: u32 = 0,
+    mismatches: std.atomic.Value(u32) = .init(0),
+
+    fn mismatch(self: *CredentialProbe, comptime fmt: []const u8, args: anytype) void {
+        std.debug.print("credential probe: " ++ fmt ++ "\n", args);
+        _ = self.mismatches.fetchAdd(1, .acq_rel);
+    }
+
+    /// One update through the public table, checked for `expect` and for a
+    /// diagnostic that never names the candidate.
+    fn update(self: *CredentialProbe, credential: []const u8, expect: u32) void {
+        var diagnostic = std.mem.zeroes(wire.OwnedBytesV1);
+        defer self.api.bufferRelease()(&diagnostic);
+        const status = self.api.session().updateCredential()(self.session, sdk.bytesView(credential), &diagnostic);
+        if (status != expect) self.mismatch("update status {d}, expected {d}", .{ status, expect });
+        if (diagnostic.ptr) |ptr| {
+            const len = std.math.cast(usize, diagnostic.len) orelse return;
+            if (credential.len >= 8 and std.mem.indexOf(u8, ptr[0..len], credential) != null)
+                self.mismatch("diagnostic names the candidate", .{});
+        }
+    }
+
+    fn event(raw: ?*anyopaque, run_ptr: ?*const wire.RunContextV1, event_json: wire.BytesViewV1) callconv(.c) u32 {
+        const self: *CredentialProbe = @ptrCast(@alignCast(raw orelse return wire.EVENT_FATAL));
+        _ = sdk.validateRunContext(run_ptr) catch return wire.EVENT_FATAL;
+        if (self.fatal_events) return wire.EVENT_FATAL;
+        const encoded = sdk.borrowedBytes(event_json) catch return wire.EVENT_FATAL;
+        const parsed = sdk.decodeCoreEvent(std.heap.c_allocator, encoded) catch return wire.EVENT_FATAL;
+        defer parsed.deinit();
+        switch (parsed.value) {
+            .known => |known| switch (known) {
+                .retry_notice => {
+                    self.retries += 1;
+                    if (self.on_retry) |next| {
+                        self.on_retry = null;
+                        self.update(next, wire.STATUS_OK);
+                    }
+                },
+                else => {},
+            },
+            .unknown => {},
+        }
+        return wire.EVENT_CONTINUE;
+    }
+
+    fn host(raw: ?*anyopaque, _: ?*const wire.RunContextV1, _: wire.BytesViewV1, out_result: ?*wire.OwnedBytesV1) callconv(.c) u32 {
+        const self: *CredentialProbe = @ptrCast(@alignCast(raw orelse return wire.HOST_FATAL));
+        self.host_calls += 1;
+        if (self.refuse_first) |candidate| {
+            self.refuse_first = null;
+            self.update(candidate, wire.STATUS_INVALID_ARGUMENT);
+        }
+        if (self.rotate_to) |next| {
+            self.rotate_to = null;
+            self.update(next, wire.STATUS_OK);
+        }
+        if (self.block_tool) {
+            self.tool_entered.store(true, .release);
+            while (!self.tool_release.load(.acquire)) std.Thread.yield() catch {};
+        }
+        const result = "rotated";
+        (out_result orelse return wire.HOST_FATAL).* = .{ .ptr = @constCast(result.ptr), .len = result.len };
+        return wire.HOST_OK;
+    }
+
+    fn releaseHost(_: ?*anyopaque, result: ?*wire.OwnedBytesV1) callconv(.c) void {
+        if (result) |out| out.* = .{ .ptr = null, .len = 0 };
+    }
+};
+
+/// One full-access AgentCore Session created with CREDENTIAL_A whose model
+/// may call the Host tool `HostRotate` and, with `web_search`, the built-in
+/// WebSearch tool, which builds its own per-call provider client.
+const CredentialFixture = struct {
+    api: sdk.Api,
+    runtime: ?*wire.RuntimeHandle = null,
+    session: ?*wire.SessionHandle = null,
+    diagnostic: wire.OwnedBytesV1 = .{ .ptr = null, .len = 0 },
+    host_tools: [1]wire.HostToolV1 = undefined,
+    builtins: [1]wire.BytesViewV1 = undefined,
+    allowed: [2]wire.BytesViewV1 = undefined,
+    host: wire.SessionHostConfigV1 = undefined,
+    callbacks: wire.SessionCallbacksV1 = undefined,
+
+    fn init(self: *CredentialFixture, root: []const u8, url: []const u8, probe: *CredentialProbe, web_search: bool) !void {
+        self.* = .{ .api = probe.api };
+        errdefer self.deinit();
+        var tool = std.mem.zeroes(wire.HostToolV1);
+        tool.struct_size = @sizeOf(wire.HostToolV1);
+        tool.ctx = probe;
+        tool.name = sdk.bytesView("HostRotate");
+        tool.description = sdk.bytesView("Rotate the provider credential");
+        tool.input_schema_json = sdk.bytesView("{\"type\":\"object\",\"properties\":{},\"required\":[]}");
+        tool.execute = CredentialProbe.host;
+        tool.release_result = CredentialProbe.releaseHost;
+        self.host_tools = .{tool};
+        self.builtins = .{sdk.bytesView("WebSearch")};
+        var runtime_config = std.mem.zeroes(wire.RuntimeConfigV1);
+        runtime_config.struct_size = @sizeOf(wire.RuntimeConfigV1);
+        runtime_config.host_tools = &self.host_tools;
+        runtime_config.host_tool_count = self.host_tools.len;
+        if (web_search) {
+            runtime_config.builtin_tools = &self.builtins;
+            runtime_config.builtin_tool_count = self.builtins.len;
+        }
+        try std.testing.expectEqual(wire.STATUS_OK, self.api.runtime().create()(&runtime_config, null, &self.runtime, &self.diagnostic));
+
+        self.allowed = .{ sdk.bytesView("HostRotate"), sdk.bytesView("WebSearch") };
+        self.host = std.mem.zeroes(wire.SessionHostConfigV1);
+        self.host.struct_size = @sizeOf(wire.SessionHostConfigV1);
+        self.host.provider_kind_code = wire.PROVIDER_ANTHROPIC;
+        self.host.permission_mode_code = wire.PERMISSION_FULL_ACCESS;
+        self.host.shell_policy_code = wire.SHELL_DISABLED;
+        self.host.api_key = sdk.bytesView(CREDENTIAL_A);
+        self.host.base_url = sdk.bytesView(url);
+        self.host.workspace_root = sdk.bytesView(root);
+        self.host.workspace_home = sdk.bytesView(root);
+        self.host.allowed_tools = &self.allowed;
+        self.host.allowed_tool_count = if (web_search) 2 else 1;
+        var create_config = sessionCreateConfig(&self.host, "credential-model");
+        self.callbacks = std.mem.zeroes(wire.SessionCallbacksV1);
+        self.callbacks.struct_size = @sizeOf(wire.SessionCallbacksV1);
+        self.callbacks.ctx = probe;
+        self.callbacks.on_event = CredentialProbe.event;
+        try std.testing.expectEqual(wire.STATUS_OK, self.api.session().create()(self.runtime, &create_config, &self.callbacks, &self.session, &self.diagnostic));
+        probe.session = self.session;
+    }
+
+    fn run(self: *CredentialFixture, run_id: u64, prompt: []const u8, result: *wire.RunResultV1) u32 {
+        var options = std.mem.zeroes(wire.RunOptionsV1);
+        options.struct_size = @sizeOf(wire.RunOptionsV1);
+        options.max_turns = 4;
+        result.* = std.mem.zeroes(wire.RunResultV1);
+        var diagnostic = std.mem.zeroes(wire.OwnedBytesV1);
+        defer self.api.bufferRelease()(&diagnostic);
+        return self.api.session().runText(self.session, run_id, sdk.bytesView(prompt), &options, result, &diagnostic);
+    }
+
+    fn update(self: *CredentialFixture, credential: wire.BytesViewV1) u32 {
+        self.api.bufferRelease()(&self.diagnostic);
+        return self.api.session().updateCredential()(self.session, credential, &self.diagnostic);
+    }
+
+    fn deinit(self: *CredentialFixture) void {
+        if (self.session) |handle| _ = self.api.session().destroy()(handle, &self.diagnostic);
+        self.session = null;
+        self.api.bufferRelease()(&self.diagnostic);
+        if (self.runtime) |handle| _ = self.api.runtime().destroy()(handle, &self.diagnostic);
+        self.runtime = null;
+        self.api.bufferRelease()(&self.diagnostic);
+    }
+};
+
+fn credentialProbe() !CredentialProbe {
+    return .{ .api = try runInputApi() };
+}
+
+test "L2 Revision 25 update_credential while idle reaches the next request, refusals keep it, and no copy leaves the Session (#336)" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try rootPath(&tmp, &root_buf);
+    const bodies = [_][]const u8{ FINAL_SSE, FINAL_SSE, FINAL_SSE, FINAL_SSE, FINAL_SSE, FINAL_SSE };
+    var server = try harness.MockServer.startCassette(&bodies, 0);
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+    var probe = try credentialProbe();
+    var fixture: CredentialFixture = undefined;
+    try fixture.init(root, url, &probe, false);
+    defer fixture.deinit();
+    var result: wire.RunResultV1 = undefined;
+
+    try std.testing.expectEqual(wire.STATUS_OK, fixture.run(1, "first", &result));
+    try std.testing.expectEqual(wire.STATUS_OK, fixture.update(sdk.bytesView(CREDENTIAL_B)));
+
+    // Each refusal names its rule, never the bytes, and keeps CREDENTIAL_B.
+    const too_long = try a.alloc(u8, @as(usize, @intCast(wire.MAX_CREDENTIAL_BYTES_V1)) + 1);
+    defer a.free(too_long);
+    @memset(too_long, 'k');
+    const Refusal = struct { candidate: wire.BytesViewV1, status: u32 };
+    const refusals = [_]Refusal{
+        .{ .candidate = sdk.bytesView(""), .status = wire.STATUS_INVALID_ARGUMENT },
+        .{ .candidate = sdk.bytesView("credential b 336"), .status = wire.STATUS_INVALID_ARGUMENT },
+        .{ .candidate = sdk.bytesView("credential-b-336\r\nx-injected: 1"), .status = wire.STATUS_INVALID_ARGUMENT },
+        .{ .candidate = sdk.bytesView("credential-\x00-336"), .status = wire.STATUS_INVALID_ARGUMENT },
+        .{ .candidate = sdk.bytesView("credential-\xc3\xa9-336"), .status = wire.STATUS_INVALID_ARGUMENT },
+        .{ .candidate = sdk.bytesView(too_long), .status = wire.STATUS_RESOURCE_LIMIT },
+        .{ .candidate = .{ .ptr = null, .len = 4 }, .status = wire.STATUS_INVALID_ARGUMENT },
+    };
+    for (refusals) |refusal| {
+        try std.testing.expectEqual(refusal.status, fixture.update(refusal.candidate));
+        const message = try sdk.borrowedBytes(.{ .ptr = fixture.diagnostic.ptr, .len = fixture.diagnostic.len });
+        try std.testing.expect(message.len != 0);
+        if (refusal.candidate.ptr) |ptr| if (refusal.candidate.len != 0) {
+            const candidate = ptr[0..@intCast(refusal.candidate.len)];
+            try std.testing.expect(std.mem.indexOf(u8, message, candidate[0..@min(candidate.len, 12)]) == null);
+        };
+    }
+    try std.testing.expectEqual(wire.STATUS_INVALID_ARGUMENT, fixture.api.session().updateCredential()(null, sdk.bytesView(CREDENTIAL_C), &fixture.diagnostic));
+    try std.testing.expectEqual(wire.STATUS_OK, fixture.run(2, "second", &result));
+
+    // The longest credential the limit admits is accepted whole.
+    const longest = too_long[0..@as(usize, @intCast(wire.MAX_CREDENTIAL_BYTES_V1))];
+    try std.testing.expectEqual(wire.STATUS_OK, fixture.update(sdk.bytesView(longest)));
+    try std.testing.expectEqual(wire.STATUS_OK, fixture.run(3, "third", &result));
+    try std.testing.expectEqual(wire.STATUS_OK, fixture.update(sdk.bytesView(CREDENTIAL_C)));
+    try std.testing.expectEqual(wire.STATUS_OK, fixture.run(4, "fourth", &result));
+
+    try expectBearer(server, 0, CREDENTIAL_A);
+    try expectBearer(server, 1, CREDENTIAL_B);
+    try expectBearer(server, 2, longest);
+    try expectBearer(server, 3, CREDENTIAL_C);
+
+    // No credential reaches describe or the checkpoint.
+    var description = std.mem.zeroes(wire.OwnedBytesV1);
+    try std.testing.expectEqual(wire.STATUS_OK, fixture.api.sessionControl().describe()(fixture.session, &description, &fixture.diagnostic));
+    const described = try sdk.borrowedBytes(.{ .ptr = description.ptr, .len = description.len });
+    var checkpoint = PublicCheckpointBuffer{};
+    defer checkpoint.deinit();
+    var limits = publicCheckpointLimits();
+    var sink = checkpoint.sink();
+    var export_config = std.mem.zeroes(wire.CheckpointExportConfigV1);
+    export_config.struct_size = @sizeOf(wire.CheckpointExportConfigV1);
+    export_config.limits = &limits;
+    export_config.sink = &sink;
+    var export_result = std.mem.zeroes(wire.CheckpointExportResultV1);
+    try std.testing.expectEqual(wire.STATUS_OK, fixture.api.sessionControl().exportCheckpoint()(fixture.session, &export_config, &export_result, &fixture.diagnostic));
+    for ([_][]const u8{ CREDENTIAL_A, CREDENTIAL_B, CREDENTIAL_C, longest[0..64] }) |credential| {
+        try std.testing.expect(std.mem.indexOf(u8, described, credential) == null);
+        try std.testing.expect(std.mem.indexOf(u8, checkpoint.bytes.items, credential) == null);
+    }
+    fixture.api.bufferRelease()(&description);
+
+    // Restore is unchanged: the restored Session uses the credential the
+    // restore configuration supplies, not the one last published.
+    try std.testing.expectEqual(wire.STATUS_OK, fixture.api.session().destroy()(fixture.session, &fixture.diagnostic));
+    fixture.session = null;
+    fixture.host.api_key = sdk.bytesView("credential-restore-336");
+    var source = checkpoint.source();
+    var restore_config = std.mem.zeroes(wire.SessionRestoreConfigV1);
+    restore_config.struct_size = @sizeOf(wire.SessionRestoreConfigV1);
+    restore_config.host = &fixture.host;
+    restore_config.source = &source;
+    restore_config.limits = &limits;
+    var restore_report = std.mem.zeroes(wire.OwnedBytesV1);
+    try std.testing.expectEqual(wire.STATUS_OK, fixture.api.sessionControl().restore()(fixture.runtime, &restore_config, &fixture.callbacks, &fixture.session, &restore_report, &fixture.diagnostic));
+    fixture.api.bufferRelease()(&restore_report);
+    probe.session = fixture.session;
+    try std.testing.expectEqual(wire.STATUS_OK, fixture.run(5, "after restore", &result));
+    try expectBearer(server, 4, "credential-restore-336");
+    try std.testing.expectEqual(@as(u32, 0), probe.mismatches.load(.acquire));
+}
+
+test "L2 Revision 25 a Host tool callback rotates the credential mid-Run and the next turn carries it (#336)" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try rootPath(&tmp, &root_buf);
+    const bodies = [_][]const u8{ HOST_ROTATE_SSE, FINAL_SSE, FINAL_SSE };
+    var server = try harness.MockServer.startCassette(&bodies, 0);
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+    var probe = try credentialProbe();
+    // A refused candidate inside the callback changes nothing and the Run goes on.
+    probe.refuse_first = "credential b\n336";
+    probe.rotate_to = CREDENTIAL_B;
+    var fixture: CredentialFixture = undefined;
+    try fixture.init(root, url, &probe, false);
+    defer fixture.deinit();
+    var result: wire.RunResultV1 = undefined;
+
+    try std.testing.expectEqual(wire.STATUS_OK, fixture.run(1, "rotate", &result));
+    try std.testing.expectEqual(wire.STOP_END_TURN, result.stop_reason_code);
+    try std.testing.expectEqual(@as(u32, 2), result.turns);
+    try std.testing.expectEqual(@as(u32, 1), probe.host_calls);
+    try std.testing.expectEqual(wire.STATUS_OK, fixture.run(2, "again", &result));
+    try std.testing.expectEqual(@as(u32, 0), probe.mismatches.load(.acquire));
+    try expectBearer(server, 0, CREDENTIAL_A);
+    try expectBearer(server, 1, CREDENTIAL_B);
+    try expectBearer(server, 2, CREDENTIAL_B);
+}
+
+const CredentialRun = struct {
+    fixture: *CredentialFixture,
+    run_id: u64,
+    prompt: []const u8,
+    status: u32 = 0,
+    result: wire.RunResultV1 = undefined,
+
+    fn go(self: *CredentialRun) void {
+        self.status = self.fixture.run(self.run_id, self.prompt, &self.result);
+    }
+};
+
+test "L2 Revision 25 an update leaves an in-flight request and stream undisturbed and reaches the next request (#336)" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try rootPath(&tmp, &root_buf);
+    const bodies = [_][]const u8{ FINAL_SSE, FINAL_SSE, FINAL_SSE };
+    var server = try harness.MockServer.startCassette(&bodies, 0);
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+    var probe = try credentialProbe();
+    var fixture: CredentialFixture = undefined;
+    try fixture.init(root, url, &probe, false);
+    defer fixture.deinit();
+
+    // Run 1: the response head has arrived and the stream is being read.
+    server.gateNextResponse();
+    var first = CredentialRun{ .fixture = &fixture, .run_id = 1, .prompt = "stream" };
+    const first_thread = try std.Thread.spawn(.{}, CredentialRun.go, .{&first});
+    try server.waitUntilResponseGated();
+    probe.update(CREDENTIAL_B, wire.STATUS_OK);
+    server.releaseGatedResponse();
+    first_thread.join();
+    try std.testing.expectEqual(wire.STATUS_OK, first.status);
+    try std.testing.expectEqual(wire.STOP_END_TURN, first.result.stop_reason_code);
+
+    // Run 2: the request is sent and the head has not arrived yet.
+    server.gateResponseAt(1);
+    var second = CredentialRun{ .fixture = &fixture, .run_id = 2, .prompt = "head" };
+    const second_thread = try std.Thread.spawn(.{}, CredentialRun.go, .{&second});
+    try server.waitUntilResponseGated();
+    probe.update(CREDENTIAL_C, wire.STATUS_OK);
+    server.releaseGatedResponse();
+    second_thread.join();
+    try std.testing.expectEqual(wire.STATUS_OK, second.status);
+    try std.testing.expectEqual(wire.STOP_END_TURN, second.result.stop_reason_code);
+
+    var result: wire.RunResultV1 = undefined;
+    try std.testing.expectEqual(wire.STATUS_OK, fixture.run(3, "next", &result));
+    try std.testing.expectEqual(@as(usize, 3), server.requestCount());
+    try expectBearer(server, 0, CREDENTIAL_A);
+    try expectBearer(server, 1, CREDENTIAL_B);
+    try expectBearer(server, 2, CREDENTIAL_C);
+    try std.testing.expectEqual(@as(u32, 0), probe.mismatches.load(.acquire));
+}
+
+test "L2 Revision 25 a retry of the Run's request after an update from the retry_notice callback carries the new credential (#336)" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try rootPath(&tmp, &root_buf);
+    const bodies = [_][]const u8{ SERVICE_UNAVAILABLE_BODY, FINAL_SSE, FINAL_SSE };
+    const statuses = [_][]const u8{ STATUS_503, STATUS_200, STATUS_200 };
+    var server = try harness.MockServer.startHttpCassette(&bodies, &statuses);
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+    var probe = try credentialProbe();
+    probe.on_retry = CREDENTIAL_B;
+    var fixture: CredentialFixture = undefined;
+    try fixture.init(root, url, &probe, false);
+    defer fixture.deinit();
+    var result: wire.RunResultV1 = undefined;
+
+    try std.testing.expectEqual(wire.STATUS_OK, fixture.run(1, "retry", &result));
+    try std.testing.expectEqual(wire.STOP_END_TURN, result.stop_reason_code);
+    try std.testing.expectEqual(@as(u32, 1), probe.retries);
+    try std.testing.expectEqual(wire.STATUS_OK, fixture.run(2, "after", &result));
+    try std.testing.expectEqual(@as(usize, 3), server.requestCount());
+    try expectBearer(server, 0, CREDENTIAL_A);
+    try expectBearer(server, 1, CREDENTIAL_B);
+    try expectBearer(server, 2, CREDENTIAL_B);
+    try std.testing.expectEqual(@as(u32, 0), probe.mismatches.load(.acquire));
+}
+
+test "L2 Revision 25 a WebSearch client built before the update retries with the new credential (#336)" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try rootPath(&tmp, &root_buf);
+    // 0: the Run's tool turn; 1: WebSearch's own request, refused 503 after
+    // it is held; 2: WebSearch's retry; 3: the Run's next turn.
+    const bodies = [_][]const u8{ WEB_SEARCH_TOOL_SSE, SERVICE_UNAVAILABLE_BODY, WEB_SEARCH_SUMMARY_SSE, FINAL_SSE };
+    const statuses = [_][]const u8{ STATUS_200, STATUS_503, STATUS_200, STATUS_200 };
+    var server = try harness.MockServer.startHttpCassette(&bodies, &statuses);
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+    var probe = try credentialProbe();
+    var fixture: CredentialFixture = undefined;
+    try fixture.init(root, url, &probe, true);
+    defer fixture.deinit();
+
+    server.gateResponseAt(1);
+    var run = CredentialRun{ .fixture = &fixture, .run_id = 1, .prompt = "search" };
+    const thread = try std.Thread.spawn(.{}, CredentialRun.go, .{&run});
+    try server.waitUntilResponseGated();
+    // WebSearch's per-call client exists: its first request is out.
+    probe.update(CREDENTIAL_B, wire.STATUS_OK);
+    server.releaseGatedResponse();
+    thread.join();
+    try std.testing.expectEqual(wire.STATUS_OK, run.status);
+    try std.testing.expectEqual(wire.STOP_END_TURN, run.result.stop_reason_code);
+    try std.testing.expectEqual(@as(usize, 4), server.requestCount());
+    for ([_]usize{ 1, 2 }) |index| {
+        const request = server.requestAt(index) orelse return error.MissingProviderRequest;
+        try std.testing.expect(std.mem.indexOf(u8, request.body(), "web_search_20250305") != null);
+    }
+    try expectBearer(server, 0, CREDENTIAL_A);
+    try expectBearer(server, 1, CREDENTIAL_A);
+    try expectBearer(server, 2, CREDENTIAL_B);
+    try expectBearer(server, 3, CREDENTIAL_B);
+    try std.testing.expectEqual(@as(u32, 0), probe.mismatches.load(.acquire));
+}
+
+test "L2 Revision 25 compaction summary and forked Skill requests carry the updated credential (#336)" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try rootPath(&tmp, &root_buf);
+    try writeSkillFixture(
+        a,
+        root,
+        "forked",
+        "---\nname: Forked\ndescription: Runs in a fresh child Conversation\ncontext: fork\n---\nFORKED_SKILL_SENTINEL",
+    );
+    const bodies = [_][]const u8{FINAL_SSE} ** 10;
+    var server = try harness.MockServer.startCassette(&bodies, 0);
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+    var probe = try credentialProbe();
+    var fixture: CredentialFixture = undefined;
+    try fixture.init(root, url, &probe, false);
+    defer fixture.deinit();
+    var result: wire.RunResultV1 = undefined;
+
+    const old_context = [_]u8{'A'} ** 8192;
+    try std.testing.expectEqual(wire.STATUS_OK, fixture.run(1, &old_context, &result));
+    for (2..7) |run_id| try std.testing.expectEqual(wire.STATUS_OK, fixture.run(run_id, "recent context", &result));
+    try std.testing.expectEqual(wire.STATUS_OK, fixture.update(sdk.bytesView(CREDENTIAL_B)));
+    var compact_result = std.mem.zeroes(wire.CompactResultV1);
+    try std.testing.expectEqual(wire.STATUS_OK, fixture.api.sessionControl().compact()(fixture.session, 1, &compact_result, &fixture.diagnostic));
+    try std.testing.expectEqual(wire.COMPACT_COMPACTED, compact_result.outcome_code);
+    for (0..6) |index| try expectBearer(server, index, CREDENTIAL_A);
+    const summary = server.requestAt(6) orelse return error.MissingProviderRequest;
+    try std.testing.expect(std.mem.indexOf(u8, summary.body(), &([_]u8{'A'} ** 128)) != null);
+    try expectBearer(server, 6, CREDENTIAL_B);
+
+    var query = wire.SkillCatalogQueryV1{
+        .struct_size = @sizeOf(wire.SkillCatalogQueryV1),
+        .reserved0 = 0,
+        .workspace_root = sdk.bytesView(root),
+        .workspace_home = sdk.bytesView(root),
+        .workspace_epoch = sdk.bytesView("credential-fork-epoch"),
+        .additional_sources = null,
+        .additional_source_count = 0,
+        .reserved = [_]u64{0} ** 1,
+    };
+    var catalog: ?*wire.SkillCatalogHandle = null;
+    var descriptor = std.mem.zeroes(wire.OwnedBytesV1);
+    defer fixture.api.bufferRelease()(&descriptor);
+    try std.testing.expectEqual(wire.STATUS_OK, fixture.api.skill().resolveCatalog()(fixture.runtime, &query, &catalog, &descriptor, &fixture.diagnostic));
+    defer if (catalog) |handle| {
+        _ = fixture.api.skill().releaseCatalog()(handle, &fixture.diagnostic);
+    };
+    const descriptor_bytes = try sdk.borrowedBytes(.{ .ptr = descriptor.ptr, .len = descriptor.len });
+    var policy = try DecodedSkillPolicy.init(a, descriptor_bytes);
+    defer policy.deinit();
+    const ids = try extractCatalogIdentities(a, descriptor_bytes, "forked");
+    defer a.free(ids.revision);
+    defer a.free(ids.skill_id);
+    try std.testing.expectEqual(wire.STATUS_OK, fixture.api.skill().bindPolicy()(fixture.session, catalog, &policy.policy, &fixture.diagnostic));
+    try std.testing.expectEqual(wire.STATUS_OK, fixture.update(sdk.bytesView(CREDENTIAL_C)));
+    var options = std.mem.zeroes(wire.RunOptionsV1);
+    options.struct_size = @sizeOf(wire.RunOptionsV1);
+    options.max_turns = 2;
+    try std.testing.expectEqual(wire.STATUS_OK, fixture.api.session().runSkill(
+        fixture.session,
+        7,
+        sdk.bytesView(ids.skill_id),
+        sdk.bytesView(ids.revision),
+        sdk.bytesView(""),
+        &options,
+        &result,
+        &fixture.diagnostic,
+    ));
+    try std.testing.expectEqual(wire.STOP_END_TURN, result.stop_reason_code);
+    const forked = server.requestAt(7) orelse return error.MissingProviderRequest;
+    try std.testing.expect(std.mem.indexOf(u8, forked.body(), "FORKED_SKILL_SENTINEL") != null);
+    try expectBearer(server, 7, CREDENTIAL_C);
+    try std.testing.expectEqual(@as(u32, 0), probe.mismatches.load(.acquire));
+}
+
+test "L2 Revision 25 a poisoned Session refuses update_credential (#336)" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try rootPath(&tmp, &root_buf);
+    const bodies = [_][]const u8{FINAL_SSE};
+    var server = try harness.MockServer.startCassette(&bodies, 0);
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+    var probe = try credentialProbe();
+    probe.fatal_events = true;
+    var fixture: CredentialFixture = undefined;
+    try fixture.init(root, url, &probe, false);
+    defer fixture.deinit();
+    var result: wire.RunResultV1 = undefined;
+    try std.testing.expectEqual(wire.STATUS_CALLBACK_FAILED, fixture.run(1, "poison", &result));
+    try std.testing.expectEqual(wire.STATUS_INVALID_STATE, fixture.update(sdk.bytesView(CREDENTIAL_B)));
+    // Checked before the candidate: an invalid one is refused for the state too.
+    try std.testing.expectEqual(wire.STATUS_INVALID_STATE, fixture.update(sdk.bytesView("")));
+}
+
+const CredentialUpdater = struct {
+    probe: *CredentialProbe,
+    id: u8,
+    rounds: usize,
+    last: [32]u8 = undefined,
+    last_len: usize = 0,
+
+    fn go(self: *CredentialUpdater) void {
+        for (0..self.rounds) |round| {
+            const candidate = std.fmt.bufPrint(&self.last, "credential-t{d}-r{d}", .{ self.id, round }) catch unreachable;
+            self.last_len = candidate.len;
+            self.probe.update(candidate, wire.STATUS_OK);
+        }
+    }
+
+    fn lastValue(self: *const CredentialUpdater) []const u8 {
+        return self.last[0..self.last_len];
+    }
+};
+
+const CredentialSubmitter = struct {
+    probe: *CredentialProbe,
+    run_id: u64,
+    accepted: u32 = 0,
+
+    fn go(self: *CredentialSubmitter) void {
+        for (1..9) |input_id| {
+            var receipt = std.mem.zeroes(wire.InputReceiptV1);
+            var diagnostic = std.mem.zeroes(wire.OwnedBytesV1);
+            const status = self.probe.api.session().submitInput(self.probe.session, self.run_id, input_id, sdk.bytesView("more context"), &receipt, &diagnostic);
+            self.probe.api.bufferRelease()(&diagnostic);
+            if (status == wire.STATUS_OK) self.accepted += 1 else self.probe.mismatch("submit status {d}", .{status});
+        }
+    }
+};
+
+const CredentialAborter = struct {
+    probe: *CredentialProbe,
+    run_id: u64,
+    status: u32 = 0,
+
+    fn go(self: *CredentialAborter) void {
+        var diagnostic = std.mem.zeroes(wire.OwnedBytesV1);
+        self.status = self.probe.api.session().abort()(self.probe.session, self.run_id, wire.ABORT_USER_REQUEST, &diagnostic);
+        self.probe.api.bufferRelease()(&diagnostic);
+    }
+};
+
+fn expectBearerAmong(server: *harness.MockServer, index: usize, updaters: []const CredentialUpdater) !void {
+    const value = try requestAuthorization(server, index);
+    if (std.mem.startsWith(u8, value, "Bearer ")) {
+        for (updaters) |updater| {
+            if (std.mem.eql(u8, value["Bearer ".len..], updater.lastValue())) return;
+        }
+    }
+    std.debug.print("request {d} authorization [{s}] is no updater's last credential\n", .{ index, value });
+    return error.UnexpectedAuthorization;
+}
+
+test "L2 Revision 25 concurrent updates, submit_input and abort during Runs neither deadlock nor lose the last update (#336)" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try rootPath(&tmp, &root_buf);
+    const bodies = [_][]const u8{ HOST_ROTATE_SSE, FINAL_SSE, FINAL_SSE, FINAL_SSE };
+    var server = try harness.MockServer.startCassette(&bodies, 0);
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+    var probe = try credentialProbe();
+    probe.block_tool = true;
+    var fixture: CredentialFixture = undefined;
+    try fixture.init(root, url, &probe, false);
+    defer fixture.deinit();
+
+    // Run 1, held inside its Host tool callback: four threads update while a
+    // fifth submits input to the same Run.
+    var first = CredentialRun{ .fixture = &fixture, .run_id = 1, .prompt = "hold" };
+    const first_thread = try std.Thread.spawn(.{}, CredentialRun.go, .{&first});
+    while (!probe.tool_entered.load(.acquire)) std.Thread.yield() catch {};
+    var updaters: [4]CredentialUpdater = undefined;
+    for (&updaters, 0..) |*updater, i| updater.* = .{ .probe = &probe, .id = @intCast(i), .rounds = 32 };
+    var submitter = CredentialSubmitter{ .probe = &probe, .run_id = 1 };
+    var threads: [5]std.Thread = undefined;
+    for (updaters[0..], threads[0..4]) |*updater, *thread| thread.* = try std.Thread.spawn(.{}, CredentialUpdater.go, .{updater});
+    threads[4] = try std.Thread.spawn(.{}, CredentialSubmitter.go, .{&submitter});
+    for (threads) |thread| thread.join();
+    probe.tool_release.store(true, .release);
+    first_thread.join();
+    try std.testing.expectEqual(wire.STATUS_OK, first.status);
+    try std.testing.expectEqual(wire.STOP_END_TURN, first.result.stop_reason_code);
+    try std.testing.expectEqual(@as(u32, 8), submitter.accepted);
+    try std.testing.expectEqual(@as(u32, 8), first.result.input_adopted_count);
+    // Every update returned before the next turn: its request carries the
+    // last update some thread made, never an earlier or a torn one.
+    try expectBearerAmong(server, 1, &updaters);
+
+    // Run 2, its stream held: four threads update while a fifth aborts it.
+    probe.block_tool = false;
+    server.gateNextResponse();
+    var second = CredentialRun{ .fixture = &fixture, .run_id = 2, .prompt = "abort me" };
+    const second_thread = try std.Thread.spawn(.{}, CredentialRun.go, .{&second});
+    try server.waitUntilResponseGated();
+    for (&updaters, 0..) |*updater, i| updater.* = .{ .probe = &probe, .id = @intCast(4 + i), .rounds = 32 };
+    var aborter = CredentialAborter{ .probe = &probe, .run_id = 2 };
+    for (updaters[0..], threads[0..4]) |*updater, *thread| thread.* = try std.Thread.spawn(.{}, CredentialUpdater.go, .{updater});
+    threads[4] = try std.Thread.spawn(.{}, CredentialAborter.go, .{&aborter});
+    for (threads) |thread| thread.join();
+    server.releaseGatedResponse();
+    second_thread.join();
+    try std.testing.expectEqual(wire.STATUS_OK, aborter.status);
+    try std.testing.expectEqual(wire.STATUS_OK, second.status);
+    try std.testing.expectEqual(wire.STOP_ABORTED, second.result.stop_reason_code);
+
+    var result: wire.RunResultV1 = undefined;
+    try std.testing.expectEqual(wire.STATUS_OK, fixture.run(3, "after the storm", &result));
+    try expectBearerAmong(server, 3, &updaters);
+    try expectBearer(server, 0, CREDENTIAL_A);
+    try std.testing.expectEqual(@as(u32, 0), probe.mismatches.load(.acquire));
 }

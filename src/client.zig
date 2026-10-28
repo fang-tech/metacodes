@@ -22,6 +22,7 @@ const connection_gate = @import("api/connection_gate.zig");
 const models_pages = @import("api/models_pages.zig");
 const dialect_mod = @import("api/dialect.zig");
 const auth_header_mod = @import("api/auth_header.zig");
+const credential_mod = @import("api/credential_cell.zig");
 
 /// P0:AnthropicProvider 复用中立 Provider 接口(非 generic)。Client.provider() 产出它
 /// (thunk 转调 + StreamResponse.handle() 中立化)。P1 起 agent_loop 等收 Provider 类型。
@@ -409,7 +410,10 @@ pub const Client = struct {
     pub const RefreshFn = *const fn (ctx: *anyopaque, stale_access_token: []const u8) anyerror![]u8;
     allocator: std.mem.Allocator,
     http_client: http.Client,
-    api_key: []const u8,
+    /// What every request authenticates with, read when its header is built
+    /// (each attempt, retries included). A Session's clients share its
+    /// replaceable cell (issue #336); the CLI's borrow fixed bytes.
+    credential: credential_mod.Credential,
     /// **写务必走 setModel、跨线程读走 modelSnapshot(task#13)**:model 是 []const u8(ptr+len 两字),
     /// 非原子写。lead 主线程 switchModel(app.setModel→api_client.setModel)与后台 subagent 降级路径
     /// (owned_prov OOM 回退共享 api_client)的请求体读并发 → 撕裂 {new_ptr,old_len} 可致 OOB。mutex 串行。
@@ -472,7 +476,7 @@ pub const Client = struct {
         return .{
             .allocator = allocator,
             .http_client = http.Client{ .allocator = allocator, .io = io },
-            .api_key = api_key,
+            .credential = .{ .fixed = api_key },
             .model = model,
             .base_url = base_url_override orelse ANTHROPIC_API_URL,
             .catalog = Catalog.init(allocator),
@@ -507,7 +511,7 @@ pub const Client = struct {
     fn replaceRefreshToken(client: *Client, token: []u8) !void {
         if (client.refresh_token_owned) |old| try client.refresh_token_history.append(client.allocator, old);
         client.refresh_token_owned = token;
-        client.api_key = token;
+        client.credential = .{ .fixed = token };
     }
 
     // ── P0:Provider vtable 包装(AnthropicProvider = Client 的 thunk)─────────
@@ -548,7 +552,8 @@ pub const Client = struct {
             .kind = .anthropic,
             .base_url = client.base_url,
             .model = client.modelSnapshot(),
-            .credential = client.api_key,
+            // A replaceable credential is never lent: no delegable route.
+            .credential = client.credential.lendable() orelse return null,
             .auth_scheme = client.auth_scheme,
         };
     }
@@ -710,7 +715,7 @@ pub const Client = struct {
     /// GET <base>/v1/models with this client's route and credential: the body,
     /// owned by `client.allocator`.
     pub fn fetchModelsList(client: *Client) ![]u8 {
-        const auth = auth_header_mod.build(client.allocator, client.auth_scheme, client.api_key) catch return error.RequestFailed;
+        const auth = client.credential.header(client.allocator, client.auth_scheme) catch return error.RequestFailed;
         defer secureFree(client.allocator, auth.value);
         var status: u16 = 0;
         defer if (status != 0) {
@@ -857,7 +862,10 @@ pub const Client = struct {
             if (err != error.TokenExpired) return err;
             const callback = client.refresh_fn orelse return error.Unauthorized;
             const ctx = client.refresh_ctx orelse return error.Unauthorized;
-            const token = callback(ctx, client.api_key) catch return error.Unauthorized;
+            // Refresh replaces fixed bytes the client owns; a Session's
+            // replaceable credential is rotated by its Host instead.
+            const stale = client.credential.lendable() orelse return error.Unauthorized;
+            const token = callback(ctx, stale) catch return error.Unauthorized;
             client.replaceRefreshToken(token) catch {
                 secureFree(client.allocator, token);
                 return error.Unauthorized;
@@ -974,7 +982,7 @@ pub const Client = struct {
 
         // OAuth access tokens can be longer than a small stack buffer. Allocate
         // the header value and scrub it after request setup.
-        const auth = auth_header_mod.build(client.allocator, client.auth_scheme, client.api_key) catch |err| {
+        const auth = client.credential.header(client.allocator, client.auth_scheme) catch |err| {
             log.errId("client", rid, "auth header materialization failed: {s}", .{@errorName(err)});
             return error.RequestFailed;
         };

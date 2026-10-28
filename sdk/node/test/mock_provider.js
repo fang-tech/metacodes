@@ -75,12 +75,14 @@ function lastToolResult(body) {
 async function startMockProvider(script) {
   const steps = [...script];
   const requests = [];
+  const authorizations = [];
   const server = http.createServer((request, response) => {
     const chunks = [];
     request.on('data', (chunk) => chunks.push(chunk));
     request.on('end', () => {
       const body = JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}');
       requests.push(body);
+      authorizations.push(request.headers.authorization || '');
       const index = requests.length;
       const step = steps.shift() || ['text', 'script exhausted'];
       let payload;
@@ -95,6 +97,7 @@ async function startMockProvider(script) {
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
   return {
     requests,
+    authorizations,
     baseUrl: `http://127.0.0.1:${server.address().port}/v1/messages`,
     openaiUrl: `http://127.0.0.1:${server.address().port}/v1/chat/completions`,
     close: () => new Promise((resolve) => server.close(resolve)),

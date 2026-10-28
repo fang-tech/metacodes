@@ -6,10 +6,11 @@
 #include <string.h>
 
 #if defined(METASK_AGENTCORE_CALLBACK_CONTINUE) || defined(METASK_AGENTCORE_CALLBACK_FATAL)
-#error "revision 24 must not retain historical callback aliases"
+#error "revision 25 must not retain historical callback aliases"
 #endif
 
-#if METASK_AGENTCORE_ABI_REVISION != 24u || \
+#if METASK_AGENTCORE_ABI_REVISION != 25u || \
+    METASK_AGENTCORE_MAX_CREDENTIAL_BYTES_V1 != 16384u || \
     METASK_AGENTCORE_MAX_SUBMITTED_INPUTS_V1 != 64u || \
     METASK_AGENTCORE_MAX_SUBMITTED_INPUT_BYTES_V1 != 16777216u || \
     METASK_AGENTCORE_PROMPT_OP_ADD != 1u || \
@@ -60,7 +61,7 @@
     METASK_AGENTCORE_TEAM_ROLE_MEMBER != 2u || \
     METASK_AGENTCORE_MAX_TEAM_NAME_BYTES_V1 != 64u || \
     METASK_AGENTCORE_MAX_TEAM_MEMBER_BYTES_V1 != 64u
-#error "source-free Revision 23/24 codes must match the public contract"
+#error "source-free Revision 23-25 codes must match the public contract"
 #endif
 
 #ifdef _WIN32
@@ -148,6 +149,16 @@ static const char RESPONSE_BODY[] =
     "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n"
     "data: {\"type\":\"message_stop\"}\n\n";
 
+/* Revision 25 (#336): the first round of the credential rotation Run calls
+ * the Host stream tool, whose callback rotates the credential. */
+static const char ROTATE_TOOL_BODY[] =
+    "data: {\"type\":\"message_start\",\"message\":{\"id\":\"c2\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n"
+    "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_rotate\",\"name\":\"HostStreamC\",\"input\":{}}}\n\n"
+    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{}\"}}\n\n"
+    "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n"
+    "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":1}}\n\n"
+    "data: {\"type\":\"message_stop\"}\n\n";
+
 /* Rolling substring scan over a streamed request so the multimodal image
  * payload is proven inside provider-visible request bytes even when recv
  * splits it across chunks. */
@@ -197,6 +208,10 @@ struct test_server {
     struct needle_scan time_scan;
     /* Revision 23: the input the runtime writes for a goal continuation. */
     struct needle_scan goal_scan;
+    /* Revision 25: per-round response bodies (NULL: RESPONSE_BODY every
+     * round) and the authorization header value each round's request carried. */
+    const char *const *bodies;
+    char authorization[4][128];
 };
 
 static int socket_is_valid(socket_handle fd) {
@@ -242,9 +257,45 @@ static int write_all(socket_handle fd, const void *bytes, size_t len) {
     return 0;
 }
 
+/* Copy the value of the request header `name` (lower case, with its colon,
+ * matched in any case), or an empty string when the head has none. `header`
+ * is the NUL-terminated head. */
+static void copy_header_value(const char *header, const char *name, char *out,
+                              size_t cap) {
+    const size_t name_len = strlen(name);
+    const char *line = header;
+    out[0] = '\0';
+    while (line != NULL) {
+        const char *end = strstr(line, "\r\n");
+        size_t len = end != NULL ? (size_t)(end - line) : strlen(line);
+        size_t index;
+        int same = len >= name_len;
+        if (len == 0) return; /* the blank line ends the head */
+        for (index = 0; same && index < name_len; index++) {
+            char c = line[index];
+            if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
+            same = c == name[index];
+        }
+        if (same) {
+            const char *value = line + name_len;
+            size_t value_len = len - name_len;
+            while (value_len != 0 && (*value == ' ' || *value == '\t')) {
+                value++;
+                value_len--;
+            }
+            if (value_len >= cap) value_len = cap - 1;
+            memcpy(out, value, value_len);
+            out[value_len] = '\0';
+            return;
+        }
+        line = end != NULL ? end + 2 : NULL;
+    }
+}
+
 static int read_request(socket_handle fd, struct needle_scan *scan,
                         struct needle_scan *time_scan,
-                        struct needle_scan *goal_scan) {
+                        struct needle_scan *goal_scan, char *authorization,
+                        size_t authorization_cap) {
     char header[64 * 1024 + 1];
     size_t total = 0;
     char *end = NULL;
@@ -256,13 +307,19 @@ static int read_request(socket_handle fd, struct needle_scan *scan,
         end = strstr(header, "\r\n\r\n");
     }
     if (end == NULL) return -1;
+    if (authorization != NULL)
+        copy_header_value(header, "authorization:", authorization, authorization_cap);
     scan_feed(scan, header, total);
     scan_feed(time_scan, header, total);
     scan_feed(goal_scan, header, total);
     size_t header_len = (size_t)(end - header) + 4;
-    size_t content_len = 0;
-    char *length = strstr(header, "Content-Length:");
-    if (length != NULL) content_len = (size_t)strtoull(length + 15, NULL, 10);
+    /* The client sends `content-length` in lower case. Matching only
+     * `Content-Length` left a body that arrived after the head unread, and
+     * Winsock resets a connection closed over unread bytes, discarding the
+     * response already sent. */
+    char length[32];
+    copy_header_value(header, "content-length:", length, sizeof(length));
+    size_t content_len = (size_t)strtoull(length, NULL, 10);
     size_t body_read = total - header_len;
     char discard[8192];
     while (body_read < content_len) {
@@ -307,22 +364,27 @@ static void *serve_rounds(void *raw) {
         }
         if (!socket_is_valid(client) ||
             read_request(client, &server->scan, &server->time_scan,
-                         &server->goal_scan) != 0) {
+                         &server->goal_scan,
+                         round < 4 ? server->authorization[round] : NULL,
+                         sizeof(server->authorization[0])) != 0) {
             if (socket_is_valid(client)) close_socket(client);
             server->result = -1;
             THREAD_RETURN;
         }
         {
+            const char *body =
+                server->bodies != NULL ? server->bodies[round] : RESPONSE_BODY;
+            size_t body_len = strlen(body);
             char header[256];
             int header_len = snprintf(header, sizeof(header),
                                       "HTTP/1.1 200 OK\r\n"
                                       "Content-Type: text/event-stream\r\n"
                                       "Content-Length: %zu\r\n"
                                       "Connection: close\r\n\r\n",
-                                      sizeof(RESPONSE_BODY) - 1);
+                                      body_len);
             int round_ok = header_len > 0 &&
                            write_all(client, header, (size_t)header_len) == 0 &&
-                           write_all(client, RESPONSE_BODY, sizeof(RESPONSE_BODY) - 1) == 0;
+                           write_all(client, body, body_len) == 0;
             close_socket(client);
             if (!round_ok) {
                 server->result = -1;
@@ -336,9 +398,10 @@ static void *serve_rounds(void *raw) {
 }
 
 static int start_server(struct test_server *server, int rounds,
-                        const char *needle) {
+                        const char *needle, const char *const *bodies) {
     memset(server, 0, sizeof(*server));
     server->rounds = rounds;
+    server->bodies = bodies;
     server->result = -1;
     if (needle != NULL) {
         server->scan.needle = needle;
@@ -438,6 +501,13 @@ static const metask_agentcore_api_v1 *callback_api = NULL;
 static int submit_on_event = 0;
 static uint32_t submit_status = UINT32_MAX;
 static uint32_t submit_sequence = 0;
+
+/* Revision 25: the armed Host stream tool call rotates the provider
+ * credential from inside its own callback, first with a candidate the
+ * library must refuse (a space), then with the replacement. */
+static int rotate_on_tool = 0;
+static uint32_t rotate_refused_status = UINT32_MAX;
+static uint32_t rotate_status = UINT32_MAX;
 
 static int accept_run_context(const metask_agentcore_run_context_v1 *run) {
     if (run == NULL || run->struct_size != sizeof(*run) || run->reserved0 != 0 ||
@@ -541,8 +611,17 @@ static uint32_t host_stream(
     const metask_agentcore_host_result_sink_v1 *sink, uint32_t *media_code,
     metask_agentcore_owned_bytes_v1 *detail) {
     (void)ctx;
-    (void)run;
     (void)arguments;
+    if (rotate_on_tool && callback_api != NULL && run != NULL) {
+        metask_agentcore_owned_bytes_v1 rotate_diagnostic = {0};
+        rotate_on_tool = 0;
+        rotate_refused_status = callback_api->session->update_credential(
+            run->session, view("c rotated key"), &rotate_diagnostic);
+        callback_api->buffer_release(&rotate_diagnostic);
+        rotate_status = callback_api->session->update_credential(
+            run->session, view("c-rotated-key"), &rotate_diagnostic);
+        callback_api->buffer_release(&rotate_diagnostic);
+    }
     if (sink == NULL || sink->struct_size != sizeof(*sink) ||
         sink->write == NULL ||
         sink->max_bytes != METASK_AGENTCORE_MAX_HOST_STREAM_ARTIFACT_BYTES_V1 ||
@@ -562,6 +641,120 @@ static void host_stream_release(void *ctx,
                                 metask_agentcore_owned_bytes_v1 *detail) {
     (void)ctx;
     if (detail != NULL) *detail = (metask_agentcore_owned_bytes_v1){0};
+}
+
+/* Revision 25 (#336): one Session's provider credential, rotated twice
+ * against a loopback provider that records each request's authorization
+ * header. The Run's first request carries the creation key; its Host stream
+ * tool callback rotates the key (after a refused candidate), so the Run's
+ * second request carries the rotation; an update while idle reaches the next
+ * Run; refusals keep the key; describe never names a key. 0 or an exit code. */
+static int credential_rotation(const metask_agentcore_api_v1 *api,
+                               metask_agentcore_runtime *runtime,
+                               const metask_agentcore_session_callbacks_v1 *callbacks,
+                               const char *cwd) {
+    static const char *const bodies[] = {ROTATE_TOOL_BODY, RESPONSE_BODY, RESPONSE_BODY};
+    static char oversized[METASK_AGENTCORE_MAX_CREDENTIAL_BYTES_V1 + 1];
+    metask_agentcore_owned_bytes_v1 diagnostic = {0};
+    struct test_server server;
+    if (start_server(&server, 3, NULL, bodies) != 0) return 80;
+    char base_url[128];
+    snprintf(base_url, sizeof(base_url), "http://127.0.0.1:%u/v1/messages",
+             (unsigned)server.port);
+
+    metask_agentcore_session_host_config_v1 host = {0};
+    host.struct_size = sizeof(host);
+    host.provider_kind_code = METASK_AGENTCORE_PROVIDER_ANTHROPIC;
+    host.protocol_kind_code = METASK_AGENTCORE_PROTOCOL_DEFAULT;
+    host.permission_mode_code = METASK_AGENTCORE_PERMISSION_FULL_ACCESS;
+    host.shell_policy_code = METASK_AGENTCORE_SHELL_DISABLED;
+    host.api_key = view("c-consumer-key");
+    host.base_url = view(base_url);
+    host.workspace_root = view(cwd);
+    host.workspace_home = view(cwd);
+    metask_agentcore_bytes_view_v1 allowed[] = {view("HostStreamC")};
+    host.allowed_tools = allowed;
+    host.allowed_tool_count = 1;
+    metask_agentcore_session_create_config_v1 config = {0};
+    config.struct_size = sizeof(config);
+    config.host = &host;
+    config.model = view("c-consumer-model");
+    metask_agentcore_session *session = NULL;
+    if (api->session->create(runtime, &config, callbacks, &session, &diagnostic) !=
+            METASK_AGENTCORE_STATUS_OK ||
+        session == NULL) {
+        api->buffer_release(&diagnostic);
+        stop_server(&server);
+        return 81;
+    }
+    registered_session = session;
+    bound_session_id_len = 0;
+
+    metask_agentcore_run_options_v1 options = {0};
+    options.struct_size = sizeof(options);
+    options.max_turns = 4;
+    metask_agentcore_run_input_v1 input = {0};
+    input.struct_size = sizeof(input);
+    input.kind_code = METASK_AGENTCORE_RUN_INPUT_TEXT;
+    input.text = view("rotate the credential");
+    metask_agentcore_run_result_v1 result = {0};
+    int code = 0;
+
+    active_run_id = 1;
+    callback_api = api;
+    rotate_on_tool = 1;
+    uint32_t status = api->session->run_input(session, 1, &input, &options, &result, &diagnostic);
+    active_run_id = 0;
+    api->buffer_release(&diagnostic);
+    memset(oversized, 'k', sizeof(oversized));
+    metask_agentcore_bytes_view_v1 too_long = {(const uint8_t *)oversized, sizeof(oversized)};
+    metask_agentcore_bytes_view_v1 empty = {NULL, 0};
+    if (status != METASK_AGENTCORE_STATUS_OK ||
+        result.stop_reason_code != METASK_AGENTCORE_STOP_END_TURN || result.turns != 2) {
+        code = 82;
+    } else if (rotate_refused_status != METASK_AGENTCORE_STATUS_INVALID_ARGUMENT ||
+               rotate_status != METASK_AGENTCORE_STATUS_OK) {
+        code = 83;
+    } else if (api->session->update_credential(session, view("c-idle-key"), &diagnostic) !=
+               METASK_AGENTCORE_STATUS_OK) {
+        code = 84;
+    } else if (api->session->update_credential(session, empty, &diagnostic) !=
+                   METASK_AGENTCORE_STATUS_INVALID_ARGUMENT ||
+               (api->buffer_release(&diagnostic),
+                api->session->update_credential(session, too_long, &diagnostic)) !=
+                   METASK_AGENTCORE_STATUS_RESOURCE_LIMIT) {
+        code = 85;
+    } else {
+        api->buffer_release(&diagnostic);
+        input.text = view("once more");
+        active_run_id = 2;
+        status = api->session->run_input(session, 2, &input, &options, &result, &diagnostic);
+        active_run_id = 0;
+        if (status != METASK_AGENTCORE_STATUS_OK ||
+            result.stop_reason_code != METASK_AGENTCORE_STOP_END_TURN) {
+            code = 86;
+        } else if (description_contains(api, session, "c-consumer-key") ||
+                   description_contains(api, session, "c-rotated-key") ||
+                   description_contains(api, session, "c-idle-key")) {
+            code = 87;
+        }
+    }
+    api->buffer_release(&diagnostic);
+    if (api->session->destroy(session, &diagnostic) != METASK_AGENTCORE_STATUS_OK && code == 0)
+        code = 88;
+    api->buffer_release(&diagnostic);
+    registered_session = NULL;
+    stop_server(&server);
+    if (code == 0 &&
+        (server.result != 0 ||
+         strcmp(server.authorization[0], "Bearer c-consumer-key") != 0 ||
+         strcmp(server.authorization[1], "Bearer c-rotated-key") != 0 ||
+         strcmp(server.authorization[2], "Bearer c-idle-key") != 0)) {
+        fprintf(stderr, "credential rotation saw [%s] [%s] [%s]\n",
+                server.authorization[0], server.authorization[1], server.authorization[2]);
+        code = 89;
+    }
+    return code;
 }
 
 int main(int argc, char **argv) {
@@ -591,6 +784,8 @@ int main(int argc, char **argv) {
         api->session->destroy != raw_api->session->destroy ||
         api->session->run_input != raw_api->session->run_input ||
         api->session->abort != raw_api->session->abort ||
+        api->session->submit_input != raw_api->session->submit_input ||
+        api->session->update_credential != raw_api->session->update_credential ||
         api->session_control->restore != raw_api->session_control->restore ||
         api->session_control->describe != raw_api->session_control->describe ||
         api->session_control->set_model != raw_api->session_control->set_model ||
@@ -670,7 +865,7 @@ int main(int argc, char **argv) {
         return release_error(api, &diagnostic, 13);
     }
     struct test_server server;
-    if (start_server(&server, 3, "\"data\":\"aWNvbi1ieXRlcw==\"") != 0) {
+    if (start_server(&server, 3, "\"data\":\"aWNvbi1ieXRlcw==\"", NULL) != 0) {
         api->runtime->destroy(runtime, &diagnostic);
         return release_error(api, &diagnostic, 14);
     }
@@ -1122,10 +1317,17 @@ int main(int argc, char **argv) {
         api->runtime->destroy(runtime, &diagnostic);
         return release_error(api, &diagnostic, 19);
     }
+    {
+        int rotation = credential_rotation(api, runtime, &callbacks, cwd);
+        if (rotation != 0) {
+            api->runtime->destroy(runtime, &diagnostic);
+            return release_error(api, &diagnostic, rotation);
+        }
+    }
     if (api->runtime->destroy(runtime, &diagnostic) != METASK_AGENTCORE_STATUS_OK) {
         return release_error(api, &diagnostic, 20);
     }
     api->buffer_release(&diagnostic);
-    puts("AgentCore source-free C consumer: ABI table, callback, active-Run input, multimodal input, goal, host-scheduled team and lifecycle OK");
+    puts("AgentCore source-free C consumer: ABI table, callback, active-Run input, multimodal input, goal, host-scheduled team, credential rotation and lifecycle OK");
     return 0;
 }

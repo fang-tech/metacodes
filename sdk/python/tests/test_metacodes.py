@@ -354,6 +354,35 @@ class PythonSdkTest(unittest.TestCase):
         self.assertEqual((result.input_accepted, result.input_adopted), (1, 1))
         self.assertIn("and mention the weather", str(provider.requests[1]["messages"]))
 
+    def test_update_credential_from_a_tool_changes_the_next_request(self) -> None:
+        @metacodes.tool(
+            description="Rotate the provider key.",
+            input_schema={"type": "object", "properties": {}, "required": []},
+        )
+        def rotate(_arguments):
+            session.update_credential("rotated-key")
+            return "rotated"
+
+        script = [("tool", "rotate", {}), ("text", "done"), ("text", "again")]
+        with MockProvider(script) as provider:
+            with metacodes.Runtime(tools=(), host_tools=[rotate]) as runtime:
+                session = self.session(runtime, provider, permission_mode="full_access", api_key="first-key")
+                result = session.run("rotate the key")
+                with self.assertRaises(metacodes.AgentCoreError) as refused:
+                    session.update_credential("bad key")
+                session.run("once more")
+                session.close()
+                with self.assertRaises(RuntimeError):
+                    session.update_credential("after-close")
+        self.assertEqual(result.text, "done")
+        self.assertEqual(refused.exception.status_name, "INVALID_ARGUMENT")
+        self.assertNotIn("bad key", str(refused.exception))
+        # The Run's first request used the creation key; the turn after the
+        # tool, and the next Run after the refused update, the rotated one.
+        self.assertEqual(
+            provider.authorizations, ["Bearer first-key", "Bearer rotated-key", "Bearer rotated-key"]
+        )
+
     def test_abort_stops_the_active_run(self) -> None:
         wait, started, release = self.blocking_tool()
         with MockProvider([("tool", "wait", {}), ("text", "never asked")]) as provider:

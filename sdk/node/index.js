@@ -6,7 +6,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 
-const ABI_REVISION = 24;
+const ABI_REVISION = 25;
 const BUILTIN_TOOLS = [
   'Read', 'Write', 'Edit', 'Glob', 'Grep', 'Bash', 'BashOutput', 'KillShell',
   'WebSearch', 'WebFetch', 'AskUserQuestion',
@@ -477,6 +477,18 @@ class Session {
   submit(text) {
     if (!this._active) throw new Error('no active Run');
     return this._native.sessionSubmit(this._handle, this._active.runId, this._nextInputId++, String(text));
+  }
+
+  /**
+   * Replace the provider credential in place (AgentCore Revision 25). Every
+   * request that builds its authentication header afterwards uses it: the next
+   * turn of a Run already going, a retry, a compaction, a Skill. A request
+   * already sent keeps the old key. Callable from this Session's own tool and
+   * UI handlers. 1 to 16384 bytes of printable ASCII; anything else throws and
+   * keeps the previous key.
+   */
+  updateCredential(apiKey) {
+    this._native.sessionUpdateCredential(this._handle, String(apiKey));
   }
 
   describe() {

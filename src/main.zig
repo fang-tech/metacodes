@@ -43,6 +43,7 @@ pub const api_stream = @import("api/stream.zig");
 pub const api_provider = @import("api/provider.zig");
 pub const api_provider_factory = @import("api/provider_factory.zig");
 pub const api_auth_header = @import("api/auth_header.zig");
+pub const api_credential_cell = @import("api/credential_cell.zig");
 pub const fs_util = @import("util/fs.zig");
 // issue #16 provider offer kernel — re-exported for L2 component tests and for
 // embedders that drive model selection through the control plane.
@@ -3852,6 +3853,7 @@ test "Metask login dispatch uses JSON device flow except token import" {
 test {
     _ = &@import("json.zig");
     _ = &@import("client.zig");
+    _ = &@import("api/credential_cell.zig");
     _ = &@import("tools.zig");
     _ = &@import("symbols/symbol.zig");
     _ = &@import("tools/symbol_provider.zig");

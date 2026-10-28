@@ -8031,6 +8031,45 @@ fn sessionSubmitInput(
     return wire.STATUS_OK;
 }
 
+/// Revision 25 (#336): replace the Session's provider credential in place.
+/// Like abort and submit_input it bypasses the facade call gate and never
+/// takes the callback mutex, so a Host may call it from another thread or
+/// from inside the matching Run's own callbacks, while idle, during a Run,
+/// compaction or checkpoint export. It is never BUSY. A refusal keeps the
+/// previous credential and never ends, aborts or poisons a Run; the
+/// diagnostic names the rule, never the bytes.
+fn sessionUpdateCredential(
+    handle: ?*wire.SessionHandle,
+    credential_view: wire.BytesViewV1,
+    out_error: ?*wire.OwnedBytesV1,
+) callconv(.c) u32 {
+    emptyError(out_error);
+    const self = sessionFrom(handle orelse return fail(wire.STATUS_INVALID_ARGUMENT, "session is required", out_error));
+    const runtime = self.runtime orelse
+        return fail(wire.STATUS_INVALID_STATE, "Session has no owning Runtime", out_error);
+    var runtime_call = runtime.catalogs.enterCall() catch |err|
+        return failError(catalogLifecycleStatus(err), err, out_error);
+    defer runtime_call.deinit();
+    if (self.facade_poisoned.load(.acquire))
+        return fail(wire.STATUS_INVALID_STATE, "Session is poisoned by a previous admitted Run failure", out_error);
+    if (credential_view.len > wire.MAX_CREDENTIAL_BYTES_V1)
+        return fail(wire.STATUS_RESOURCE_LIMIT, "credential exceeds AgentCore ABI v1 limit", out_error);
+    const candidate = borrowed(credential_view) catch |err|
+        return failError(wire.STATUS_INVALID_ARGUMENT, err, out_error);
+    _ = self.core_session.updateCredential(candidate) catch |err| return failError(switch (err) {
+        error.EmptyCredential, error.InvalidCredentialByte => wire.STATUS_INVALID_ARGUMENT,
+        error.CredentialTooLong => wire.STATUS_RESOURCE_LIMIT,
+        error.OutOfMemory => wire.STATUS_OUT_OF_MEMORY,
+        error.InvalidSessionState => wire.STATUS_INVALID_STATE,
+    }, err, out_error);
+    return wire.STATUS_OK;
+}
+
+comptime {
+    // One limit, enforced where it is published and where the bytes are kept.
+    std.debug.assert(wire.MAX_CREDENTIAL_BYTES_V1 == core.api_credential_cell.MAX_REPLACEMENT_BYTES);
+}
+
 comptime {
     // The Core queue's defaults are the published per-Run limits; a drift
     // would make the ABI enforce something other than what it documents.
@@ -8198,6 +8237,7 @@ const session_api_v1 = wire.SessionApiV1{
     .run_input = sessionRunInput,
     .abort = sessionAbort,
     .submit_input = sessionSubmitInput,
+    .update_credential = sessionUpdateCredential,
 };
 
 const session_control_api_v1 = wire.SessionControlApiV1{
@@ -8505,8 +8545,10 @@ test "ABI discovery is versioned" {
     try std.testing.expect(metask_agentcore_get_api(0) == null);
     const raw = metask_agentcore_get_api(wire.ABI_VERSION_V1) orelse return error.MissingApi;
     const api: *const wire.ApiV1 = @ptrCast(@alignCast(raw));
-    try std.testing.expectEqual(@as(u32, 24), api.abi_revision);
+    try std.testing.expectEqual(@as(u32, 25), api.abi_revision);
     try std.testing.expectEqual(@as(usize, 80), api.struct_size);
+    try std.testing.expectEqual(@as(u32, 56), api.session.?.struct_size);
+    try std.testing.expect(api.session.?.update_credential != null);
     try std.testing.expect(api.runtime != null);
     try std.testing.expect(api.session != null);
     try std.testing.expect(api.session_control != null);
@@ -10443,7 +10485,7 @@ test "checkpoint restores compatible MCP view and exact Session grant" {
         )).decision,
     );
     try std.testing.expectEqual(@as(usize, 1), restored.session.core_session.conversation.len());
-    try std.testing.expectEqualStrings("current-key", restored.session.core_session.api_key);
+    try std.testing.expect(restored.session.core_session.credential.matches("current-key"));
 
     Cleanup.session(restored.session);
     restored_live = false;
@@ -11504,7 +11546,7 @@ test "Revision 6 AgentCore restore is atomic and continues logical operation IDs
     );
     try std.testing.expectEqual(@as(usize, 1), restored.session.core_session.conversation.len());
     try std.testing.expectEqualStrings("checkpoint-model", restored.session.core_session.model);
-    try std.testing.expectEqualStrings("new-key", restored.session.core_session.api_key);
+    try std.testing.expect(restored.session.core_session.credential.matches("new-key"));
     try std.testing.expectError(
         error.StaleRun,
         restored.session.core_session.admitRun(7, TestEventSink.sink(&event_ctx)),

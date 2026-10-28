@@ -88,6 +88,8 @@ export class Session {
   stream(prompt: string, options?: { maxTurns?: number }): EventStream;
   abort(): void;
   submit(text: string): number;
+  /** Revision 25: replace the provider credential in place, also mid-Run. */
+  updateCredential(apiKey: string): void;
   describe(): Record<string, unknown>;
   setModel(model: string): void;
   setPermissionMode(mode: NonNullable<SessionOptions['permissionMode']>): void;

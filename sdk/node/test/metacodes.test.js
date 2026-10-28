@@ -291,6 +291,27 @@ test('submit hands the active Run more input', { skip, timeout: TIMEOUT }, async
   assert.match(JSON.stringify(provider.requests[1].messages), /and mention the weather/);
 });
 
+test('updateCredential from a tool changes the next request', { skip, timeout: TIMEOUT }, async (t) => {
+  let session;
+  const rotate = metacodes.tool({
+    name: 'rotate',
+    description: 'Rotates the provider key.',
+    handler: async () => {
+      session.updateCredential('rotated-key');
+      return 'rotated';
+    },
+  });
+  const provider = await withProvider(t, [['tool', 'rotate', {}], ['text', 'done'], ['text', 'again']]);
+  ({ session } = open(t, { tools: [], hostTools: [rotate] }, provider, workspace(t), { permissionMode: 'full_access', apiKey: 'first-key' }));
+  const result = await session.run('rotate the key');
+  assert.equal(result.text, 'done');
+  assert.throws(() => session.updateCredential('bad key'), (error) => !String(error.message).includes('bad key'));
+  await session.run('once more');
+  // The Run's first request used the creation key; the turn after the tool,
+  // and the next Run after the refused update, the rotated one.
+  assert.deepEqual(provider.authorizations, ['Bearer first-key', 'Bearer rotated-key', 'Bearer rotated-key']);
+});
+
 test('abort stops the active Run', { skip, timeout: TIMEOUT }, async (t) => {
   const provider = await withProvider(t, [['tool', 'wait', {}], ['text', 'never asked']]);
   const { wait, started, release } = blockingTool();

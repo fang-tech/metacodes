@@ -55,6 +55,10 @@ event vocabulary is listed in
 [doc/AGENTCORE_BINARY_ABI.md](../../doc/AGENTCORE_BINARY_ABI.md).
 `session.abort()` stops the active run and `session.submit(text)` adds user
 input to it; both may be called from another thread.
+`session.update_credential(api_key)` replaces the provider key in place, while
+idle or during a run, from any thread or from inside a tool or handler: every
+request built afterwards (the run's next turn, a retry) carries it, and a
+request already sent keeps the old one. The provider, endpoint and model stay.
 
 `session.close()`, and leaving a `with` block, aborts a run that is still going
 and waits for it first. That includes a `stream()` the loop stopped early with
