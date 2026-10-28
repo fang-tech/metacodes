@@ -106,3 +106,37 @@ def test_blank_enter_writes_nothing(bin_path):
     a = TTYAssert(raw)
     if a.box_top_row() != base.box_top_row():
         a._fail(f"blank Enter moved the prompt (box top {base.box_top_row()} → {a.box_top_row()})")
+
+
+def _in_one_sync_frame(raw, at, text):
+    """Whether the bytes at `at` and the next `text` are inside one synchronized
+    update (DEC 2026): opened before `at`, closed after `text`."""
+    opened = raw.rfind(b"\x1b[?2026h", 0, at)
+    if opened < 0 or raw.rfind(b"\x1b[?2026l", 0, at) > opened:
+        return False
+    closed = raw.find(b"\x1b[?2026l", at)
+    return closed >= 0 and text in raw[at:closed]
+
+
+def test_ctrl_l_clears_the_screen_and_redraws_the_box_on_top(bin_path):
+    # Ctrl+L goes through RenderRegion.resetScreen (doc/TUI_VIEWPORT_OWNERSHIP.md):
+    # the box is erased, ED 2 clears the screen (never ED 3, which would wipe
+    # the scrollback), and the box comes back on the top row with the draft.
+    from tty_driver import IS_WINDOWS, submit
+
+    raw = run(bin_path, submit("/cost", "Total cost:") + [READY, "type:keep me", "key:ctrl_l", "strictsleep:1.0"])
+    a = TTYAssert(raw)
+    if a.final.find_row("Total cost:") is not None:
+        a._fail("Ctrl+L should clear the screen")
+    if b"\x1b[3J" in raw:
+        a._fail("Ctrl+L must not wipe the scrollback (ED 3)")
+    if a.box_top_row() != 0:
+        a._fail(f"the box should start on the top row after Ctrl+L, not row {a.box_top_row()}")
+    a.assert_box_at_bottom()
+    a.assert_single_box()
+    assert "keep me" in _content(a), a.final.render_ascii()
+    # ConPTY re-renders the screen itself; the bytes are only metacodes' own on a pty.
+    if not IS_WINDOWS:
+        ed2 = raw.find(b"\x1b[2J")
+        if ed2 < 0 or not _in_one_sync_frame(raw, ed2, b"\x1b[2J"):
+            a._fail("Ctrl+L should erase the box and clear the screen in one synchronized frame")

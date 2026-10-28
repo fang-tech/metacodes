@@ -199,8 +199,9 @@ pub const cursor = struct {
     pub const hide = "\x1b[?25l";
     pub const show = "\x1b[?25h";
     pub const home = "\x1b[H"; // (1, 1)
-    pub const save = "\x1b7"; // DECSC(更可靠,save SCO 用 \x1b[s 不所有终端兼容)
-    pub const restore = "\x1b8"; // DECRC
+    // 无 save/restore(DECSC/DECRC、SCO 的 CSI s/u):保存的是绝对屏幕行,区画在屏底时帧内
+    // \r\n 滚屏后它不跟着滚(Warp 也不还原 DECRC)。回区顶用相对上移(reflow.Anchor),见
+    // doc/TUI_VIEWPORT_OWNERSHIP.md;`zig build test:scrollback` 禁止它们回到 src/repl。
 
     /// 移动到 (row, col),1-based。`\x1b[{R};{C}H`。
     pub fn move(row: u32, col: u32, buf: []u8) []const u8 {
@@ -235,6 +236,9 @@ pub const cursor = struct {
 // 清屏 / 清行
 // ============================================================================
 
+// 区只用 ED 0(to_end_of_screen)。ED 2 只在 RenderRegion.resetScreen 用(用户要求的
+// Ctrl+L、/clear、/resume),ED 1 不用;ED 3(清 scrollback)不定义。
+// 见 doc/TUI_VIEWPORT_OWNERSHIP.md,`zig build test:scrollback` 执行。
 pub const clear = struct {
     pub const screen = "\x1b[2J"; // 全屏(不动光标)
     pub const screen_and_home = "\x1b[2J\x1b[H";

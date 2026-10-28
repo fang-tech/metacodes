@@ -10,6 +10,31 @@ status, compatibility boundaries, and entry points are defined by
 
 ## Unreleased
 
+### Fixed
+
+- **Ctrl+L during a reply clears the screen through the renderer** (#320).
+  The keyboard watcher sent `ESC[2J` straight to the terminal, outside the
+  render lock and between two frames, while the agent loop could be printing,
+  and kept the half-line continuation whose text the clear had just removed.
+  Ctrl+L, `/clear` and `/resume` now share `RenderRegion.resetScreen`: it
+  erases the region, clears the screen and, during a reply, draws the region
+  again on the top row, in one synchronized frame, and drops the
+  continuation. The scrollback is never wiped (no `ESC[3J`).
+
+### Added
+
+- **The TUI's screen ownership is written down and enforced** (#332, #320).
+  [doc/TUI_VIEWPORT_OWNERSHIP.md](doc/TUI_VIEWPORT_OWNERSHIP.md) records who
+  may write past the inline region and how: the scrollback only through the
+  Renderer, erase/print/redraw in pairs inside one frame, the half-line
+  snapshot taken at draw time, ED 0 only, no saved cursor, and the review
+  checklist. `zig build test:scrollback` (part of `zig build test`) fails on
+  `ESC[1J`/`[2J`/`[3J` outside `tui/ansi.zig`, a wide erase outside
+  `resetScreen`, any cursor save/restore, and a direct terminal write from a
+  function in `src/repl/` that is not listed with its reason. The unused
+  DECSC/DECRC constants left `ansi.zig`, and `src/repl/statusline.zig`, which
+  no build imported, is gone with its direct write to stderr.
+
 ## 0.8.1 — 2026-10-28
 
 ### Fixed
