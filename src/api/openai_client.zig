@@ -388,16 +388,18 @@ pub const OpenAIClient = struct {
             .{ self.effectiveUrl(), self.model, body.len, cache.modeFor(.openai).label(), if (self.reasoning_effort) |effort| effort.name() else "default" },
         );
         const uri = std.Uri.parse(self.effectiveUrl()) catch return error.InvalidUrl;
-        const auth = self.credential.header(self.allocator, self.auth_scheme) catch |err| {
-            log.errId("openai", rid, "auth header materialization failed: {s}", .{@errorName(err)});
-            return credential_mod.requestError(err);
-        };
-        defer secureFree(self.allocator, auth.value);
 
         const req_ptr = try self.allocator.create(http.Client.Request);
         errdefer self.allocator.destroy(req_ptr); // 唯一 destroy:所有错误路径靠它(不手动 destroy,否则 double-free)
         var connection_lease = try connection_gate.acquire(abort);
         defer connection_lease.release();
+        // Read with the connection slot held, right before the request opens
+        // (see client_mod.Client.doRequest).
+        const auth = self.credential.header(self.allocator, self.auth_scheme) catch |err| {
+            log.errId("openai", rid, "auth header materialization failed: {s}", .{@errorName(err)});
+            return credential_mod.requestError(err);
+        };
+        defer secureFree(self.allocator, auth.value);
         req_ptr.* = self.http_client.request(.POST, uri, .{
             // 保持禁用陈旧池连接；跨 provider 的 process-wide connection_gate 限制并发握手。
             .keep_alive = false,

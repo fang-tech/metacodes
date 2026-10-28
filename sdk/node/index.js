@@ -481,9 +481,9 @@ class Session {
 
   /**
    * Replace the provider credential in place (AgentCore Revision 25). Every
-   * request that builds its authentication header afterwards uses it: the next
-   * turn of a Run already going, a retry, a compaction, a Skill. A request
-   * already sent keeps the old key. Callable from this Session's own tool and
+   * request sent afterwards uses it: the next turn of a Run already going, a
+   * retry, a compaction, a Skill, a request still waiting for a connection. A
+   * request already sent keeps the old key. Callable from this Session's own tool and
    * UI handlers. 1 to 16384 bytes of printable ASCII; anything else throws and
    * keeps the previous key.
    */

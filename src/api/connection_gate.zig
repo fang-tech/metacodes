@@ -14,6 +14,8 @@ pub const Gate = struct {
     mutex: sync.Mutex = .{},
     cond: sync.Condition = .{},
     in_flight: usize = 0,
+    /// Callers blocked in `acquire` for a slot.
+    waiting: usize = 0,
     limit: usize,
 
     pub fn init(limit: usize) Gate {
@@ -24,7 +26,15 @@ pub const Gate = struct {
     pub fn acquire(self: *Gate, abort: ?*const AbortSignal) error{Aborted}!Lease {
         self.mutex.lock();
         defer self.mutex.unlock();
+        var counted = false;
+        defer if (counted) {
+            self.waiting -= 1;
+        };
         while (self.in_flight >= self.limit) {
+            if (!counted) {
+                counted = true;
+                self.waiting += 1;
+            }
             if (abort) |signal| if (signal.isAborted()) return error.Aborted;
             // Timed wait keeps cancellation responsive even when no holder releases promptly.
             _ = self.cond.timedWait(&self.mutex, 50 * std.time.ns_per_ms);
@@ -83,6 +93,14 @@ pub fn raiseProcessLimit(limit: usize) void {
     }
 }
 
+/// Callers waiting for a process slot now (a test can tell that a request
+/// is queued at the gate).
+pub fn processWaiting() usize {
+    process_gate.mutex.lock();
+    defer process_gate.mutex.unlock();
+    return process_gate.waiting;
+}
+
 pub fn processLimit() usize {
     process_gate.mutex.lock();
     defer process_gate.mutex.unlock();
@@ -132,4 +150,27 @@ test "Gate capacity is enforced under concurrent callers" {
     shared.release.store(true, .release);
     for (threads) |thread| thread.join();
     try std.testing.expectEqual(@as(usize, 0), shared.gate.current());
+}
+
+test "Gate counts a caller while it waits for a slot" {
+    var gate = Gate.init(1);
+    var held = try gate.acquire(null);
+    const Waiter = struct {
+        fn run(target: *Gate) void {
+            var lease = target.acquire(null) catch return;
+            lease.release();
+        }
+    };
+    const thread = try std.Thread.spawn(.{}, Waiter.run, .{&gate});
+    while (true) {
+        gate.mutex.lock();
+        const waiting = gate.waiting;
+        gate.mutex.unlock();
+        if (waiting == 1) break;
+        std.Thread.yield() catch {};
+    }
+    held.release();
+    thread.join();
+    try std.testing.expectEqual(@as(usize, 0), gate.waiting);
+    try std.testing.expectEqual(@as(usize, 0), gate.current());
 }

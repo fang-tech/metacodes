@@ -44,6 +44,7 @@ pub const api_provider = @import("api/provider.zig");
 pub const api_provider_factory = @import("api/provider_factory.zig");
 pub const api_auth_header = @import("api/auth_header.zig");
 pub const api_credential_cell = @import("api/credential_cell.zig");
+pub const api_connection_gate = @import("api/connection_gate.zig");
 pub const fs_util = @import("util/fs.zig");
 // issue #16 provider offer kernel — re-exported for L2 component tests and for
 // embedders that drive model selection through the control plane.

@@ -26,9 +26,9 @@ one Run as user-role context instead of system-prompt text.
 permission mode in place while idle: same handle and Conversation, a new policy
 generation, every Session grant revoked; `describe` reports `permission_mode`.
 `session->update_credential` replaces a Session's provider credential in place,
-idle or during a Run, from any thread or callback: every request that builds its
-authentication header afterwards (later turns, retries, compaction, Skills, tool
-providers) carries it, a request already sent keeps the old one, and provider,
+idle or during a Run, from any thread or callback: every request sent afterwards
+(later turns, retries, compaction, Skills, tool providers, requests still
+waiting for a connection) carries it, a request already sent keeps the old one, and provider,
 scheme, `base_url` and model stay; refusals keep the previous credential.
 `session->submit_input` hands the active Run more user text from any thread or
 callback; the Run appends it at its next turn boundary and reports each

@@ -2499,12 +2499,13 @@ pub const AgentSession = struct {
         _ = self.run_inputs.close();
     }
 
-    /// Replace the provider credential in place (issue #336). Every request
-    /// that builds its authentication header after this returns uses the new
-    /// credential: later turns, retries of a request already under way, a
-    /// compaction summary, a Skill Run, and every provider this Session built
-    /// earlier, tool providers included. A request that built its header
-    /// before keeps the old credential and is not touched; nothing is
+    /// Replace the provider credential in place (issue #336). A request reads
+    /// the credential when it is sent (once it holds its connection slot), so
+    /// every request sent after this returns uses the new credential: later
+    /// turns, retries of a request already under way, a compaction summary, a
+    /// Skill Run, every provider this Session built earlier, tool providers
+    /// included, and a request still waiting for a connection slot. A request
+    /// already sent keeps the old credential and is not touched; nothing is
     /// cancelled or replayed. Provider, authentication scheme, base URL and
     /// model are unchanged.
     ///
@@ -2522,7 +2523,7 @@ pub const AgentSession = struct {
     /// and freed before this returns. The caller must let it return before
     /// destroying the Session.
     pub fn updateCredential(self: *AgentSession, candidate: []const u8) CredentialUpdateError!u64 {
-        try self.refuseCredentialUpdateWhenTerminal();
+        try self.checkCredentialUpdateState();
         var replacement = try self.credential.prepare(candidate);
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -2536,7 +2537,11 @@ pub const AgentSession = struct {
         return replacement.publish();
     }
 
-    fn refuseCredentialUpdateWhenTerminal(self: *AgentSession) error{InvalidSessionState}!void {
+    /// The state `updateCredential` checks before it looks at the candidate:
+    /// `InvalidSessionState` once the Session is poisoned or being destroyed.
+    /// A facade that validates the candidate itself calls this first, so the
+    /// state outranks the candidate there too.
+    pub fn checkCredentialUpdateState(self: *AgentSession) error{InvalidSessionState}!void {
         self.mutex.lock();
         defer self.mutex.unlock();
         switch (self.state) {

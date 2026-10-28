@@ -35,12 +35,14 @@ status, compatibility boundaries, and entry points are defined by
   table grows from 48 to 56 bytes) and the source-level
   `AgentSession.updateCredential`.
   - Callable while idle and during a Run, from any thread or from the Run's own
-    callbacks; never `BUSY`. Concurrent updates are linearized, and every
-    request that builds its authentication header after an update returns
-    carries it: the Run's later turns, retries of a request already under way,
-    compaction summaries, Skill Runs and forked Skills, and a tool's own
-    per-call provider (`WebSearch`), including one built before the update. A
-    request already sent and a stream being read are left alone.
+    callbacks; never `BUSY`. Concurrent updates are linearized. A request reads
+    the credential when it is sent (once it holds its connection slot), so
+    every request sent after an update returns carries it: the Run's later
+    turns, retries of a request already under way, compaction summaries, Skill
+    Runs and forked Skills, a tool's own per-call provider (`WebSearch`)
+    including one built before the update, and a request that was still
+    waiting for a connection slot. A request already sent and a stream being
+    read are left alone.
   - Only the credential changes: provider, authentication scheme, `base_url`
     and model stay. An empty credential, a byte outside printable ASCII, more
     than `MAX_CREDENTIAL_BYTES_V1` (16 KiB), or an allocation failure is
