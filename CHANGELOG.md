@@ -46,6 +46,20 @@ status, compatibility boundaries, and entry points are defined by
   background-colour answer used to arrive as Esc, text, Esc; the two Escs
   cleared the prompt.
 
+### Fixed
+
+- **Everything typed while metacodes starts reaches the first prompt, in
+  order.** The key that skipped the startup animation was consumed by it (on
+  Windows the skip flushed the console's whole input queue, so `abc` typed at
+  startup became `bc` or nothing), and on macOS and Linux the input box's
+  first raw-mode entry (`TCSAFLUSH`) dropped whatever was typed after the
+  animation while startup still ran (connecting MCP servers, fetching the
+  model list). The animation still ends on the first key, but leaves the key
+  for the prompt (only a key that types nothing, a bare modifier on Windows,
+  is dropped); it enters and leaves raw mode without discarding input; and
+  the process's first raw-mode entry keeps what the terminal has received.
+  Later entries still drop keys typed between two prompts, as before.
+
 ## 0.8.1 — 2026-10-28
 
 ### Fixed

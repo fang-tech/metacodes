@@ -641,9 +641,15 @@ pub fn newlineHint() []const u8 {
     return if (shouldEnableKittyKeyboard()) "shift + \xe2\x8f\x8e for newline" else "\\ + \xe2\x8f\x8e for newline";
 }
 
+/// 进程第一次进 raw mode 之前,终端收到的都是启动期间敲的键(探测之后、启动动画期间、
+/// App.init 期间):它们是给第一个输入框的,这一次切换保留它们。此后的切换照旧丢掉终端已收、
+/// 未读的输入(TCSAFLUSH:两次读输入之间的键,见 tests/tty/tty_driver.py)。
+var g_first_raw_entry = std.atomic.Value(bool).init(true);
+
 pub fn enterRawMode(fd: c_int) ?platform_term.SavedMode {
     // 模式切换走可移植 platform/terminal(POSIX termios / Windows console mode)。
-    const orig = platform_term.enterRaw(fd) orelse return null;
+    const startup = g_first_raw_entry.swap(false, .acq_rel);
+    const orig = (if (startup) platform_term.enterRawKeepingInput(fd) else platform_term.enterRaw(fd)) orelse return null;
     emitEnableSequences(fd);
     return orig;
 }

@@ -265,9 +265,7 @@ fn waitTerminal(fd: c_int, timeout_ms: i32) i32 {
 ///
 /// Bytes handed back with `replayInput` stay: the process has already read
 /// them from the terminal and owes them to the input parser, they are not
-/// pending there. The keys typed while the startup probe waited for its
-/// answers skip the startup animation (it discards the key that skips it)
-/// and still reach the prompt.
+/// pending there.
 pub fn discardPendingInput(fd: c_int) void {
     if (is_windows and fd == 0) {
         const h = GetStdHandle(STD_INPUT_HANDLE);
@@ -286,6 +284,39 @@ pub fn discardPendingInput(fd: c_int) void {
     while (rounds < 64 and waitTerminal(fd, 0) > 0) : (rounds += 1) {
         if (readTerminal(fd, &scratch) <= 0) break;
     }
+}
+
+/// Drop, without blocking, the pending input events at the head of the
+/// queue that type nothing, and keep everything from the first one that
+/// does. A Windows console queues a key-down for a bare Shift, Ctrl, Alt, Win
+/// or lock key; `waitReadable` reports it, and `ReadConsoleW` would then
+/// block until the next key that types something. For a reader that reacts
+/// to "a key was pressed" but leaves the key to the next reader (the startup
+/// animation skips on it). POSIX: every pending byte is input; nothing goes.
+pub fn dropSilentInput(fd: c_int) void {
+    if (!is_windows or fd != 0) return;
+    const h = GetStdHandle(STD_INPUT_HANDLE);
+    while (true) {
+        var pending: win.DWORD = 0;
+        if (GetNumberOfConsoleInputEvents(h, &pending) == 0 or pending == 0) return;
+        var rec: INPUT_RECORD = undefined;
+        var got: win.DWORD = 0;
+        if (PeekConsoleInputW(h, &rec, 1, &got) == 0 or got == 0) return;
+        if (rec.EventType == KEY_EVENT and rec.Event.KeyEvent.bKeyDown != 0 and
+            !typesNothing(rec.Event.KeyEvent.wVirtualKeyCode)) return;
+        _ = ReadConsoleInputW(h, &rec, 1, &got);
+    }
+}
+
+/// Virtual keys whose key-down never types: the modifiers and the locks.
+fn typesNothing(vk: u16) bool {
+    return switch (vk) {
+        0x10, 0x11, 0x12 => true, // VK_SHIFT, VK_CONTROL, VK_MENU
+        0xA0...0xA5 => true, // VK_LSHIFT .. VK_RMENU
+        0x5B, 0x5C => true, // VK_LWIN, VK_RWIN
+        0x14, 0x90, 0x91 => true, // VK_CAPITAL, VK_NUMLOCK, VK_SCROLL
+        else => false,
+    };
 }
 
 pub const TermSize = struct { rows: u16, cols: u16 };
@@ -520,6 +551,21 @@ test "replayInput: owed bytes come first, in order, survive a discard and only f
     try std.testing.expectEqual(@as(isize, 1), std.c.write(fds[1], "c", 1));
     try std.testing.expectEqual(@as(isize, 1), readInput(fds[0], &buf));
     try std.testing.expectEqual(@as(u8, 'c'), buf[0]);
+}
+
+test "dropSilentInput: modifiers and locks type nothing, every other key does" {
+    for ([_]u16{ 0x10, 0x11, 0x12, 0xA0, 0xA5, 0x5B, 0x5C, 0x14, 0x90, 0x91 }) |vk| try std.testing.expect(typesNothing(vk));
+    // Letters, Enter, Esc, arrows, F1: the console turns them into input.
+    for ([_]u16{ 0x41, 0x0D, 0x1B, 0x26, 0x70 }) |vk| try std.testing.expect(!typesNothing(vk));
+    if (is_windows) return;
+    // POSIX: a pending byte is input and stays.
+    var fds: [2]c_int = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.pipe(&fds));
+    defer _ = std.c.close(fds[0]);
+    defer _ = std.c.close(fds[1]);
+    try std.testing.expectEqual(@as(isize, 1), std.c.write(fds[1], "x", 1));
+    dropSilentInput(fds[0]);
+    try std.testing.expect(waitReadable(fds[0], 0) > 0);
 }
 
 test "console_reflows: conhost clips on Windows; elsewhere the terminal emulator decides" {

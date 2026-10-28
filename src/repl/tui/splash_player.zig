@@ -5,11 +5,12 @@
 //! the settled wordmark, and always ends with the cursor shown and SGR reset.
 //! `Background` runs `play` on a thread of its own so the CLI can start it
 //! before `App.init` and let it play during startup.
-//! The key that skips is consumed, without blocking even when it types
-//! nothing (a bare modifier on Windows): before the prompt exists there is
-//! nowhere for it to go. On POSIX the input box's own raw-mode entry
-//! (TCSA.FLUSH) flushes type-ahead anyway; on Windows, entering raw mode does
-//! not, so the discard is what drops it. The size is checked before every frame, the settled one
+//! The key that skips is not consumed: it is the first key of what the user
+//! types, and the input box reads it once the prompt is up. Raw mode is
+//! entered and left without discarding input, and the REPL's first raw-mode
+//! entry keeps it too (`input.enterRawMode`). Only a key that types nothing (a
+//! bare modifier on Windows) is dropped, so the prompt's first read does not
+//! block on it. The size is checked before every frame, the settled one
 //! included, so no frame is drawn at a size the terminal no longer has.
 
 const std = @import("std");
@@ -97,8 +98,8 @@ pub fn play(gpa: std.mem.Allocator, plan: Plan, style: splash.Style, seed: u64) 
 
 /// `play`, ending at the next frame once `stop` is set, settled as a key would.
 fn playUntil(gpa: std.mem.Allocator, plan: Plan, style: splash.Style, seed: u64, stop: ?*const std.atomic.Value(bool)) Outcome {
-    const saved = platform_term.enterRaw(0) orelse return .no_raw_mode;
-    defer platform_term.restoreMode(0, saved);
+    const saved = platform_term.enterRawKeepingInput(0) orelse return .no_raw_mode;
+    defer platform_term.restoreModeKeepingInput(0, saved);
 
     var sp = splash.Splash.init(gpa, plan.layout, style, seed) catch return .out_of_memory;
     defer sp.deinit();
@@ -124,7 +125,7 @@ fn playUntil(gpa: std.mem.Allocator, plan: Plan, style: splash.Style, seed: u64,
         if (!writeAll(buf.items)) break :run .write_failed;
         const deadline = start + @as(util_time.Nanos, frames) * splash.frame_ns;
         if (platform_term.waitReadable(0, msUntil(deadline)) > 0) {
-            platform_term.discardPendingInput(0);
+            platform_term.dropSilentInput(0);
             break :run .skipped_by_key;
         }
     };
