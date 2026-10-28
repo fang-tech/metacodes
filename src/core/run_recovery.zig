@@ -59,6 +59,9 @@ pub const Record = union(enum) {
     tool_result: EffectKey,
     run_closing,
     run_finished,
+    /// A later process proved this Run's owner gone and closed it as it was:
+    /// pending effects are dropped unresolved, never retried or synthesized.
+    run_abandoned,
     poison,
 };
 
@@ -125,6 +128,11 @@ pub const Reducer = struct {
                 const active = activeRun(&self.state) orelse return error.NoActiveRun;
                 if (active.phase != .closing) return error.RunNotClosing;
                 std.debug.assert(self.pending.count() == 0);
+                self.state = .idle;
+            },
+            .run_abandoned => {
+                _ = activeRun(&self.state) orelse return error.NoActiveRun;
+                self.pending.clearRetainingCapacity();
                 self.state = .idle;
             },
             .poison => unreachable,
@@ -269,6 +277,23 @@ test "reducer requires matching intent and makes poison terminal" {
     );
     try reducer.apply(.poison);
     try std.testing.expectError(error.Poisoned, reducer.apply(.run_finished));
+}
+
+test "an abandoned Run closes with its effects still pending" {
+    var reducer = Reducer.init(std.testing.allocator, 2);
+    defer reducer.deinit();
+    try std.testing.expectError(error.NoActiveRun, reducer.apply(.run_abandoned));
+    try reducer.apply(.{ .run_started = EffectKey.fromBytes("dead") });
+    try reducer.apply(.{ .tool_intent = .{ .key = EffectKey.fromBytes("bash"), .replay = .never } });
+    try reducer.apply(.run_abandoned);
+    try std.testing.expect(reducer.state == .idle);
+    try std.testing.expect(reducer.nextRecoveryAction() == .none);
+    // The next Run starts from nothing: the dead Run's intent is not its own.
+    try reducer.apply(.{ .run_started = EffectKey.fromBytes("next") });
+    try std.testing.expectError(
+        error.ResultWithoutIntent,
+        reducer.apply(.{ .tool_result = EffectKey.fromBytes("bash") }),
+    );
 }
 
 test "sha256 effect keys decode rather than hash the printable hex" {

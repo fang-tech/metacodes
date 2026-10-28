@@ -34,18 +34,25 @@ pub const RunControl = struct {
     project_gate: ?*RunGate,
     operational_observation_id: ?[64]u8,
 
+    /// A product session: a Run whose process died is closed as abandoned
+    /// (`journal_mod.AbandonedRunPolicy`), and `report` says what `init`
+    /// found — the abandoned Run, or why the session is not available.
     pub fn init(
         allocator: std.mem.Allocator,
         session_dir: []const u8,
         session_id: session_id_mod.SessionId,
         project_root: []const u8,
         abort: ?*const @import("../util/abort.zig").AbortSignal,
+        report: ?*journal_mod.OpenReport,
     ) !*RunControl {
         const self = try allocator.create(RunControl);
         errdefer allocator.destroy(self);
         const owned_session_dir = try allocator.dupe(u8, session_dir);
         errdefer allocator.free(owned_session_dir);
-        const journal = try journal_mod.Journal.init(session_dir, session_id);
+        const journal = try journal_mod.Journal.initWithOptions(session_dir, session_id, .{
+            .abandoned_run = .record_abandoned,
+            .report = report,
+        });
         self.* = .{
             .allocator = allocator,
             .session_dir = owned_session_dir,
@@ -64,8 +71,8 @@ pub const RunControl = struct {
             // No provider request or tool action can occur before RunControl
             // returns. A gate configuration/artifact failure is therefore a
             // known pre-action abort, not an ambiguous crash window. Close it
-            // durably so fixing the configuration does not require deleting a
-            // poison lease; if the close itself fails, deinit keeps the lease.
+            // durably so fixing the configuration does not leave a Run for the
+            // next one to abandon; if the close itself fails, it will.
             self.journal.finishRun("project_gate_load_failed") catch {};
             return err;
         };
@@ -99,20 +106,24 @@ pub const RunControl = struct {
             try self.journal.finishRun(stop_reason);
             return;
         };
-        // Keep the journal marker until the operational observer has been
-        // durably persisted and reopened. A crash or publication error after
-        // run_finished therefore makes the next Run fail closed instead of
-        // silently losing the observer.
+        // Keep the journal lease, marked publication-pending, until the
+        // operational observer has been durably persisted and reopened. A crash
+        // or publication error after run_finished therefore makes the next Run
+        // fail closed instead of silently losing the observer.
         try self.journal.sealRun(stop_reason);
         const binding = try self.journal.finishedRunBinding();
         // Re-attest the active pointer after the durable Run close. A bundle
-        // change during the Run is not attributed to either identity.
+        // change during the Run is not attributed to either identity. The
+        // Run's abort signal is not passed: it stopped the Run (Esc, Ctrl+C,
+        // SIGTERM/SIGHUP), and an aborted Run's evidence must still publish,
+        // or the lease stays publication-pending and the session closed for
+        // good. The kernel's own timeout bounds this call.
         var current = (try bundle.loadVerifiedActive(
             self.allocator,
             gate.directory,
             gate.active.project_sha256,
             gate.runtime.config,
-            gate.runtime.abort,
+            null,
         )) orelse return error.ActivePointerDisappeared;
         defer current.deinit();
         if (current.revision != gate.active.revision or
@@ -242,7 +253,7 @@ test "RunControl keeps the returned journal sink address stable" {
     defer std.testing.allocator.free(session_dir);
     try @import("../util/fs.zig").mkdirParents(session_dir);
     const session = session_id_mod.SessionId.fromSlice("0123456789abcdef01234567").?;
-    const control = try RunControl.init(std.testing.allocator, session_dir, session, root, null);
+    const control = try RunControl.init(std.testing.allocator, session_dir, session, root, null, null);
     const sink = control.observer();
     try std.testing.expect(sink.emit(.{ .dispatch_started = .{
         .id = "stable-sink",

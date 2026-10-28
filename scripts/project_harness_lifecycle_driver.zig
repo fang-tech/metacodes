@@ -379,6 +379,7 @@ fn finalize(init: std.process.Init, allocator: std.mem.Allocator, options: Optio
         runtime_sid,
         prepared.project_root,
         null,
+        null,
     );
     var control_live = true;
     defer if (control_live) control.deinit();

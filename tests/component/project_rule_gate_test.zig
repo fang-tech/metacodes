@@ -2749,6 +2749,7 @@ test "L2 normal RunControl finish publishes a bound operational observer" {
             sid,
             root,
             null,
+            null,
         );
         defer control.deinit();
         var probe = Probe{};
@@ -2802,14 +2803,40 @@ test "L2 normal RunControl finish publishes a bound operational observer" {
         try std.testing.expectEqual(@as(usize, 1), probe.calls);
     }
 
+    // A Run stopped by its abort signal (Esc, Ctrl+C, SIGTERM/SIGHUP) still
+    // publishes its observer: the signal stops the Run, not the evidence of
+    // it, and a lease left publication-pending would close the session.
+    {
+        var stop = cc.abort.AbortSignal.init();
+        const control = try cc.project_rule_activation.RunControl.init(
+            allocator,
+            session_dir,
+            sid,
+            root,
+            &stop,
+            null,
+        );
+        defer control.deinit();
+        stop.abort(.user_ctrl_c);
+        try control.finishRun("aborted");
+        try std.testing.expect(control.operationalObservationId() != null);
+    }
+    {
+        var next = try cc.tool_observation_journal.Journal.init(session_dir, sid);
+        defer next.deinit();
+        try next.finishRun("end_turn");
+    }
+
     // Exercise the product failure path, not only Journal helpers. If the
     // active pointer drifts after RunControl admission, finish seals the Run
-    // but must retain its marker because no observer was published.
+    // but must keep its lease publication-pending because no observer was
+    // published: the next Run is refused even though this owner is gone.
     const drift_control = try cc.project_rule_activation.RunControl.init(
         allocator,
         session_dir,
         sid,
         root,
+        null,
         null,
     );
     const active_path = try std.fmt.allocPrintSentinel(
@@ -2827,9 +2854,17 @@ test "L2 normal RunControl finish publishes a bound operational observer" {
     try std.testing.expect(drift_control.operationalObservationId() == null);
     drift_control.deinit();
     try std.testing.expectError(
-        error.JournalBusy,
+        error.RunPublicationPending,
         cc.tool_observation_journal.Journal.init(session_dir, sid),
     );
+    try std.testing.expectError(error.RunPublicationPending, cc.project_rule_activation.RunControl.init(
+        allocator,
+        session_dir,
+        sid,
+        root,
+        null,
+        null,
+    ));
 }
 
 test "L2 extending an active bundle reattests the prior promotion before mutation" {

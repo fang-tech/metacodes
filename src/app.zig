@@ -4059,6 +4059,11 @@ pub const App = struct {
         @atomicStore(?*AbortSignal, &g_abort_signal, &app.abort, .seq_cst);
         // 可移植:POSIX=SIGINT sigaction;Windows=SetConsoleCtrlHandler(见 platform/signal.zig)。
         platform_signal.installInterrupt(onSigint);
+        // A closed terminal (SIGHUP) or a `kill` (SIGTERM) would otherwise end
+        // the process mid-Run by default, leaving the Run for the next process
+        // to close as abandoned. Stop the Run so it closes itself, then leave.
+        // A disposition inherited as ignored (`nohup`) is kept.
+        platform_signal.installTerminateUnlessIgnored(onTerminate);
     }
 
     /// Stop SIGINT from aborting this App's run; SIGINT still requests process
@@ -4142,6 +4147,43 @@ fn onSigint() void {
         s.abort(.user_ctrl_c);
     }
 }
+
+/// SIGTERM / SIGHUP (Windows: console close, logoff, shutdown) arrived: the
+/// interactive loop leaves at its next turn boundary instead of reading input.
+pub fn terminateRequested() bool {
+    return g_terminate_requested.load(.seq_cst);
+}
+
+var g_terminate_requested = std.atomic.Value(bool).init(false);
+
+/// How long a requested termination may take before the process is ended
+/// outright. A stopped Run with project rules re-attests its bundle before it
+/// gives its lease up, and the project kernel may take up to 30 s
+/// (`METACODES_PROJECT_KERNEL_TIMEOUT_MS`); ending the process inside that
+/// would leave the session closed. Usually the process is gone in well under
+/// a second. (Windows ends a process ~5 s after its console closes.)
+const terminate_grace_s: c_uint = 45;
+
+/// A termination request stops the process as Ctrl+C does (abort the Run,
+/// request shutdown) and bounds how long that may take. Only the first one
+/// acts: a terminal closing under a shell delivers SIGHUP twice, milliseconds
+/// apart (the shell forwards its own; the kernel sends another as the shell
+/// exits), and the second must not cut the first's shutdown short — nor
+/// extend its bound. async-signal-safe: atomics and `alarm`.
+fn onTerminate() void {
+    const is_windows = @import("builtin").os.tag == .windows;
+    if (!g_terminate_requested.swap(true, .seq_cst)) {
+        onSigint();
+        // SIGALRM's default action ends the process should the Run not stop.
+        if (!is_windows) _ = std.c.alarm(terminate_grace_s);
+    }
+    // The console handler runs on its own thread, and Windows ends the process
+    // as soon as it returns (or, for a closed console, after about 5 s): wait
+    // here while the main thread stops the Run; the process exits under it.
+    if (is_windows) Sleep(terminate_grace_s * 1000);
+}
+
+extern "kernel32" fn Sleep(milliseconds: u32) callconv(.winapi) void;
 
 pub fn shouldQueueModelSwitchCompact(
     previous_model: []const u8,

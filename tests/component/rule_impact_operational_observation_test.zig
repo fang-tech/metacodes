@@ -316,6 +316,7 @@ test "L2 RunControl with no active bundle has zero operational observer artifact
         sid,
         root,
         null,
+        null,
     );
     defer control.deinit();
     try control.finishRun("end_turn");

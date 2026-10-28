@@ -50,6 +50,9 @@ const WindowsO = struct {
     APPEND: bool = false,
     EXCL: bool = false,
     NOFOLLOW: bool = false,
+    /// `_O_NOINHERIT`: the handle is never inheritable, not even between the
+    /// open and a later `makeCloseOnExec`.
+    CLOEXEC: bool = false,
 
     pub const AccessMode = enum(u2) { RDONLY = 0, WRONLY = 1, RDWR = 2 };
 };
@@ -63,6 +66,7 @@ const _O_CREAT: c_int = 0x0100;
 const _O_TRUNC: c_int = 0x0200;
 const _O_EXCL: c_int = 0x0400;
 const _O_BINARY: c_int = 0x8000; // 必须：关掉 CRLF 文本翻译，保字节精确
+const _O_NOINHERIT: c_int = 0x0080;
 
 extern "c" fn _read(fd: c_int, buf: [*]u8, count: c_uint) c_int;
 extern "c" fn _write(fd: c_int, buf: [*]const u8, count: c_uint) c_int;
@@ -166,6 +170,7 @@ fn windowsOflag(flags: WindowsO) c_int {
     if (flags.TRUNC) o |= _O_TRUNC;
     if (flags.APPEND) o |= _O_APPEND;
     if (flags.EXCL) o |= _O_EXCL;
+    if (flags.CLOEXEC) o |= _O_NOINHERIT;
     return o;
 }
 
@@ -371,6 +376,10 @@ pub const FileInfo = struct {
     /// True for a directory. `is_regular` answers the common case; a caller
     /// that hands a pathname to another process has to know the difference.
     is_dir: bool,
+    /// Last data modification, wall-clock nanoseconds since the Unix epoch
+    /// (Windows: 100 ns resolution). For a file never written since it was
+    /// created, its creation time.
+    modified_wall_ns: i128,
 };
 
 /// 对已打开 fd 做类型与大小检查。安全敏感读取必须先 open(O_NOFOLLOW)，再 fstat fd，
@@ -388,6 +397,7 @@ pub fn fileInfo(fd: Fd) error{StatFailed}!FileInfo {
             .inode = @intCast(st.st_ino),
             .uid = 0,
             .is_dir = (@as(u32, st.st_mode) & S_IFMT) == S_IFDIR,
+            .modified_wall_ns = windowsModifiedNs(fd) orelse @as(i128, st.st_mtime) * std.time.ns_per_s,
         };
     }
     if (builtin.os.tag == .linux) {
@@ -405,6 +415,7 @@ pub fn fileInfo(fd: Fd) error{StatFailed}!FileInfo {
             .inode = stx.ino,
             .uid = stx.uid,
             .is_dir = (@as(u32, stx.mode) & S_IFMT) == S_IFDIR,
+            .modified_wall_ns = @as(i128, stx.mtime.sec) * std.time.ns_per_s + stx.mtime.nsec,
         };
     }
     var st: std.c.Stat = undefined;
@@ -418,8 +429,26 @@ pub fn fileInfo(fd: Fd) error{StatFailed}!FileInfo {
         .inode = @intCast(st.ino),
         .uid = @intCast(st.uid),
         .is_dir = (@as(u32, @intCast(st.mode)) & S_IFMT) == S_IFDIR,
+        .modified_wall_ns = @as(i128, st.mtime().sec) * std.time.ns_per_s + st.mtime().nsec,
     };
 }
+
+/// `_fstat64` keeps whole seconds; the handle's write time has 100 ns.
+fn windowsModifiedNs(fd: Fd) ?i128 {
+    const raw = _get_osfhandle(fd);
+    if (raw == -1) return null;
+    var written: std.os.windows.FILETIME = undefined;
+    if (GetFileTime(@ptrFromInt(@as(usize, @bitCast(raw))), null, null, &written) == 0) return null;
+    const ticks = (@as(i128, written.dwHighDateTime) << 32) | written.dwLowDateTime;
+    // FILETIME counts 100 ns ticks from 1601-01-01.
+    return (ticks - 116_444_736_000_000_000) * 100;
+}
+extern "kernel32" fn GetFileTime(
+    hFile: *anyopaque,
+    lpCreationTime: ?*std.os.windows.FILETIME,
+    lpLastAccessTime: ?*std.os.windows.FILETIME,
+    lpLastWriteTime: ?*std.os.windows.FILETIME,
+) callconv(.winapi) c_int;
 
 /// 禁止 fd 穿过后续 exec 边界。POSIX 用 FD_CLOEXEC；Windows 清底层 HANDLE 的
 /// HANDLE_FLAG_INHERIT，避免 bInheritHandles=TRUE 的工具子进程拿到可信 artifact fd。
@@ -435,6 +464,52 @@ pub fn makeCloseOnExec(fd: Fd) error{CloseOnExecFailed}!void {
     if (current < 0 or std.c.fcntl(fd, std.c.F.SETFD, current | std.c.FD_CLOEXEC) < 0)
         return error.CloseOnExecFailed;
 }
+
+/// Take an exclusive advisory lock that lasts exactly as long as this open
+/// file: the system drops it when the descriptor is closed, which includes the
+/// process dying by any signal. `WouldBlock` means another open of the same
+/// file holds it now — in another process or in this one, since the lock
+/// belongs to the open file, not to the process.
+///
+/// POSIX `flock(LOCK_EX | LOCK_NB)`. Windows `LockFileEx` on one byte far past
+/// any content: a Windows byte-range lock is mandatory for its range, and a
+/// reader that finds the lock taken must still read what the file says.
+pub fn tryLockExclusive(fd: Fd) error{ WouldBlock, LockFailed }!void {
+    if (is_windows) {
+        const raw = _get_osfhandle(fd);
+        if (raw == -1) return error.LockFailed;
+        var overlapped: Overlapped = .{ .OffsetHigh = lock_range_offset_high };
+        const flags = LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY;
+        if (LockFileEx(@ptrFromInt(@as(usize, @bitCast(raw))), flags, 0, 1, 0, &overlapped) == 0)
+            return if (GetLastError() == ERROR_LOCK_VIOLATION) error.WouldBlock else error.LockFailed;
+        return;
+    }
+    while (std.c.flock(fd, std.c.LOCK.EX | std.c.LOCK.NB) != 0) {
+        if (lastErrnoIs(.INTR)) continue;
+        return if (lastErrnoIs(.AGAIN)) error.WouldBlock else error.LockFailed;
+    }
+}
+
+/// 4 GiB × 0x4000_0000: past any file this lock guards.
+const lock_range_offset_high: u32 = 0x4000_0000;
+const LOCKFILE_FAIL_IMMEDIATELY: u32 = 0x1;
+const LOCKFILE_EXCLUSIVE_LOCK: u32 = 0x2;
+const ERROR_LOCK_VIOLATION: u32 = 33;
+const Overlapped = extern struct {
+    Internal: usize = 0,
+    InternalHigh: usize = 0,
+    Offset: u32 = 0,
+    OffsetHigh: u32 = 0,
+    hEvent: ?*anyopaque = null,
+};
+extern "kernel32" fn LockFileEx(
+    hFile: *anyopaque,
+    dwFlags: u32,
+    dwReserved: u32,
+    nNumberOfBytesToLockLow: u32,
+    nNumberOfBytesToLockHigh: u32,
+    lpOverlapped: *Overlapped,
+) callconv(.winapi) c_int;
 
 const Stat64 = extern struct {
     st_dev: u32,
@@ -865,6 +940,55 @@ test "openReadShared: a reader holding the file does not block renameReplace and
     defer allocator.free(missing);
     try std.testing.expectEqual(@as(c_int, -1), openReadShared(missing.ptr));
     try std.testing.expect(lastErrnoIs(.NOENT));
+}
+
+test "tryLockExclusive: one open file holds the lock until it is closed" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const path = try std.fmt.allocPrintSentinel(allocator, "{s}/lease", .{root_buffer[0..root_len]}, 0);
+    defer allocator.free(path);
+    try writeWholeFile(path, "owner");
+
+    const first = open(path.ptr, .{ .ACCMODE = .RDWR }, 0);
+    try std.testing.expect(first >= 0);
+    try tryLockExclusive(first);
+    // A second open of the same file is a second holder, even in this process.
+    const second = open(path.ptr, .{ .ACCMODE = .RDWR }, 0);
+    try std.testing.expect(second >= 0);
+    defer close(second);
+    try std.testing.expectError(error.WouldBlock, tryLockExclusive(second));
+    // The lock does not cover the content: the loser can still read the owner.
+    var buf: [16]u8 = undefined;
+    const n = read(second, buf[0..]);
+    try std.testing.expectEqualStrings("owner", buf[0..@intCast(n)]);
+    close(first);
+    try tryLockExclusive(second);
+}
+
+test "fileInfo reports when a file was last written, on the wall clock" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const first = try std.fmt.allocPrintSentinel(allocator, "{s}/first", .{root_buffer[0..root_len]}, 0);
+    defer allocator.free(first);
+    const second = try std.fmt.allocPrintSentinel(allocator, "{s}/second", .{root_buffer[0..root_len]}, 0);
+    defer allocator.free(second);
+    try writeWholeFile(first, "a");
+    try writeWholeFile(second, "b");
+    const a = open(first.ptr, .{ .ACCMODE = .RDONLY }, 0);
+    defer close(a);
+    const b = open(second.ptr, .{ .ACCMODE = .RDONLY }, 0);
+    defer close(b);
+    const written_a = (try fileInfo(a)).modified_wall_ns;
+    const written_b = (try fileInfo(b)).modified_wall_ns;
+    // After 2020-09-13 (1.6e18 ns), and in the order the files were written.
+    try std.testing.expect(written_a > 1_600_000_000 * std.time.ns_per_s);
+    try std.testing.expect(written_b >= written_a);
 }
 
 test "Windows: a plain open reader (no FILE_SHARE_DELETE) does block renameReplace" {
