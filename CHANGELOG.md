@@ -57,6 +57,23 @@ status, compatibility boundaries, and entry points are defined by
   and prompt rows into the scrollback. It is now cut with an ellipsis, like
   the MCP notice on the same line.
 
+### Changed
+
+- **The Linux release binary no longer carries unwind tables (`.eh_frame`),
+  saving 300 KB.** The program never read them. A panic in the stripped
+  binary prints its message without a stack trace either way, and frame
+  pointers are kept. What changes is post-mortem debugging with outside
+  tools:
+  - **Without the release's debug-symbol file:** gdb can no longer unwind a
+    core past the first metacodes frame, and CFI-based unwinders
+    (`perf --call-graph=dwarf`, systemd-coredump) degrade the same way.
+    `perf --call-graph=fp` still works.
+  - **With the symbol file:** gdb unwinds the whole stack, with function
+    names and source lines.
+
+  macOS and Windows binaries are unchanged
+  (`doc/PERF_MEMORY_PRINCIPLES.md` §3f).
+
 ## 0.8.1 — 2026-10-28
 
 ### Fixed

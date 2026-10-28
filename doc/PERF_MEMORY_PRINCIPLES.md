@@ -61,6 +61,10 @@
 
 ### 3f. 二进制体积:ReleaseSmall + 按需链接
 - 默认 ReleaseSmall(已 1.29 MB)。新依赖/大表(verb 库/工具 schema)评估体积。vendor 工具(ripgrep)进程外调用,不进二进制。
+- **Linux 发布件不带 `.eh_frame`**(`build.zig` 给 release_mod 设 `unwind_tables = .none`,仅 Linux;省 300 KB)。
+  - 程序自身从不读它:ReleaseSmall 默认 strip,`std.Options.allow_stack_tracing` 因此为 false,panic 只打印消息;没有任何依赖导入 `_Unwind_*` / `pthread_cancel` / `pthread_exit`。帧指针保留,`libc.so.6` 自带 `.eh_frame`。
+  - 取舍在外部调试工具:**没有符号文件时**,gdb 看 core 只能展开到第一个 Zig 帧,`perf --call-graph=dwarf`、systemd-coredump 这类靠 CFI 的展开也会退化;`perf --call-graph=fp` 照常可用。**有发布的同布局符号文件时**(同一次不 strip 构建,`objcopy --only-keep-debug` 留符号,`--strip-all` 出发布件),gdb 能完整展开、带函数名和源码行。
+  - macOS 与 Windows 不变(Windows x64 的 SEH 必须有 unwind 数据)。
 
 ## §4 验证机制
 

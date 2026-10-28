@@ -824,6 +824,13 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = .ReleaseSmall,
         .link_libc = true,
+        // No .eh_frame on Linux: 300 KB the stripped executable never reads.
+        // std prints no panic stack trace without debug info, and nothing
+        // imports an unwinder. Frame pointers stay, so `perf --call-graph=fp`
+        // still walks the stack. gdb needs the release's debug-symbol file
+        // to unwind a core (doc/PERF_MEMORY_PRINCIPLES.md §3f). Windows x64
+        // needs its unwind data for SEH; macOS is left as is.
+        .unwind_tables = if (target.result.os.tag == .linux) std.builtin.UnwindTables.none else null,
     });
     addHl(b, release_mod);
     release_mod.addOptions("build_info", build_info);
