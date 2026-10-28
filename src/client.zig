@@ -140,9 +140,6 @@ pub fn retryDelayMsWithSample(attempt: u32, base_ms: u64, sample: u64) u64 {
     return base + jitter;
 }
 
-/// 重试退避(对齐 CC getRetryDelay):min(base * 2^(attempt-1), 32000) + 真随机 jitter(0~25%)。
-/// attempt 从 1 起。若系统熵源罕见失败，以单调时间 + 栈地址混合作为降级，避免退回所有
-/// session 按 attempt 同步重试的确定性羊群行为。
 /// The wait before connect attempt `attempt + 1`: the reporter hears of the
 /// failure, the sleep checks `abort` every 50 ms, and the reporter is asked
 /// before the next attempt; error.Aborted when either says stop. Kept out of
@@ -168,6 +165,9 @@ fn backOffBeforeRetry(
     }
 }
 
+/// 重试退避(对齐 CC getRetryDelay):min(base * 2^(attempt-1), 32000) + 真随机 jitter(0~25%)。
+/// attempt 从 1 起。若系统熵源罕见失败，以单调时间 + 栈地址混合作为降级，避免退回所有
+/// session 按 attempt 同步重试的确定性羊群行为。
 pub fn retryDelayMs(attempt: u32, base_ms: u64) u64 {
     var bytes: [8]u8 = undefined;
     var sample: u64 = 0;
