@@ -29,6 +29,8 @@ FIRST_FRAME = b"\x1b[?25l\x1b[?2026h\r"
 REDRAW = b"\x1b[?2026h\x1b[8A"
 ON = {"METACODES_NO_STARTUP_ANIMATION": None}
 PALETTE = set("MetaskLb")
+# FIRST_FRAME as a driver event (`waitbytes:` takes \xNN escapes).
+FIRST_FRAME_EVENT = "\\x1b[?25l\\x1b[?2026h\\r"
 
 
 def _banner_top(a):
@@ -160,27 +162,64 @@ def _typed_during_startup(bin_path, env, first_key_after):
     return TTYAssert(raw, *SIZE), raw
 
 
+# The Windows driver sends the first key only after the first frame that shows the
+# cursor (tty_driver._run_windows): with the splash off that is the input box, so keys
+# "typed during startup" would reach a prompt that is already up. With the splash on it is
+# the splash's settled frame, and App.init is still waiting: keys sent then are startup input.
+WINDOWS_TYPES_AFTER_FIRST_FRAME = (
+    "the Windows driver sends keys only after the first frame (tty_driver._run_windows): "
+    "it cannot type during the splash or before an input box drawn without one"
+)
+
+
+def test_lines_pasted_during_startup_land_in_the_prompt_unsubmitted(bin_path):
+    """A multi-line paste right after starting, before the prompt is up, comes
+    without bracketed paste (the REPL turns it on with its first prompt), so
+    every newline is an Enter. It used to submit `line1` on its own and drop or
+    queue the other lines. Now everything typed before the first prompt goes
+    into it as one paste: three lines in the box, nothing submitted until the
+    user presses Enter. The paste goes out after the splash, while App.init
+    still waits for `/v1/models` (4 s), on both platforms."""
+    if IS_WINDOWS:
+        first = ["strictsleep:0.3"]  # the driver has waited for the splash's settled frame
+    else:
+        first = [f"waitbytes:{FIRST_FRAME_EVENT}:30", "strictsleep:1.8"]
+    server, base_url = SlowModels.serve(4.0)
+    try:
+        # strictsleep after the lines show: a submitted line would be echoed above the box by then.
+        raw = run(bin_path, first + ["raw:line1\\rline2\\rline3", wait_for("line3"), "strictsleep:1.5"],
+                  term_size=SIZE, env=dict(ON, METACODES_NO_PROBE=None), base_url=base_url, startup_drain=0)
+    finally:
+        server.shutdown()
+    assert SlowModels.answered, "App.init did not wait for /v1/models"
+    a = TTYAssert(raw, *SIZE)
+    screen = "\n".join(a.final.line_text(r) for r in range(a.final.rows))
+    a.assert_box_height(3)
+    top = a.box_top_row()
+    for i, line in enumerate(("line1", "line2", "line3"), 1):
+        a.assert_line_contains(top + i, line)
+    # Submitted, `line1` would also be echoed above the box.
+    assert sum("line1" in a.final.line_text(r) for r in range(a.final.rows)) == 1, "line1 was submitted:\n" + screen
+
+
 def test_keys_typed_during_the_splash_and_after_it_reach_the_prompt_in_order(bin_path):
     """`a` skips the splash, `b` comes while App.init still waits: both are the
     start of what the user types. The splash used to consume `a` (on Windows
     it flushed the console's whole input queue), and on POSIX the input box's
-    raw-mode entry (TCSAFLUSH) dropped `b`.
-
-    Windows: the pywinpty pseudo console never reports a key to the splash's
-    wait (it plays to the end with keys arriving throughout, on main as well),
-    so there the case only shows that nothing typed during startup is lost.
-    Windows Terminal does report it (`skipped_by_key`); the skip that keeps the
-    key was checked there by hand."""
-    first = "waitink:30" if IS_WINDOWS else "waitbytes:\\x1b[?25l\\x1b[?2026h\\r:30"
-    a, raw = _typed_during_startup(bin_path, ON, first)
-    if not IS_WINDOWS:
-        assert raw.count(REDRAW) < 10, "`a` did not cut the splash short"
+    raw-mode entry (TCSAFLUSH) dropped `b`. On Windows this was checked in
+    Windows Terminal by hand (`skipped_by_key`, `abc` kept)."""
+    if IS_WINDOWS:
+        raise SkipTest(WINDOWS_TYPES_AFTER_FIRST_FRAME)
+    a, raw = _typed_during_startup(bin_path, ON, f"waitbytes:{FIRST_FRAME_EVENT}:30")
+    assert raw.count(REDRAW) < 10, "`a` did not cut the splash short"
     a.assert_input_echo("ab")
     a.assert_box_at_bottom()
 
 
 def test_keys_typed_while_startup_waits_reach_the_prompt(bin_path):
     """No splash: everything typed before the prompt is up goes into it, in order."""
+    if IS_WINDOWS:
+        raise SkipTest(WINDOWS_TYPES_AFTER_FIRST_FRAME)
     a, _ = _typed_during_startup(bin_path, {}, "strictsleep:0.4")
     a.assert_input_echo("ab")
     a.assert_box_at_bottom()

@@ -670,8 +670,9 @@ pub fn newlineHint() []const u8 {
 }
 
 /// 进程第一次进 raw mode 之前,终端收到的都是启动期间敲的键(探测之后、启动动画期间、
-/// App.init 期间):它们是给第一个输入框的,这一次切换保留它们。此后的切换照旧丢掉终端已收、
-/// 未读的输入(TCSAFLUSH:两次读输入之间的键,见 tests/tty/tty_driver.py)。
+/// App.init 期间):它们是给第一个输入框的,这一次切换保留它们,并整体作为一次粘贴交给它
+/// (pasteStartupInput)。此后的切换照旧丢掉终端已收、未读的输入(TCSAFLUSH:两次读输入之间
+/// 的键,见 tests/tty/tty_driver.py)。
 var g_first_raw_entry = std.atomic.Value(bool).init(true);
 
 pub fn enterRawMode(fd: c_int) ?platform_term.SavedMode {
@@ -685,8 +686,93 @@ pub fn enterRawMode(fd: c_int) ?platform_term.SavedMode {
         return null;
     };
     emitEnableSequences(fd);
+    if (startup) pasteStartupInput(fd);
     return original orelse orig;
 }
+
+const paste_begin_seq = "\x1b[200~";
+const paste_end_seq = "\x1b[201~";
+
+/// 首个输入框出现之前留下的启动期输入(探测、启动动画、App.init 期间敲的键或粘贴的文字)
+/// 整体作为一次粘贴交给它:那时括号粘贴还没打开(第一个输入框才开),一段多行粘贴里的每个
+/// 换行都是 Enter——第一行单独提交给了模型,其余行被丢掉或排成下一轮。现在已到的启动期输入
+/// 全部读出,还原成正文(StartupText),包上括号粘贴的起止标记交还 stdin,由输入框的粘贴路径
+/// 插入:换行是文本,用户按 Enter 才提交;大段粘贴照常变成占位符。
+/// 正文至多 StartupText.capacity 字节;更多的部分留在终端里,按原样作为按键读到。
+fn pasteStartupInput(fd: c_int) void {
+    var text: StartupText = .{};
+    var chunk: [256]u8 = undefined;
+    while (text.room() > 0) {
+        // Windows:单按的修饰键排在队首时 ReadConsoleW 会一直等下一个产字符的键。
+        platform_term.dropSilentInput(fd);
+        if (platform_term.waitReadable(fd, 0) <= 0) break;
+        const n = platform_term.readInput(fd, chunk[0..@min(chunk.len, text.room())]); // no EINTR: waitReadable reported data
+        if (n <= 0) break;
+        text.feed(chunk[0..@intCast(n)]);
+    }
+    text.finish();
+    @import("../util/log.zig").debug("input", "startup input before the first prompt: {d} bytes of text", .{text.len});
+    if (text.len == 0) return;
+    _ = platform_term.replayInput(fd, paste_begin_seq);
+    _ = platform_term.replayInput(fd, text.bytes());
+    _ = platform_term.replayInput(fd, paste_end_seq);
+}
+
+/// 启动期输入 → 粘贴正文:按键还原(KeyParser),字符、换行、Tab 留下,退格删掉前一个
+/// UTF-8 字符(启动期间打错了改的字照样生效),其它键(方向键、Esc、Ctrl 组合)丢掉。
+/// 正文里因此没有 ESC,粘贴结束标记不会被它打断。
+pub const StartupText = struct {
+    buf: [capacity]u8 = undefined,
+    len: usize = 0,
+    parser: KeyParser = .{},
+
+    /// What stdin's replay can take with the paste markers around it.
+    pub const capacity = platform_term.replay_capacity - paste_begin_seq.len - paste_end_seq.len;
+
+    /// Input bytes the text still has room for: a byte adds at most one byte
+    /// of text (an abandoned `ESC ] 12` can release its few held bytes at
+    /// once; `push` stops at the capacity, the bytes past it are dropped).
+    pub fn room(self: *const StartupText) usize {
+        return capacity - self.len;
+    }
+
+    pub fn feed(self: *StartupText, input_bytes: []const u8) void {
+        for (input_bytes) |b| {
+            if (self.parser.feed(b)) |k| self.apply(k);
+            while (self.parser.drain()) |k| self.apply(k);
+        }
+    }
+
+    /// Nothing more comes: a sequence still open is resolved (a lone Esc is
+    /// dropped like any key that types nothing).
+    pub fn finish(self: *StartupText) void {
+        if (self.parser.flushEsc()) |k| self.apply(k);
+        while (self.parser.drain()) |k| self.apply(k);
+    }
+
+    pub fn bytes(self: *const StartupText) []const u8 {
+        return self.buf[0..self.len];
+    }
+
+    fn apply(self: *StartupText, k: Key) void {
+        switch (k) {
+            .char => |c| self.push(c),
+            .enter, .shift_enter => self.push('\n'),
+            .tab => self.push('\t'),
+            .backspace => while (self.len > 0) {
+                self.len -= 1;
+                if (self.buf[self.len] & 0xC0 != 0x80) break; // a lead byte: the whole character is gone
+            },
+            else => {},
+        }
+    }
+
+    fn push(self: *StartupText, c: u8) void {
+        if (self.len == capacity) return;
+        self.buf[self.len] = c;
+        self.len += 1;
+    }
+};
 
 pub fn restoreMode(fd: c_int, orig: platform_term.SavedMode) void {
     // 关 bracketed paste(始终)+ 键盘协议(仅发过 enable 的——对称 enterRawMode,同进程 env 不变、
@@ -1896,6 +1982,42 @@ test "KeyParser: 读到一半的序列等不来后半截 → 超时兑现时丢�
     try testing.expect(p.pendingEsc());
     try testing.expect(p.flushEsc().? == .esc);
     try testing.expectEqual(@as(u8, 'a'), p.feed('a').?.char);
+}
+
+fn startupText(input_bytes: []const u8) StartupText {
+    var t: StartupText = .{};
+    t.feed(input_bytes);
+    t.finish();
+    return t;
+}
+
+test "StartupText: 启动期粘贴的换行是文本,退格删前一个字,其它键不进正文" {
+    // 没有括号粘贴的多行粘贴:换行是 CR(终端的 Enter)或 LF。
+    try testing.expectEqualStrings("line1\nline2\nline3", startupText("line1\rline2\nline3").bytes());
+    // 打错了退格改:按 UTF-8 字符删。
+    try testing.expectEqualStrings("fix the bug", startupText("fix teh\x7f\x7fhe bug").bytes());
+    try testing.expectEqualStrings("a", startupText("a你\x08").bytes());
+    try testing.expectEqualStrings("", startupText("\x7f\x7f").bytes());
+    // 方向键、Esc、Ctrl 组合、Alt+]、截断的序列都不进正文(正文里不会有 ESC)。
+    const t = startupText("a\x1b[Db\x1b\x03c\x1b]x\td\x1b[1;5");
+    try testing.expectEqualStrings("abc]x\td", t.bytes());
+    try testing.expect(std.mem.indexOfScalar(u8, t.bytes(), 0x1b) == null);
+}
+
+test "StartupText: 装满为止,不越界" {
+    var t: StartupText = .{};
+    var flood: [StartupText.capacity + 50]u8 = undefined;
+    @memset(&flood, 'p');
+    var fed: usize = 0;
+    while (t.room() > 0) {
+        const n = @min(t.room(), flood.len - fed);
+        if (n == 0) break;
+        t.feed(flood[fed..][0..n]);
+        fed += n;
+    }
+    t.finish();
+    try testing.expectEqual(StartupText.capacity, t.bytes().len);
+    try testing.expectEqual(StartupText.capacity, fed);
 }
 
 test "KeyParser: 超长的数字参数饱和而不溢出,整条仍是一个认不出的键" {

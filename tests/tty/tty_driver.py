@@ -31,7 +31,8 @@
     丢失)。所以提交后先等 READY(新的空输入框)再打字;要在生成期按键,先
     wait_for("esc to interrupt") 等进入生成态;生成结束后再发键,等 IDLE。
     进程第一次进 raw mode 例外:启动期间(探测、启动动画、App.init)敲的键都留给第一个
-    输入框(input.enterRawMode),不必等 READY。
+    输入框(input.enterRawMode),而且整体作为一次粘贴进去——换行是文本、不提交;要在启动后
+    提交命令,先等 READY 再打字。
   - 生成期的 sleep: 本身会等(spinner 每 100ms 重画,turn 结束才静默),但只等到静默,
     不保证下一个输入框已经画出来。
 """
@@ -263,19 +264,6 @@ class _Capture:
                 return False
             self._pump(0.02)
 
-    def wait_ink(self, timeout):
-        """等屏幕上第一次出现任何可见字符,至多 timeout 秒;命中即返回,不 settle。超时返回 False。
-        给"画面刚开始出东西"的时刻用(启动动画的第一帧):ConPTY 重编码输出,原始字节对不上。"""
-        end = time.time() + timeout
-        while True:
-            self.screen_has("")  # 把新字节喂进 Screen
-            sc = self._screen
-            if any(sc.line_text(r).strip() for r in range(sc.rows)):
-                return True
-            if time.time() >= end or self.eof:
-                return False
-            self._pump(0.02)
-
     def wait_pattern(self, pattern, timeout):
         """等屏幕出现 pattern,至多 timeout 秒;命中后短 settle。超时静默返回 False。"""
         end = time.time() + timeout
@@ -394,9 +382,6 @@ def _drive(key_events, write, cap, set_size, per_key_drain, signal_child=None, s
             needle = spec.encode("latin-1", "ignore").decode("unicode_escape").encode("latin-1")
             if not cap.wait_bytes(needle, float(t)):
                 raise AssertionError(f"waitbytes: {spec!r} not in the output within {t}s")
-        elif ev.startswith("waitink:"):
-            if not cap.wait_ink(float(ev[8:])):
-                raise AssertionError(f"waitink: nothing visible on the screen within {ev[8:]}s")
         elif ev.startswith("wait:"):
             pattern, _, t = ev[5:].rpartition(":")
             cap.wait_pattern(pattern, float(t))
@@ -451,8 +436,6 @@ def run(bin_path, key_events, term_size=(24, 80), env=None,
       "wait:PATTERN:N"   等屏幕出现 PATTERN,至多 N 秒(命中后短 settle;超时静默继续)
       "waitbytes:ESC:N"  等原始输出出现 ESC(\\xNN 转义)这段字节,至多 N 秒;命中即返回,超时抛
                          AssertionError(动画进行中按键等没有稳定屏幕文本的时刻)
-      "waitink:N"        等屏幕上第一次出现任何可见字符,至多 N 秒;命中即返回,超时抛 AssertionError
-                         (Windows 上对准启动动画的第一帧:ConPTY 重编码,waitbytes 等不到帧前缀)
       "waitline:TEXT:N"  等屏幕某一整行(去首尾空白)等于 TEXT,至多 N 秒;超时抛 AssertionError
                          (等命令输出用:回显行 `❯ !echo X` 含 X 但整行不等于 X)
       "resize:RxC"       运行中改窗口(触 SIGWINCH / ConPTY resize)

@@ -76,6 +76,14 @@ status, compatibility boundaries, and entry points are defined by
   is dropped); it enters and leaves raw mode without discarding input; and
   the process's first raw-mode entry keeps what the terminal has received.
   Later entries still drop keys typed between two prompts, as before.
+- **A multi-line paste made before the first prompt lands in it as one paste
+  and is not submitted line by line.** Bracketed paste is turned on with the
+  first prompt, so a paste right after starting arrived as typed keys and
+  every newline was an Enter: the first line went to the model on its own,
+  and the rest was dropped or queued as the next turn. Everything typed
+  before the first prompt (up to 4 KiB) now goes into it as one paste:
+  newlines stay text, Backspace still deletes, other keys are left out, a
+  large paste becomes the usual placeholder, and nothing is sent until Enter.
 
 ## 0.8.1 — 2026-10-28
 

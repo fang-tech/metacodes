@@ -37,7 +37,7 @@ python3 tests/tty/run_tty_tests.py --bin zig-out/bin/metacodes-debug --shard 2/3
   → 虚拟 grid + 光标 + SGR border_class;`char_width` 复刻 `src/repl/tui/term.zig` 的 CJK/emoji 宽度表。
 - `tty_driver.py` —— `run(bin, key_events, term_size)`:fork pty + TIOCSWINSZ + 键名映射
   (`type:文本`/`key:shift_enter|backspace|left|right|shift_tab|ctrl_u|enter`/`sleep:N`/
-  `strictsleep:N`/`wait:PATTERN:N`/`waitbytes:ESC:N`/`waitink:N`/`resize:RxC`/`resize-now:RxC`)。锁 `FORCE_COLOR=1` 让 accent/warn SGR 稳定可断言;
+  `strictsleep:N`/`wait:PATTERN:N`/`waitbytes:ESC:N`/`resize:RxC`/`resize-now:RxC`)。锁 `FORCE_COLOR=1` 让 accent/warn SGR 稳定可断言;
   默认 `METACODES_NO_STARTUP_ANIMATION=1` 关掉启动动画(布局类用例断言的是它之后的画面),
   `test_startup_splash` 经 env 参数传 `None` 打开。
   **等待语义(事件+上限结合)**:`sleep:N` 是 settle 睡眠——至多 N 秒,输出流静默 0.8s 即提前返回
