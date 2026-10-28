@@ -320,11 +320,11 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, startup: Startup) !v
                 // The screen restarts at the banner with the command under it.
                 cmd_output.dropEcho();
                 cmd_output.end();
-                std.debug.print("\x1b[2J\x1b[H", .{});
+                turn_host.region.?.resetScreen();
                 printBanner(app);
                 if (renderEcho(app, trimmed)) |echo| {
                     defer std.heap.c_allocator.free(echo);
-                    std.debug.print("{s}", .{echo});
+                    turn_host.region.?.emitScrollback(echo);
                 }
             } else {
                 cmd_output.print("Started a new session with empty context.\n", .{});
@@ -585,7 +585,7 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, startup: Startup) !v
                     // what it restored.
                     cmd_output.dropEcho();
                     cmd_output.end();
-                    std.debug.print("\x1b[2J\x1b[H", .{});
+                    turn_host.region.?.resetScreen();
                     printBanner(app);
                     replayConversation(app, allocator, turn_host.region.?);
                     beginCommandBlock(app, trimmed);
@@ -2097,8 +2097,7 @@ fn readLineRaw(
                     continue;
                 },
                 .redraw_screen => {
-                    region.clear();
-                    region.emitTerminal("\x1b[2J\x1b[H");
+                    region.resetScreen();
                     redraw(region, &editor, app);
                     continue;
                 },

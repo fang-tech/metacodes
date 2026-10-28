@@ -313,6 +313,7 @@ pub const tui_ui_state = @import("repl/tui/ui_state.zig");
 pub const tui_ui = @import("repl/tui/ui.zig");
 pub const tui_event = @import("repl/tui/event.zig");
 pub const tui_theme = @import("repl/tui/theme.zig");
+pub const tui_term = @import("repl/tui/term.zig");
 pub const tool_card = @import("repl/tui/widget/tool_card.zig");
 pub const tui_test_capture = @import("repl/tui/test_capture.zig");
 pub const repl_input = @import("repl/input.zig");

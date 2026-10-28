@@ -242,6 +242,39 @@ def test_empty_esc_and_ctrl_c_interrupt_generation(bin_path):
         assert b"Interrupted" in raw, f"空框 {key} 没有中断慢请求"
 
 
+def test_ctrl_l_while_generating_resets_the_screen_in_one_frame(bin_path):
+    """Ctrl+L during a reply goes through RenderRegion.resetScreen under the
+    render lock: the region is erased, ED 2 clears the screen and the region
+    is drawn again on the top row, in one DEC 2026 frame. The watcher used to
+    send ED 2 straight to fd 2, outside the lock and between two frames
+    (doc/TUI_VIEWPORT_OWNERSHIP.md)."""
+    from tty_driver import IS_WINDOWS, wait_for
+    from slow_mock_server import SlowMockServer, slow_text_then_end
+
+    with SlowMockServer([slow_text_then_end(n_chunks=12, delay=0.25)]) as srv:
+        raw = run(bin_path, [
+            "sleep:0.8", "type:clear while generating", "key:enter",
+            wait_for("esc to interrupt"), "strictsleep:0.4",
+            "key:ctrl_l", wait_for("tok11", 20), "sleep:1.0",
+        ], base_url=srv.url, startup_drain=0.8, per_key_drain=0.05)
+
+    a = TTYAssert(raw)
+    assert b"\x1b[3J" not in raw, "Ctrl+L must not wipe the scrollback (ED 3)"
+    if a.final.find_row("❯ clear while generating") is not None:
+        a._fail("Ctrl+L should have cleared the submission's echo off the screen")
+    if a.final.find_last_row("tok11") is None:
+        a._fail("the reply did not continue after Ctrl+L")
+    a.assert_single_box()
+    # ConPTY re-renders the screen itself; the bytes are only metacodes' own on a pty.
+    if not IS_WINDOWS:
+        ed2 = raw.find(b"\x1b[2J")
+        assert ed2 >= 0, "Ctrl+L sent no ED 2"
+        opened = raw.rfind(b"\x1b[?2026h", 0, ed2)
+        assert opened >= 0 and raw.rfind(b"\x1b[?2026l", 0, ed2) < opened, "ED 2 was sent outside a synchronized frame"
+        closed = raw.find(b"\x1b[?2026l", ed2)
+        assert b"esc to interrupt" in raw[ed2:closed], "the region was not drawn again in the reset's frame"
+
+
 def test_completion_spinner_never_commits_to_history(bin_path):
     # 用户实测 bug:每次回答完,spinner 的完成态词("✻ Hatched for 1s" / "Cooked for 1s" / "Drafted
     # for 2s")被 commit 进**历史消息区**,多轮后一行行堆噪声。产品决策:**spinner 根本不该进历史区**
@@ -362,9 +395,12 @@ def test_A6_narrow_terminal_no_wrap(bin_path):
               term_size=(24, 40), per_key_drain=0.05)
     a = TTYAssert(raw, rows=24, cols=40)
     bad = []
-    for sc in a.frame_screens:
-        if sc.find_last_row("esc to interrupt") is None:
-            continue  # 只看生成期帧
+    # 只看生成期帧。40 列下 footer 被截断(`⏵⏵ bypass permissions on (shift+t…`),
+    # 'esc to interrupt' 不会出现,按 spinner 行的 '…' 认生成期帧。
+    gens = _gen_frames(a)
+    if not gens:
+        a._fail("没有捕获到生成期帧")
+    for sc in gens:
         for r in range(sc.rows):
             if str_width(sc.line_text(r)) > 40:
                 bad.append((r, sc.line_text(r)))

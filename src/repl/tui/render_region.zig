@@ -135,14 +135,18 @@ pub const RenderRegion = struct {
     /// 边界(endScrollLine、leaveGenerating)收集缓冲残行时置位:emitToScroll 只攒不画,
     /// 边界自己画一帧。
     hold_paint: bool = false,
-    /// 测试捕获:非 null 时 flush 写这里而不写终端。生产路径恒 null。
-    sink: ?*std.Io.Writer = null,
     /// 生成期输入框内容的 region 自有副本。watcher 的 LineEditor 缓冲会在下一个键时重分配,
     /// 而区可能由别的线程(agent 主线程的文本帧、合并窗口的定时线程)在那之前画:借用它就会
     /// 读到已释放的内存。生成期的 Interaction.editor 借用的是这份副本(持锁写)。
     gen_editor: std.ArrayList(u8) = .empty,
 
     mutex: sync.Mutex = .{},
+
+    /// Where flushed bytes go. Null in the product: stderr through
+    /// std.debug.print (the stderr lock, see the module header). Component
+    /// tests point it at a buffer and replay the bytes through a virtual
+    /// terminal (tests/component/vterm.zig).
+    sink: ?*std.Io.Writer = null,
 
     fn lock(self: *RenderRegion) void {
         _ = self.mutex.lock();
@@ -588,12 +592,12 @@ pub const RenderRegion = struct {
         self.scratch.writer.end = 0;
     }
 
-    /// 把 scratch 已写字节一次性输出(走 std.debug.print → lockStdErr)。
+    /// 把 scratch 已写字节一次性输出(走 std.debug.print → lockStdErr;设了 sink 则写 sink)。
     fn flush(self: *RenderRegion) void {
         const bytes = self.scratch.written();
         if (bytes.len == 0) return;
-        if (self.sink) |s| {
-            s.writeAll(bytes) catch {};
+        if (self.sink) |out| {
+            out.writeAll(bytes) catch {};
             return;
         }
         std.debug.print("{s}", .{bytes});
@@ -1282,9 +1286,20 @@ pub const RenderRegion = struct {
     /// 其余文字 dim。token 用量走 /cost,不进 footer。
     fn drawFooter(self: *RenderRegion, w: *std.Io.Writer, app: *const app_mod.App) void {
         const th = self.theme;
+        // The footer is the region's last row and must never wrap: an
+        // autowrapping terminal (every real one) spills a longer line onto rows
+        // the region does not count, and at the bottom of the screen that
+        // scroll pushes the region's top rows into the scrollback for good.
+        // Everything stays inside cols - 1, like the MCP notice below.
+        var room: usize = if (self.cols > 1) self.cols - 1 else 0;
         // An armed exit press takes the whole footer line (Claude Code).
         if (self.exitHint()) |text| {
-            w.print("{s} {s}{s}", .{ th.dim, text, th.reset }) catch {};
+            w.writeAll(th.dim) catch {};
+            if (room > 0) {
+                w.writeAll(" ") catch {};
+                _ = writeClippedWidth(w, text, room - 1);
+            }
+            w.writeAll(th.reset) catch {};
             return;
         }
         const sb = @import("widget/status_bar.zig");
@@ -1355,11 +1370,11 @@ pub const RenderRegion = struct {
         // (对齐 cc:footer 行只左对齐文案;token 用量走 /cost)。
         if (show_mode) {
             w.writeAll(sb.modeColor(th, mode_pm)) catch {};
-            w.writeAll(mode_plain) catch {};
+            room -= writeClippedWidth(w, mode_plain, room);
             w.writeAll(th.reset) catch {};
         }
         w.writeAll(th.dim) catch {};
-        w.writeAll(hint) catch {};
+        room -= writeClippedWidth(w, hint, room);
         w.writeAll(th.reset) catch {};
 
         // MCP servers connecting in the background, then the ones that
@@ -1771,6 +1786,55 @@ pub const RenderRegion = struct {
             self.frame_active = false;
             w.writeAll(ansi.sync.end) catch {};
             self.flush();
+        }
+    }
+
+    /// Ctrl+L, `/clear` and `/resume` start the visible screen over: erase the
+    /// region the way its phase drew it, then ED 2 and home, in one DEC 2026
+    /// frame. A generating region is drawn again in the same frame; the input
+    /// box stays erased until the caller renders it (Ctrl+L) or the next read
+    /// does (`/clear`, `/resume` print first). ED 2 clears the screen and
+    /// leaves the scrollback in place; ED 3 would wipe it, the user's history
+    /// from before the session included, and is never sent. This is the one
+    /// place in src/repl that erases more than ED 0 (doc/TUI_VIEWPORT_OWNERSHIP.md).
+    pub fn resetScreen(self: *RenderRegion) void {
+        self.lock();
+        defer self.unlock();
+        // Text the merge window still holds arrived before the reset: it goes
+        // out first (with the region hidden), not onto the cleared screen (#328).
+        self.paintLocked(.hidden, "");
+        self.resetScratch();
+        self.scratch.writer.writeAll(ansi.sync.begin) catch {};
+        self.frame_active = true;
+        self.resetScreenInFrame();
+        self.frame_active = false;
+        self.scratch.writer.writeAll(ansi.sync.end) catch {};
+        self.flush();
+        // The reset redrew the generating region with the current state, which
+        // is what a pending frame would have shown.
+        if (self.inGeneration()) {
+            self.region_dirty = false;
+            if (self.merge) |*m| m.sched.painted(m.now_ms());
+        }
+    }
+
+    fn resetScreenInFrame(self: *RenderRegion) void {
+        if (self.inGeneration()) {
+            self.observeResize(); // the climb counts rows at the current width
+            self.eraseRegion();
+        } else {
+            self.clearInner();
+        }
+        self.scratch.writer.writeAll(ansi.clear.screen_and_home) catch {};
+        // The half-line went with the screen. Continuing it would start the
+        // next text at the old column of an empty top row.
+        self.text_pending_newline = false;
+        self.pending_col = 0;
+        self.region_drawn_pending_nl = false;
+        self.region_drawn_pending_col = 0;
+        self.resize_seal_pending = false;
+        if (self.inGeneration()) {
+            if (self.gen_app) |a| self.drawGenRegion(a);
         }
     }
 
@@ -2956,8 +3020,8 @@ test "input-phase clear walks up the tracked rows and erases with ED0" {
     const up_at = std.mem.indexOf(u8, out, "\x1b[2A") orelse return error.TestExpectedEqual;
     const ed_at = std.mem.indexOf(u8, out, ansi.clear.to_end_of_screen) orelse return error.TestExpectedEqual;
     try std.testing.expect(up_at < ed_at);
-    try std.testing.expect(std.mem.indexOf(u8, out, ansi.cursor.save) == null);
-    try std.testing.expect(std.mem.indexOf(u8, out, ansi.cursor.restore) == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\x1b7") == null); // DECSC
+    try std.testing.expect(std.mem.indexOf(u8, out, "\x1b8") == null); // DECRC
     try std.testing.expect(std.mem.indexOfScalar(u8, out, '\n') == null);
     try std.testing.expectEqual(@as(u16, 0), r.anchor.rows_above);
     try std.testing.expectEqual(@as(u16, 0), r.prev_rows);
@@ -2979,10 +3043,62 @@ test "generation erase walks up from the edit row, clears with ED0, returns to t
     const ed_at = std.mem.indexOf(u8, out, ansi.clear.to_end_of_screen) orelse return error.TestExpectedEqual;
     const back_at = std.mem.indexOf(u8, out, "\x1b[1A\r\x1b[7C") orelse return error.TestExpectedEqual;
     try std.testing.expect(up_at < ed_at and ed_at < back_at);
-    try std.testing.expect(std.mem.indexOf(u8, out, ansi.cursor.save) == null);
-    try std.testing.expect(std.mem.indexOf(u8, out, ansi.cursor.restore) == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\x1b7") == null); // DECSC
+    try std.testing.expect(std.mem.indexOf(u8, out, "\x1b8") == null); // DECRC
     try std.testing.expect(std.mem.indexOfScalar(u8, out, '\n') == null);
     try std.testing.expect(!r.region_drawn);
+}
+
+// Ctrl+L while a reply streams used to send ED 2 straight to fd 2, outside the
+// render lock, and keep the half-line: the next text started at the old column
+// of an empty top row. The reset now erases the region first, clears in the
+// same frame, and drops the continuation with the text it pointed at.
+test "a screen reset during generation erases the region, then ED2, and drops the half line" {
+    var r = RenderRegion.init(std.testing.allocator, -1, theme_mod.select(.dark, .none), .none);
+    defer r.deinit();
+    r.changePhaseLocked(.{ .generating = .{} });
+    r.region_drawn = true;
+    r.prev_rows = 6;
+    r.anchor = .{ .rows_above = 3 };
+    r.text_pending_newline = true;
+    r.pending_col = 9;
+    r.region_drawn_pending_nl = true;
+    r.region_drawn_pending_col = 9;
+    r.frame_active = true;
+    r.resetScreenInFrame();
+    const out = r.scratch.written();
+    const up_at = std.mem.indexOf(u8, out, "\x1b[3A") orelse return error.TestExpectedEqual;
+    const ed0_at = std.mem.indexOf(u8, out, ansi.clear.to_end_of_screen) orelse return error.TestExpectedEqual;
+    try std.testing.expect(up_at < ed0_at);
+    try std.testing.expect(std.mem.endsWith(u8, out, "\x1b[2J\x1b[H"));
+    try std.testing.expect(std.mem.indexOf(u8, out, "\x1b[3J") == null); // never the scrollback
+    try std.testing.expect(!r.region_drawn);
+    try std.testing.expect(!r.text_pending_newline);
+    try std.testing.expectEqual(@as(u16, 0), r.pending_col);
+    try std.testing.expect(!r.region_drawn_pending_nl);
+    try std.testing.expectEqual(@as(u16, 0), r.region_drawn_pending_col);
+    try std.testing.expect(!r.resize_seal_pending);
+}
+
+test "a screen reset at the input box erases it like clear, then ED2" {
+    var r = RenderRegion.init(std.testing.allocator, -1, theme_mod.select(.dark, .none), .none);
+    defer r.deinit();
+    r.prev_rows = 5;
+    r.anchor = .{ .rows_above = 2 };
+    r.visible = true;
+    r.frame_active = true;
+    r.resetScreenInFrame();
+    const out = r.scratch.written();
+    const up_at = std.mem.indexOf(u8, out, "\x1b[2A") orelse return error.TestExpectedEqual;
+    const ed0_at = std.mem.indexOf(u8, out, ansi.clear.to_end_of_screen) orelse return error.TestExpectedEqual;
+    try std.testing.expect(up_at < ed0_at);
+    try std.testing.expect(std.mem.endsWith(u8, out, "\x1b[2J\x1b[H"));
+    try std.testing.expectEqual(@as(u16, 0), r.prev_rows);
+    try std.testing.expect(!r.visible);
+    // Already erased (a command ran after the read): only the screen is cleared.
+    r.resetScratch();
+    r.resetScreenInFrame();
+    try std.testing.expectEqualStrings("\x1b[2J\x1b[H", r.scratch.written());
 }
 
 // A frame drawn at 100 columns: its top rule is 99 wide. At 60 columns a

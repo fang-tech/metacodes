@@ -132,7 +132,8 @@ def test_T13_resize_during_generation_keeps_stream_and_region_aligned(bin_path):
     # spinner still says "esc to interrupt") must use the new width too.
     import re
     from asserts import split_frames
-    gen_frames = [c for k, c in split_frames(raw) if k == "frame" and b"esc to interrupt" in c]
+    # At 60 columns the 65-column bypass-mode footer is cut (`… · esc to in…`), so match its head.
+    gen_frames = [c for k, c in split_frames(raw) if k == "frame" and b" \xc2\xb7 esc to" in c]
     if not gen_frames:
         a._fail("没有捕获到生成期固定区帧")
     runs = [len(m.group(0)) // 3 for m in re.finditer(rb"(?:\xe2\x94\x80)+", gen_frames[-1])]

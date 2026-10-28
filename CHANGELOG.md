@@ -10,6 +10,28 @@ status, compatibility boundaries, and entry points are defined by
 
 ## Unreleased
 
+### Added
+
+- **The TUI's screen ownership is written down and enforced** (#332, #320).
+  [doc/TUI_VIEWPORT_OWNERSHIP.md](doc/TUI_VIEWPORT_OWNERSHIP.md) records who
+  may write past the inline region and how: the scrollback only through the
+  Renderer, erase/print/redraw in pairs inside one frame, the half-line
+  snapshot taken at draw time, ED 0 only, no saved cursor, and the review
+  checklist. `zig build test:scrollback` (part of `zig build test`) fails on
+  `ESC[1J`/`[2J`/`[3J` outside `tui/ansi.zig`, a wide erase outside
+  `resetScreen`, any cursor save/restore, and a direct terminal write from a
+  function in `src/repl/` that is not listed with its reason. The unused
+  DECSC/DECRC constants left `ansi.zig`, and `src/repl/statusline.zig`, which
+  no build imported, is gone with its direct write to stderr.
+- A virtual terminal for component tests (`tests/component/vterm.zig`, a Zig
+  port of `tests/tty/screen.py` pinned to it by golden vectors, with bounded
+  scrollback content) and the first tests that drive the real render region
+  through it: emit/erase pairing, half-line continuation, phase hand-off,
+  narrow strict-autowrap terminals (#319); and convergence of the streamed
+  assistant markdown under token, line, byte, every-single-cut and seeded
+  random chunkings, tables cut mid-row or never confirmed, with and without
+  the live region redrawn between chunks (#318).
+
 ### Changed
 
 - **The TUI's turn phase now owns every widget it opens (#330).** The agent
@@ -37,6 +59,32 @@ status, compatibility boundaries, and entry points are defined by
   WebSearch result line is always painted before its card goes. The end of
   each provider turn is now one synchronized frame instead of three writes,
   and a resize while the region was hidden no longer printed a blank line.
+
+### Fixed
+
+- **Ctrl+L during a reply clears the screen through the renderer** (#320).
+  The keyboard watcher sent `ESC[2J` straight to the terminal, outside the
+  render lock and between two frames, while the agent loop could be printing,
+  and kept the half-line continuation whose text the clear had just removed.
+  Ctrl+L, `/clear` and `/resume` now share `RenderRegion.resetScreen`: it
+  erases the region, clears the screen and, during a reply, draws the region
+  again on the top row, in one synchronized frame, and drops the
+  continuation. The scrollback is never wiped (no `ESC[3J`).
+- **Code blocks in a streamed reply are highlighted for their fence's
+  language.** The live markdown renderer kept the language as a slice of the
+  line buffer the reply streams through; by the block's first code line that
+  buffer had been shifted to the next line (and sometimes reallocated), so
+  the slice read other bytes and blocks were highlighted with the generic
+  keyword set (a Python `lambda` or `None` stayed plain). The renderer now
+  keeps its own copy of the language name.
+- **The footer no longer wraps on a narrow terminal.** The mode and key-hint
+  line (`⏵⏵ accept edits on (shift+tab to cycle) · esc to interrupt`) was
+  never cut to the terminal width. On a terminal narrower than it, the
+  terminal wrapped it onto rows the input box does not count, and with the
+  box at the bottom of the screen every redraw pushed the spinner, border
+  and prompt rows into the scrollback. It is now cut with an ellipsis, like
+  the MCP notice on the same line.
+
 
 ## 0.8.1 — 2026-10-28
 

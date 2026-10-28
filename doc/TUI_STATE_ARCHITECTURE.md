@@ -2,6 +2,7 @@
 
 > 来源:2026-06-05 session。用户连续指出 cc-zig TUI 的架构病根(Ctrl+O 是旁路非视图、状态流转无法测试、加 CC 功能靠散点硬接线),决策做**状态驱动架构重构**。本文是目标架构设计 + 分阶段迁移计划。
 > 关联设计文档:[UI_DECOUPLE_BACKEND_FRAMEWORK](UI_DECOUPLE_BACKEND_FRAMEWORK.md)、[CORE_REFERENCE](CORE_REFERENCE.md)。早期 TUI 设计稿(TUI_DESIGN、UI_LAYER_DESIGN、TUI_ALIGNMENT 等)已随过程文档清理移出仓库,见 git 历史。
+> 本文管"UI 状态怎么算";"屏幕和 scrollback 上每个字节归谁、谁能擦"(Renderer 独占 scrollback 写入、erase/print/redraw 成对、半行续接快照、只用 ED 0、不用 DECSC/DECRC)见 ADR [TUI_VIEWPORT_OWNERSHIP](TUI_VIEWPORT_OWNERSHIP.md),由 `zig build test:scrollback` 执行。
 > 状态:设计稿(2026-06-05),供逐阶段实施依据;§8 阶段所有权(#330)已落地(2026-10-28),§1 字段树按现状更新。
 
 ## §0 病根(为何重构)
