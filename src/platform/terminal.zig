@@ -152,11 +152,20 @@ pub fn replayInput(fd: c_int, bytes: []const u8) usize {
 /// How many times input the terminal had received was thrown away: a POSIX
 /// mode switch with TCSAFLUSH, or `discardPendingInput`. A reader holding the
 /// first half of a sequence compares two counts to learn that its second
-/// half may be gone.
+/// half may be gone. A discard that found nothing queued does not count: the
+/// half still to come cannot have gone with it (the startup splash enters raw
+/// mode right after the probe, before a late tail arrives). Queued input is
+/// what `poll` reports, which in canonical mode is only a whole line; the
+/// reader this is for keeps the terminal non-canonical.
 var g_discards = std.atomic.Value(u32).init(0);
 
 pub fn discardCount() u32 {
     return g_discards.load(.acquire);
+}
+
+/// Whether a discard on `fd` now throws input away.
+fn hasQueuedInput(fd: c_int) bool {
+    return waitTerminal(fd, 0) > 0;
 }
 
 fn replayOwed(fd: c_int) []const u8 {
@@ -290,7 +299,7 @@ fn waitTerminal(fd: c_int, timeout_ms: i32) i32 {
 /// them from the terminal and owes them to the input parser, they are not
 /// pending there.
 pub fn discardPendingInput(fd: c_int) void {
-    _ = g_discards.fetchAdd(1, .acq_rel);
+    if (hasQueuedInput(fd)) _ = g_discards.fetchAdd(1, .acq_rel);
     if (is_windows and fd == 0) {
         const h = GetStdHandle(STD_INPUT_HANDLE);
         var mode: win.DWORD = 0;
@@ -440,8 +449,9 @@ fn enterRawWith(fd: c_int, pending: PendingInput) ?SavedMode {
     raw.iflag.ISTRIP = false;
     raw.cc[@intFromEnum(std.c.V.MIN)] = 1;
     raw.cc[@intFromEnum(std.c.V.TIME)] = 0;
+    const discards = pending == .discard and hasQueuedInput(fd);
     if (std.c.tcsetattr(fd, tcsaction(pending), &raw) != 0) return null;
-    if (pending == .discard) _ = g_discards.fetchAdd(1, .acq_rel);
+    if (discards) _ = g_discards.fetchAdd(1, .acq_rel);
     return orig;
 }
 
@@ -510,8 +520,8 @@ fn restoreModeWith(fd: c_int, saved: SavedMode, pending: PendingInput) void {
         // stdin 文本/二进制模式还原(0/-1 = 未记录或失败——不动)。
         if (saved.stdin_fmode > 0) _ = _setmode(0, saved.stdin_fmode);
     } else {
-        _ = std.c.tcsetattr(fd, tcsaction(pending), &saved);
-        if (pending == .discard) _ = g_discards.fetchAdd(1, .acq_rel);
+        const discards = pending == .discard and hasQueuedInput(fd);
+        if (std.c.tcsetattr(fd, tcsaction(pending), &saved) == 0 and discards) _ = g_discards.fetchAdd(1, .acq_rel);
     }
 }
 
@@ -575,11 +585,15 @@ test "discardPendingInput drops readable bytes and never waits" {
     defer _ = std.c.close(fds[1]);
     try std.testing.expectEqual(@as(isize, 5), std.c.write(fds[1], "hello", 5));
     try std.testing.expect(waitReadable(fds[0], 0) > 0);
+    const before = discardCount();
     discardPendingInput(fds[0]);
     try std.testing.expectEqual(@as(i32, 0), waitReadable(fds[0], 0));
-    // Nothing pending: it returns at once instead of blocking on the read end.
+    try std.testing.expectEqual(before + 1, discardCount());
+    // Nothing pending: it returns at once instead of blocking on the read end,
+    // and threw nothing away.
     discardPendingInput(fds[0]);
     try std.testing.expectEqual(@as(i32, 0), waitReadable(fds[0], 0));
+    try std.testing.expectEqual(before + 1, discardCount());
 }
 
 fn resetReplayForTesting() void {

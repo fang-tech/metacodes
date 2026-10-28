@@ -234,6 +234,30 @@ def test_late_answers_do_not_skip_the_splash(bin_path):
     assert "62;22c" not in screen
 
 
+SPLASH_FIRST_FRAME = "waitbytes:\\x1b[?25l\\x1b[?2026h\\r:30"
+
+
+def test_a_cut_answer_completed_during_the_splash_is_dropped_whole(bin_path):
+    _posix_only()
+    # The deadline falls inside DA1: `ESC[?62;` arrives in time, `22c` while the splash plays,
+    # then a key ends the splash. The splash entered raw mode (TCSAFLUSH) before `22c` came,
+    # on an empty queue; counted as a discard that may have taken the tail, it made the
+    # answer be given up, and `22c` was typed into the prompt.
+    raw = _slow_startup(bin_path, [
+        QUERY_SENT,
+        "raw:\\x1b[?62;",
+        SPLASH_FIRST_FRAME,
+        "strictsleep:0.3",
+        "raw:22c",
+        "strictsleep:0.3",
+        "raw:ls",
+        wait_for("❯ ls"),
+    ], _unknown_terminal(METACODES_NO_STARTUP_ANIMATION=None), term_size=(30, 100))
+    a, screen = _screen_sized(raw, 30, 100)
+    a.assert_input_echo("ls")
+    assert b"22c" not in raw, "the tail of the cut answer was echoed:\n" + screen
+
+
 def test_a_flood_typed_after_a_timed_out_round_does_not_crash(bin_path):
     _posix_only()
     # The probe gave up (nothing answers); then more is typed during startup than stdin's
