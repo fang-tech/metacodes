@@ -37,6 +37,7 @@ test {
     _ = @import("component/agent_session_runtime_config_test.zig");
     _ = @import("component/agent_session_credential_test.zig");
     _ = @import("component/wire_contract_test.zig");
+    _ = @import("component/frontend_capabilities_test.zig");
     _ = @import("component/session_host_test.zig");
     _ = @import("component/skill_fork_test.zig");
     _ = @import("component/sealed_skill_test.zig");

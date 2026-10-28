@@ -198,6 +198,7 @@ pub const protocol = struct {
     pub const ui_event = @import("core/protocol/ui_event.zig"); // CoreEvent, UiEvent, ConfigChange
     pub const ui_request = @import("core/protocol/ui_request.zig"); // UiRequest, UiResponse, UiRequestFn
     pub const wire = @import("core/protocol/wire.zig"); // versioned JSON lines for out-of-process Hosts
+    pub const frontend_capabilities = @import("core/protocol/frontend_capabilities.zig"); // what a cross-process frontend renders; request routing
     pub const PermissionChoice = @import("core/protocol/permission_choice.zig").PermissionChoice;
     pub const CHAT_SENTINEL = @import("core/protocol/chat_sentinel.zig").CHAT_SENTINEL;
 };
