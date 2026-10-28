@@ -12,6 +12,16 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Added
 
+- **CI reports the footprint red lines** (#303). The Linux and macOS `release`
+  legs of `ci.yml` run `scripts/perf_baseline.sh --build` (ReleaseSmall binary
+  size, warm `--help` start, idle peak RSS; `doc/PERF_MEMORY_PRINCIPLES.md` §2)
+  and write its output to the job summary. The step is report-only: a line
+  over its limit marks it failed with a warning, and the leg stays green until
+  a few weeks of numbers decide whether it becomes blocking. The script's
+  warm-start line measured nothing before: the timed `--help` output landed
+  in the captured number. It now times in microseconds and shows 0.1 ms, where
+  whole milliseconds had read a 0.6 ms start as 0 ms. An RSS of 0 KB without
+  `/usr/bin/time`, or a start it could not time, no longer passes either.
 - **The TUI's screen ownership is written down and enforced** (#332, #320).
   [doc/TUI_VIEWPORT_OWNERSHIP.md](doc/TUI_VIEWPORT_OWNERSHIP.md) records who
   may write past the inline region and how: the scrollback only through the
