@@ -1,0 +1,11 @@
+{"v":1,"type":"capabilities","ui_requests":["permission","ask_question"],"custom":["video_timeline@1","diff_review@2"],"events":["text_chunk","tool_result","stream_done"]}
+{"v":1,"type":"capabilities","ui_requests":["permission","form"],"custom":["video_timeline@1","video_timeline@1"],"events":["text_chunk","hologram"],"extensions":{"x":1}}
+{"v":1,"type":"capabilities","ui_requests":[]}
+{"v":2,"type":"capabilities","ui_requests":["permission","ask_question"]}
+{"type":"capabilities","ui_requests":["permission"]}
+["capabilities"]
+{"v":1,"type":"hello","ui_requests":[]}
+{"v":1,"type":"capabilities","ui_requests":"permission"}
+{"v":1,"type":"capabilities","ui_requests":["custom"]}
+{"v":1,"type":"capabilities","ui_requests":[],"custom":["video_timeline"]}
+{"v":1,"type":"capabilities","ui_requests":["x","x","x","x","x","x","x","x","x","x","x","x","x","x","x","x","x","x","x","x","x","x","x","x","x","x","x","x","x","x","x","x","x"]}

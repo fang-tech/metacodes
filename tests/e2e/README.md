@@ -29,6 +29,19 @@ zig build && bash tests/e2e/daemon_serve_e2e.sh && bash tests/e2e/daemon_serve_m
 恢复、`--sessions 0`、`--max-sessions` 的 429,#254)、SIGINT 关停。端口全由内核分配,HOME 与
 state root 临时,TinyKG autostart 关,共用 `daemon_e2e_lib.sh`。
 
+前端能力交换(doc/WIRE_PROTOCOL.md §2)另有一个跨进程 e2e,纯 Python + HTTP,所以每个平台的
+`zig build test:product` 都跑:
+
+```bash
+zig build && python3 tests/e2e/frontend_capabilities_e2e.py
+```
+
+脚本本身就是第二进程前端:`POST /capabilities` 声明能渲染什么,读 `/events`、答 `/respond`。
+mock provider 见到 `CAPS_ASK` / `CAPS_WRITE:<path>` 时让模型调 AskUserQuestion / Write。断言:
+未声明照旧通告;v2 帧被拒且不生效;不声明 ask_question 则问题不通告、落 `ui_request_unavailable`、
+回合照常结束;什么都不声明则 Write 的权限请求 unavailable → 拒绝、文件不写;两者都声明后同样的
+请求被通告、作答、文件写入。`CAPS_E2E_DUMP=<file>` 把最终 journal 落盘供复核。
+
 ## 它怎么工作
 
 cc-zig 的 REPL 在**非 tty(stdin 是管道)** 下走 `readLineBuffered` 干净逐行读取,

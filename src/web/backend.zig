@@ -14,6 +14,11 @@
 //! session driver(session.zig)的 {"user_message": "..."} / {"run_done":{...}} 仍是本 web
 //! 宿主自己的信封。浏览器回填的 JSON 由 wire.parseResponse 解析。
 //!
+//! 能力声明(doc/WIRE_PROTOCOL.md §2):前端 POST /capabilities 的帧经 declareCapabilities
+//! 装进 `capabilities` 槽,并把 capabilities_accepted 行落 journal。之后 requester 先路由:
+//! 声明里没有的 kind 不通告,落 ui_request_unavailable 行并立即返 .unavailable。未声明 =
+//! 照旧全部通告。
+//!
 //! 线程性:emit 可能在 agent_loop 线程或工具线程被调(协议契约)——allocator **必须
 //! 线程安全**(production 传 std.heap.c_allocator;单测 std.testing.allocator 自带锁)。
 //! requester 由 agent_loop 线程同步阻塞调用;respond() 由 HTTP 连接线程调——pending
@@ -32,6 +37,7 @@ const usage_mod = @import("../core/usage.zig");
 const journal_mod = @import("../core/event_journal.zig");
 const log = @import("../util/log.zig");
 const wire = @import("../core/protocol/wire.zig");
+const frontend_capabilities = @import("../core/protocol/frontend_capabilities.zig");
 
 const CoreEvent = ui_event.CoreEvent;
 const UiEvent = ui_event.UiEvent;
@@ -64,6 +70,9 @@ pub const WebBackend = struct {
     /// POST /respond 回填的原始 JSON(owned by allocator)。
     response_json: ?[]u8 = null,
 
+    /// 前端声明的能力(POST /capabilities);空 = 未声明,全部通告。
+    capabilities: frontend_capabilities.Slot = .{},
+
     pub fn init(allocator: std.mem.Allocator, journal: *EventJournal) WebBackend {
         return .{ .allocator = allocator, .journal = journal };
     }
@@ -73,6 +82,7 @@ pub const WebBackend = struct {
         if (self.response_json) |r| self.allocator.free(r);
         self.response_json = null;
         self.unlock();
+        self.capabilities.deinit(self.allocator);
     }
 
     fn lock(self: *WebBackend) void {
@@ -95,6 +105,27 @@ pub const WebBackend = struct {
         self.lock();
         defer self.unlock();
         return self.pending_id;
+    }
+
+    /// HTTP 线程:装入前端的能力帧,返回 capabilities_accepted 行(owned by allocator;
+    /// 先装,再把同一行落 journal)。此后发起的请求按它路由;已挂起的不受影响。帧被拒 →
+    /// 返 RefusalError,什么都不变。
+    pub fn declareCapabilities(self: *WebBackend, frame_json: []const u8) wire.DeclareError![]u8 {
+        var accepted = try wire.acceptCapabilities(self.allocator, frame_json);
+        errdefer {
+            accepted.declaration.deinit();
+            self.allocator.free(accepted.line);
+        }
+        const reply = try self.allocator.dupe(u8, accepted.line);
+        errdefer self.allocator.free(reply);
+        try self.capabilities.install(self.allocator, accepted.declaration, accepted.line);
+        self.journal.append(reply);
+        return reply;
+    }
+
+    /// GET /state:当前生效的 capabilities_accepted 行(owned by allocator),未声明 → null。
+    pub fn acceptedCapabilities(self: *WebBackend, allocator: std.mem.Allocator) error{OutOfMemory}!?[]u8 {
+        return self.capabilities.acceptedLine(allocator);
     }
 
     // ── UiBackend:emit / poll ──────────────────────────────────────────────
@@ -127,6 +158,18 @@ pub const WebBackend = struct {
         out: *UiResponse,
     ) anyerror!RequestOutcome {
         const self: *WebBackend = @ptrCast(@alignCast(state));
+
+        // 前端声明过、且不含这个 kind → 不通告、不占 id,立即 unavailable(工具按语义兜底)。
+        switch (self.capabilities.route(req)) {
+            .deliver => {},
+            .unavailable => |reason| {
+                if (wire.writeRequestUnavailable(self.allocator, req, reason)) |line| {
+                    defer self.allocator.free(line);
+                    self.journal.append(line);
+                } else |_| log.warn("web", "dropped ui_request_unavailable (serialize OOM)", .{});
+                return .unavailable;
+            },
+        }
 
         // 注册挂起槽(先注册再 append:浏览器看到 ui_request 时 respond 一定有槽可回填)
         self.lock();

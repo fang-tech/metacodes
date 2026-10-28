@@ -360,6 +360,12 @@ pub fn serializeUiRequest(allocator, req) ![]u8; // 给异步前端投递用
 `tests/fixtures/wire/v1`。`serializeUiRequest` 只是内部 struct 的直译，供挂起持久化使用，
 不是对外契约。
 
+跨进程前端可先发一帧能力声明(`protocol.wire.acceptCapabilities`,规范见
+[WIRE_PROTOCOL.md](WIRE_PROTOCOL.md)):列出它能渲染的 UiRequest kind 和带版本的
+custom kind(`name@major`)。Host 把它装进每个 Session 的 `protocol.frontend_capabilities.Slot`,
+requester 通告前先 `route`:声明里没有的请求不通告，记 `ui_request_unavailable` 并立即返
+`.unavailable`。从未声明的前端照旧收到全部请求；进程内 backend 从不声明，行为不变。
+
 ---
 
 ## 4. 主循环契约:agent_loop.run()

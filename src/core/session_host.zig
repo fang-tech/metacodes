@@ -12,6 +12,12 @@
 //! `transcript.sessionDir` — so each Host does not rebuild them.
 //! Authentication, tenancy, idempotency and the transport stay with the Host.
 //!
+//! A Host whose client opens the channel with a capability frame
+//! (doc/WIRE_PROTOCOL.md §2) hands it to `declareCapabilities`; from then on
+//! a UI request the client cannot render is journaled as
+//! `ui_request_unavailable` and answered `unavailable` without waiting. A
+//! Session whose client never declares announces every request, as before.
+//!
 //! Per Session one driver thread makes every call into the AgentSession.
 //! Submissions and configuration commands share one FIFO, so "set the model,
 //! then send this" happens in that order and only while the Session is idle.
@@ -40,6 +46,7 @@ const EventJournal = @import("event_journal.zig").EventJournal;
 const wire = @import("protocol/wire.zig");
 const ui_request = @import("protocol/ui_request.zig");
 const ui_event = @import("protocol/ui_event.zig");
+const frontend_capabilities = @import("protocol/frontend_capabilities.zig");
 const session_id_mod = @import("session_id.zig");
 const types = @import("../types.zig");
 const prompt_sections = @import("prompt_sections.zig");
@@ -376,6 +383,8 @@ pub const HostedSession = struct {
     pending_request_id: u64 = 0,
     next_request_id: u64 = 1,
     response: ?[]u8 = null,
+    /// What the client declared it renders; empty until `declareCapabilities`.
+    capabilities: frontend_capabilities.Slot = .{},
 
     // Driver-only.
     last_run_id: u64 = 0,
@@ -492,6 +501,24 @@ pub const HostedSession = struct {
         }
         self.response = owned;
         self.ui_ready.broadcast();
+    }
+
+    /// Installs the client's capability frame, replacing any earlier one, and
+    /// journals its `capabilities_accepted` line, which is returned owned by
+    /// `allocator`. Requests made from then on are routed by it; one already
+    /// pending is not. A refused frame changes nothing: reply with
+    /// `wire.writeCapabilitiesRefused`.
+    pub fn declareCapabilities(self: *HostedSession, allocator: std.mem.Allocator, frame_json: []const u8) wire.DeclareError![]u8 {
+        var accepted = try wire.acceptCapabilities(self.gpa, frame_json);
+        errdefer {
+            accepted.declaration.deinit();
+            self.gpa.free(accepted.line);
+        }
+        const reply = try allocator.dupe(u8, accepted.line);
+        errdefer allocator.free(reply);
+        try self.capabilities.install(self.gpa, accepted.declaration, accepted.line);
+        self.journal.append(reply);
+        return reply;
     }
 
     pub fn snapshot(self: *HostedSession, allocator: std.mem.Allocator) error{OutOfMemory}!Snapshot {
@@ -715,6 +742,15 @@ pub const HostedSession = struct {
         out: *ui_request.UiResponse,
     ) anyerror!ui_request.RequestOutcome {
         const self: *HostedSession = @ptrCast(@alignCast(ctx));
+        // A request the client declared it cannot render never waits, not
+        // even behind another prompt.
+        switch (self.capabilities.route(req)) {
+            .deliver => {},
+            .unavailable => |reason| {
+                self.appendLine(wire.writeRequestUnavailable(self.gpa, req, reason));
+                return .unavailable;
+            },
+        }
         self.ui_serial.lock();
         defer self.ui_serial.unlock();
 
@@ -836,6 +872,7 @@ pub const HostedSession = struct {
     }
 
     fn destroyShell(self: *HostedSession) void {
+        self.capabilities.deinit(self.gpa);
         self.journal.deinit();
         self.gpa.free(self.model);
         self.gpa.destroy(self);
