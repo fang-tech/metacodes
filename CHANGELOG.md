@@ -10,6 +10,34 @@ status, compatibility boundaries, and entry points are defined by
 
 ## Unreleased
 
+### Fixed
+
+- **Code blocks in a streamed reply are highlighted for their fence's
+  language.** The live markdown renderer kept the language as a slice of the
+  line buffer the reply streams through; by the block's first code line that
+  buffer had been shifted to the next line (and sometimes reallocated), so
+  the slice read other bytes and blocks were highlighted with the generic
+  keyword set (a Python `lambda` or `None` stayed plain). The renderer now
+  keeps its own copy of the language name.
+- **The footer no longer wraps on a narrow terminal.** The mode and key-hint
+  line (`⏵⏵ accept edits on (shift+tab to cycle) · esc to interrupt`) was
+  never cut to the terminal width. On a terminal narrower than it, the
+  terminal wrapped it onto rows the input box does not count, and with the
+  box at the bottom of the screen every redraw pushed the spinner, border
+  and prompt rows into the scrollback. It is now cut with an ellipsis, like
+  the MCP notice on the same line.
+
+### Tests
+
+- A virtual terminal for component tests (`tests/component/vterm.zig`, a Zig
+  port of `tests/tty/screen.py` pinned to it by golden vectors, with bounded
+  scrollback content) and the first tests that drive the real render region
+  through it: emit/erase pairing, half-line continuation, phase hand-off,
+  narrow strict-autowrap terminals (#319); and convergence of the streamed
+  assistant markdown under token, line, byte, every-single-cut and seeded
+  random chunkings, tables cut mid-row or never confirmed, with and without
+  the live region redrawn between chunks (#318).
+
 ## 0.8.1 — 2026-10-28
 
 ### Fixed
