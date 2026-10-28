@@ -172,6 +172,16 @@ pub const Term = struct {
         try self.screen.feed(rest);
     }
 
+    /// Resize the terminal, as a SIGWINCH would: the screen reflows (or clips)
+    /// what it shows now, and the region sees the new size the next time it
+    /// measures (`RenderRegion.size_override`).
+    pub fn resize(self: *Term, rows: usize, cols: usize, reflow: bool) !void {
+        try self.sync();
+        try self.screen.resize(rows, cols, reflow);
+        self.region.reflows = reflow;
+        self.region.size_override = .{ .rows = @intCast(rows), .cols = @intCast(cols) };
+    }
+
     /// Every byte the region has written so far.
     pub fn written(self: *Term) []const u8 {
         return self.out.written();

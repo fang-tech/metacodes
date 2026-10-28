@@ -147,6 +147,10 @@ pub const RenderRegion = struct {
     /// tests point it at a buffer and replay the bytes through a virtual
     /// terminal (tests/component/vterm.zig).
     sink: ?*std.Io.Writer = null,
+    /// Test seam: the size `measureSize` reports instead of asking the fd.
+    /// Component tests run the region on fd -1, which has no size, so this is
+    /// how they resize it. Null in the product.
+    size_override: ?term.TermSize = null,
 
     fn lock(self: *RenderRegion) void {
         _ = self.mutex.lock();
@@ -465,7 +469,7 @@ pub const RenderRegion = struct {
     }
 
     /// 定时线程做的事:待画帧到期就画掉。返回是否画了(测试关掉线程、按假时钟手动推进)。
-    fn pumpFrame(self: *RenderRegion) bool {
+    pub fn pumpFrame(self: *RenderRegion) bool {
         self.lock();
         defer self.unlock();
         const m = &(self.merge orelse return false);
@@ -633,7 +637,7 @@ pub const RenderRegion = struct {
     }
 
     fn measureSize(self: *RenderRegion) bool {
-        if (term.getSize(self.fd)) |sz| {
+        if (self.size_override orelse term.getSize(self.fd)) |sz| {
             const changed = sz.cols != self.cols or sz.rows != self.rows;
             self.cols = sz.cols;
             self.rows = sz.rows;
