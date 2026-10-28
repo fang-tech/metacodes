@@ -43,7 +43,8 @@ class TTYAssert:
         """resizes:run(resizes=) 记下的 [(字节偏移, rows, cols)]。给了就从起始尺寸回放,
         每个偏移处按终端的做法改尺寸(reflow=True 重排,False 是 xterm 式裁剪),rows/cols
         取最后一项。不给就整条流按 rows×cols 回放——看不到 resize 时终端对旧画面做了什么。
-        Windows 上忽略 resizes:ConPTY 在 conhost 里重排后自己重画整屏,流里已是重排后的样子。
+        Windows 上忽略 resizes:resize 后 ConPTY 的 conhost 自己重画整屏,流里已是终端的样子
+        (它裁剪、不重排已显示的行,所以 metacodes 在 Windows 上按裁剪终端爬行,见 term.reflowFromEnv)。
         autowrap:见 Screen(比终端宽的行在画的那一刻就折行,如比终端还宽的权限框)。"""
         self.raw = raw
         self.autowrap = autowrap

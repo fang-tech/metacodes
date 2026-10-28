@@ -227,6 +227,17 @@ pub fn discardPendingInput(fd: c_int) void {
 
 pub const TermSize = struct { rows: u16, cols: u16 };
 
+/// Whether the console re-wraps the lines it shows when the window narrows,
+/// where the platform decides it rather than the terminal emulator. On POSIX
+/// the emulator decides (null; repl/tui/term.zig reads its environment). On
+/// Windows the output goes through conhost, and the pseudo console the TTY
+/// suite drives (pywinpty, on the CI runners and on Windows 11) clips: after
+/// a narrowing the banner stays one row, and a frame that climbed as if its
+/// rows had been re-wrapped went one row too far per resize, erasing the line
+/// above it. A Windows host that does re-wrap is left the old rule's second
+/// half instead, the lesser fault: it erases nothing.
+pub const console_reflows: ?bool = if (is_windows) false else null;
+
 /// 查终端尺寸。非 TTY / 失败 → null。
 pub fn windowSize(fd: c_int) ?TermSize {
     if (is_windows) {
@@ -375,4 +386,12 @@ test "discardPendingInput drops readable bytes and never waits" {
     // Nothing pending: it returns at once instead of blocking on the read end.
     discardPendingInput(fds[0]);
     try std.testing.expectEqual(@as(i32, 0), waitReadable(fds[0], 0));
+}
+
+test "console_reflows: conhost clips on Windows; elsewhere the terminal emulator decides" {
+    if (is_windows) {
+        try std.testing.expectEqual(@as(?bool, false), console_reflows);
+    } else {
+        try std.testing.expectEqual(@as(?bool, null), console_reflows);
+    }
 }

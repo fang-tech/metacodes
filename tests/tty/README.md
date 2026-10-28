@@ -56,7 +56,8 @@ python3 tests/tty/run_tty_tests.py --bin zig-out/bin/metacodes-debug --shard 2/3
   `TTYAssert(raw, resizes=lst)` 从起始尺寸回放、在同一偏移调 `Screen.resize`:默认按现代终端
   (iTerm2、Terminal.app、kitty、xterm.js、tmux……)把软折的行拼成逻辑行再按新宽度重排,
   `reflow=False` 是 xterm / GNU screen 式裁剪;`autowrap=True` 让比终端宽的行在画的那一刻就折行。
-  Windows 上忽略(ConPTY 在 conhost 里重排后自己重画整屏)。
+  Windows 上忽略:resize 后 ConPTY 的 conhost 自己重画整屏;它裁剪、不重排已显示的行,
+  metacodes 在 Windows 上也就按裁剪终端爬行(`term.reflowFromEnv`)。
 - `cases/*.py` —— T01-T13 用例(每个 `def test_*(bin_path)`)。用例自建的临时目录(工作目录、
   指定的 HOME)用 `tty_driver.case_tmpdir(prefix)`,runner 在每个用例结束后删,失败也删;
   缺依赖(replay_server、mock_mcp_server)时 `raise SkipTest`,不要 `return`。

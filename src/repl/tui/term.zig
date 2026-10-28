@@ -117,8 +117,8 @@ pub fn getSize(fd: c_int) ?TermSize {
 // ============================================================================
 
 /// Whether the terminal re-wraps the lines it shows when the window narrows.
-/// Most do (iTerm2, Terminal.app, kitty, Ghostty, WezTerm, Alacritty, VTE,
-/// Windows Terminal, xterm.js, tmux); xterm, GNU screen and the Linux console
+/// Most POSIX terminals do (iTerm2, Terminal.app, kitty, Ghostty, WezTerm,
+/// Alacritty, VTE, xterm.js, tmux); xterm, GNU screen and the Linux console
 /// clip instead. tmux re-wraps whatever runs inside it, so its marker wins over
 /// the outer terminal's. See reflow.zig for what the answer changes.
 pub fn detectReflow(tmux: bool, screen: bool, xterm: bool, term: ?[]const u8) bool {
@@ -129,8 +129,11 @@ pub fn detectReflow(tmux: bool, screen: bool, xterm: bool, term: ?[]const u8) bo
 }
 
 /// detectReflow over the process environment: `TMUX`, GNU screen's `STY`,
-/// xterm's `XTERM_VERSION`, and `TERM`.
+/// xterm's `XTERM_VERSION`, and `TERM`. Where the platform's console decides
+/// (Windows: conhost clips, platform.terminal.console_reflows), the
+/// environment is not consulted.
 pub fn reflowFromEnv() bool {
+    if (platform_term.console_reflows) |reflows| return reflows;
     const term = if (std.c.getenv("TERM")) |t| std.mem.span(t) else null;
     return detectReflow(envSet("TMUX"), envSet("STY"), envSet("XTERM_VERSION"), term);
 }
@@ -266,6 +269,14 @@ test "detectReflow: xterm, GNU screen and the Linux console clip; tmux re-wraps 
     // tmux running in xterm or in screen still re-wraps its own panes.
     try testing.expect(detectReflow(true, false, true, "tmux-256color"));
     try testing.expect(detectReflow(true, true, false, "screen-256color"));
+}
+
+test "reflowFromEnv: the platform's console answer wins over the environment" {
+    const reflows = platform_term.console_reflows orelse return error.SkipZigTest;
+    // Windows: no TMUX, STY, XTERM_VERSION or TERM=linux is set by a console,
+    // so detectReflow alone would answer true.
+    try testing.expectEqual(reflows, reflowFromEnv());
+    try testing.expect(!reflows);
 }
 
 test "displayWidth: ASCII" {

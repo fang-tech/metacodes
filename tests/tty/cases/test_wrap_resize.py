@@ -44,13 +44,18 @@ def _narrow_idle_box(bin_path, env=None, reflow=True):
     """空闲输入框从 100 列分四步缩到 60 列(拖窗口边时一串 SIGWINCH),每步等重画。
 
     回放在每次 resize 的那个字节偏移改尺寸:reflow=True 按现代终端重排已显示的行,
-    False 按 xterm 式裁剪。整条流按最终尺寸回放的话,看不到终端对旧画面做了什么。"""
-    from tty_driver import READY
+    False 按 xterm 式裁剪。整条流按最终尺寸回放的话,看不到终端对旧画面做了什么。
+
+    工作目录是空的临时目录:在 git 仓库里启动,banner 和框之间还有一行按 `git log -1
+    --name-only` 选的 suggestion,有没有它取决于检出(CI 的 depth-1 检出把 HEAD 当根提交、
+    列出全部文件,有;HEAD 是 merge 提交时没有)。"""
+    from tty_driver import READY, case_tmpdir
     resizes = []
     events = [READY]
     for cols in (90, 80, 70, 60):
         events += [f"resize:24x{cols}", "strictsleep:0.5"]
-    raw = run(bin_path, events, term_size=(24, 100), env=env, resizes=resizes)
+    raw = run(bin_path, events, term_size=(24, 100), env=env, resizes=resizes,
+              cwd=case_tmpdir("cc-tty-narrow-"))
     return TTYAssert(raw, resizes=resizes, reflow=reflow)
 
 
