@@ -17,7 +17,11 @@ status, compatibility boundaries, and entry points are defined by
   `x86_64-macos` on its Intel macOS runner (`macos-15-intel`), each natively
   and through the same steps as the other units: both Lean kernels, the
   release-configuration suite, `release:verify`, the AgentCore gate, the CLI
-  and AgentCore SDK archives and the byte-reproducibility check. Releases
+  and AgentCore SDK archives and the byte-reproducibility check. Their
+  executables are built for the baseline CPU and the oldest system they
+  support, glibc 2.31 and macOS 13, not for the runner's CPU and C library:
+  the arm64 unit needs no CPU extension (SVE) that Graviton2, Ampere Altra,
+  Raspberry Pi 5 or Jetson boards lack. Releases
   from the next one on ship five units. `scripts/install.sh` picks them on
   Linux aarch64 and on Intel Macs; in a Rosetta shell on Apple Silicon it
   picks the native arm64 unit instead. The AgentCore Rust link probe and

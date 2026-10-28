@@ -191,7 +191,11 @@ kernels link the Lean runtime, GMP and libuv statically; their licence texts
 ship under `share/licenses/` (vendor/lean-runtime/). Every unit is built on a
 hosted runner of its own architecture, because the kernels, `release:verify`
 and the AgentCore gate all run what they build: aarch64-linux on the arm64
-Linux runner, x86_64-macos on the Intel macOS runner (#307). `release/LAYOUT.md`,
+Linux runner, x86_64-macos on the Intel macOS runner (#307). Those two build
+the executable for an explicit target, not the runner's own: the baseline CPU
+and the oldest C library or OS they support (`aarch64-linux-gnu.2.31`,
+`x86_64-macos.13.0`), so the unit runs on the boards and Macs it is for rather
+than only on machines like the runner. `release/LAYOUT.md`,
 `release/manifest.schema.json` and `scripts/verify_install_prefix.py` list the
 kernels and `tinykgd` as required runtime assets.
 

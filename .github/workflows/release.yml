@@ -58,6 +58,18 @@ jobs:
       # hosted arm64 Linux runner, x86_64-macos on its Intel macOS runner
       # (macos-13 is retired; macos-15-intel is the oldest Intel image GitHub
       # still hosts, and few Intel Macs run macOS 26).
+      #
+      # cli_target: the Zig target the CLI unit is built for, where the
+      # runner's own would not run on the target's machines. Without
+      # -Dtarget the executable is built for the runner's CPU and C library:
+      # the x86_64 Linux runner's build carries AVX-512 instructions and needs
+      # GLIBC_2.36. An explicit target means the baseline CPU, and its version
+      # suffix is the oldest glibc or macOS the unit runs on. The arm64 unit is
+      # for the Graviton, Ampere, Raspberry Pi 5 and Jetson boards #307 names:
+      # no SVE, and glibc 2.31 (Ubuntu 20.04, Debian 11). The Intel macOS unit
+      # runs on macOS 13 and any Intel Mac's CPU. release:verify still runs the
+      # unit, since the target keeps the runner's OS, architecture and ABI.
+      # The rows without it are built as they always were.
       matrix:
         include:
           - os: Linux
@@ -68,6 +80,7 @@ jobs:
             arch: ARM64
             runner: ubuntu-24.04-arm
             zig_target: aarch64-linux-gnu
+            cli_target: aarch64-linux-gnu.2.31
           - os: macOS
             arch: ARM64
             runner: macos-latest
@@ -76,7 +89,10 @@ jobs:
             arch: X64
             runner: macos-15-intel
             zig_target: x86_64-macos
+            cli_target: x86_64-macos.13.0
     runs-on: ${{ matrix.runner }}
+    env:
+      CLI_TARGET: ${{ matrix.cli_target && format('-Dtarget={0}', matrix.cli_target) || '' }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -141,7 +157,7 @@ jobs:
       - name: Full suite in release configuration
         run: zig build test -Doptimize=ReleaseSafe --test-timeout 5m -Dlean-kernels=on
       - name: Stage, manifest and verify the release unit
-        run: zig build release:verify -Drelease-layout=true -Doptimize=ReleaseSafe --prefix "$RUNNER_TEMP/release" $KERNEL_PINS
+        run: zig build release:verify -Drelease-layout=true -Doptimize=ReleaseSafe --prefix "$RUNNER_TEMP/release" $KERNEL_PINS $CLI_TARGET
       - name: Installed prefix matches the release layout
         run: python3 scripts/verify_install_prefix.py "$RUNNER_TEMP/release" --release --doctor
       # The same watchdog again, as agentcore-windows.yml runs this gate: at
@@ -150,7 +166,7 @@ jobs:
       - name: AgentCore gate for the native target
         run: zig build agentcore:gate -Dtarget=${{ matrix.zig_target }} -Doptimize=ReleaseSafe --test-timeout 5m
       - name: Archive (CLI unit)
-        run: zig build release:archive -Drelease-layout=true -Doptimize=ReleaseSafe --prefix "$RUNNER_TEMP/release" $KERNEL_PINS -Drelease-archive-dir="$RUNNER_TEMP/dist"
+        run: zig build release:archive -Drelease-layout=true -Doptimize=ReleaseSafe --prefix "$RUNNER_TEMP/release" $KERNEL_PINS $CLI_TARGET -Drelease-archive-dir="$RUNNER_TEMP/dist"
       # What a user does with the archive: scripts/install.sh, then doctor.
       - name: The archive installs
         shell: bash
@@ -162,7 +178,7 @@ jobs:
         run: zig build agentcore:archive -Dtarget=${{ matrix.zig_target }} -Doptimize=ReleaseSafe -Dagentcore-archive-dir="$RUNNER_TEMP/dist"
       - name: Archives are reproducible
         run: |
-          zig build release:archive -Drelease-layout=true -Doptimize=ReleaseSafe --prefix "$RUNNER_TEMP/release" $KERNEL_PINS -Drelease-archive-dir="$RUNNER_TEMP/dist-again"
+          zig build release:archive -Drelease-layout=true -Doptimize=ReleaseSafe --prefix "$RUNNER_TEMP/release" $KERNEL_PINS $CLI_TARGET -Drelease-archive-dir="$RUNNER_TEMP/dist-again"
           cmp "$RUNNER_TEMP"/dist/metacodes-*.tar.gz "$RUNNER_TEMP"/dist-again/metacodes-*.tar.gz
       # What `curl … install.sh | sh` does on this machine: no archive named,
       # so install.sh picks one by the host's target (host_target) from a
