@@ -10,22 +10,27 @@ status, compatibility boundaries, and entry points are defined by
 
 ## Unreleased
 
-### Fixed
-
-- **A provider credential with a byte a request header cannot carry no longer
-  ends the process.** Session create and restore accepted any UTF-8 as
-  `api_key`, and the CLI sent whatever bytes its flag, environment, key file
-  or token response held; a credential with CR LF reached the HTTP client,
-  whose header assertion ended the process at the first request (a panic in
-  ReleaseSafe). Create and restore now apply the rule `update_credential`
-  applies (1 to 16 KiB of printable ASCII): AgentCore returns
-  `INVALID_ARGUMENT` (`RESOURCE_LIMIT` when too long) with a diagnostic that
-  names the rule and never the bytes, and `AgentSession` creation fails with
-  `error.InvalidCredentialByte`. A fixed (CLI) credential is checked before
-  every request and fails that request instead of sending it.
-
 ### Added
 
+- **The TUI's screen ownership is written down and enforced** (#332, #320).
+  [doc/TUI_VIEWPORT_OWNERSHIP.md](doc/TUI_VIEWPORT_OWNERSHIP.md) records who
+  may write past the inline region and how: the scrollback only through the
+  Renderer, erase/print/redraw in pairs inside one frame, the half-line
+  snapshot taken at draw time, ED 0 only, no saved cursor, and the review
+  checklist. `zig build test:scrollback` (part of `zig build test`) fails on
+  `ESC[1J`/`[2J`/`[3J` outside `tui/ansi.zig`, a wide erase outside
+  `resetScreen`, any cursor save/restore, and a direct terminal write from a
+  function in `src/repl/` that is not listed with its reason. The unused
+  DECSC/DECRC constants left `ansi.zig`, and `src/repl/statusline.zig`, which
+  no build imported, is gone with its direct write to stderr.
+- A virtual terminal for component tests (`tests/component/vterm.zig`, a Zig
+  port of `tests/tty/screen.py` pinned to it by golden vectors, with bounded
+  scrollback content) and the first tests that drive the real render region
+  through it: emit/erase pairing, half-line continuation, phase hand-off,
+  narrow strict-autowrap terminals (#319); and convergence of the streamed
+  assistant markdown under token, line, byte, every-single-cut and seeded
+  random chunkings, tables cut mid-row or never confirmed, with and without
+  the live region redrawn between chunks (#318).
 - **An AgentCore Session's provider credential can be replaced in place,
   also during a Run** (#336). An expiring access token used to mean exporting
   a checkpoint, restoring a new Session and destroying the old one, which only
@@ -57,6 +62,42 @@ status, compatibility boundaries, and entry points are defined by
     (`Session.update_credential`) and Node (`Session.updateCredential`)
     packages, the Zig and Rust SDKs, and both source-free consumers carry the
     slot. SDK 0.12.0-dev.
+
+### Fixed
+
+- **Ctrl+L during a reply clears the screen through the renderer** (#320).
+  The keyboard watcher sent `ESC[2J` straight to the terminal, outside the
+  render lock and between two frames, while the agent loop could be printing,
+  and kept the half-line continuation whose text the clear had just removed.
+  Ctrl+L, `/clear` and `/resume` now share `RenderRegion.resetScreen`: it
+  erases the region, clears the screen and, during a reply, draws the region
+  again on the top row, in one synchronized frame, and drops the
+  continuation. The scrollback is never wiped (no `ESC[3J`).
+- **Code blocks in a streamed reply are highlighted for their fence's
+  language.** The live markdown renderer kept the language as a slice of the
+  line buffer the reply streams through; by the block's first code line that
+  buffer had been shifted to the next line (and sometimes reallocated), so
+  the slice read other bytes and blocks were highlighted with the generic
+  keyword set (a Python `lambda` or `None` stayed plain). The renderer now
+  keeps its own copy of the language name.
+- **The footer no longer wraps on a narrow terminal.** The mode and key-hint
+  line (`⏵⏵ accept edits on (shift+tab to cycle) · esc to interrupt`) was
+  never cut to the terminal width. On a terminal narrower than it, the
+  terminal wrapped it onto rows the input box does not count, and with the
+  box at the bottom of the screen every redraw pushed the spinner, border
+  and prompt rows into the scrollback. It is now cut with an ellipsis, like
+  the MCP notice on the same line.
+- **A provider credential with a byte a request header cannot carry no longer
+  ends the process.** Session create and restore accepted any UTF-8 as
+  `api_key`, and the CLI sent whatever bytes its flag, environment, key file
+  or token response held; a credential with CR LF reached the HTTP client,
+  whose header assertion ended the process at the first request (a panic in
+  ReleaseSafe). Create and restore now apply the rule `update_credential`
+  applies (1 to 16 KiB of printable ASCII): AgentCore returns
+  `INVALID_ARGUMENT` (`RESOURCE_LIMIT` when too long) with a diagnostic that
+  names the rule and never the bytes, and `AgentSession` creation fails with
+  `error.InvalidCredentialByte`. A fixed (CLI) credential is checked before
+  every request and fails that request instead of sending it.
 
 ## 0.8.1 — 2026-10-28
 

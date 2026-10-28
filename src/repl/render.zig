@@ -113,8 +113,28 @@ pub fn renderToOwned(md: []const u8, allocator: std.mem.Allocator) ![]u8 {
 /// 流式跨行 markdown 状态(供 live 逐行渲染携带:代码块/语法高亮跨行)。
 pub const StreamState = struct {
     in_code_block: bool = false,
-    code_lang: []const u8 = "",
+    /// 打开中的围栏 info string(决定高亮语言)。**自持有**:调用方传入的 line 常借自它自己的
+    /// 行缓冲(RenderRegion.md_buf),下一行流入时该缓冲会前移、扩容重分配——借围栏行的切片到
+    /// 代码块第一行时已指向别的字节(或已释放内存),语言判定退化成 generic(#318 收敛测试抓到)。
+    code_lang_buf: [max_lang_len]u8 = undefined,
+    code_lang_len: u8 = 0,
     hl_state: HlState = .{},
+
+    /// 超长 info string 不截断(截断可能误判成别的语言),按 generic 处理。
+    pub const max_lang_len = 32;
+
+    pub fn codeLang(st: *const StreamState) []const u8 {
+        return st.code_lang_buf[0..st.code_lang_len];
+    }
+
+    fn setCodeLang(st: *StreamState, lang: []const u8) void {
+        if (lang.len > max_lang_len) {
+            st.code_lang_len = 0;
+            return;
+        }
+        @memcpy(st.code_lang_buf[0..lang.len], lang);
+        st.code_lang_len = @intCast(lang.len);
+    }
 };
 
 /// 渲染**单行** markdown(不含尾随 \n)到 out,携带跨行状态 st(代码块/高亮)。
@@ -126,11 +146,11 @@ pub fn renderLineStreaming(line: []const u8, st: *StreamState, out: *std.ArrayLi
             try out.appendSlice(allocator, RESET);
             st.in_code_block = false;
         } else {
-            try highlightCodeLine(line, st.code_lang, &st.hl_state, GRAY, out, allocator, syn);
+            try highlightCodeLine(line, st.codeLang(), &st.hl_state, GRAY, out, allocator, syn);
             try out.appendSlice(allocator, RESET);
         }
     } else if (std.mem.startsWith(u8, line, "```")) {
-        st.code_lang = std.mem.trim(u8, line[3..], " \t\r");
+        st.setCodeLang(std.mem.trim(u8, line[3..], " \t\r"));
         st.hl_state = .{};
         st.in_code_block = true;
         // 围栏行本身不输出内容(对齐 cc 去围栏)。
@@ -983,6 +1003,47 @@ test "renderLineStreaming: 逐行携带代码块状态 + 去标记" {
     out.clearRetainingCapacity();
     try renderLineStreaming("```", &st, &out, testing.allocator, ansi.syntax_palette.b16);
     try testing.expect(!st.in_code_block);
+}
+
+test "renderLineStreaming: the fence language survives the caller reusing its line buffer" {
+    const syn = ansi.syntax_palette.b16;
+    // Reference: fence and code line from stable memory.
+    var ref_st: StreamState = .{};
+    var ref: std.ArrayList(u8) = .empty;
+    defer ref.deinit(testing.allocator);
+    try renderLineStreaming("```python", &ref_st, &ref, testing.allocator, syn);
+    ref.clearRetainingCapacity();
+    try renderLineStreaming("x = lambda y: None", &ref_st, &ref, testing.allocator, syn);
+
+    // Streaming: the fence line lives in a buffer the caller overwrites with
+    // the next line before rendering it (RenderRegion.md_buf).
+    var st: StreamState = .{};
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    var buf: [32]u8 = undefined;
+    const fence = "```python";
+    @memcpy(buf[0..fence.len], fence);
+    try renderLineStreaming(buf[0..fence.len], &st, &out, testing.allocator, syn);
+    const code = "x = lambda y: None";
+    @memcpy(buf[0..code.len], code);
+    out.clearRetainingCapacity();
+    try renderLineStreaming(buf[0..code.len], &st, &out, testing.allocator, syn);
+
+    try testing.expectEqualStrings("python", st.codeLang());
+    try testing.expectEqualStrings(ref.items, out.items);
+    // Python keywords are highlighted: the output differs from a generic block's.
+    var gen_st: StreamState = .{};
+    var gen: std.ArrayList(u8) = .empty;
+    defer gen.deinit(testing.allocator);
+    try renderLineStreaming("```", &gen_st, &gen, testing.allocator, syn);
+    gen.clearRetainingCapacity();
+    try renderLineStreaming(code, &gen_st, &gen, testing.allocator, syn);
+    try testing.expect(!std.mem.eql(u8, gen.items, out.items));
+
+    // An info string longer than the buffer falls back to generic, not to a prefix.
+    var long_st: StreamState = .{};
+    try renderLineStreaming("```" ++ "p" ** (StreamState.max_lang_len + 1), &long_st, &gen, testing.allocator, syn);
+    try testing.expectEqualStrings("", long_st.codeLang());
 }
 
 test "render italic" {
