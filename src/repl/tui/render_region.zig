@@ -1567,6 +1567,46 @@ pub const RenderRegion = struct {
         }
     }
 
+    /// Ctrl+L, `/clear` and `/resume` start the visible screen over: erase the
+    /// region the way its phase drew it, then ED 2 and home, in one DEC 2026
+    /// frame. A generating region is drawn again in the same frame; the input
+    /// box stays erased until the caller renders it (Ctrl+L) or the next read
+    /// does (`/clear`, `/resume` print first). ED 2 clears the screen and
+    /// leaves the scrollback in place; ED 3 would wipe it, the user's history
+    /// from before the session included, and is never sent. This is the one
+    /// place in src/repl that erases more than ED 0 (doc/TUI_VIEWPORT_OWNERSHIP.md).
+    pub fn resetScreen(self: *RenderRegion) void {
+        self.lock();
+        defer self.unlock();
+        self.resetScratch();
+        self.scratch.writer.writeAll(ansi.sync.begin) catch {};
+        self.frame_active = true;
+        self.resetScreenInFrame();
+        self.frame_active = false;
+        self.scratch.writer.writeAll(ansi.sync.end) catch {};
+        self.flush();
+    }
+
+    fn resetScreenInFrame(self: *RenderRegion) void {
+        if (self.generating) {
+            self.observeResize(); // the climb counts rows at the current width
+            self.eraseRegion();
+        } else {
+            self.clearInner();
+        }
+        self.scratch.writer.writeAll(ansi.clear.screen_and_home) catch {};
+        // The half-line went with the screen. Continuing it would start the
+        // next text at the old column of an empty top row.
+        self.text_pending_newline = false;
+        self.pending_col = 0;
+        self.region_drawn_pending_nl = false;
+        self.region_drawn_pending_col = 0;
+        self.resize_seal_pending = false;
+        if (self.generating) {
+            if (self.gen_app) |a| self.drawGenRegion(a);
+        }
+    }
+
     // =====================================================================
     // 生成期:文本零重绘 + 区(spinner+输入框+footer)按事件节流重画
     // =====================================================================
@@ -2690,8 +2730,8 @@ test "input-phase clear walks up the tracked rows and erases with ED0" {
     const up_at = std.mem.indexOf(u8, out, "\x1b[2A") orelse return error.TestExpectedEqual;
     const ed_at = std.mem.indexOf(u8, out, ansi.clear.to_end_of_screen) orelse return error.TestExpectedEqual;
     try std.testing.expect(up_at < ed_at);
-    try std.testing.expect(std.mem.indexOf(u8, out, ansi.cursor.save) == null);
-    try std.testing.expect(std.mem.indexOf(u8, out, ansi.cursor.restore) == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\x1b7") == null); // DECSC
+    try std.testing.expect(std.mem.indexOf(u8, out, "\x1b8") == null); // DECRC
     try std.testing.expect(std.mem.indexOfScalar(u8, out, '\n') == null);
     try std.testing.expectEqual(@as(u16, 0), r.anchor.rows_above);
     try std.testing.expectEqual(@as(u16, 0), r.prev_rows);
@@ -2713,10 +2753,62 @@ test "generation erase walks up from the edit row, clears with ED0, returns to t
     const ed_at = std.mem.indexOf(u8, out, ansi.clear.to_end_of_screen) orelse return error.TestExpectedEqual;
     const back_at = std.mem.indexOf(u8, out, "\x1b[1A\r\x1b[7C") orelse return error.TestExpectedEqual;
     try std.testing.expect(up_at < ed_at and ed_at < back_at);
-    try std.testing.expect(std.mem.indexOf(u8, out, ansi.cursor.save) == null);
-    try std.testing.expect(std.mem.indexOf(u8, out, ansi.cursor.restore) == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\x1b7") == null); // DECSC
+    try std.testing.expect(std.mem.indexOf(u8, out, "\x1b8") == null); // DECRC
     try std.testing.expect(std.mem.indexOfScalar(u8, out, '\n') == null);
     try std.testing.expect(!r.region_drawn);
+}
+
+// Ctrl+L while a reply streams used to send ED 2 straight to fd 2, outside the
+// render lock, and keep the half-line: the next text started at the old column
+// of an empty top row. The reset now erases the region first, clears in the
+// same frame, and drops the continuation with the text it pointed at.
+test "a screen reset during generation erases the region, then ED2, and drops the half line" {
+    var r = RenderRegion.init(std.testing.allocator, -1, theme_mod.select(.dark, .none), .none);
+    defer r.deinit();
+    r.generating = true;
+    r.region_drawn = true;
+    r.prev_rows = 6;
+    r.anchor = .{ .rows_above = 3 };
+    r.text_pending_newline = true;
+    r.pending_col = 9;
+    r.region_drawn_pending_nl = true;
+    r.region_drawn_pending_col = 9;
+    r.frame_active = true;
+    r.resetScreenInFrame();
+    const out = r.scratch.written();
+    const up_at = std.mem.indexOf(u8, out, "\x1b[3A") orelse return error.TestExpectedEqual;
+    const ed0_at = std.mem.indexOf(u8, out, ansi.clear.to_end_of_screen) orelse return error.TestExpectedEqual;
+    try std.testing.expect(up_at < ed0_at);
+    try std.testing.expect(std.mem.endsWith(u8, out, "\x1b[2J\x1b[H"));
+    try std.testing.expect(std.mem.indexOf(u8, out, "\x1b[3J") == null); // never the scrollback
+    try std.testing.expect(!r.region_drawn);
+    try std.testing.expect(!r.text_pending_newline);
+    try std.testing.expectEqual(@as(u16, 0), r.pending_col);
+    try std.testing.expect(!r.region_drawn_pending_nl);
+    try std.testing.expectEqual(@as(u16, 0), r.region_drawn_pending_col);
+    try std.testing.expect(!r.resize_seal_pending);
+}
+
+test "a screen reset at the input box erases it like clear, then ED2" {
+    var r = RenderRegion.init(std.testing.allocator, -1, theme_mod.select(.dark, .none), .none);
+    defer r.deinit();
+    r.prev_rows = 5;
+    r.anchor = .{ .rows_above = 2 };
+    r.visible = true;
+    r.frame_active = true;
+    r.resetScreenInFrame();
+    const out = r.scratch.written();
+    const up_at = std.mem.indexOf(u8, out, "\x1b[2A") orelse return error.TestExpectedEqual;
+    const ed0_at = std.mem.indexOf(u8, out, ansi.clear.to_end_of_screen) orelse return error.TestExpectedEqual;
+    try std.testing.expect(up_at < ed0_at);
+    try std.testing.expect(std.mem.endsWith(u8, out, "\x1b[2J\x1b[H"));
+    try std.testing.expectEqual(@as(u16, 0), r.prev_rows);
+    try std.testing.expect(!r.visible);
+    // Already erased (a command ran after the read): only the screen is cleared.
+    r.resetScratch();
+    r.resetScreenInFrame();
+    try std.testing.expectEqualStrings("\x1b[2J\x1b[H", r.scratch.written());
 }
 
 // A frame drawn at 100 columns: its top rule is 99 wide. At 60 columns a

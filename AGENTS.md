@@ -33,6 +33,13 @@ These rules apply to the entire repository.
   after a raw read, and write to the terminal through `pfs.writeAll`; a call
   that cannot see EINTR says `// no EINTR: <reason>` on its line
   (`zig build test:terminal-io` enforces it).
+- The TUI's scrollback has no undo: in `src/repl/`, only the Renderer
+  (`RenderRegion`) erases the screen or writes past the inline region. Erase
+  with ED 0, reset the screen only through `RenderRegion.resetScreen`, climb
+  with relative moves instead of saving the cursor, and send scrollback text
+  through the Renderer; any other direct terminal write is listed with its
+  reason ([doc/TUI_VIEWPORT_OWNERSHIP.md](doc/TUI_VIEWPORT_OWNERSHIP.md);
+  `zig build test:scrollback` enforces it).
 - Preserve the kernel boundaries: plugins cannot replace the AgentLoop or bypass
   permission, sandbox, budget, formal verdicts, TinyKG admission, or artifact CAS.
 - Provider-visible bytes are a cache contract. Runtime generation, plugin paths,
