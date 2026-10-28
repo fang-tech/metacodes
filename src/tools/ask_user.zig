@@ -24,6 +24,15 @@ const AskOption = context.AskOption;
 /// 必须 ≤ dialog 的 MAX_Q(栈数组容量);两者一起改,否则 4<nq≤MAX_Q 漏进 dialog 撞容量上限。
 pub const MAX_QUESTIONS = 9;
 
+/// What the model reads when the session's frontend declared it does not
+/// render questions (RequestOutcome.unrenderable, doc/WIRE_PROTOCOL.md §2.2).
+/// Nobody saw the question, so it must not read as the user's answer or
+/// refusal, and the model can still ask in its reply.
+pub const FRONTEND_CANNOT_RENDER_DETAIL =
+    "AskUserQuestion was not shown: the frontend connected to this session cannot render questions " ++
+    "(it declared that it does not render ask_question requests). This is not an answer or a refusal " ++
+    "from the user. Ask the question in plain text in your reply instead.";
+
 /// 从 option 对象取 label(必有);非对象或无 label → error。
 fn optionLabel(o: std.json.Value) ![]const u8 {
     if (o != .object) return error.InvalidArgs;
@@ -125,10 +134,15 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         };
         // L3:异步前端返 .pending → error.UiPending(agent_loop 挂起,响应到达 resumeRun 续跑);
         // .unavailable(headless/无 backend/sync 永不到此)→ NotATty 兜底。sync TUI 恒 .answered。
+        // .unrenderable:连着的前端声明了不渲染问答 → 问题从没给用户看过,如实告诉模型。
         switch (outcome) {
             .answered => {},
             .pending => return error.UiPending,
             .unavailable => return error.NotATty,
+            .unrenderable => {
+                if (ctx.error_detail) |slot| slot.* = allocator.dupe(u8, FRONTEND_CANNOT_RENDER_DETAIL) catch null;
+                return error.FrontendCannotRender;
+            },
         }
         // resp.answers owned by allocator → 转移进 answers(后续序列化用),用完统一 free。
         switch (resp) {
@@ -314,6 +328,49 @@ test "AskUserQuestion maps an AgentCore Host cancellation to InputAborted" {
         \\{"questions":[{"question":"q","options":[{"label":"a"},{"label":"b"}]}]}
     ;
     try std.testing.expectError(error.InputAborted, execute(&ctx, args));
+}
+
+test "AskUserQuestion: a frontend that cannot render questions is reported as such, not as NotATty" {
+    const ui_request = @import("../core/protocol/ui_request.zig");
+    const Probe = struct {
+        outcome: ui_request.RequestOutcome,
+        fn request(
+            raw: *anyopaque,
+            _: ui_request.SessionId,
+            _: std.mem.Allocator,
+            _: *const ui_request.UiRequest,
+            _: *ui_request.UiResponse,
+        ) anyerror!ui_request.RequestOutcome {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return self.outcome;
+        }
+    };
+    const args =
+        \\{"questions":[{"question":"q","options":[{"label":"a"},{"label":"b"}]}]}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var unrenderable = Probe{ .outcome = .unrenderable };
+    var detail: ?[]const u8 = null;
+    const declared = ToolContext{
+        .allocator = arena.allocator(),
+        .error_detail = &detail,
+        .ui_requester = .{ .ctx = &unrenderable, .requestFn = Probe.request },
+    };
+    try std.testing.expectError(error.FrontendCannotRender, execute(&declared, args));
+    try std.testing.expectEqualStrings(FRONTEND_CANNOT_RENDER_DETAIL, detail.?);
+
+    // No UI at all keeps its old meaning and its old wording.
+    var unavailable = Probe{ .outcome = .unavailable };
+    detail = null;
+    const headless = ToolContext{
+        .allocator = arena.allocator(),
+        .error_detail = &detail,
+        .ui_requester = .{ .ctx = &unavailable, .requestFn = Probe.request },
+    };
+    try std.testing.expectError(error.NotATty, execute(&headless, args));
+    try std.testing.expect(detail == null);
 }
 
 test "AskUserQuestion rejects non-tty" {

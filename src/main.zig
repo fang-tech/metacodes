@@ -29,22 +29,32 @@ const build_options = @import("build_info");
 
 pub const VERSION = @import("version.zig").semver;
 
-/// Debug builds of Zig 0.16.0 print `error.Unexpected NTSTATUS=…` and a stack
-/// trace to stderr for every status the Windows network layer does not map.
-/// Esc aborts the reply's socket (CONNECTION_ABORTED on the next read) and the
-/// trace landed on top of the TUI (#221). The error itself still propagates
-/// and is logged where it is handled; only the unconditional print goes.
-/// A test binary's root is the test runner, so the evidence is the TTY case
+/// `unexpected_error_tracing`: Debug builds of Zig 0.16.0 print
+/// `error.Unexpected NTSTATUS=…` and a stack trace to stderr for every status
+/// the Windows network layer does not map. Esc aborts the reply's socket
+/// (CONNECTION_ABORTED on the next read) and the trace landed on top of the
+/// TUI (#221). The error itself still propagates and is logged where it is
+/// handled; only the unconditional print goes. A test binary's root is the
+/// test runner, so the evidence is the TTY case
 /// `test_refused_endpoint_retries_without_system_error_noise`.
 ///
-/// `allow_stack_tracing` defaults to "built with debug info", and on links in
-/// about 100 KB of std.debug unwinding code. The ReleaseSmall executable never
+/// `signal_stack_size`: std gives every thread a 256 KiB alternate signal
+/// stack, a `threadlocal` array that only std's segfault handler runs on, and
+/// std installs that handler only in builds with runtime safety. glibc zeroes
+/// a thread's whole static TLS block when it sets the thread up, so in the
+/// ReleaseSmall binary the unused stack was 256 KiB of RSS in every thread,
+/// the main one included (the idle red line of
+/// doc/PERF_MEMORY_PRINCIPLES.md §2). Builds that install the handler keep it.
+///
+/// `allow_stack_tracing`: std defaults it to "built with debug info", and on it
+/// links in about 100 KB of std.debug unwinding code. The ReleaseSmall executable never
 /// traces. A stripped build already has it off, and is byte-identical with or
 /// without this line. With `-Drelease-symbols` the executable links with DWARF
 /// for the split symbol file, and this keeps its code within a few bytes of
 /// the stripped build's (doc/RELEASE_RUNNER.md, "Debug symbols").
 pub const std_options: std.Options = .{
     .unexpected_error_tracing = false,
+    .signal_stack_size = if (std.debug.default_enable_segfault_handler) (std.Options{}).signal_stack_size else null,
     .allow_stack_tracing = !builtin.strip_debug_info and builtin.mode != .ReleaseSmall,
 };
 
@@ -268,6 +278,7 @@ pub const ui_event = @import("core/protocol/ui_event.zig");
 pub const ui_backend = @import("core/protocol/ui_backend.zig");
 pub const ui_request = @import("core/protocol/ui_request.zig");
 pub const wire = @import("core/protocol/wire.zig");
+pub const frontend_capabilities = @import("core/protocol/frontend_capabilities.zig");
 pub const session_id = @import("core/session_id.zig");
 pub const tui_backend = @import("repl/tui/tui_backend.zig");
 pub const writer_backend = @import("core/writer_backend.zig");
@@ -564,6 +575,16 @@ pub fn main(init: std.process.Init) !void {
     // the library learns the layout here, before anything — `doctor`
     // included — can resolve it.
     @import("util/toolchain.zig").setLayout(if (build_options.release_layout) .release else .development);
+
+    // `metacodes --help` (or `-h`) answers before the rest of startup. The
+    // state-dir option, subcommand dispatch and the full Config change nothing
+    // about that answer but map code and data the help never uses, and the
+    // idle red line is measured on this path (doc/PERF_MEMORY_PRINCIPLES.md
+    // §2). `--help` in any later position is still parseArgsInto's.
+    if (helpRequestedFirst(init)) {
+        printHelp();
+        std.process.exit(0);
+    }
 
     // `--state-dir` as argv[1] is a global option: it precedes, and applies
     // to, every subcommand below (login, doctor, kg, ...).
@@ -1417,6 +1438,16 @@ fn leadingStateDir(init: std.process.Init, allocator: std.mem.Allocator) Leading
     const value = args.next() orelse stateDirUsage();
     if (value.len == 0) stateDirUsage();
     return .{ .consumed = 2, .value = allocator.dupe(u8, value) catch stateDirUsage() };
+}
+
+/// Whether argv[1] is `--help` or `-h`. parseArgsInto stops at that argument
+/// too, so every later argument was already ignored.
+fn helpRequestedFirst(init: std.process.Init) bool {
+    var args = argsIter(init);
+    defer args.deinit();
+    _ = args.next();
+    const first = args.next() orelse return false;
+    return std.mem.eql(u8, first, "--help") or std.mem.eql(u8, first, "-h");
 }
 
 fn stateDirUsage() noreturn {
@@ -3967,6 +3998,8 @@ test {
     _ = &@import("core/protocol/ui_event.zig");
     _ = &@import("core/protocol/ui_backend.zig");
     _ = &@import("core/protocol/ui_request.zig");
+    _ = &@import("core/protocol/wire.zig");
+    _ = &@import("core/protocol/frontend_capabilities.zig");
     _ = &@import("repl/tui/tui_backend.zig");
     _ = &@import("core/writer_backend.zig");
     _ = &@import("core/headless_backend.zig");
