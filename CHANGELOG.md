@@ -10,6 +10,17 @@ status, compatibility boundaries, and entry points are defined by
 
 ## Unreleased
 
+### Added
+
+- A virtual terminal for component tests (`tests/component/vterm.zig`, a Zig
+  port of `tests/tty/screen.py` pinned to it by golden vectors, with bounded
+  scrollback content) and the first tests that drive the real render region
+  through it: emit/erase pairing, half-line continuation, phase hand-off,
+  narrow strict-autowrap terminals (#319); and convergence of the streamed
+  assistant markdown under token, line, byte, every-single-cut and seeded
+  random chunkings, tables cut mid-row or never confirmed, with and without
+  the live region redrawn between chunks (#318).
+
 ### Fixed
 
 - **Code blocks in a streamed reply are highlighted for their fence's
@@ -26,17 +37,6 @@ status, compatibility boundaries, and entry points are defined by
   box at the bottom of the screen every redraw pushed the spinner, border
   and prompt rows into the scrollback. It is now cut with an ellipsis, like
   the MCP notice on the same line.
-
-### Tests
-
-- A virtual terminal for component tests (`tests/component/vterm.zig`, a Zig
-  port of `tests/tty/screen.py` pinned to it by golden vectors, with bounded
-  scrollback content) and the first tests that drive the real render region
-  through it: emit/erase pairing, half-line continuation, phase hand-off,
-  narrow strict-autowrap terminals (#319); and convergence of the streamed
-  assistant markdown under token, line, byte, every-single-cut and seeded
-  random chunkings, tables cut mid-row or never confirmed, with and without
-  the live region redrawn between chunks (#318).
 
 ## 0.8.1 — 2026-10-28
 

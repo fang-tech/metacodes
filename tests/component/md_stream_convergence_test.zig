@@ -105,6 +105,10 @@ const Config = struct {
     seed: u64 = 0,
     /// Finish with endScrollLine (stream_done) instead of flushGenAssistant.
     end_scroll_line: bool = false,
+    /// Replay on a strict DEC autowrap terminal. The reference is always an
+    /// ideal (clipping) one: a line that fills the last column must not add
+    /// a row either way.
+    autowrap: bool = false,
 };
 
 fn tickAfter(seed: u64, pos: usize) bool {
@@ -118,7 +122,7 @@ fn tickAfter(seed: u64, pos: usize) bool {
 /// What the terminal shows after streaming `doc` cut at `cuts` (ascending,
 /// inside 1..doc.len-1). Caller frees.
 fn render(doc: []const u8, cuts: []const usize, cfg: Config) ![]u8 {
-    const t = try harness.Term.create(gpa, .{ .rows = 24, .cols = cfg.cols });
+    const t = try harness.Term.create(gpa, .{ .rows = 24, .cols = cfg.cols, .autowrap = cfg.autowrap });
     defer t.destroy();
     const r = &t.region;
     if (cfg.app) |app| {
@@ -172,8 +176,13 @@ fn check(doc: Doc, cuts: []const usize, cfg: Config, reference: []const u8, what
         i += 1;
     }
     std.debug.print(
-        "md stream convergence: doc \"{s}\", {d} cols, {s}, region {s}, seed 0x{x}, end {s}\n  minimized cuts {any}\n  chunks:",
-        .{ doc.name, cfg.cols, what, if (cfg.app != null) "drawn" else "off", cfg.seed, if (cfg.end_scroll_line) "endScrollLine" else "flushGenAssistant", kept.items },
+        "md stream convergence: doc \"{s}\", {d} cols ({s} terminal), {s}, region {s}, seed 0x{x}, end {s}\n  minimized cuts {any}\n  chunks:",
+        .{
+            doc.name,                                                          cfg.cols,
+            if (cfg.autowrap) "autowrap" else "clipping",                      what,
+            if (cfg.app != null) "drawn" else "off",                           cfg.seed,
+            if (cfg.end_scroll_line) "endScrollLine" else "flushGenAssistant", kept.items,
+        },
     );
     var last: usize = 0;
     for (0..kept.items.len + 1) |k| {
@@ -316,6 +325,7 @@ test "md stream: seeded random chunkings, half with the live region redrawn betw
                     .app = if (run % 2 == 0) fx.app else null,
                     .seed = run_seed,
                     .end_scroll_line = run % 3 == 0,
+                    .autowrap = run % 4 >= 2,
                 };
                 check(doc, cuts.items, cfg, ref, "random cuts") catch |err| {
                     std.debug.print("\n  (random run {d} of corpus seed 0x{x})\n", .{ run, seed });
