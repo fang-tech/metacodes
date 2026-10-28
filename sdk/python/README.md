@@ -119,5 +119,5 @@ network, no API key. Without a library they skip, unless
 
 Experimental, like the AgentCore ABI it wraps: the package pins one exact ABI
 revision and follows it. Not yet published to PyPI; build the wheel as above.
-Windows is untested. Skills, MCP, checkpoints, goals and teams exist in
+Windows is not covered by CI. Skills, MCP, checkpoints, goals and teams exist in
 the ABI but are not wrapped yet; contributions welcome.

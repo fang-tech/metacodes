@@ -308,6 +308,30 @@ class PythonSdkTest(unittest.TestCase):
                 self.assertEqual(runtime._sessions, [session])
         self.assertEqual(result.text, "saw: child said: child answer")
 
+    def test_a_run_from_a_small_stack_thread_nests_a_child_run(self) -> None:
+        # The Run, and the child Run its tool starts, each get their own
+        # RUN_STACK_BYTES thread, whatever stack the caller's thread has.
+        box = {}
+
+        @metacodes.tool(description="Asks a child session.")
+        def delegate(_arguments):
+            with self.session(box["runtime"], box["provider"]) as child:
+                return "child said: " + child.run("sub task").text
+
+        script = [("tool", "delegate", {}), ("text", "child answer"), ("echo",)]
+        with MockProvider(script) as provider:
+            with metacodes.Runtime(tools=(), host_tools=[delegate]) as runtime:
+                box.update(runtime=runtime, provider=provider)
+                session = self.session(runtime, provider, permission_mode="full_access")
+                previous = threading.stack_size(512 * 1024)
+                try:
+                    caller = threading.Thread(target=lambda: box.update(result=session.run("delegate it")))
+                    caller.start()
+                finally:
+                    threading.stack_size(previous)
+                caller.join(30)
+        self.assertEqual(box["result"].text, "saw: child said: child answer")
+
     def test_close_with_a_timeout_leaves_a_blocked_run_open(self) -> None:
         wait, started, release = self.blocking_tool()
         with MockProvider([("tool", "wait", {}), ("text", "done")]) as provider:
@@ -417,7 +441,8 @@ class PythonSdkTest(unittest.TestCase):
             with metacodes.Runtime(tools=["Write"]) as runtime:
                 session = self.session(runtime, provider, on_ui_request=on_ui_request)
                 session.run("write three times")
-        self.assertEqual(asked, [str(self.root / "a.txt"), str(self.root / "b.txt")])
+        # AgentCore names Windows paths with forward slashes; compare as paths.
+        self.assertEqual([Path(target) for target in asked], [self.root / "a.txt", self.root / "b.txt"])
         self.assertTrue((self.root / "a.txt").exists())
         self.assertTrue((self.root / "b.txt").exists())
 

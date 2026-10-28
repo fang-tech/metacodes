@@ -43,6 +43,42 @@ def _in_callback_of(handle: Optional[int]) -> bool:
     return handle is not None and handle in getattr(_CALLBACK, "handles", ())
 
 
+# The stack each Run executes on, the size the Node addon gives its Run
+# threads. A Run needs more than some callers' threads have: on Windows the
+# main thread of python.exe reserves 2 MB, and a Run that a host tool starts
+# from inside another Run (a child Session) overflowed it. The overflow was a
+# structured exception ctypes turned into OSError, leaving the child Session's
+# Run unfinished, so it could not be closed. Each Run getting its own thread
+# also makes nesting depth independent of the caller's stack.
+RUN_STACK_BYTES = 8 * 1024 * 1024
+# threading.stack_size() is process-wide and read when a thread starts.
+_RUN_THREAD_START = threading.Lock()
+
+
+def _call_on_run_thread(function: Callable[[], Any]) -> Any:
+    """Call ``function`` on a new thread with ``RUN_STACK_BYTES`` of stack
+    and wait for it; its result or exception is the caller's."""
+    box: Dict[str, Any] = {}
+
+    def target() -> None:
+        try:
+            box["value"] = function()
+        except BaseException as error:  # handed to the caller below
+            box["error"] = error
+
+    thread = threading.Thread(target=target, name="metacodes-run", daemon=True)
+    with _RUN_THREAD_START:
+        previous = threading.stack_size(RUN_STACK_BYTES)
+        try:
+            thread.start()
+        finally:
+            threading.stack_size(previous)
+    thread.join()
+    if "error" in box:
+        raise box["error"]
+    return box["value"]
+
+
 SHELL_TOOLS = ("Bash", "BashOutput", "KillShell")
 _API_KEY_ENV = {
     "anthropic": ("ANTHROPIC_API_KEY",),
@@ -517,13 +553,15 @@ class Session:
             self._callback_error = None
             self._active_run_id = run_id
             try:
-                status = self._lib.api.session.contents.run_input(
-                    self._handle,
-                    run_id,
-                    ctypes.byref(run_input),
-                    ctypes.byref(options),
-                    ctypes.byref(result),
-                    ctypes.byref(diagnostic),
+                status = _call_on_run_thread(
+                    lambda: self._lib.api.session.contents.run_input(
+                        self._handle,
+                        run_id,
+                        ctypes.byref(run_input),
+                        ctypes.byref(options),
+                        ctypes.byref(result),
+                        ctypes.byref(diagnostic),
+                    )
                 )
             finally:
                 self._active_run_id = 0
