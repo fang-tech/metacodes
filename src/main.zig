@@ -270,6 +270,7 @@ pub const ui_event = @import("core/protocol/ui_event.zig");
 pub const ui_backend = @import("core/protocol/ui_backend.zig");
 pub const ui_request = @import("core/protocol/ui_request.zig");
 pub const wire = @import("core/protocol/wire.zig");
+pub const frontend_capabilities = @import("core/protocol/frontend_capabilities.zig");
 pub const session_id = @import("core/session_id.zig");
 pub const tui_backend = @import("repl/tui/tui_backend.zig");
 pub const writer_backend = @import("core/writer_backend.zig");
@@ -3989,6 +3990,8 @@ test {
     _ = &@import("core/protocol/ui_event.zig");
     _ = &@import("core/protocol/ui_backend.zig");
     _ = &@import("core/protocol/ui_request.zig");
+    _ = &@import("core/protocol/wire.zig");
+    _ = &@import("core/protocol/frontend_capabilities.zig");
     _ = &@import("repl/tui/tui_backend.zig");
     _ = &@import("core/writer_backend.zig");
     _ = &@import("core/headless_backend.zig");

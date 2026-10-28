@@ -1,0 +1,11 @@
+{"v":1,"type":"capabilities_accepted","ui_requests":["ask_question","permission"],"custom":["video_timeline@1","diff_review@2"],"events":["text_chunk","tool_result","stream_done"],"ignored":{"ui_requests":[],"events":[]}}
+{"v":1,"type":"capabilities_accepted","ui_requests":["permission"],"custom":["video_timeline@1"],"events":["text_chunk"],"ignored":{"ui_requests":["form"],"events":["hologram"]}}
+{"v":1,"type":"capabilities_accepted","ui_requests":[],"custom":[],"events":null,"ignored":{"ui_requests":[],"events":[]}}
+{"v":1,"type":"capabilities_refused","reason":"SchemaVersionMismatch"}
+{"v":1,"type":"capabilities_refused","reason":"SchemaVersionMismatch"}
+{"v":1,"type":"capabilities_refused","reason":"NotAnObject"}
+{"v":1,"type":"capabilities_refused","reason":"NotCapabilities"}
+{"v":1,"type":"capabilities_refused","reason":"InvalidField"}
+{"v":1,"type":"capabilities_refused","reason":"CustomInUiRequests"}
+{"v":1,"type":"capabilities_refused","reason":"InvalidCustomKind"}
+{"v":1,"type":"capabilities_refused","reason":"TooManyEntries"}

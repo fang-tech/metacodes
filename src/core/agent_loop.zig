@@ -3544,15 +3544,26 @@ fn runCounted(
                     // R2-3:传 canonical_name——ask 记忆(rememberAllow/Deny)与决策链读取
                     // (decisionFor)必须同键,否则 "always deny" 存 "bash" 键、后续按 "Bash"
                     // 查不到,session deny 被 settings allow 越过。
-                    const allowed = if (forced_confirm)
-                        permission_mod.promptUserForced(@constCast(permission_ctx), canonical_name, eff_input) catch false
+                    // Every failure denies. PromptUnrenderable is the one that
+                    // asked nobody: the connected frontend declared it cannot
+                    // render permission prompts (doc/WIRE_PROTOCOL.md §2.2).
+                    var unrenderable = false;
+                    const prompted = if (forced_confirm)
+                        permission_mod.promptUserForced(@constCast(permission_ctx), canonical_name, eff_input)
                     else
-                        permission_mod.promptUser(@constCast(permission_ctx), canonical_name, eff_input) catch false;
+                        permission_mod.promptUser(@constCast(permission_ctx), canonical_name, eff_input);
+                    const allowed = prompted catch |err| blk: {
+                        unrenderable = err == error.PromptUnrenderable;
+                        break :blk false;
+                    };
                     policy_allowed = allowed;
-                    log.infoId("permission", rid, "prompt tool={s} user_allowed={}", .{ tu.name, allowed });
+                    log.infoId("permission", rid, "prompt tool={s} user_allowed={} unrenderable={}", .{ tu.name, allowed, unrenderable });
                     if (!allowed) {
                         slot.decision = .denied;
-                        slot.content = try tool_error.errorToJson("PermissionDenied", "user declined '{s}' via prompt", .{tu.name}, allocator);
+                        slot.content = if (unrenderable)
+                            try tool_error.errorToJson("PermissionDenied", "'{s}' was denied without asking: the frontend connected to this session cannot render permission prompts (it declared that it does not render permission requests). This is not the user's decision; the user never saw the request.", .{tu.name}, allocator)
+                        else
+                            try tool_error.errorToJson("PermissionDenied", "user declined '{s}' via prompt", .{tu.name}, allocator);
                         slot.is_error = true;
                     }
                 },
