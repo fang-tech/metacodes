@@ -12,7 +12,7 @@ the overview; this page holds the details it links to.
 
 ## Install a release
 
-macOS (aarch64) and Linux (x86_64), the latest release:
+macOS and Linux (aarch64 or x86_64), the latest release:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/metask-ai/metacodes/main/scripts/install.sh | sh

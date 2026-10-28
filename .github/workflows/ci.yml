@@ -323,10 +323,10 @@ jobs:
           zig build tinykg:stage
       # Both vendored runtime assets stage for aarch64-linux (#86): the
       # target's rg is the upstream aarch64 musl binary, first published with
-      # ripgrep 15.x. A complete aarch64-linux release unit (manifest v2) also
-      # needs both Lean kernels, which only a native aarch64 runner can build,
-      # so this leg proves the cross-staged assets and the release unit waits
-      # for that runner (doc/INSTALL_DESIGN.md §5).
+      # ripgrep 15.x. The complete aarch64-linux release unit (manifest v2)
+      # also needs both Lean kernels, which release.yml builds natively on an
+      # arm64 runner (#307, doc/INSTALL_DESIGN.md §5); this leg keeps proving
+      # the cross-staged assets on every change.
       - name: Verify Linux arm64 cross-stage contract
         if: matrix.cross && runner.os == 'Linux' && env.FAST_PATH != 'true' && env.SUITES != 'false'
         run: |

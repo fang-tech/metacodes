@@ -39,7 +39,7 @@ Agent 正在离开终端。它们正在进入编辑器和桌面应用、CI 流�
 | 一次 headless 运行，20 轮工具调用，本地 mock 模型 | 峰值 RSS 23 MB |
 | 完整发布单元：CLI、TinyKG CLI 与守护进程、两个 Lean 内核、ripgrep | 归档 16.5–20.8 MB（0.5.0 版发布资产） |
 | Sealed gateway，64 个并发客户端，mock 模型（2026-10-16，Windows 11，ReleaseFast） | 每秒 1,835 个 agent step；网关自身每步 p50 3 ms / p99 9 ms |
-| 原生平台 | Linux x86_64、macOS arm64、Windows x86_64 |
+| 原生平台 | Linux x86_64 与 arm64、macOS arm64 与 x86_64、Windows x86_64 |
 
 作为参照，同一台机器上 `--help` 的峰值 RSS：Codex CLI 0.163 为 20 MB，Claude Code 2.1.278 为 121 MB。测量方法和限定条件见 [doc/BENCHMARKS.md](doc/BENCHMARKS.md#footprint-snapshot)。
 
@@ -164,7 +164,7 @@ TinyKG 是 Metask Lab 自研的图存储，用 Zig 编写。它的源码暂未�
 curl -fsSL https://raw.githubusercontent.com/metask-ai/metacodes/main/scripts/install.sh | sh
 ```
 
-它会在 macOS（arm64）或 Linux（x86_64）上安装最新发布版。Windows 用 `scripts\install.ps1` 配合发布的 zip 安装。然后：
+它会在 macOS 或 Linux（arm64 或 x86_64）上安装最新发布版。Windows 用 `scripts\install.ps1` 配合发布的 zip 安装。然后：
 
 ```sh
 metacodes login --provider metask          # 或 --api-key / --provider openai|gemini|zai-coding-plan
@@ -207,7 +207,7 @@ flowchart TB
 
 ## 项目状态
 
-metacodes 处于 1.0 之前，版本号以 `build.zig.zon` 为准，每个发布版都为三个平台提供带校验和的产物。
+metacodes 处于 1.0 之前，版本号以 `build.zig.zon` 为准，每个发布版都为五个目标平台提供带校验和的产物。
 
 | 部分 | 状态 |
 |---|---|
@@ -232,7 +232,7 @@ metacodes 由 Metask Lab 开发，也就是 [Metask](https://app.metask-ai.com)�
 - **语言绑定。** Go 绑定、Node 扩展的 Windows 移植、发布 Python 和 Node 包，以及一个 30 行的 C 语言 "hello agent"。
 - **质量。** 补上 WorkBuddy Security 的差距，为真实失败编写离线回归用例。
 - **记忆研究。** 增加一个 Markdown 记忆或向量 RAG 对照组，与 TinyKG 比较。
-- **平台。** Linux 沙箱后端（bubblewrap 或 Landlock），以及 aarch64 Linux、Intel macOS 的发布版。
+- **平台。** Linux 沙箱后端（bubblewrap 或 Landlock）。
 
 [CONTRIBUTING.md](CONTRIBUTING.md) 把每个方向对应到具体的入口，并说明改动如何被接受。提交第一个 PR 之前请读一遍 [AGENTS.md](AGENTS.md)，它很短。问题和想法请发到 [Discussions](https://github.com/metask-ai/metacodes/discussions)；安全漏洞请按 [SECURITY.md](SECURITY.md) 私下报告，不要开公开 issue。
 

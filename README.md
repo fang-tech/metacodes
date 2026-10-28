@@ -54,7 +54,7 @@ except the two rows that name another source:
 | One headless run, 20 tool rounds against a local mock model | 23 MB peak RSS |
 | Complete release unit: CLI, TinyKG CLI and daemon, two Lean kernels, ripgrep | 16.5–20.8 MB archive (0.5.0 release assets) |
 | Sealed gateway, 64 concurrent clients, mock model (2026-10-16, Windows 11, ReleaseFast) | 1,835 agent steps/s; 3 ms p50 / 9 ms p99 gateway cost per step |
-| Native targets | Linux x86_64, macOS arm64, Windows x86_64 |
+| Native targets | Linux x86_64 and arm64, macOS arm64 and x86_64, Windows x86_64 |
 
 For scale, on the same machine the `--help` peak RSS of Codex CLI 0.163 is
 20 MB and of Claude Code 2.1.278 is 121 MB. Method and caveats are in
@@ -253,7 +253,7 @@ This is the research frontier of the project and an open invitation.
 curl -fsSL https://raw.githubusercontent.com/metask-ai/metacodes/main/scripts/install.sh | sh
 ```
 
-That installs the latest release on macOS (arm64) or Linux (x86_64). Windows
+That installs the latest release on macOS or Linux, arm64 or x86_64. Windows
 uses `scripts\install.ps1` with the release zip. Then:
 
 ```sh
@@ -300,7 +300,7 @@ flowchart TB
 ## Project status
 
 metacodes is pre-1.0. The version is declared in `build.zig.zon`, and releases
-ship for three platforms with checksums.
+ship for five targets with checksums.
 
 | Area | Status |
 |---|---|
@@ -333,8 +333,7 @@ We want contributors, and the most useful work right now is:
   fixtures for real failures.
 - **Memory research.** A Markdown-memory or vector-RAG comparison arm against
   TinyKG.
-- **Platforms.** A Linux sandbox backend (bubblewrap or Landlock), and
-  aarch64 Linux and Intel macOS releases.
+- **Platforms.** A Linux sandbox backend (bubblewrap or Landlock).
 
 [CONTRIBUTING.md](CONTRIBUTING.md) maps each area to a starting point and
 explains how changes get accepted. Read [AGENTS.md](AGENTS.md) before your
