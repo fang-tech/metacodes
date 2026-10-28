@@ -57,6 +57,33 @@ status, compatibility boundaries, and entry points are defined by
   and prompt rows into the scrollback. It is now cut with an ellipsis, like
   the MCP notice on the same line.
 
+### Changed
+
+- **Smaller Linux footprint: idle RSS back under its red line, binary
+  433 KB smaller.** On x86_64 Linux, the ReleaseSmall binary was 6.60 MB
+  (red line 6 MiB) and `metacodes --help` peaked at 3120 KB RSS (red line
+  3 MB; `doc/PERF_MEMORY_PRINCIPLES.md` §2). Nothing a user sees changes;
+  measured in WSL on x86_64:
+  - **Signal stack.** The release binary no longer reserves std's 256 KiB
+    alternate signal stack. It is thread-local, and glibc zeroes it for
+    every thread, the main one included. Only std's segfault handler uses
+    it, and the release build does not install that handler, so sessions
+    also save 256 KiB per thread.
+  - **`--help` first.** `metacodes --help` (or `-h`) as the first argument
+    prints before the rest of startup runs, with byte-identical output.
+  - **No zero-filled constants.** The provider control plane's event ring is
+    no longer copied out of a 138 KiB read-only constant.
+  - **Run-end records out of line.** The agent loop's nine run-end records
+    run as functions instead of being copied into every exit of the loop
+    (−277 KB).
+
+  Result: 6.19 MB binary and 2564 KB RSS for the native build; 6.16 MB and
+  2920 KB for the glibc 2.31 baseline-CPU build. RSS is now under its red
+  line, but the binary is still about 195 KB over 6 MiB. The macOS binary
+  is 283 KB smaller. §3g records the Zig 0.16 patterns behind the waste:
+  aggregates copied from zero-filled constants, and `defer` bodies copied
+  into every exit.
+
 ## 0.8.1 — 2026-10-28
 
 ### Fixed
