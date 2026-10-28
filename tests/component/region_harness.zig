@@ -112,6 +112,16 @@ pub fn isRegionRow(text: []const u8) bool {
     return isPromptRow(text) or isRuleRow(text);
 }
 
+/// The clock of every `Term` that runs with the merge window on. Only
+/// `Term.sync` moves it, so between two syncs every request falls inside
+/// one window.
+pub const MergeClock = struct {
+    var now: i64 = 1_000_000;
+    pub fn read() i64 {
+        return now;
+    }
+};
+
 /// A RenderRegion wired to a virtual terminal of the given size.
 /// Heap-pinned: the region's sink points into it.
 pub const Term = struct {
@@ -120,11 +130,18 @@ pub const Term = struct {
     region: RenderRegion,
     screen: vterm.Screen,
     fed: usize = 0,
+    merging: bool = false,
 
     pub const Options = struct {
         rows: usize = 24,
         cols: usize = 80,
         autowrap: bool = false,
+        /// Run the generating region with the merge window on (#328), on
+        /// `MergeClock` and without the timer thread. A request after a
+        /// painted frame then waits for the window, and `sync` paints it, as
+        /// the timer would 16 ms later: what a test sees after a sync is the
+        /// merged frame, not each request's own.
+        merge_window: bool = false,
     };
 
     pub fn create(gpa: std.mem.Allocator, opts: Options) !*Term {
@@ -146,6 +163,10 @@ pub const Term = struct {
         self.region.rows = @intCast(opts.rows);
         self.region.cols = @intCast(opts.cols);
         self.region.sink = &self.out.writer;
+        if (opts.merge_window) {
+            self.region.merge = .{ .now_ms = MergeClock.read, .timer = false };
+            self.merging = true;
+        }
         return self;
     }
 
@@ -159,8 +180,13 @@ pub const Term = struct {
     /// Replay what the region wrote since the last sync, through the tty's
     /// output processing: the REPL's raw mode keeps OPOST|ONLCR (and the
     /// Windows console auto-returns on LF), so every LF reaches the terminal
-    /// as CR LF.
+    /// as CR LF. With the merge window on, the window runs out first and the
+    /// frame waiting for it is painted.
     pub fn sync(self: *Term) !void {
+        if (self.merging) {
+            if (self.region.merge) |m| MergeClock.now += m.sched.window_ms;
+            _ = self.region.pumpFrame();
+        }
         const bytes = self.out.written();
         var rest = bytes[self.fed..];
         self.fed = bytes.len;

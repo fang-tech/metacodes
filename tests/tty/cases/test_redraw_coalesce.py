@@ -179,15 +179,41 @@ def test_exit_right_after_a_burst_is_clean(bin_path):
     TTYAssert(raw).assert_clean_exit()
 
 
+def _websearch_query_then_result_at_once(lead=0.8):
+    """The WebSearch sub-request with everything after `lead` in one write: the
+    query (`Searching: …`, sent when the server_tool_use block ends), the
+    result (`Found 1 result`), and the rest of the stream, whose end completes
+    the tool and takes the card away.
+
+    The two progress updates come microseconds apart, so the result always
+    lands inside a merge window: the one the query's frame opened, or one
+    already pending that the query joined. Either way `Found 1 result` is
+    waiting when the card goes, and only the frame `clearToolCard` paints
+    before removing the card shows it."""
+    return (
+        b'data: {"type":"message_start","message":{"id":"ws","role":"assistant","model":"x","usage":{"input_tokens":1,"output_tokens":1}}}\n\n'
+        + b'__DELAY__%f\n' % lead
+        + b'data: {"type":"content_block_start","index":0,"content_block":{"type":"server_tool_use","id":"srv_1","name":"web_search","input":{}}}\n\n'
+        b'data: {"type":"content_block_stop","index":0}\n\n'
+        b'data: {"type":"content_block_start","index":1,"content_block":{"type":"web_search_tool_result","tool_use_id":"srv_1","content":[{"type":"web_search_result","title":"Merge","url":"https://example.com"}]}}\n\n'
+        b'data: {"type":"content_block_stop","index":1}\n\n'
+        b'data: {"type":"content_block_start","index":2,"content_block":{"type":"text","text":""}}\n\n'
+        b'data: {"type":"content_block_delta","index":2,"delta":{"type":"text_delta","text":"merge summary."}}\n\n'
+        b'data: {"type":"content_block_stop","index":2}\n\n'
+        b'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":5}}\n\n'
+        b'data: {"type":"message_stop"}\n\n'
+    )
+
+
 def test_websearch_result_line_is_painted_before_its_card_goes(bin_path):
     # 9016b64a: the result arrives at the end of the sub-request and the card
     # leaves right after it. The merge window may drop the superseded query
     # line, never the result line.
-    from slow_mock_server import SlowMockServer, slow_text_then_tooluse, slow_websearch_subrequest, simple_text
+    from slow_mock_server import SlowMockServer, slow_text_then_tooluse, simple_text
 
     turns = [
         slow_text_then_tooluse(n_chunks=2, delay=0.2, tool="WebSearch", tool_input='{"query":"merge window"}'),
-        slow_websearch_subrequest(delay=0.2, n_delay=4),
+        _websearch_query_then_result_at_once(),
         simple_text("search summarized."),
     ]
     with SlowMockServer(turns) as srv:
