@@ -17,6 +17,12 @@
 两列都是 macOS Apple Silicon 上单机单次实测;10-18 一列的方法见
 [BENCHMARKS.md](BENCHMARKS.md#footprint-snapshot)。
 
+**Linux x86_64(2026-10-29,WSL2 Ubuntu 22.04,`scripts/perf_baseline.sh` 各 5 次)**:`main` @ `8060498d` 本机构建
+6.60 MB / `--help` RSS 3120 KB,glibc 2.31 + baseline CPU 构建 6.56 MB / 3088 KB,体积与 RSS 两条红线均超。
+按 §3g 修完后分别为 6.19 MB / 2564 KB 与 6.16 MB / 2920 KB:RSS 回到线内,体积仍超 6 MiB 约 0.2 MB。
+同一提交 Linux 比 macOS 大约 1 MB:arm64 默认开 LLVM MachineOutliner(x86_64 不开),`__text` 比 `.text` 小 1.6 MiB;
+macOS 保留的符号表(约 0.6 MB)抵掉一部分。`--help` RSS 的文件页部分随代码布局和内核页缓存而变(±0.2 MB)。
+
 对比 Claude Code(Node/TS):同机 2026-10-18 实测 Claude Code 2.1.278 `--help` 峰值 RSS 121 MB(仅进程底座,非会话)。cc-zig 已是**数量级优势**——目标是**守住并扩大**,绝不因功能堆叠回退。
 
 ## §2 量化目标指标(后续对标)
