@@ -1715,14 +1715,39 @@ pub const App = struct {
     /// Refresh the picker's snapshot from the kernel. Called when the picker
     /// opens and whenever the catalog moves underneath it.
     pub fn refreshModelPicker(app: *App) !void {
+        var listing = try app.listModelOffers();
+        defer listing.deinit(app.allocator);
+        try app.adoptModelListing(&listing);
+    }
+
+    /// The kernel's model list, taken without touching the picker. A caller
+    /// whose picker other threads draw (a reply's, #328) lists outside its
+    /// lock and adopts under it (`picker_host`).
+    pub const ModelListing = struct {
+        page: std.ArrayList(provider_control_plane.OfferSummary) = .empty,
+        /// Borrows `page`. Null when the kernel could not list the catalog.
+        listed: ?provider_control_plane.ListPage = null,
+        current: ?provider_control_plane.OfferId = null,
+
+        pub fn deinit(listing: *ModelListing, allocator: std.mem.Allocator) void {
+            listing.page.deinit(allocator);
+        }
+    };
+
+    /// Fails only when the provider host cannot be built.
+    pub fn listModelOffers(app: *App) !ModelListing {
         const host = try app.providerHost();
-        var page: std.ArrayList(provider_control_plane.OfferSummary) = .empty;
-        defer page.deinit(app.allocator);
-        const listed = host.kernel.modelList(.{}, .{}, app.allocator, &page) catch {
-            app.model_picker.markFailed();
-            return;
-        };
-        try app.model_picker.adopt(listed, host.kernel.currentOfferId());
+        var listing: ModelListing = .{};
+        listing.listed = host.kernel.modelList(.{}, .{}, app.allocator, &listing.page) catch null;
+        listing.current = host.kernel.currentOfferId();
+        return listing;
+    }
+
+    /// Make `listing` the picker's snapshot; a catalog that could not be
+    /// listed marks the picker failed.
+    pub fn adoptModelListing(app: *App, listing: *const ModelListing) !void {
+        const listed = listing.listed orelse return app.model_picker.markFailed();
+        try app.model_picker.adopt(listed, listing.current);
     }
 
     /// Apply a picker commit: validate through the kernel, bind the winning
