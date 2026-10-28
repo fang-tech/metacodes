@@ -181,7 +181,7 @@ jobs:
           python3 -m http.server 8765 --bind 127.0.0.1 --directory "$RUNNER_TEMP/mirror" > "$RUNNER_TEMP/mirror.log" 2>&1 &
           server=$!
           trap 'kill "$server" 2>/dev/null || true' EXIT
-          for _ in $(seq 50); do curl -fsS -o /dev/null http://127.0.0.1:8765/ && break; sleep 0.2; done
+          for _ in $(seq 50); do curl -fs -o /dev/null http://127.0.0.1:8765/ && break; sleep 0.2; done
           sh scripts/install.sh --no-link --prefix "$RUNNER_TEMP/installed-release" --release-base http://127.0.0.1:8765 --version "$version" 2> "$RUNNER_TEMP/install.log" || { cat "$RUNNER_TEMP/install.log" "$RUNNER_TEMP/mirror.log"; exit 1; }
           cat "$RUNNER_TEMP/install.log"
           grep -F "metacodes $version for ${{ matrix.zig_target }} from" "$RUNNER_TEMP/install.log"
