@@ -12,6 +12,20 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- **A resumed session no longer fails with `error: InvalidRecord` on the next
+  turn.** When a provider stream died mid-turn, the agent loop re-issued the
+  same request within the turn and restarted the provider retry budget at
+  physical attempt 1. The attempt id is derived from the request, the logical
+  turn and the attempt number, so the re-issue collided with the attempt it
+  replaced, writing two `provider_attempt` records with the same id. The
+  writer never re-reads its own journal, so the duplicate rode along for the
+  rest of the session; only a fresh process validating the journal on the
+  first new Run (a `/resume` followed by a message) rejected it. The journal
+  reader now treats a balanced started → finished → started → finished as the
+  legitimate re-issue it is (a still-open duplicate id is still refused), so
+  sessions already carrying one open again; and the writer folds every
+  same-turn re-issue into the recorded generation, so a new re-issue always
+  gets a distinct id.
 - **A session whose turn was killed can be resumed.** A turn's lease on
   `<session>/tool-observations.lock` was a file created with `O_EXCL` and
   deleted at the end of the turn, so a process killed mid-turn (a closed
