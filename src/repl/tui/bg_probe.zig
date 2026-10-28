@@ -274,14 +274,14 @@ pub const Wait = enum { readable, timeout, interrupted, closed };
 
 /// One round over `io`: write the query for `want`, then read until DA1 or
 /// until `deadline_ms` has passed. `io` is the terminal (`TerminalIo`) or a
-/// scripted one in tests: `write([]const u8) bool`, `wait(timeout_ms: u32)
+/// scripted one in tests: `sendQuery([]const u8) bool`, `wait(timeout_ms: u32)
 /// Wait`, `read([]u8) isize`, `nowMs() i64`.
 ///
 /// Reading stops while the typed bytes would overflow what stdin can be
 /// handed back: anything after that stays with the terminal, in order.
 pub fn runRound(io: anytype, want: Want, deadline_ms: u32) Scanner {
     var scanner = Scanner.init(want);
-    if (!want.any() or !io.write(queryFor(want))) return scanner;
+    if (!want.any() or !io.sendQuery(queryFor(want))) return scanner;
     const start = io.nowMs();
     while (!scanner.done()) {
         const elapsed = io.nowMs() - start;
@@ -311,7 +311,7 @@ pub const budget_ms: u32 = 120;
 const TerminalIo = struct {
     fd: c_int,
 
-    pub fn write(self: *const TerminalIo, bytes: []const u8) bool {
+    pub fn sendQuery(self: *const TerminalIo, bytes: []const u8) bool {
         return pfs.writeAll(self.fd, bytes);
     }
 
@@ -514,7 +514,7 @@ const ScriptedTerminal = struct {
 
     const Event = struct { at_ms: i64, bytes: []const u8 };
 
-    pub fn write(self: *ScriptedTerminal, bytes: []const u8) bool {
+    pub fn sendQuery(self: *ScriptedTerminal, bytes: []const u8) bool {
         @memcpy(self.written[self.written_len..][0..bytes.len], bytes);
         self.written_len += bytes.len;
         return self.write_ok;
@@ -639,8 +639,8 @@ test "runRound: interrupted waits retry within the deadline; a closed terminal e
     const Flaky = struct {
         inner: ScriptedTerminal,
         interruptions: u8 = 2,
-        pub fn write(self: *@This(), bytes: []const u8) bool {
-            return self.inner.write(bytes);
+        pub fn sendQuery(self: *@This(), bytes: []const u8) bool {
+            return self.inner.sendQuery(bytes);
         }
         pub fn wait(self: *@This(), timeout_ms: u32) Wait {
             if (self.interruptions > 0) {
@@ -662,7 +662,7 @@ test "runRound: interrupted waits retry within the deadline; a closed terminal e
     try testing.expectEqual(Keyboard.unsupported, round.result.keyboard);
 
     const Closed = struct {
-        pub fn write(_: *@This(), _: []const u8) bool {
+        pub fn sendQuery(_: *@This(), _: []const u8) bool {
             return true;
         }
         pub fn wait(_: *@This(), _: u32) Wait {
