@@ -10,6 +10,17 @@ status, compatibility boundaries, and entry points are defined by
 
 ## Unreleased
 
+### Added
+
+- **CI reports the footprint red lines** (#303). The Linux and macOS `release`
+  legs of `ci.yml` run `scripts/perf_baseline.sh --build` (ReleaseSmall binary
+  size, warm `--help` start, idle peak RSS; `doc/PERF_MEMORY_PRINCIPLES.md` §2)
+  and write its output to the job summary. The step is report-only: a line
+  over its limit marks it failed with a warning, and the leg stays green until
+  a few weeks of numbers decide whether it becomes blocking. The script no
+  longer reports an RSS of 0 KB (a pass) when `/usr/bin/time` is missing, or a
+  start time it could not measure; both now count as failures.
+
 ## 0.8.1 — 2026-10-28
 
 ### Fixed

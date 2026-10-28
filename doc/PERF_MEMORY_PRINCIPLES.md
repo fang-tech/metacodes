@@ -31,7 +31,11 @@
 
 > **重新标定(2026-10-18,owner 决定按实际情况)**:二进制已从 1.29 MB 长到 5.50 MB,超出初版
 > 1.5 MB 体积红线;体积红线改为 6 MiB,`scripts/perf_baseline.sh` 同步。启动(≤ 20 ms)、
-> 空闲 RSS(≤ 3 MB)与典型会话(≤ 30 MB)三条红线不变,实测均在线内。脚本仍未接入 CI。
+> 空闲 RSS(≤ 3 MB)与典型会话(≤ 30 MB)三条红线不变,实测均在线内。
+
+**CI 报告(#303)**:`ci.yml` 的 Linux 与 macOS `release` leg 各跑一次 `scripts/perf_baseline.sh --build`
+(体积、暖启动、空闲 RSS 三条红线),输出写进该 job 的 summary。目前只报告不阻塞
+(`continue-on-error`):超线或量不到时该 step 标红并发 warning,leg 仍为绿;攒够几周数据再决定是否改为阻塞。
 
 ## §3 设计原则(所有改动遵守)
 

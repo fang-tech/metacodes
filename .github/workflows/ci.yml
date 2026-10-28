@@ -401,6 +401,39 @@ jobs:
       - name: Default install prefix
         if: matrix.release && env.FAST_PATH != 'true' && env.SUITES != 'false'
         run: zig build --prefix "$RUNNER_TEMP/install-prefix" && python3 scripts/verify_install_prefix.py "$RUNNER_TEMP/install-prefix" --doctor
+      # The footprint red lines of doc/PERF_MEMORY_PRINCIPLES.md §2 (the
+      # ReleaseSmall binary size, warm `--help` start, idle peak RSS), measured
+      # by scripts/perf_baseline.sh into the job summary (#303). Report-only
+      # until a few weeks of numbers exist: shared-runner timing noise must not
+      # block a merge, so a line over its limit marks this step failed and
+      # leaves the leg green. Here because the step above just built the same
+      # ReleaseSmall executable (its optimize mode ignores -Doptimize), so
+      # `--build` is a cache hit, not another LLVM build. The script needs
+      # /usr/bin/time (-l on macOS, -v on Linux), perl and bc; one missing on
+      # Linux is installed, and one missing anywhere fails the step instead of
+      # measuring zero.
+      - name: Footprint red lines (report-only)
+        if: matrix.release && env.FAST_PATH != 'true' && env.SUITES != 'false'
+        continue-on-error: true
+        shell: bash
+        run: |
+          missing=""
+          [ -x /usr/bin/time ] || missing="$missing time"
+          command -v perl >/dev/null 2>&1 || missing="$missing perl"
+          command -v bc >/dev/null 2>&1 || missing="$missing bc"
+          if [ -n "$missing" ] && [ "$RUNNER_OS" = Linux ]; then sudo apt-get install -y $missing; fi
+          status=0
+          scripts/perf_baseline.sh --build > "$RUNNER_TEMP/footprint.txt" 2>&1 || status=$?
+          cat "$RUNNER_TEMP/footprint.txt"
+          {
+            echo "### Footprint red lines, $RUNNER_OS $RUNNER_ARCH (report-only, #303)"
+            echo
+            echo '```text'
+            cat "$RUNNER_TEMP/footprint.txt"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$status" -ne 0 ]; then echo "::warning title=Footprint red lines::scripts/perf_baseline.sh exited $status on $RUNNER_OS $RUNNER_ARCH (report-only); see the job summary"; fi
+          exit "$status"
       # The sidecar the kernel build script wrote, read by the installed
       # product's own loader: the pairing no unit test can cover (the project
       # kernel's v6 sidecar was validated with the formal v4 loader for as long
