@@ -326,9 +326,10 @@ Current delivery status is intentionally target-specific:
 | `x86_64-windows-msvc` | revision 24 ReleaseSafe bundle built and gated in CI (`agentcore-windows.yml`, GitHub-hosted `windows-latest`) | revision 24 native gate (`zig build agentcore:gate`) passed in CI on `main` at `7efc170d` (run 39107702062, 2026-10-18); the workflow repeats it on every push to `main` and on pull requests touching the native-gate paths |
 | `aarch64-windows-msvc` | revision 14 evidence retained; revision 24 not revalidated | native revision 24 gate pending |
 | `aarch64-windows-gnu` | revision 14 evidence retained; revision 24 not revalidated | native revision 24 gate pending |
-| `x86_64-windows-gnu` | revision 19 bundle archived by the 0.5.0 release run; revision 24 not revalidated | revision 19 native gate passed in the 0.5.0 release run (`release.yml` run 38111469169, 2026-10-11); native revision 24 gate pending until the next release |
-| `x86_64-linux-gnu` | revision 19 bundle archived by the 0.5.0 release run; revision 24 not revalidated | revision 19 native gate passed in the 0.5.0 release run (`release.yml` run 38111469169, 2026-10-11); native revision 24 gate pending until the next release |
-| `x86_64-macos` | revision 13 evidence retained; revision 24 not revalidated | native revision 24 gate pending |
+| `x86_64-windows-gnu` | revision 24 ReleaseSafe bundle archived by a `release.yml` dry run (`windows-latest`, run 40720244817, 2026-10-28) | revision 24 native gate passed in that run (revision 19 in the 0.5.0 release run 38111469169) |
+| `x86_64-linux-gnu` | revision 24 ReleaseSafe bundle archived by a `release.yml` dry run (`ubuntu-latest`, run 40720244817, 2026-10-28) | revision 24 native gate passed in that run (revision 19 in the 0.5.0 release run 38111469169) |
+| `aarch64-linux-gnu` | revision 24 ReleaseSafe bundle archived by a `release.yml` dry run on GitHub's hosted arm64 Linux runner (`ubuntu-24.04-arm`, run 40720244817, 2026-10-28, #307) | revision 24 native gate (`zig build agentcore:gate`, Rust triple `aarch64-unknown-linux-gnu`) passed in that run |
+| `x86_64-macos` | revision 24 ReleaseSafe bundle archived by a `release.yml` dry run on GitHub's hosted Intel macOS runner (`macos-15-intel`, run 40720244817, 2026-10-28, #307) | revision 24 native gate (`zig build agentcore:gate`) passed in that run |
 
 Cross-build success is not a support claim. In particular, the empty macOS
 framework list remains provisional until the corresponding native gates pass.

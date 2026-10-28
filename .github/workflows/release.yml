@@ -62,8 +62,9 @@ jobs:
       # cli_target: the Zig target the CLI unit is built for, where the
       # runner's own would not run on the target's machines. Without
       # -Dtarget the executable is built for the runner's CPU and C library:
-      # the x86_64 Linux runner's build carries AVX-512 instructions and needs
-      # GLIBC_2.36. An explicit target means the baseline CPU, and its version
+      # the x86_64 Linux unit needs GLIBC_2.36, and carries AVX-512
+      # instructions whenever the job lands on a CPU that has them (dispatch
+      # run 40705387727). An explicit target means the baseline CPU, and its version
       # suffix is the oldest glibc or macOS the unit runs on. The arm64 unit is
       # for the Graviton, Ampere, Raspberry Pi 5 and Jetson boards #307 names:
       # no SVE, and glibc 2.31 (Ubuntu 20.04, Debian 11). The Intel macOS unit
