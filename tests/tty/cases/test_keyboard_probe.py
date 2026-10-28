@@ -10,8 +10,9 @@ ConPTY 也不透传应用发的私有序列,字节级断言在那里观测不到
 """
 import sys
 
-from tty_driver import run, wait_for, case_tmpdir
+from tty_driver import IDLE, run, wait_for, case_tmpdir
 from asserts import TTYAssert
+from slow_mock_server import SlowModels
 
 try:
     from e2e_helpers import SkipTest
@@ -47,13 +48,28 @@ def _unknown_terminal(**extra):
     return env
 
 
-def _run(bin_path, events, env):
+def _run(bin_path, events, env, **kw):
     # startup_drain=0:查询在启动后几十毫秒内就写出,探测只等 ~120ms,不能先睡 0.8s 再应答。
-    return run(bin_path, events, env=env, startup_drain=0, cwd=case_tmpdir("cc-tty-kbd-"))
+    return run(bin_path, events, env=env, startup_drain=0, cwd=case_tmpdir("cc-tty-kbd-"), **kw)
+
+
+def _slow_startup(bin_path, events, env, **kw):
+    """App.init waits 2.5 s for `/v1/models`: bytes written in that window arrive
+    before the REPL takes the terminal."""
+    server, base_url = SlowModels.serve(2.5)
+    try:
+        return _run(bin_path, events, env, base_url=base_url, **kw)
+    finally:
+        server.shutdown()
 
 
 def _screen(raw):
     a = TTYAssert(raw)
+    return a, "\n".join(a.final.line_text(r) for r in range(a.final.rows))
+
+
+def _screen_sized(raw, rows, cols):
+    a = TTYAssert(raw, rows, cols)
     return a, "\n".join(a.final.line_text(r) for r in range(a.final.rows))
 
 
@@ -143,3 +159,76 @@ def test_no_probe_env_skips_the_question(bin_path):
     raw = _run(bin_path, ["sleep:0.8"], _unknown_terminal(METACODES_NO_PROBE="1"))
     assert KITTY_QUERY not in raw and b"\x1b[c" not in raw, "METACODES_NO_PROBE 应跳过探测"
     assert KITTY_ENABLE not in raw, "没探测的认不出的终端照旧不发"
+
+
+# A full answer set, arriving after the probe stopped waiting (a slow link).
+LATE_ANSWERS = "raw:\\x1b]11;rgb:ffff/ffff/ffff\\x1b\\\\\\x1b[?1u\\x1b[?62;22c"
+
+
+def test_answer_queued_before_the_probe_is_not_taken_for_its_sentinel(bin_path):
+    _posix_only()
+    # A program that ran before left its DA1 answer unread in the input queue. Taken for this
+    # round's sentinel it ended the round before the Kitty answer and the protocol stayed off.
+    raw = _run(bin_path, [
+        "raw:\\x1b[?62;22c",
+        QUERY_SENT,
+        "raw:\\x1b[?1u\\x1b[?62;22c",
+        wait_for('Try "fix typecheck errors"'),
+        "type:x", "key:shift_enter", "type:y",
+        wait_for(SHIFT_HINT),
+    ], _unknown_terminal(), per_key_drain=0.01)
+    assert KITTY_ENABLE in raw, "an answer queued before the query was taken for this round's DA1"
+
+
+def test_answer_cut_by_the_deadline_neither_echoes_nor_eats_the_next_key(bin_path):
+    _posix_only()
+    # The deadline falls inside DA1: `h` and `ESC[?62;` arrive in time, `22c` after, while
+    # App.init still runs. The half answer used to go to the prompt's parser, which waited for
+    # its tail (echoed, then flushed by the first raw-mode entry) and ate the `l` of `ls`.
+    raw = _slow_startup(bin_path, [
+        QUERY_SENT,
+        "raw:h\\x1b[?62;",
+        "strictsleep:0.3",
+        "raw:22c",
+        wait_for("❯ h"),
+        "type:ls",
+        wait_for("❯ hls"),
+    ], _unknown_terminal())
+    a, screen = _screen(raw)
+    a.assert_input_echo("hls")
+    assert b"22c" not in raw, "the tail of the cut answer was echoed:\n" + screen
+
+
+def test_late_answers_during_a_slow_startup_are_not_echoed(bin_path):
+    _posix_only()
+    # The probe gave up after 120 ms; the answers come while App.init waits. The terminal
+    # stays quiet until the REPL takes it, so the line discipline does not print them
+    # (`^[[?62;22c` above the banner), and they never reach the prompt.
+    raw = _slow_startup(bin_path, [
+        QUERY_SENT,
+        "strictsleep:0.3",
+        LATE_ANSWERS,
+        IDLE,
+        "type:z",
+        wait_for("❯ z"),
+    ], _unknown_terminal())
+    a, screen = _screen(raw)
+    a.assert_input_echo("z")
+    for echo in (b"62;22c", b"rgb:ffff"):
+        assert echo not in raw, f"a late answer was echoed ({echo!r}):\n" + screen
+
+
+def test_late_answers_do_not_skip_the_splash(bin_path):
+    _posix_only()
+    # The splash ends on a key. Late answers are not one: it plays to the end.
+    raw = _run(bin_path, [
+        QUERY_SENT,
+        "strictsleep:0.3",
+        LATE_ANSWERS,
+        IDLE,
+    ], _unknown_terminal(METACODES_NO_STARTUP_ANIMATION=None), term_size=(30, 100))
+    redraws = raw.count(b"\x1b[?2026h\x1b[8A")
+    assert redraws >= 15, f"{redraws} redraws: a late answer cut the splash short"
+    a, screen = _screen_sized(raw, 30, 100)
+    a.assert_input_echo("")
+    assert "62;22c" not in screen

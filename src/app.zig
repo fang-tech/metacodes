@@ -300,7 +300,9 @@ fn settleTerminal(
         .keyboard = questions == .theme_and_keyboard and input.keyboardPolicy() == .probe,
     };
     if (!want.any()) return variant;
-    const answer = bg_probe.probe(want);
+    // The interactive REPL takes the terminal next: a round its deadline cut
+    // short keeps reading its answers until then (`bg_probe.handOver`).
+    const answer = bg_probe.probe(want, questions == .theme_and_keyboard);
     if (want.keyboard) input.recordKeyboardProbe(answer.keyboard == .supported);
     if (variant != .auto) return variant;
     const bg = answer.background orelse return variant;

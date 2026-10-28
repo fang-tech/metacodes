@@ -10,15 +10,12 @@ ConPTY 会把输出流整屏重合成,原始字节(帧前缀、cursor-up 计数)
 那两条用例在 Windows 上 SkipTest,其余只看屏幕终态,两平台都跑。
 """
 import glob
-import http.server
 import json
 import os
-import threading
-import time
 
 from tty_driver import IDLE, IS_WINDOWS, READY, arrival_time, case_tmpdir, run, wait_for
 from asserts import TTYAssert
-from slow_mock_server import SlowMockServer, simple_text
+from slow_mock_server import SlowMockServer, SlowModels, simple_text
 
 try:
     from e2e_helpers import SkipTest
@@ -122,39 +119,6 @@ def test_splash_skips_a_terminal_too_narrow_for_the_wordmark(bin_path):
     _assert_no_splash(TTYAssert(raw, 30, 60), raw)
 
 
-class _SlowModels(http.server.BaseHTTPRequestHandler):
-    """`/v1/models` that answers after DELAY_S. With the probe on and no cached
-    copy, App.init waits for it: a startup that is visibly slow."""
-
-    DELAY_S = 2.5
-    answered = []
-
-    @classmethod
-    def serve(cls, delay_s):
-        cls.DELAY_S = delay_s
-        cls.answered = []
-        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), cls)
-        threading.Thread(target=server.serve_forever, daemon=True).start()
-        return server, f"http://127.0.0.1:{server.server_port}/v1/messages"
-
-    def log_message(self, *args):  # noqa: D401
-        return
-
-    def do_GET(self):  # noqa: N802
-        if self.path != "/v1/models":
-            self.send_error(404)
-            return
-        time.sleep(self.DELAY_S)
-        body = b'{"data":[{"id":"claude-sonnet-4-5","max_tokens":8192,"max_input_tokens":200000}]}'
-        self.send_response(200)
-        self.send_header("content-type", "application/json")
-        self.send_header("content-length", str(len(body)))
-        self.send_header("connection", "close")
-        self.end_headers()
-        self.wfile.write(body)
-        _SlowModels.answered.append(time.monotonic())
-
-
 def test_splash_plays_while_startup_waits(bin_path):
     """The splash starts before App.init and plays during it: it has settled
     while init is still waiting for `/v1/models`, and the banner follows the
@@ -162,7 +126,7 @@ def test_splash_plays_while_startup_waits(bin_path):
     the whole wait, then 1.5 s more of animation.)"""
     if IS_WINDOWS:
         raise SkipTest("ConPTY re-encodes the stream; byte arrival times are not observable")
-    server, base_url = _SlowModels.serve(2.5)
+    server, base_url = SlowModels.serve(2.5)
     timeline = []
     try:
         raw = run(bin_path, [IDLE], term_size=SIZE, env=dict(ON, METACODES_NO_PROBE=None),
@@ -172,8 +136,8 @@ def test_splash_plays_while_startup_waits(bin_path):
     a = TTYAssert(raw, *SIZE)
     _assert_settled_wordmark(a)
     a.assert_box_present()
-    assert len(_SlowModels.answered) == 1, f"/v1/models answered {len(_SlowModels.answered)} times"
-    answered = _SlowModels.answered[0]
+    assert len(SlowModels.answered) == 1, f"/v1/models answered {len(SlowModels.answered)} times"
+    answered = SlowModels.answered[0]
     settled = arrival_time(timeline, raw, REDRAW, last=True)
     banner = arrival_time(timeline, raw, b"metacodes v")
     assert settled is not None and banner is not None
@@ -186,13 +150,13 @@ def _typed_during_startup(bin_path, env, first_key_after):
     type `a`, then `b` 0.6 s later while App.init still waits, and return the
     screen once the prompt shows them. `first_key_after` is the event that
     marks when `a` goes out."""
-    server, base_url = _SlowModels.serve(2.5)
+    server, base_url = SlowModels.serve(2.5)
     try:
         raw = run(bin_path, [first_key_after, "raw:a", "strictsleep:0.6", "raw:b", wait_for("❯ ab"), IDLE],
                   term_size=SIZE, env=dict(env, METACODES_NO_PROBE=None), base_url=base_url, startup_drain=0)
     finally:
         server.shutdown()
-    assert _SlowModels.answered, "App.init did not wait for /v1/models: nothing was typed during startup"
+    assert SlowModels.answered, "App.init did not wait for /v1/models: nothing was typed during startup"
     return TTYAssert(raw, *SIZE), raw
 
 
@@ -265,7 +229,7 @@ def test_splash_is_cut_short_by_a_startup_error_after_init(bin_path):
         f.write(json.dumps({"role": "user", "blocks": [{"type": "document", "media_type": "application/pdf",
                                                          "title": "r.pdf", "pages": 1, "data": "JVBERi0xLjcK"}]}) + "\n")
 
-    server, base_url = _SlowModels.serve(0.6)
+    server, base_url = SlowModels.serve(0.6)
     try:
         raw = run(bin_path, ["sleep:4"], term_size=SIZE, cwd=cwd,
                   env=dict(env, METACODES_NO_STARTUP_ANIMATION=None, METACODES_NO_PROBE=None),
@@ -285,7 +249,7 @@ def test_splash_is_cut_short_by_a_repl_setup_error(bin_path):
     splash is settled first and the error follows it."""
     if IS_WINDOWS:
         raise SkipTest("ConPTY re-encodes the stream; the frame prefix to key off is not observable")
-    server, base_url = _SlowModels.serve(0.6)
+    server, base_url = SlowModels.serve(0.6)
     try:
         raw = run(bin_path, ["sleep:4"], term_size=SIZE, base_url=base_url,
                   env=dict(ON, METACODES_NO_PROBE=None, METACODES_EVAL_METADATA="{not json"))

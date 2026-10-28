@@ -26,7 +26,9 @@ status, compatibility boundaries, and entry points are defined by
   fallback (no answer: the protocol stays off). The named terminals and tmux
   are still turned on without asking. Apple Terminal and the xterm.js hosts
   (VS Code, Hyper) are now a deny-list that is neither asked nor turned on
-  (Claude Code #23350). A dumb terminal, GNU screen, zellij and
+  (Claude Code #23350); a terminal whose own `TERM` names it (kitty,
+  Ghostty) is still turned on when it was started from one of them and
+  inherited their `TERM_PROGRAM`. A dumb terminal, GNU screen, zellij and
   `METACODES_NO_PROBE` are not asked either. Windows consoles are not asked:
   on Windows Terminal 1.24 the console host answers DA1 itself (in about
   0.1 ms) and never the flags question. With the protocol on, Alt+B and
@@ -37,14 +39,24 @@ status, compatibility boundaries, and entry points are defined by
   not its answer, and switched modes with `TCSAFLUSH`, which discards typed
   input outright. The startup probe now keeps the input already received and
   hands every byte that is not an answer back to the REPL's input, in order,
-  ahead of what the terminal sends next.
-- **A terminal's answer that arrives after the startup probe gave up is no
-  longer typed into the prompt.** The key parser now consumes a whole
-  private-marker CSI (`ESC [ ? … c`, `ESC [ ? … u`), any CSI with more
-  parameters than it decodes (xterm's `ESC [ 27 ; 2 ; 13 ~`), and an OSC
-  answer (`ESC ] 11 ; … BEL`), reporting one unknown key for each. A late
-  background-colour answer used to arrive as Esc, text, Esc; the two Escs
-  cleared the prompt.
+  ahead of what the terminal sends next. Answers already queued before the
+  query (left unread by a program that ran before) are read first and
+  dropped, so another program's DA1 is not taken for this round's.
+- **A terminal's answer that arrives after the startup probe gave up (a
+  link slower than 120 ms) is no longer echoed, taken for a key, or typed
+  into the prompt.** Until the REPL takes the terminal it stays quiet (no
+  echo; Ctrl+C still works; restored at exit if startup fails), and what
+  arrives is read through the probe's answer scanner: answers are dropped,
+  keys are kept. A late answer used to be printed above the banner
+  (`^[[?62;22c`) or end the startup animation as if it were the key that
+  skips it. An answer the deadline cut in half is dropped rather than handed
+  to the prompt, where its missing tail took the user's next key. The key
+  parser also consumes a whole private-marker CSI (`ESC [ ? … c`,
+  `ESC [ ? … u`), any CSI with more parameters than it decodes (xterm's
+  `ESC [ 27 ; 2 ; 13 ~`), and an OSC answer (`ESC ] 11 ; … BEL`), reporting
+  one unknown key for each; a sequence whose rest has not come within one
+  read wait is dropped instead of swallowing the next key; and rxvt's
+  `$`-terminated Shift keys (`ESC [ 3 $`) stay one key.
 
 ### Fixed
 

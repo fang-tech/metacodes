@@ -122,6 +122,39 @@ def _json_str(s):
     return json.dumps(s)
 
 
+class SlowModels(http.server.BaseHTTPRequestHandler):
+    """`/v1/models` that answers after DELAY_S. With the probe on and no cached
+    copy, App.init waits for it: a startup that is visibly slow."""
+
+    DELAY_S = 2.5
+    answered = []
+
+    @classmethod
+    def serve(cls, delay_s):
+        cls.DELAY_S = delay_s
+        cls.answered = []
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), cls)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        return server, f"http://127.0.0.1:{server.server_port}/v1/messages"
+
+    def log_message(self, *args):  # noqa: D401
+        return
+
+    def do_GET(self):  # noqa: N802
+        if self.path != "/v1/models":
+            self.send_error(404)
+            return
+        time.sleep(self.DELAY_S)
+        body = b'{"data":[{"id":"claude-sonnet-4-5","max_tokens":8192,"max_input_tokens":200000}]}'
+        self.send_response(200)
+        self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(body)))
+        self.send_header("connection", "close")
+        self.end_headers()
+        self.wfile.write(body)
+        SlowModels.answered.append(time.monotonic())
+
+
 class SlowMockServer:
     """逐连接回放 turns[i]。turn bytes 里的 `__DELAY__<sec>\\n` 标记被解释成 sleep(用于宽窗口)。"""
 

@@ -15,6 +15,7 @@ const platform_term = @import("platform").terminal;
 const platform_signal = @import("platform").signal;
 const process = @import("platform").process;
 const shutdown = @import("../core/shutdown.zig");
+const bg_probe = @import("tui/bg_probe.zig");
 
 // ============================================================================
 // Key 抽象
@@ -104,13 +105,19 @@ pub const KeyParser = struct {
         return b >= 0x20 and b <= 0x3f;
     }
 
-    /// 是否正卡在"已收 ESC、等后续字节判断是否 CSI/OSC 序列"的状态(含 `ESC ]`、`ESC ] 数字`)。
-    /// 调用方(watcher)在 read 超时时若此为 true,应调 flushEsc() 把孤立 ESC 兑现为 .esc。
+    /// 数字参数之后的 `$`:rxvt 系(urxvt、Eterm、aterm)Shift 组合键的终结字节(Shift+Delete
+    /// `ESC[3$`、Shift+Home/End `ESC[7$`/`ESC[8$`、Shift+F11 `ESC[23$`)。按标准它是中间字节,
+    /// 当成中间字节的话 parser 会把用户接着敲的字母当终结字节吃掉。
+    fn rxvtShiftFinal(b: u8) bool {
+        return b == '$';
+    }
+
+    /// 是否正读到一个序列中间(已收 ESC,等后续字节),包括 CSI 参数和 OSC 正文。
+    /// 调用方(watcher)在 read 超时时若此为 true,应调 flushEsc():终端一次写出整个序列,
+    /// 等一个读周期都没来的后半截不会再来了(被下一次进 raw 的 TCSAFLUSH 丢了,或根本是
+    /// 用户按的 Esc)。
     pub fn pendingEsc(self: *const KeyParser) bool {
-        return switch (self.state) {
-            .esc_seen, .osc_seen, .osc_ps => true,
-            else => false,
-        };
+        return self.state != .normal;
     }
 
     /// 取出 feed / flushEsc 暂存的下一个键(若有)。调用方每次 feed 后循环 drain 至 null。
@@ -132,16 +139,23 @@ pub const KeyParser = struct {
         self.queued_len += 1;
     }
 
-    /// 把卡在 esc_seen 的孤立 ESC 兑现为 .esc(超时无后续字节时调)。`ESC ]`(Alt+])及其后的
-    /// 数字一并兑现:返回 .esc,']' 与数字随后 drain 出。不在这些状态返 null。
+    /// 读周期超时、序列的后半截没来(见 pendingEsc):兑现读到的部分,parser 回到 normal。
+    /// - 孤立 ESC → .esc;`ESC ]`(Alt+])及其后的数字 → .esc,']' 与数字随后 drain 出;
+    ///   OSC 正文里的 ESC 等不来 `\` → 那个 ESC 是用户按的 Esc,返回 .esc。
+    /// - CSI 参数、OSC 正文读到一半 → 整条作废,返回 null(不产生键)。
+    /// 不在序列中间返 null。
     pub fn flushEsc(self: *KeyParser) ?Key {
-        switch (self.state) {
-            .esc_seen => {},
-            .osc_seen, .osc_ps => self.queueOscPrefix(),
-            else => return null,
-        }
+        const key: ?Key = switch (self.state) {
+            .normal => return null,
+            .esc_seen, .osc_st => .esc,
+            .osc_seen, .osc_ps => blk: {
+                self.queueOscPrefix();
+                break :blk .esc;
+            },
+            .csi_seen, .csi_num1, .csi_semi, .csi_num2, .csi_skip, .osc_body => null,
+        };
         self.state = .normal;
-        return .esc;
+        return key;
     }
 
     /// `ESC ]` 和其后的数字不是 OSC 应答:']' 和数字作为键排队(.esc 由调用方返回)。
@@ -214,12 +228,17 @@ pub const KeyParser = struct {
             },
             .csi_num1 => {
                 if (b >= '0' and b <= '9') {
-                    self.num1 = self.num1 * 10 + (b - '0');
+                    // 饱和:十位以上的参数不是任何认得的键,停在上限仍是 .unknown(不溢出 panic)。
+                    self.num1 = self.num1 *| 10 +| (b - '0');
                     return null;
                 }
                 if (b == ';') {
                     self.state = .csi_semi;
                     return null;
+                }
+                if (rxvtShiftFinal(b)) {
+                    self.state = .normal;
+                    return .unknown;
                 }
                 if (csiParam(b)) {
                     self.state = .csi_skip;
@@ -256,6 +275,10 @@ pub const KeyParser = struct {
                     self.state = .csi_num2;
                     return null;
                 }
+                if (rxvtShiftFinal(b)) {
+                    self.state = .normal;
+                    return .unknown;
+                }
                 if (csiParam(b)) {
                     self.state = .csi_skip;
                     return null;
@@ -265,8 +288,12 @@ pub const KeyParser = struct {
             },
             .csi_num2 => {
                 if (b >= '0' and b <= '9') {
-                    self.num2 = self.num2 * 10 + (b - '0');
+                    self.num2 = self.num2 *| 10 +| (b - '0');
                     return null;
+                }
+                if (rxvtShiftFinal(b)) {
+                    self.state = .normal;
+                    return .unknown;
                 }
                 if (csiParam(b)) {
                     self.state = .csi_skip;
@@ -550,7 +577,8 @@ pub const KeyboardPolicy = enum {
     probe,
 };
 
-/// Kitty 键盘协议 **deny-list**:探测也不问,答了也不发。
+/// Kitty 键盘协议 **deny-list**:探测也不问,答了也不发(TERM 自己认得出的 kitty/Ghostty 除外,
+/// 见 classifyKittyKeyboard)。
 /// 真 cc 注释铁证(terminal.ts:167):此前无条件发(#23350)是 bug——某些终端(Apple Terminal/
 /// SSH/xterm.js)会 honor enable 并发回 parser 处理不了的 codepoint(→ 各种键乱/乱码)。
 /// 那次教训里点名的终端留在这里:Apple_Terminal;xterm.js 的宿主 vscode(VS Code 及其分支)、Hyper。
@@ -578,17 +606,17 @@ fn classifyKittyKeyboard(term_program: ?[]const u8, term: ?[]const u8, multiplex
     // dumb 终端不懂私有模式:emitEnableSequences 什么都不发,提示文案也要与之一致。
     if (term == null or term.?.len == 0 or std.mem.eql(u8, term.?, "dumb")) return .disable;
     if (multiplexer == .tmux) return .enable;
+    // TERM 是终端给自己起的 shell 设的;TERM_PROGRAM 会从外层继承(从 Terminal.app 或 VS Code
+    // 里启动的 kitty 仍带着外层的 TERM_PROGRAM)。TERM 认得出就以它为准,先于 deny-list。
+    if (kittyTerm(term.?)) return .enable;
     if (term_program) |tp| {
         for (kitty_deny_term_programs) |n| if (std.mem.eql(u8, tp, n)) return .disable;
+        for (kitty_term_programs) |n| if (std.mem.eql(u8, tp, n)) return .enable;
     }
-    if (recognizedKittyTerminal(term_program, term.?)) return .enable;
     return if (multiplexer == .other) .disable else .probe;
 }
 
-fn recognizedKittyTerminal(term_program: ?[]const u8, term: []const u8) bool {
-    if (term_program) |tp| {
-        for (kitty_term_programs) |n| if (std.mem.eql(u8, tp, n)) return true;
-    }
+fn kittyTerm(term: []const u8) bool {
     if (std.mem.indexOf(u8, term, "kitty") != null) return true; // xterm-kitty 等
     return std.mem.eql(u8, term, "xterm-ghostty");
 }
@@ -647,11 +675,17 @@ pub fn newlineHint() []const u8 {
 var g_first_raw_entry = std.atomic.Value(bool).init(true);
 
 pub fn enterRawMode(fd: c_int) ?platform_term.SavedMode {
+    // 启动探测到期、应答还在路上时终端一直是安静模式(bg_probe.Late):接管它,返回探测前的
+    // 模式供 restoreMode 复原(当前的安静模式不是要复原的那个)。
+    const original = bg_probe.handOver(fd);
     // 模式切换走可移植 platform/terminal(POSIX termios / Windows console mode)。
     const startup = g_first_raw_entry.swap(false, .acq_rel);
-    const orig = (if (startup) platform_term.enterRawKeepingInput(fd) else platform_term.enterRaw(fd)) orelse return null;
+    const orig = (if (startup) platform_term.enterRawKeepingInput(fd) else platform_term.enterRaw(fd)) orelse {
+        if (original) |o| platform_term.restoreModeKeepingInput(fd, o);
+        return null;
+    };
     emitEnableSequences(fd);
-    return orig;
+    return original orelse orig;
 }
 
 pub fn restoreMode(fd: c_int, orig: platform_term.SavedMode) void {
@@ -1717,6 +1751,11 @@ test "classifyKittyKeyboard:deny-list / 认得出 / 探测 分流矩阵" {
     try testing.expectEqual(KeyboardPolicy.disable, classifyKittyKeyboard(null, null, .none));
     try testing.expectEqual(KeyboardPolicy.disable, classifyKittyKeyboard(null, "", .none));
     try testing.expectEqual(KeyboardPolicy.disable, classifyKittyKeyboard("iTerm.app", "dumb", .tmux));
+    // TERM 认得出的终端先于 deny-list:从 Terminal.app / VS Code 里启动的 kitty、Ghostty 继承了
+    // 外层的 TERM_PROGRAM,TERM 才是它自己设的。
+    try testing.expectEqual(KeyboardPolicy.enable, classifyKittyKeyboard("Apple_Terminal", "xterm-kitty", .none));
+    try testing.expectEqual(KeyboardPolicy.enable, classifyKittyKeyboard("vscode", "xterm-ghostty", .none));
+    try testing.expectEqual(KeyboardPolicy.enable, classifyKittyKeyboard("Hyper", "xterm-kitty", .other));
     // tmux 照旧直接发;其它复用器照旧只看环境(答查询的是复用器自己,不问)。
     try testing.expectEqual(KeyboardPolicy.enable, classifyKittyKeyboard(null, "screen-256color", .tmux));
     try testing.expectEqual(KeyboardPolicy.enable, classifyKittyKeyboard("vscode", "tmux-256color", .tmux));
@@ -1836,6 +1875,50 @@ test "KeyParser: OSC 被控制键或别的序列截断 → 那个键照常" {
     keys = parseAll("\x1b]11;rgb\x1b[A", &buf);
     try testing.expectEqual(@as(usize, 1), keys.len);
     try testing.expect(keys[0] == .up);
+}
+
+test "KeyParser: 读到一半的序列等不来后半截 → 超时兑现时丢掉,不吞下一个键" {
+    // 探测到期时停在应答中间、或一个键被读切开,后半截被下一次进 raw 的 TCSAFLUSH 丢了:
+    // 以前 parser 一直等终结字节,把用户接着敲的第一个字母当终结字节吃掉(`ls` → `s`)。
+    const cut = [_][]const u8{ "\x1b[?62;", "\x1b]11;rgb:1e1e/", "\x1b[", "\x1b[1;5", "\x1b[12" };
+    for (cut) |prefix| {
+        var p = KeyParser{};
+        for (prefix) |b| try testing.expect(p.feed(b) == null);
+        try testing.expect(p.pendingEsc());
+        try testing.expect(p.flushEsc() == null); // 序列作废,没有键
+        try testing.expect(!p.pendingEsc());
+        try testing.expectEqual(@as(u8, 'l'), p.feed('l').?.char);
+        try testing.expectEqual(@as(u8, 's'), p.feed('s').?.char);
+    }
+    // OSC 里的 ESC 之后等不来 `\`:那个 ESC 是用户按的 Esc。
+    var p = KeyParser{};
+    for ("\x1b]11;x\x1b") |b| try testing.expect(p.feed(b) == null);
+    try testing.expect(p.pendingEsc());
+    try testing.expect(p.flushEsc().? == .esc);
+    try testing.expectEqual(@as(u8, 'a'), p.feed('a').?.char);
+}
+
+test "KeyParser: 超长的数字参数饱和而不溢出,整条仍是一个认不出的键" {
+    // `ESC [` 后十位以上数字:u32 累加在 Safe 构建里溢出 panic。
+    var buf: [8]Key = undefined;
+    const keys = parseAll("\x1b[99999999999999999999~\x1b[1;99999999999999999999u\x1b[4294967296ua", &buf);
+    try testing.expectEqual(@as(usize, 4), keys.len);
+    for (keys[0..3]) |k| try testing.expect(k == .unknown);
+    try testing.expectEqual(@as(u8, 'a'), keys[3].char);
+}
+
+test "KeyParser: rxvt 用 `$` 结尾的 Shift 组合键仍是一个键,不吞下一个键" {
+    // urxvt/Eterm/aterm:Shift+Delete ESC[3$、Shift+Home/End ESC[7$/ESC[8$、Shift+F11/F12 ESC[23$/ESC[24$。
+    for ([_][]const u8{ "\x1b[3$", "\x1b[7$", "\x1b[8$", "\x1b[23$", "\x1b[24$" }) |seq| {
+        var buf: [8]Key = undefined;
+        var stream: [16]u8 = undefined;
+        @memcpy(stream[0..seq.len], seq);
+        @memcpy(stream[seq.len..][0..3], " ab");
+        const keys = parseAll(stream[0 .. seq.len + 3], &buf);
+        try testing.expectEqual(@as(usize, 4), keys.len);
+        try testing.expect(keys[0] == .unknown);
+        try testing.expectEqualStrings(" ab", &[_]u8{ keys[1].char, keys[2].char, keys[3].char });
+    }
 }
 
 test "KeyParser: Kitty 下的 Alt+B / Alt+F(CSI 98;3u / 102;3u)仍是词跳转" {

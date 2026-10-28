@@ -3,7 +3,9 @@
 //! 机制:进 raw(保留已到的输入)→ 一次写出 `[OSC 11 ?][CSI ? u] CSI c` → 读应答直到 DA1
 //! 回来或超时 → 还原 termios。每个终端都答 DA1(primary device attributes),而终端按顺序应答:
 //! DA1 到了还没见到 Kitty 应答,就是确定的"不支持",不用等超时;OSC 11 同理。超时(~120ms)
-//! 只是兜底——应答在路上太久(慢 SSH)或终端什么都不答,结果是"不知道",调用方沿用旧默认。
+//! 只是兜底——应答在路上太久(慢 SSH)或终端什么都不答,结果是"不知道",调用方沿用旧默认;
+//! 迟到的应答由 `Late` 接着读掉(终端保持安静,不回显),直到 REPL 接管。
+//! 查询发出前已经排在队列里的应答(上一个程序没读走的)不算这一轮的。
 //! 背景色:`\x1b]11;rgb:RRRR/GGGG/BBBB\x07`(或 ST `\x1b\\` 结尾)→ 解析高字节 → BT.601 亮度判明暗。
 //!
 //! 同一批字节里不是应答的(探测期间敲的键、粘贴的文字)原样交还 stdin
@@ -159,9 +161,26 @@ pub const Scanner = struct {
         return self.result.sentinel;
     }
 
-    /// The round is over: a sequence still open goes out as typed.
+    /// No more bytes will be read: a sequence still open is resolved. One
+    /// only an answer could be (`ESC [ ?`, `ESC ] 11 ;`) is an answer cut
+    /// short and is dropped: handed to the input parser it would wait there
+    /// for a tail that may never come, and take the next typed key for it.
+    /// Anything else (a lone Esc, half an arrow key) goes out as typed.
     pub fn finish(self: *Scanner) void {
-        self.flushSeq();
+        if (self.openAnswer()) {
+            self.seq_len = 0;
+            self.state = .ground;
+        } else self.flushSeq();
+    }
+
+    fn openAnswer(self: *const Scanner) bool {
+        const seq = self.seq[0..self.seq_len];
+        return std.mem.startsWith(u8, seq, "\x1b[?") or std.mem.startsWith(u8, seq, "\x1b]" ++ osc11_prefix);
+    }
+
+    /// The typed bytes so far were handed on; collect afresh.
+    pub fn clearTyped(self: *Scanner) void {
+        self.typed_len = 0;
     }
 
     pub fn typedBytes(self: *const Scanner) []const u8 {
@@ -279,9 +298,22 @@ pub const Wait = enum { readable, timeout, interrupted, closed };
 ///
 /// Reading stops while the typed bytes would overflow what stdin can be
 /// handed back: anything after that stays with the terminal, in order.
+///
+/// What the terminal had queued before the query is read first and is not
+/// this round's: a program that ran before may have left answers unread, and
+/// its DA1 taken for this round's would end the round before this round's
+/// Kitty answer. Answers among it are dropped, the rest is typed.
+///
+/// A round that DA1 ended is finished (`Scanner.finish`). One the deadline
+/// ended keeps its open sequence: it may be an answer whose tail is still on
+/// its way, and the caller decides (`probe` keeps reading it, `Late`).
 pub fn runRound(io: anytype, want: Want, deadline_ms: u32) Scanner {
     var scanner = Scanner.init(want);
-    if (!want.any() or !io.sendQuery(queryFor(want))) return scanner;
+    if (!want.any()) return scanner;
+    readQueued(io, &scanner);
+    scanner.finish();
+    scanner.result = .{};
+    if (!io.sendQuery(queryFor(want))) return scanner;
     const start = io.nowMs();
     while (!scanner.done()) {
         const elapsed = io.nowMs() - start;
@@ -299,8 +331,20 @@ pub fn runRound(io: anytype, want: Want, deadline_ms: u32) Scanner {
         if (n <= 0) break;
         scanner.feed(chunk[0..@intCast(n)]);
     }
-    scanner.finish();
+    if (scanner.done()) scanner.finish();
     return scanner;
+}
+
+/// Feed what `io` has queued right now into `scanner`, without waiting.
+fn readQueued(io: anytype, scanner: *Scanner) void {
+    var chunk: [256]u8 = undefined;
+    while (true) {
+        const limit = @min(chunk.len, scanner.room());
+        if (limit == 0 or io.wait(0) != .readable) return;
+        const n = io.read(chunk[0..limit]);
+        if (n <= 0) return;
+        scanner.feed(chunk[0..@intCast(n)]);
+    }
 }
 
 /// The deadline when DA1 does not come back. A local terminal answers in well
@@ -343,19 +387,23 @@ const TerminalIo = struct {
 /// answer could only be "unsupported"; and the enable sequence, written to the
 /// stdin descriptor, cannot reach a Windows console anyway. It does answer
 /// OSC 11; the theme keeps its Windows default until that is wired.
-pub fn probe(want: Want) Result {
+///
+/// `hand_over`: the REPL takes stdin's terminal next (`handOver`). A round the
+/// deadline ended then leaves the terminal quiet and keeps reading its answers
+/// until the REPL takes over (`Late`); otherwise the terminal is restored.
+pub fn probe(want: Want, hand_over: bool) Result {
     if (builtin.os.tag == .windows) return .{};
     var asked = want;
     const fd: c_int = if (platform_term.isatty(0)) 0 else 1;
     if (fd != 0) asked.keyboard = false;
     if (!asked.any() or !platform_term.isatty(fd)) return .{};
     const saved = platform_term.enterRawKeepingInput(fd) orelse return .{};
-    defer platform_term.restoreModeKeepingInput(fd, saved);
 
     const started = util_time.nowNs();
     var io: TerminalIo = .{ .fd = fd };
-    const round = runRound(&io, asked, budget_ms);
-    if (fd == 0) platform_term.replayInput(0, round.typedBytes());
+    var round = runRound(&io, asked, budget_ms);
+    const late = !round.done() and fd == 0 and hand_over and platform_term.enterQuiet(fd, saved);
+    if (!late) round.finish();
     log.debug("probe", "terminal answered in {d}us: sentinel={} keyboard={s} background={} typed={d}B", .{
         @divTrunc(util_time.nowNs() - started, std.time.ns_per_us),
         round.result.sentinel,
@@ -363,7 +411,80 @@ pub fn probe(want: Want) Result {
         round.result.background != null,
         round.typed_len,
     });
+    if (fd == 0) platform_term.replayInput(0, round.typedBytes());
+    if (late) {
+        round.clearTyped();
+        platform_term.restoreAtExit(fd, saved);
+        g_late = .{ .fd = fd, .original = saved, .scanner = round };
+    } else platform_term.restoreModeKeepingInput(fd, saved);
     return round.result;
+}
+
+/// A round the deadline ended, on the REPL's terminal: its answers may still
+/// be on their way (a slow link). Until the REPL takes the terminal
+/// (`handOver`) it stays quiet (`platform.terminal.enterQuiet`: nothing is
+/// echoed, Ctrl+C still works), so a late answer is not printed over the
+/// startup screen; and what it queues is read through the round's scanner, so
+/// a late answer is not taken for a key (the splash skips on a key) nor typed
+/// into the prompt. A process that exits before the REPL restores `original`
+/// at exit. Read by the splash's thread while it plays, then by the REPL's
+/// first raw-mode entry, which comes after the splash has ended: never by two
+/// threads at once.
+const Late = struct {
+    fd: c_int,
+    /// The terminal's mode before the probe: the REPL restores it when it
+    /// leaves raw mode.
+    original: platform_term.SavedMode,
+    /// The round's scanner, with any sequence the deadline cut still open.
+    scanner: Scanner,
+};
+var g_late: ?Late = null;
+
+/// Read what the terminal queued since the round ended through its scanner:
+/// answers are dropped, the rest goes back to stdin (`replayInput`). True
+/// when some of it was typed.
+fn absorbLate(late: *Late) bool {
+    var typed = false;
+    var chunk: [256]u8 = undefined;
+    while (true) {
+        const limit = @min(chunk.len, late.scanner.room(), platform_term.replayRoom(late.fd));
+        if (limit == 0) break;
+        const n = platform_term.readPending(late.fd, chunk[0..limit]);
+        if (n <= 0) break;
+        late.scanner.feed(chunk[0..@intCast(n)]);
+        if (late.scanner.typed_len == 0) continue;
+        typed = true;
+        platform_term.replayInput(late.fd, late.scanner.typedBytes());
+        late.scanner.clearTyped();
+    }
+    return typed;
+}
+
+/// Whether what stdin has pending is only the late answers of a round the
+/// deadline ended (they are read and dropped here). False when something was
+/// typed (it stays pending, for stdin's next reader) and when there is no
+/// such round: then whatever is pending is input.
+pub fn lateAnswersOnly(fd: c_int) bool {
+    const late = if (g_late) |*l| l else return false;
+    if (late.fd != fd or platform_term.replayRoom(fd) < platform_term.replay_capacity) return false;
+    return !absorbLate(late);
+}
+
+/// The REPL takes stdin's terminal. After a round the deadline ended, what is
+/// queued is read through its scanner one last time, an answer still cut
+/// short is dropped, and the mode the terminal had before the probe is
+/// returned: the REPL restores it when it leaves raw mode (the terminal is
+/// quiet now). Null when no such round is pending.
+pub fn handOver(fd: c_int) ?platform_term.SavedMode {
+    const late = if (g_late) |*l| l else return null;
+    if (late.fd != fd) return null;
+    _ = absorbLate(late);
+    late.scanner.finish();
+    platform_term.replayInput(fd, late.scanner.typedBytes());
+    const original = late.original;
+    g_late = null;
+    platform_term.cancelRestoreAtExit();
+    return original;
 }
 
 // ============================================================================
@@ -611,15 +732,52 @@ test "runRound: no DA1 by the deadline is unknown, and what came is kept" {
     try testing.expectEqual(@as(i64, budget_ms), term.now);
 }
 
-test "runRound: an answer still arriving at the deadline is handed back with the keys" {
+test "runRound: an answer still arriving at the deadline is not handed back as typed" {
     var term: ScriptedTerminal = .{ .events = &.{
         .{ .at_ms = 5, .bytes = "h\x1b[?62;" },
         .{ .at_ms = 500, .bytes = "22c" },
     } };
-    const round = runRound(&term, .{ .keyboard = true }, budget_ms);
+    var round = runRound(&term, .{ .keyboard = true }, budget_ms);
     try testing.expectEqual(Keyboard.unknown, round.result.keyboard);
-    // The input parser skips an unknown CSI as a whole once its tail arrives.
-    try testing.expectEqualStrings("h\x1b[?62;", round.typedBytes());
+    round.finish();
+    // `ESC [ ?` is a shape only an answer has. Handed to the input parser,
+    // it waited there for a tail that a later raw-mode entry flushed, and
+    // ate the next key the user typed.
+    try testing.expectEqualStrings("h", round.typedBytes());
+}
+
+test "Scanner: finish drops an open sequence only an answer could be, keeps one a key could be" {
+    const cases = [_]struct { in: []const u8, typed: []const u8 }{
+        .{ .in = "a\x1b[?62;", .typed = "a" }, // DA1 cut short
+        .{ .in = "a\x1b[?", .typed = "a" },
+        .{ .in = "a\x1b]11;rgb:1e1e/", .typed = "a" }, // OSC 11 cut short
+        .{ .in = "a\x1b]11;", .typed = "a" },
+        .{ .in = "a\x1b[", .typed = "a\x1b[" }, // half an arrow key
+        .{ .in = "a\x1b[1;5", .typed = "a\x1b[1;5" }, // half of Ctrl+Up
+        .{ .in = "a\x1b]1", .typed = "a\x1b]1" }, // Alt+] then 1
+        .{ .in = "a\x1b", .typed = "a\x1b" }, // Esc
+    };
+    for (cases) |c| {
+        var s = scan(both, c.in);
+        s.finish();
+        try testing.expectEqualStrings(c.typed, s.typedBytes());
+    }
+}
+
+test "runRound: answers already queued before the query are not this round's" {
+    // A program that ran before left its DA1 answer unread. Read as this
+    // round's sentinel it made a Kitty terminal look unsupported.
+    var term: ScriptedTerminal = .{ .events = &.{
+        .{ .at_ms = -1, .bytes = "k\x1b[?62;22c\x1b]11;rgb:0/0/0\x07" },
+        .{ .at_ms = 2, .bytes = "\x1b[?1u" },
+        .{ .at_ms = 3, .bytes = "\x1b[?62;22c" },
+    } };
+    var round = runRound(&term, .{ .keyboard = true }, budget_ms);
+    try testing.expectEqual(Keyboard.supported, round.result.keyboard);
+    try testing.expect(round.result.background == null);
+    round.finish();
+    // The key typed before the round is kept.
+    try testing.expectEqualStrings("k", round.typedBytes());
 }
 
 test "runRound: keys typed before, between and after the answers come back in order" {
@@ -679,15 +837,53 @@ test "runRound: interrupted waits retry within the deadline; a closed terminal e
     try testing.expectEqual(Keyboard.unknown, runRound(&closed, .{ .keyboard = true }, budget_ms).result.keyboard);
 }
 
-test "runRound: nothing asked, or the query not written, reads nothing" {
-    var term: ScriptedTerminal = .{ .events = &.{.{ .at_ms = 0, .bytes = "k" }} };
+test "runRound: nothing asked reads nothing; an unwritten query reads only what was queued" {
+    var term: ScriptedTerminal = .{ .events = &.{
+        .{ .at_ms = -1, .bytes = "k" },
+        .{ .at_ms = 5, .bytes = "\x1b[?62c" },
+    } };
     _ = runRound(&term, .{}, budget_ms);
     try testing.expectEqual(@as(usize, 0), term.written_len);
     term.write_ok = false;
     const round = runRound(&term, .{ .keyboard = true }, budget_ms);
     try testing.expectEqual(Keyboard.unknown, round.result.keyboard);
+    // The key typed before the round is the probe's to hand back.
+    try testing.expectEqualStrings("k", round.typedBytes());
     var rest: [8]u8 = undefined;
-    try testing.expectEqualStrings("k", term.unread(&rest));
+    try testing.expectEqualStrings("\x1b[?62c", term.unread(&rest));
+}
+
+test "Late: answers that come after the deadline are dropped, keys are kept, a cut answer is dropped at hand-over" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest; // a pipe stands in for the terminal
+    var fds: [2]c_int = undefined;
+    try testing.expectEqual(@as(c_int, 0), std.c.pipe(&fds));
+    defer _ = std.c.close(fds[0]);
+    defer _ = std.c.close(fds[1]);
+    const r = fds[0];
+    // The deadline cut the round inside DA1.
+    g_late = .{ .fd = r, .original = std.mem.zeroes(platform_term.SavedMode), .scanner = scan(both, "\x1b[?62;") };
+    defer g_late = null;
+    var buf: [32]u8 = undefined;
+
+    // Its tail and a late OSC 11 answer: not a key, nothing for the prompt.
+    try testing.expect(pfs.writeAll(fds[1], "22c\x1b]11;rgb:0/0/0\x07"));
+    try testing.expect(lateAnswersOnly(r));
+    try testing.expectEqual(@as(i32, 0), platform_term.waitReadable(r, 0));
+
+    // A key typed meanwhile is a key; it stays pending for the prompt.
+    try testing.expect(pfs.writeAll(fds[1], "x"));
+    try testing.expect(!lateAnswersOnly(r));
+    // Pending bytes owed to the prompt are input too.
+    try testing.expect(!lateAnswersOnly(r));
+
+    // The REPL takes over while another answer is still cut short: dropped.
+    try testing.expect(pfs.writeAll(fds[1], "y\x1b[?1"));
+    try testing.expect(handOver(r) != null);
+    try testing.expect(g_late == null);
+    try testing.expect(handOver(r) == null);
+    try testing.expectEqual(@as(isize, 2), platform_term.readInput(r, &buf));
+    try testing.expectEqualStrings("xy", buf[0..2]);
+    try testing.expectEqual(@as(i32, 0), platform_term.waitReadable(r, 0));
 }
 
 test "runRound: a paste larger than stdin can be handed stays with the terminal" {
@@ -708,6 +904,7 @@ test "runRound: a paste larger than stdin can be handed stays with the terminal"
 
 test "probe: no terminal, nothing asked → nothing known, nothing owed" {
     // The test runner's stdin is a pipe or /dev/null; asking nothing returns before any I/O.
-    const nothing = probe(.{});
+    const nothing = probe(.{}, true);
     try testing.expect(nothing.background == null and nothing.keyboard == .unknown and !nothing.sentinel);
+    try testing.expect(g_late == null);
 }
