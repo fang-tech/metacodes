@@ -12,6 +12,7 @@
 //!     it used to be three separate writes).
 
 const std = @import("std");
+const cc = @import("cc");
 const harness = @import("region_harness.zig");
 
 const testing = std.testing;
@@ -136,4 +137,61 @@ test "endScrollLine seals a half line in one closed frame, with no blank row aft
     r.writeGenText("next\n");
     r.leaveGenerating(fx.app);
     try expectTranscript(t, "first\nhalf\nnext");
+}
+
+// A panic ends the process with what the merge window still holds unwritten:
+// up to one window of the reply, often the lines that led to the panic. The
+// panic hook (main.zig) writes them first, but only when it can take the
+// region's lock without waiting.
+test "panic: the text still waiting in the merge window is written before the panic message" {
+    const fx = try harness.AppFixture.create(gpa);
+    defer fx.destroy();
+    const t = try mergingTerm(12, 60);
+    defer t.destroy();
+    const r = &t.region;
+    r.enableMergeWindow(); // the session region registers for the hook (keeps the fake clock)
+    r.enterGenerating(fx.app, null);
+    r.tickSpinner(fx.app);
+    try expectRegionOnScreenOnce(t);
+    r.writeGenText("before the crash\n");
+    r.writeGenText("last words\n"); // inside the window: not on screen yet
+    try t.sync();
+    try testing.expect((try t.screen.findRow("last words")) == null);
+
+    try testing.expect(cc.tui_render_region.flushPendingOnPanic());
+    // The hook keeps the lock, so nothing draws over the panic message.
+    defer r.mutex.unlock();
+    // The text is out and the region is gone; the cursor waits on the next
+    // row, where the panic message is printed.
+    try expectTranscript(t, "before the crash\nlast words");
+    try testing.expectEqual(@as(usize, 0), try t.screen.countRows(.screen, harness.isRegionRow));
+    try testing.expectEqual(@as(usize, 0), t.screen.sync_depth);
+    const last = (try t.screen.findRow("last words")).?;
+    try testing.expectEqual(harness.vterm.Pos{ .row = last + 1, .col = 0 }, t.screen.cursor());
+}
+
+test "panic: a region whose lock is held is left alone, and a freed one is forgotten" {
+    const fx = try harness.AppFixture.create(gpa);
+    defer fx.destroy();
+    {
+        const t = try mergingTerm(12, 60);
+        defer t.destroy();
+        const r = &t.region;
+        r.enableMergeWindow();
+        r.enterGenerating(fx.app, null);
+        r.tickSpinner(fx.app);
+        r.writeGenText("pending\n");
+        try t.sync();
+        const bytes_before = t.written().len;
+        // Another thread is drawing (or the panicking thread was): the frame
+        // state cannot be trusted, so the hook gives up rather than wait.
+        r.mutex.lock();
+        const took = cc.tui_render_region.flushPendingOnPanic();
+        r.mutex.unlock();
+        try testing.expect(!took);
+        try testing.expectEqual(bytes_before, t.written().len);
+        r.leaveGenerating(fx.app);
+    }
+    // The region is gone: the hook must not reach for it.
+    try testing.expect(!cc.tui_render_region.flushPendingOnPanic());
 }

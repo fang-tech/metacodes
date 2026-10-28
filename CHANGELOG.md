@@ -59,6 +59,9 @@ status, compatibility boundaries, and entry points are defined by
   WebSearch result line is always painted before its card goes. The end of
   each provider turn is now one synchronized frame instead of three writes,
   and a resize while the region was hidden no longer printed a blank line.
+  If metacodes panics mid-reply, the lines still waiting for the window are
+  written before the panic message, and the live region no longer draws
+  over the stack trace.
 
 ### Fixed
 

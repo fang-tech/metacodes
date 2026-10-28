@@ -202,6 +202,9 @@ renderInput/GenFrame = 把现 renderFrameInner/drawGenRegion 的**纯计算行�
 - **overlay/对话框**:enterExclusiveOverlay 先写出攒着的文本再擦区,overlay 期间持锁,定时线程等锁。
 - **借用**:生成期输入框不再借用草稿(TuiBackend 的 `draft`)的缓冲(下一个键会重分配它,而区可能先被别的线程画),改为 region 自有副本 `gen_editor`。
 - 修掉的旧问题:区不在屏时 resize 封口的换行曾写出两次(`sealResizedLine` 自己 flush 后 scratch 未清)。
+- **panic**:合并窗口最多压着一个窗口(~16 ms)已发出、还没写到终端的文本,而它们常常正是 panic 前最后发生的事。没有钩子时它们要么随进程丢掉(abort 得快),要么更糟:实测 Debug 构建(WSL pty,临时加的 panic 触发点)里默认 handler 打调用栈期间定时线程照常到点画帧——panic 信息打在固定区中间,按过时的锚点擦掉一段调用栈,再把攒着的行和整个区画在调用栈下面。根 panic handler(`main.zig`)先调 `render_region.flushPendingOnPanic`:拿得到 region 锁(`tryLock`,不等)就画一个 `.hidden` 帧——擦区、按序写出攒着的文本、不再画区——然后**不放锁**交给默认 handler 打印信息与调用栈,别的线程不会再画区盖住它(同一实测:攒着的行按序在前,区擦掉,panic 信息与完整调用栈在下面)。锁被占着(panic 的正是持锁画帧的线程,或者别的线程正画到一半)就放弃:那一刻帧状态不可信,宁可丢最后一个窗口的文本也不把屏幕写乱。仍会丢的:持锁时的 panic、外部信号杀进程(SIGKILL、终端关闭)时的那一窗口。会话 region 由 `enableMergeWindow` 登记、deinit 注销;测试与 `/agent-churn-test` 的 region 不登记。
+- **picker(已知残留,未修)**:生成期 watcher 调 `picker_host.open/onKey/poll` 时不持 region 锁,直接改 `app.model_picker` 和 `Interaction.picker_open`,而 agent 线程的文本帧、合并窗口的定时线程可能同时持锁画 picker。这个读写竞争在 #328 之前就有(#220 起 agent 线程的帧就会画回复中打开的 picker);#328 多了一个读者(定时线程),没有多写者。危险的交错只有一种:picker 开着时刷新目录(`poll` 里登录成功后的 `refreshModelPicker`、`apply` 遇 `.conflict` 的重载),`adopt` 往 `offers` 追加时可能扩容、释放旧缓冲,正在遍历它的帧会读到已释放内存(代码推断,未复现)。其余写入是光标、页高、notice 这类小字段,最坏画出一帧不一致的 picker,下一帧就对了;`open` 先刷新、后置 `picker_open`,刷新时没有帧读它。
+  没有直接持锁调用的原因:这三个入口会阻塞——提交经 `commitModelSelection` → `bindCommittedSelection`,可能刷新 OAuth token(网络)、读配置、写会话选择;`open_key_page` 起浏览器进程;刷新经 `providerHost()`。持 region 锁做这些,回复的每一帧、agent 线程每一次 emit(流式文本要拿这把锁)都要等到网络调用结束,还会把 provider kernel 与凭据相关的锁嵌套到渲染锁之下,而这个锁序没人审计过。修法方向:picker_host 拆成计算与发布两段,网络/文件 IO 与 kernel 调用在锁外算出新快照,`adopt`、光标、notice、`picker_open` 在 region 锁内一次发布(或者 region 持有 picker 视图的自有副本,与 `gen_editor` 同理)。
 
 ### 9.3 测量
 
@@ -216,3 +219,9 @@ WSL Ubuntu 22.04 的 POSIX pty(字节即 metacodes 写出的字节),Debug 构建
 | WebSearch:进度 + 完成(3 个 turn) | 22 → 24 | 19,389 → 21,012 |
 
 读法:窗口只合并真正挤在 16 ms 内的请求。行间隔大于窗口的 token 流、10 Hz 的 spinner 本来就不挤,不变;WebSearch 多出的 2 帧是工具完成的立即帧和卡离场前的那一帧(前者让完成即时上屏,后者守 `Found N`)。逐键等回显的打字(驱动等上一键的回显才发下一键)仍是一键一帧,同一窗口里第二个键起的回显最多晚 16 ms。测量脚本与原始数据不入库(会话 scratchpad),断言版本在 `tests/tty/cases/test_redraw_coalesce.py`:突发流帧数 < 行数/2,突发打字帧数 < 键数/2——对 #330 的二进制这两条都失败(174 帧/160 行、57 帧/54 键),对本改动通过。
+
+### 9.4 验证
+
+- **逻辑**:`frame_scheduler.zig` 的假时钟单测(窗口、期限、立即通道满足待画帧)。
+- **终端所见**(vterm oracle):`tests/component/redraw_window_contract_test.zig` 断言突发一帧写完、resize 时待画帧按新宽度排、`endScrollLine` 一个闭合帧、panic 钩子写出攒着的文本(以及锁被占时不动、region 释放后不再找它);`render_region_contract_test.zig` 的全部合约(emit/erase 配对、半行续接、阶段交接、严格自动换行、footer 截断)在合并窗口关、开两种模式下各跑一遍——开窗口时 harness 用假时钟,`sync` 让窗口到期并画出待画帧,断言看到的是合并后的那一帧。
+- **真二进制**:`tests/tty/cases/test_redraw_coalesce.py`。WebSearch 用例让 `Searching` 与 `Found 1 result` 两次进度在同一次写入里到达,所以结果行一定落在某个窗口里、卡离场时还在等,只有 `clearToolCard` 离场前画的那一帧能把它画出来;去掉那一帧,这条用例失败。

@@ -735,6 +735,8 @@ pub const TuiBackend = struct {
             .open_model_picker => {
                 // 生成期也能开(要求:picker 在流式回复期间可用)。不碰 alt-screen:
                 // picker 画在固定区内,回复继续往 scrollback 走;改动只影响下一轮。
+                // picker_host 的三个入口不持 region 锁(会做网络/文件 IO),别的线程可能同时在画
+                // picker:已知残留,见 doc/TUI_STATE_ARCHITECTURE.md §9.2「picker」。
                 picker_host.open(app, &self.region.ui);
                 self.region.redrawGen(app);
                 return;

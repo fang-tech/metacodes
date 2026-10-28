@@ -43,6 +43,18 @@ const Conversation = @import("../../core/conversation.zig").Conversation;
 const Theme = theme_mod.Theme;
 const ColorCapability = term.ColorCapability;
 
+/// The session region (the one with the merge window on, so the only one that
+/// can hold text it has not written yet). The panic hook finds it here.
+var panic_target: std.atomic.Value(?*RenderRegion) = .init(null);
+
+/// Called by the root panic handler (main.zig) before the default one prints
+/// the panic: write what the merge window still holds (`flushForPanic`).
+/// True when the region's lock was taken, and is still held.
+pub fn flushPendingOnPanic() bool {
+    const region = panic_target.load(.acquire) orelse return false;
+    return region.flushForPanic();
+}
+
 pub const RenderRegion = struct {
     /// 生成期重画的合并窗口(#328,见 frame_scheduler.zig)。`merge` 非 null 时生效。
     pub const MergeWindow = struct {
@@ -353,11 +365,25 @@ pub const RenderRegion = struct {
     }
 
     /// 打开生成期重画合并窗口(#328)。REPL 的会话 region 调一次;此后 region 的地址不能再变
-    /// (定时线程持有它),deinit 时 join。
+    /// (定时线程持有它,panic 钩子也记着它),deinit 时 join 并注销。
     pub fn enableMergeWindow(self: *RenderRegion) void {
         self.lock();
         defer self.unlock();
         if (self.merge == null) self.merge = .{};
+        panic_target.store(self, .release);
+    }
+
+    /// 合并窗口最多压着一个窗口(~16 ms)已经发出、还没写到终端的文本。进程 panic 时它们随进程
+    /// 一起丢掉,而它们常常正是 panic 之前最后发生的事。panic 钩子(main.zig)先调这里:
+    /// 拿得到锁才写——锁被占着(panic 的正是持锁画帧的线程,或别的线程正画到一半)时帧状态
+    /// 不可信,放弃,宁可少几行也不把屏幕写乱。写的是 `.hidden` 帧:擦掉固定区、写出文本、
+    /// 不再画区,panic 信息接着打在文本下面。
+    /// 返回 true 时锁**仍被持有**:panic 信息打完之前,定时线程和别的线程不会再画区盖住它
+    /// (进程随后 abort,不放)。
+    pub fn flushForPanic(self: *RenderRegion) bool {
+        if (!self.mutex.tryLock()) return false;
+        if (self.pending_scroll.items.len > 0) self.paintLocked(.hidden, "");
+        return true;
     }
 
     fn paintPending(self: *const RenderRegion) bool {
@@ -576,6 +602,7 @@ pub const RenderRegion = struct {
     }
 
     pub fn deinit(self: *RenderRegion) void {
+        _ = panic_target.cmpxchgStrong(self, null, .acq_rel, .acquire);
         self.stopTimer();
         self.pending_scroll.deinit(self.allocator);
         self.gen_editor.deinit(self.allocator);

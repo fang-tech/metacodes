@@ -38,6 +38,16 @@ pub const VERSION = @import("version.zig").semver;
 /// `test_refused_endpoint_retries_without_system_error_noise`.
 pub const std_options: std.Options = .{ .unexpected_error_tracing = false };
 
+/// Panics go through the default handler (message, stack trace, abort), after
+/// the TUI writes the reply text its merge window still holds (#328).
+pub const panic = std.debug.FullPanic(panicAfterPendingOutput);
+
+fn panicAfterPendingOutput(msg: []const u8, first_trace_addr: ?usize) noreturn {
+    @branchHint(.cold);
+    _ = tui_render_region.flushPendingOnPanic();
+    std.debug.defaultPanic(msg, first_trace_addr);
+}
+
 // Public re-exports for tests and future consumers.
 pub const api_stream = @import("api/stream.zig");
 pub const api_provider = @import("api/provider.zig");
