@@ -54,7 +54,8 @@ callback. `RunResult.text` is the final answer rebuilt from the
 event vocabulary is listed in
 [doc/AGENTCORE_BINARY_ABI.md](../../doc/AGENTCORE_BINARY_ABI.md).
 `session.abort()` stops the active run and `session.submit(text)` adds user
-input to it; both may be called from another thread.
+input to it; both may be called from another thread. Each run executes on its
+own thread; Ctrl+C while `run()` waits aborts the run and waits for it to stop.
 `session.update_credential(api_key)` replaces the provider key in place, while
 idle or during a run, from any thread or from inside a tool or handler: every
 request sent afterwards (the run's next turn, a retry) carries it, and a
@@ -123,5 +124,5 @@ network, no API key. Without a library they skip, unless
 
 Experimental, like the AgentCore ABI it wraps: the package pins one exact ABI
 revision and follows it. Not yet published to PyPI; build the wheel as above.
-Windows is untested. Skills, MCP, checkpoints, goals and teams exist in
+Windows is not covered by CI. Skills, MCP, checkpoints, goals and teams exist in
 the ABI but are not wrapped yet; contributions welcome.

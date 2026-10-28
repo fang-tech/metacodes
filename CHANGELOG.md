@@ -139,6 +139,20 @@ status, compatibility boundaries, and entry points are defined by
   box at the bottom of the screen every redraw pushed the spinner, border
   and prompt rows into the scrollback. It is now cut with an ellipsis, like
   the MCP notice on the same line.
+- **Python package: a host tool can run a child Session on Windows.** A Run
+  executed on the thread that called `Session.run`; on Windows the main
+  thread of python.exe reserves 2 MB, and a Run that a tool started from
+  inside another Run overflowed it. ctypes reported the overflow as
+  `OSError: exception: stack overflow`, the child's Run never finished, and
+  closing the child failed with `BUSY`. Every Run now executes on its own
+  thread with an 8 MiB stack, the size the Node addon gives its Run threads,
+  so nesting no longer depends on the caller's stack. The thread is not a
+  daemon, and an interrupt (Ctrl+C) while `run()` waits for it aborts the Run
+  and waits for it to end before it propagates; a second interrupt stops the
+  wait and leaves the Session busy until the Run ends, so `abort()` and
+  `close()` still reach it. The suite's
+  permission-target test compares paths as paths, since AgentCore names
+  Windows paths with forward slashes.
 - **A provider credential with a byte a request header cannot carry no longer
   ends the process.** Session create and restore accepted any UTF-8 as
   `api_key`, and the CLI sent whatever bytes its flag, environment, key file
