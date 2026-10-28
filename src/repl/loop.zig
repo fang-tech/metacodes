@@ -182,6 +182,9 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, startup: Startup) !v
     else
         null;
     defer if (tui_region) |*r| r.deinit();
+    // 生成期重画合并窗口(#328):tool progress / spinner / 流式文本 / 打字回显在一个窗口内合成一帧。
+    // 在 region 落到最终地址后打开(定时线程持有它)。
+    if (tui_region) |*r| r.enableMergeWindow();
 
     // `--resume <id>`: the conversation under the banner, as Claude Code shows
     // a resumed session, then what was restored.

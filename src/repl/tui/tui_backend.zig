@@ -237,6 +237,8 @@ pub const TuiBackend = struct {
                 } else {
                     self.renderCardResult(r);
                 }
+                // 工具完成走立即通道(#328):结果卡与收掉的动态卡当场一帧画出,不等合并窗口。
+                self.region.flushGen();
             },
             .usage => |u| {
                 if (self.usage_acc) |acc| acc.apply(u);
@@ -779,18 +781,24 @@ pub const TuiBackend = struct {
                 }
                 ed.clear();
                 self.interruptCurrentRun(app);
-                return; // 中断不重画(主线程很快收尾)
+                // 中断走立即通道(#328):合并窗口里还在等的文本与清空的输入框当场画出,不排在窗口后。
+                self.region.setGenInput(ed.view(), ed.cursor);
+                self.region.flushGen();
+                return;
             },
             .ctrl_c => {
                 ed.clear();
                 self.interruptCurrentRun(app);
+                self.region.setGenInput(ed.view(), ed.cursor);
+                self.region.flushGen();
                 return;
             },
             else => {
-                // 普通编辑键 → 喂 LineEditor,重画生成区输入框。
+                // 普通编辑键 → 喂 LineEditor,重画生成区输入框。普通通道:连打/粘贴/按住键在一个
+                // 窗口内只画一帧(以前每个键一帧)。
                 _ = ed.handle(key) catch {};
                 self.region.setGenInput(ed.view(), ed.cursor);
-                self.region.redrawGen(app);
+                self.region.requestGenRedraw();
             },
         }
     }
