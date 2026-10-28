@@ -59,6 +59,24 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- **Release executables run beyond machines like the build runner.**
+  `release.yml` built the CLI executable without `-Dtarget`, so zig targeted
+  the runner: its CPU, glibc and macOS. Every published release from 0.4.0 to
+  0.8.0 is affected:
+  - The x86_64 Linux executable needs GLIBC_2.36 and an AVX2 CPU. On Ubuntu
+    22.04 the 0.8.0 one exits with "version `GLIBC_2.36' not found".
+  - The Windows executable needs AVX2, and AVX-512 in 0.4.0, 0.6.0 and 0.8.0.
+  - The aarch64 macOS executable declares macOS 26.6.2 as its minimum.
+
+  Each unit is now built for an explicit target (`cli_target`): the baseline
+  CPU and the oldest system it supports. Those targets are
+  `x86_64-linux-gnu.2.31`, `aarch64-macos.13.0` and `x86_64-windows-gnu`.
+  The new `scripts/check_binary_baseline.py` step fails a release whose
+  executable needs more. It disassembles the executable (no AVX, AVX2 or
+  AVX-512 on x86_64; no SVE or Armv8.6 matrix instructions on aarch64) and
+  reads the GLIBC symbol versions and the Mach-O minimum macOS. The Lean
+  kernels were never affected: they are built for the baseline CPU and need
+  GLIBC_2.14.
 - **Ctrl+L during a reply clears the screen through the renderer** (#320).
   The keyboard watcher sent `ESC[2J` straight to the terminal, outside the
   render lock and between two frames, while the agent loop could be printing,
