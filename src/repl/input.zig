@@ -698,7 +698,8 @@ const paste_end_seq = "\x1b[201~";
 /// 换行都是 Enter——第一行单独提交给了模型,其余行被丢掉或排成下一轮。现在已到的启动期输入
 /// 全部读出,还原成正文(StartupText),包上括号粘贴的起止标记交还 stdin,由输入框的粘贴路径
 /// 插入:换行是文本,用户按 Enter 才提交;大段粘贴照常变成占位符。
-/// 正文至多 StartupText.capacity 字节;更多的部分留在终端里,按原样作为按键读到。
+/// 正文至多 StartupText.capacity 字节:stdin 回放里欠的(至多 replay_capacity)总能整段
+/// 读进正文,所以粘贴前后的顺序不乱;终端里更多的部分留在那里,排在粘贴之后作为按键读到。
 fn pasteStartupInput(fd: c_int) void {
     var text: StartupText = .{};
     var chunk: [256]u8 = undefined;
@@ -726,8 +727,13 @@ pub const StartupText = struct {
     len: usize = 0,
     parser: KeyParser = .{},
 
-    /// What stdin's replay can take with the paste markers around it.
-    pub const capacity = platform_term.replay_capacity - paste_begin_seq.len - paste_end_seq.len;
+    /// All that stdin's replay can owe: what the probe handed back is read in
+    /// full before any byte the terminal still holds, so the paste keeps the
+    /// order it was typed in. Its markers go in the replay's wrap room.
+    pub const capacity = platform_term.replay_capacity;
+    comptime {
+        std.debug.assert(paste_begin_seq.len + paste_end_seq.len <= platform_term.replay_wrap_room);
+    }
 
     /// Input bytes the text still has room for: a byte adds at most one byte
     /// of text (an abandoned `ESC ] 12` can release its few held bytes at
@@ -2018,6 +2024,41 @@ test "StartupText: 装满为止,不越界" {
     t.finish();
     try testing.expectEqual(StartupText.capacity, t.bytes().len);
     try testing.expectEqual(StartupText.capacity, fed);
+}
+
+/// Read what stdin's replay owes `fd`, then what the pipe holds.
+fn drainStdinForTest(fd: c_int, out: []u8) []u8 {
+    var n: usize = 0;
+    while (n < out.len and platform_term.waitReadable(fd, 0) > 0) {
+        const k = platform_term.readInput(fd, out[n..]); // no EINTR: the replay buffer, or a test pipe poll reported readable
+        if (k <= 0) break;
+        n += @intCast(k);
+    }
+    return out[0..n];
+}
+
+test "pasteStartupInput: a full replay and what the terminal still holds become one paste, in order, markers whole" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest; // pipe as the terminal
+    var fds: [2]c_int = undefined;
+    try testing.expectEqual(@as(c_int, 0), std.c.pipe(&fds));
+    defer _ = std.c.close(fds[0]);
+    defer _ = std.c.close(fds[1]);
+    const r = fds[0];
+    var got: [platform_term.replay_capacity + 64]u8 = undefined;
+    defer _ = drainStdinForTest(r, &got);
+    // A probe round that timed out read a flood typed during startup: stdin's
+    // replay owes all it can but one byte. A Left arrow and a key are still
+    // with the terminal.
+    var flood: [platform_term.replay_capacity - 1]u8 = undefined;
+    @memset(&flood, 'p');
+    try testing.expectEqual(flood.len, platform_term.replayInput(r, &flood));
+    try testing.expectEqual(@as(isize, 4), std.c.write(fds[1], "\x1b[Dd", 4));
+    pasteStartupInput(r);
+    const all = drainStdinForTest(r, &got);
+    // The flood, then `d` (the arrow types nothing), between whole markers.
+    try testing.expectEqual(paste_begin_seq.len + flood.len + 1 + paste_end_seq.len, all.len);
+    try testing.expectEqualStrings(paste_begin_seq, all[0..paste_begin_seq.len]);
+    try testing.expectEqualStrings("pd" ++ paste_end_seq, all[all.len - 2 - paste_end_seq.len ..]);
 }
 
 test "KeyParser: 超长的数字参数饱和而不溢出,整条仍是一个认不出的键" {
