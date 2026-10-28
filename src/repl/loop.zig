@@ -862,6 +862,7 @@ fn awaitMcpServers(host: *const TurnHost) !bool {
         const raw = if (host.tty) input.enterRawMode(host.stdin_fd) else null;
         defer if (raw) |o| input.restoreMode(host.stdin_fd, o);
         var tui_be: ?tui_backend_mod.TuiBackend = if (region) |r| turnBackend(host, r) else null;
+        defer if (tui_be) |*tb| tb.deinit();
         if (!waitForMcpServers(host, if (tui_be) |*tb| tb else null)) {
             if (region) |r| leaveGenerationRegion(app, r);
             app.abort.reset();
@@ -924,6 +925,9 @@ fn runTurn(host: *const TurnHost, kind: TurnKind, synthetic_user_input: ?[]const
     // 同一地址——agent_loop(emit)与 watcher(键盘)共享这一个 TuiBackend 实例。
     // 不要把 tui_be 重新赋值 / 搬移 / 放进会 realloc 的容器,否则两个指针指向坟墓。
     var tui_be: ?tui_backend_mod.TuiBackend = if (region_writer) |*rw| turnBackend(host, rw.region) else null;
+    // The reply's draft lives in the backend across dialog restarts of the watcher;
+    // any exit from here stops the watcher before the draft is freed.
+    defer if (tui_be) |*tb| tb.deinit();
     var fallback_be = debugBackend(app.config.verbose, true, &app.usage);
     const ui_be: ui_backend_mod.UiBackend = if (tui_be) |*tb| tb.backend() else fallback_be.backend();
 

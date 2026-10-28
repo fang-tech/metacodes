@@ -220,8 +220,9 @@ pub const MenuDismissal = struct {
 /// 每个交互阶段(input 与 generating)各自拥有一份、进入阶段时重建的交互状态。
 /// 键盘分发两期共用这一份语义,所以它是两个阶段 payload 的公共部分,而不是会话状态。
 pub const Interaction = struct {
-    /// 编辑器投影:借用本阶段 LineEditor 的缓冲(输入期是 readLineRaw 的,生成期是 watcher 的)。
-    /// 阶段结束时那块缓冲随 LineEditor 释放,所以投影只能活在阶段里。
+    /// 编辑器投影:借用本阶段草稿 LineEditor 的缓冲(输入期是 readLineRaw 的,生成期是这一轮
+    /// TuiBackend 的 `draft`,跨对话框重启 watcher 存活)。阶段结束时那块缓冲随之释放,
+    /// 所以投影只能活在阶段里。
     editor: EditorState = .{},
     /// `?` 快捷键帮助:**非模态**——footer 区原地展开多列快捷键,输入框仍在、可继续打字
     /// (对齐 cc helpOpen,见 PromptInputFooter.tsx)。transcript 走 alt-screen viewer,非 overlay。

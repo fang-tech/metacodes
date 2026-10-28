@@ -150,7 +150,7 @@ renderInput/GenFrame = 把现 renderFrameInner/drawGenRegion 的**纯计算行�
 | footer | 会话 | 保留 | usage/mode 快照 |
 | panel.task_list_visible | 会话 | 保留 | Ctrl+T 偏好,两期共用 |
 | agent_count | 会话 | 保留 | registry 镜像,render 回写 |
-| Interaction.editor | input / generating | 清空 | 借用该阶段 LineEditor 的缓冲(输入期 readLineRaw、生成期 watcher),阶段结束缓冲即释放 |
+| Interaction.editor | input / generating | 清空 | 借用该阶段草稿 LineEditor 的缓冲:输入期是 readLineRaw 的;生成期是这一轮 TuiBackend 的 `draft`——权限/提问对话框会停掉再重启 watcher 线程,草稿归 backend 才能跨过这次重启(以前归 watcher,对话框一关缓冲就被释放,框里读到已释放内存、下一个键丢掉草稿)。阶段结束缓冲即释放 |
 | Interaction.help_open | input / generating | 关 | `?` 帮助 |
 | Interaction.ctrl_x_armed | input / generating | 清 | Ctrl+X 前缀 |
 | Interaction.agents | input / generating | closed | switcher list/viewing、sel、viewing_id、视口 |

@@ -323,6 +323,26 @@ test "TuiBackend.poll: 取走的消息进 readline 历史(与 Run 之间消费�
     try testing.expectEqualStrings("remember me", back);
 }
 
+test "TuiBackend: 回复草稿归 backend,stopInput 不动它;deinit 先撤 region 投影再释放" {
+    var region = try makeRegion(testing.allocator);
+    defer region.deinit();
+    var tb = tui_backend.TuiBackend.init(&region);
+    // 等同 startInput 建的草稿 + watcher 打过字后交给 region 的投影。
+    tb.draft = cc.repl_input.LineEditor.init(testing.allocator);
+    try tb.draft.?.setLine("keep me");
+    region.setGenInput(tb.draft.?.view(), tb.draft.?.cursor);
+
+    // 对话框:停 watcher。草稿和投影都留着,重启的 watcher 接着用。
+    tb.stopInput();
+    try testing.expectEqualStrings("keep me", tb.draft.?.view());
+    try testing.expectEqualStrings("keep me", region.ui.phase.generating.interaction.editor.view);
+
+    // 出错返回时 deinit 先于离开生成阶段:投影不能再指着要释放的缓冲。
+    tb.deinit();
+    try testing.expect(tb.draft == null);
+    try testing.expectEqual(@as(usize, 0), region.ui.phase.generating.interaction.editor.view.len);
+}
+
 // ---------------------------------------------------------------------------
 // Part 3:WriterBackend 字节锁 —— 喂 CoreEvent,断言 sink 收到的字节 == legacy 串。
 // 这是阶段 B1 原子切换前的字节精确保险:print-only 路径(DebugWriter/Sink)的输出
