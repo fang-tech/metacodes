@@ -39,8 +39,10 @@ zig build && python3 tests/e2e/frontend_capabilities_e2e.py
 脚本本身就是第二进程前端:`POST /capabilities` 声明能渲染什么,读 `/events`、答 `/respond`。
 mock provider 见到 `CAPS_ASK` / `CAPS_WRITE:<path>` 时让模型调 AskUserQuestion / Write。断言:
 未声明照旧通告;v2 帧被拒且不生效;不声明 ask_question 则问题不通告、落 `ui_request_unavailable`、
-回合照常结束;什么都不声明则 Write 的权限请求 unavailable → 拒绝、文件不写;两者都声明后同样的
-请求被通告、作答、文件写入。`CAPS_E2E_DUMP=<file>` 把最终 journal 落盘供复核。
+回合照常结束,模型读到的是"前端渲染不了问答"而不是 NotATty;什么都不声明则 Write 的权限请求被直接
+拒绝、文件不写,模型读到的是"未询问即拒绝、前端渲染不了权限请求"而不是"user declined";两者都声明后
+同样的请求被通告、作答、文件写入;用户真的拒绝时仍是 "user declined 'Write' via prompt"。
+`CAPS_E2E_DUMP=<file>` 把最终 journal 落盘供复核。
 
 ## 它怎么工作
 

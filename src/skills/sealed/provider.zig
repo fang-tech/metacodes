@@ -882,7 +882,8 @@ pub const SealedSkillProvider = struct {
             .answered => {},
             // An asynchronous front end stashed the question; a provider
             // cannot suspend the fork, so this run cannot take the answer.
-            .pending, .unavailable => return .unavailable,
+            // A front end that cannot render questions never shows it.
+            .pending, .unavailable, .unrenderable => return .unavailable,
         }
         switch (resp) {
             .answers => |answers| {

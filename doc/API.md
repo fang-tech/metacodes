@@ -782,9 +782,12 @@ Custom kinds carry their version (`<name>@<major>`) and match exactly. Once a
 frame is installed, a request it leaves out is not announced: the Host
 journals `ui_request_unavailable` (reason `kind_not_declared`,
 `custom_kind_not_declared` or `custom_kind_unversioned`) and the tool gets
-`RequestOutcome.unavailable` at once, with its usual fallback
-(`AskUserQuestion` fails, `requestUiCustom` returns `CustomUiUnsupported`, a
-permission prompt is denied). A frame of another version, or a malformed one,
+`RequestOutcome.unrenderable` at once: it fails as without a UI
+(`AskUserQuestion` fails with `FrontendCannotRender`, `requestUiCustom`
+returns `CustomUiUnsupported`, a permission prompt is denied with no terminal
+fallback), and the tool result tells the model the frontend cannot render the
+request rather than that the user refused it. A Zig Host that switches over
+`RequestOutcome` handles the fourth value. A frame of another version, or a malformed one,
 is answered `{"v":1,"type":"capabilities_refused","reason":"<RefusalError>"}`
 and changes nothing. A frontend that never declares receives every request,
 as before; in-process backends (TUI, headless, the C ABI) never declare.

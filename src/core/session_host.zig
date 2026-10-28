@@ -15,7 +15,7 @@
 //! A Host whose client opens the channel with a capability frame
 //! (doc/WIRE_PROTOCOL.md §2) hands it to `declareCapabilities`; from then on
 //! a UI request the client cannot render is journaled as
-//! `ui_request_unavailable` and answered `unavailable` without waiting. A
+//! `ui_request_unavailable` and answered `unrenderable` without waiting. A
 //! Session whose client never declares announces every request, as before.
 //!
 //! Per Session one driver thread makes every call into the AgentSession.
@@ -748,7 +748,7 @@ pub const HostedSession = struct {
             .deliver => {},
             .unavailable => |reason| {
                 self.appendLine(wire.writeRequestUnavailable(self.gpa, req, reason));
-                return .unavailable;
+                return .unrenderable;
             },
         }
         self.ui_serial.lock();

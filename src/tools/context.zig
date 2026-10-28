@@ -692,11 +692,13 @@ pub const ToolContext = struct {
         return try r.request(self.session, allocator, req, out);
     }
 
-    /// L3:发起一个 custom UI 请求(动态 UI)。三态:
+    /// L3:发起一个 custom UI 请求(动态 UI)。四态:
     /// - answered:同步 backend 已渲染并写 out.custom(结果 JSON),返回它(borrow,arena 有效)。
     /// - pending:异步 backend 已 stash 请求未阻塞 → 把 {kind,payload_json} 写进 pending_request 槽
     ///   并返 error.UiPending(agent_loop 据此挂起)。**out 未写,不得读**。
     /// - unavailable:无 requester(headless/子 agent/无 backend)→ error.CustomUiUnsupported(工具兜底)。
+    /// - unrenderable:前端声明了不渲染这个 kind → 同样 error.CustomUiUnsupported,另在 error_detail
+    ///   写明是前端渲染不了(工具兜底成功则这段 detail 不会出现)。
     /// kind/payload_json 借用调用方内存;pending 时 dupe 进 pending_request(逃逸 runJob arena 由其负责)。
     ///
     /// **⚠️ error.UiPending 是控制信号,工具绝不能 catch 它**——必须让它一路冒泡到 tool_exec.runJob
@@ -726,6 +728,16 @@ pub const ToolContext = struct {
                 return error.UiPending;
             },
             .unavailable => return error.CustomUiUnsupported,
+            .unrenderable => {
+                // Same fallback, honest wording: a tool that does not recover
+                // from it reports why the UI never appeared.
+                if (self.error_detail) |slot| slot.* = std.fmt.allocPrint(
+                    self.allocator,
+                    "The custom UI '{s}' was not shown: the frontend connected to this session did not declare that it renders this kind. This is not a decision by the user.",
+                    .{kind},
+                ) catch null;
+                return error.CustomUiUnsupported;
+            },
         }
     }
 

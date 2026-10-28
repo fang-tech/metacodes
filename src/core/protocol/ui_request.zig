@@ -64,7 +64,10 @@ pub const SessionId = @import("../session_id.zig").SessionId;
 ///   工具据此返 error.UiPending,agent_loop 挂起(stop_reason=.suspended),响应到达后
 ///   经 resumeWithResponse 注入 tool_result 续跑。**out 未写,工具不得读。**
 /// - unavailable:无 requester(headless/单测/子 agent)→ 工具按语义兜底(ask→NotATty 等)。
-pub const RequestOutcome = enum { answered, pending, unavailable };
+/// - unrenderable:有前端连着,但它的能力帧声明了渲染不了这个请求(frontend_capabilities.zig,
+///   doc/WIRE_PROTOCOL.md §2.2)——请求从未展示给用户。工具照 unavailable 兜底(权限照样
+///   fail closed),但给模型的文字必须如实:是前端渲染不了,不是用户的回答或拒绝。**out 未写。**
+pub const RequestOutcome = enum { answered, pending, unavailable, unrenderable };
 
 pub const UiRequestFn = *const fn (
     state: *anyopaque,

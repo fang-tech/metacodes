@@ -12,7 +12,9 @@
 //! Every request is shown both ways: announced and answered while the
 //! frontend renders it (or never declared), and `ui_request_unavailable`
 //! with no announcement, no round trip and the tool's own fallback once the
-//! declaration leaves it out.
+//! declaration leaves it out. The tool results the provider receives are
+//! checked word for word: a request the frontend cannot render reads as
+//! that, never as the user's refusal, and a real refusal keeps its wording.
 
 const std = @import("std");
 const harness = @import("harness");
@@ -146,10 +148,20 @@ const CustomAsk = struct {
 /// `ToolContext.requestUiCustom` through `requester`; the answer is
 /// testing.allocator's.
 fn ask(requester: cc.ui_request.UiRequester, kind: []const u8) ![]u8 {
+    return askReporting(requester, kind, null);
+}
+
+/// `ask`, also handing back (testing.allocator's) the error detail the model
+/// would read when the request fails.
+fn askReporting(requester: cc.ui_request.UiRequester, kind: []const u8, detail_out: ?*?[]u8) ![]u8 {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const ctx = cc.tool_context.ToolContext{ .allocator = arena.allocator(), .ui_requester = requester };
-    const answer = try ctx.requestUiCustom(arena.allocator(), kind, "{\"clips\":[1,2]}");
+    var detail: ?[]const u8 = null;
+    const ctx = cc.tool_context.ToolContext{ .allocator = arena.allocator(), .ui_requester = requester, .error_detail = &detail };
+    const answer = ctx.requestUiCustom(arena.allocator(), kind, "{\"clips\":[1,2]}") catch |err| {
+        if (detail_out) |out| out.* = if (detail) |text| try std.testing.allocator.dupe(u8, text) else null;
+        return err;
+    };
     return std.testing.allocator.dupe(u8, answer);
 }
 
@@ -239,11 +251,19 @@ test "L2 web: custom kinds reach the frontend only as declared, by exact version
     // tool's fallback at once.
     var watchdog = Watchdog{ .signal = &signal };
     try watchdog.start();
-    const other_major = ask(wb.requester(), "video_timeline@2");
+    var other_major_detail: ?[]u8 = null;
+    defer if (other_major_detail) |text| a.free(text);
+    const other_major = askReporting(wb.requester(), "video_timeline@2", &other_major_detail);
     const unversioned = ask(wb.requester(), "video_timeline");
     watchdog.stop();
     try std.testing.expectError(error.CustomUiUnsupported, other_major);
     try std.testing.expectError(error.CustomUiUnsupported, unversioned);
+    // What the model reads if the tool does not recover: the frontend, not
+    // the user, is why nothing appeared.
+    try std.testing.expectEqualStrings(
+        "The custom UI 'video_timeline@2' was not shown: the frontend connected to this session did not declare that it renders this kind. This is not a decision by the user.",
+        other_major_detail.?,
+    );
     try std.testing.expect(!signal.isAborted());
     try std.testing.expectEqual(@as(usize, 1), try countLines(&journal, "{\"v\":1,\"type\":\"ui_request_unavailable\",\"kind\":\"custom\",\"custom_kind\":\"video_timeline@2\",\"reason\":\"custom_kind_not_declared\"}"));
     try std.testing.expectEqual(@as(usize, 1), try countLines(&journal, "{\"v\":1,\"type\":\"ui_request_unavailable\",\"kind\":\"custom\",\"custom_kind\":\"video_timeline\",\"reason\":\"custom_kind_unversioned\"}"));
@@ -307,13 +327,24 @@ fn exists(dir: []const u8, name: []const u8) !bool {
     return pfs.exists(path.ptr);
 }
 
-/// Whether the newest tool_result the provider received in request `index`
-/// was reported as an error (earlier turns' results ride along before it).
-fn toolResultIsError(server: *harness.MockServer, index: usize) !bool {
+/// The newest tool_result the provider received in request `index`, as the
+/// model reads it (earlier turns' results ride along before it).
+fn newestToolResult(server: *harness.MockServer, index: usize) ![]const u8 {
     const body = (server.requestAt(index) orelse return error.NoRequestCaptured).body();
     const at = std.mem.lastIndexOf(u8, body, "\"tool_result\"") orelse return error.NoToolResult;
-    return std.mem.indexOf(u8, body[at..], "\"is_error\":true") != null;
+    return body[at..];
 }
+
+fn toolResultIsError(server: *harness.MockServer, index: usize) !bool {
+    return std.mem.indexOf(u8, try newestToolResult(server, index), "\"is_error\":true") != null;
+}
+
+/// Whether the model read `text` in the newest tool_result of request `index`.
+fn modelRead(server: *harness.MockServer, index: usize, text: []const u8) !bool {
+    return std.mem.indexOf(u8, try newestToolResult(server, index), text) != null;
+}
+
+const UNRENDERABLE_PERMISSION = "'Write' was denied without asking: the frontend connected to this session cannot render permission prompts";
 
 test "L2 SessionHost: AskUserQuestion and permission prompts are routed by the declared capabilities" {
     const a = std.testing.allocator;
@@ -331,11 +362,15 @@ test "L2 SessionHost: AskUserQuestion and permission prompts are routed by the d
     defer a.free(write_denied);
     const write_allowed = try writeToolSse(a, allowed_path);
     defer a.free(write_allowed);
+    const declined_path = try std.fmt.allocPrint(a, "{s}/declined.txt", .{workspace});
+    defer a.free(declined_path);
+    const write_declined = try writeToolSse(a, declined_path);
+    defer a.free(write_declined);
 
     // Provider requests, in order: 0-1 ask (undeclared), 2-3 ask (declared
     // without ask_question), 4-5 write (declared nothing), 6-7 write
-    // (declared permission).
-    const bodies = [_][]const u8{ ASK_SSE, DONE_SSE, ASK_SSE, DONE_SSE, write_denied, DONE_SSE, write_allowed, DONE_SSE };
+    // (declared permission, granted), 8-9 write (declared, user declines).
+    const bodies = [_][]const u8{ ASK_SSE, DONE_SSE, ASK_SSE, DONE_SSE, write_denied, DONE_SSE, write_allowed, DONE_SSE, write_declined, DONE_SSE };
     var server = try harness.MockServer.startCassette(&bodies, 0);
     defer server.stop();
     const url = try server.urlOwned(a);
@@ -379,10 +414,16 @@ test "L2 SessionHost: AskUserQuestion and permission prompts are routed by the d
     try waitFor(journal, "\"type\":\"run_done\"", 2);
     try std.testing.expectEqual(@as(usize, 1), try countLines(journal, "{\"v\":1,\"type\":\"ui_request_unavailable\",\"kind\":\"ask_question\",\"reason\":\"kind_not_declared\"}"));
     try std.testing.expectEqual(@as(usize, 1), try countLines(journal, "\"type\":\"ui_request\","));
+    // The model is told the truth: no one saw the question.
     try std.testing.expect(try toolResultIsError(server, 3));
+    try std.testing.expect(try modelRead(server, 3, "AskUserQuestion was not shown: the frontend connected to this session cannot render questions"));
+    try std.testing.expect(try modelRead(server, 3, "This is not an answer or a refusal from the user."));
+    try std.testing.expect(try modelRead(server, 3, "capability_unsupported"));
+    try std.testing.expect(!try modelRead(server, 3, "NotATty"));
 
-    // Declared nothing: the Write permission prompt is unavailable, which
-    // the gate answers as a denial. The file is never written.
+    // Declared nothing: the Write permission prompt is unrenderable, which
+    // the gate answers as a denial. The file is never written, and the model
+    // is not told the user declined.
     const nothing = try hosted.declareCapabilities(a, "{\"v\":1,\"type\":\"capabilities\",\"ui_requests\":[]}");
     defer a.free(nothing);
     try hosted.submit(.{ .text = "write while declared nothing" });
@@ -391,6 +432,10 @@ test "L2 SessionHost: AskUserQuestion and permission prompts are routed by the d
     try std.testing.expectEqual(@as(usize, 1), try countLines(journal, "\"type\":\"ui_request\","));
     try std.testing.expect(!try exists(workspace, "denied.txt"));
     try std.testing.expect(try toolResultIsError(server, 5));
+    try std.testing.expect(try modelRead(server, 5, UNRENDERABLE_PERMISSION));
+    try std.testing.expect(try modelRead(server, 5, "This is not the user's decision; the user never saw the request."));
+    try std.testing.expect(try modelRead(server, 5, "permission_denied"));
+    try std.testing.expect(!try modelRead(server, 5, "user declined"));
 
     // Declared permission again: the same prompt is announced and granted.
     const permission = try hosted.declareCapabilities(a, "{\"v\":1,\"type\":\"capabilities\",\"ui_requests\":[\"permission\",\"ask_question\"]}");
@@ -401,5 +446,14 @@ test "L2 SessionHost: AskUserQuestion and permission prompts are routed by the d
     try waitFor(journal, "\"type\":\"run_done\"", 4);
     try std.testing.expect(try exists(workspace, "allowed.txt"));
     try std.testing.expect(!try toolResultIsError(server, 7));
+
+    // A real decline still reads as the user's decline, word for word.
+    try hosted.submit(.{ .text = "write and decline" });
+    try waitFor(journal, "\"type\":\"ui_request\",\"id\":3,\"kind\":\"permission\"", 1);
+    try hosted.respond(3, "{\"choice\":\"deny_once\"}");
+    try waitFor(journal, "\"type\":\"run_done\"", 5);
+    try std.testing.expect(!try exists(workspace, "declined.txt"));
+    try std.testing.expect(try modelRead(server, 9, "user declined 'Write' via prompt"));
+    try std.testing.expect(!try modelRead(server, 9, "without asking"));
     try std.testing.expectEqual(@as(usize, 3), try countLines(journal, "\"type\":\"capabilities_accepted\""));
 }

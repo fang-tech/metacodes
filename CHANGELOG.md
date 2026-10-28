@@ -18,9 +18,14 @@ status, compatibility boundaries, and entry points are defined by
   `POST /capabilities` on `--web` and `serve` (`/s/<id>/capabilities` per
   session), `HostedSession.declareCapabilities` for a `SessionHost` Host. A
   UI request the frame leaves out is no longer announced and failed by a
-  round trip: the Host journals `ui_request_unavailable` and the tool gets
-  `unavailable` at once (AskUserQuestion fails, `requestUiCustom` returns
-  `CustomUiUnsupported`, a permission prompt is denied). Custom kinds carry
+  round trip: the Host journals `ui_request_unavailable` and the requester
+  answers the new `RequestOutcome.unrenderable` at once. The tool fails as
+  without a UI — AskUserQuestion with `FrontendCannotRender`
+  (`capability_unsupported`), `requestUiCustom` with `CustomUiUnsupported`, a
+  permission prompt denied with no terminal fallback — and the tool result
+  says the connected frontend cannot render the request and that the user
+  never saw it, instead of "failed with NotATty" or "user declined … via
+  prompt"; those texts are unchanged where they are true. Custom kinds carry
   their version and match exactly. The reply is a journaled
   `capabilities_accepted` line, or `capabilities_refused` for a frame of
   another schema version or a malformed one, which changes nothing; `GET

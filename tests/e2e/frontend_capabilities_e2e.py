@@ -11,11 +11,15 @@ checks that the declaration, and nothing else, changes what it is asked:
   1. undeclared: an AskUserQuestion is announced and answered (legacy rule);
   2. a v2 frame is refused with core's version; nothing is installed;
   3. declared without ask_question: the question is never announced, the
-     journal says `ui_request_unavailable`, the turn still ends;
+     journal says `ui_request_unavailable`, the turn still ends, and the
+     model is told the frontend cannot render questions (not NotATty);
   4. declared nothing: a Write permission prompt is unavailable, so denied,
-     and the file is not written;
+     the file is not written, and the model is told it was denied without
+     asking (not that the user declined);
   5. declared both: the same question and the same Write are announced,
-     answered, and the file is written.
+     answered, and the file is written;
+  6. a real refusal of the declared prompt keeps "user declined ... via
+     prompt".
 
 Run by `zig build test:product` (METACODES_DAEMON_E2E_BIN set by build.zig);
 by hand: `zig build && python3 tests/e2e/frontend_capabilities_e2e.py`.
@@ -141,6 +145,11 @@ def of_type(lines: list[dict], line_type: str) -> list[dict]:
     return [line for line in lines if line.get("v") == 1 and line.get("type") == line_type]
 
 
+def writes(lines: list[dict]) -> list[dict]:
+    """The Write tool_result lines, in order."""
+    return [line for line in of_type(lines, "tool_result") if line["data"]["name"] == "Write"]
+
+
 def runs_done(lines: list[dict]) -> int:
     return sum(1 for line in lines if "run_done" in line)
 
@@ -213,6 +222,9 @@ def scenario(frontend: Frontend, work: Path) -> None:
     check(len(of_type(lines, "ui_request")) == 1, "the undeclared kind was announced anyway")
     asked = [line for line in of_type(lines, "tool_result") if line["data"]["name"] == "AskUserQuestion"]
     check(len(asked) == 2 and asked[1]["data"]["is_error"], "AskUserQuestion did not fall back")
+    told = asked[1]["data"]["content"]  # what the model reads
+    check("cannot render questions" in told and "not an answer or a refusal from the user" in told
+          and "NotATty" not in told, f"the model was not told the frontend cannot render questions: {told}")
 
     # 4. Declared nothing: a permission prompt is unavailable, which is a denial.
     status, body = frontend.declare({"v": 1, "type": "capabilities", "ui_requests": []})
@@ -224,6 +236,9 @@ def scenario(frontend: Frontend, work: Path) -> None:
           "no ui_request_unavailable for the permission prompt")
     check(len(of_type(lines, "ui_request")) == 1, "the permission prompt was announced anyway")
     check(not denied.exists(), "an unavailable permission prompt let Write run")
+    told = writes(lines)[-1]["data"]["content"]
+    check("denied without asking" in told and "cannot render permission prompts" in told
+          and "user declined" not in told, f"the model was told the user declined: {told}")
 
     # 5. Declared both: the same requests are announced and answered.
     status, body = frontend.declare({"v": 1, "type": "capabilities", "ui_requests": ["permission", "ask_question"],
@@ -244,7 +259,18 @@ def scenario(frontend: Frontend, work: Path) -> None:
     frontend.respond({"id": prompt["id"], "choice": "allow_once"})
     lines = frontend.journal(lambda ls: runs_done(ls) >= 5)
     check(allowed.exists(), "Write did not run after the declared prompt was granted")
-    check(len(of_type(lines, "ui_request")) == 3, "unexpected number of announced requests")
+
+    # 6. A real refusal still reads as the user's refusal.
+    declined = work / "declined.txt"
+    frontend.send(f"CAPS_WRITE:{declined.as_posix()}")
+    lines = frontend.journal(lambda ls: pending_request(ls, "permission", prompt["id"]) is not None)
+    refusal = pending_request(lines, "permission", prompt["id"])
+    frontend.respond({"id": refusal["id"], "choice": "deny_once"})
+    lines = frontend.journal(lambda ls: runs_done(ls) >= 6)
+    check(not declined.exists(), "a declined Write ran")
+    told = writes(lines)[-1]["data"]["content"]
+    check("user declined 'Write' via prompt" in told and "without asking" not in told, told)
+    check(len(of_type(lines, "ui_request")) == 4, "unexpected number of announced requests")
     check(len(of_type(lines, "capabilities_accepted")) == 3, "every accepted declaration is journaled")
     check(all(line.get("v") == 1 for line in lines if "type" in line), "a wire line without v=1")
     if os.environ.get("CAPS_E2E_DUMP"):  # the whole journal, for a reviewer

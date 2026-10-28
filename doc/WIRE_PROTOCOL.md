@@ -115,19 +115,33 @@ journals
 {"v":1,"type":"ui_request_unavailable","kind":"custom","custom_kind":"video_timeline@2","reason":"custom_kind_not_declared"}
 ```
 
-(`custom_kind` only for `custom`) and returns `RequestOutcome.unavailable` to
-the caller at once, with no round trip. The caller's existing fallback for an
-unavailable requester applies unchanged:
+(`custom_kind` only for `custom`) and returns `RequestOutcome.unrenderable` to
+the caller at once, with no round trip. That outcome is not `unavailable` (no
+UI at all): a frontend is there, and nobody was asked. The caller fails as it
+would without a UI, but tells the model why, never as the user's answer:
 
-- `ask_question` — `AskUserQuestion` fails with `NotATty`; the model sees the
-  tool error.
+- `ask_question` — `AskUserQuestion` fails with `FrontendCannotRender`
+  (`code` `capability_unsupported`): *"AskUserQuestion was not shown: the
+  frontend connected to this session cannot render questions (it declared
+  that it does not render ask_question requests). This is not an answer or a
+  refusal from the user. Ask the question in plain text in your reply
+  instead."*
 - `custom` — `ToolContext.requestUiCustom` returns `error.CustomUiUnsupported`
-  and the tool falls back.
-- `permission` — no answer was given, so the gate fails closed: denied under
-  `no_interactive_prompt` (every embedded Session) or without a terminal; a
-  product process that does own a terminal falls back to its terminal prompt
-  as it does for any requester that gives no answer. Declaring capabilities
+  as before, so the tool falls back; if it does not, the model reads *"The
+  custom UI '<kind>' was not shown: the frontend connected to this session did
+  not declare that it renders this kind. This is not a decision by the
+  user."*
+- `permission` — the gate fails closed: the call is denied at once, with no
+  terminal or answer-queue fallback (a terminal is not the declared
+  frontend), and the model reads *"'<tool>' was denied without asking: the
+  frontend connected to this session cannot render permission prompts (it
+  declared that it does not render permission requests). This is not the
+  user's decision; the user never saw the request."* Declaring capabilities
   can never grant a permission.
+
+Every other path keeps its wording: no UI at all is still `NotATty` /
+`CustomUiUnsupported`, and a user who refuses a prompt is still *"user
+declined '<tool>' via prompt"*.
 
 A declaration applies to requests made after it is installed. A request
 already announced stays pending and is answered or cancelled as before.

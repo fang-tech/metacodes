@@ -159,7 +159,8 @@ pub const WebBackend = struct {
     ) anyerror!RequestOutcome {
         const self: *WebBackend = @ptrCast(@alignCast(state));
 
-        // 前端声明过、且不含这个 kind → 不通告、不占 id,立即 unavailable(工具按语义兜底)。
+        // 前端声明过、且不含这个 kind → 不通告、不占 id,立即 unrenderable(工具按语义兜底,
+        // 给模型的文字说明是前端渲染不了)。
         switch (self.capabilities.route(req)) {
             .deliver => {},
             .unavailable => |reason| {
@@ -167,7 +168,7 @@ pub const WebBackend = struct {
                     defer self.allocator.free(line);
                     self.journal.append(line);
                 } else |_| log.warn("web", "dropped ui_request_unavailable (serialize OOM)", .{});
-                return .unavailable;
+                return .unrenderable;
             },
         }
 
