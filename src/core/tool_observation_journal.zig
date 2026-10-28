@@ -4434,4 +4434,3 @@ test "lease outcomes are described for the person who sent the message" {
     try std.testing.expectEqualStrings("an unknown time", localClock(&clock, std.math.maxInt(i128)));
     try std.testing.expectEqualStrings("an unknown time", localClock(&clock, -1));
 }
-
