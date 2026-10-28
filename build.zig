@@ -2449,6 +2449,18 @@ pub fn build(b: *std.Build) void {
     const io_threaded_test_step = b.step("test:io-threaded", "Test that std.Io.Threaded is created only through platform.signal.threadedIo");
     io_threaded_test_step.dependOn(&io_threaded_test_cmd.step);
     units_test_step.dependOn(&io_threaded_test_cmd.step);
+    // The REPL's SIGWINCH handler has no SA_RESTART: its terminal reads retry
+    // EINTR and its terminal writes go through pfs.writeAll (#340).
+    const terminal_io_test_cmd = b.addSystemCommand(&.{
+        if (@import("builtin").os.tag == .windows) "python" else "python3",
+        "-m",
+        "unittest",
+        "scripts.tests.test_terminal_io_discipline",
+        "-v",
+    });
+    const terminal_io_test_step = b.step("test:terminal-io", "Test that REPL terminal reads retry EINTR and writes go through pfs.writeAll");
+    terminal_io_test_step.dependOn(&terminal_io_test_cmd.step);
+    units_test_step.dependOn(&terminal_io_test_cmd.step);
     const gate_manifest_test_cmd = b.addSystemCommand(&.{
         if (@import("builtin").os.tag == .windows) "python" else "python3",
         "-m",

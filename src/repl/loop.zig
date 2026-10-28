@@ -1368,7 +1368,10 @@ fn readLineBuffered(allocator: std.mem.Allocator, fd: c_int) ![]u8 {
     while (len < buf.len) {
         var b: [1]u8 = undefined;
         const n_i = platform_term.readInput(fd, &b);
-        if (n_i < 0) return error.ReadError;
+        if (n_i < 0) {
+            if (input.retryInterruptedRead(fd)) continue;
+            return error.ReadError;
+        }
         const n: usize = @intCast(n_i);
         if (n == 0) {
             if (len == 0) return error.Eof;
@@ -2213,6 +2216,9 @@ fn applyCompletion(editor: *input.LineEditor, allocator: std.mem.Allocator, star
 }
 
 /// Ctrl+R 反向历史搜索：读字节构建 query，实时显示首个匹配；Enter 接受，Esc/Ctrl+C 取消。
+/// 键经 `input.readKey` 与输入框共用的 parser 拼出:resize 打断在 ESC 与 `[` 之间时序列留在
+/// parser 里接着读(旧版逐字节读,第二字节被 EINTR 打断就当裸 Esc 取消,`[A` 漏成两个字符);
+/// 裸 Esc 等满一个 tick 即取消,不再等下一个键。Esc 后紧跟的字符留在 parser,回输入框照常处理。
 fn handleReverseSearch(
     fd: c_int,
     editor: *input.LineEditor,
@@ -2221,7 +2227,6 @@ fn handleReverseSearch(
     allocator: std.mem.Allocator,
     region: *render_region_mod.RenderRegion,
 ) !void {
-    _ = parser;
     var query = std.ArrayList(u8).empty;
     defer query.deinit(allocator);
     var match: ?[]const u8 = null;
@@ -2230,70 +2235,28 @@ fn handleReverseSearch(
         // 渲染搜索提示
         region.emitTerminalFmt("\r\x1b[2K(reverse-search)`{s}': {s}", .{ query.items, match orelse "" });
 
-        var b: [1]u8 = undefined;
-        const n = platform_term.readInput(fd, &b);
-        if (n < 0 and input.retryInterruptedRead(fd)) continue;
-        if (n <= 0) return;
-        const c = b[0];
-
-        if (c == 0x1b) {
-            // 可能是裸 Esc,或 Kitty CSI-u 编码的 Esc(\x1b[27u)/Enter(\x1b[13u)/方向键。读后续判定:
-            // 非 '[' → 裸 Esc 取消;'[' → 解析 CSI codepoint(27=Esc 取消 / 13=Enter 接受 / 其余忽略并吞掉序列)。
-            // 不解析会把 `[27u` 等字节漏给下一轮 read 成乱码(白名单终端 reverse-search 的 CSI-u 盲区)。
-            var nb: [1]u8 = undefined;
-            const nn_i = platform_term.readInput(fd, &nb);
-            if (nn_i <= 0) return;
-            const nn: usize = @intCast(nn_i);
-            if (nn == 0 or nb[0] != '[') {
-                region.emitTerminal("\r\x1b[2K"); // 裸 Esc → 取消
-                return;
-            }
-            // 读 CSI 序列到终止字母,解析首段 codepoint。
-            var cp: u32 = 0;
-            var in_mod = false;
-            while (true) {
-                var sx: [1]u8 = undefined;
-                const sn_i = platform_term.readInput(fd, &sx);
-                if (sn_i <= 0) break;
-                const sn: usize = @intCast(sn_i);
-                if (sn == 0) break;
-                const ch = sx[0];
-                if (ch >= '0' and ch <= '9') {
-                    if (!in_mod) cp = cp * 10 + (ch - '0');
-                } else if (ch == ';') {
-                    in_mod = true;
-                } else break; // 终止字母(u/~/letter)
-            }
-            if (cp == 13) {
-                if (match) |m| try editor.setLine(m); // Kitty Enter → 接受
+        const key = switch (input.readKey(fd, parser)) {
+            .key => |key| key,
+            .interrupted => continue,
+            .closed => return,
+        };
+        switch (key) {
+            // Enter(含 Kitty CSI-u 编码的 Enter / Shift+Enter / Ctrl+Enter)接受当前匹配。
+            .enter, .shift_enter, .ctrl_enter => {
+                if (match) |m| try editor.setLine(m);
                 region.emitTerminal("\r\x1b[2K");
                 return;
-            }
-            if (cp == 27 or cp == 0) { // CSI-u Esc(27)或裸 ESC[(无 codepoint)→ 取消
+            },
+            // Esc(裸 / CSI-u)、Ctrl+C、方向键、Alt+词跳:取消,保留原 buffer。
+            .esc, .ctrl_c, .up, .down, .left, .right, .home, .end, .alt_b, .alt_f => {
                 region.emitTerminal("\r\x1b[2K");
                 return;
-            }
-            continue; // 其余 CSI(方向键等)忽略,继续搜索
-        }
-        if (c == 0x03) {
-            // Ctrl+C:取消,保留原 buffer
-            region.emitTerminal("\r\x1b[2K");
-            return;
-        }
-        if (c == '\r' or c == '\n') {
-            // 接受当前匹配
-            if (match) |m| {
-                try editor.setLine(m);
-            }
-            region.emitTerminal("\r\x1b[2K");
-            return;
-        }
-        if (c == 0x7f or c == 0x08) {
-            if (query.items.len > 0) _ = query.pop();
-        } else if (c >= 0x20) {
-            try query.append(allocator, c);
-        } else {
-            continue;
+            },
+            .backspace => {
+                if (query.items.len > 0) _ = query.pop();
+            },
+            .char => |c| try query.append(allocator, c),
+            else => continue, // 其余键(功能键、Ctrl 组合)忽略,继续搜索
         }
         match = searchHistory(history, query.items);
     }

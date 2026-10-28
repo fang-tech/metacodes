@@ -218,6 +218,9 @@ pub const KeyParser = struct {
                             else => .enter,
                         };
                     }
+                    // 带修饰的 Esc(Shift/Ctrl+Esc)仍是 Esc:取消、关闭对它的每个使用方都一样
+                    // (反向搜索、transcript viewer 旧的自解码 CSI-u 就只看 codepoint 27)。
+                    if (self.num1 == 27) return .esc;
                     // Ctrl+字母：mod=5 表示 Ctrl。Kitty disambiguate 模式下某些终端/tmux 会把
                     // 普通 Ctrl+letter 也编成 CSI-u(非仅歧义键)→ 必须覆盖 app 用到的全部 Ctrl 组合,
                     // 否则该键在这些终端上静默丢(实测 bug:Ctrl+O 在发 CSI-u 的终端无反应)。
@@ -325,6 +328,43 @@ pub fn retryInterruptedRead(fd: c_int) bool {
     return interrupted or resumed;
 }
 
+/// How long a modal key loop waits for input before it looks again. A lone
+/// ESC still pending when the wait runs out is the Esc key: terminals send a
+/// sequence's bytes together, and the prompt's own loop uses the same tick.
+const key_wait_ms: i32 = 200;
+
+/// What `readKey` got.
+pub const KeyRead = union(enum) {
+    key: Key,
+    /// A signal (a resize, a resume) cut the wait short. Nothing was lost:
+    /// a sequence read halfway stays in the parser. Redraw, then read again.
+    interrupted,
+    /// End of input, a read error, or a requested shutdown.
+    closed,
+};
+
+/// One key for a modal loop that owns the terminal in raw mode (transcript
+/// viewer, reverse search). Bytes go through `parser`, so the rest of an
+/// escape sequence is read like any other byte: a resize between ESC and `[`
+/// no longer splits `ESC [ A` into Esc plus two typed characters, and a lone
+/// Esc is reported once the wait runs out instead of waiting for another key.
+pub fn readKey(fd: c_int, parser: *KeyParser) KeyRead {
+    if (parser.drain()) |key| return .{ .key = key };
+    while (true) {
+        const rc = platform_term.waitReadable(fd, key_wait_ms);
+        if (rc == 0) {
+            if (parser.flushEsc()) |key| return .{ .key = key };
+            continue;
+        }
+        if (rc < 0) return if (retryInterruptedRead(fd)) .interrupted else .closed;
+        var b: [1]u8 = undefined;
+        const n = platform_term.readInput(fd, &b);
+        if (n < 0) return if (retryInterruptedRead(fd)) .interrupted else .closed;
+        if (n == 0) return .closed;
+        if (parser.feed(b[0])) |key| return .{ .key = key };
+    }
+}
+
 /// Reconcile all terminal mode families with the intended interactive state.
 /// This is deliberately shared by initial entry and SIGCONT recovery so a new
 /// mode cannot be enabled in one path and forgotten in the other.
@@ -344,10 +384,10 @@ fn emitEnableSequences(fd: c_int) void {
     // are known to parse them.  The sequence starts by popping stale Kitty
     // state, making repeated reconciliation safe even after shell changes.
     if (shouldEnableKittyKeyboard()) {
-        _ = pfs.write(fd, kbd_enable_seq[0..kbd_enable_seq.len]);
+        _ = pfs.writeAll(fd, kbd_enable_seq);
     }
     const enable_paste = "\x1b[?2004h";
-    _ = pfs.write(fd, enable_paste[0..enable_paste.len]);
+    _ = pfs.writeAll(fd, enable_paste);
 }
 
 /// 切 raw 模式，返回旧 termios；非 tty 或失败返 null。
@@ -414,9 +454,9 @@ pub fn restoreMode(fd: c_int, orig: platform_term.SavedMode) void {
     // 关 bracketed paste(始终)+ 键盘协议(仅白名单——对称 enterRawMode,同进程 env 不变判定恒一致,
     // 不会发了 enable 没 disable;非白名单不发孤立 disable,避免 Apple Terminal honor 它出异常)。
     const disable_paste = "\x1b[?2004l";
-    _ = pfs.write(fd, disable_paste[0..disable_paste.len]);
+    _ = pfs.writeAll(fd, disable_paste);
     if (shouldEnableKittyKeyboard()) {
-        _ = pfs.write(fd, kbd_disable_seq[0..kbd_disable_seq.len]);
+        _ = pfs.writeAll(fd, kbd_disable_seq);
     }
     platform_term.restoreMode(fd, orig); // POSIX tcsetattr / Windows SetConsoleMode
 }
@@ -437,7 +477,7 @@ pub fn externalEdit(allocator: std.mem.Allocator, current: []const u8) ![]u8 {
         const fd = pfs.open(tmp_path.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o600));
         if (fd < 0) return error.WriteFailed;
         defer _ = pfs.close(fd);
-        if (current.len > 0) _ = pfs.write(fd, current[0..current.len]);
+        if (current.len > 0) _ = pfs.write(fd, current[0..current.len]); // no EINTR: regular file
     }
 
     const path_z = try allocator.dupeZ(u8, tmp_path);
@@ -458,7 +498,7 @@ pub fn externalEdit(allocator: std.mem.Allocator, current: []const u8) ![]u8 {
     errdefer out.deinit(allocator);
     var buf: [4096]u8 = undefined;
     while (true) {
-        const n = pfs.read(rfd, buf[0..buf.len]);
+        const n = pfs.read(rfd, buf[0..buf.len]); // no EINTR: regular file
         if (n <= 0) break;
         try out.appendSlice(allocator, buf[0..@intCast(n)]);
     }
@@ -1154,6 +1194,15 @@ test "KeyParser: 无 mod CSI-u Enter/Esc 还原" {
     try testing.expect(p2.feed('u').? == .esc);
 }
 
+test "KeyParser: CSI-u Esc with a modifier is still Esc" {
+    // ESC[27;5u(Ctrl+Esc)/ESC[27;2u(Shift+Esc):反向搜索与 transcript viewer 靠它取消/关闭。
+    for ([_][]const u8{ "\x1b[27;5u", "\x1b[27;2u" }) |seq| {
+        var p = KeyParser{};
+        for (seq[0 .. seq.len - 1]) |b| try testing.expect(p.feed(b) == null);
+        try testing.expect(p.feed('u').? == .esc);
+    }
+}
+
 test "KeyParser: CSI Delete still works" {
     var p = KeyParser{};
     for ([_]u8{ 0x1b, '[', '3' }) |b| try testing.expect(p.feed(b) == null);
@@ -1358,6 +1407,73 @@ test "an interrupted key read is retried unless the process is shutting down" {
     shutdown.request();
     std.c._errno().* = @intFromEnum(std.c.E.INTR);
     try testing.expect(!retryInterruptedRead(-1));
+}
+
+test "readKey assembles a sequence, reports a lone Esc once the wait runs out, and stops at end of input" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest; // pipe as the terminal
+    var fds: [2]std.c.fd_t = undefined;
+    try testing.expectEqual(@as(c_int, 0), std.c.pipe(&fds));
+    defer _ = std.c.close(fds[0]);
+    var parser = KeyParser{};
+    try testing.expect(pfs.writeAll(fds[1], "\x1b[Aq\x1b"));
+    try testing.expect(readKey(fds[0], &parser).key == .up);
+    try testing.expectEqual(@as(u8, 'q'), readKey(fds[0], &parser).key.char);
+    // Nothing follows the ESC: it is the Esc key, not the start of a sequence
+    // that waits for the next key.
+    try testing.expect(readKey(fds[0], &parser).key == .esc);
+    _ = std.c.close(fds[1]);
+    try testing.expect(readKey(fds[0], &parser) == .closed);
+}
+
+// The case #340 describes: the terminal's resize lands between ESC and `[`.
+// The REPL's SIGWINCH handler has no SA_RESTART, so the wait for the rest of
+// the sequence returns EINTR. It used to end the read (reverse search
+// cancelled, viewer closed) and leave `[A` to be read as typed text.
+test "a resize between ESC and [ interrupts readKey and leaves the sequence in the parser" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    defer shutdown.resetForTesting();
+    var saved: std.posix.Sigaction = undefined;
+    std.posix.sigaction(std.posix.SIG.WINCH, null, &saved);
+    defer std.posix.sigaction(std.posix.SIG.WINCH, &saved, null);
+    platform_signal.installResize(struct {
+        fn onResize() void {}
+    }.onResize);
+
+    var fds: [2]std.c.fd_t = undefined;
+    try testing.expectEqual(@as(c_int, 0), std.c.pipe(&fds));
+    defer _ = std.c.close(fds[0]);
+    defer _ = std.c.close(fds[1]);
+    try testing.expect(pfs.writeAll(fds[1], "\x1b"));
+
+    const Reader = struct {
+        fd: c_int,
+        parser: KeyParser = .{},
+        got: KeyRead = .closed,
+        started: std.atomic.Value(bool) = .init(false),
+        finished: std.atomic.Value(bool) = .init(false),
+
+        fn run(self: *@This()) void {
+            self.started.store(true, .release);
+            self.got = readKey(self.fd, &self.parser);
+            self.finished.store(true, .release);
+        }
+    };
+    var reader: Reader = .{ .fd = fds[0] };
+    const thread = try std.Thread.spawn(.{}, Reader.run, .{&reader});
+    while (!reader.started.load(.acquire)) std.Thread.yield() catch {};
+    // Keep resizing until the reader is back: the first signal may land
+    // before it blocks.
+    var rounds: usize = 0;
+    while (rounds < 100 and !reader.finished.load(.acquire)) : (rounds += 1) {
+        @import("platform").sync.sleepMs(2);
+        _ = std.c.pthread_kill(thread.getHandle(), std.posix.SIG.WINCH);
+    }
+    thread.join();
+    try testing.expect(reader.got == .interrupted);
+    try testing.expect(reader.parser.pendingEsc());
+
+    try testing.expect(pfs.writeAll(fds[1], "[A"));
+    try testing.expect(readKey(fds[0], &reader.parser).key == .up);
 }
 
 test "reconcileModes on a non-tty is a no-op" {
