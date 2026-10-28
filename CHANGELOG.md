@@ -50,7 +50,12 @@ status, compatibility boundaries, and entry points are defined by
   keys are kept. A late answer used to be printed above the banner
   (`^[[?62;22c`) or end the startup animation as if it were the key that
   skips it. An answer the deadline cut in half is dropped rather than handed
-  to the prompt, where its missing tail took the user's next key. The key
+  to the prompt, where its missing tail took the user's next key; one still
+  open when its tail was discarded (a `TCSAFLUSH` mode switch) or has not
+  come within a read wait is given up, so the text typed next is not read as
+  its tail. Reading what queued up stops where stdin's replay is full
+  instead of overrunning it (a 4 KiB burst typed during such a startup
+  crashed a Debug or ReleaseSafe build). The key
   parser also consumes a whole private-marker CSI (`ESC [ ? … c`,
   `ESC [ ? … u`), any CSI with more parameters than it decodes (xterm's
   `ESC [ 27 ; 2 ; 13 ~`), and an OSC answer (`ESC ] 11 ; … BEL`), reporting
