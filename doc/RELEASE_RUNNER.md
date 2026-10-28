@@ -23,6 +23,7 @@ job.
 | Property | Value |
 |---|---|
 | Runners | `ubuntu-latest`, `macos-latest`, `windows-latest`; one job per platform, `publish` on `ubuntu-latest` |
+| CLI target | An explicit Zig target per unit, never the runner's own: `x86_64-linux-gnu.2.31`, `aarch64-macos.13.0`, `x86_64-windows-gnu` (`cli_target` in the matrix, passed to `release:verify` and `release:archive`). It means the baseline CPU and the oldest glibc or macOS the unit supports; `scripts/check_binary_baseline.py` fails a unit whose executable needs more |
 | Trigger | `workflow_dispatch` only, inputs `tag` (bare `X.Y.Z` for the stable channel, a branch or full 40-hex commit SHA for `0.x.y-dev` pre-releases; `actions/checkout` rejects short SHAs) and `dry_run` (default `true`: build, verify, archive and upload artifacts, no draft) |
 | Toolchain | Zig 0.16.0 from `mlugg/setup-zig` (no cache); the images' Python and Rust stable (`cargo`); `bindgen` 0.72.1 installed by `cargo install bindgen-cli --locked` in the job for the AgentCore gate's bindings-regen check; PyYAML from `requirements-dev.txt`; elan 4.2.4 from its pinned release asset (`scripts/ci/install-elan.sh`, Git Bash on Windows) and the Lean toolchain `control-plane/lean/lean-toolchain` names, to build both kernels the unit ships (`zig build kernels:stage`, then `scripts/kernel_pins.py`) |
 | Network | `zig build` downloads nothing: ripgrep and TinyKG are vendored and hash-checked (`verify_ripgrep_binary.py`, `verify_tinykg_binary.py`). The job itself reaches GitHub (checkout, `setup-zig`, artifacts, the elan asset and the Lean toolchain elan resolves) and crates.io (`bindgen`) |
@@ -63,7 +64,12 @@ Each platform job runs the repository's own gates in release configuration:
 `verify_tinykg_binary.py`, `verify_ripgrep_binary.py`, `zig build test
 -Doptimize=ReleaseSafe`, `zig build release:verify` (the seven-point acceptance
 of #47 §5.4 on the staged prefix, from outside it), `zig build agentcore:gate`
-for the native target, then `release:archive` and `agentcore:archive`. The
+for the native target, then `release:archive` and `agentcore:archive`. Between
+`release:verify` and the archives, `scripts/check_binary_baseline.py`
+disassembles the unit's executable and fails it on any instruction beyond the
+baseline CPU (no AVX, AVX2 or AVX-512 on x86_64; no SVE or Armv8.6 matrix
+instructions on aarch64), on a GLIBC symbol version newer than the target's
+glibc, or on a minimum macOS newer than the target's. The
 `publish` job downloads every platform's archives, writes
 `metacodes-<version>-SHA256SUMS` with `release_sums.py`, and attaches archives
 and sums to a draft release created with `--verify-tag`. A consumer verifies an
