@@ -7,11 +7,15 @@
 //! 属于 Renderer(render_region.zig),不在这里。
 
 const std = @import("std");
+const builtin = @import("builtin");
 const complete = @import("../complete.zig");
 const types = @import("../../types.zig");
 
-/// 决策面:输入期 vs 生成期。
-pub const Phase = enum { input, generating };
+/// 回合阶段(#330:widget 生命周期的唯一驱动)。一个阶段实例 = 一次输入读取(`input`)
+/// 或一次回复/等待(`generating`);两次之间是 `idle`(固定区不在屏上,没有任何 widget)。
+/// 阶段只经 `.phase_change` 事件切换(`UiState.enter`),合法边只有 idle↔input、idle↔generating:
+/// 每个交互阶段都先回到 idle 再开下一个,teardown 点就是这几次 enter。
+pub const Phase = enum { idle, input, generating };
 
 /// 编辑器投影:borrow LineEditor.buf.items(渲染瞬时有效)。LineEditor 本体不并入 UiState。
 pub const EditorState = struct {
@@ -99,7 +103,7 @@ pub const AgentSwitcherState = struct {
     sel: usize = 0,
     /// viewing 态正在查看的 agent id(idSlice 拷贝定长)。**Enter 提交时落定**,↑↓ 不动它
     /// (对齐真 cc:↑↓ 只移 ❯ 高亮,Enter 才切换被查看对象 → 分隔 label + ⏺ marker)。
-    viewing_id: [16]u8 = undefined,
+    viewing_id: [16]u8 = [_]u8{0} ** 16,
     viewing_id_len: u8 = 0,
     /// viewing_id 是否已落定。dispatch(纯状态层,无 registry)进 viewing / 再 Enter 时置 false,
     /// 由 render(能访问 snapshot)在下一帧把 sel 对应 agent 的 id 拷进 viewing_id 并置 true。
@@ -213,85 +217,213 @@ pub const MenuDismissal = struct {
     }
 };
 
+/// 每个交互阶段(input 与 generating)各自拥有一份、进入阶段时重建的交互状态。
+/// 键盘分发两期共用这一份语义,所以它是两个阶段 payload 的公共部分,而不是会话状态。
+pub const Interaction = struct {
+    /// 编辑器投影:借用本阶段 LineEditor 的缓冲(输入期是 readLineRaw 的,生成期是 watcher 的)。
+    /// 阶段结束时那块缓冲随 LineEditor 释放,所以投影只能活在阶段里。
+    editor: EditorState = .{},
+    /// `?` 快捷键帮助:**非模态**——footer 区原地展开多列快捷键,输入框仍在、可继续打字
+    /// (对齐 cc helpOpen,见 PromptInputFooter.tsx)。transcript 走 alt-screen viewer,非 overlay。
+    help_open: bool = false,
+    /// Ctrl+X Ctrl+K / Ctrl+X Ctrl+O 序列 arming(Emacs 风格双键前缀):Ctrl+X 后置 true,下个键消费。
+    ctrl_x_armed: bool = false,
+    /// Agent switcher(区域2):footer 下方 agent 列表 + agent transcript 查看。
+    agents: AgentSwitcherState = .{},
+    /// issue #16: the cross-UI model picker is on screen. Modal for keys —
+    /// while it is open every keystroke belongs to it, including plain
+    /// characters, which are its filter. It is *not* modal for the session:
+    /// the draft in the editor is untouched and a reply keeps streaming.
+    /// Like every widget it dies with its phase; it reaches the next phase
+    /// only through the explicit `app.pending_overlay` hand-off (#220).
+    picker_open: bool = false,
+};
+
+/// 一次输入读取拥有的状态。
+pub const InputPhase = struct {
+    interaction: Interaction = .{},
+    /// `/` 菜单的命令源(内建 + 可由用户调用的 skill)。借用 readLineRaw 本次读取的 arena,
+    /// 由 `PhaseEntry.input` 带入——读取结束(回 idle)它随 payload 一起消失,不会悬挂。
+    slash_catalog: complete.SlashCatalog = .builtin,
+    /// slash 菜单选中项(对齐 cc:`/` 菜单 ↑↓ 移高亮 + Enter 选中)。menu 开时 ↑↓ 改它而非历史导航。
+    /// 渲染按它高亮(accent 色);菜单关(非 `/` 态)恒重置为 0。范围由 complete.slashFilterCount 钳制。
+    slash_sel: usize = 0,
+    /// Ctrl+U/K/W 杀行后显 `Ctrl+Y to paste deleted text` 提示(对齐 cc,框上方右对齐)。
+    /// 杀行键置 true,下次打字(char)清 false。
+    paste_hint: bool = false,
+    /// Idle-prompt double-press confirmation (Ctrl+C / Ctrl+D exit, Esc clear).
+    press: DoublePress = .{},
+    /// Suggestion menus closed with Esc for the current draft.
+    menu_dismissal: MenuDismissal = .{},
+};
+
+/// 一次回复(或回复前的等待)拥有的状态。
+pub const GeneratingPhase = struct {
+    interaction: Interaction = .{},
+    /// 由 `PhaseEntry.generating` 带入 verb/start_ms。
+    spinner: SpinnerState = .{},
+    tools: ToolsState = .{},
+};
+
+/// 阶段及其拥有的全部状态。payload 在 `enter` 时整体替换:旧阶段打开的东西没有任何
+/// 一条路能活过边界,新加进 payload 的字段也不用登记到哪个 reset 列表里。
+pub const PhaseState = union(Phase) {
+    idle,
+    input: InputPhase,
+    generating: GeneratingPhase,
+};
+
+/// 进入阶段时边界上合法知道的参数——只有这些,没有旧阶段的任何东西。
+pub const PhaseEntry = union(Phase) {
+    idle,
+    input: struct { slash_catalog: complete.SlashCatalog = .builtin },
+    generating: struct { verb: []const u8 = "", start_ms: i64 = 0 },
+};
+
+/// 合法的阶段边:每个交互阶段都经 idle 结束。idle→idle 是幂等的收尾(leave 兜底)。
+pub fn transitionAllowed(from: Phase, to: Phase) bool {
+    return from == .idle or to == .idle;
+}
+
 /// 集中 UI 逻辑状态。机制态(prev_rows 等)不在此(属 Renderer)。
+/// 顶层字段都是**会话**拥有的(跨阶段存活),各自在 `session_owned` 里写明原因;
+/// 其余一切状态都在 `phase` 的 payload 里,归某个阶段拥有。
 pub const UiState = struct {
     // 几何(resize 改)
     cols: u16 = 80,
     rows: u16 = 24,
 
-    // 决策面
-    phase: Phase = .input,
-    /// `?` 快捷键帮助:**非模态**——footer 区原地展开多列快捷键,输入框仍在、可继续打字
-    /// (对齐 cc helpOpen,见 PromptInputFooter.tsx)。transcript 走 alt-screen viewer,非 overlay。
-    help_open: bool = false,
-
-    // 编辑器投影
-    editor: EditorState = .{},
-    prompt: []const u8 = "> ",
-
-    // 生成期
-    spinner: SpinnerState = .{},
-    tools: ToolsState = .{},
+    /// 当前阶段 + 它拥有的全部 widget 状态。只有 `enter` 写它。
+    phase: PhaseState = .idle,
 
     // footer / 面板
     footer: FooterState = .{},
     panel: PanelState = .{},
 
-    // Ctrl+X Ctrl+K 序列 arming(Emacs 风格双键前缀):Ctrl+X 后置 true,下个键消费。
-    // 从 LineEditor 迁来 → dispatch 统一处理序列,两期一致(生成期也能 Ctrl+X-K 杀后台)。
-    ctrl_x_armed: bool = false,
-
-    // slash 菜单选中项(对齐 cc:`/` 菜单 ↑↓ 移高亮 + Enter 选中)。menu 开时 ↑↓ 改它而非历史导航。
-    // 渲染按它高亮(accent 色);菜单关(非 `/` 态)恒重置为 0。范围由 complete.slashFilterCount 钳制。
-    slash_sel: usize = 0,
-    // `/` 菜单的命令源(内建 + 可由用户调用的 skill)。REPL loop 在 skill catalog 就绪后
-    // 设置并持有其内存;默认只有内建命令(测试/无 skill 场景)。
-    slash_catalog: complete.SlashCatalog = .builtin,
-
-    // Ctrl+U/K/W 杀行后显 `Ctrl+Y to paste deleted text` 提示(对齐 cc,框上方右对齐)。
-    // 杀行键置 true,下次打字(char)清 false。
-    paste_hint: bool = false,
-
-    // 瞬时提示(对齐 CC:"再按 Ctrl+C 退出" / "agent finished" 等)
-    hint: ?[]const u8 = null,
-
-    /// Idle-prompt double-press confirmation (Ctrl+C / Ctrl+D exit, Esc clear).
-    press: DoublePress = .{},
-    /// Suggestion menus closed with Esc for the current draft.
-    menu_dismissal: MenuDismissal = .{},
-
-    // Agent switcher(区域2):footer 下方 agent 列表 + agent transcript 查看。
-    agents: AgentSwitcherState = .{},
     /// agent 数量镜像(由 render/usage 时回写,dispatch 用于 ↓ 选择钳制)。
     /// dispatch 是纯函数无 registry 访问,靠此镜像知道选择上界。
     agent_count: usize = 0,
 
-    /// issue #16: the cross-UI model picker is on screen. Modal for keys —
-    /// while it is open every keystroke belongs to it, including plain
-    /// characters, which are its filter. It is *not* modal for the session:
-    /// the draft in the editor is untouched and a reply keeps streaming.
-    picker_open: bool = false,
+    /// 每个顶层字段的拥有者声明。新加顶层字段而不在这里写明它为什么跨阶段存活 → 编译失败
+    /// (见文件末 comptime 块):阶段内的状态应该放进阶段 payload。
+    pub const session_owned = .{
+        .cols = "terminal geometry",
+        .rows = "terminal geometry",
+        .phase = "the phase itself; everything it owns lives in its payload",
+        .footer = "usage/mode snapshot, fed by .usage between and across phases",
+        .panel = "Ctrl+T task-list preference, kept for the whole session",
+        .agent_count = "mirror of the agent registry the renderer writes back",
+    };
+
+    /// 一个处于 `entry` 阶段的新状态(测试与只关心单个阶段的调用方用)。
+    pub fn in(entry: PhaseEntry) UiState {
+        var s: UiState = .{};
+        s.enter(entry);
+        return s;
+    }
+
+    /// 唯一的阶段写入点:旧阶段的 payload(它打开的每个 widget)被整体替换。
+    /// Debug 构建拒绝不经 idle 的边——那意味着有一个阶段没有被关闭就开了下一个。
+    pub fn enter(self: *UiState, entry: PhaseEntry) void {
+        if (builtin.mode == .Debug and !transitionAllowed(self.phase, entry)) {
+            std.debug.panic("UiState: phase {t} -> {t} skips idle; the old phase was never closed", .{ @as(Phase, self.phase), @as(Phase, entry) });
+        }
+        self.phase = switch (entry) {
+            .idle => .idle,
+            .input => |e| .{ .input = .{ .slash_catalog = e.slash_catalog } },
+            .generating => |e| .{ .generating = .{ .spinner = .{ .verb = e.verb, .start_ms = e.start_ms } } },
+        };
+    }
+
+    /// 当前交互阶段的交互状态;idle 时没有。
+    pub fn interaction(self: *UiState) ?*Interaction {
+        return switch (self.phase) {
+            .idle => null,
+            .input => |*p| &p.interaction,
+            .generating => |*p| &p.interaction,
+        };
+    }
+
+    pub fn interactionConst(self: *const UiState) ?*const Interaction {
+        return switch (self.phase) {
+            .idle => null,
+            .input => |*p| &p.interaction,
+            .generating => |*p| &p.interaction,
+        };
+    }
+
+    pub fn inputPhase(self: *UiState) ?*InputPhase {
+        return switch (self.phase) {
+            .input => |*p| p,
+            else => null,
+        };
+    }
+
+    pub fn inputPhaseConst(self: *const UiState) ?*const InputPhase {
+        return switch (self.phase) {
+            .input => |*p| p,
+            else => null,
+        };
+    }
+
+    pub fn generatingPhase(self: *UiState) ?*GeneratingPhase {
+        return switch (self.phase) {
+            .generating => |*p| p,
+            else => null,
+        };
+    }
+
+    pub fn generatingPhaseConst(self: *const UiState) ?*const GeneratingPhase {
+        return switch (self.phase) {
+            .generating => |*p| p,
+            else => null,
+        };
+    }
 };
+
+comptime {
+    // 顶层字段 = 会话状态,必须声明拥有者;phase payload 的字段必须有默认值,
+    // 进入阶段时才能整份重建(teardown 是全量的,不靠枚举字段)。
+    for (@typeInfo(UiState).@"struct".fields) |f| {
+        if (!@hasField(@TypeOf(UiState.session_owned), f.name)) @compileError("UiState." ++ f.name ++
+            " has no declared owner: phase-scoped state belongs in a phase payload " ++
+            "(Interaction/InputPhase/GeneratingPhase); session state must say why in UiState.session_owned");
+    }
+    for (@typeInfo(@TypeOf(UiState.session_owned)).@"struct".fields) |f| {
+        if (!@hasField(UiState, f.name)) @compileError("UiState.session_owned names a missing field: " ++ f.name);
+    }
+    for ([_]type{ Interaction, InputPhase, GeneratingPhase }) |T| {
+        for (@typeInfo(T).@"struct".fields) |f| {
+            if (f.default_value_ptr == null) @compileError(@typeName(T) ++ "." ++ f.name ++
+                " needs a default: entering a phase rebuilds its payload from defaults");
+        }
+    }
+}
 
 // ---- 状态操作 helper(纯逻辑,dispatch 调用)----
 
+// 工具状态属于生成期;生成期以外到达的工具事件没有可更新的对象(它的阶段已经结束),丢弃即 teardown。
+
 /// 设置当前工具(定长拷贝)。
 pub fn setCurrentTool(s: *UiState, name: []const u8, start_ms: i64) void {
-    const n = @min(name.len, s.tools.current.len);
-    @memcpy(s.tools.current[0..n], name[0..n]);
-    s.tools.current_len = @intCast(n);
-    s.tools.current_start_ms = start_ms;
+    const g = s.generatingPhase() orelse return;
+    const n = @min(name.len, g.tools.current.len);
+    @memcpy(g.tools.current[0..n], name[0..n]);
+    g.tools.current_len = @intCast(n);
+    g.tools.current_start_ms = start_ms;
 }
 
 pub fn clearCurrentTool(s: *UiState) void {
-    s.tools.current_len = 0;
+    const g = s.generatingPhase() orelse return;
+    g.tools.current_len = 0;
 }
 
 /// 找卡片 index(按 id)。
 pub fn findCard(s: *const UiState, id: []const u8) ?usize {
+    const g = s.generatingPhaseConst() orelse return null;
     var i: usize = 0;
-    while (i < s.tools.cards_len) : (i += 1) {
-        if (std.mem.eql(u8, s.tools.cards[i].idSlice(), id)) return i;
+    while (i < g.tools.cards_len) : (i += 1) {
+        if (std.mem.eql(u8, g.tools.cards[i].idSlice(), id)) return i;
     }
     return null;
 }
@@ -299,8 +431,9 @@ pub fn findCard(s: *const UiState, id: []const u8) ?usize {
 /// 追加进度卡(定长拷贝;满或重复 id 则忽略/更新)。
 pub fn addCard(s: *UiState, id: []const u8, name: []const u8, input: []const u8, start_ms: i64) void {
     if (findCard(s, id) != null) return;
-    if (s.tools.cards_len >= MAX_TOOL_CARDS) return;
-    var c = &s.tools.cards[s.tools.cards_len];
+    const g = s.generatingPhase() orelse return;
+    if (g.tools.cards_len >= MAX_TOOL_CARDS) return;
+    var c = &g.tools.cards[g.tools.cards_len];
     const idn = @min(id.len, c.id.len);
     @memcpy(c.id[0..idn], id[0..idn]);
     c.id_len = @intCast(idn);
@@ -312,13 +445,13 @@ pub fn addCard(s: *UiState, id: []const u8, name: []const u8, input: []const u8,
     c.input_len = @intCast(inn);
     c.progress_len = 0;
     c.start_ms = start_ms;
-    s.tools.cards_len += 1;
+    g.tools.cards_len += 1;
 }
 
 /// 更新卡片进度(定长拷贝)。
 pub fn setCardProgress(s: *UiState, id: []const u8, text: []const u8) void {
     const idx = findCard(s, id) orelse return;
-    var c = &s.tools.cards[idx];
+    var c = &s.phase.generating.tools.cards[idx];
     const n = @min(text.len, c.progress.len);
     @memcpy(c.progress[0..n], text[0..n]);
     c.progress_len = @intCast(n);
@@ -327,11 +460,12 @@ pub fn setCardProgress(s: *UiState, id: []const u8, text: []const u8) void {
 /// 移除卡片(按 id;后续前移保持紧凑)。
 pub fn clearCard(s: *UiState, id: []const u8) void {
     const idx = findCard(s, id) orelse return;
+    const tools = &s.phase.generating.tools;
     var i = idx;
-    while (i + 1 < s.tools.cards_len) : (i += 1) {
-        s.tools.cards[i] = s.tools.cards[i + 1];
+    while (i + 1 < tools.cards_len) : (i += 1) {
+        tools.cards[i] = tools.cards[i + 1];
     }
-    s.tools.cards_len -= 1;
+    tools.cards_len -= 1;
 }
 
 // ── 测试 ──────────────────────────────────────────────────────────────────────

@@ -45,7 +45,8 @@ pub fn dispatch(state: *UiState, ev: Event) Effect {
     switch (ev) {
         .key => |k| return dispatchKey(state, k.key, k.now_ms),
         .spinner_tick => {
-            state.spinner.frame +%= 1;
+            const g = state.generatingPhase() orelse return .{};
+            g.spinner.frame +%= 1;
             return .{ .redraw_region = true };
         },
         .resize => |r| {
@@ -65,44 +66,50 @@ pub fn dispatch(state: *UiState, ev: Event) Effect {
             return .{ .redraw_region = true };
         },
         .text_chunk => |t| return .{ .emit_scroll = t.text },
+        // 工具状态归生成期所有:回复结束后才到的事件没有可更新的卡片,也不触发重画。
         .tool_progress => |p| {
+            if (state.phase != .generating) return .{};
             ui_state.setCardProgress(state, p.id, p.text);
             return .{ .redraw_region = true, .immediate = true };
         },
         .set_current_tool => |s| {
+            if (state.phase != .generating) return .{};
             ui_state.setCurrentTool(state, s.name, s.start_ms);
             return .{ .redraw_region = true };
         },
         .clear_current_tool => {
+            if (state.phase != .generating) return .{};
             ui_state.clearCurrentTool(state);
             return .{ .redraw_region = true };
         },
         .add_tool_card => |c| {
+            if (state.phase != .generating) return .{};
             ui_state.addCard(state, c.id, c.name, c.input, c.start_ms);
             return .{ .redraw_region = true };
         },
         .clear_tool_card => |c| {
+            if (state.phase != .generating) return .{};
             ui_state.clearCard(state, c.id);
             return .{ .redraw_region = true };
         },
-        .phase_change => |p| {
-            state.phase = p.to;
-            if (p.to == .generating) state.spinner.frame = 0;
-            // 切换到生成期关闭非模态 help(生成期不弹)。
-            if (p.to == .generating) {
-                state.help_open = false;
-            }
+        // 唯一的 teardown 点:旧阶段打开的 help/agent 列表/菜单高亮/双击窗口/工具卡……随 payload
+        // 一起消失(#330,取代散在各边界的 resetPhaseUi)。
+        .phase_change => |entry| {
+            state.enter(entry);
             return .{ .redraw_region = true };
         },
         .editor_view => |e| {
-            state.editor = .{ .view = e.view, .cursor = e.cursor };
+            const ix = state.interaction() orelse return .{};
+            ix.editor = .{ .view = e.view, .cursor = e.cursor };
             // slash 菜单选中项随 buffer 变化归位:菜单关 → 重置 0;过滤变窄 → 钳到末项。
             // (打字改前缀会重排匹配列表,选中项不归位会指向错命令。)
-            const n = complete.slashFilterCount(state.slash_catalog, e.view);
-            if (n == 0) {
-                state.slash_sel = 0;
-            } else if (state.slash_sel >= n) {
-                state.slash_sel = n - 1;
+            if (state.inputPhase()) |p| {
+                const n = complete.slashFilterCount(p.slash_catalog, e.view);
+                if (n == 0) {
+                    p.slash_sel = 0;
+                } else if (p.slash_sel >= n) {
+                    p.slash_sel = n - 1;
+                }
             }
             return .{ .redraw_region = true };
         },
@@ -111,12 +118,14 @@ pub fn dispatch(state: *UiState, ev: Event) Effect {
 }
 
 fn dispatchKey(state: *UiState, key: input.Key, now_ms: i64) Effect {
+    // 按键只属于交互阶段:idle 时没有输入框,也没有能接收它的 widget。
+    const ix = state.interaction() orelse return .{};
     // Ctrl+X Ctrl+K 序列(Emacs 双键前缀,杀后台任务)。arming 在 UiState,dispatch 统一处理。
     // 进入即消费上次的 armed(每键清一次,除非本键是 Ctrl+X 重新设)→ 防粘连。
-    const was_x_armed = state.ctrl_x_armed;
-    state.ctrl_x_armed = false;
+    const was_x_armed = ix.ctrl_x_armed;
+    ix.ctrl_x_armed = false;
     if (key == .ctrl_x) {
-        state.ctrl_x_armed = true; // 等下一个键
+        ix.ctrl_x_armed = true; // 等下一个键
         return .{ .redraw_region = false }; // Ctrl+X 单独无视觉变化
     }
     if (was_x_armed and key == .ctrl_k) {
@@ -133,7 +142,7 @@ fn dispatchKey(state: *UiState, key: input.Key, now_ms: i64) Effect {
     // ── issue #16: model picker 开着时,键盘属于它 ──────────────────────────
     // 对键模态(普通字符是它的过滤器),对会话不模态:草稿不动、生成不停。
     // Ctrl+C/Ctrl+D 故意不拦——用户永远有一条不依赖本状态机的退出路径。
-    if (state.picker_open and key != .ctrl_c and key != .ctrl_d) {
+    if (ix.picker_open and key != .ctrl_c and key != .ctrl_d) {
         const mapped: ?@import("../model_picker.zig").Key = switch (key) {
             .up => .up,
             .down => .down,
@@ -157,15 +166,15 @@ fn dispatchKey(state: *UiState, key: input.Key, now_ms: i64) Effect {
     }
 
     // `?` 帮助(非模态,对齐 cc onChange):空 editor 打 `?` → toggle help_open,`?` 不进 editor。
-    if (key == .char and key.char == '?' and state.editor.view.len == 0) {
-        state.help_open = !state.help_open;
+    if (key == .char and key.char == '?' and ix.editor.view.len == 0) {
+        ix.help_open = !ix.help_open;
         return .{ .redraw_region = true };
     }
     // help 开着时按键:Esc 仅关闭 help(消费,不透传——对齐 cc:Esc 是 help dismiss 键,
     // 不顺带清 draft/中断);其它键关 help 并继续正常处理(非模态,该键照常生效)。
     var help_closed = false;
-    if (state.help_open) {
-        state.help_open = false;
+    if (ix.help_open) {
+        ix.help_open = false;
         if (key == .esc) {
             // Esc 消费:只关 help + 重画,不透传给编辑器。
             return .{ .redraw_region = true };
@@ -178,14 +187,14 @@ fn dispatchKey(state: *UiState, key: input.Key, now_ms: i64) Effect {
     // `Press Ctrl-C again to exit` in the footer. Ctrl+C also discards the
     // draft. Nothing reaches the scrollback. A reply in flight owns these keys
     // (the watcher interrupts it), so this is input-phase only.
-    if (state.phase == .input) switch (key) {
+    if (state.inputPhase()) |p| switch (key) {
         .ctrl_c => {
-            if (state.press.press(.exit_ctrl_c, now_ms)) return .{ .action = .exit_prompt };
-            if (state.editor.view.len > 0) return .{ .redraw_region = true, .action = .discard_draft };
+            if (p.press.press(.exit_ctrl_c, now_ms)) return .{ .action = .exit_prompt };
+            if (ix.editor.view.len > 0) return .{ .redraw_region = true, .action = .discard_draft };
             return .{ .redraw_region = true };
         },
-        .ctrl_d => if (state.editor.view.len == 0) {
-            if (state.press.press(.exit_ctrl_d, now_ms)) return .{ .action = .exit_prompt };
+        .ctrl_d => if (ix.editor.view.len == 0) {
+            if (p.press.press(.exit_ctrl_d, now_ms)) return .{ .action = .exit_prompt };
             return .{ .redraw_region = true };
         },
         else => {},
@@ -212,84 +221,76 @@ fn dispatchKey(state: *UiState, key: input.Key, now_ms: i64) Effect {
         return .{ .redraw_region = true };
     }
 
-    // Esc closes whichever suggestion menu the draft opened and keeps the
-    // draft (Claude Code); the next Esc is the draft's own double press.
-    // While dismissed the menus neither render nor take ↑/↓/Enter/Tab.
-    const menus_dismissed = state.menu_dismissal.covers(state.editor.view);
-    if (state.phase == .input and key == .esc and !menus_dismissed and suggestionMenuOpen(state)) {
-        state.menu_dismissal.dismiss(state.editor.view);
-        return .{ .redraw_region = true };
-    }
-
-    // ── /models 两级账号 API key / model 菜单导航。必须先于普通 slash 菜单。
-    if (!menus_dismissed) {
-        const gen_models = state.phase == .generating;
-        if (!gen_models and complete.modelsMenuOpen(state.editor.view)) {
-            switch (key) {
-                .down => return .{ .action = .models_nav, .menu_step = .next },
-                .up => return .{ .action = .models_nav, .menu_step = .previous },
-                .page_down => return .{ .action = .models_nav, .menu_step = .page_down },
-                .page_up => return .{ .action = .models_nav, .menu_step = .page_up },
-                .home => return .{ .action = .models_nav, .menu_step = .first },
-                .end => return .{ .action = .models_nav, .menu_step = .last },
-                .enter => return .{ .action = .models_select },
-                else => {},
-            }
+    // 建议菜单(`/models`、`/model`、`/`、`@`)都从输入期草稿派生,只在输入期存在。
+    if (state.inputPhase()) |p| {
+        const view = ix.editor.view;
+        // Esc closes whichever suggestion menu the draft opened and keeps the
+        // draft (Claude Code); the next Esc is the draft's own double press.
+        // While dismissed the menus neither render nor take ↑/↓/Enter/Tab.
+        const menus_dismissed = p.menu_dismissal.covers(view);
+        if (key == .esc and !menus_dismissed and suggestionMenuOpen(state)) {
+            p.menu_dismissal.dismiss(view);
+            return .{ .redraw_region = true };
         }
-    }
-
-    // ── /model 服务端 catalog 菜单导航。必须先于普通 slash 菜单,否则 `/model`
-    // 会被当成单个 slash command,方向键无法选择模型。
-    if (!menus_dismissed) {
-        const gen0 = state.phase == .generating;
-        if (!gen0 and complete.modelMenuOpen(state.editor.view)) {
-            switch (key) {
-                .down => return .{ .action = .model_nav, .at_nav_dir = true },
-                .up => return .{ .action = .model_nav, .at_nav_dir = false },
-                .enter => return .{ .action = .model_select },
-                .tab => return .{ .action = .model_complete },
-                else => {},
+        if (!menus_dismissed) {
+            // ── /models 两级账号 API key / model 菜单导航。必须先于普通 slash 菜单。
+            if (complete.modelsMenuOpen(view)) {
+                switch (key) {
+                    .down => return .{ .action = .models_nav, .menu_step = .next },
+                    .up => return .{ .action = .models_nav, .menu_step = .previous },
+                    .page_down => return .{ .action = .models_nav, .menu_step = .page_down },
+                    .page_up => return .{ .action = .models_nav, .menu_step = .page_up },
+                    .home => return .{ .action = .models_nav, .menu_step = .first },
+                    .end => return .{ .action = .models_nav, .menu_step = .last },
+                    .enter => return .{ .action = .models_select },
+                    else => {},
+                }
             }
-        }
-    }
 
-    // ── slash 菜单导航(对齐 cc DIFF#4:`/` 菜单 ↑↓ 移高亮 + Enter 选中 + Tab 补全)──────
-    // 仅输入期 + 菜单开(`/` 前缀无空格且有匹配)时介入,抢 ↑↓/Enter/Tab 语义;
-    // 否则这些键照常走历史导航/提交/补全。菜单关时 slash_sel 恒 0(下方非 `/` 态会重置)。
-    if (!menus_dismissed) {
-        const gen0 = state.phase == .generating;
-        const view = state.editor.view;
-        if (!gen0 and complete.slashMenuOpen(state.slash_catalog, view)) {
-            const n = complete.slashFilterCount(state.slash_catalog, view);
-            if (state.slash_sel >= n) state.slash_sel = if (n == 0) 0 else n - 1;
-            switch (key) {
-                .down => {
-                    state.slash_sel = (state.slash_sel + 1) % n; // 循环(对齐 cc 列表滚动)
-                    return .{ .redraw_region = true };
-                },
-                .up => {
-                    state.slash_sel = if (state.slash_sel == 0) n - 1 else state.slash_sel - 1;
-                    return .{ .redraw_region = true };
-                },
-                .enter => return .{ .action = .slash_select }, // 填命令 + 提交
-                .tab => return .{ .action = .slash_complete }, // 仅补全(不提交)
-                else => {},
+            // ── /model 服务端 catalog 菜单导航。必须先于普通 slash 菜单,否则 `/model`
+            // 会被当成单个 slash command,方向键无法选择模型。
+            if (complete.modelMenuOpen(view)) {
+                switch (key) {
+                    .down => return .{ .action = .model_nav, .at_nav_dir = true },
+                    .up => return .{ .action = .model_nav, .at_nav_dir = false },
+                    .enter => return .{ .action = .model_select },
+                    .tab => return .{ .action = .model_complete },
+                    else => {},
+                }
             }
-        }
-    }
 
-    // ── @-mention 菜单导航(对齐 cc DIFF#5)──────────────────────────────────────
-    // dispatch 无 allocator → 不能算文件候选数,只能检测 @ 激活并上抛动作;
-    // 候选数/slash_sel 钳位 + 插入由 loop.zig(有 allocator)处理。
-    if (!menus_dismissed) {
-        const gen1 = state.phase == .generating;
-        if (!gen1 and complete.atMenuActive(state.editor.view, state.editor.cursor)) {
-            switch (key) {
-                .down => return .{ .action = .at_nav, .at_nav_dir = true },
-                .up => return .{ .action = .at_nav, .at_nav_dir = false },
-                .enter => return .{ .action = .at_select },
-                .tab => return .{ .action = .at_select },
-                else => {},
+            // ── slash 菜单导航(对齐 cc DIFF#4:`/` 菜单 ↑↓ 移高亮 + Enter 选中 + Tab 补全)──────
+            // 菜单开(`/` 前缀无空格且有匹配)时介入,抢 ↑↓/Enter/Tab 语义;
+            // 否则这些键照常走历史导航/提交/补全。菜单关时 slash_sel 恒 0(editor_view 会重置)。
+            if (complete.slashMenuOpen(p.slash_catalog, view)) {
+                const n = complete.slashFilterCount(p.slash_catalog, view);
+                if (p.slash_sel >= n) p.slash_sel = if (n == 0) 0 else n - 1;
+                switch (key) {
+                    .down => {
+                        p.slash_sel = (p.slash_sel + 1) % n; // 循环(对齐 cc 列表滚动)
+                        return .{ .redraw_region = true };
+                    },
+                    .up => {
+                        p.slash_sel = if (p.slash_sel == 0) n - 1 else p.slash_sel - 1;
+                        return .{ .redraw_region = true };
+                    },
+                    .enter => return .{ .action = .slash_select }, // 填命令 + 提交
+                    .tab => return .{ .action = .slash_complete }, // 仅补全(不提交)
+                    else => {},
+                }
+            }
+
+            // ── @-mention 菜单导航(对齐 cc DIFF#5)──────────────────────────────────────
+            // dispatch 无 allocator → 不能算文件候选数,只能检测 @ 激活并上抛动作;
+            // 候选数/slash_sel 钳位 + 插入由 loop.zig(有 allocator)处理。
+            if (complete.atMenuActive(view, ix.editor.cursor)) {
+                switch (key) {
+                    .down => return .{ .action = .at_nav, .at_nav_dir = true },
+                    .up => return .{ .action = .at_nav, .at_nav_dir = false },
+                    .enter => return .{ .action = .at_select },
+                    .tab => return .{ .action = .at_select },
+                    else => {},
+                }
             }
         }
     }
@@ -300,33 +301,33 @@ fn dispatchKey(state: *UiState, key: input.Key, now_ms: i64) Effect {
     // 严格 gate 防破坏光标移动/历史导航。
     {
         const gen2 = state.phase == .generating;
-        if (state.agents.view == .list) {
+        if (ix.agents.view == .list) {
             switch (key) {
                 .up => {
-                    state.agents.selectUp();
+                    ix.agents.selectUp();
                     return .{ .redraw_region = true };
                 },
                 .down => {
-                    state.agents.selectDown(state.agent_count);
+                    ix.agents.selectDown(state.agent_count);
                     return .{ .redraw_region = true };
                 },
                 .enter => {
                     // sel==0(main)→ 关闭回 main;否则进**持久 viewing**(分隔 label 变被查看 agent
                     // 的 desc + switcher marker ⏺)。viewing_id 在 render 层落定(committed=false 触发)。
-                    if (state.agents.sel == 0) {
-                        state.agents.close();
+                    if (ix.agents.sel == 0) {
+                        ix.agents.close();
                         return .{ .redraw_region = true };
                     }
-                    state.agents.view = .viewing;
-                    state.agents.viewing_committed = false; // render 下一帧把 sel 对应 id 落定
+                    ix.agents.view = .viewing;
+                    ix.agents.viewing_committed = false; // render 下一帧把 sel 对应 id 落定
                     return .{ .redraw_region = true };
                 },
                 .esc => {
-                    state.agents.close();
+                    ix.agents.close();
                     return .{ .redraw_region = true };
                 },
                 .char => {
-                    if (key.char == 'x' and state.agents.selection_active and state.agents.sel > 0) {
+                    if (key.char == 'x' and ix.agents.selection_active and ix.agents.sel > 0) {
                         return .{ .action = .agents_stop };
                     }
                 },
@@ -337,56 +338,56 @@ fn dispatchKey(state: *UiState, key: input.Key, now_ms: i64) Effect {
         }
         // viewing 态:↑/↓ **只移 ❯ 高亮**(不切被查看对象——对齐真 cc:Enter 才提交);
         // Enter on sel>0 → 重新落定 viewing_id(切到新选中 agent);esc 退回 list。
-        if (state.agents.view == .viewing) {
+        if (ix.agents.view == .viewing) {
             switch (key) {
                 .up => {
-                    state.agents.selectUp();
+                    ix.agents.selectUp();
                     // sel 回到 0(main)→ 退出 viewing 回 list(main 无可查看对象)。
-                    if (state.agents.sel == 0) state.agents.view = .list;
+                    if (ix.agents.sel == 0) ix.agents.view = .list;
                     return .{ .redraw_region = true };
                 },
                 .down => {
-                    state.agents.selectDown(state.agent_count);
+                    ix.agents.selectDown(state.agent_count);
                     return .{ .redraw_region = true };
                 },
                 .enter => {
                     // 在 viewing 态对当前高亮的 agent 再按 Enter → 切换被查看对象(render 落定新 id)。
-                    if (state.agents.sel > 0) state.agents.viewing_committed = false;
+                    if (ix.agents.sel > 0) ix.agents.viewing_committed = false;
                     return .{ .redraw_region = true };
                 },
                 .page_up => {
                     // 视口上翻(dispatch 无几何 → 用固定 step,render 层按真实 view_rows clamp)。
-                    state.agents.viewPageUp(VIEW_PAGE_STEP);
+                    ix.agents.viewPageUp(VIEW_PAGE_STEP);
                     return .{ .redraw_region = true };
                 },
                 .page_down => {
-                    state.agents.viewPageDown(VIEW_PAGE_STEP);
+                    ix.agents.viewPageDown(VIEW_PAGE_STEP);
                     return .{ .redraw_region = true };
                 },
                 .esc => {
-                    state.agents.view = .list; // 退回列表(再 esc 关闭)
+                    ix.agents.view = .list; // 退回列表(再 esc 关闭)
                     return .{ .redraw_region = true };
                 },
                 .char => {
-                    if (key.char == 'x' and state.agents.sel > 0) return .{ .action = .agents_stop };
+                    if (key.char == 'x' and ix.agents.sel > 0) return .{ .action = .agents_stop };
                 },
                 else => {},
             }
             return .{ .redraw_region = false };
         }
         // 未打开:检测入口键。
-        if (state.agents.view == .closed and state.agent_count > 0) {
-            if (!gen2 and key == .left and state.editor.view.len == 0) {
+        if (ix.agents.view == .closed and state.agent_count > 0) {
+            if (!gen2 and key == .left and ix.editor.view.len == 0) {
                 // 空闲 + editor 空 + 有 agent → 进 list(对齐实拍 `← for agents`)。
-                state.agents.view = .list;
-                state.agents.selection_active = false;
-                state.agents.sel = 0;
+                ix.agents.view = .list;
+                ix.agents.selection_active = false;
+                ix.agents.sel = 0;
                 return .{ .redraw_region = true };
             }
             if (gen2 and key == .down) {
                 // 生成期 `↓ to manage` → 进 list + 立即激活选择(实拍 ↓ 直接出 ❯)。
-                state.agents.view = .list;
-                state.agents.selectDown(state.agent_count);
+                ix.agents.view = .list;
+                ix.agents.selectDown(state.agent_count);
                 return .{ .redraw_region = true };
             }
         }
@@ -396,11 +397,11 @@ fn dispatchKey(state: *UiState, key: input.Key, now_ms: i64) Effect {
     // keeps it in history; the first shows `Esc again to clear` (Claude Code
     // `useTextInput`). An empty prompt has nothing to clear. During a reply
     // Esc interrupts, which the watcher owns.
-    if (state.phase == .input and key == .esc) {
-        if (state.editor.view.len == 0) return .{};
-        if (state.press.press(.clear_input, now_ms)) return .{ .redraw_region = true, .action = .clear_draft };
+    if (state.inputPhase()) |p| if (key == .esc) {
+        if (ix.editor.view.len == 0) return .{};
+        if (p.press.press(.clear_input, now_ms)) return .{ .redraw_region = true, .action = .clear_draft };
         return .{ .redraw_region = true };
-    }
+    };
 
     // ── 全局快捷键:dispatch 识别 → 上抛 LoopAction,IO 体留调用方(两期共用解析)──────
     // 按 UiState gate:生成期对无意义的键(history/complete/reverse_search/external_edit)
@@ -426,8 +427,10 @@ fn dispatchKey(state: *UiState, key: input.Key, now_ms: i64) Effect {
 }
 
 /// The footer line while an exit press is armed (it replaces the whole line).
+/// The presses belong to the input phase; no other phase has one armed.
 pub fn exitHint(state: *const UiState) ?[]const u8 {
-    return switch (state.press.kind) {
+    const p = state.inputPhaseConst() orelse return null;
+    return switch (p.press.kind) {
         .exit_ctrl_c => "Press Ctrl-C again to exit",
         .exit_ctrl_d => "Press Ctrl-D again to exit",
         .none, .clear_input => null,
@@ -437,18 +440,21 @@ pub fn exitHint(state: *const UiState) ?[]const u8 {
 /// The one-line notice right-aligned above the input box: the Esc double
 /// press outranks the yank hint.
 pub fn aboveBoxNotice(state: *const UiState) ?[]const u8 {
-    if (state.press.kind == .clear_input) return "Esc again to clear";
-    if (state.paste_hint) return "Ctrl+Y to paste deleted text";
+    const p = state.inputPhaseConst() orelse return null;
+    if (p.press.kind == .clear_input) return "Esc again to clear";
+    if (p.paste_hint) return "Ctrl+Y to paste deleted text";
     return null;
 }
 
 /// A suggestion menu the draft opens on its own: `/models`, `/model`, the `/`
-/// command menu, or an `@` file mention under the cursor.
+/// command menu, or an `@` file mention under the cursor. Only an input
+/// phase has a draft that opens them.
 pub fn suggestionMenuOpen(state: *const UiState) bool {
-    const view = state.editor.view;
+    const p = state.inputPhaseConst() orelse return false;
+    const view = p.interaction.editor.view;
     return complete.modelsMenuOpen(view) or complete.modelMenuOpen(view) or
-        complete.slashMenuOpen(state.slash_catalog, view) or
-        complete.atMenuActive(view, state.editor.cursor);
+        complete.slashMenuOpen(p.slash_catalog, view) or
+        complete.atMenuActive(view, p.interaction.editor.cursor);
 }
 
 // ============================ render ============================
@@ -457,10 +463,10 @@ pub fn suggestionMenuOpen(state: *const UiState) bool {
 /// transcript 现走 alt-screen viewer(transcript_viewer.zig),不再嵌入式渲染。
 /// `?` help 非模态——在 renderInputFrame 内把 footer 区换成快捷键菜单(输入框仍在)。
 pub fn render(w: anytype, in: RenderInputs) !Frame {
-    const s = in.state;
-    return switch (s.phase) {
-        .input => try renderInputFrame(w, in),
-        .generating => try renderGenFrame(w, in),
+    return switch (in.state.phase) {
+        .idle => .{}, // 两次交互之间固定区不在屏上
+        .input => |*p| try renderInputFrame(w, in, p),
+        .generating => |*p| try renderGenFrame(w, in, p),
     };
 }
 
@@ -548,36 +554,36 @@ pub fn renderHelpLines(w: anytype, th: Theme, cols: u16) !u16 {
 
 /// 输入期帧(阶段 0 最简版:❯ + editor view + footer 行)。
 /// 后续阶段接入完整边框/多行/panel。
-fn renderInputFrame(w: anytype, in: RenderInputs) !Frame {
+fn renderInputFrame(w: anytype, in: RenderInputs, p: *const ui_state.InputPhase) !Frame {
     const th = in.theme;
     const s = in.state;
+    const ed = p.interaction.editor;
     var rows: u16 = 0;
     // ❯ 行 + editor view。
     try w.writeAll(th.accent);
     try w.writeAll("❯ ");
     try w.writeAll(th.reset);
-    try w.writeAll(s.editor.view);
+    try w.writeAll(ed.view);
     try w.writeAll("\r\n");
     rows += 1;
     // footer 区:help_open 时原地展开快捷键菜单(非模态,输入框仍在);否则正常 footer 行。
-    if (s.help_open) {
+    if (p.interaction.help_open) {
         rows += try renderHelpLines(w, in.theme, s.cols);
     } else {
         rows += try renderFooterLine(w, in);
     }
-    const cursor_col: u16 = @intCast(2 + term.displayWidth(s.editor.view[0..@min(s.editor.cursor, s.editor.view.len)]));
+    const cursor_col: u16 = @intCast(2 + term.displayWidth(ed.view[0..@min(ed.cursor, ed.view.len)]));
     return .{ .rows = rows, .cursor_row = 0, .cursor_col = cursor_col };
 }
 
 /// 生成期帧(阶段 0 占位:spinner 行 + footer;阶段 3 接入完整)。
-fn renderGenFrame(w: anytype, in: RenderInputs) !Frame {
+fn renderGenFrame(w: anytype, in: RenderInputs, p: *const ui_state.GeneratingPhase) !Frame {
     const th = in.theme;
-    const s = in.state;
     var rows: u16 = 0;
-    const elapsed = @divTrunc(@max(in.now_ms - s.spinner.start_ms, 0), 1000);
+    const elapsed = @divTrunc(@max(in.now_ms - p.spinner.start_ms, 0), 1000);
     const glyph: []const u8 = if (in.use_unicode) "*" else "*";
     try w.writeAll(th.accent);
-    try w.print("{s} {s}… ({d}s · esc to interrupt)", .{ glyph, s.spinner.verb, elapsed });
+    try w.print("{s} {s}… ({d}s · esc to interrupt)", .{ glyph, p.spinner.verb, elapsed });
     try w.writeAll(th.reset);
     try w.writeAll("\r\n");
     rows += 1;
@@ -632,7 +638,7 @@ fn press(state: *UiState, k: input.Key) Effect {
 }
 
 test "issue #16: Ctrl+O opens the picker and Ctrl+X Ctrl+O still opens the transcript" {
-    var state = UiState{};
+    var state = UiState.in(.{ .input = .{} });
     try testing.expectEqual(event.LoopAction.open_model_picker, press(&state, .ctrl_o).action);
 
     // The rebinding must not make transcript viewing unreachable: the prefix
@@ -646,17 +652,18 @@ test "issue #16: Ctrl+O opens the picker and Ctrl+X Ctrl+O still opens the trans
 }
 
 test "issue #16: an open picker owns the keyboard without touching the draft" {
-    var state = UiState{};
-    state.editor = .{ .view = "explain this function", .cursor = 4 };
-    state.picker_open = true;
+    var state = UiState.in(.{ .input = .{} });
+    const ix = state.interaction().?;
+    ix.editor = .{ .view = "explain this function", .cursor = 4 };
+    ix.picker_open = true;
 
     const typed = press(&state, .{ .char = 'g' });
     try testing.expectEqual(event.LoopAction.picker_key, typed.action);
     try testing.expect(typed.picker_key == .char and typed.picker_key.char == 'g');
     // A plain character while the picker is open is its filter, not editor
     // input — and the draft the user was writing stays exactly as it was.
-    try testing.expectEqualStrings("explain this function", state.editor.view);
-    try testing.expectEqual(@as(usize, 4), state.editor.cursor);
+    try testing.expectEqualStrings("explain this function", ix.editor.view);
+    try testing.expectEqual(@as(usize, 4), ix.editor.cursor);
 
     try testing.expect(press(&state, .enter).picker_key == .enter);
     try testing.expect(press(&state, .esc).picker_key == .escape);
@@ -668,8 +675,8 @@ test "issue #16: an open picker owns the keyboard without touching the draft" {
 }
 
 test "issue #16: an open picker never traps the session" {
-    var state = UiState{};
-    state.picker_open = true;
+    var state = UiState.in(.{ .input = .{} });
+    state.interaction().?.picker_open = true;
     // Ctrl+C and Ctrl+D keep their normal meaning, so there is always a way
     // out that does not depend on the picker's own state machine.
     try testing.expect(press(&state, .ctrl_c).action != .picker_key);

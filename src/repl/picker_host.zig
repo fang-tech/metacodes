@@ -38,23 +38,31 @@ pub fn open(app: *app_mod.App, ui: *ui_state.UiState) void {
         if (effort.active()) app.model_picker.presetControl("reasoning_effort", effort.name());
     }
     app.model_picker.page_rows = pageRowsFor(ui.rows);
-    ui.picker_open = true;
+    setOpen(ui, true);
 }
 
 /// Show a picker the previous phase left open (#220). Unlike `open` it keeps
 /// the snapshot and the half-finished browse; only the page height, which
-/// belongs to the new region, is recomputed.
+/// belongs to the new region, is recomputed. The overlay itself died with
+/// that phase (#330), so this is what carries it across the boundary.
 pub fn keep(app: *app_mod.App, ui: *ui_state.UiState) void {
     app.model_picker.page_rows = pageRowsFor(ui.rows);
-    ui.picker_open = true;
+    setOpen(ui, true);
 }
 
 pub fn close(app: *app_mod.App, ui: *ui_state.UiState) void {
     // A picker that closes mid sign-in must not leave a thread waiting on
     // a socket.
     cancelLogin(app);
-    ui.picker_open = false;
+    setOpen(ui, false);
     app.model_picker.clearNotice();
+}
+
+/// The overlay is owned by the interactive phase it is shown in. Outside one
+/// (idle) there is no region to show it in, so there is nothing to set.
+fn setOpen(ui: *ui_state.UiState, open_now: bool) void {
+    const ix = ui.interaction() orelse return;
+    ix.picker_open = open_now;
 }
 
 /// One line describing the last commit. Stable until the picker is reopened,
@@ -274,7 +282,7 @@ fn apply(app: *app_mod.App, ui: *ui_state.UiState, commit: picker_mod.Commit) Re
                     view_mod.scopeWord(accepted.scope),
                 });
             }
-            ui.picker_open = false;
+            setOpen(ui, false);
             return .committed;
         },
         .rejected => |reason| {

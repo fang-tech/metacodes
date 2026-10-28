@@ -10,6 +10,22 @@ status, compatibility boundaries, and entry points are defined by
 
 ## Unreleased
 
+### Changed
+
+- **The TUI's turn phase now owns every widget it opens (#330).** The agent
+  switcher, `?` help, the Ctrl+X prefix, the slash/`@` menu highlight, the
+  paste hint, the double-press windows, the model picker, the input box
+  projection, the spinner and the tool cards used to live side by side in one
+  session-long `UiState`, kept from leaking into the next prompt or reply by a
+  reset list at every boundary (#298). They now live in the payload of the
+  phase they belong to (`idle`/`input`/`generating`), which a single typed
+  `phase_change` event replaces wholesale, so nothing a reply or a read opened
+  can outlive it and a new widget is torn down without being listed anywhere.
+  A top-level field without a declared reason to outlive phases fails the
+  build, and a debug build panics on a phase that opens before the previous
+  one closed. The picker still crosses a boundary, but only through its
+  explicit `pending_overlay` hand-off (#220). No visible behaviour changes.
+
 ## 0.8.1 — 2026-10-28
 
 ### Fixed

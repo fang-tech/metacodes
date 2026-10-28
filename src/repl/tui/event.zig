@@ -115,7 +115,6 @@ pub const SetToolEvent = struct { name: []const u8, start_ms: i64 };
 pub const ToolCardEvent = struct { id: []const u8, name: []const u8, input: []const u8 = "", start_ms: i64 };
 pub const ClearCardEvent = struct { id: []const u8 };
 pub const ToolProgressEvent = struct { id: []const u8, text: []const u8 };
-pub const PhaseChangeEvent = struct { to: ui_state.Phase };
 pub const EditorViewEvent = struct { view: []const u8, cursor: usize };
 
 /// 所有 UI 事件。闭合 union → dispatch 的 switch 漏分支编译报错(漏接线编译失败,非运行时静默)。
@@ -131,7 +130,8 @@ pub const Event = union(enum) {
     clear_current_tool,
     add_tool_card: ToolCardEvent,
     clear_tool_card: ClearCardEvent,
-    phase_change: PhaseChangeEvent,
+    /// 阶段边界(#330):旧阶段拥有的全部状态随它的 payload 一起销毁,新阶段从 entry 参数重建。
+    phase_change: ui_state.PhaseEntry,
     editor_view: EditorViewEvent,
 };
 

@@ -83,6 +83,7 @@ python3 tests/tty/run_tty_tests.py --bin zig-out/bin/metacodes-debug --shard 2/3
 | T43/T44 缩窄不叠框 | 空闲框 100→60 列分四步缩窄:重排终端里只剩一个框(上方无旧横线、下方无旧 footer);裁剪终端(`XTERM_VERSION`)里框上方一行不丢 |
 | startup_splash | 启动动画原地重绘、定格字标在 banner 上方且只用 Metask Lab 的字母、任意键跳过且吃掉该键、env/config 开关、窄终端不播(帧字节类断言 Windows 跳过:ConPTY 重编码) |
 | e2e_metask_device(真模型) | Metask 设备码登录(程序化确认)→ 经网关请求真实模型 → 本地账本每请求带 X-Metask-Request-Id → `scripts/metask_reconcile.py` 与网关 /v1/usage 对账零差异;需 METASK_WEB_SESSION_TOKEN、METASK_SITE_URL、METASK_MODELS |
+| phase_ownership 阶段拥有 widget(#330) | 回复里打开的 agent 列表(`↓ to manage`)与 `?` help 不进入下一次提示:列表不吞下一次输入(#298 的症状),空闲 footer 不被 help 盖住;离线(slow mock server) |
 | T45-T47 resize 打断按键 | ESC、resize、`[A` 在一次 ESC 等待内先后到达:反向搜索不被取消、transcript viewer 不被关掉,`[A` 不漏进输入框(#340);单按 Esc 不等下一个键就关 viewer(POSIX;ConPTY 无 SIGWINCH,T45/T46 跳过) |
 
 ## 已发现并修复的 bug

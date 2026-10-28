@@ -19,8 +19,16 @@ fn mkInputs(s: *const UiState) ui.RenderInputs {
     return .{ .state = s, .now_ms = 0, .theme = theme_mod.monochrome, .use_unicode = false };
 }
 
+fn reading(view: []const u8, footer: ui_state.FooterState) UiState {
+    var s = UiState.in(.{ .input = .{} });
+    s.footer = footer;
+    s.interaction().?.editor = .{ .view = view, .cursor = view.len };
+    return s;
+}
+
 test "render: help_open 在输入帧 footer 区投影多列快捷键(非模态,输入框仍在)" {
-    var s = UiState{ .help_open = true, .cols = 80, .rows = 24, .editor = .{ .view = "", .cursor = 0 } };
+    var s = reading("", .{});
+    s.interaction().?.help_open = true;
     var cw = capture.CaptureWriter.init(testing.allocator);
     defer cw.deinit();
     const frame = try ui.render(&cw, mkInputs(&s));
@@ -33,7 +41,7 @@ test "render: help_open 在输入帧 footer 区投影多列快捷键(非模态,�
 }
 
 test "render: input 帧含 editor view + footer,绝不含 \\x1b[2J" {
-    var s = UiState{ .phase = .input, .editor = .{ .view = "abc", .cursor = 3 }, .footer = .{ .mode = .accept_edits } };
+    var s = reading("abc", .{ .mode = .accept_edits });
     var cw = capture.CaptureWriter.init(testing.allocator);
     defer cw.deinit();
     _ = try ui.render(&cw, mkInputs(&s));
@@ -49,7 +57,7 @@ test "render: input 帧含 editor view + footer,绝不含 \\x1b[2J" {
 test "render: footer default 态显 '? for shortcuts',不显 cycle 提示(对齐 cc)" {
     // default 态是 cyclePermMode 循环起点;footer 分支与非 default 不同。
     // 此前仅 PTY(test_mode_commit/test_overlay)覆盖;下沉成纯投影单测。
-    var s = UiState{ .phase = .input, .editor = .{ .view = "", .cursor = 0 }, .footer = .{ .mode = .default } };
+    var s = reading("", .{ .mode = .default });
     var cw = capture.CaptureWriter.init(testing.allocator);
     defer cw.deinit();
     _ = try ui.render(&cw, mkInputs(&s));
@@ -61,7 +69,7 @@ test "render: footer default 态显 '? for shortcuts',不显 cycle 提示(对齐
 }
 
 test "render: footer accept_edits 态显 mode part(cyclePermMode 中间档)" {
-    var s = UiState{ .phase = .input, .editor = .{ .view = "", .cursor = 0 }, .footer = .{ .mode = .accept_edits } };
+    var s = reading("", .{ .mode = .accept_edits });
     var cw = capture.CaptureWriter.init(testing.allocator);
     defer cw.deinit();
     _ = try ui.render(&cw, mkInputs(&s));
@@ -72,7 +80,7 @@ test "render: footer accept_edits 态显 mode part(cyclePermMode 中间档)" {
 }
 
 test "render: generating 帧 spinner 行确定性(注入 now_ms)" {
-    var s = UiState{ .phase = .generating, .spinner = .{ .verb = "Thinking", .start_ms = 0 } };
+    var s = UiState.in(.{ .generating = .{ .verb = "Thinking", .start_ms = 0 } });
     var cw = capture.CaptureWriter.init(testing.allocator);
     defer cw.deinit();
     var in = mkInputs(&s);
@@ -86,7 +94,7 @@ test "render: generating 帧 spinner 行确定性(注入 now_ms)" {
 }
 
 test "E2E 内存级: ? 开 help → render help 帧 → 任意键关 → render 回输入帧" {
-    var s = UiState{};
+    var s = reading("", .{});
     // 初态:input 帧(无 help)
     {
         var cw = capture.CaptureWriter.init(testing.allocator);
@@ -97,7 +105,7 @@ test "E2E 内存级: ? 开 help → render help 帧 → 任意键关 → render 
     // dispatch '?' → help_open(非模态)
     const e1 = ui.dispatch(&s, .{ .key = .{ .key = .{ .char = '?' } } });
     try testing.expect(e1.redraw_region);
-    try testing.expect(s.help_open);
+    try testing.expect(s.interaction().?.help_open);
     {
         var cw = capture.CaptureWriter.init(testing.allocator);
         defer cw.deinit();
@@ -107,7 +115,7 @@ test "E2E 内存级: ? 开 help → render help 帧 → 任意键关 → render 
     }
     // dispatch 任意键 → 关闭 help(该键透传编辑器)
     _ = ui.dispatch(&s, .{ .key = .{ .key = .{ .char = 'x' } } });
-    try testing.expect(!s.help_open);
+    try testing.expect(!s.interaction().?.help_open);
     {
         var cw = capture.CaptureWriter.init(testing.allocator);
         defer cw.deinit();
@@ -119,7 +127,8 @@ test "E2E 内存级: ? 开 help → render help 帧 → 任意键关 → render 
 test "dispatch: Ctrl+O / Ctrl+X Ctrl+O 都只上抛 LoopAction,不改 UiState 渲染态" {
     // transcript 走 alt-screen viewer(transcript_viewer.zig),picker 画在固定区里;
     // 两者都只上抛 LoopAction,dispatch 不改 UiState、不嵌入式渲染。渲染帧仍是输入帧。
-    var s = UiState{ .rows = 10 };
+    var s = reading("", .{});
+    s.rows = 10;
     const eff = ui.dispatch(&s, .{ .key = .{ .key = .ctrl_o } });
     try testing.expectEqual(event.LoopAction.open_model_picker, eff.action);
     _ = ui.dispatch(&s, .{ .key = .{ .key = .ctrl_x } });
@@ -132,4 +141,13 @@ test "dispatch: Ctrl+O / Ctrl+X Ctrl+O 都只上抛 LoopAction,不改 UiState �
     defer cw.deinit();
     _ = try ui.render(&cw, mkInputs(&s));
     try capture.expectContains(cw.output(), "❯");
+}
+
+test "render: idle 时固定区不在屏上——零行、零字节" {
+    const s = UiState{};
+    var cw = capture.CaptureWriter.init(testing.allocator);
+    defer cw.deinit();
+    const frame = try ui.render(&cw, mkInputs(&s));
+    try testing.expectEqual(@as(u16, 0), frame.rows);
+    try testing.expectEqual(@as(usize, 0), cw.output().len);
 }

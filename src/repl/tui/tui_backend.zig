@@ -606,7 +606,7 @@ pub const TuiBackend = struct {
                     // The picker's sign-in runs on a worker thread (#67);
                     // this tick moves its transcript into the overlay and
                     // commits the pending route once the login lands.
-                    if (self.region.ui.picker_open) switch (picker_host.poll(app, &self.region.ui)) {
+                    if (self.region.pickerOpen()) switch (picker_host.poll(app, &self.region.ui)) {
                         .committed => {
                             self.region.writeGenText(picker_host.lastNotice(app));
                             self.region.writeGenText("\n");

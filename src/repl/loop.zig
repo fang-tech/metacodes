@@ -1490,8 +1490,17 @@ fn installSigwinch() void {
 /// after the watcher has stopped, and once more by the iteration's defer.
 fn leaveGenerationRegion(app: *app_mod.App, region: *render_region_mod.RenderRegion) void {
     if (!region.isGenerating()) return;
-    if (region.ui.picker_open) app.pending_overlay = .model_picker_kept;
+    if (region.pickerOpen()) app.pending_overlay = .model_picker_kept;
     region.leaveGenerating(app);
+}
+
+/// End the input phase of the shared region (idempotent). Everything the read
+/// opened closes with it (#330); a picker still open (vim NORMAL Enter submits
+/// past it) is handed to the next phase the same way a reply hands it off.
+fn endInputRegion(app: *app_mod.App, region: *render_region_mod.RenderRegion) void {
+    if (region.ui.phase != .input) return;
+    if (region.pickerOpen()) app.pending_overlay = .model_picker_kept;
+    region.endInput();
 }
 
 /// 把提交的输入回显到 scrollback(复刻 Claude Code:提交后历史里留 "❯ <内容>")。
@@ -1643,23 +1652,20 @@ fn readLineRaw(
     // 共享 region 跨整个会话:`/theme` 换的是 app.theme,每次读取开始时同步进来,
     // 否则输入框/footer 仍画旧主题。
     region.syncTheme(app.theme);
-    // 上一期(回复或上一次读取)打开的 agent 列表/help/slash 高亮不带进本次读取:
-    // 否则停在 list 态的 agent 切换器会吞掉新提示的输入。
-    region.resetPhaseUi();
 
     // `/` 菜单命令源:内建命令 + 本 session 可由用户调用的 skill(对齐 cc:输入 `/` 即联想
     // 出命令与 skill)。每次读取重建:skill catalog 可能已重载,构建成本只是几十个借用切片。
     var slash_arena = std.heap.ArenaAllocator.init(allocator);
     defer slash_arena.deinit();
-    region.ui.slash_catalog = slashCatalog(slash_arena.allocator(), app);
+    // 本次读取是一个输入阶段(#330):上一阶段打开的 agent 列表/help/slash 高亮已随它结束,
+    // 停在 list 态的 agent 切换器吞掉新提示输入(#298)的那类泄漏无从发生。catalog 借用上面的
+    // arena,读取结束时随阶段 payload 一起消失(下方 defer 在 arena 释放之前跑)。
+    region.beginInput(slashCatalog(slash_arena.allocator(), app));
     // 终端 resize 监听:SIGWINCH → 下次 poll 超时时重画自适应。
     g_winch.store(false, .release);
     installSigwinch();
-    // slash_catalog 借用本次读取的 arena；共享 Renderer 会跨越 input/generation
-    // 生命周期，不能把已经释放的 skill 切片留在 UiState 里。
     defer {
-        region.ui.slash_catalog = .builtin;
-        region.setInput("", 0);
+        endInputRegion(app, region);
         region.clear();
         region.emitTerminal("\x1b[?25h"); // 确保光标可见
     }
@@ -1755,7 +1761,7 @@ fn readLineRaw(
                 }
                 // The picker's sign-in runs on a worker thread (#67); the idle
                 // tick is where its transcript reaches the overlay.
-                if (region.ui.picker_open) switch (picker_host.poll(app, &region.ui)) {
+                if (region.pickerOpen()) switch (picker_host.poll(app, &region.ui)) {
                     .committed => {
                         region.clear();
                         region.emitTerminalFmt("{s}\n", .{picker_host.lastNotice(app)});
@@ -1815,7 +1821,7 @@ fn readLineRaw(
         // vim mode keeps its own keymap, but the exit keys go through the same
         // double-press state as everywhere else.
         if (!app.config.vim_mode or key == .ctrl_c or key == .ctrl_d) {
-            region.ui.editor = .{ .view = editor.view(), .cursor = editor.cursor };
+            region.setInput(editor.view(), editor.cursor);
             const eff = region.applyEvent(app, &app.conversation, .{ .key = .{ .key = key, .now_ms = util_time.nowMs() } });
             switch (eff.action) {
                 .pass_to_editor => {}, // 落到下面正常编辑
@@ -1876,13 +1882,13 @@ fn readLineRaw(
                 },
                 .complete => {
                     region.clear();
-                    try handleCompletion(&editor, allocator, region.ui.slash_catalog, region);
+                    try handleCompletion(&editor, allocator, region.ui.phase.input.slash_catalog, region);
                     redraw(region, &editor, app);
                     continue;
                 },
                 .slash_complete => {
                     // Tab on slash 菜单:把 buffer 换成选中命令名(不提交,留补参数)。
-                    if (complete.slashNthMatch(region.ui.slash_catalog, editor.view(), region.ui.slash_sel)) |cmd| {
+                    if (complete.slashNthMatch(region.ui.phase.input.slash_catalog, editor.view(), region.ui.phase.input.slash_sel)) |cmd| {
                         try setSlashLine(&editor, cmd);
                     }
                     redraw(region, &editor, app);
@@ -1891,17 +1897,17 @@ fn readLineRaw(
                 .slash_select => {
                     // Enter on slash 菜单:把 buffer 换成选中命令名后提交(对齐 cc:Enter 运行选中项)。
                     // 复刻 .commit 路径(下方 editor.handle(.enter)→.commit 同款):清区 + 回显 + 返回。
-                    if (complete.slashNthMatch(region.ui.slash_catalog, editor.view(), region.ui.slash_sel)) |cmd| {
+                    if (complete.slashNthMatch(region.ui.phase.input.slash_catalog, editor.view(), region.ui.phase.input.slash_sel)) |cmd| {
                         if (cmd.takes_args) {
                             // 带参数的 skill:Enter 只填 `/name ` 留给用户输入参数(对齐 cc),不提交。
                             try setSlashLine(&editor, cmd);
-                            region.ui.slash_sel = 0;
+                            region.ui.phase.input.slash_sel = 0;
                             redraw(region, &editor, app);
                             continue;
                         }
                         try editor.setLine(cmd.name);
                     }
-                    region.ui.slash_sel = 0;
+                    region.ui.phase.input.slash_sel = 0;
                     region.setInput("", 0);
                     region.clear();
                     echoUserSubmission(app, editor.view(), region);
@@ -1911,11 +1917,11 @@ fn readLineRaw(
                     // /model 服务端 catalog 菜单 ↑↓:只在已 probe 到服务端模型时移动选择。
                     const n = @min(app.api_client.catalog.entries.items.len, complete.MODEL_MENU_MAX_ROWS);
                     if (n > 0) {
-                        if (region.ui.slash_sel >= n) region.ui.slash_sel = n - 1;
+                        if (region.ui.phase.input.slash_sel >= n) region.ui.phase.input.slash_sel = n - 1;
                         if (eff.at_nav_dir) {
-                            region.ui.slash_sel = (region.ui.slash_sel + 1) % n;
+                            region.ui.phase.input.slash_sel = (region.ui.phase.input.slash_sel + 1) % n;
                         } else {
-                            region.ui.slash_sel = if (region.ui.slash_sel == 0) n - 1 else region.ui.slash_sel - 1;
+                            region.ui.phase.input.slash_sel = if (region.ui.phase.input.slash_sel == 0) n - 1 else region.ui.phase.input.slash_sel - 1;
                         }
                     }
                     redraw(region, &editor, app);
@@ -1929,11 +1935,11 @@ fn readLineRaw(
                         continue;
                     }
                     const visible_n = @min(entries.len, complete.MODEL_MENU_MAX_ROWS);
-                    const idx = @min(region.ui.slash_sel, visible_n - 1);
+                    const idx = @min(region.ui.phase.input.slash_sel, visible_n - 1);
                     const line = try std.fmt.allocPrint(allocator, "/model use {s}", .{entries[idx].model_id});
                     defer allocator.free(line);
                     try editor.setLine(line);
-                    region.ui.slash_sel = 0;
+                    region.ui.phase.input.slash_sel = 0;
                     if (eff.action == .model_complete) {
                         redraw(region, &editor, app);
                         continue;
@@ -1953,7 +1959,7 @@ fn readLineRaw(
                         app.api_client.catalog.entries.items.len
                     else
                         reasoningOptionCount(app);
-                    region.ui.slash_sel = complete.menuMove(n, region.ui.slash_sel, eff.menu_step, complete.MODEL_MENU_MAX_ROWS);
+                    region.ui.phase.input.slash_sel = complete.menuMove(n, region.ui.phase.input.slash_sel, eff.menu_step, complete.MODEL_MENU_MAX_ROWS);
                     redraw(region, &editor, app);
                     continue;
                 },
@@ -1964,13 +1970,13 @@ fn readLineRaw(
                             redraw(region, &editor, app);
                             continue;
                         }
-                        const idx = @min(region.ui.slash_sel, keys.len - 1);
+                        const idx = @min(region.ui.phase.input.slash_sel, keys.len - 1);
                         app.selectApiKeyForModels(idx) catch |err| {
                             region.clear();
                             region.emitTerminalFmt("\x1b[31m/model key selection failed: {s}\x1b[0m\n", .{@errorName(err)});
                         };
                         app.models_picker_model_index = null;
-                        region.ui.slash_sel = 0;
+                        region.ui.phase.input.slash_sel = 0;
                         redraw(region, &editor, app);
                         continue;
                     }
@@ -1981,9 +1987,9 @@ fn readLineRaw(
                             redraw(region, &editor, app);
                             continue;
                         }
-                        const idx = @min(region.ui.slash_sel, entries.len - 1);
+                        const idx = @min(region.ui.phase.input.slash_sel, entries.len - 1);
                         app.models_picker_model_index = idx;
-                        region.ui.slash_sel = 0;
+                        region.ui.phase.input.slash_sel = 0;
                         redraw(region, &editor, app);
                         continue;
                     }
@@ -1996,12 +2002,12 @@ fn readLineRaw(
                     }
                     var efforts_buf: @import("../api/catalog.zig").ReasoningOptions = undefined;
                     const efforts = @import("../api/catalog.zig").reasoningOptions(entries[model_idx].reasoning_mask, &efforts_buf);
-                    const effort_idx = @min(region.ui.slash_sel, efforts.len - 1);
+                    const effort_idx = @min(region.ui.phase.input.slash_sel, efforts.len - 1);
                     try app.setReasoningEffort(efforts[effort_idx]);
                     const line = try std.fmt.allocPrint(allocator, "/model use {s}", .{entries[model_idx].model_id});
                     defer allocator.free(line);
                     try editor.setLine(line);
-                    region.ui.slash_sel = 0;
+                    region.ui.phase.input.slash_sel = 0;
                     app.models_picker_key_index = null;
                     app.models_picker_model_index = null;
                     region.setInput("", 0);
@@ -2017,11 +2023,11 @@ fn readLineRaw(
                     defer r.deinit(allocator);
                     const n = r.candidates.len;
                     if (n > 0) {
-                        if (region.ui.slash_sel >= n) region.ui.slash_sel = n - 1;
+                        if (region.ui.phase.input.slash_sel >= n) region.ui.phase.input.slash_sel = n - 1;
                         if (eff.at_nav_dir) {
-                            region.ui.slash_sel = (region.ui.slash_sel + 1) % n;
+                            region.ui.phase.input.slash_sel = (region.ui.phase.input.slash_sel + 1) % n;
                         } else {
-                            region.ui.slash_sel = if (region.ui.slash_sel == 0) n - 1 else region.ui.slash_sel - 1;
+                            region.ui.phase.input.slash_sel = if (region.ui.phase.input.slash_sel == 0) n - 1 else region.ui.phase.input.slash_sel - 1;
                         }
                     }
                     redraw(region, &editor, app);
@@ -2034,13 +2040,13 @@ fn readLineRaw(
                     };
                     defer r.deinit(allocator);
                     if (r.candidates.len > 0) {
-                        const idx = @min(region.ui.slash_sel, r.candidates.len - 1);
+                        const idx = @min(region.ui.phase.input.slash_sel, r.candidates.len - 1);
                         const cand = r.candidates[idx];
                         // 替换 [replace_start, cursor) 为候选(保留 @ 前缀与已输入目录)。
                         const old_len = editor.cursor - @min(r.replace_start, editor.cursor);
                         try applyCompletion(&editor, allocator, r.replace_start, old_len, cand);
                     }
-                    region.ui.slash_sel = 0;
+                    region.ui.phase.input.slash_sel = 0;
                     redraw(region, &editor, app);
                     continue;
                 },
@@ -2132,13 +2138,13 @@ fn readLineRaw(
         // 打字(char)→ 清提示。在 editor.handle 前后比对 yank_buf 长度判定"确有删除"。
         const yank_before = editor.yankLen();
         switch (key) {
-            .char => region.ui.paste_hint = false,
+            .char => region.ui.phase.input.paste_hint = false,
             else => {},
         }
         const action = try editor.handle(key);
         switch (key) {
             .ctrl_u, .ctrl_k, .ctrl_w => {
-                if (editor.yankLen() > yank_before) region.ui.paste_hint = true;
+                if (editor.yankLen() > yank_before) region.ui.phase.input.paste_hint = true;
             },
             else => {},
         }
@@ -4966,10 +4972,10 @@ fn externalEdit(allocator: std.mem.Allocator, current: []const u8) ![]u8 {
 }
 
 /// 杀所有 running 后台任务,返回杀掉的数量。
-/// 停止选中 agent(registry.kill)。region.ui.agents.sel 是 1-based agent index。
+/// 停止选中 agent(registry.kill)。region.ui.phase.input.interaction.agents.sel 是 1-based agent index。
 fn stopSelectedAgent(app: *app_mod.App, region: *render_region_mod.RenderRegion) !void {
     const reg = app.agentJobsPtr() orelse return;
-    const sel = region.ui.agents.sel;
+    const sel = region.ui.phase.input.interaction.agents.sel;
     if (sel == 0) return;
     const allocator = app.allocator;
     // The switcher lists `agentJobScope()`, so stopping by its index must use

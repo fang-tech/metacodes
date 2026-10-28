@@ -2,7 +2,7 @@
 
 > 来源:2026-06-05 session。用户连续指出 cc-zig TUI 的架构病根(Ctrl+O 是旁路非视图、状态流转无法测试、加 CC 功能靠散点硬接线),决策做**状态驱动架构重构**。本文是目标架构设计 + 分阶段迁移计划。
 > 关联设计文档:[UI_DECOUPLE_BACKEND_FRAMEWORK](UI_DECOUPLE_BACKEND_FRAMEWORK.md)、[CORE_REFERENCE](CORE_REFERENCE.md)。早期 TUI 设计稿(TUI_DESIGN、UI_LAYER_DESIGN、TUI_ALIGNMENT 等)已随过程文档清理移出仓库,见 git 历史。
-> 状态:设计稿(2026-06-05),供逐阶段实施依据。
+> 状态:设计稿(2026-06-05),供逐阶段实施依据;§8 阶段所有权(#330)已落地(2026-10-28),§1 字段树按现状更新。
 
 ## §0 病根(为何重构)
 
@@ -30,15 +30,13 @@ cc-zig UI 现状 = **命令式 + 散点重绘**:
 | **Renderer** | render_region.zig(瘦身) | 唯一碰 IO:持 mutex+机制态,applyEvent 锁内 dispatch+erase+draw 到 fd | **是(唯一)** |
 
 ### UiState 字段树(逻辑状态,机制态不进)
-- 几何:cols/rows(resize 改)
-- 决策面:phase(input/generating)、overlay(none/help/transcript)
-- editor:view/cursor(LineEditor 的**投影** borrow,LineEditor 本体不并入)
-- spinner:frame/verb/start_ms(elapsed=now-start,now 注入)
-- tools:current(定长)+ cards[]( MAX 6,定长拷贝防跨线程撕裂)
-- footer:mode/total_tokens/cost/bg_count/cron_count(快照,收口跨线程裸读)
-- panel:task_list_visible 等 toggle 位
-- transcript_top(Ctrl+O 滚动)、hint(瞬时提示)
-- **不进 UiState**:prev_rows/region_drawn/anchor(回顶支点,见 `tui/reflow.zig`)/mutex/line_buf/pending 快照——属 Renderer(是"上一帧物理痕迹",非逻辑状态)。
+现状(#330 之后;完整的归属表与规则见 §8):
+- **会话拥有**(顶层字段,跨阶段存活,每个都在 `UiState.session_owned` 写明原因):cols/rows(几何)、footer(usage/mode 快照,收口跨线程裸读)、panel(Ctrl+T 偏好)、agent_count(registry 镜像)。
+- **阶段拥有**:`phase: PhaseState = union(Phase){ idle, input: InputPhase, generating: GeneratingPhase }`。
+  - 两个交互阶段共有 `Interaction`:editor(LineEditor 的**投影** borrow,LineEditor 本体不并入)、help_open、ctrl_x_armed、agents(switcher)、picker_open。
+  - `InputPhase`:slash_catalog(借用本次读取的 arena)、slash_sel、paste_hint、press(双击窗口)、menu_dismissal。
+  - `GeneratingPhase`:spinner(frame/verb/start_ms,elapsed=now-start,now 注入)、tools(current 定长 + cards[] MAX 6,定长拷贝防跨线程撕裂)。
+- **不进 UiState**:prev_rows/region_drawn/anchor(回顶支点,见 `tui/reflow.zig`)/mutex/line_buf/pending 快照/gen_app/gen_queue——属 Renderer(是"上一帧物理痕迹"或绘制用的借用指针,非逻辑状态)。
 
 ### render 的大数据靠注入(纯函数)
 `RenderInputs{ state, now_ms, theme, use_unicode, agent_snaps[], tasks?, queue_preview[], transcript_lines[] }`——时间注入、大数据只读借用,不拷进 UiState。测试传空/mock 即可。
@@ -116,3 +114,65 @@ renderInput/GenFrame = 把现 renderFrameInner/drawGenRegion 的**纯计算行�
 **已达成用户三诉求**:① 真 Ctrl+O(视图态,可纯单测,非旁路)② 真测试(23 内存级 dispatch/render,不依赖真模型/key,Ctrl+O/? 现可纯单测)③ 可测+易对齐 CC(UiState/dispatch/render 硬边界不碰 IO;加 CC 功能=加 Event+字段+dispatch+render 四点闭环,闭合 union 漏分支编译报错)。
 
 **遗留(后续迭代)**:drawGenRegion 整体搬进 ui.renderGenFrame + 删 RenderRegion 双写字段(spinner_frame/verb/tool_cards 等)+ 文本事件流。这是把"双写过渡"收敛为"单一真相源"的纯重构,无功能变化,可独立安全推进。
+
+## §8 阶段是 widget 生命周期的唯一驱动(#330,2026-10-28)
+
+**问题**:共享 Renderer(#298 之后整个会话一个 RenderRegion)让每个 widget 状态都可能活过它被打开的那一期——回复里开着的 agent 列表吞掉下一次提示的输入、卡住的 generating 让输入框再也不画。#298 的修法是在每个边界重置一份清单(`resetPhaseUi`:每次读取开头、`enterGenerating` 里),不变式靠构造点打补丁维持:新加的阶段状态得记得登记进清单,忘了就是用户看得见又难查的泄漏。
+
+**现在**:状态放在哪里就归谁所有,边界的 teardown 是全量的。
+
+### 8.1 阶段与合法边
+
+`Phase = enum { idle, input, generating }`。一个阶段实例 = 一次输入读取(`input`)或一次回复/回复前的等待(`generating`);两次之间是 `idle`(固定区不在屏上,没有任何 widget)。
+
+```
+          beginInput                  enterGenerating
+  idle ─────────────▶ input   idle ─────────────────▶ generating
+   ▲   endInput(读取结束)│     ▲  leaveGenerating          │
+   └────────────────────┘     └──────────────────────────┘
+```
+
+合法边只有 idle↔input、idle↔generating(`ui_state.transitionAllowed`;idle→idle 是幂等收尾)。每个交互阶段都先回到 idle 再开下一个,所以 teardown 点就是这四处入口。Debug 构建在 `UiState.enter` 里对不经 idle 的边 `panic`——那意味着某个阶段没被关闭就开了下一个(ReleaseSafe 不检查,不拿用户会话冒险)。
+
+### 8.2 phase_change 事件与集中 teardown
+
+- 唯一写 `UiState.phase` 的地方是 `UiState.enter(entry)`,经 `ui.dispatch(.{ .phase_change = entry })` 调到;Renderer 的 `changePhaseLocked` 是它在 IO 侧的唯一调用点(`beginInput`/`endInput`/`enterGenerating`/`leaveGenerating`)。
+- `PhaseEntry = union(Phase)` 只带边界上合法知道的参数:`input{ slash_catalog }`、`generating{ verb, start_ms }`。旧阶段的任何东西都不在其中——payload 整体替换,旧阶段打开的东西没有一条路能活过边界。
+- 阶段外到达的事件:按键与 `editor_view` 在 idle 时无处可去(返回空 Effect);工具事件(`add/clear_tool_card`、`tool_progress`、`set/clear_current_tool`)与 `spinner_tick` 在生成期以外被丢弃且不要求重画——它们的拥有者已经结束,丢弃就是 teardown。
+- Renderer 不再另存 `generating: bool`、`input_view`/`gen_view` 等阶段态副本:生成期 ⟺ `ui.phase == .generating`(`inGeneration()`),输入框内容就是当前阶段 `Interaction.editor`。
+
+### 8.3 归属表
+
+| 状态 | 拥有者 | 进入阶段时 | 说明 |
+|------|--------|-----------|------|
+| cols / rows | 会话 | 保留 | 终端几何 |
+| footer | 会话 | 保留 | usage/mode 快照 |
+| panel.task_list_visible | 会话 | 保留 | Ctrl+T 偏好,两期共用 |
+| agent_count | 会话 | 保留 | registry 镜像,render 回写 |
+| Interaction.editor | input / generating | 清空 | 借用该阶段 LineEditor 的缓冲(输入期 readLineRaw、生成期 watcher),阶段结束缓冲即释放 |
+| Interaction.help_open | input / generating | 关 | `?` 帮助 |
+| Interaction.ctrl_x_armed | input / generating | 清 | Ctrl+X 前缀 |
+| Interaction.agents | input / generating | closed | switcher list/viewing、sel、viewing_id、视口 |
+| Interaction.picker_open | input / generating | 关 | 唯一跨边界的 widget:**只**经 `app.pending_overlay = .model_picker_kept` 显式交接(#220)——`leaveGenerationRegion`、`endInputRegion` 在阶段结束前记下,下一阶段 `picker_host.keep` 兑现 |
+| InputPhase.slash_catalog | input | entry 参数 | 借用本次读取的 arena;读取结束随 payload 消失(以前靠 defer 里手动改回 `.builtin`) |
+| InputPhase.slash_sel | input | 0 | `/`、`/model`、`/models`、`@` 菜单选中项 |
+| InputPhase.paste_hint | input | 关 | `Ctrl+Y to paste deleted text` |
+| InputPhase.press | input | 未武装 | Ctrl+C/Ctrl+D/Esc 双击窗口 |
+| InputPhase.menu_dismissal | input | 无 | Esc 关掉的建议菜单 |
+| GeneratingPhase.spinner | generating | entry 参数 | verb/start_ms 由 enterGenerating 给,frame 从 0 |
+| GeneratingPhase.tools | generating | 空 | 当前工具 + 进度卡 |
+
+删掉的死字段:`UiState.hint`、`UiState.prompt`(声明后从未接线)。
+
+### 8.4 编译期与运行期的检查
+
+- **编译期**:`UiState` 的每个顶层字段必须出现在 `UiState.session_owned`(附原因),否则 `@compileError`——阶段内的状态应该放进阶段 payload,而不是悄悄加成会话状态。payload(`Interaction`/`InputPhase`/`GeneratingPhase`)的每个字段必须有默认值,进入阶段才能整份重建。
+- **运行期**:Debug 的非法边 panic(§8.1);直接访问非活跃 payload(`ui.phase.input.…` 在生成期)由 Zig 的 union 安全检查在 Debug/ReleaseSafe 里当场失败。常规代码走返回 optional 的访问器(`interaction()`、`inputPhase()`、`generatingPhase()`)。
+
+### 8.5 加一个新 widget
+
+放进它所属阶段的 payload(两期都有就放 `Interaction`),给默认值,完。不用登记任何 reset 列表;它会在阶段结束时随 payload 消失。真要跨阶段存活的,要么是会话状态(加进 `session_owned` 写清理由),要么像 picker 一样走显式交接——不能靠"没人重置它"活下来。
+
+### 8.6 验证
+
+#298 的回归由 parity 测试守住:`render_region.zig` 的 "#298 parity" 两组用例重放 回复→读取、读取→回复、读取→读取 三种边界(含"agent 列表不吞下一次提示的输入"),`tests/component/ui_state_test.zig` 覆盖 teardown 全量性、会话状态保留、合法边、阶段外事件丢弃;TTY 套件的 #220 picker 用例(`test_model_picker.py`)守显式交接。
