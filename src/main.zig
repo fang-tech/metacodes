@@ -566,6 +566,16 @@ pub fn main(init: std.process.Init) !void {
     // included — can resolve it.
     @import("util/toolchain.zig").setLayout(if (build_options.release_layout) .release else .development);
 
+    // `metacodes --help` (or `-h`) answers before the rest of startup. The
+    // state-dir option, subcommand dispatch and the full Config change nothing
+    // about that answer but map code and data the help never uses, and the
+    // idle red line is measured on this path (doc/PERF_MEMORY_PRINCIPLES.md
+    // §2). `--help` in any later position is still parseArgsInto's.
+    if (helpRequestedFirst(init)) {
+        printHelp();
+        std.process.exit(0);
+    }
+
     // `--state-dir` as argv[1] is a global option: it precedes, and applies
     // to, every subcommand below (login, doctor, kg, ...).
     const leading_state_dir = leadingStateDir(init, allocator);
@@ -1418,6 +1428,16 @@ fn leadingStateDir(init: std.process.Init, allocator: std.mem.Allocator) Leading
     const value = args.next() orelse stateDirUsage();
     if (value.len == 0) stateDirUsage();
     return .{ .consumed = 2, .value = allocator.dupe(u8, value) catch stateDirUsage() };
+}
+
+/// Whether argv[1] is `--help` or `-h`. parseArgsInto stops at that argument
+/// too, so every later argument was already ignored.
+fn helpRequestedFirst(init: std.process.Init) bool {
+    var args = argsIter(init);
+    defer args.deinit();
+    _ = args.next();
+    const first = args.next() orelse return false;
+    return std.mem.eql(u8, first, "--help") or std.mem.eql(u8, first, "-h");
 }
 
 fn stateDirUsage() noreturn {
