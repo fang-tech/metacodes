@@ -397,7 +397,7 @@ pub const OpenAIClient = struct {
         // (see client_mod.Client.doRequest).
         const auth = self.credential.header(self.allocator, self.auth_scheme) catch |err| {
             log.errId("openai", rid, "auth header materialization failed: {s}", .{@errorName(err)});
-            return error.RequestFailed;
+            return credential_mod.requestError(err);
         };
         defer secureFree(self.allocator, auth.value);
         req_ptr.* = self.http_client.request(.POST, uri, .{

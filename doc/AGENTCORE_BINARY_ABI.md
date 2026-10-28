@@ -1148,6 +1148,14 @@ destroy and restore are not needed, also not while a Run is going.
   Every refusal leaves the previous credential in effect and never ends,
   aborts or poisons a Run. A diagnostic names the rule, never the bytes. There
   is no `BUSY`.
+
+  Session create and restore apply the same rule to
+  `SessionHostConfigV1.api_key`: empty or a refused byte is
+  `INVALID_ARGUMENT`, longer than `MAX_CREDENTIAL_BYTES_V1` is
+  `RESOURCE_LIMIT`, no handle is published, and the diagnostic names the rule.
+  Earlier, create and restore took any UTF-8, and a credential with CR LF
+  ended the process at the first request, in the HTTP client's header
+  assertion.
 - **Effective point.** A provider request reads the credential when it is
   sent: once it holds its connection slot, immediately before it opens the
   connection. Every request sent after the call returns `OK` carries the new

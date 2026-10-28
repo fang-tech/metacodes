@@ -13151,3 +13151,89 @@ test "L2 Revision 25 concurrent updates, submit_input and abort during Runs neit
     try expectBearer(server, 0, CREDENTIAL_A);
     try std.testing.expectEqual(@as(u32, 0), probe.mismatches.load(.acquire));
 }
+
+test "L2 Revision 25 create and restore refuse a credential a header cannot carry, and diagnostics never name it (#336)" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try rootPath(&tmp, &root_buf);
+    const bodies = [_][]const u8{ FINAL_SSE, FINAL_SSE };
+    var server = try harness.MockServer.startCassette(&bodies, 0);
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+    var probe = try credentialProbe();
+    var fixture: CredentialFixture = undefined;
+    try fixture.init(root, url, &probe, false);
+    defer fixture.deinit();
+    var result: wire.RunResultV1 = undefined;
+    try std.testing.expectEqual(wire.STATUS_OK, fixture.run(1, "first", &result));
+
+    const too_long = try a.alloc(u8, @as(usize, @intCast(wire.MAX_CREDENTIAL_BYTES_V1)) + 1);
+    defer a.free(too_long);
+    @memset(too_long, 'k');
+    const Refusal = struct { key: []const u8, status: u32 };
+    const refusals = [_]Refusal{
+        .{ .key = "credential-a-336\r\nx-injected: 1", .status = wire.STATUS_INVALID_ARGUMENT },
+        .{ .key = "credential a 336", .status = wire.STATUS_INVALID_ARGUMENT },
+        .{ .key = "credential-\xc3\xa9-336", .status = wire.STATUS_INVALID_ARGUMENT },
+        .{ .key = too_long, .status = wire.STATUS_RESOURCE_LIMIT },
+    };
+    const valid_key = fixture.host.api_key;
+    var create_config = sessionCreateConfig(&fixture.host, "credential-model");
+    for (refusals) |refusal| {
+        fixture.host.api_key = sdk.bytesView(refusal.key);
+        var session: ?*wire.SessionHandle = null;
+        try std.testing.expectEqual(refusal.status, fixture.api.session().create()(fixture.runtime, &create_config, &fixture.callbacks, &session, &fixture.diagnostic));
+        try std.testing.expect(session == null);
+        const message = try sdk.borrowedBytes(.{ .ptr = fixture.diagnostic.ptr, .len = fixture.diagnostic.len });
+        try std.testing.expect(message.len != 0);
+        try std.testing.expect(std.mem.indexOf(u8, message, refusal.key[0..12]) == null);
+        fixture.api.bufferRelease()(&fixture.diagnostic);
+    }
+    fixture.host.api_key = valid_key;
+
+    var checkpoint = PublicCheckpointBuffer{};
+    defer checkpoint.deinit();
+    var limits = publicCheckpointLimits();
+    var sink = checkpoint.sink();
+    var export_config = std.mem.zeroes(wire.CheckpointExportConfigV1);
+    export_config.struct_size = @sizeOf(wire.CheckpointExportConfigV1);
+    export_config.limits = &limits;
+    export_config.sink = &sink;
+    var export_result = std.mem.zeroes(wire.CheckpointExportResultV1);
+    try std.testing.expectEqual(wire.STATUS_OK, fixture.api.sessionControl().exportCheckpoint()(fixture.session, &export_config, &export_result, &fixture.diagnostic));
+    try std.testing.expectEqual(wire.STATUS_OK, fixture.api.session().destroy()(fixture.session, &fixture.diagnostic));
+    fixture.session = null;
+
+    var restore_config = std.mem.zeroes(wire.SessionRestoreConfigV1);
+    restore_config.struct_size = @sizeOf(wire.SessionRestoreConfigV1);
+    restore_config.host = &fixture.host;
+    restore_config.limits = &limits;
+    var restore_report = std.mem.zeroes(wire.OwnedBytesV1);
+    for (refusals) |refusal| {
+        fixture.host.api_key = sdk.bytesView(refusal.key);
+        var source = checkpoint.source();
+        restore_config.source = &source;
+        var session: ?*wire.SessionHandle = null;
+        try std.testing.expectEqual(refusal.status, fixture.api.sessionControl().restore()(fixture.runtime, &restore_config, &fixture.callbacks, &session, &restore_report, &fixture.diagnostic));
+        try std.testing.expect(session == null);
+        fixture.api.bufferRelease()(&restore_report);
+        const message = try sdk.borrowedBytes(.{ .ptr = fixture.diagnostic.ptr, .len = fixture.diagnostic.len });
+        try std.testing.expect(std.mem.indexOf(u8, message, refusal.key[0..12]) == null);
+        fixture.api.bufferRelease()(&fixture.diagnostic);
+    }
+
+    // A valid key restores as before and is the one the next request carries.
+    fixture.host.api_key = sdk.bytesView(CREDENTIAL_B);
+    var source = checkpoint.source();
+    restore_config.source = &source;
+    try std.testing.expectEqual(wire.STATUS_OK, fixture.api.sessionControl().restore()(fixture.runtime, &restore_config, &fixture.callbacks, &fixture.session, &restore_report, &fixture.diagnostic));
+    fixture.api.bufferRelease()(&restore_report);
+    probe.session = fixture.session;
+    try std.testing.expectEqual(wire.STATUS_OK, fixture.run(2, "after restore", &result));
+    try std.testing.expectEqual(@as(usize, 2), server.requestCount());
+    try expectBearer(server, 0, CREDENTIAL_A);
+    try expectBearer(server, 1, CREDENTIAL_B);
+}

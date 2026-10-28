@@ -348,7 +348,7 @@ pub const GeminiClient = struct {
         // and erased once the request is set up.
         const auth = self.credential.header(self.allocator, .{ .api_key_header = "x-goog-api-key" }) catch |err| {
             log.errId("gemini", rid, "auth header materialization failed: {s}", .{@errorName(err)});
-            return error.RequestFailed;
+            return credential_mod.requestError(err);
         };
         defer secure.free(self.allocator, auth.value);
         req_ptr.* = self.http_client.request(.POST, uri, .{
