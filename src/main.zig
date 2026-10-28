@@ -36,7 +36,17 @@ pub const VERSION = @import("version.zig").semver;
 /// and is logged where it is handled; only the unconditional print goes.
 /// A test binary's root is the test runner, so the evidence is the TTY case
 /// `test_refused_endpoint_retries_without_system_error_noise`.
-pub const std_options: std.Options = .{ .unexpected_error_tracing = false };
+///
+/// `allow_stack_tracing` defaults to "built with debug info", and on links in
+/// about 100 KB of std.debug unwinding code. The ReleaseSmall executable never
+/// traces. A stripped build already has it off, and is byte-identical with or
+/// without this line. With `-Drelease-symbols` the executable links with DWARF
+/// for the split symbol file, and this keeps its code within a few bytes of
+/// the stripped build's (doc/RELEASE_RUNNER.md, "Debug symbols").
+pub const std_options: std.Options = .{
+    .unexpected_error_tracing = false,
+    .allow_stack_tracing = !builtin.strip_debug_info and builtin.mode != .ReleaseSmall,
+};
 
 // Public re-exports for tests and future consumers.
 pub const api_stream = @import("api/stream.zig");

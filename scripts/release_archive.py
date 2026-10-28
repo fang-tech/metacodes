@@ -9,6 +9,11 @@ manifest identity:
   agentcore  `metask-agentcore-<version>-<target-id>` from the SDK bundle manifest
   cli        `metacodes-<version>-<target-id>`        from the CLI release manifest
              (release/manifest.schema.json)
+  symbols    `metacodes-<version>-<target-id>-debug`  a Linux CLI unit's debug
+             symbols (`--debug-file`, from `-Drelease-symbols`), held as
+             `bin/metacodes.debug`. The unit's `bin/metacodes` must name it:
+             the same GNU build ID, and a `.gnu_debuglink` whose file name
+             and CRC-32 match. The symbols are never part of the unit itself.
 
 Channels gate what may be archived (#47 Q1/Q3): a pre-release version
 (`X.Y.Z-<pre>+<commit12>`) archives from any commit; a stable version requires a
@@ -30,12 +35,14 @@ import json
 import os
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import tarfile
 import tempfile
 import unittest
 import zipfile
+import zlib
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 
@@ -234,20 +241,93 @@ def write_archive(bundle_root: Path, output_dir: Path, kind: str, git_facts: Git
         raise ValueError("archive output directory must not be inside the bundle root")
     bundle = load_bundle(bundle_root, kind)
     enforce_channel(bundle, git_facts)
-    suffix = ".zip" if bundle.target_os == "windows" else ".tar.gz"
+    members = [(bundle_root.joinpath(*PurePosixPath(relative).parts), relative) for relative in bundle.archive_paths]
+    return write_immutable(output_dir, bundle.coordinate, members, as_zip=bundle.target_os == "windows")
+
+
+# ── Debug symbols (`--kind symbols`) ─────────────────────────────────────────
+
+
+def elf_sections(path: Path) -> dict[str, bytes]:
+    """Section name -> contents of a 64-bit little-endian ELF file (both Linux
+    release targets are)."""
+    data = path.read_bytes()
+    if data[:4] != b"\x7fELF" or data[4] != 2 or data[5] != 1:
+        raise ValueError(f"not a 64-bit little-endian ELF file: {path.name}")
+    shoff, = struct.unpack_from("<Q", data, 0x28)
+    shentsize, shnum, shstrndx = struct.unpack_from("<HHH", data, 0x3A)
+    headers = [struct.unpack_from("<IIQQQQ", data, shoff + i * shentsize) for i in range(shnum)]
+    names = headers[shstrndx]
+    sections = {}
+    for name_offset, sh_type, _, _, offset, size in headers:
+        start = names[4] + name_offset
+        name = data[start:data.index(b"\0", start)].decode("ascii", "replace")
+        sections[name] = b"" if sh_type == 8 else data[offset:offset + size]  # SHT_NOBITS
+    return sections
+
+
+def gnu_build_id(sections: dict[str, bytes], label: str) -> str:
+    note = sections.get(".note.gnu.build-id")
+    if note is None or len(note) < 16:
+        raise ValueError(f"{label} carries no GNU build ID")
+    namesz, descsz, note_type = struct.unpack_from("<III", note, 0)
+    name_end = 12 + ((namesz + 3) & ~3)
+    if note_type != 3 or note[12:12 + namesz] != b"GNU\0":
+        raise ValueError(f"{label} carries no GNU build ID")
+    return note[name_end:name_end + descsz].hex()
+
+
+def write_symbols_archive(bundle_root: Path, debug_file: Path, output_dir: Path, git_facts: GitFacts | None) -> tuple[Path, Path]:
+    """`metacodes-<version>-<target-id>-debug.tar.gz` holding the unit's
+    `bin/metacodes.debug`, refused unless the unit's executable names that
+    exact file (build ID, and .gnu_debuglink name and CRC-32)."""
+    bundle_root = bundle_root.resolve()
+    output_dir = output_dir.resolve()
+    if output_dir == bundle_root or bundle_root in output_dir.parents:
+        raise ValueError("archive output directory must not be inside the bundle root")
+    bundle = load_bundle(bundle_root, "cli")
+    if bundle.target_os != "linux":
+        raise ValueError(f"debug symbols are archived for Linux units only, not {bundle.target_os}")
+    enforce_channel(bundle, git_facts)
+    executable = bundle_root / "bin" / "metacodes"
+    exe_sections = elf_sections(executable)
+    debug_sections = elf_sections(debug_file)
+    if any(name.startswith(".debug_") for name in exe_sections):
+        raise ValueError("bin/metacodes still carries DWARF; the unit must ship the stripped executable")
+    if ".debug_info" not in debug_sections:
+        raise ValueError(f"{debug_file.name} carries no .debug_info")
+    exe_id = gnu_build_id(exe_sections, "bin/metacodes")
+    debug_id = gnu_build_id(debug_sections, debug_file.name)
+    if exe_id != debug_id:
+        raise ValueError(f"build ID mismatch: bin/metacodes {exe_id}, {debug_file.name} {debug_id}")
+    link = exe_sections.get(".gnu_debuglink")
+    if link is None:
+        raise ValueError("bin/metacodes has no .gnu_debuglink")
+    link_name = link[:link.index(b"\0")].decode("ascii", "replace")
+    link_crc, = struct.unpack_from("<I", link, len(link) - 4)
+    if link_name != "metacodes.debug":
+        raise ValueError(f"bin/metacodes links to {link_name!r}, not metacodes.debug")
+    actual_crc = zlib.crc32(debug_file.read_bytes()) & 0xFFFFFFFF
+    if link_crc != actual_crc:
+        raise ValueError(f"{debug_file.name} CRC-32 {actual_crc:08x} is not the {link_crc:08x} bin/metacodes links to")
+    return write_immutable(output_dir, f"{bundle.coordinate}-debug", [(debug_file, "bin/metacodes.debug")], as_zip=False)
+
+
+def write_immutable(output_dir: Path, coordinate: str, members: list[tuple[Path, str]], as_zip: bool) -> tuple[Path, Path]:
+    """`<coordinate>.zip|.tar.gz` holding each (file, path) under
+    `<coordinate>/`, plus its `.sha256` sidecar; never replaced once written."""
     output_dir.mkdir(parents=True, exist_ok=True)
-    archive_path = output_dir / f"{bundle.coordinate}{suffix}"
+    archive_path = output_dir / f"{coordinate}{'.zip' if as_zip else '.tar.gz'}"
     checksum_path = output_dir / f"{archive_path.name}.sha256"
 
-    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{bundle.coordinate}.", suffix=".tmp", dir=output_dir)
+    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{coordinate}.", suffix=".tmp", dir=output_dir)
     os.close(descriptor)
     temporary = Path(temporary_name)
     try:
-        if bundle.target_os == "windows":
+        if as_zip:
             with zipfile.ZipFile(temporary, "w", zipfile.ZIP_DEFLATED, compresslevel=ZIP_COMPRESSION_LEVEL) as archive:
-                for relative in bundle.archive_paths:
-                    path = bundle_root.joinpath(*PurePosixPath(relative).parts)
-                    write_zip_file(archive, path, f"{bundle.coordinate}/{relative}")
+                for path, relative in members:
+                    write_zip_file(archive, path, f"{coordinate}/{relative}")
         else:
             # A gzip header carries a file name and an mtime; `tarfile`'s "w:gz"
             # would write the temporary's name and the current time, and two
@@ -255,9 +335,8 @@ def write_archive(bundle_root: Path, output_dir: Path, kind: str, git_facts: Git
             with temporary.open("wb") as raw, gzip.GzipFile(
                 filename="", mode="wb", fileobj=raw, mtime=0, compresslevel=ZIP_COMPRESSION_LEVEL
             ) as compressed, tarfile.open(fileobj=compressed, mode="w", format=tarfile.PAX_FORMAT) as archive:
-                for relative in bundle.archive_paths:
-                    path = bundle_root.joinpath(*PurePosixPath(relative).parts)
-                    archive.add(path, arcname=f"{bundle.coordinate}/{relative}", recursive=False, filter=sanitized_tar_info)
+                for path, relative in members:
+                    archive.add(path, arcname=f"{coordinate}/{relative}", recursive=False, filter=sanitized_tar_info)
 
         digest = sha256_file(temporary)
         if archive_path.exists() or checksum_path.exists():
@@ -273,7 +352,7 @@ def write_archive(bundle_root: Path, output_dir: Path, kind: str, git_facts: Git
                 and checksum_path.read_text(encoding="ascii") == expected_sidecar
             ):
                 return archive_path, checksum_path
-            raise FileExistsError(f"archive coordinate already exists with different bytes: {bundle.coordinate}")
+            raise FileExistsError(f"archive coordinate already exists with different bytes: {coordinate}")
         archive_created = False
         checksum_created = False
         try:
@@ -317,11 +396,12 @@ def _sdk_fixture(root: Path, target_os: str, target_id: str, version: str = "0.1
     return bundle
 
 
-def _cli_fixture(root: Path, target_os: str, target_id: str, version: str, channel: str, dirty: bool = False) -> Path:
+def _cli_fixture(root: Path, target_os: str, target_id: str, version: str, channel: str, dirty: bool = False,
+                 executable_bytes: bytes = b"metacodes") -> Path:
     bundle = root / "cli-bundle"
     executable = bundle / "bin" / ("metacodes.exe" if target_os == "windows" else "metacodes")
     executable.parent.mkdir(parents=True)
-    executable.write_bytes(b"metacodes")
+    executable.write_bytes(executable_bytes)
     manifest = {
         "schema_version": 2,
         "vendor": "metask",
@@ -335,7 +415,102 @@ def _cli_fixture(root: Path, target_os: str, target_id: str, version: str, chann
     return bundle
 
 
+def _elf(sections: dict[str, bytes]) -> bytes:
+    """A 64-bit little-endian ELF holding exactly `sections` (plus the null
+    section and .shstrtab), enough for elf_sections()."""
+    names = list(sections) + [".shstrtab"]
+    shstrtab = b"\0" + b"".join(name.encode() + b"\0" for name in names)
+    offsets, cursor, body = [], 64, b""
+    for name in names:
+        content = shstrtab if name == ".shstrtab" else sections[name]
+        offsets.append((cursor + len(body), len(content)))
+        body += content
+    shoff = 64 + len(body)
+    headers = struct.pack("<IIQQQQIIQQ", 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+    name_offset = 1
+    for name, (offset, size) in zip(names, offsets):
+        headers += struct.pack("<IIQQQQIIQQ", name_offset, 3 if name == ".shstrtab" else 1, 0, 0, offset, size, 0, 0, 1, 0)
+        name_offset += len(name) + 1
+    ident = b"\x7fELF" + bytes([2, 1, 1]) + bytes(9)
+    header = ident + struct.pack("<HHIQQQIHHHHHH", 2, 62, 1, 0, 0, shoff, 0, 64, 0, 0, 64, len(names) + 1, len(names))
+    return header + body + headers
+
+
+def _build_id_note(build_id: bytes) -> bytes:
+    return struct.pack("<III", 4, len(build_id), 3) + b"GNU\0" + build_id
+
+
+def _debuglink(name: str, crc: int) -> bytes:
+    encoded = name.encode() + b"\0"
+    encoded += b"\0" * (-len(encoded) % 4)
+    return encoded + struct.pack("<I", crc)
+
+
+def _symbols_fixture(root: Path, target_os: str = "linux", channel: str = "pre", version: str = "0.2.0-dev+0123456789ab",
+                     exe_id: bytes = b"\x11" * 20, debug_id: bytes = b"\x11" * 20, link_name: str = "metacodes.debug",
+                     exe_dwarf: bool = False) -> tuple[Path, Path]:
+    debug = _elf({".note.gnu.build-id": _build_id_note(debug_id), ".debug_info": b"dwarf"})
+    exe_sections = {".note.gnu.build-id": _build_id_note(exe_id), ".gnu_debuglink": _debuglink(link_name, zlib.crc32(debug))}
+    if exe_dwarf:
+        exe_sections[".debug_info"] = b"dwarf"
+    target_id = "x86_64-linux-gnu" if target_os == "linux" else "aarch64-macos"
+    bundle = _cli_fixture(root, target_os, target_id, version, channel, executable_bytes=_elf(exe_sections))
+    debug_file = root / "split" / "metacodes.debug"
+    debug_file.parent.mkdir(parents=True)
+    debug_file.write_bytes(debug)
+    return bundle, debug_file
+
+
 class ArchiveTests(unittest.TestCase):
+    def test_symbols_archive_holds_the_linked_debug_file_reproducibly(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            bundle, debug_file = _symbols_fixture(root)
+            first, checksum = write_symbols_archive(bundle, debug_file, root / "one", None)
+            second, _ = write_symbols_archive(bundle, debug_file, root / "two", None)
+            self.assertEqual(first.name, "metacodes-0.2.0-dev+0123456789ab-x86_64-linux-gnu-debug.tar.gz")
+            self.assertEqual(first.read_bytes(), second.read_bytes())
+            self.assertEqual(checksum.read_text(encoding="ascii"), f"{sha256_file(first)}  {first.name}\n")
+            with tarfile.open(first, "r:gz") as opened:
+                self.assertEqual(opened.getnames(), ["metacodes-0.2.0-dev+0123456789ab-x86_64-linux-gnu-debug/bin/metacodes.debug"])
+                member = opened.getmembers()[0]
+                self.assertEqual((member.uid, member.gid, member.uname, member.gname, member.mtime), (0, 0, "", "", 0))
+                self.assertEqual(opened.extractfile(member).read(), debug_file.read_bytes())
+            # The CLI archive of the same unit is untouched by the symbols.
+            cli, _ = write_archive(bundle, root / "one", "cli", None)
+            with tarfile.open(cli, "r:gz") as opened:
+                self.assertFalse(any(name.endswith(".debug") for name in opened.getnames()))
+
+    def test_symbols_archive_refuses_a_debug_file_the_executable_does_not_name(self) -> None:
+        cases = (
+            ({"debug_id": b"\x22" * 20}, "build ID mismatch"),
+            ({"link_name": "other.debug"}, "links to 'other.debug'"),
+            ({"exe_dwarf": True}, "still carries DWARF"),
+            ({"target_os": "macos"}, "Linux units only"),
+        )
+        for overrides, message in cases:
+            with self.subTest(**{key: str(value) for key, value in overrides.items()}), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                bundle, debug_file = _symbols_fixture(root, **overrides)
+                with self.assertRaisesRegex(ValueError, re.escape(message)):
+                    write_symbols_archive(bundle, debug_file, root / "out", None)
+                self.assertFalse((root / "out").exists() and any((root / "out").iterdir()))
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            bundle, debug_file = _symbols_fixture(root)
+            debug_file.write_bytes(debug_file.read_bytes() + b"\0")  # not the file the link names
+            with self.assertRaisesRegex(ValueError, "CRC-32"):
+                write_symbols_archive(bundle, debug_file, root / "out", None)
+
+    def test_stable_symbols_follow_the_cli_channel_gate(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            bundle, debug_file = _symbols_fixture(root, channel="stable", version="0.2.0")
+            with self.assertRaisesRegex(ValueError, "tagged 0.2.0"):
+                write_symbols_archive(bundle, debug_file, root / "out", GitFacts(head_tag=None))
+            archive, _ = write_symbols_archive(bundle, debug_file, root / "out", GitFacts(head_tag="0.2.0"))
+            self.assertEqual(archive.name, "metacodes-0.2.0-x86_64-linux-gnu-debug.tar.gz")
+
     def test_sdk_windows_zip_has_coordinate_root_and_refuses_overwrite(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -418,7 +593,8 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("bundle_root", nargs="?", type=Path)
     parser.add_argument("output_dir", nargs="?", type=Path)
-    parser.add_argument("--kind", choices=KINDS, default="cli")
+    parser.add_argument("--kind", choices=KINDS + ("symbols",), default="cli")
+    parser.add_argument("--debug-file", type=Path, help="--kind symbols: the unit's split symbol file (metacodes.debug)")
     parser.add_argument("--repo-root", type=Path, default=Path(__file__).resolve().parents[1], help="repository the channel gate asks git about")
     parser.add_argument("--self-test", action="store_true")
     args = parser.parse_args()
@@ -427,10 +603,15 @@ def main() -> int:
         return 0 if unittest.TextTestRunner(verbosity=2).run(suite).wasSuccessful() else 1
     if args.bundle_root is None or args.output_dir is None:
         parser.error("bundle_root and output_dir are required")
+    if (args.kind == "symbols") != (args.debug_file is not None):
+        parser.error("--debug-file goes with --kind symbols, and only with it")
     try:
-        bundle = load_bundle(args.bundle_root.resolve(), args.kind)
+        bundle = load_bundle(args.bundle_root.resolve(), "cli" if args.kind == "symbols" else args.kind)
         git_facts = collect_git_facts(args.repo_root, (bundle.version,)) if bundle.channel == "stable" else None
-        archive, checksum = write_archive(args.bundle_root.resolve(), args.output_dir.resolve(), args.kind, git_facts)
+        if args.kind == "symbols":
+            archive, checksum = write_symbols_archive(args.bundle_root.resolve(), args.debug_file.resolve(), args.output_dir.resolve(), git_facts)
+        else:
+            archive, checksum = write_archive(args.bundle_root.resolve(), args.output_dir.resolve(), args.kind, git_facts)
     except (FileExistsError, OSError, ValueError) as error:
         print(f"release archive: {error}", file=sys.stderr)
         return 1

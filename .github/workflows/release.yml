@@ -74,6 +74,12 @@ jobs:
             zig_target: aarch64-macos
             cli_target: aarch64-macos.13.0
     runs-on: ${{ matrix.runner }}
+    env:
+      # A Linux unit's executable ships stripped, and its debug symbols ship
+      # beside the unit as metacodes-<version>-<target-id>-debug.tar.gz
+      # (doc/RELEASE_RUNNER.md, "Debug symbols"). Every step that builds or
+      # archives the unit passes the same flags.
+      RELEASE_SYMBOLS: ${{ matrix.os == 'Linux' && '-Drelease-symbols=true' || '' }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -119,7 +125,7 @@ jobs:
       - name: Full suite in release configuration
         run: zig build test -Doptimize=ReleaseSafe --test-timeout 5m -Dlean-kernels=on
       - name: Stage, manifest and verify the release unit
-        run: zig build release:verify -Drelease-layout=true -Doptimize=ReleaseSafe --prefix "$RUNNER_TEMP/release" $KERNEL_PINS -Dtarget=${{ matrix.cli_target }}
+        run: zig build release:verify -Drelease-layout=true -Doptimize=ReleaseSafe --prefix "$RUNNER_TEMP/release" $KERNEL_PINS -Dtarget=${{ matrix.cli_target }} $RELEASE_SYMBOLS
       # The executable needs no CPU feature, glibc or macOS newer than its
       # cli_target names (see the matrix); it fails here, before it is archived.
       - name: The executable needs no more than its target
@@ -132,20 +138,24 @@ jobs:
       - name: AgentCore gate for the native target
         run: zig build agentcore:gate -Dtarget=${{ matrix.zig_target }} -Doptimize=ReleaseSafe --test-timeout 5m
       - name: Archive (CLI unit)
-        run: zig build release:archive -Drelease-layout=true -Doptimize=ReleaseSafe --prefix "$RUNNER_TEMP/release" $KERNEL_PINS -Dtarget=${{ matrix.cli_target }} -Drelease-archive-dir="$RUNNER_TEMP/dist"
+        run: zig build release:archive -Drelease-layout=true -Doptimize=ReleaseSafe --prefix "$RUNNER_TEMP/release" $KERNEL_PINS -Dtarget=${{ matrix.cli_target }} $RELEASE_SYMBOLS -Drelease-archive-dir="$RUNNER_TEMP/dist"
       # What a user does with the archive: scripts/install.sh, then doctor.
       - name: The archive installs
         shell: bash
         run: |
           set -euo pipefail
-          sh scripts/install.sh --no-link --prefix "$RUNNER_TEMP/installed" "$RUNNER_TEMP"/dist/metacodes-*.tar.gz
+          sh scripts/install.sh --no-link --prefix "$RUNNER_TEMP/installed" "$RUNNER_TEMP"/dist/metacodes-*-${{ matrix.zig_target }}.tar.gz
           "$RUNNER_TEMP/installed/bin/metacodes" doctor --strict
       - name: Archive (AgentCore SDK)
         run: zig build agentcore:archive -Dtarget=${{ matrix.zig_target }} -Doptimize=ReleaseSafe -Dagentcore-archive-dir="$RUNNER_TEMP/dist"
+      # The unit's archive and, on Linux, its symbols archive.
       - name: Archives are reproducible
+        shell: bash
         run: |
-          zig build release:archive -Drelease-layout=true -Doptimize=ReleaseSafe --prefix "$RUNNER_TEMP/release" $KERNEL_PINS -Dtarget=${{ matrix.cli_target }} -Drelease-archive-dir="$RUNNER_TEMP/dist-again"
-          cmp "$RUNNER_TEMP"/dist/metacodes-*.tar.gz "$RUNNER_TEMP"/dist-again/metacodes-*.tar.gz
+          set -euo pipefail
+          zig build release:archive -Drelease-layout=true -Doptimize=ReleaseSafe --prefix "$RUNNER_TEMP/release" $KERNEL_PINS -Dtarget=${{ matrix.cli_target }} $RELEASE_SYMBOLS -Drelease-archive-dir="$RUNNER_TEMP/dist-again"
+          for archive in "$RUNNER_TEMP"/dist/metacodes-*.tar.gz; do cmp "$archive" "$RUNNER_TEMP/dist-again/$(basename "$archive")"; echo "reproducible: $(basename "$archive")"; done
+          if [ -n "$RELEASE_SYMBOLS" ]; then ls "$RUNNER_TEMP"/dist/metacodes-*-${{ matrix.zig_target }}-debug.tar.gz; fi
       # aarch64-linux has a vendored musl ripgrep since #86 and ci.yml proves
       # the cross-staged assets. A release unit for it also needs both Lean
       # kernels, which only a native aarch64 runner can build: adding it is a
