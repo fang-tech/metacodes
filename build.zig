@@ -2726,6 +2726,19 @@ pub fn build(b: *std.Build) void {
                 product_test_step.dependOn(&daemon_e2e.step);
             }
         }
+        // The capability exchange (doc/WIRE_PROTOCOL.md §2) end to end: the
+        // installed `serve` against the same loopback mock provider, with the
+        // script as the second-process frontend that declares what it renders
+        // and checks what it is then asked. Python and HTTP only, so every host.
+        {
+            const caps_e2e = b.addSystemCommand(&.{
+                if (@import("builtin").os.tag == .windows) "python" else "python3",
+                "tests/e2e/frontend_capabilities_e2e.py",
+            });
+            caps_e2e.step.dependOn(b.getInstallStep());
+            caps_e2e.setEnvironmentVariable("METACODES_DAEMON_E2E_BIN", b.getInstallPath(.bin, exe.out_filename));
+            product_test_step.dependOn(&caps_e2e.step);
+        }
         // The native project-Harness suites (E3 runtime and templates, the
         // E2 evolution lifecycle, the calibration matrix) run the installed
         // product, both zero-provider drivers, the project kernel and the

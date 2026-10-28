@@ -343,7 +343,7 @@ pub const UiResponse = union(enum) {
     permission: PermissionChoice,                         // allow_once/allow_always/deny_once/deny_tool_session
     custom: []const u8,                                   // custom 请求的结果 JSON
 };
-pub const RequestOutcome = enum { answered, pending, unavailable };
+pub const RequestOutcome = enum { answered, pending, unavailable, unrenderable };
 pub const UiRequester = struct {
     ctx: *anyopaque,
     requestFn: UiRequestFn, // fn(ctx, session, allocator, *const UiRequest, *UiResponse) anyerror!RequestOutcome
@@ -352,13 +352,21 @@ pub const UiRequester = struct {
 pub fn serializeUiRequest(allocator, req) ![]u8; // 给异步前端投递用
 ```
 
-`RequestOutcome` 三态是同步/异步前端的分水岭(见 §5)。
+`RequestOutcome` 的 answered/pending 是同步/异步前端的分水岭(见 §5);unavailable 是没有 UI,
+unrenderable 是连着的前端声明了渲染不了这个请求(见下)。
 
 跨进程或网络投递(SSE、WebSocket、队列)用 `protocol.wire`:带版本号的事件行、请求行、
 请求关闭行，以及把前端应答解析回 `UiResponse` 的 `parseResponse`(坏应答一律按取消处理，
 绝不放行)。格式见 [API.md](API.md#wire-lines-for-out-of-process-hosts)，逐行钉在
 `tests/fixtures/wire/v1`。`serializeUiRequest` 只是内部 struct 的直译，供挂起持久化使用，
 不是对外契约。
+
+跨进程前端可先发一帧能力声明(`protocol.wire.acceptCapabilities`,规范见
+[WIRE_PROTOCOL.md](WIRE_PROTOCOL.md)):列出它能渲染的 UiRequest kind 和带版本的
+custom kind(`name@major`)。Host 把它装进每个 Session 的 `protocol.frontend_capabilities.Slot`,
+requester 通告前先 `route`:声明里没有的请求不通告，记 `ui_request_unavailable` 并立即返
+`.unrenderable`——工具照没有 UI 时兜底(权限照样拒绝，且不落终端 prompt)，但告诉模型的是"前端渲染不了",
+不是用户拒绝。从未声明的前端照旧收到全部请求；进程内 backend 从不声明，行为不变。
 
 ---
 
@@ -782,7 +790,7 @@ connector、process plugin 与公开 Host stream ABI 都复用同一 CAS/receipt
 |------|--------|------|
 | `EventSink` | `agent_session` | Session 级 `CoreEvent` 消费（文本、工具、usage、progress、诊断） |
 | `UiBackend` | `protocol/ui_backend` | 低层 `agent_loop.run` 的 emit/poll 事件面 |
-| `UiRequester` | `protocol/ui_request` | 交互式 UI 请求(§3.4)，可返回 answered/pending/unavailable |
+| `UiRequester` | `protocol/ui_request` | 交互式 UI 请求(§3.4)，可返回 answered/pending/unavailable/unrenderable |
 | `HostServices` | `tools/context` | Skill/ToolSearch 激活、Worktree push/pop 与当前工作根(`workingRoot`)的宿主 RPC;工具每次调用从 `workingRoot` 开始,EnterWorktree/ExitWorktree 中途切换它 |
 | `ToolProgressReporter` | `tools/context` | 工具执行内进度(id, phase, text, count;WebSearch 用) |
 | `ToolObservationSink` | `tools/observation` | UI-independent 的实际 dispatch 观察 |

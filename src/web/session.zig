@@ -156,6 +156,16 @@ pub const StateSource = struct {
         );
         defer plugin_inventory.deinit();
 
+        // The frontend's declaration in force (doc/WIRE_PROTOCOL.md §2.3): the
+        // capabilities_accepted line as an object, null while undeclared.
+        const capabilities_line = try self.wb.acceptedCapabilities(allocator);
+        defer if (capabilities_line) |line| allocator.free(line);
+        var capabilities: ?std.json.Parsed(std.json.Value) = if (capabilities_line) |line|
+            try std.json.parseFromSlice(std.json.Value, allocator, line, .{})
+        else
+            null;
+        defer if (capabilities) |*parsed| parsed.deinit();
+
         const u = &self.app.usage; // u64 无锁读，良性 skew（poll-based）
         return stringifyJson(allocator, .{
             .seq = seq,
@@ -172,6 +182,7 @@ pub const StateSource = struct {
             .agents = agent_views, // U6 A4:附着 roster
             .tasks = task_views, // task#19:mid-session task 列表进快照
             .plugin_inventory = plugin_inventory.value,
+            .frontend_capabilities = if (capabilities) |parsed| parsed.value else @as(?std.json.Value, null),
         });
     }
 
