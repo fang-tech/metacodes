@@ -20,6 +20,7 @@ const splash = @import("splash.zig");
 const term = @import("term.zig");
 const theme = @import("theme.zig");
 const util_time = @import("../../util/time.zig");
+const bg_probe = @import("bg_probe.zig");
 
 /// Set to any value to keep the splash off for this process.
 pub const disable_env = "METACODES_NO_STARTUP_ANIMATION";
@@ -123,7 +124,9 @@ fn playUntil(gpa: std.mem.Allocator, plan: Plan, style: splash.Style, seed: u64,
         frames += 1;
         if (!writeAll(buf.items)) break :run .write_failed;
         const deadline = start + @as(util_time.Nanos, frames) * splash.frame_ns;
-        if (platform_term.waitReadable(0, msUntil(deadline)) > 0) {
+        // A terminal answer the startup probe stopped waiting for (a slow
+        // link) is not a key: it is read and dropped, and the frames go on.
+        if (platform_term.waitReadable(0, msUntil(deadline)) > 0 and !bg_probe.lateAnswersOnly(0)) {
             platform_term.discardPendingInput(0);
             break :run .skipped_by_key;
         }

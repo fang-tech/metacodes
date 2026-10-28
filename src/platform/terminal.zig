@@ -153,6 +153,18 @@ fn replayOwed(fd: c_int) []const u8 {
     return g_replay_buf[g_replay_pos..g_replay_len];
 }
 
+/// How many more bytes `replayInput(fd, …)` can take now.
+pub fn replayRoom(fd: c_int) usize {
+    return replay_capacity - replayOwed(fd).len;
+}
+
+/// What the terminal has queued on `fd`, without waiting and without the
+/// bytes `replayInput` handed back: 0 when nothing is queued, <0 on error.
+pub fn readPending(fd: c_int, buf: []u8) isize {
+    if (waitTerminal(fd, 0) <= 0) return 0;
+    return readTerminal(fd, buf);
+}
+
 /// 读终端输入。先吐 replayInput 交回的字节(若有)。POSIX / 非 console fd:直读(CRT read)。
 /// Windows console(fd=0 且真 console):ReadConsoleW 宽读 → UTF-8 内部缓冲 → 按需吐出。
 /// 返回读到字节数;0=EOF;<0=错误。
@@ -387,6 +399,47 @@ fn enterRawWith(fd: c_int, pending: PendingInput) ?SavedMode {
     raw.cc[@intFromEnum(std.c.V.TIME)] = 0;
     if (std.c.tcsetattr(fd, tcsaction(pending), &raw) != 0) return null;
     return orig;
+}
+
+/// Keep the terminal quiet: nothing typed is echoed, input is readable byte
+/// by byte, and Ctrl+C / Ctrl+Z still signal (unlike raw mode). `original` is
+/// the mode to build it from. Input already received stays. For the stretch
+/// of startup between the terminal probe and the REPL, when the probe's
+/// answers may still arrive and must not be echoed. POSIX only (a Windows
+/// console echoes only while a read is pending): false elsewhere.
+pub fn enterQuiet(fd: c_int, original: SavedMode) bool {
+    if (is_windows) return false;
+    var quiet = original;
+    quiet.lflag.ECHO = false;
+    quiet.lflag.ICANON = false;
+    quiet.lflag.IEXTEN = false;
+    quiet.cc[@intFromEnum(std.c.V.MIN)] = 1;
+    quiet.cc[@intFromEnum(std.c.V.TIME)] = 0;
+    return std.c.tcsetattr(fd, std.posix.TCSA.NOW, &quiet) == 0;
+}
+
+// ── 退出时复原 ─────────────────────────────────────────────────────────────
+// enterQuiet 之后、交给 REPL 之前,进程从任何正常路径退出(main 返回错误、std.process.exit)
+// 都要把终端还原:否则 shell 接手一个不回显的终端。被信号杀掉时由 shell 复原它保存的模式。
+var g_exit_restore: ?struct { fd: c_int, saved: SavedMode } = null;
+var g_exit_hooked = false;
+extern "c" fn atexit(func: *const fn () callconv(.c) void) c_int;
+
+/// Restore `saved` on `fd` when the process exits, unless cancelled first.
+/// POSIX only (it pairs with enterQuiet).
+pub fn restoreAtExit(fd: c_int, saved: SavedMode) void {
+    if (is_windows) return;
+    g_exit_restore = .{ .fd = fd, .saved = saved };
+    if (!g_exit_hooked) g_exit_hooked = atexit(&restoreOnExit) == 0;
+}
+
+/// The mode passed to restoreAtExit is someone else's to restore now.
+pub fn cancelRestoreAtExit() void {
+    g_exit_restore = null;
+}
+
+fn restoreOnExit() callconv(.c) void {
+    if (g_exit_restore) |r| restoreModeWith(r.fd, r.saved, .keep);
 }
 
 fn tcsaction(pending: PendingInput) @TypeOf(std.posix.TCSA.FLUSH) {
