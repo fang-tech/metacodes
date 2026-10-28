@@ -4468,8 +4468,6 @@ fn parsePromptProfile(
     return .{ .sections = sections };
 }
 
-/// INVALID_ARGUMENT naming the entry and the rule when the kernel refuses the
-/// profile, else null.
 /// The one credential rule (`credential_cell.validate`) applied to a
 /// Session's create and restore before anything is built, as
 /// `update_credential` applies it: a refusal names the rule, never the
@@ -4484,6 +4482,8 @@ fn refuseInvalidCredential(api_key: []const u8, out_error: ?*wire.OwnedBytesV1) 
     return null;
 }
 
+/// INVALID_ARGUMENT naming the entry and the rule when the kernel refuses the
+/// profile, else null.
 fn refusePromptProfile(profile: core.prompt_sections.Profile, out_error: ?*wire.OwnedBytesV1) ?u32 {
     const diagnostic = core.system_prompt.validateProfile(profile) orelse return null;
     var buf: [512]u8 = undefined;
