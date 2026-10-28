@@ -150,7 +150,7 @@ renderInput/GenFrame = 把现 renderFrameInner/drawGenRegion 的**纯计算行�
 | footer | 会话 | 保留 | usage/mode 快照 |
 | panel.task_list_visible | 会话 | 保留 | Ctrl+T 偏好,两期共用 |
 | agent_count | 会话 | 保留 | registry 镜像,render 回写 |
-| Interaction.editor | input / generating | 清空 | 借用该阶段草稿 LineEditor 的缓冲:输入期是 readLineRaw 的;生成期是这一轮 TuiBackend 的 `draft`——权限/提问对话框会停掉再重启 watcher 线程,草稿归 backend 才能跨过这次重启(以前归 watcher,对话框一关缓冲就被释放,框里读到已释放内存、下一个键丢掉草稿)。阶段结束缓冲即释放 |
+| Interaction.editor | input / generating | 清空 | 输入期借用 readLineRaw 的 LineEditor 缓冲;生成期借用 region 的副本 `gen_editor`(§9.2),草稿本体是这一轮 TuiBackend 的 `draft`——权限/提问对话框会停掉再重启 watcher 线程,草稿归 backend 才能跨过这次重启(以前归 watcher,对话框一关缓冲就被释放,框里读到已释放内存、下一个键丢掉草稿)。阶段结束缓冲即释放 |
 | Interaction.help_open | input / generating | 关 | `?` 帮助 |
 | Interaction.ctrl_x_armed | input / generating | 清 | Ctrl+X 前缀 |
 | Interaction.agents | input / generating | closed | switcher list/viewing、sel、viewing_id、视口 |
@@ -200,7 +200,7 @@ renderInput/GenFrame = 把现 renderFrameInner/drawGenRegion 的**纯计算行�
 - **resize**:每一帧开头 `observeResize`;待画帧到点时按终端当时的尺寸量,续接点作废/封口逻辑与以前同一处。
 - **spinner tick**:就是普通请求;tick 与其它请求同窗口时合成一帧(spinner 帧号照样每 tick 前进)。
 - **overlay/对话框**:enterExclusiveOverlay 先写出攒着的文本再擦区,overlay 期间持锁,定时线程等锁。
-- **借用**:生成期输入框不再借用 watcher 的 LineEditor 缓冲(下一个键会重分配它,而区可能先被别的线程画),改为 region 自有副本 `gen_editor`。
+- **借用**:生成期输入框不再借用草稿(TuiBackend 的 `draft`)的缓冲(下一个键会重分配它,而区可能先被别的线程画),改为 region 自有副本 `gen_editor`。
 - 修掉的旧问题:区不在屏时 resize 封口的换行曾写出两次(`sealResizedLine` 自己 flush 后 scratch 未清)。
 
 ### 9.3 测量

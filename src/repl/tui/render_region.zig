@@ -135,7 +135,7 @@ pub const RenderRegion = struct {
     /// 边界(endScrollLine、leaveGenerating)收集缓冲残行时置位:emitToScroll 只攒不画,
     /// 边界自己画一帧。
     hold_paint: bool = false,
-    /// 生成期输入框内容的 region 自有副本。watcher 的 LineEditor 缓冲会在下一个键时重分配,
+    /// 生成期输入框内容的 region 自有副本。草稿(TuiBackend 的 `draft`)的缓冲会在下一个键时重分配,
     /// 而区可能由别的线程(agent 主线程的文本帧、合并窗口的定时线程)在那之前画:借用它就会
     /// 读到已释放的内存。生成期的 Interaction.editor 借用的是这份副本(持锁写)。
     gen_editor: std.ArrayList(u8) = .empty,

@@ -337,7 +337,7 @@ test "TuiBackend: 回复草稿归 backend,stopInput 不动它;deinit 先撤 regi
     try testing.expectEqualStrings("keep me", tb.draft.?.view());
     try testing.expectEqualStrings("keep me", region.ui.phase.generating.interaction.editor.view);
 
-    // 出错返回时 deinit 先于离开生成阶段:投影不能再指着要释放的缓冲。
+    // 出错返回时 deinit 先于离开生成阶段:框里不再留着这份草稿。
     tb.deinit();
     try testing.expect(tb.draft == null);
     try testing.expectEqual(@as(usize, 0), region.ui.phase.generating.interaction.editor.view.len);

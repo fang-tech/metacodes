@@ -479,8 +479,9 @@ pub const TuiBackend = struct {
     }
 
     /// 回复结束:停 watcher(若还在),释放草稿。持有 backend 的一方 defer 调它,任何出口都走得到。
-    /// 出错返回时 defer 先跑这里、后离开生成阶段,所以释放前先撤掉 region 上的投影(持锁),
-    /// 免得这之间画出的一帧读到已释放的缓冲。
+    /// 出错返回时 defer 先跑这里、后离开生成阶段,所以释放前先撤掉 region 上的投影(持锁)。
+    /// 投影是 region 自己的副本(gen_editor),不会读到释放的缓冲;撤掉它是让这之间画出的帧
+    /// 不再显示一份已经没有回复接收的草稿。
     pub fn deinit(self: *TuiBackend) void {
         self.stopInput();
         if (self.draft) |*d| {
