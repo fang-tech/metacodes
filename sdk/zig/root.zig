@@ -345,6 +345,12 @@ pub const SessionApi = struct {
         };
         return self.submitInputFn()(session, run_id, &input, out_receipt, out_diagnostic);
     }
+    /// Replace the Session's provider credential in place (Revision 25). The
+    /// bytes are borrowed for the call; safe from any thread and from the
+    /// Session's own callbacks, including while a Run is active.
+    pub fn updateCredential(self: SessionApi) types.SessionUpdateCredentialFnV1 {
+        return self.raw.update_credential.?;
+    }
 };
 
 pub const SessionControlApi = struct {
@@ -471,7 +477,7 @@ fn validateSessionApi(raw: ?*const types.SessionApiV1) bool {
     if (@intFromPtr(api) % @alignOf(types.SessionApiV1) != 0) return false;
     return api.struct_size == @sizeOf(types.SessionApiV1) and api.reserved0 == 0 and
         api.create != null and api.destroy != null and api.run_input != null and api.abort != null and
-        api.submit_input != null;
+        api.submit_input != null and api.update_credential != null;
 }
 
 fn validateSessionControlApi(raw: ?*const types.SessionControlApiV1) bool {
@@ -528,7 +534,7 @@ test "RunContext validator bounds length before pointer slicing" {
     try std.testing.expectEqualStrings(id, valid.session_id);
 }
 
-test "Revision 24 SDK rejects Revision 13 through 23 and stale reference roots" {
+test "Revision 25 SDK rejects Revision 13 through 24 and stale reference roots" {
     const Revision13Api = extern struct {
         struct_size: u32,
         abi_version: u32,
@@ -545,8 +551,8 @@ test "Revision 24 SDK rejects Revision 13 through 23 and stale reference roots" 
     try std.testing.expectError(error.UnsupportedAbi, Api.validate(&revision13));
 
     // Revisions 14 through 22 (16 withdrawn) had the 64-byte root; Revision 23
-    // added the goal table for a 72-byte root. Both are short of Revision 24's
-    // 80-byte root, so the size check rejects every one of them.
+    // added the goal table for a 72-byte root. Both are short of the 80-byte
+    // root Revisions 24 and 25 share, so the size check rejects every one.
     const Revision22Api = extern struct {
         struct_size: u32,
         abi_version: u32,
@@ -578,10 +584,10 @@ test "Revision 24 SDK rejects Revision 13 through 23 and stale reference roots" 
         try std.testing.expectError(error.UnsupportedAbi, Api.validate(&root));
     }
 
-    // The 80-byte reference layout has Revision 24's size, so it fails at the
-    // revision check (it never carried 24) or, carrying 24, at its missing
-    // tables.
-    for ([_]u32{ 13, 23, types.ABI_REVISION }) |revision| {
+    // The 80-byte reference layout has Revision 25's size, so it fails at the
+    // revision check (a Revision 24 root, whose Session table is 8 bytes
+    // short, included) or, carrying 25, at its missing tables.
+    for ([_]u32{ 13, 23, 24, types.ABI_REVISION }) |revision| {
         var stale_reference: types.ApiV1 align(@alignOf(types.ApiV1)) = std.mem.zeroes(types.ApiV1);
         stale_reference.struct_size = @sizeOf(types.ApiV1);
         stale_reference.abi_version = types.ABI_VERSION_V1;

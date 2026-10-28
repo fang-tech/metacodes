@@ -117,7 +117,7 @@ test "L2 redirect: the /v1/models probe does not follow a redirect with its key"
         std.testing.allocator,
         &http_client,
         hop.url,
-        .{ .name = "x-api-key", .value = SECRET },
+        .{ .header = .{ .name = "x-api-key", .value = SECRET } },
         &status,
     ));
     try std.testing.expectEqual(@as(u16, 302), status);

@@ -34,6 +34,16 @@ status, compatibility boundaries, and entry points are defined by
     ReleaseSmall build, so DWARF no longer links in ~100 KB of unwinding code.
     A stripped build is byte-identical with or without that line.
 
+- **CI reports the footprint red lines** (#303). The Linux and macOS `release`
+  legs of `ci.yml` run `scripts/perf_baseline.sh --build` (ReleaseSmall binary
+  size, warm `--help` start, idle peak RSS; `doc/PERF_MEMORY_PRINCIPLES.md` §2)
+  and write its output to the job summary. The step is report-only: a line
+  over its limit marks it failed with a warning, and the leg stays green until
+  a few weeks of numbers decide whether it becomes blocking. The script's
+  warm-start line measured nothing before: the timed `--help` output landed
+  in the captured number. It now times in microseconds and shows 0.1 ms, where
+  whole milliseconds had read a 0.6 ms start as 0 ms. An RSS of 0 KB without
+  `/usr/bin/time`, or a start it could not time, no longer passes either.
 - **The TUI's screen ownership is written down and enforced** (#332, #320).
   [doc/TUI_VIEWPORT_OWNERSHIP.md](doc/TUI_VIEWPORT_OWNERSHIP.md) records who
   may write past the inline region and how: the scrollback only through the
@@ -78,6 +88,64 @@ status, compatibility boundaries, and entry points are defined by
   rules and the policy on which `CoreEvent`/`UiRequest` changes bump
   `SCHEMA_VERSION` are in the new [doc/WIRE_PROTOCOL.md](doc/WIRE_PROTOCOL.md);
   `tests/fixtures/wire/v1` pins the frames and replies.
+- **An AgentCore Session's provider credential can be replaced in place,
+  also during a Run** (#336). An expiring access token used to mean exporting
+  a checkpoint, restoring a new Session and destroying the old one, which only
+  works while idle: a token that expired while a tool ran or a permission
+  request waited ended the Run with `api_error`. AgentCore ABI Revision 25 adds
+  `session->update_credential(session, credential, out_error)` (the Session
+  table grows from 48 to 56 bytes) and the source-level
+  `AgentSession.updateCredential`.
+  - Callable while idle and during a Run, from any thread or from the Run's own
+    callbacks; never `BUSY`. Concurrent updates are linearized. A request reads
+    the credential when it is sent (once it holds its connection slot), so
+    every request sent after an update returns carries it: the Run's later
+    turns, retries of a request already under way, compaction summaries, Skill
+    Runs and forked Skills, a tool's own per-call provider (`WebSearch`)
+    including one built before the update, and a request that was still
+    waiting for a connection slot. A request already sent and a stream being
+    read are left alone.
+  - Only the credential changes: provider, authentication scheme, `base_url`
+    and model stay. An empty credential, a byte outside printable ASCII, more
+    than `MAX_CREDENTIAL_BYTES_V1` (16 KiB), or an allocation failure is
+    refused and keeps the previous credential; a poisoned Session refuses
+    with `INVALID_STATE`. Diagnostics name the rule, never the bytes.
+  - The replaced credential is erased before the call returns and the last one
+    when the Session is destroyed. No credential reaches checkpoints,
+    `describe`, events or diagnostics; restore still uses the credential in
+    its configuration.
+  - Every Session-owned provider now reads one Session-owned credential at each
+    request instead of borrowing the Session's key bytes. The Python
+    (`Session.update_credential`) and Node (`Session.updateCredential`)
+    packages, the Zig and Rust SDKs, and both source-free consumers carry the
+    slot. SDK 0.12.0-dev.
+
+### Changed
+
+- **Smaller Linux footprint: idle RSS back under its red line, binary
+  433 KB smaller.** On x86_64 Linux, the ReleaseSmall binary was 6.60 MB
+  (red line 6 MiB) and `metacodes --help` peaked at 3120 KB RSS (red line
+  3 MB; `doc/PERF_MEMORY_PRINCIPLES.md` §2). Nothing a user sees changes;
+  measured in WSL on x86_64:
+  - **Signal stack.** The release binary no longer reserves std's 256 KiB
+    alternate signal stack. It is thread-local, and glibc zeroes it for
+    every thread, the main one included. Only std's segfault handler uses
+    it, and the release build does not install that handler, so sessions
+    also save 256 KiB per thread.
+  - **`--help` first.** `metacodes --help` (or `-h`) as the first argument
+    prints before the rest of startup runs, with byte-identical output.
+  - **No zero-filled constants.** The provider control plane's event ring is
+    no longer copied out of a 138 KiB read-only constant.
+  - **Run-end records out of line.** The agent loop's nine run-end records
+    run as functions instead of being copied into every exit of the loop
+    (−277 KB).
+
+  Result: 6.19 MB binary and 2564 KB RSS for the native build; 6.16 MB and
+  2920 KB for the glibc 2.31 baseline-CPU build. RSS is now under its red
+  line, but the binary is still about 195 KB over 6 MiB. The macOS binary
+  is 283 KB smaller. §3g records the Zig 0.16 patterns behind the waste:
+  aggregates copied from zero-filled constants, and `defer` bodies copied
+  into every exit.
 
 ### Fixed
 
@@ -135,33 +203,17 @@ status, compatibility boundaries, and entry points are defined by
   `close()` still reach it. The suite's
   permission-target test compares paths as paths, since AgentCore names
   Windows paths with forward slashes.
-
-### Changed
-
-- **Smaller Linux footprint: idle RSS back under its red line, binary
-  433 KB smaller.** On x86_64 Linux, the ReleaseSmall binary was 6.60 MB
-  (red line 6 MiB) and `metacodes --help` peaked at 3120 KB RSS (red line
-  3 MB; `doc/PERF_MEMORY_PRINCIPLES.md` §2). Nothing a user sees changes;
-  measured in WSL on x86_64:
-  - **Signal stack.** The release binary no longer reserves std's 256 KiB
-    alternate signal stack. It is thread-local, and glibc zeroes it for
-    every thread, the main one included. Only std's segfault handler uses
-    it, and the release build does not install that handler, so sessions
-    also save 256 KiB per thread.
-  - **`--help` first.** `metacodes --help` (or `-h`) as the first argument
-    prints before the rest of startup runs, with byte-identical output.
-  - **No zero-filled constants.** The provider control plane's event ring is
-    no longer copied out of a 138 KiB read-only constant.
-  - **Run-end records out of line.** The agent loop's nine run-end records
-    run as functions instead of being copied into every exit of the loop
-    (−277 KB).
-
-  Result: 6.19 MB binary and 2564 KB RSS for the native build; 6.16 MB and
-  2920 KB for the glibc 2.31 baseline-CPU build. RSS is now under its red
-  line, but the binary is still about 195 KB over 6 MiB. The macOS binary
-  is 283 KB smaller. §3g records the Zig 0.16 patterns behind the waste:
-  aggregates copied from zero-filled constants, and `defer` bodies copied
-  into every exit.
+- **A provider credential with a byte a request header cannot carry no longer
+  ends the process.** Session create and restore accepted any UTF-8 as
+  `api_key`, and the CLI sent whatever bytes its flag, environment, key file
+  or token response held; a credential with CR LF reached the HTTP client,
+  whose header assertion ended the process at the first request (a panic in
+  ReleaseSafe). Create and restore now apply the rule `update_credential`
+  applies (1 to 16 KiB of printable ASCII): AgentCore returns
+  `INVALID_ARGUMENT` (`RESOURCE_LIMIT` when too long) with a diagnostic that
+  names the rule and never the bytes, and `AgentSession` creation fails with
+  `error.InvalidCredentialByte`. A fixed (CLI) credential is checked before
+  every request and fails that request instead of sending it.
 
 ## 0.8.1 — 2026-10-28
 
