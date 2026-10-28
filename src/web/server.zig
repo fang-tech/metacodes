@@ -6,6 +6,8 @@
 //!   GET  /events      → SSE:重放 journal(?since=N / Last-Event-ID)+ condvar 推新事件
 //!   POST /message     → 入 inbox 队列(session driver 消费;user_message 由 driver 在该轮开跑时回显)
 //!   POST /respond     → 回填 WebBackend 挂起的 UiRequest({"id":N,...})
+//!   POST /capabilities → 前端能力帧(doc/WIRE_PROTOCOL.md §2):200 capabilities_accepted,
+//!                       400 capabilities_refused(什么都不变)
 //!   POST /command     → 斜杠命令入队(driver 线程执行)
 //!   POST /interrupt   → 打 AbortSignal(与 TUI esc 同通道)
 //!   GET  /state       → session 状态快照(经回调,server 不依赖 App)
@@ -56,6 +58,7 @@ const net = @import("platform").net;
 const http = @import("../util/http.zig");
 const util_json = @import("../util/json.zig");
 const SessionId = @import("../core/session_id.zig").SessionId;
+const wire = @import("../core/protocol/wire.zig");
 
 const EventJournal = journal_mod.EventJournal;
 const WebBackend = backend_mod.WebBackend;
@@ -585,6 +588,27 @@ pub const WebServer = struct {
             } else {
                 writeSimple(fd, "409 Conflict", "application/json", "{\"error\":\"no pending request with this id\"}");
             }
+            return;
+        }
+        if (std.mem.eql(u8, line.method, "POST") and std.mem.eql(u8, eff_path, "/capabilities")) {
+            const wb = sv.web_backend;
+            const accepted = wb.declareCapabilities(body) catch |err| switch (err) {
+                error.OutOfMemory => {
+                    writeSimple(fd, "500 Internal Server Error", "application/json", "{\"error\":\"out of memory\"}");
+                    return;
+                },
+                else => |refusal| {
+                    const refused = wire.writeCapabilitiesRefused(self.allocator, refusal) catch {
+                        writeSimple(fd, "500 Internal Server Error", "application/json", "{\"error\":\"out of memory\"}");
+                        return;
+                    };
+                    defer self.allocator.free(refused);
+                    writeSimple(fd, "400 Bad Request", "application/json", refused);
+                    return;
+                },
+            };
+            defer wb.allocator.free(accepted);
+            writeSimple(fd, "200 OK", "application/json", accepted);
             return;
         }
         if (std.mem.eql(u8, line.method, "POST") and std.mem.eql(u8, eff_path, "/command")) {
