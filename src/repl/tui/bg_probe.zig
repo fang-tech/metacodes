@@ -131,6 +131,9 @@ pub const Scanner = struct {
     /// The sequence begun with ESC, until it is known to be an answer or not.
     seq: [seq_capacity]u8 = undefined,
     seq_len: usize = 0,
+    /// How many sequences have begun: a different count means the open one
+    /// is not the one that was open before.
+    begun: u32 = 0,
     /// Every byte that was not an answer, in arrival order.
     typed: [typed_capacity]u8 = undefined,
     typed_len: usize = 0,
@@ -167,7 +170,17 @@ pub const Scanner = struct {
     /// for a tail that may never come, and take the next typed key for it.
     /// Anything else (a lone Esc, half an arrow key) goes out as typed.
     pub fn finish(self: *Scanner) void {
+        self.finishTyping(self.seq_len);
+    }
+
+    /// `finish`, except that the bytes a cut answer took from `from` on are
+    /// typed instead of dropped with it: they fitted its tail without
+    /// completing it.
+    pub fn finishTyping(self: *Scanner, from: usize) void {
         if (self.openAnswer()) {
+            const kept = self.seq[@min(from, self.seq_len)..self.seq_len];
+            @memcpy(self.typed[self.typed_len..][0..kept.len], kept);
+            self.typed_len += kept.len;
             self.seq_len = 0;
             self.state = .ground;
         } else self.flushSeq();
@@ -259,6 +272,7 @@ pub const Scanner = struct {
         self.seq[0] = 0x1b;
         self.seq_len = 1;
         self.state = .esc;
+        self.begun +%= 1;
     }
 
     fn take(self: *Scanner, b: u8) bool {
@@ -472,8 +486,14 @@ const Late = struct {
     /// different count means queued input was thrown away since (a TCSAFLUSH
     /// mode switch), and what came right after the open sequence is its rest.
     discards: u32,
-    /// When the open sequence last grew.
+    /// When the open sequence last grew while its tail was awaited.
     progress_ms: i64,
+    /// `Scanner.begun` at `progress_ms`: another count is another sequence.
+    begun: u32,
+    /// Once the open sequence has waited `late_tail_ms`, how long it was
+    /// then. From there on every byte must fit its tail and none restarts the
+    /// wait. Null while it waits.
+    overdue_from: ?usize = null,
 
     fn init(fd: c_int, original: platform_term.SavedMode, scanner: Scanner) Late {
         return .{
@@ -482,27 +502,47 @@ const Late = struct {
             .scanner = scanner,
             .discards = platform_term.discardCount(),
             .progress_ms = util_time.nowMs(),
+            .begun = scanner.begun,
         };
     }
 
+    /// The open sequence is resolved (`Scanner.finish`: a cut answer is
+    /// dropped, a cut key is typed). The bytes a cut answer took after it
+    /// went overdue are typed: they fitted its tail without completing it.
+    fn giveUp(self: *Late) void {
+        self.scanner.finishTyping(self.overdue_from orelse self.scanner.seq_len);
+        self.overdue_from = null;
+    }
+
     /// Input was discarded since the open sequence was read: its tail may be
-    /// gone with it, so it is resolved now (`Scanner.finish`: a cut answer is
-    /// dropped, a cut key is typed) and the keys typed next are not fed to it.
+    /// gone with it, so it is given up now and the keys typed next are not
+    /// fed to it.
     fn expireDiscarded(self: *Late) void {
         const discards = platform_term.discardCount();
         const discarded = discards != self.discards;
         self.discards = discards;
-        if (discarded and self.scanner.seq_len > 0) self.scanner.finish();
+        if (discarded and self.scanner.seq_len > 0) self.giveUp();
     }
 
-    /// The open sequence has not grown for a read wait and `next` (read now)
-    /// cannot be its tail: it is given up the same way. The tail may well
-    /// have arrived in time and only been read late (nothing reads between
-    /// the splash and the REPL), so the time alone does not decide.
-    fn expireStale(self: *Late, next: []const u8) void {
-        if (self.scanner.seq_len == 0) return;
-        if (util_time.nowMs() - self.progress_ms < late_tail_ms) return;
-        if (!self.scanner.tailFits(next)) self.scanner.finish();
+    /// Feed one byte, read at `now`. An open sequence that has not grown for
+    /// a read wait is overdue: a byte that cannot be its tail gives it up,
+    /// and one that can does not restart the wait, so text typed key by key
+    /// is not taken for a tail just because `f` fits a colour. The tail may
+    /// well have arrived in time and only been read late (nothing reads
+    /// between the splash and the REPL), so the time alone does not decide.
+    fn take(self: *Late, b: u8, now: i64) void {
+        const s = &self.scanner;
+        if (s.seq_len > 0 and self.overdue_from == null and now - self.progress_ms >= late_tail_ms) self.overdue_from = s.seq_len;
+        if (self.overdue_from != null and !s.tailFits(&.{b})) self.giveUp();
+        s.feed(&.{b});
+        if (s.begun != self.begun) {
+            // Another sequence began: it waits afresh.
+            self.begun = s.begun;
+            self.overdue_from = null;
+            self.progress_ms = now;
+        } else if (s.seq_len == 0) {
+            self.overdue_from = null;
+        } else if (self.overdue_from == null) self.progress_ms = now;
     }
 
     /// Hand the typed bytes to stdin. Every byte read adds at most one to
@@ -531,12 +571,10 @@ const Late = struct {
             if (limit == 0) break;
             const n = platform_term.readPending(self.fd, chunk[0..limit]);
             if (n <= 0) break;
-            const next = chunk[0..@intCast(n)];
-            // Resolving the open sequence moves its bytes to the typed ones:
-            // the bound above still holds.
-            self.expireStale(next);
-            self.scanner.feed(next);
-            if (self.scanner.seq_len > 0) self.progress_ms = util_time.nowMs();
+            const now = util_time.nowMs();
+            // Giving up the open sequence moves its bytes to the typed ones
+            // or drops them: the bound above still holds.
+            for (chunk[0..@intCast(n)]) |b| self.take(b, now);
             if (self.replayTyped()) typed = true;
         }
         return typed;
@@ -563,7 +601,7 @@ pub fn handOver(fd: c_int) ?platform_term.SavedMode {
     const late = if (g_late) |*l| l else return null;
     if (late.fd != fd) return null;
     _ = late.absorb();
-    late.scanner.finish();
+    late.giveUp();
     _ = late.replayTyped();
     const original = late.original;
     g_late = null;
@@ -1088,6 +1126,39 @@ test "Late: a cut answer read only after a read wait still takes the tail that c
     var rest: [8]u8 = undefined;
     const got = drainForTest(r, &owed, &rest);
     try testing.expectEqualStrings("ls", got.owed);
+}
+
+/// What the prompt gets when, after `cut` waited a read wait for its tail,
+/// `text` is typed key by key, each key read on its own.
+fn typedKeyByKeyAfterOverdue(cut: []const u8, text: []const u8, out: []u8) ![]u8 {
+    var fds: [2]c_int = undefined;
+    try testing.expectEqual(@as(c_int, 0), std.c.pipe(&fds));
+    defer _ = std.c.close(fds[0]);
+    defer _ = std.c.close(fds[1]);
+    const r = fds[0];
+    defer forgetOwedForTest(r);
+    g_late = Late.init(r, std.mem.zeroes(platform_term.SavedMode), scan(both, cut));
+    defer g_late = null;
+    g_late.?.progress_ms -= late_tail_ms;
+    for (text) |c| {
+        try testing.expect(pfs.writeAll(fds[1], &.{c}));
+        _ = lateAnswersOnly(r); // the splash looks, frame after frame
+    }
+    try testing.expect(handOver(r) != null);
+    var rest: [8]u8 = undefined;
+    return drainForTest(r, out, &rest).owed;
+}
+
+test "Late: keys typed one by one after a cut answer went overdue are typed, those that fit its tail too" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var out: [32]u8 = undefined;
+    // `f` is a hex digit: it fits the colour. Taking it used to restart the
+    // wait, so the next key fitted too (an OSC body takes any printable).
+    try testing.expectEqualStrings("fix the bug", try typedKeyByKeyAfterOverdue("\x1b]11;rgb:1e1e/", "fix the bug", &out));
+    try testing.expectEqualStrings("1. fix", try typedKeyByKeyAfterOverdue("\x1b[?62;", "1. fix", &out));
+    try testing.expectEqualStrings("hello", try typedKeyByKeyAfterOverdue("\x1b]11;rgb:1e1e/", "hello", &out));
+    // The tail itself, arriving late and in pieces, still completes it.
+    try testing.expectEqualStrings("ls", try typedKeyByKeyAfterOverdue("\x1b[?62;", "22cls", &out));
 }
 
 test "Scanner.tailFits: an answer's own bytes fit it, typed text does not" {
