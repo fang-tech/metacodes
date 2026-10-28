@@ -81,6 +81,14 @@ tests/
 新增 component/integration 测试文件必须登记进 `tests/integration_suite.zig`
 (build graph 会在构建期强制检查,漏登记直接失败)。
 
+TUI 渲染的组件测试断言"终端最后显示什么",不断言字节序:`component/vterm.zig` 是
+`tty/screen.py` 的 Zig 移植(行列网格、光标、SGR、ED/EL、autowrap pending-wrap、DEC 2026 帧、
+alt-screen、宽字符、底部滚入 scrollback,外加有界的 scrollback 内容缓冲),
+`component/region_harness.zig` 把真实 `RenderRegion` 的输出(`RenderRegion.sink`)经 tty 的
+ONLCR 回放进去。只走公共入口驱动 render_region,只读屏幕/scrollback,不读内部字段。
+用例:`render_region_contract_test.zig`(emit/erase 成对、半行续接、阶段交接、窄终端 footer)、
+`md_stream_convergence_test.zig`(助手 markdown 流在任意切分下收敛到整段渲染)。
+
 ## 已知执行覆盖缺口(登记非沉默)
 
 以下工具无法在纯 L2 自动化里做执行冒烟,只有 schema 覆盖

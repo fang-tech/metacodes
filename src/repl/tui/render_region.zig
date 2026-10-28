@@ -122,6 +122,12 @@ pub const RenderRegion = struct {
 
     mutex: sync.Mutex = .{},
 
+    /// Where flushed bytes go. Null in the product: stderr through
+    /// std.debug.print (the stderr lock, see the module header). Component
+    /// tests point it at a buffer and replay the bytes through a virtual
+    /// terminal (tests/component/vterm.zig).
+    sink: ?*std.Io.Writer = null,
+
     fn lock(self: *RenderRegion) void {
         _ = self.mutex.lock();
     }
@@ -371,10 +377,14 @@ pub const RenderRegion = struct {
         self.scratch.writer.end = 0;
     }
 
-    /// 把 scratch 已写字节一次性输出(走 std.debug.print → lockStdErr)。
+    /// 把 scratch 已写字节一次性输出(走 std.debug.print → lockStdErr;设了 sink 则写 sink)。
     fn flush(self: *RenderRegion) void {
         const bytes = self.scratch.written();
         if (bytes.len == 0) return;
+        if (self.sink) |out| {
+            out.writeAll(bytes) catch {};
+            return;
+        }
         std.debug.print("{s}", .{bytes});
     }
 
@@ -1057,9 +1067,20 @@ pub const RenderRegion = struct {
     /// 其余文字 dim。token 用量走 /cost,不进 footer。
     fn drawFooter(self: *RenderRegion, w: *std.Io.Writer, app: *const app_mod.App) void {
         const th = self.theme;
+        // The footer is the region's last row and must never wrap: an
+        // autowrapping terminal (every real one) spills a longer line onto rows
+        // the region does not count, and at the bottom of the screen that
+        // scroll pushes the region's top rows into the scrollback for good.
+        // Everything stays inside cols - 1, like the MCP notice below.
+        var room: usize = if (self.cols > 1) self.cols - 1 else 0;
         // An armed exit press takes the whole footer line (Claude Code).
         if (self.exitHint()) |text| {
-            w.print("{s} {s}{s}", .{ th.dim, text, th.reset }) catch {};
+            w.writeAll(th.dim) catch {};
+            if (room > 0) {
+                w.writeAll(" ") catch {};
+                _ = writeClippedWidth(w, text, room - 1);
+            }
+            w.writeAll(th.reset) catch {};
             return;
         }
         const sb = @import("widget/status_bar.zig");
@@ -1130,11 +1151,11 @@ pub const RenderRegion = struct {
         // (对齐 cc:footer 行只左对齐文案;token 用量走 /cost)。
         if (show_mode) {
             w.writeAll(sb.modeColor(th, mode_pm)) catch {};
-            w.writeAll(mode_plain) catch {};
+            room -= writeClippedWidth(w, mode_plain, room);
             w.writeAll(th.reset) catch {};
         }
         w.writeAll(th.dim) catch {};
-        w.writeAll(hint) catch {};
+        room -= writeClippedWidth(w, hint, room);
         w.writeAll(th.reset) catch {};
 
         // MCP servers connecting in the background, then the ones that
