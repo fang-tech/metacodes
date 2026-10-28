@@ -184,11 +184,13 @@ status, compatibility boundaries, and entry points are defined by
   to the prompt, where its missing tail took the user's next key; one still
   open when queued input was thrown away since (a `TCSAFLUSH` mode switch
   that found input waiting) is given up, and after a read wait without its
-  tail, what follows is taken for its tail only if it completes it (digits
-  up to `c`/`u`, a colour up to BEL), so the text typed next is not read as
-  its tail. Reading what queued up stops where stdin's replay is full
-  instead of overrunning it (a 4 KiB burst typed during such a startup
-  crashed a Debug or ReleaseSafe build). The key
+  tail, each byte that follows is taken for its tail only while it fits
+  (digits up to `c`/`u`, a colour up to BEL) and none restarts the wait;
+  when one does not fit, the answer is given up and the bytes it took since
+  are typed, so text typed key by key is not read as its tail (`fix the
+  bug` used to leave only `bug`). Reading what queued up stops where
+  stdin's replay is full instead of overrunning it (a 4 KiB burst typed
+  during such a startup crashed a Debug or ReleaseSafe build). The key
   parser also consumes a whole private-marker CSI (`ESC [ ? … c`,
   `ESC [ ? … u`), any CSI with more parameters than it decodes (xterm's
   `ESC [ 27 ; 2 ; 13 ~`), and an OSC answer (`ESC ] 11 ; … BEL`), reporting

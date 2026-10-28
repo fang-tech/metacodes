@@ -258,6 +258,27 @@ def test_a_cut_answer_completed_during_the_splash_is_dropped_whole(bin_path):
     assert b"22c" not in raw, "the tail of the cut answer was echoed:\n" + screen
 
 
+def test_keys_typed_one_by_one_after_a_lost_tail_are_typed(bin_path):
+    _posix_only()
+    # The deadline cuts OSC 11 inside its colour and the tail never comes. Then `fix the bug`
+    # is typed a key every 100 ms while the splash plays (it reads each key as it comes).
+    # `f` fits a colour; taking it used to restart the 200 ms wait for the tail, so each next
+    # key, read within it, went into the answer as well: the prompt read `bug`.
+    keys = []
+    for c in "fix the bug":
+        keys += ["raw:" + c, "strictsleep:0.1"]
+    raw = _slow_startup(bin_path, [
+        QUERY_SENT,
+        "raw:\\x1b]11;rgb:1e1e/",
+        SPLASH_FIRST_FRAME,
+        "strictsleep:0.3",
+        *keys,
+        wait_for("❯ fix the bug"),
+    ], _unknown_terminal(METACODES_NO_STARTUP_ANIMATION=None), term_size=(30, 100), per_key_drain=0.01)
+    a, _ = _screen_sized(raw, 30, 100)
+    a.assert_input_echo("fix the bug")
+
+
 def test_a_flood_typed_after_a_timed_out_round_does_not_crash(bin_path):
     _posix_only()
     # The probe gave up (nothing answers); then more is typed during startup than stdin's
