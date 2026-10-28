@@ -104,6 +104,25 @@ jobs:
         run: python3 -m pip install --break-system-packages -r requirements-dev.txt
       - name: Vendored runtime assets are attested
         run: python3 scripts/verify_tinykg_binary.py && python3 scripts/verify_ripgrep_binary.py
+      # The suite's Glob and Grep tests resolve rg from PATH, as in ci.yml. The
+      # arm64 Linux image ships none, and its first dry run failed those tests
+      # with RipgrepNotFound (#307). There the vendored, attested binary the
+      # unit itself ships goes on PATH rather than a package manager's, so the
+      # job reaches no new network source.
+      - name: ripgrep for the test suite
+        shell: bash
+        env:
+          ZIG_TARGET: ${{ matrix.zig_target }}
+        run: |
+          set -euo pipefail
+          if ! command -v rg >/dev/null 2>&1; then
+            arch=${ZIG_TARGET%%-*}; os=${ZIG_TARGET#*-}; os=${os%%-*}
+            python3 scripts/stage_ripgrep_binary.py "$arch" "$os" "$RUNNER_TEMP/ripgrep"
+            echo "$RUNNER_TEMP/ripgrep" >> "$GITHUB_PATH"
+            export PATH="$RUNNER_TEMP/ripgrep:$PATH"
+          fi
+          command -v rg
+          rg --version
       # The unit ships both Lean kernels (manifest v2, release/LAYOUT.md),
       # built here natively and cold like everything else in a release: the
       # pinned elan, no Lean cache.
