@@ -172,34 +172,59 @@ WINDOWS_TYPES_AFTER_FIRST_FRAME = (
 )
 
 
-def test_lines_pasted_during_startup_land_in_the_prompt_unsubmitted(bin_path):
-    """A multi-line paste right after starting, before the prompt is up, comes
-    without bracketed paste (the REPL turns it on with its first prompt), so
-    every newline is an Enter. It used to submit `line1` on its own and drop or
-    queue the other lines. Now everything typed before the first prompt goes
-    into it as one paste: three lines in the box, nothing submitted until the
-    user presses Enter. The paste goes out after the splash, while App.init
-    still waits for `/v1/models` (4 s), on both platforms."""
+def _sent_during_startup(bin_path, raw_text, shown):
+    """`raw_text` arrives after the splash, while App.init still waits for
+    `/v1/models` (4 s), on both platforms; then the case waits for `shown`
+    and 1.5 s more (a submitted line would be echoed above the box by then)."""
     if IS_WINDOWS:
         first = ["strictsleep:0.3"]  # the driver has waited for the splash's settled frame
     else:
         first = [f"waitbytes:{FIRST_FRAME_EVENT}:30", "strictsleep:1.8"]
     server, base_url = SlowModels.serve(4.0)
     try:
-        # strictsleep after the lines show: a submitted line would be echoed above the box by then.
-        raw = run(bin_path, first + ["raw:line1\\rline2\\rline3", wait_for("line3"), "strictsleep:1.5"],
+        raw = run(bin_path, first + ["raw:" + raw_text, shown, "strictsleep:1.5"],
                   term_size=SIZE, env=dict(ON, METACODES_NO_PROBE=None), base_url=base_url, startup_drain=0)
     finally:
         server.shutdown()
     assert SlowModels.answered, "App.init did not wait for /v1/models"
     a = TTYAssert(raw, *SIZE)
-    screen = "\n".join(a.final.line_text(r) for r in range(a.final.rows))
+    return a, "\n".join(a.final.line_text(r) for r in range(a.final.rows))
+
+
+def test_lines_pasted_during_startup_land_in_the_prompt_unsubmitted(bin_path):
+    """A multi-line paste right after starting, before the prompt is up, comes
+    without bracketed paste (the REPL turns it on with its first prompt), so
+    every newline is an Enter. It used to submit `line1` on its own and drop or
+    queue the other lines. Now everything typed before the first prompt goes
+    into it as one paste: three lines in the box, nothing submitted until the
+    user presses Enter. The Enter after the last line is left out: kept, it
+    made a fourth, empty line, and four lines fold into a placeholder."""
+    a, screen = _sent_during_startup(bin_path, "line1\\rline2\\rline3\\r", wait_for("line3"))
     a.assert_box_height(3)
     top = a.box_top_row()
     for i, line in enumerate(("line1", "line2", "line3"), 1):
         a.assert_line_contains(top + i, line)
     # Submitted, `line1` would also be echoed above the box.
     assert sum("line1" in a.final.line_text(r) for r in range(a.final.rows)) == 1, "line1 was submitted:\n" + screen
+
+
+def test_a_paste_longer_than_4_kib_during_startup_is_one_paste_unsubmitted(bin_path):
+    """5000 bytes, a hundred lines. Only the first 4 KiB used to make the
+    paste; the rest stayed with the terminal as typed keys, and its first
+    newline submitted the cut paste with half a line."""
+    a, screen = _sent_during_startup(bin_path, ("x" * 49 + "\\r") * 100, wait_for("[Pasted text #1"))
+    assert "[Pasted text #1 " in screen and "#2" not in screen, screen
+    assert "x" * 20 not in screen, "part of the paste was typed or submitted:\n" + screen
+    assert "API request failed" not in screen and "Error" not in screen, "something was submitted:\n" + screen
+
+
+def test_enter_that_skips_the_splash_leaves_the_prompt_empty(bin_path):
+    """Enter is a key like any other for ending the splash; the newline it
+    types is not kept, so the first prompt is empty, not a blank line with the
+    cursor on a second one."""
+    a, _ = _sent_during_startup(bin_path, "\\r", IDLE)
+    a.assert_box_height(1)
+    a.assert_input_echo("")
 
 
 def test_keys_typed_during_the_splash_and_after_it_reach_the_prompt_in_order(bin_path):

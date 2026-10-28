@@ -121,23 +121,17 @@ extern "kernel32" fn ReadConsoleW(hConsoleInput: win.HANDLE, lpBuffer: [*]u16, n
 // 它们、再读终端:输入 parser 看到的字节流与没有探测时逐字节相同(#327)。
 // 单线程假设同上;唯一的跨线程读者(启动动画线程)在探测写完之后才起。
 pub const replay_capacity = 4096;
-/// Room past `replay_capacity` for wrapping what is owed: the first prompt
-/// hands everything typed before it back as one bracketed paste
-/// (`repl/input.zig`), markers around up to `replay_capacity` bytes of text.
-pub const replay_wrap_room = 16;
-var g_replay_buf: [replay_capacity + replay_wrap_room]u8 = undefined;
+var g_replay_buf: [replay_capacity]u8 = undefined;
 var g_replay_fd: c_int = -1;
 var g_replay_len: usize = 0;
 var g_replay_pos: usize = 0;
 
 /// Hand `bytes`, read from `fd` but not meant for the reader that took them,
 /// back to the next `readInput(fd, …)`, ahead of anything the terminal sends
-/// later. They append to what is still owed. Readers that hand back what they
-/// read keep what is owed to `replay_capacity` bytes (`replayRoom`); the
-/// buffer holds `replay_wrap_room` more, for the markers the first prompt
-/// wraps that in. This takes what fits and returns how many bytes it took.
-/// Callers read no more from the terminal than fits, so nothing is cut; one
-/// that passed more would lose the excess, never the buffer.
+/// later. They append to what is still owed. At most `replay_capacity` bytes
+/// are owed: this takes what fits (`replayRoom`) and returns how many bytes
+/// it took. Callers read no more from the terminal than fits, so nothing is
+/// cut; one that passed more would lose the excess, never the buffer.
 pub fn replayInput(fd: c_int, bytes: []const u8) usize {
     if (bytes.len == 0) return 0;
     if (g_replay_pos >= g_replay_len or g_replay_fd != fd) {
@@ -147,7 +141,7 @@ pub fn replayInput(fd: c_int, bytes: []const u8) usize {
     // Move what is still owed to the front, then append.
     const owed = g_replay_len - g_replay_pos;
     std.mem.copyForwards(u8, g_replay_buf[0..owed], g_replay_buf[g_replay_pos..g_replay_len]);
-    const n = @min(bytes.len, g_replay_buf.len - owed);
+    const n = @min(bytes.len, replay_capacity - owed);
     @memcpy(g_replay_buf[owed..][0..n], bytes[0..n]);
     g_replay_fd = fd;
     g_replay_pos = 0;
@@ -179,10 +173,9 @@ fn replayOwed(fd: c_int) []const u8 {
     return g_replay_buf[g_replay_pos..g_replay_len];
 }
 
-/// How many more bytes a reader may hand back with `replayInput(fd, …)` now:
-/// up to `replay_capacity` owed. None while a wrapped paste owes more.
+/// How many more bytes `replayInput(fd, …)` can take now.
 pub fn replayRoom(fd: c_int) usize {
-    return replay_capacity -| replayOwed(fd).len;
+    return replay_capacity - replayOwed(fd).len;
 }
 
 /// What the terminal has queued on `fd`, without waiting and without the

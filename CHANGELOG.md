@@ -112,9 +112,12 @@ status, compatibility boundaries, and entry points are defined by
   first prompt, so a paste right after starting arrived as typed keys and
   every newline was an Enter: the first line went to the model on its own,
   and the rest was dropped or queued as the next turn. Everything typed
-  before the first prompt (up to 4 KiB) now goes into it as one paste:
+  before the first prompt, of any length, now goes into it as one paste:
   newlines stay text, Backspace still deletes, other keys are left out, a
   large paste becomes the usual placeholder, and nothing is sent until Enter.
+  The newlines it starts or ends with (the Enter that skipped the animation,
+  the one after the last line) are left out, and input that is only blanks
+  leaves the prompt empty.
 
 ### Changed
 
