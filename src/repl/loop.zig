@@ -2031,7 +2031,7 @@ fn readLineRaw(
                     // 产生一对 open/close。见 RenderRegion.noteCtrloAndShouldSuppressReopen(生成期同源处理)。
                     if (region.noteCtrloAndShouldSuppressReopen()) continue;
                     // Ctrl+O → inline transcript viewer(方案 A:不覆盖 banner)。region.clear() 擦固定区
-                    // + 光标停区顶(=内容结束下一行,banner 在其上方保留)+ 清零 input_cursor_row;
+                    // + 光标停区顶(=内容结束下一行,banner 在其上方保留)+ 清零回顶支点 anchor;
                     // viewer 从区顶 DECSC 存档往下画 transcript,退出回区顶 + ESC[J 清掉,redraw 从区顶
                     // 相对重画固定区 → 跟随内容、幂等(不再 box_h 反推贴底,那是 box_top 漂移 bug 根源)。
                     const sz = tui_term_root.getSize(fd);

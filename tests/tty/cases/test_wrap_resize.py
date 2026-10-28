@@ -40,6 +40,46 @@ def test_T12_resize_widens(bin_path):
     a.assert_box_at_bottom()
 
 
+def _narrow_idle_box(bin_path, env=None, reflow=True):
+    """空闲输入框从 100 列分四步缩到 60 列(拖窗口边时一串 SIGWINCH),每步等重画。
+
+    回放在每次 resize 的那个字节偏移改尺寸:reflow=True 按现代终端重排已显示的行,
+    False 按 xterm 式裁剪。整条流按最终尺寸回放的话,看不到终端对旧画面做了什么。"""
+    from tty_driver import READY
+    resizes = []
+    events = [READY]
+    for cols in (90, 80, 70, 60):
+        events += [f"resize:24x{cols}", "strictsleep:0.5"]
+    raw = run(bin_path, events, term_size=(24, 100), env=env, resizes=resizes)
+    return TTYAssert(raw, resizes=resizes, reflow=reflow)
+
+
+def _assert_nothing_above_the_box_moved(a):
+    # 启动画面:banner、一行空行、输入框。少爬了行,空行处是旧横线;多爬了行(把裁剪的
+    # 终端当成会重排),新框盖掉空行和 banner 的底边。
+    top = a.box_top_row()
+    if top is None or top < 2 or a.final.line_text(top - 1) != "" or "─" not in a.final.line_text(top - 2):
+        a._fail(f"框上方应是一行空行和 banner 的底边(上边框在第 {top} 行)")
+
+
+def test_T43_narrowing_a_reflowing_terminal_leaves_one_box(bin_path):
+    # iTerm2、Terminal.app、kitty、xterm.js……变窄时把 99 列的横线重排成两行。
+    a = _narrow_idle_box(bin_path)
+    a.assert_single_box()
+    _assert_nothing_above_the_box_moved(a)
+    a.assert_input_echo("")
+    a.assert_cursor_on_content("")
+
+
+def test_T44_narrowing_a_clipping_terminal_keeps_the_lines_above_the_box(bin_path):
+    # xterm(XTERM_VERSION)变窄时只裁剪,横线仍是一行:按重排算行数会多爬一行,
+    # 每次 resize 吃掉框上方一行对话。
+    a = _narrow_idle_box(bin_path, env={"XTERM_VERSION": "XTerm(390)"}, reflow=False)
+    a.assert_single_box()
+    _assert_nothing_above_the_box_moved(a)
+    a.assert_cursor_on_content("")
+
+
 def test_T13_resize_during_generation_keeps_stream_and_region_aligned(bin_path):
     """A SIGWINCH during a live stream must not strand the fixed generation region.
 
@@ -51,6 +91,7 @@ def test_T13_resize_during_generation_keeps_stream_and_region_aligned(bin_path):
     from tty_driver import READY, wait_for
     from slow_mock_server import SlowMockServer, slow_text_then_end
 
+    resizes = []
     with SlowMockServer([slow_text_then_end(n_chunks=18, delay=0.2)]) as srv:
         raw = run(
             bin_path,
@@ -68,11 +109,19 @@ def test_T13_resize_during_generation_keeps_stream_and_region_aligned(bin_path):
             base_url=srv.url,
             startup_drain=0.8,
             per_key_drain=0.05,
+            resizes=resizes,
         )
 
-    a = TTYAssert(raw, rows=24, cols=60)
+    # The terminal re-wraps the generation region drawn at 80 columns when
+    # it narrows; the erase that follows has to climb those rows.
+    a = TTYAssert(raw, resizes=resizes)
     if a.final.find_last_row("tok17") is None:
         a._fail("resize 后流式输出尾部 tok17 丢失或落入固定区")
+    # A short climb stopped inside the old region and left its spinner row in
+    # the conversation, between the echo and the reply.
+    echo = a.final.find_row("❯ resize while generating")
+    if echo is None or not a.final.line_text(echo + 1).startswith("⏺"):
+        a._fail("回复应紧跟在提交回显下面:resize 后擦生成期固定区少爬了行,旧 spinner 行留在了对话里")
     # The final screen is the input phase, which always re-measures. The
     # generation region is drawn by a different path: its last frame (the
     # spinner still says "esc to interrupt") must use the new width too.
@@ -84,18 +133,23 @@ def test_T13_resize_during_generation_keeps_stream_and_region_aligned(bin_path):
     runs = [len(m.group(0)) // 3 for m in re.finditer(rb"(?:\xe2\x94\x80)+", gen_frames[-1])]
     if not runs or max(runs) > 60 or max(runs) < 50:
         a._fail(f"resize 后生成期固定区边框未按新宽度(60)重画:横线长度 {runs}")
-    a.assert_box_present()
-    a.assert_box_at_bottom()
+    a.assert_single_box()
 
 
 
-def _resize_during_dialog(bin_path, tool, tool_input, dialog_marker, answer_events):
+def _resize_during_dialog(bin_path, tool, tool_input, dialog_marker, answer_events, drawn_once):
     """Drive one tool call whose dialog is open while the terminal resizes.
 
     A resize interrupts the dialog's blocked key read with EINTR (SIGWINCH has
     no SA_RESTART). The dialog must keep waiting for a key instead of reading
     the interruption as an answer. Returns the final screen and the
     tool_result the next provider request carried.
+
+    The dialog redraws after each resize. The narrower terminal has re-wrapped
+    its full-width rows (and the 64-column permission box no longer fits 60),
+    so a redraw that climbs the rows it was drawn with stops inside the old
+    frame and leaves a second copy: `drawn_once` is on at most one row of the
+    screen the terminal holds (replayed with its reflow and autowrap).
     """
     import json
     from tty_driver import READY, wait_for
@@ -105,6 +159,7 @@ def _resize_during_dialog(bin_path, tool, tool_input, dialog_marker, answer_even
         slow_text_then_tooluse(n_chunks=1, delay=0.1, tool=tool, tool_input=tool_input),
         slow_text_then_end(n_chunks=1, delay=0.1),
     ]
+    resizes = []
     with SlowMockServer(turns) as srv:
         raw = run(
             bin_path,
@@ -114,7 +169,7 @@ def _resize_during_dialog(bin_path, tool, tool_input, dialog_marker, answer_even
                 "key:enter",
                 wait_for(dialog_marker, 15),
                 "strictsleep:0.8",
-                "resize:24x70",
+                "resize:24x60",
                 "strictsleep:1.0",
                 "resize:24x80",
                 "strictsleep:1.0",
@@ -124,9 +179,13 @@ def _resize_during_dialog(bin_path, tool, tool_input, dialog_marker, answer_even
             permission="default",
             startup_drain=0.8,
             per_key_drain=0.05,
+            resizes=resizes,
         )
         requests = list(srv.requests)
-    a = TTYAssert(raw, rows=24, cols=80)
+    a = TTYAssert(raw, resizes=resizes, autowrap=True)
+    copies = [r for r in range(a.rows) if drawn_once in a.final.line_text(r)]
+    if len(copies) > 1:
+        a._fail(f"resize 之后对话框叠了 {len(copies)} 份({drawn_once!r} 在 {copies} 行)")
     if len(requests) < 2:
         a._fail(f"工具结果没有发回模型(只收到 {len(requests)} 个请求)")
     result = None
@@ -160,6 +219,7 @@ def test_T14_resize_during_permission_prompt_keeps_waiting(bin_path):
         json.dumps({"file_path": target, "content": "x"}),
         "Permission required",
         ["type:y", "sleep:1.5"],
+        "[a] Yes, always",
     )
     text = _tool_result_text(result)
     if result.get("is_error") or "declined" in text:
@@ -189,6 +249,7 @@ def test_T15_resize_during_ask_question_keeps_waiting(bin_path):
         json.dumps(question),
         "Which colour?",
         ["key:enter", "sleep:1.5"],
+        "☐ Colour",
     )
     text = _tool_result_text(result)
     if result.get("is_error") or "Teal" not in text:

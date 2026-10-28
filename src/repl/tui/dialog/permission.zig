@@ -19,6 +19,7 @@ const ansi = @import("../ansi.zig");
 const theme_mod = @import("../theme.zig");
 const layout = @import("../layout.zig");
 const term = @import("../term.zig");
+const reflow = @import("../reflow.zig");
 const input_mod = @import("../../input.zig");
 const Theme = theme_mod.Theme;
 
@@ -106,19 +107,24 @@ pub fn prompt(alloc: std.mem.Allocator, th: Theme, tool_name: []const u8, args: 
 /// 用于:① prompt() 自己进 raw mode 后调;② TuiBackend 终端接管(停 watcher+持锁)后调。
 /// out_fd 输出(prompt 用 stdout=1;TuiBackend 接管用 stderr=2 与 region 同流)。
 /// 重画用 render 实际行数(不再硬编码 8——参数长会折行变多行,硬编码会错位)。
+/// 回顶按终端现在的宽度数上一帧占的行:框比终端宽时画的那一刻就折了行,终端变窄后
+/// 又会把每行重排成多行(reflow.zig);回顶后 ED 0 清掉旧帧多出的行。
 pub fn promptLoop(alloc: std.mem.Allocator, th: Theme, in_fd: c_int, out_fd: c_int, tool_name: []const u8, args: []const u8) ?PermissionChoice {
     var selected: usize = 0;
-    var prev_rows: usize = 0;
+    var drawn: ?reflow.Anchor = null;
+    const reflows = term.reflowFromEnv();
     while (true) {
-        if (prev_rows > 0) {
+        const cols: u16 = if (term.getSize(out_fd)) |size| size.cols else 80;
+        if (drawn) |anchor| {
             var up_buf: [16]u8 = undefined;
-            writeAll(out_fd, ansi.cursor.up(@intCast(prev_rows), &up_buf));
+            writeAll(out_fd, ansi.cursor.up(anchor.climb(cols, reflows), &up_buf));
             writeAll(out_fd, "\r");
+            writeAll(out_fd, ansi.clear.to_end_of_screen);
         }
         const frame = render(alloc, th, tool_name, args, selected) catch return .deny_once;
         defer alloc.free(frame);
         writeAll(out_fd, frame);
-        prev_rows = countRows(frame);
+        drawn = reflow.Anchor.atEnd(frame, cols);
 
         var buf: [8]u8 = undefined;
         const n = pfs.read(in_fd, &buf);
@@ -146,15 +152,6 @@ pub fn promptLoop(alloc: std.mem.Allocator, th: Theme, in_fd: c_int, out_fd: c_i
             }
         }
     }
-}
-
-/// frame 占的终端行数(= '\n' 数),供 cursor.up 精确回顶。
-fn countRows(frame: []const u8) usize {
-    var rows: usize = 0;
-    for (frame) |c| {
-        if (c == '\n') rows += 1;
-    }
-    return rows;
 }
 
 fn writeAll(fd: c_int, bytes: []const u8) void {

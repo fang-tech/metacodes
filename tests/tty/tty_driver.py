@@ -168,10 +168,16 @@ class _Capture:
     keepalive 过滤、宽字符)全部在 read_once 内消化,等待语义这里只有一份。
     """
 
-    def __init__(self, read_once, rows, cols, timeline=None):
+    def __init__(self, read_once, rows, cols, timeline=None, resizes=None):
         self._read_once = read_once
         # 可选:每收到一片字节记 (time.monotonic(), 累计字节数),供时序断言(见 arrival_time)。
         self.timeline = timeline
+        # 可选:[(字节偏移, rows, cols)],首项是起始尺寸;每个 resize: 事件追加一项,偏移 =
+        # 改尺寸那一刻已收到的字节数。驱动就是终端:改尺寸时它显示的正是这些字节,之后到的
+        # 字节按新尺寸画——TTYAssert(resizes=) 在同一偏移重排回放(见 Screen.resize)。
+        self.resizes = resizes
+        if resizes is not None:
+            resizes.append((0, rows, cols))
         self.out = bytearray()
         self.rows = rows
         self.cols = cols
@@ -382,6 +388,8 @@ def _drive(key_events, write, cap, set_size, per_key_drain, signal_child=None):
             spec = ev[7:]
             r2, c2 = spec.split("x")
             set_size(int(r2), int(c2))
+            if cap.resizes is not None:
+                cap.resizes.append((len(cap.out), int(r2), int(c2)))
             cap.drain(0.2)
         elif ev.startswith("raw:"):
             write(ev[4:].encode("latin-1", "ignore").decode("unicode_escape").encode("latin-1"))
@@ -395,7 +403,7 @@ def _drive(key_events, write, cap, set_size, per_key_drain, signal_child=None):
 
 def run(bin_path, key_events, term_size=(24, 80), env=None,
         startup_drain=0.8, per_key_drain=0.25, base_url="http://127.0.0.1:1/v1/messages",
-        permission="bypassPermissions", cwd=None, extra_args=None, timeline=None):
+        permission="bypassPermissions", cwd=None, extra_args=None, timeline=None, resizes=None):
     """fork pty,设窗口,exec bin,按 key_events 喂键,返回合并原始字节流。
 
     base_url: 默认指死端口(连接立即 refused,probeModels/请求不 hang)——离线渲染测试用。
@@ -405,6 +413,8 @@ def run(bin_path, key_events, term_size=(24, 80), env=None,
     extra_args: 追加到命令行的参数(如 ["--provider", "metask", "--model", "GLM-5.3-Flash"])。
     timeline: 传一个 list,收到的每片字节记 (time.monotonic(), 累计字节数);配 arrival_time()
               断言"某段字节在某时刻之前已上屏"(POSIX;ConPTY 重合成流,时序不可断言)。
+    resizes: 传一个 list,记起始尺寸和每个 resize: 落在输出流的位置 [(字节偏移, rows, cols)];
+             交给 TTYAssert(resizes=) 按终端重排回放(否则整条流按最终尺寸回放,看不到重排)。
 
     key_events 元素(字符串):
       "type:文本"        逐 codepoint 写(模拟打字,每字单独 drain → 暴露逐帧 bug)
@@ -428,10 +438,11 @@ def run(bin_path, key_events, term_size=(24, 80), env=None,
     try:
         if IS_WINDOWS:
             return _run_windows(bin_path, key_events, (rows, cols), full_env,
-                                permission, base_url, cwd, startup_drain, per_key_drain, extra_args=extra_args)
+                                permission, base_url, cwd, startup_drain, per_key_drain, extra_args=extra_args,
+                                resizes=resizes)
         return _run_posix(bin_path, key_events, (rows, cols), full_env,
                           permission, base_url, cwd, startup_drain, per_key_drain, extra_args=extra_args,
-                          timeline=timeline)
+                          timeline=timeline, resizes=resizes)
     finally:
         # ephemeral home 无凭证(live 用例都显式传播种 HOME),删失败无害,尽力而为。
         if ephemeral_home:
@@ -473,7 +484,8 @@ def _set_child_canonical(pid):
 
 
 def _run_posix(bin_path, key_events, term_size, full_env,
-               permission, base_url, cwd, startup_drain, per_key_drain, extra_args=None, timeline=None):
+               permission, base_url, cwd, startup_drain, per_key_drain, extra_args=None, timeline=None,
+               resizes=None):
     rows, cols = term_size
     pid, fd = pty.fork()
     if pid == 0:
@@ -510,7 +522,7 @@ def _run_posix(bin_path, key_events, term_size, full_env,
             return None
         return data
 
-    cap = _Capture(read_once, rows, cols, timeline)
+    cap = _Capture(read_once, rows, cols, timeline, resizes)
 
     def write(b):
         try:
@@ -571,7 +583,7 @@ def _reap(pid, timeout):
 
 
 def _run_windows(bin_path, key_events, term_size, full_env,
-                 permission, base_url, cwd, startup_drain, per_key_drain, extra_args=None):
+                 permission, base_url, cwd, startup_drain, per_key_drain, extra_args=None, resizes=None):
     """ConPTY 后端。与 POSIX run() 相同的键序列/drain 语义,返回原始字节流(UTF-8)。
 
     走 pywinpty 高层 PtyProcess(argv 列表 + env dict,它负责 which/cmdline/env 块拼装
@@ -602,7 +614,7 @@ def _run_windows(bin_path, key_events, term_size, full_env,
             return None
         return kfilter.feed(data)  # 整片是 keepalive 时返回 b"" → 不算新字节,不打破静默
 
-    cap = _Capture(read_once, rows, cols)
+    cap = _Capture(read_once, rows, cols, resizes=resizes)
 
     def write(b):
         # PtyProcess.write 收 str(内部 utf-8 编码)。type: 的 CJK 字节按 utf-8 还原;

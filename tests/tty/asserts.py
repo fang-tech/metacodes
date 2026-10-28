@@ -3,6 +3,8 @@
 切帧:RenderRegion 每次重画都包在 ESC[?25l ... ESC[?25h 之间(hide/show 光标对),
 这是最可靠的 flush 边界。一帧 = 一对 hide/show 之间的字节(含)。
 """
+import sys
+
 from screen import Screen, str_width
 
 HIDE = b"\x1b[?25l"
@@ -37,23 +39,53 @@ class AssertError(Exception):
 
 
 class TTYAssert:
-    def __init__(self, raw: bytes, rows=24, cols=80):
+    def __init__(self, raw: bytes, rows=24, cols=80, resizes=None, reflow=True, autowrap=False):
+        """resizes:run(resizes=) 记下的 [(字节偏移, rows, cols)]。给了就从起始尺寸回放,
+        每个偏移处按终端的做法改尺寸(reflow=True 重排,False 是 xterm 式裁剪),rows/cols
+        取最后一项。不给就整条流按 rows×cols 回放——看不到 resize 时终端对旧画面做了什么。
+        Windows 上忽略 resizes:ConPTY 在 conhost 里重排后自己重画整屏,流里已是重排后的样子。
+        autowrap:见 Screen(比终端宽的行在画的那一刻就折行,如比终端还宽的权限框)。"""
         self.raw = raw
+        self.autowrap = autowrap
+        if resizes and sys.platform != "win32":
+            self.resizes = list(resizes)
+            _, rows, cols = self.resizes[-1]
+        else:
+            self.resizes = [(0, rows, cols)]
+        self.reflow = reflow
         self.rows = rows
         self.cols = cols
         # 最终屏幕 = 整条流喂一个 Screen
-        self.final = Screen(rows, cols)
-        self.final.feed(raw)
+        self.final, pending = self._start()
+        self._feed(self.final, pending, 0, len(raw))
         # 逐帧快照(每帧累积喂,得到该帧后的屏幕)
         self.frame_screens = []
-        sc = Screen(rows, cols)
+        sc, pending = self._start()
+        at = 0
         for kind, chunk in split_frames(raw):
-            sc.feed(chunk)
+            self._feed(sc, pending, at, at + len(chunk))
+            at += len(chunk)
             if kind == "frame":
-                snap = Screen(rows, cols)
+                snap = Screen(sc.rows, sc.cols)
                 # 复制当前 grid 状态
                 self._copy_into(sc, snap)
                 self.frame_screens.append(snap)
+
+    def _start(self):
+        """起始尺寸的空屏 + 还没生效的 resize。"""
+        _, rows, cols = self.resizes[0]
+        return Screen(rows, cols, autowrap=self.autowrap), list(self.resizes[1:])
+
+    def _feed(self, sc, pending, start, end):
+        """把 raw[start:end] 喂给 sc,途经的 resize 在它的偏移处生效。"""
+        while pending and pending[0][0] <= end:
+            at, rows, cols = pending.pop(0)
+            if at > start:
+                sc.feed(self.raw[start:at])
+                start = at
+            sc.resize(rows, cols, self.reflow)
+        if start < end:
+            sc.feed(self.raw[start:end])
 
     def sync_screens(self):
         """The screen after every complete synchronized update (DEC 2026 end).
@@ -64,15 +96,15 @@ class TTYAssert:
         """
         marker = b"\x1b[?2026l"
         screens = []
-        sc = Screen(self.rows, self.cols)
+        sc, pending = self._start()
         start = 0
         while True:
             at = self.raw.find(marker, start)
             if at == -1:
                 break
             end = at + len(marker)
-            sc.feed(self.raw[start:end])
-            snap = Screen(self.rows, self.cols)
+            self._feed(sc, pending, start, end)
+            snap = Screen(sc.rows, sc.cols)
             self._copy_into(sc, snap)
             screens.append(snap)
             start = end
@@ -180,6 +212,21 @@ class TTYAssert:
         for r in range(foot + 1, self.rows):
             if self.final.line_text(r).strip():
                 self._fail(f"footer({foot}) 之下第 {r} 行有残留内容 '{self.final.line_text(r)}'")
+
+    def assert_single_box(self):
+        """屏上只剩一个输入框:整行横线只有框自己的上下边框,footer 只有一行。
+
+        resize 之后回区顶少爬了行(终端把画满一行的横线重排成了两行),新框就画在旧框
+        里面:上方留下旧横线的前半截,下方留下旧 footer,每次 resize 各多一条。"""
+        self.assert_box_at_bottom()
+        top, bot, foot = self.box_top_row(), self.box_bottom_row(), self.footer_row()
+        rules = [r for r in range(self.rows) if self._is_rule_row(self.final, r)]
+        if rules != [top, bot]:
+            self._fail(f"整行横线应只有框的上下边框 {[top, bot]},实际在 {rules} 行")
+        marker = "? for shortcuts" if "? for shortcuts" in self.final.line_text(foot) else "shift+tab to cycle"
+        footers = [r for r in range(self.rows) if marker in self.final.line_text(r)]
+        if footers != [foot]:
+            self._fail(f"footer 应只有第 {foot} 行,实际在 {footers} 行")
 
     def assert_line_contains(self, row, substr):
         txt = self.final.line_text(row)
