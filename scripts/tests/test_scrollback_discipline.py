@@ -289,7 +289,8 @@ def stale_allowances(root: Path) -> list[str]:
 def write(root: Path, relative: str, text: str) -> None:
     path = root / relative
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(text, encoding="utf-8", newline="\n")
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
+        f.write(text)
 
 
 class ScrollbackDisciplineTest(unittest.TestCase):
