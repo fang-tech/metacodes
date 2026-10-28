@@ -10,6 +10,8 @@ status, compatibility boundaries, and entry points are defined by
 
 ## Unreleased
 
+## 0.8.1 — 2026-10-28
+
 ### Fixed
 
 - **A resumed session no longer fails with `error: InvalidRecord` on the next
