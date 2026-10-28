@@ -316,6 +316,15 @@ pub const KeyParser = struct {
                             else => .unknown,
                         };
                     }
+                    // Alt+字母:mod=3。Kitty disambiguate 把 Alt+B/Alt+F 编成 CSI-u(旧编码 ESC b
+                    // 与"ESC 再按 b"有歧义),不认的话开了协议的终端上词跳转就没了。
+                    if (self.num2 == 3) {
+                        return switch (self.num1) {
+                            98, 66 => .alt_b,
+                            102, 70 => .alt_f,
+                            else => .unknown,
+                        };
+                    }
                     return .unknown;
                 }
                 return .unknown;
@@ -1821,6 +1830,17 @@ test "KeyParser: OSC 被控制键或别的序列截断 → 那个键照常" {
     keys = parseAll("\x1b]11;rgb\x1b[A", &buf);
     try testing.expectEqual(@as(usize, 1), keys.len);
     try testing.expect(keys[0] == .up);
+}
+
+test "KeyParser: Kitty 下的 Alt+B / Alt+F(CSI 98;3u / 102;3u)仍是词跳转" {
+    var buf: [4]Key = undefined;
+    var keys = parseAll("\x1b[98;3u\x1b[102;3u", &buf);
+    try testing.expectEqual(@as(usize, 2), keys.len);
+    try testing.expect(keys[0] == .alt_b and keys[1] == .alt_f);
+    // 其它 Alt 组合认不出,整条一个 .unknown,不漏字符。
+    keys = parseAll("\x1b[120;3u", &buf);
+    try testing.expectEqual(@as(usize, 1), keys.len);
+    try testing.expect(keys[0] == .unknown);
 }
 
 test "KeyParser: 被控制键或 ESC 截断的认不出 CSI 不吞那个键" {

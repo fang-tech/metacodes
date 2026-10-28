@@ -29,7 +29,9 @@ status, compatibility boundaries, and entry points are defined by
   (Claude Code #23350). A dumb terminal, GNU screen, zellij and
   `METACODES_NO_PROBE` are not asked either. Windows consoles are not asked:
   on Windows Terminal 1.24 the console host answers DA1 itself (in about
-  0.1 ms) and never the flags question.
+  0.1 ms) and never the flags question. With the protocol on, Alt+B and
+  Alt+F arrive as `CSI 98;3u` / `CSI 102;3u`; the key parser now reads them
+  as word movement (it dropped them, in kitty, WezTerm and Ghostty too).
 - **Keys typed while metacodes starts are no longer lost to its terminal
   query.** The background-colour probe discarded every byte it read that was
   not its answer, and switched modes with `TCSAFLUSH`, which discards typed
