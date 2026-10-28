@@ -178,7 +178,11 @@ status, compatibility boundaries, and entry points are defined by
   daemon, and an interrupt (Ctrl+C) while `run()` waits for it aborts the Run
   and waits for it to end before it propagates; a second interrupt stops the
   wait and leaves the Session busy until the Run ends, so `abort()` and
-  `close()` still reach it. The suite's
+  `close()` still reach it. A Run's thread starts inside the callbacks of the
+  thread that started it, so closing a Session from a callback of a child Run
+  that the Session's own tool started is still refused with RuntimeError, as
+  when the child ran on the tool's thread, instead of aborting the Session's
+  Run and waiting for a return that cannot come. The suite's
   permission-target test compares paths as paths, since AgentCore names
   Windows paths with forward slashes.
 - **A provider credential with a byte a request header cannot carry no longer

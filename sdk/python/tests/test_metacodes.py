@@ -333,6 +333,46 @@ class PythonSdkTest(unittest.TestCase):
                 caller.join(30)
         self.assertEqual(box["result"].text, "saw: child said: child answer")
 
+    def test_a_child_runs_callbacks_cannot_close_the_parent_session(self) -> None:
+        # The child's Run executes inside the parent's tool, on a thread of
+        # its own: closing the parent from the child's callbacks is refused,
+        # as from the parent's, and leaves the parent's Run alone. Closing an
+        # unrelated Session there works.
+        box = {}
+        outcomes = []
+
+        def close_parent_then_other(_event):
+            if outcomes:
+                return
+            try:
+                box["parent"].close(timeout=2)
+                outcomes.append("parent closed")
+            except RuntimeError:
+                outcomes.append("parent refused")
+            except TimeoutError:  # not refused: it aborted the parent's Run and waited
+                outcomes.append("parent waited")
+            box["other"].close(timeout=2)
+            outcomes.append("other closed")
+
+        @metacodes.tool(description="Asks a child session.")
+        def delegate(_arguments):
+            with self.session(box["runtime"], box["provider"]) as child:
+                return "child said: " + child.run("sub task", on_event=close_parent_then_other).text
+
+        script = [("tool", "delegate", {}), ("text", "child answer"), ("echo",)]
+        with MockProvider(script) as provider:
+            with metacodes.Runtime(tools=(), host_tools=[delegate]) as runtime:
+                box.update(runtime=runtime, provider=provider)
+                session = self.session(runtime, provider, permission_mode="full_access")
+                other = self.session(runtime, provider)
+                box.update(parent=session, other=other)
+                result = session.run("delegate it")
+                self.assertEqual(outcomes, ["parent refused", "other closed"])
+                self.assertTrue(session._handle)
+                self.assertFalse(other._handle)
+        self.assertEqual(result.stop_reason, "end_turn")
+        self.assertEqual(result.text, "saw: child said: child answer")
+
     def test_close_with_a_timeout_leaves_a_blocked_run_open(self) -> None:
         wait, started, release = self.blocking_tool()
         with MockProvider([("tool", "wait", {}), ("text", "done")]) as provider:
