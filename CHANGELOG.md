@@ -10,6 +10,40 @@ status, compatibility boundaries, and entry points are defined by
 
 ## Unreleased
 
+### Changed
+
+- **Shift+Enter inserts a newline in any terminal that says it can, not only
+  in the ones metacodes knows by name (#327).** The Kitty keyboard protocol
+  used to be turned on only when `TERM_PROGRAM`/`TERM` named iTerm2, WezTerm,
+  Ghostty, Warp, kitty or tmux. Every other terminal, including any terminal
+  reached over SSH (which forwards `TERM` but not `TERM_PROGRAM`), fell back
+  to bare Enter, so Shift+Enter submitted and the footer said `\ + ⏎ for
+  newline`. At startup the interactive REPL now asks a terminal it cannot
+  place the Kitty flags question (`CSI ? u`) followed by a DA1 request, in
+  the same write as the background-colour query: every terminal answers DA1
+  and answers in order, so DA1 arriving without a flags answer is a definite
+  no, and the round ends as soon as it does. The 120 ms deadline is only a
+  fallback (no answer: the protocol stays off). The named terminals and tmux
+  are still turned on without asking. Apple Terminal and the xterm.js hosts
+  (VS Code, Hyper) are now a deny-list that is neither asked nor turned on
+  (Claude Code #23350). A dumb terminal, GNU screen, zellij and
+  `METACODES_NO_PROBE` are not asked either. Windows consoles are not asked:
+  on Windows Terminal 1.24 the console host answers DA1 itself (in about
+  0.1 ms) and never the flags question.
+- **Keys typed while metacodes starts are no longer lost to its terminal
+  query.** The background-colour probe discarded every byte it read that was
+  not its answer, and switched modes with `TCSAFLUSH`, which discards typed
+  input outright. The startup probe now keeps the input already received and
+  hands every byte that is not an answer back to the REPL's input, in order,
+  ahead of what the terminal sends next.
+- **A terminal's answer that arrives after the startup probe gave up is no
+  longer typed into the prompt.** The key parser now consumes a whole
+  private-marker CSI (`ESC [ ? … c`, `ESC [ ? … u`), any CSI with more
+  parameters than it decodes (xterm's `ESC [ 27 ; 2 ; 13 ~`), and an OSC
+  answer (`ESC ] 11 ; … BEL`), reporting one unknown key for each. A late
+  background-colour answer used to arrive as Esc, text, Esc; the two Escs
+  cleared the prompt.
+
 ## 0.8.1 — 2026-10-28
 
 ### Fixed

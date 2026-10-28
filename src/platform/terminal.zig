@@ -115,9 +115,60 @@ var g_conin_pos: usize = 0;
 
 extern "kernel32" fn ReadConsoleW(hConsoleInput: win.HANDLE, lpBuffer: [*]u16, nNumberOfCharsToRead: win.DWORD, lpNumberOfCharsRead: *win.DWORD, pInputControl: ?*anyopaque) callconv(.winapi) c_int;
 
-/// 读终端输入。POSIX / 非 console fd:直读(CRT read)。Windows console(fd=0 且真 console):
-/// ReadConsoleW 宽读 → UTF-8 内部缓冲 → 按需吐出。返回读到字节数;0=EOF;<0=错误。
+// ── 回放:已从终端读走、还欠下一个读者的输入 ─────────────────────────────────
+// 启动期终端探测(repl/tui/bg_probe.zig)读应答时,同一批字节里可能夹着用户在探测期间
+// 敲的键、粘贴的文字。探测把这些原样交回这里(replayInput),readInput/waitReadable 先吐
+// 它们、再读终端:输入 parser 看到的字节流与没有探测时逐字节相同(#327)。
+// 单线程假设同上;唯一的跨线程读者(启动动画线程)在探测写完之后才起。
+pub const replay_capacity = 4096;
+var g_replay_buf: [replay_capacity]u8 = undefined;
+var g_replay_fd: c_int = -1;
+var g_replay_len: usize = 0;
+var g_replay_pos: usize = 0;
+
+/// Hand `bytes`, read from `fd` but not meant for the reader that took them,
+/// back to the next `readInput(fd, …)`, ahead of anything the terminal sends
+/// later. They append to what is still owed; at most `replay_capacity` bytes
+/// are ever owed, and the startup probe that calls this never takes more (a
+/// caller that did would lose the excess, never overrun the buffer).
+pub fn replayInput(fd: c_int, bytes: []const u8) void {
+    if (bytes.len == 0) return;
+    if (g_replay_pos >= g_replay_len or g_replay_fd != fd) {
+        g_replay_len = 0;
+        g_replay_pos = 0;
+    }
+    // Move what is still owed to the front, then append.
+    const owed = g_replay_len - g_replay_pos;
+    std.mem.copyForwards(u8, g_replay_buf[0..owed], g_replay_buf[g_replay_pos..g_replay_len]);
+    std.debug.assert(owed + bytes.len <= replay_capacity);
+    const n = @min(bytes.len, replay_capacity - owed);
+    @memcpy(g_replay_buf[owed..][0..n], bytes[0..n]);
+    g_replay_fd = fd;
+    g_replay_pos = 0;
+    g_replay_len = owed + n;
+}
+
+fn replayOwed(fd: c_int) []const u8 {
+    if (fd != g_replay_fd) return &.{};
+    return g_replay_buf[g_replay_pos..g_replay_len];
+}
+
+/// 读终端输入。先吐 replayInput 交回的字节(若有)。POSIX / 非 console fd:直读(CRT read)。
+/// Windows console(fd=0 且真 console):ReadConsoleW 宽读 → UTF-8 内部缓冲 → 按需吐出。
+/// 返回读到字节数;0=EOF;<0=错误。
 pub fn readInput(fd: c_int, buf: []u8) isize {
+    const owed = replayOwed(fd);
+    if (owed.len > 0 and buf.len > 0) {
+        const n = @min(buf.len, owed.len);
+        @memcpy(buf[0..n], owed[0..n]);
+        g_replay_pos += n;
+        return @intCast(n);
+    }
+    return readTerminal(fd, buf);
+}
+
+/// readInput without the replay: what the terminal itself sends.
+fn readTerminal(fd: c_int, buf: []u8) isize {
     if (is_windows and fd == 0) {
         const h = GetStdHandle(STD_INPUT_HANDLE);
         var mode: win.DWORD = 0;
@@ -150,8 +201,14 @@ pub fn readInput(fd: c_int, buf: []u8) isize {
 /// resize/focus/mouse/键抬起等 INPUT_RECORD 也会把句柄置 signaled,但 ReadFile 读不出字节——
 /// 不过滤的话 resize 一发生,调用方 read 直接阻塞到下一次真按键(TUI 卡死,ConPTY 实测)。
 /// 这里把队首的非产字节记录消费掉再判定;只剩非键记录时按"超时"返回,让调用方的
-/// 超时分支(查 resize 标志/轮询尺寸)跑起来。
+/// 超时分支(查 resize 标志/轮询尺寸)跑起来。replayInput 交回的字节还没吐完 → 立即可读。
 pub fn waitReadable(fd: c_int, timeout_ms: i32) i32 {
+    if (replayOwed(fd).len > 0) return 1;
+    return waitTerminal(fd, timeout_ms);
+}
+
+/// waitReadable without the replay: whether the terminal itself has input.
+fn waitTerminal(fd: c_int, timeout_ms: i32) i32 {
     if (is_windows) {
         // readInput 的内部 UTF-8 缓冲还有余量 → 立即可读(否则宽读一批后调用方在
         // waitReadable 上等 console 新事件,缓冲里的字节被卡住直到下一次按键)。
@@ -205,6 +262,12 @@ pub fn waitReadable(fd: c_int, timeout_ms: i32) i32 {
 /// reports those as readable, and `ReadConsoleW` would then block until the
 /// next key that types something. POSIX, or a non-console fd: the bytes
 /// already readable, a bounded number of reads that never wait.
+///
+/// Bytes handed back with `replayInput` stay: the process has already read
+/// them from the terminal and owes them to the input parser, they are not
+/// pending there. The keys typed while the startup probe waited for its
+/// answers skip the startup animation (it discards the key that skips it)
+/// and still reach the prompt.
 pub fn discardPendingInput(fd: c_int) void {
     if (is_windows and fd == 0) {
         const h = GetStdHandle(STD_INPUT_HANDLE);
@@ -220,8 +283,8 @@ pub fn discardPendingInput(fd: c_int) void {
     // cannot hold the caller; each read follows a zero-timeout check.
     var scratch: [256]u8 = undefined;
     var rounds: u8 = 0;
-    while (rounds < 64 and waitReadable(fd, 0) > 0) : (rounds += 1) {
-        if (readInput(fd, &scratch) <= 0) break;
+    while (rounds < 64 and waitTerminal(fd, 0) > 0) : (rounds += 1) {
+        if (readTerminal(fd, &scratch) <= 0) break;
     }
 }
 
@@ -259,8 +322,30 @@ pub fn windowSize(fd: c_int) ?TermSize {
 }
 
 /// 进 raw 模式（关行缓冲/回显/信号），返回原始状态（restoreMode 复原）；非 tty/失败 → null。
-/// 只切模式，不发 escape 序列（上层负责）。
+/// 只切模式，不发 escape 序列（上层负责）。POSIX 切换时丢掉终端已收、未读的输入(TCSAFLUSH)。
 pub fn enterRaw(fd: c_int) ?SavedMode {
+    return enterRawWith(fd, .discard);
+}
+
+/// What a POSIX mode switch does with input the terminal has received but
+/// nobody has read. A Windows console mode switch never discards input.
+const PendingInput = enum { discard, keep };
+
+/// enterRaw that keeps the input already received (TCSANOW): a line typed
+/// ahead in cooked mode becomes readable instead of being dropped. For a
+/// reader that hands back every byte it does not consume (the startup probe,
+/// `replayInput`).
+pub fn enterRawKeepingInput(fd: c_int) ?SavedMode {
+    return enterRawWith(fd, .keep);
+}
+
+/// restoreMode that keeps the input already received, the pair of
+/// enterRawKeepingInput.
+pub fn restoreModeKeepingInput(fd: c_int, saved: SavedMode) void {
+    restoreModeWith(fd, saved, .keep);
+}
+
+fn enterRawWith(fd: c_int, pending: PendingInput) ?SavedMode {
     if (is_windows) {
         const hin = GetStdHandle(STD_INPUT_HANDLE);
         const hout = GetStdHandle(STD_OUTPUT_HANDLE);
@@ -300,12 +385,23 @@ pub fn enterRaw(fd: c_int) ?SavedMode {
     raw.iflag.ISTRIP = false;
     raw.cc[@intFromEnum(std.c.V.MIN)] = 1;
     raw.cc[@intFromEnum(std.c.V.TIME)] = 0;
-    if (std.c.tcsetattr(fd, std.posix.TCSA.FLUSH, &raw) != 0) return null;
+    if (std.c.tcsetattr(fd, tcsaction(pending), &raw) != 0) return null;
     return orig;
 }
 
-/// 复原终端模式。
+fn tcsaction(pending: PendingInput) @TypeOf(std.posix.TCSA.FLUSH) {
+    return switch (pending) {
+        .discard => std.posix.TCSA.FLUSH,
+        .keep => std.posix.TCSA.NOW,
+    };
+}
+
+/// 复原终端模式。POSIX 切换时丢掉终端已收、未读的输入(TCSAFLUSH)。
 pub fn restoreMode(fd: c_int, saved: SavedMode) void {
+    restoreModeWith(fd, saved, .discard);
+}
+
+fn restoreModeWith(fd: c_int, saved: SavedMode, pending: PendingInput) void {
     if (is_windows) {
         _ = SetConsoleMode(GetStdHandle(STD_INPUT_HANDLE), saved.in_mode);
         // 仅当原输出模式成功取到才复原——否则 out_mode=0 的 SetConsoleMode 会清掉 VT processing
@@ -317,7 +413,7 @@ pub fn restoreMode(fd: c_int, saved: SavedMode) void {
         // stdin 文本/二进制模式还原(0/-1 = 未记录或失败——不动)。
         if (saved.stdin_fmode > 0) _ = _setmode(0, saved.stdin_fmode);
     } else {
-        _ = std.c.tcsetattr(fd, std.posix.TCSA.FLUSH, &saved);
+        _ = std.c.tcsetattr(fd, tcsaction(pending), &saved);
     }
 }
 
@@ -386,6 +482,44 @@ test "discardPendingInput drops readable bytes and never waits" {
     // Nothing pending: it returns at once instead of blocking on the read end.
     discardPendingInput(fds[0]);
     try std.testing.expectEqual(@as(i32, 0), waitReadable(fds[0], 0));
+}
+
+fn resetReplayForTesting() void {
+    g_replay_fd = -1;
+    g_replay_len = 0;
+    g_replay_pos = 0;
+}
+
+test "replayInput: owed bytes come first, in order, survive a discard and only for their fd" {
+    if (is_windows) return;
+    defer resetReplayForTesting();
+    var fds: [2]c_int = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.pipe(&fds));
+    defer _ = std.c.close(fds[0]);
+    defer _ = std.c.close(fds[1]);
+
+    replayInput(fds[0], "ab\x1b");
+    // Readable without waiting, though the terminal sent nothing.
+    try std.testing.expectEqual(@as(i32, 1), waitReadable(fds[0], 0));
+    // Another descriptor is not owed them.
+    try std.testing.expectEqual(@as(i32, 0), waitReadable(fds[1], 0));
+
+    var buf: [8]u8 = undefined;
+    try std.testing.expectEqual(@as(isize, 1), readInput(fds[0], buf[0..1]));
+    try std.testing.expectEqual(@as(u8, 'a'), buf[0]);
+    // More owed later goes after what is still owed.
+    replayInput(fds[0], "[A");
+    // A discard drops what the terminal has pending, not what is owed.
+    try std.testing.expectEqual(@as(isize, 3), std.c.write(fds[1], "zzz", 3));
+    discardPendingInput(fds[0]);
+    try std.testing.expectEqual(@as(isize, 4), readInput(fds[0], &buf));
+    try std.testing.expectEqualStrings("b\x1b[A", buf[0..4]);
+
+    // Paid off: the terminal is read again.
+    try std.testing.expectEqual(@as(i32, 0), waitReadable(fds[0], 0));
+    try std.testing.expectEqual(@as(isize, 1), std.c.write(fds[1], "c", 1));
+    try std.testing.expectEqual(@as(isize, 1), readInput(fds[0], &buf));
+    try std.testing.expectEqual(@as(u8, 'c'), buf[0]);
 }
 
 test "console_reflows: conhost clips on Windows; elsewhere the terminal emulator decides" {
