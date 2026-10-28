@@ -569,6 +569,25 @@ pub const McpClient = struct {
         abort: ?*const AbortSignal,
         require_content: bool,
     ) !ToolResultBody {
+        var body: ToolResultBody = undefined;
+        try self.requestBodyInto(&body, method, params_json, artifact_root, budget, abort, require_content);
+        return body;
+    }
+
+    /// `requestBody` writing its result to `out`, as `requestBodyUnlocked`
+    /// does: in a function returning a ToolResultBody, each `return error.X`
+    /// would copy a 3.7 KiB constant, one per error name
+    /// (doc/PERF_MEMORY_PRINCIPLES.md §3g).
+    fn requestBodyInto(
+        self: *McpClient,
+        out: *ToolResultBody,
+        method: []const u8,
+        params_json: []const u8,
+        artifact_root: []const u8,
+        budget: result_budget.Budget,
+        abort: ?*const AbortSignal,
+        require_content: bool,
+    ) !void {
         self.request_mutex.lock();
         defer self.request_mutex.unlock();
         self.transport.setDeadline(if (self.request_timeout_ms) |ms| util_time.nowMs() + ms else null);
@@ -577,8 +596,13 @@ pub const McpClient = struct {
         defer self.allocator.free(params);
         var round: usize = 0;
         while (true) : (round += 1) {
-            switch (try self.requestBodyUnlocked(method, params, artifact_root, budget, abort, require_content)) {
-                .body => |body| return body,
+            var outcome: BodyOutcome = undefined;
+            try self.requestBodyUnlocked(&outcome, method, params, artifact_root, budget, abort, require_content);
+            switch (outcome) {
+                .body => |body| {
+                    out.* = body;
+                    return;
+                },
                 .input_required => |result| {
                     defer self.allocator.free(result);
                     if (round + 1 >= MAX_INPUT_ROUNDS) return error.McpInputRequired;
@@ -598,13 +622,14 @@ pub const McpClient = struct {
 
     fn requestBodyUnlocked(
         self: *McpClient,
+        out: *BodyOutcome,
         method: []const u8,
         params_json: []const u8,
         artifact_root: []const u8,
         budget: result_budget.Budget,
         abort: ?*const AbortSignal,
         require_content: bool,
-    ) !BodyOutcome {
+    ) !void {
         if (artifact_root.len == 0) return error.ArtifactRootUnavailable;
         const id = self.nextId();
         const params = try self.wireParams(self.allocator, params_json);
@@ -649,20 +674,27 @@ pub const McpClient = struct {
                 if (try self.handleIncoming(obj, line)) continue;
                 const response_id = responseId(obj);
                 if (response_id != null and response_id.? != id) continue;
-                if (obj.get("error") != null)
-                    return .{ .body = try self.structuredMcpError(line, .other, .user_error) };
+                if (obj.get("error") != null) {
+                    out.* = .{ .body = try self.structuredMcpError(line, .other, .user_error) };
+                    return;
+                }
                 const response = protocol.parseResponse(line) catch
                     return error.McpMalformedResponse;
-                if (!response.isSuccess())
-                    return .{ .body = try self.structuredMcpError(line, .other, .user_error) };
+                if (!response.isSuccess()) {
+                    out.* = .{ .body = try self.structuredMcpError(line, .other, .user_error) };
+                    return;
+                }
                 const result = response.result_json orelse "null";
                 if (self.modern and isInputRequired(self.allocator, result)) {
                     if (!mrtrMethod(method)) return error.McpInputRequired;
-                    return .{ .input_required = try self.allocator.dupe(u8, result) };
+                    out.* = .{ .input_required = try self.allocator.dupe(u8, result) };
+                    return;
                 }
-                if (result.len <= budget.per_result_bytes)
-                    return .{ .body = ToolResultBody.initInline(try self.allocator.dupe(u8, result)) };
-                return .{
+                if (result.len <= budget.per_result_bytes) {
+                    out.* = .{ .body = ToolResultBody.initInline(try self.allocator.dupe(u8, result)) };
+                    return;
+                }
+                out.* = .{
                     .body = sealJsonResult(self.allocator, artifact_root, result) catch |err| {
                         // Keep a complete bounded result renderable when CAS publication fails.
                         if (!result_budget.retainInlineAfterFailedPublish(
@@ -671,9 +703,11 @@ pub const McpClient = struct {
                             true,
                             CONTROL_FRAME_MATERIALIZE_BYTES,
                         )) return err;
-                        return .{ .body = ToolResultBody.initInline(try self.allocator.dupe(u8, result)) };
+                        out.* = .{ .body = ToolResultBody.initInline(try self.allocator.dupe(u8, result)) };
+                        return;
                     },
                 };
+                return;
             }
 
             const projected = try result_stream.project(
@@ -688,22 +722,25 @@ pub const McpClient = struct {
                 require_content,
             );
             switch (projected) {
-                .result => |body| return .{ .body = body },
+                .result => |body| out.* = .{ .body = body },
                 .diagnostic => |diagnostic| {
                     if (diagnostic.code == .response_id_mismatch) continue;
-                    if (diagnostic.code == .resource_limit)
-                        return .{ .body = try self.structuredMcpError(
+                    if (diagnostic.code == .resource_limit) {
+                        out.* = .{ .body = try self.structuredMcpError(
                             @tagName(diagnostic.code),
                             .io_error,
                             .system_error,
                         ) };
-                    return .{ .body = try self.structuredMcpError(
-                        @tagName(diagnostic.code),
-                        .other,
-                        .user_error,
-                    ) };
+                    } else {
+                        out.* = .{ .body = try self.structuredMcpError(
+                            @tagName(diagnostic.code),
+                            .other,
+                            .user_error,
+                        ) };
+                    }
                 },
             }
+            return;
         }
     }
 

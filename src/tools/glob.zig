@@ -15,8 +15,19 @@ const STDERR_CAPTURE_BYTES: usize = 64 * 1024;
 /// Production path: ripgrep writes to a private Session capture from byte
 /// zero, then only the first 100 bounded path rows are materialized.
 pub fn executeBody(ctx: *const ToolContext, args: []const u8) anyerror!ToolResultBody {
-    if (ctx.artifact_root.len == 0)
-        return ToolResultBody.initInline(try execute(ctx, args));
+    var body: ToolResultBody = undefined;
+    try executeBodyInto(&body, ctx, args);
+    return body;
+}
+
+/// `executeBody` writing its result to `out`. In a function returning a
+/// ToolResultBody, each `return error.X` would copy a 3.7 KiB constant, one
+/// per error name (doc/PERF_MEMORY_PRINCIPLES.md §3g).
+fn executeBodyInto(out: *ToolResultBody, ctx: *const ToolContext, args: []const u8) anyerror!void {
+    if (ctx.artifact_root.len == 0) {
+        out.* = .initInline(try execute(ctx, args));
+        return;
+    }
 
     const allocator = ctx.allocator;
     const pattern = common.extractJsonArg(args, "pattern") orelse return error.MissingPattern;
@@ -78,7 +89,7 @@ pub fn executeBody(ctx: *const ToolContext, args: []const u8) anyerror!ToolResul
 
     var summary = try summarizeCapture(allocator, &spawned.stdout, spawned.capture_complete);
     defer summary.deinit(allocator);
-    return ToolResultBody.initInline(try renderSummary(allocator, summary));
+    out.* = .initInline(try renderSummary(allocator, summary));
 }
 
 const CaptureSummary = struct {

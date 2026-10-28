@@ -219,10 +219,24 @@ fn executeCliProcessTool(
     args: []const u8,
     raw: ?*anyopaque,
 ) anyerror!@import("core/tool_result.zig").ToolResultBody {
+    var body: @import("core/tool_result.zig").ToolResultBody = undefined;
+    try executeCliProcessToolInto(&body, ctx, args, raw);
+    return body;
+}
+
+/// `executeCliProcessTool` writing its result to `out`. In a function
+/// returning a ToolResultBody, each `return error.X` would copy a 3.7 KiB
+/// constant, one per error name (doc/PERF_MEMORY_PRINCIPLES.md §3g).
+fn executeCliProcessToolInto(
+    out: *@import("core/tool_result.zig").ToolResultBody,
+    ctx: *const @import("tools/context.zig").ToolContext,
+    args: []const u8,
+    raw: ?*anyopaque,
+) anyerror!void {
     const isolated: *const @import("core/tool_catalog.zig").IsolatedTool =
         @ptrCast(@alignCast(raw orelse return error.ProcessPluginUnavailable));
     const outcome = try isolated.execute(isolated.ctx, ctx, args);
-    return switch (outcome) {
+    out.* = switch (outcome) {
         .ok => |body| body,
         .host_failed => |detail| {
             installCliProcessError(ctx, detail);
@@ -234,7 +248,7 @@ fn executeCliProcessTool(
         },
         // process.zig never produces fatal. Keep the legacy adapter fail-closed
         // if another isolated implementation violates that contract.
-        .host_fatal => error.ProcessPluginProtocolViolation,
+        .host_fatal => return error.ProcessPluginProtocolViolation,
     };
 }
 
