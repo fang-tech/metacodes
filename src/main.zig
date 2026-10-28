@@ -45,9 +45,17 @@ pub const VERSION = @import("version.zig").semver;
 /// ReleaseSmall binary the unused stack was 256 KiB of RSS in every thread,
 /// the main one included (the idle red line of
 /// doc/PERF_MEMORY_PRINCIPLES.md §2). Builds that install the handler keep it.
+///
+/// `allow_stack_tracing`: std defaults it to "built with debug info", and on it
+/// links in about 100 KB of std.debug unwinding code. The ReleaseSmall executable never
+/// traces. A stripped build already has it off, and is byte-identical with or
+/// without this line. With `-Drelease-symbols` the executable links with DWARF
+/// for the split symbol file, and this keeps its code within a few bytes of
+/// the stripped build's (doc/RELEASE_RUNNER.md, "Debug symbols").
 pub const std_options: std.Options = .{
     .unexpected_error_tracing = false,
     .signal_stack_size = if (std.debug.default_enable_segfault_handler) (std.Options{}).signal_stack_size else null,
+    .allow_stack_tracing = !builtin.strip_debug_info and builtin.mode != .ReleaseSmall,
 };
 
 /// Panics go through the default handler (message, stack trace, abort), after

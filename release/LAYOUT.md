@@ -102,6 +102,14 @@ same (it never replaces an archive). `zig build release:sums` joins every
 `.sha256` under the archive directory into `metacodes-<version>-SHA256SUMS`
 (`sha256sum -c` format), re-verifying each sidecar against its archive first.
 
+On Linux, `-Drelease-symbols=true` also makes `release:archive` write
+`metacodes-<version>-<target-id>-debug.tar.gz`. That archive holds the
+executable's split debug symbols as `bin/metacodes.debug`, and it is refused
+unless the unit's `bin/metacodes` names that file by build ID and
+`.gnu_debuglink`. It sits beside the unit's archive and is never part of it;
+`doc/RELEASE_RUNNER.md`, "Debug symbols", covers how it is built and how to
+read a core dump with it.
+
 The channel gate applies at archive time too (#47 Q1/Q3): a stable version
 archives only from a clean tree whose HEAD carries the bare `X.Y.Z` tag; a
 pre-release (`0.x.y-dev+<commit12>`) archives from any commit but is published

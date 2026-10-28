@@ -12,6 +12,28 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Added
 
+- **Linux releases ship their debug symbols as a separate asset.**
+  - **What the asset is.** Each Linux unit gets
+    `metacodes-<version>-<target-id>-debug.tar.gz` beside its archive, holding
+    `bin/metacodes.debug`. `release:archive` with `-Drelease-symbols=true`
+    links the executable once with DWARF and a build ID, then splits it with
+    `objcopy`. The unit ships the stripped half, and the symbols archive the
+    other.
+  - **How it is checked.** The packager refuses the symbols archive unless the
+    unit's executable names that file by build ID and by `.gnu_debuglink`
+    (name and CRC-32).
+  - **How it is published.** The archive is byte-reproducible, listed in
+    `SHA256SUMS`, attached to the release, and downloaded by neither
+    `install.sh` nor `metacodes update`.
+  - **Effect on the executable.** It grows by 256 bytes (the build-ID note and
+    the debug link).
+  - **Using it.** `gdb -s metacodes.debug -e bin/metacodes -c core` gives every
+    thread's whole stack with function names and source lines, even once the
+    executable drops `.eh_frame` (`doc/RELEASE_RUNNER.md`, "Debug symbols").
+  - **Code unchanged.** `src/main.zig` turns stack tracing off for every
+    ReleaseSmall build, so DWARF no longer links in ~100 KB of unwinding code.
+    A stripped build is byte-identical with or without that line.
+
 - **CI reports the footprint red lines** (#303). The Linux and macOS `release`
   legs of `ci.yml` run `scripts/perf_baseline.sh --build` (ReleaseSmall binary
   size, warm `--help` start, idle peak RSS; `doc/PERF_MEMORY_PRINCIPLES.md` §2)
