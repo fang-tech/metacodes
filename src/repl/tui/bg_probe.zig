@@ -1128,37 +1128,38 @@ test "Late: a cut answer read only after a read wait still takes the tail that c
     try testing.expectEqualStrings("ls", got.owed);
 }
 
-/// What the prompt gets when, after `cut` waited a read wait for its tail,
-/// `text` is typed key by key, each key read on its own.
-fn typedKeyByKeyAfterOverdue(cut: []const u8, text: []const u8, out: []u8) ![]u8 {
-    var fds: [2]c_int = undefined;
-    try testing.expectEqual(@as(c_int, 0), std.c.pipe(&fds));
-    defer _ = std.c.close(fds[0]);
-    defer _ = std.c.close(fds[1]);
-    const r = fds[0];
-    defer forgetOwedForTest(r);
-    g_late = Late.init(r, std.mem.zeroes(platform_term.SavedMode), scan(both, cut));
-    defer g_late = null;
-    g_late.?.progress_ms -= late_tail_ms;
-    for (text) |c| {
-        try testing.expect(pfs.writeAll(fds[1], &.{c}));
-        _ = lateAnswersOnly(r); // the splash looks, frame after frame
-    }
-    try testing.expect(handOver(r) != null);
-    var rest: [8]u8 = undefined;
-    return drainForTest(r, out, &rest).owed;
-}
-
 test "Late: keys typed one by one after a cut answer went overdue are typed, those that fit its tail too" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
-    var out: [32]u8 = undefined;
-    // `f` is a hex digit: it fits the colour. Taking it used to restart the
-    // wait, so the next key fitted too (an OSC body takes any printable).
-    try testing.expectEqualStrings("fix the bug", try typedKeyByKeyAfterOverdue("\x1b]11;rgb:1e1e/", "fix the bug", &out));
-    try testing.expectEqualStrings("1. fix", try typedKeyByKeyAfterOverdue("\x1b[?62;", "1. fix", &out));
-    try testing.expectEqualStrings("hello", try typedKeyByKeyAfterOverdue("\x1b]11;rgb:1e1e/", "hello", &out));
-    // The tail itself, arriving late and in pieces, still completes it.
-    try testing.expectEqualStrings("ls", try typedKeyByKeyAfterOverdue("\x1b[?62;", "22cls", &out));
+    // What the prompt gets when, after the cut answer waited a read wait for
+    // its tail, the text is typed key by key, each key read on its own.
+    const cases = [_]struct { cut: []const u8, typed: []const u8, prompt: []const u8 }{
+        // `f` is a hex digit: it fits the colour. Taking it used to restart
+        // the wait, so the next key fitted too (an OSC body takes any printable).
+        .{ .cut = "\x1b]11;rgb:1e1e/", .typed = "fix the bug", .prompt = "fix the bug" },
+        .{ .cut = "\x1b[?62;", .typed = "1. fix", .prompt = "1. fix" },
+        .{ .cut = "\x1b]11;rgb:1e1e/", .typed = "hello", .prompt = "hello" },
+        // The tail itself, arriving late and in pieces, still completes it.
+        .{ .cut = "\x1b[?62;", .typed = "22cls", .prompt = "ls" },
+    };
+    for (cases) |case| {
+        var fds: [2]c_int = undefined;
+        try testing.expectEqual(@as(c_int, 0), std.c.pipe(&fds));
+        defer _ = std.c.close(fds[0]);
+        defer _ = std.c.close(fds[1]);
+        const r = fds[0];
+        defer forgetOwedForTest(r);
+        g_late = Late.init(r, std.mem.zeroes(platform_term.SavedMode), scan(both, case.cut));
+        defer g_late = null;
+        g_late.?.progress_ms -= late_tail_ms;
+        for (case.typed) |c| {
+            try testing.expect(pfs.writeAll(fds[1], &.{c}));
+            _ = lateAnswersOnly(r); // the splash looks, frame after frame
+        }
+        try testing.expect(handOver(r) != null);
+        var owed: [32]u8 = undefined;
+        var rest: [8]u8 = undefined;
+        try testing.expectEqualStrings(case.prompt, drainForTest(r, &owed, &rest).owed);
+    }
 }
 
 test "Scanner.tailFits: an answer's own bytes fit it, typed text does not" {
