@@ -1238,6 +1238,212 @@ const RunCounters = struct {
     usage_unknown: bool = false,
 };
 
+// Run-end records of the host gates and sensors, one function each, called by
+// the matching `defer` in `runCounted`. Zig copies a `defer` body into every
+// exit of its scope, and `runCounted` has about 250 of them (`try`, `return`,
+// `break`, `continue`), so written inline these records were some 270 KB of
+// the Linux ReleaseSmall binary (doc/PERF_MEMORY_PRINCIPLES.md §2).
+// `noinline` keeps each one a single copy. A `defer` evaluates its arguments
+// when it runs, so each record still reads the Run's final state.
+
+noinline fn recordProgressUpdates(opts: *const Options, state: *const progress_updates_mod.State) void {
+    if (opts.tool_observer) |observer| {
+        _ = observer.emit(.{ .progress_updates = .{
+            .enforced = opts.progress_updates,
+            .silent_rounds_threshold = opts.progress_update_thresholds.rounds,
+            .min_silent_ms = opts.progress_update_thresholds.min_silent_ms,
+            .max_silent_rounds = state.max_silent_rounds,
+            .decisions = state.decisions,
+            .nudges = state.nudges,
+            .max_nudges = progress_updates_mod.MAX_PROGRESS_NUDGES,
+        } });
+    }
+    if (state.decisions > 0) {
+        log.info("agent", "progress update decisions={d} nudges={d} max_silent_rounds={d}", .{ state.decisions, state.nudges, state.max_silent_rounds });
+    }
+}
+
+noinline fn recordStallGate(opts: *const Options, mode: stall_gate_mod.Mode, state: *const stall_gate_mod.State) void {
+    if (opts.tool_observer) |observer| {
+        _ = observer.emit(.{ .stall_gate = .{
+            .enforced = mode == .enforce,
+            .repeat_rounds_threshold = opts.stall_gate_thresholds.repeat_rounds,
+            .repeat_calls_threshold = opts.stall_gate_thresholds.repeat_calls,
+            .stale_rounds_threshold = opts.stall_gate_thresholds.stale_rounds,
+            .rounds = state.rounds,
+            .progress_rounds = state.progress_rounds,
+            .max_stale_rounds = state.max_stale_rounds,
+            .max_repeats = state.max_repeats,
+            .forgotten = state.forgotten,
+            .decisions = state.decisions,
+            .max_decisions = stall_gate_mod.MAX_STALL_DECISIONS,
+            .cause = if (state.decided) |report| switch (report.cause) {
+                .repeating => .repeating,
+                .stale => .stale,
+            } else .none,
+            .decided_round = if (state.decided) |report| report.round else 0,
+        } });
+    }
+    if (state.decisions > 0) {
+        log.info("agent", "stall gate decisions={d} rounds={d} max_stale_rounds={d} max_repeats={d}", .{ state.decisions, state.rounds, state.max_stale_rounds, state.max_repeats });
+    }
+}
+
+noinline fn recordDeliveryCadence(opts: *const Options, state: *const delivery_cadence_mod.State) void {
+    if (opts.tool_observer) |observer| {
+        _ = observer.emit(.{ .delivery_cadence = .{
+            .enforced = opts.delivery_cadence,
+            .exploration_calls = state.exploration_calls,
+            .mutations_occurred = state.mutation_seen,
+            .levels_reached = state.level,
+            .nudges = state.nudges,
+            .max_nudges = delivery_cadence_mod.MAX_CADENCE_NUDGES,
+            .first_threshold = opts.delivery_cadence_thresholds.first,
+            .second_threshold = opts.delivery_cadence_thresholds.second,
+        } });
+    }
+}
+
+noinline fn recordLearningReport(counters: *RunCounters, state: *const learning_turn_mod.State, mode: learning_turn_mod.Mode) void {
+    counters.learning = state.report(mode);
+}
+
+noinline fn recordLearningTurn(opts: *const Options, state: *const learning_turn_mod.State, mode: learning_turn_mod.Mode) void {
+    if (opts.tool_observer) |observer| {
+        const report = state.report(mode);
+        _ = observer.emit(.{ .learning_turn = .{
+            .enforced = report.enforced,
+            .grounding = switch (report.grounding) {
+                .unchecked => .unchecked,
+                .passed => .passed,
+                .failed => .failed,
+                .tainted => .tainted,
+                .unavailable => .unavailable,
+            },
+            .decision = switch (report.decision) {
+                .none_unfinished => .none_unfinished,
+                .none_unchecked => .none_unchecked,
+                .none_unavailable => .none_unavailable,
+                .none_tainted => .none_tainted,
+                .none_unstorable => .none_unstorable,
+                .distill => .distill,
+            },
+            .passes = report.passes,
+            .distill_turns = report.distill_turns,
+            .reconcile_turns = report.reconcile_turns,
+            .lessons_accepted = report.lessons_accepted,
+            .lessons_refused = report.lessons_refused,
+            .reconciled = report.reconciled,
+            .truncated = report.truncated,
+        } });
+    }
+}
+
+noinline fn recordTestIntegrity(
+    opts: *const Options,
+    integrity: test_integrity_mod.Options,
+    state: *test_integrity_mod.State,
+    allocator: std.mem.Allocator,
+) void {
+    state.settle(allocator);
+    const totals = state.totals();
+    if (opts.tool_observer) |observer| {
+        _ = observer.emit(.{ .test_integrity = .{
+            .enforced = integrity.mode == .enforce,
+            .coverage = switch (state.baseline.coverage) {
+                .git => .git,
+                .no_git => .no_git,
+                .git_failed => .git_failed,
+            },
+            .scans = state.scans,
+            .nudges = state.nudges,
+            .max_nudges = test_integrity_mod.MAX_NUDGES,
+            .outcome = switch (state.outcome(integrity.mode)) {
+                .clean => .clean,
+                .restored => .restored,
+                .kept_cited => .kept_cited,
+                .kept_silent => .kept_silent,
+                .observed => .observed,
+            },
+            .files_weakened = state.weakenedNow(),
+            .files_weakened_peak = state.peak,
+            .removed_lines = totals.removed_lines,
+            .removed_assert_lines = totals.removed_assert_lines,
+            .skip_markers_added = totals.skip_markers_added,
+            .deleted_files = totals.deleted_files,
+            .support_files_changed = totals.support_files_changed,
+            .post_nudge_new_files = state.post_nudge_new_files,
+            .unverified_files = state.unverified,
+            .overflow = state.overflow(),
+        } });
+    }
+    if (integrity.report) |report| state.fillReport(report, integrity.mode) catch |err| {
+        log.warn("agent", "test integrity report not filled: {s}", .{@errorName(err)});
+    };
+}
+
+noinline fn recordCheckGate(opts: *const Options, gate: check_gate_mod.Options, state: *const check_gate_mod.State) void {
+    if (opts.tool_observer) |observer| {
+        _ = observer.emit(.{ .check_gate = .{
+            .enforced = gate.mode == .enforce,
+            .command_sha256 = tools_mod.tool_observation.sha256Hex(gate.command),
+            .checks = state.checks,
+            .continuations = state.continuations,
+            .max_continuations = gate.max_continuations,
+            .final_verdict = if (state.last_verdict) |v| switch (v) {
+                .passed => .passed,
+                .failed => .failed,
+                .tainted => .tainted,
+                .unavailable => .unavailable,
+            } else .not_run,
+            .final_passed = state.last_passed,
+            .final_total = state.last_total,
+            .unchecked_changes = state.dirty,
+            .stop_hook_blocks = state.stop_hook_blocks,
+        } });
+    }
+}
+
+noinline fn recordRequirementLedger(
+    opts: *const Options,
+    state: *const requirement_ledger_mod.State,
+    verification: *const verification_progress_mod.State,
+) void {
+    if (opts.tool_observer) |observer| {
+        const counts = if (opts.tasks) |store|
+            store.ledgerCounts()
+        else
+            @import("task_store.zig").LedgerCounts{ .open = 0, .total = 0 };
+        _ = observer.emit(.{ .requirement_ledger = .{
+            .enforced = opts.requirement_ledger,
+            .prompt_emitted = state.prompt_emitted,
+            .items_total = @intCast(@min(counts.total, std.math.maxInt(u32))),
+            .items_open_at_final = @intCast(@min(counts.open, std.math.maxInt(u32))),
+            .mutations_occurred = verification.mutation_seen,
+            .nudges = state.nudges,
+            .max_nudges = requirement_ledger_mod.MAX_LEDGER_NUDGES,
+        } });
+    }
+}
+
+noinline fn recordVerificationFinalGate(opts: *const Options, verification: *const verification_progress_mod.State, nudges: u8) void {
+    if (opts.tool_observer) |observer| {
+        _ = observer.emit(.{ .verification_final_gate = .{
+            .enforced = opts.verification_final_gate,
+            .mutations_occurred = verification.mutation_seen,
+            .obligation_met = !verification.unverified_mutation,
+            .nudges = nudges,
+            .max_nudges = MAX_VERIFICATION_NUDGES,
+            .tier1_verifications = verification.tier1_verifications,
+            .tier2_verifications = verification.tier2_verifications,
+            .redundant_verifications = verification.redundant_verifications,
+            .final_closure_tier = verification.final_closure_tier,
+            .reopened_after_verification = verification.reopened_after_verification,
+            .known_failing = verification.known_failing,
+        } });
+    }
+}
+
 fn runCounted(
     conversation: *Conversation,
     provider: provider_mod.Provider,
@@ -1290,22 +1496,7 @@ fn runCounted(
     // 进度更新义务(#114):沉默段 = 连续"只调工具不说话"的轮数 + 距上一次可见文本的时长;任何可见
     // 文本或一次决策归零。终局记录与交付节奏门同款(评测 trace 据此归因 host 注入)。
     var progress_state = progress_updates_mod.State.init(util_time.nowNs());
-    defer if (opts.progress_updates or opts.progress_updates_observe) {
-        if (opts.tool_observer) |observer| {
-            _ = observer.emit(.{ .progress_updates = .{
-                .enforced = opts.progress_updates,
-                .silent_rounds_threshold = opts.progress_update_thresholds.rounds,
-                .min_silent_ms = opts.progress_update_thresholds.min_silent_ms,
-                .max_silent_rounds = progress_state.max_silent_rounds,
-                .decisions = progress_state.decisions,
-                .nudges = progress_state.nudges,
-                .max_nudges = progress_updates_mod.MAX_PROGRESS_NUDGES,
-            } });
-        }
-        if (progress_state.decisions > 0) {
-            log.info("agent", "progress update decisions={d} nudges={d} max_silent_rounds={d}", .{ progress_state.decisions, progress_state.nudges, progress_state.max_silent_rounds });
-        }
-    };
+    defer if (opts.progress_updates or opts.progress_updates_observe) recordProgressUpdates(&opts, &progress_state);
     // Stall gate: allocated only when armed (the novelty memory is tens of KB,
     // too much for this frame on every run). Destroyed after the record below.
     const stall_state: ?*stall_gate_mod.State = if (opts.stall_gate != null) blk: {
@@ -1314,45 +1505,8 @@ fn runCounted(
         break :blk state;
     } else null;
     defer if (stall_state) |state| allocator.destroy(state);
-    defer if (opts.stall_gate) |mode| if (stall_state) |state| {
-        if (opts.tool_observer) |observer| {
-            _ = observer.emit(.{ .stall_gate = .{
-                .enforced = mode == .enforce,
-                .repeat_rounds_threshold = opts.stall_gate_thresholds.repeat_rounds,
-                .repeat_calls_threshold = opts.stall_gate_thresholds.repeat_calls,
-                .stale_rounds_threshold = opts.stall_gate_thresholds.stale_rounds,
-                .rounds = state.rounds,
-                .progress_rounds = state.progress_rounds,
-                .max_stale_rounds = state.max_stale_rounds,
-                .max_repeats = state.max_repeats,
-                .forgotten = state.forgotten,
-                .decisions = state.decisions,
-                .max_decisions = stall_gate_mod.MAX_STALL_DECISIONS,
-                .cause = if (state.decided) |report| switch (report.cause) {
-                    .repeating => .repeating,
-                    .stale => .stale,
-                } else .none,
-                .decided_round = if (state.decided) |report| report.round else 0,
-            } });
-        }
-        if (state.decisions > 0) {
-            log.info("agent", "stall gate decisions={d} rounds={d} max_stale_rounds={d} max_repeats={d}", .{ state.decisions, state.rounds, state.max_stale_rounds, state.max_repeats });
-        }
-    };
-    defer if (opts.delivery_cadence or opts.delivery_cadence_observe) {
-        if (opts.tool_observer) |observer| {
-            _ = observer.emit(.{ .delivery_cadence = .{
-                .enforced = opts.delivery_cadence,
-                .exploration_calls = delivery_cadence_state.exploration_calls,
-                .mutations_occurred = delivery_cadence_state.mutation_seen,
-                .levels_reached = delivery_cadence_state.level,
-                .nudges = delivery_cadence_state.nudges,
-                .max_nudges = delivery_cadence_mod.MAX_CADENCE_NUDGES,
-                .first_threshold = opts.delivery_cadence_thresholds.first,
-                .second_threshold = opts.delivery_cadence_thresholds.second,
-            } });
-        }
-    };
+    defer if (opts.stall_gate) |mode| if (stall_state) |state| recordStallGate(&opts, mode, state);
+    defer if (opts.delivery_cadence or opts.delivery_cadence_observe) recordDeliveryCadence(&opts, &delivery_cadence_state);
     // 宿主检查门 + Stop hook 拦截(CheckGate.lean):各自有界的续跑预算,不走注入计量器
     // (续跑由外部裁决驱动,不是咨询性 nudge)。终局记录只在检查门武装时落一条。
     var check_gate_state = check_gate_mod.State{};
@@ -1360,40 +1514,9 @@ fn runCounted(
     // boundary; its passes borrow turns past max_turns like the KG repair.
     var learning_state = learning_turn_mod.State{};
     defer learning_state.deinit(allocator);
-    defer if (opts.learning_turn) |learning| if (learning_state.decision != null) {
-        counters.learning = learning_state.report(learning.mode);
-    };
+    defer if (opts.learning_turn) |learning| if (learning_state.decision != null) recordLearningReport(counters, &learning_state, learning.mode);
     var learning_borrowed_turns: u32 = 0;
-    defer if (opts.learning_turn) |learning| if (depth == 0) {
-        if (opts.tool_observer) |observer| {
-            const report = learning_state.report(learning.mode);
-            _ = observer.emit(.{ .learning_turn = .{
-                .enforced = report.enforced,
-                .grounding = switch (report.grounding) {
-                    .unchecked => .unchecked,
-                    .passed => .passed,
-                    .failed => .failed,
-                    .tainted => .tainted,
-                    .unavailable => .unavailable,
-                },
-                .decision = switch (report.decision) {
-                    .none_unfinished => .none_unfinished,
-                    .none_unchecked => .none_unchecked,
-                    .none_unavailable => .none_unavailable,
-                    .none_tainted => .none_tainted,
-                    .none_unstorable => .none_unstorable,
-                    .distill => .distill,
-                },
-                .passes = report.passes,
-                .distill_turns = report.distill_turns,
-                .reconcile_turns = report.reconcile_turns,
-                .lessons_accepted = report.lessons_accepted,
-                .lessons_refused = report.lessons_refused,
-                .reconciled = report.reconciled,
-                .truncated = report.truncated,
-            } });
-        }
-    };
+    defer if (opts.learning_turn) |learning| if (depth == 0) recordLearningTurn(&opts, &learning_state, learning.mode);
     // Test-integrity sensor (TestIntegrity.lean): the suite as it was when the
     // run started. The check gate reads it too, to taint a pass over weakened
     // tests; only an armed obligation messages, records and reports.
@@ -1402,105 +1525,17 @@ fn runCounted(
     if ((opts.test_integrity != null or opts.check_gate != null) and depth == 0) {
         try test_integrity_state.arm(allocator, if (opts.cwd_abs.len > 0) opts.cwd_abs else null, opts.abort);
     }
-    defer if (opts.test_integrity) |integrity| if (depth == 0) {
-        // A run that ended without a scan after its last tool (turn cap,
-        // abort, error) is scanned once more so the report shows the end state.
-        test_integrity_state.settle(allocator);
-        const totals = test_integrity_state.totals();
-        if (opts.tool_observer) |observer| {
-            _ = observer.emit(.{ .test_integrity = .{
-                .enforced = integrity.mode == .enforce,
-                .coverage = switch (test_integrity_state.baseline.coverage) {
-                    .git => .git,
-                    .no_git => .no_git,
-                    .git_failed => .git_failed,
-                },
-                .scans = test_integrity_state.scans,
-                .nudges = test_integrity_state.nudges,
-                .max_nudges = test_integrity_mod.MAX_NUDGES,
-                .outcome = switch (test_integrity_state.outcome(integrity.mode)) {
-                    .clean => .clean,
-                    .restored => .restored,
-                    .kept_cited => .kept_cited,
-                    .kept_silent => .kept_silent,
-                    .observed => .observed,
-                },
-                .files_weakened = test_integrity_state.weakenedNow(),
-                .files_weakened_peak = test_integrity_state.peak,
-                .removed_lines = totals.removed_lines,
-                .removed_assert_lines = totals.removed_assert_lines,
-                .skip_markers_added = totals.skip_markers_added,
-                .deleted_files = totals.deleted_files,
-                .support_files_changed = totals.support_files_changed,
-                .post_nudge_new_files = test_integrity_state.post_nudge_new_files,
-                .unverified_files = test_integrity_state.unverified,
-                .overflow = test_integrity_state.overflow(),
-            } });
-        }
-        if (integrity.report) |report| test_integrity_state.fillReport(report, integrity.mode) catch |err| {
-            log.warn("agent", "test integrity report not filled: {s}", .{@errorName(err)});
-        };
-    };
+    // A run that ended without a scan after its last tool (turn cap, abort,
+    // error) is scanned once more there, so the report shows the end state.
+    defer if (opts.test_integrity) |integrity| if (depth == 0) recordTestIntegrity(&opts, integrity, &test_integrity_state, allocator);
     var stop_hook_active = false;
-    defer if (opts.check_gate) |gate| {
-        if (opts.tool_observer) |observer| {
-            _ = observer.emit(.{ .check_gate = .{
-                .enforced = gate.mode == .enforce,
-                .command_sha256 = tools_mod.tool_observation.sha256Hex(gate.command),
-                .checks = check_gate_state.checks,
-                .continuations = check_gate_state.continuations,
-                .max_continuations = gate.max_continuations,
-                .final_verdict = if (check_gate_state.last_verdict) |v| switch (v) {
-                    .passed => .passed,
-                    .failed => .failed,
-                    .tainted => .tainted,
-                    .unavailable => .unavailable,
-                } else .not_run,
-                .final_passed = check_gate_state.last_passed,
-                .final_total = check_gate_state.last_total,
-                .unchecked_changes = check_gate_state.dirty,
-                .stop_hook_blocks = check_gate_state.stop_hook_blocks,
-            } });
-        }
-    };
+    defer if (opts.check_gate) |gate| recordCheckGate(&opts, gate, &check_gate_state);
     // 元规则①:全部 host 注入共享一个计量器——各门自证有界不蕴含合成
     // 有界(Lean HostInjectionMeter.consumed_never_exceeds_cap 对任意门
     // 序列量化)。
     var host_injection_meter = @import("host_injection_meter.zig").Meter{};
-    defer if (opts.requirement_ledger or opts.requirement_ledger_observe) {
-        if (opts.tool_observer) |observer| {
-            const counts = if (opts.tasks) |store|
-                store.ledgerCounts()
-            else
-                @import("task_store.zig").LedgerCounts{ .open = 0, .total = 0 };
-            _ = observer.emit(.{ .requirement_ledger = .{
-                .enforced = opts.requirement_ledger,
-                .prompt_emitted = requirement_ledger_state.prompt_emitted,
-                .items_total = @intCast(@min(counts.total, std.math.maxInt(u32))),
-                .items_open_at_final = @intCast(@min(counts.open, std.math.maxInt(u32))),
-                .mutations_occurred = verification_progress.mutation_seen,
-                .nudges = requirement_ledger_state.nudges,
-                .max_nudges = requirement_ledger_mod.MAX_LEDGER_NUDGES,
-            } });
-        }
-    };
-    defer if (opts.verification_final_gate or opts.verification_final_observe) {
-        if (opts.tool_observer) |observer| {
-            _ = observer.emit(.{ .verification_final_gate = .{
-                .enforced = opts.verification_final_gate,
-                .mutations_occurred = verification_progress.mutation_seen,
-                .obligation_met = !verification_progress.unverified_mutation,
-                .nudges = verification_nudges,
-                .max_nudges = MAX_VERIFICATION_NUDGES,
-                .tier1_verifications = verification_progress.tier1_verifications,
-                .tier2_verifications = verification_progress.tier2_verifications,
-                .redundant_verifications = verification_progress.redundant_verifications,
-                .final_closure_tier = verification_progress.final_closure_tier,
-                .reopened_after_verification = verification_progress.reopened_after_verification,
-                .known_failing = verification_progress.known_failing,
-            } });
-        }
-    };
+    defer if (opts.requirement_ledger or opts.requirement_ledger_observe) recordRequirementLedger(&opts, &requirement_ledger_state, &verification_progress);
+    defer if (opts.verification_final_gate or opts.verification_final_observe) recordVerificationFinalGate(&opts, &verification_progress, verification_nudges);
     const MAX_CONTINUATIONS: u32 = 3;
 
     // Governed lexical recall is run-scoped: the model proposes aliases and
