@@ -14,6 +14,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 # METACODES_PY_SDK_TEST_INSTALLED=1 tests an installed wheel instead of src/.
 if os.environ.get("METACODES_PY_SDK_TEST_INSTALLED") != "1":
@@ -377,6 +378,72 @@ class PythonSdkTest(unittest.TestCase):
         result = box["result"]
         self.assertEqual((result.input_accepted, result.input_adopted), (1, 1))
         self.assertIn("and mention the weather", str(provider.requests[1]["messages"]))
+
+    def interrupting_join(self, started, interrupts):
+        """A _RunThread._join that raises KeyboardInterrupt, as Ctrl+C does
+        out of a join, on its first ``interrupts`` calls once the Run is
+        inside its tool, and joins for real after that."""
+        from metacodes import _client
+
+        real_join = _client._RunThread._join
+        calls = []
+
+        def join(run_thread):
+            calls.append(run_thread)
+            if len(calls) <= interrupts:
+                self.assertTrue(started.wait(10))
+                raise KeyboardInterrupt
+            return real_join(run_thread)
+
+        return mock.patch.object(_client._RunThread, "_join", join), calls
+
+    def test_an_interrupted_wait_aborts_the_run_and_waits_for_it(self) -> None:
+        # Ctrl+C while run() waits for its Run thread: the Run is aborted and
+        # waited for before the interrupt propagates, so the Session is idle
+        # and the next Run works.
+        wait, started, release = self.blocking_tool()
+        patch, joins = self.interrupting_join(started, interrupts=1)
+        with MockProvider([("tool", "wait", {}), ("text", "after")]) as provider:
+            with metacodes.Runtime(tools=(), host_tools=[wait]) as runtime:
+                session = self.session(runtime, provider, permission_mode="full_access")
+                real_abort = session._abort_active
+
+                def abort_then_release():
+                    real_abort()
+                    release.set()  # the tool returns once the abort is requested
+
+                session._abort_active = abort_then_release
+                with patch:
+                    with self.assertRaises(KeyboardInterrupt):
+                        session.run("start")
+                self.assertEqual(session._active_run_id, 0)
+                after = session.run("again")
+                session.close()
+        self.assertEqual(len(joins), 2)
+        # The interrupted Run stopped after its tool: one request, then the next Run's.
+        self.assertEqual(len(provider.requests), 2)
+        self.assertEqual(after.text, "after")
+
+    def test_a_second_interrupt_leaves_the_session_busy_until_the_run_ends(self) -> None:
+        # A second Ctrl+C stops the wait while the Run is still in its tool.
+        # The Session stays busy, abort still reaches the Run, and close()
+        # aborts and waits for it instead of failing BUSY.
+        wait, started, release = self.blocking_tool()
+        patch, joins = self.interrupting_join(started, interrupts=2)
+        with MockProvider([("tool", "wait", {}), ("text", "never asked")]) as provider:
+            with metacodes.Runtime(tools=(), host_tools=[wait]) as runtime:
+                session = self.session(runtime, provider, permission_mode="full_access")
+                with patch:
+                    with self.assertRaises(KeyboardInterrupt):
+                        session.run("start")
+                self.assertNotEqual(session._active_run_id, 0)
+                with self.assertRaises(RuntimeError):
+                    session.run("too soon")
+                release.set()
+                session.close()
+                self.assertFalse(session._handle)
+        self.assertEqual(len(joins), 2)
+        self.assertEqual(len(provider.requests), 1)
 
     def test_abort_stops_the_active_run(self) -> None:
         wait, started, release = self.blocking_tool()

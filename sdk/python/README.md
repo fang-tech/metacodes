@@ -54,7 +54,8 @@ callback. `RunResult.text` is the final answer rebuilt from the
 event vocabulary is listed in
 [doc/AGENTCORE_BINARY_ABI.md](../../doc/AGENTCORE_BINARY_ABI.md).
 `session.abort()` stops the active run and `session.submit(text)` adds user
-input to it; both may be called from another thread.
+input to it; both may be called from another thread. Each run executes on its
+own thread; Ctrl+C while `run()` waits aborts the run and waits for it to stop.
 
 `session.close()`, and leaving a `with` block, aborts a run that is still going
 and waits for it first. That includes a `stream()` the loop stopped early with
