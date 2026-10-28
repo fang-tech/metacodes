@@ -835,6 +835,20 @@ fn settleMs(ms: u64) void {
     }
 }
 
+/// Test seam, read only in test builds: runs in place of the settle `acquire`
+/// gives an older metacodes' marker nobody holds, so a test can finish that
+/// marker's release inside the window instead of racing a clock into it.
+const testing_hooks = struct {
+    var legacy_release_settle: ?*const fn (lease_path: [*:0]const u8) void = null;
+};
+
+/// Give an older metacodes caught between closing its marker at `path` and
+/// unlinking it the moment to finish.
+fn settleLegacyRelease(path: [*:0]const u8) void {
+    if (@import("builtin").is_test) if (testing_hooks.legacy_release_settle) |hook| return hook(path);
+    settleMs(LEGACY_RELEASE_SETTLE_MS);
+}
+
 /// The session's Run lease while `init` decides whether to take the Run.
 const Lease = struct {
     fd: pfs.Fd,
@@ -946,7 +960,7 @@ const Lease = struct {
                             // An older metacodes releases by closing its marker,
                             // then unlinking it: one caught between the two is
                             // not a marker it kept. Give it the moment to go.
-                            settleMs(LEGACY_RELEASE_SETTLE_MS);
+                            settleLegacyRelease(path);
                             const still = namesFile(path, fd) catch |err| {
                                 _ = pfs.close(fd);
                                 return err;
@@ -965,7 +979,7 @@ const Lease = struct {
                     // again. (A marker an older metacodes made in the one-scan
                     // gap after that would pass unseen.)
                     _ = pfs.close(fd);
-                    settleMs(LEGACY_RELEASE_SETTLE_MS);
+                    settleLegacyRelease(path);
                     const held = process_scan.heldOpenByOthers(path) catch {
                         if (report) |r| r.holder = .unknown;
                         return error.JournalBusy;
@@ -4007,17 +4021,17 @@ test "an older metacodes' empty marker is busy while a process holds it and aban
     // Its holder is another process (POSIX leaves this one out of the
     // question; Windows cannot, so there this process's handle stands in).
     var holder: ?std.process.Child = if (is_windows) null else try std.process.spawn(std.testing.io, .{
-        .argv = &.{ "/bin/sh", "-c", "exec 3<\"$0\"; exec sleep 60", lease_path },
+        .argv = &.{ "/bin/sh", "-c", "exec 3<\"$0\"; echo held; exec sleep 60", lease_path },
         .stdin = .ignore,
-        .stdout = .ignore,
+        .stdout = .pipe,
         .stderr = .ignore,
     });
     defer if (holder) |*child| child.kill(std.testing.io);
-    if (holder != null) {
+    if (holder) |*child| {
         _ = pfs.close(marker);
-        var tries: usize = 0;
-        while (!(try process_scan.heldOpenByOthers(lease_path.ptr)) and tries < 200) : (tries += 1)
-            util_time.sleepMs(10);
+        // It says so once it holds the marker.
+        var said: [1]u8 = undefined;
+        while (try child.stdout.?.readStreaming(std.testing.io, &.{&said}) == 0) {}
     }
     var report: OpenReport = .{};
     try std.testing.expectError(error.JournalBusy, Journal.initWithOptions(root, sid, .{
@@ -4217,19 +4231,22 @@ test "an older metacodes' marker caught mid-release is not taken for a kept one"
         try finished.finishRun("end_turn");
     }
     // An older metacodes finishing: its marker (made when its Run began)
-    // closed, its unlink a moment away.
+    // closed, so the holder scan finds it unheld, and its unlink landing in
+    // the settle that follows the scan.
     try testKeptLegacyMarker(lease_path);
     const Release = struct {
+        var settles: usize = 0;
         fn run(path: [*:0]const u8) void {
-            // After the holder scan, inside the settle that follows it.
-            util_time.sleepMs(60);
+            settles += 1;
             pfs.unlinkPath(path) catch {};
         }
     };
-    const releaser = try std.Thread.spawn(.{}, Release.run, .{lease_path.ptr});
-    defer releaser.join();
+    testing_hooks.legacy_release_settle = Release.run;
+    defer testing_hooks.legacy_release_settle = null;
     var next = try Journal.init(root, sid);
     defer next.deinit();
+    // The marker was there to be judged: it reached the settle, once.
+    try std.testing.expectEqual(@as(usize, 1), Release.settles);
     try next.finishRun("end_turn");
 }
 
