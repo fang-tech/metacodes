@@ -5,7 +5,7 @@
 #include <stdint.h>
 
 #if !defined(UINTPTR_MAX) || !defined(UINT64_MAX) || UINTPTR_MAX != UINT64_MAX
-#error "AgentCore ABI v1 revision 24 requires a 64-bit pointer ABI"
+#error "AgentCore ABI v1 revision 25 requires a 64-bit pointer ABI"
 #endif
 
 #ifdef __cplusplus
@@ -13,11 +13,11 @@ extern "C" {
 #endif
 
 /* sdk/zig/types.zig is the normative fixed-layout schema. This header is its
- * Revision 24 C projection; sdk/rust/src/raw.rs is generated from this file.
+ * Revision 25 C projection; sdk/rust/src/raw.rs is generated from this file.
  * AgentCore ABI v1 remains experimental. Consumers pin an exact bundle and
  * must validate the exact root and mandatory child-table layouts together. */
 #define METASK_AGENTCORE_ABI_V1 1u
-#define METASK_AGENTCORE_ABI_REVISION 24u
+#define METASK_AGENTCORE_ABI_REVISION 25u
 
 #define METASK_AGENTCORE_STATUS_OK 0u
 #define METASK_AGENTCORE_STATUS_INVALID_ARGUMENT 1u
@@ -107,6 +107,8 @@ extern "C" {
  * or not, and the text bytes of all of them together. */
 #define METASK_AGENTCORE_MAX_SUBMITTED_INPUTS_V1 64ULL
 #define METASK_AGENTCORE_MAX_SUBMITTED_INPUT_BYTES_V1 16777216ULL
+/* Revision 25: the longest credential session->update_credential accepts. */
+#define METASK_AGENTCORE_MAX_CREDENTIAL_BYTES_V1 16384ULL
 /* Base64 payload cap for one image part: exactly the standard base64 encoding
  * of the built-in Read tool's 3.75 MB raw-image limit. */
 #define METASK_AGENTCORE_MAX_RUN_INPUT_IMAGE_DATA_BYTES_V1 5000000ULL
@@ -644,6 +646,8 @@ typedef struct {
     uint32_t provider_kind_code;
     uint32_t permission_mode_code;
     uint32_t shell_policy_code;
+    /* 1..MAX_CREDENTIAL_BYTES_V1 bytes of printable ASCII (0x21-0x7E), the
+     * rule session->update_credential applies too. */
     metask_agentcore_bytes_view_v1 api_key;
     metask_agentcore_bytes_view_v1 base_url;
     metask_agentcore_bytes_view_v1 workspace_root;
@@ -987,6 +991,18 @@ typedef uint32_t (*metask_agentcore_session_submit_input_fn_v1)(
     metask_agentcore_session *, uint64_t,
     const metask_agentcore_submitted_input_v1 *,
     metask_agentcore_input_receipt_v1 *, metask_agentcore_owned_bytes_v1 *);
+/* Revision 25 (#336). Replaces the Session's provider credential in place:
+ * a request reads the credential when it is sent, so every request sent after
+ * OK uses it, retries, earlier-created providers and requests still waiting
+ * for a connection included; a request already sent keeps the old one and is
+ * not interrupted. Provider, scheme, base URL and
+ * model stay. Like abort it may overlap a Run, from any thread or from inside
+ * that Run's callbacks; concurrent calls are linearized. The credential is
+ * borrowed for the call: 1..MAX_CREDENTIAL_BYTES_V1 bytes of printable ASCII
+ * (0x21-0x7E). Every refusal keeps the previous credential. Never BUSY. */
+typedef uint32_t (*metask_agentcore_session_update_credential_fn_v1)(
+    metask_agentcore_session *, metask_agentcore_bytes_view_v1,
+    metask_agentcore_owned_bytes_v1 *);
 typedef uint32_t (*metask_agentcore_session_compact_fn_v1)(
     metask_agentcore_session *, uint64_t, metask_agentcore_compact_result_v1 *,
     metask_agentcore_owned_bytes_v1 *);
@@ -1041,7 +1057,7 @@ typedef uint32_t (*metask_agentcore_team_poll_fn_v1)(
 typedef void (*metask_agentcore_buffer_release_fn_v1)(
     metask_agentcore_owned_bytes_v1 *);
 
-/* Function-table order is fixed within Revision 24. No earlier revision layout
+/* Function-table order is fixed within Revision 25. No earlier revision layout
  * is accepted, probed, aliased, or dispatched. */
 typedef struct metask_agentcore_runtime_api_v1 {
     uint32_t struct_size;
@@ -1058,6 +1074,7 @@ typedef struct metask_agentcore_session_api_v1 {
     metask_agentcore_session_run_input_fn_v1 run_input;
     metask_agentcore_session_abort_fn_v1 abort;
     metask_agentcore_session_submit_input_fn_v1 submit_input;
+    metask_agentcore_session_update_credential_fn_v1 update_credential;
 } metask_agentcore_session_api_v1;
 
 typedef struct metask_agentcore_session_control_api_v1 {
@@ -1170,6 +1187,8 @@ metask_agentcore_api_v1_is_compatible(const metask_agentcore_api_v1 *api) {
            api->session->abort != (metask_agentcore_session_abort_fn_v1)0 &&
            api->session->submit_input !=
                (metask_agentcore_session_submit_input_fn_v1)0 &&
+           api->session->update_credential !=
+               (metask_agentcore_session_update_credential_fn_v1)0 &&
            api->session_control !=
                (const metask_agentcore_session_control_api_v1 *)0 &&
            ((uintptr_t)api->session_control % sizeof(void *)) == 0 &&
@@ -1261,8 +1280,8 @@ metask_agentcore_owned_bytes_v1_release(
 #define METASK_AGENTCORE_ASSERT_OFFSET(type, field, offset) \
     METASK_AGENTCORE_STATIC_ASSERT(offsetof(type, field) == (offset), #type "." #field " offset")
 
-METASK_AGENTCORE_STATIC_ASSERT(METASK_AGENTCORE_ABI_REVISION == 24u,
-                               "AgentCore revision 24");
+METASK_AGENTCORE_STATIC_ASSERT(METASK_AGENTCORE_ABI_REVISION == 25u,
+                               "AgentCore revision 25");
 METASK_AGENTCORE_STATIC_ASSERT(METASK_AGENTCORE_MCP_NEGOTIATION_AUTO == 1u,
                                "MCP auto code");
 METASK_AGENTCORE_STATIC_ASSERT(METASK_AGENTCORE_MCP_NEGOTIATION_MODERN_ONLY == 2u,
@@ -1325,7 +1344,7 @@ METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_checkpoint_export_config_v1, 56);
 METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_checkpoint_export_result_v1, 96);
 METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_session_restore_config_v1, 64);
 METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_runtime_api_v1, 24);
-METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_session_api_v1, 48);
+METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_session_api_v1, 56);
 METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_session_control_api_v1, 80);
 METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_skill_api_v1, 32);
 METASK_AGENTCORE_ASSERT_SIZE(metask_agentcore_mcp_api_v1, 40);
@@ -1415,6 +1434,7 @@ METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_submitted_input_v1, input_id, 8)
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_submitted_input_v1, text, 16);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_input_receipt_v1, sequence, 4);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_session_api_v1, submit_input, 40);
+METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_session_api_v1, update_credential, 48);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_checkpoint_export_result_v1, digest, 32);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_api_v1, buffer_release, 16);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_api_v1, runtime, 24);

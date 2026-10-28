@@ -793,7 +793,7 @@ pub const Gateway = struct {
             const owned = try provider_factory.makeProviderWithOptions(
                 self.allocator,
                 kept.kind,
-                secret,
+                .{ .fixed = secret },
                 model,
                 if (kept.base_url.len != 0) kept.base_url else null,
                 kept.openai_protocol,

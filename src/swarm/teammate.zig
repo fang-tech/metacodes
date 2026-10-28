@@ -460,7 +460,7 @@ pub const TeammateRegistry = struct {
         return pf.makeProviderWithOptions(
             std.heap.c_allocator,
             self.provider_kind,
-            self.api_key,
+            .{ .fixed = self.api_key },
             model,
             self.base_url,
             self.openai_protocol,

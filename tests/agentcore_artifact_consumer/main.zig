@@ -21,7 +21,8 @@ fn readGoal(
 }
 
 comptime {
-    if (wire.ABI_REVISION != 24 or
+    if (wire.ABI_REVISION != 25 or
+        wire.MAX_CREDENTIAL_BYTES_V1 != 16 * 1024 or
         wire.MAX_SUBMITTED_INPUTS_V1 != 64 or
         wire.MAX_SUBMITTED_INPUT_BYTES_V1 != 16 * 1024 * 1024 or
         wire.PROMPT_OP_ADD != 1 or
@@ -73,7 +74,7 @@ comptime {
         wire.TEAM_ROLE_MEMBER != 2 or
         wire.MAX_TEAM_NAME_BYTES_V1 != 64 or
         wire.MAX_TEAM_MEMBER_BYTES_V1 != 64)
-        @compileError("source-free Revision 23/24 codes must match the public contract");
+        @compileError("source-free Revision 23-25 codes must match the public contract");
     if (@hasDecl(wire, "SessionRefreshSkillCatalogFnV1") or
         @hasField(wire.ApiV1, "session_refresh_skill_catalog"))
         @compileError("revision 24 must not expose the removed catalog refresh entry");
@@ -190,6 +191,11 @@ const Probe = struct {
     saw_prompt_manifest: bool = false,
     /// Revision 23: `goal_updated` events for the consumer's goal.
     goal_updates: u32 = 0,
+    /// Revision 25: the armed HostEcho call rotates the provider credential
+    /// from inside its own callback, after a candidate the library refuses.
+    rotate_in_host: bool = false,
+    rotate_refused_status: u32 = std.math.maxInt(u32),
+    rotate_status: u32 = std.math.maxInt(u32),
     output_segment_open: bool = false,
     output_segment_index: u32 = 0,
     output_segment_turn: u32 = 0,
@@ -411,6 +417,15 @@ const Probe = struct {
         const parsed = std.json.parseFromSlice(Args, std.heap.c_allocator, encoded, .{}) catch return wire.HOST_FAILED;
         defer parsed.deinit();
         if (!std.mem.eql(u8, parsed.value.text, "hello")) return wire.HOST_FAILED;
+        if (self.rotate_in_host) {
+            self.rotate_in_host = false;
+            const api = self.api orelse return wire.HOST_FATAL;
+            var diagnostic = wire.OwnedBytesV1{ .ptr = null, .len = 0 };
+            self.rotate_refused_status = api.session().updateCredential()(run.?.session, sdk.bytesView("zig\nrotated"), &diagnostic);
+            api.bufferRelease()(&diagnostic);
+            self.rotate_status = api.session().updateCredential()(run.?.session, sdk.bytesView("zig-rotated-key"), &diagnostic);
+            api.bufferRelease()(&diagnostic);
+        }
         self.host_calls += 1;
         const result = "artifact-host-ok";
         (out orelse return wire.HOST_FAILED).* = .{ .ptr = @constCast(result.ptr), .len = result.len };
@@ -1151,10 +1166,116 @@ pub fn main(init: std.process.Init) !void {
     try probe.unregisterSession(session.?);
     try expectStatus(.ok, api.session().destroy()(session, &diagnostic), diagnostic);
     session = null;
+    try credentialRotation(a, init.io, api, runtime, &callbacks, &probe, workspace, &prompt_profile);
     try expectStatus(.ok, api.runtime().destroy()(runtime, &diagnostic), diagnostic);
     runtime = null;
 
-    std.debug.print("AgentCore source-free consumer: Revision 24 Agent Runtime, goals, host-scheduled team, time context, Host model capabilities, active-Run input, prompt profile, permission mode update, OpenAI Responses, multimodal input, active-Run journal, Host/MCP streaming, process-plugin configuration, Workspace Skill Catalog, tools, checkpoint, Runtime rebuild, restore and continued Run OK\n", .{});
+    std.debug.print("AgentCore source-free consumer: Revision 25 Agent Runtime, credential rotation, goals, host-scheduled team, time context, Host model capabilities, active-Run input, prompt profile, permission mode update, OpenAI Responses, multimodal input, active-Run journal, Host/MCP streaming, process-plugin configuration, Workspace Skill Catalog, tools, checkpoint, Runtime rebuild, restore and continued Run OK\n", .{});
+}
+
+/// Revision 25 (#336): one Session's provider credential, rotated twice
+/// against a loopback provider that records each request's authorization
+/// header. The Run's first request carries the creation key; its HostEcho
+/// callback rotates the key (after a refused candidate), so the Run's second
+/// request carries the rotation; an update while idle reaches the next Run;
+/// refusals keep the key; describe never names a key. The Session carries the
+/// consumer's prompt profile, whose Host section the Probe requires in every
+/// `prompt_manifest`.
+fn credentialRotation(
+    a: std.mem.Allocator,
+    io: std.Io,
+    api: sdk.Api,
+    runtime: ?*wire.RuntimeHandle,
+    callbacks: *const wire.SessionCallbacksV1,
+    probe: *Probe,
+    workspace: []const u8,
+    prompt_profile: *const wire.PromptProfileV1,
+) !void {
+    const server = try Server.start(io, &.{ HOST_SSE, FINAL_SSE, FINAL_SSE });
+    defer server.destroy();
+    var joined = false;
+    defer if (!joined) server.join();
+    const url = try server.url(a);
+    const allowed = [_]wire.BytesViewV1{sdk.bytesView("HostEcho")};
+    var host = std.mem.zeroes(wire.SessionHostConfigV1);
+    host.struct_size = @sizeOf(wire.SessionHostConfigV1);
+    host.provider_kind_code = wire.PROVIDER_ANTHROPIC;
+    host.permission_mode_code = wire.PERMISSION_FULL_ACCESS;
+    host.shell_policy_code = wire.SHELL_DISABLED;
+    host.api_key = sdk.bytesView("zig-consumer-key");
+    host.base_url = sdk.bytesView(url);
+    host.workspace_root = sdk.bytesView(workspace);
+    host.workspace_home = sdk.bytesView(workspace);
+    host.allowed_tools = &allowed;
+    host.allowed_tool_count = allowed.len;
+    host.run_journal_mode_code = wire.RUN_JOURNAL_EPHEMERAL;
+    var create = std.mem.zeroes(wire.SessionCreateConfigV1);
+    create.struct_size = @sizeOf(wire.SessionCreateConfigV1);
+    create.host = &host;
+    create.model = sdk.bytesView("artifact-model");
+    create.prompt_profile = prompt_profile;
+
+    var diagnostic = wire.OwnedBytesV1{ .ptr = null, .len = 0 };
+    defer api.bufferRelease()(&diagnostic);
+    var session: ?*wire.SessionHandle = null;
+    try expectStatus(.ok, api.session().create()(runtime, &create, callbacks, &session, &diagnostic), diagnostic);
+    defer if (session) |handle| {
+        _ = api.session().destroy()(handle, &diagnostic);
+    };
+    probe.bound_session_id_len = 0;
+    try probe.registerSession(session.?);
+
+    var options = std.mem.zeroes(wire.RunOptionsV1);
+    options.struct_size = @sizeOf(wire.RunOptionsV1);
+    options.max_turns = 4;
+    var result = std.mem.zeroes(wire.RunResultV1);
+    probe.api = api;
+    probe.rotate_in_host = true;
+    try probe.beginRun(1);
+    try expectStatus(.ok, api.session().runText(session, 1, sdk.bytesView("rotate the credential"), &options, &result, &diagnostic), diagnostic);
+    try probe.endRun(1);
+    if (try sdk.StopReason.fromCode(result.stop_reason_code) != .end_turn or result.turns != 2)
+        return error.CredentialRotationRunFailed;
+    try expectStatus(.invalid_argument, probe.rotate_refused_status, .{ .ptr = null, .len = 0 });
+    try expectStatus(.ok, probe.rotate_status, .{ .ptr = null, .len = 0 });
+
+    try expectStatus(.ok, api.session().updateCredential()(session, sdk.bytesView("zig-idle-key"), &diagnostic), diagnostic);
+    // Refusals name the rule, never the bytes, and keep the idle key.
+    try expectStatus(.invalid_argument, api.session().updateCredential()(session, sdk.bytesView(""), &diagnostic), diagnostic);
+    api.bufferRelease()(&diagnostic);
+    const too_long = try a.alloc(u8, @as(usize, @intCast(wire.MAX_CREDENTIAL_BYTES_V1)) + 1);
+    @memset(too_long, 'k');
+    try expectStatus(.resource_limit, api.session().updateCredential()(session, sdk.bytesView(too_long), &diagnostic), diagnostic);
+    api.bufferRelease()(&diagnostic);
+    try expectStatus(.invalid_argument, api.session().updateCredential()(session, sdk.bytesView("zig idle key"), &diagnostic), diagnostic);
+    const refusal = try sdk.borrowedBytes(.{ .ptr = diagnostic.ptr, .len = diagnostic.len });
+    if (std.mem.indexOf(u8, refusal, "zig idle key") != null) return error.CredentialInDiagnostic;
+    api.bufferRelease()(&diagnostic);
+
+    try probe.beginRun(2);
+    try expectStatus(.ok, api.session().runText(session, 2, sdk.bytesView("once more"), &options, &result, &diagnostic), diagnostic);
+    try probe.endRun(2);
+
+    var description = wire.OwnedBytesV1{ .ptr = null, .len = 0 };
+    defer api.bufferRelease()(&description);
+    try expectStatus(.ok, api.sessionControl().describe()(session, &description, &diagnostic), diagnostic);
+    const described = try sdk.borrowedBytes(.{ .ptr = description.ptr, .len = description.len });
+    for ([_][]const u8{ "zig-consumer-key", "zig-rotated-key", "zig-idle-key" }) |key| {
+        if (std.mem.indexOf(u8, described, key) != null) return error.CredentialInDescription;
+    }
+
+    try probe.unregisterSession(session.?);
+    try expectStatus(.ok, api.session().destroy()(session, &diagnostic), diagnostic);
+    session = null;
+    server.join();
+    joined = true;
+    const expected = [_][]const u8{ "Bearer zig-consumer-key", "Bearer zig-rotated-key", "Bearer zig-idle-key" };
+    for (expected, 0..) |want, index| {
+        if (!std.mem.eql(u8, server.authorization(index), want)) {
+            std.debug.print("credential rotation request {d} carried [{s}]\n", .{ index, server.authorization(index) });
+            return error.CredentialRotationHeaderMismatch;
+        }
+    }
 }
 
 const CatalogIdentities = struct {

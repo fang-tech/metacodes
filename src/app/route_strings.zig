@@ -1,7 +1,7 @@
 //! The strings a committed provider route lends to the live clients
 //! (issue #16).
 //!
-//! `Client.base_url` and `Client.api_key` are plain `[]const u8` fields with no
+//! `Client.base_url` and the bytes `Client.credential` borrows are plain slices with no
 //! mutex, and a background subagent that fell back to the shared client reads
 //! them while the main thread may be switching routes — the same hazard
 //! `Client.model` documents and serializes with `model_mutex`.

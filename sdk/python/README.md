@@ -56,6 +56,10 @@ event vocabulary is listed in
 `session.abort()` stops the active run and `session.submit(text)` adds user
 input to it; both may be called from another thread. Each run executes on its
 own thread; Ctrl+C while `run()` waits aborts the run and waits for it to stop.
+`session.update_credential(api_key)` replaces the provider key in place, while
+idle or during a run, from any thread or from inside a tool or handler: every
+request sent afterwards (the run's next turn, a retry) carries it, and a
+request already sent keeps the old one. The provider, endpoint and model stay.
 
 `session.close()`, and leaving a `with` block, aborts a run that is still going
 and waits for it first. That includes a `stream()` the loop stopped early with
