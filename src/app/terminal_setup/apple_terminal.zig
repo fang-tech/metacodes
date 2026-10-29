@@ -20,6 +20,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const process = @import("platform").process;
+const log = @import("../../util/log.zig");
 const files = @import("files.zig");
 const setup = @import("setup.zig");
 
@@ -42,17 +43,64 @@ pub const Store = struct {
 
 pub const Error = error{ OutOfMemory, ToolFailed, NoBuiltInMap };
 
-const Ran = struct { ok: bool, out: []const u8 };
+const Ran = struct { ok: bool, code: i32, out: []const u8, err: []const u8 };
 
 fn run(arena: std.mem.Allocator, argv: []const []const u8) Error!Ran {
     const z = try arena.alloc(?[*:0]const u8, argv.len + 1);
     for (argv, 0..) |arg, i| z[i] = (try arena.dupeZ(u8, arg)).ptr;
     z[argv.len] = null;
-    const captured = process.capture(z, arena, .{ .timeout_ms = 30_000, .inherit_env = true, .want_stderr = false }) catch |err| switch (err) {
+    const captured = process.capture(z, arena, .{ .timeout_ms = 30_000, .inherit_env = true }) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
-        else => return error.ToolFailed,
+        else => {
+            noteFailure(argv, @errorName(err), "");
+            return error.ToolFailed;
+        },
     };
-    return .{ .ok = captured.exit_code == 0 and captured.capture_complete, .out = captured.stdout };
+    return .{ .ok = captured.exit_code == 0 and captured.capture_complete, .code = captured.exit_code, .out = captured.stdout, .err = captured.stderr };
+}
+
+/// `run` for a step that has to succeed. A failure is logged with the command
+/// and what the tool said on stderr, and kept for `lastFailure`, so a report
+/// (and a failing CI run) shows why instead of only that it failed. Probes
+/// whose failure is an answer ("no such key") use `run`.
+fn must(arena: std.mem.Allocator, argv: []const []const u8) Error!Ran {
+    const r = try run(arena, argv);
+    if (!r.ok) {
+        var code_buf: [24]u8 = undefined;
+        // plutil reports some errors on stdout.
+        const said = if (std.mem.trim(u8, r.err, " \t\r\n").len > 0) r.err else r.out;
+        noteFailure(argv, std.fmt.bufPrint(&code_buf, "exit {d}", .{r.code}) catch "failed", said);
+    }
+    return r;
+}
+
+var last_failure_buf: [1024]u8 = undefined;
+var last_failure_len: usize = 0;
+
+/// The last step that had to succeed and did not: its command, how it ended
+/// and its stderr. Empty after `clearFailure` until the next one.
+pub fn lastFailure() []const u8 {
+    return last_failure_buf[0..last_failure_len];
+}
+
+pub fn clearFailure() void {
+    last_failure_len = 0;
+}
+
+fn noteFailure(argv: []const []const u8, how: []const u8, stderr: []const u8) void {
+    var w: std.Io.Writer = .fixed(&last_failure_buf);
+    for (argv, 0..) |arg, i| {
+        if (i > 0) w.writeByte(' ') catch {};
+        // The seed map is kilobytes of JSON, the mapping's value control bytes.
+        if (arg.len > 80) {
+            w.print("<{d} bytes>", .{arg.len}) catch {};
+            continue;
+        }
+        for (arg) |c| w.writeByte(if (c < 0x20 or c == 0x7f) '?' else c) catch {};
+    }
+    w.print(" ({s}): {s}", .{ how, std.mem.trim(u8, stderr, " \t\r\n") }) catch {};
+    last_failure_len = w.end;
+    log.warn("terminal_setup", "{s}", .{lastFailure()});
 }
 
 /// `name` as one plutil keypath component (`.` escaped), or null when it holds
@@ -71,12 +119,12 @@ pub const Prefs = struct {
 
     pub fn exportTo(arena: std.mem.Allocator, store: Store, path: []const u8) Error!Prefs {
         // A domain with no settings exports as an empty dictionary.
-        if (!(try run(arena, &.{ defaults, "export", store.domain, path })).ok) return error.ToolFailed;
+        if (!(try must(arena, &.{ defaults, "export", store.domain, path })).ok) return error.ToolFailed;
         return .{ .arena = arena, .store = store, .path = path };
     }
 
     pub fn importBack(self: *const Prefs) Error!void {
-        if (!(try run(self.arena, &.{ defaults, "import", self.store.domain, self.path })).ok) return error.ToolFailed;
+        if (!(try must(self.arena, &.{ defaults, "import", self.store.domain, self.path })).ok) return error.ToolFailed;
     }
 
     /// plutil's name for the value's type ("dictionary", "string", …), or null.
@@ -89,7 +137,7 @@ pub const Prefs = struct {
     fn string(self: *const Prefs, keypath: []const u8) Error!?[]const u8 {
         const kind = try self.typeOf(keypath) orelse return null;
         if (!std.mem.eql(u8, kind, "string")) return null;
-        const r = try run(self.arena, &.{ plutil, "-extract", keypath, "raw", "-o", "-", self.path });
+        const r = try must(self.arena, &.{ plutil, "-extract", keypath, "raw", "-o", "-", self.path });
         if (!r.ok) return error.ToolFailed;
         // `raw` ends the value with one line break of its own.
         return if (std.mem.endsWith(u8, r.out, "\n")) r.out[0 .. r.out.len - 1] else r.out;
@@ -103,12 +151,12 @@ pub const Prefs = struct {
         const part = try std.fmt.allocPrint(self.arena, "{s}.part.plist", .{self.path});
         defer files.remove(part);
         if (!(try run(self.arena, &.{ plutil, "-extract", keypath, "xml1", "-o", part, self.path })).ok) return null;
-        const r = try run(self.arena, &.{ plutil, "-convert", "json", "-o", "-", part });
+        const r = try must(self.arena, &.{ plutil, "-convert", "json", "-o", "-", part });
         return if (r.ok) r.out else null;
     }
 
     fn edit(self: *const Prefs, argv: []const []const u8) Error!void {
-        if (!(try run(self.arena, argv)).ok) return error.ToolFailed;
+        if (!(try must(self.arena, argv)).ok) return error.ToolFailed;
     }
 };
 
@@ -120,7 +168,7 @@ fn profileKeypath(arena: std.mem.Allocator, profile: []const u8, tail: []const u
 /// Terminal's built-in key map as JSON (every value is a string).
 pub fn builtInMap(arena: std.mem.Allocator, store: Store) Error![]const u8 {
     const path = try std.fs.path.join(arena, &.{ store.app, "Contents", "Resources", "keyMappings.plist" });
-    const r = try run(arena, &.{ plutil, "-convert", "json", "-o", "-", path });
+    const r = try must(arena, &.{ plutil, "-convert", "json", "-o", "-", path });
     if (!r.ok) return error.NoBuiltInMap;
     const object = parseMap(arena, r.out) orelse return error.NoBuiltInMap;
     if (object.count() == 0 or object.get(shift_return) != null) return error.NoBuiltInMap;
@@ -537,17 +585,39 @@ test "apple terminal: a seeded map the user edited since keeps the edit on resto
     try f.seed(fresh_profiles);
     const prefs = try f.snapshot();
     try apply(&prefs, (try plan(&prefs)).ready.steps);
-    // The user adds a mapping of their own in Terminal's settings.
+    // The user adds a mapping of their own in Terminal's settings: a key the
+    // built-in map does not have (it maps no Command keys), checked here
+    // rather than assumed for every macOS.
+    const base = parseMap(arena, try builtInMap(arena, f.store)).?;
+    const own = for ([_][]const u8{ "@F70C", "@~F70C", "@^F70C", "@$F70C" }) |key| {
+        if (base.get(key) == null) break key;
+    } else return error.TestUnexpectedResult;
+    const own_keypath = try std.fmt.allocPrint(arena, "Window Settings.Basic.keyMapBoundKeys.{s}", .{own});
     const edited = try f.snapshot();
-    try edited.edit(&.{ plutil, "-insert", "Window Settings.Basic.keyMapBoundKeys.~F70C", "-string", "mine", edited.path });
+    try edited.edit(&.{ plutil, "-insert", own_keypath, "-string", "mine", edited.path });
     try edited.importBack();
 
     const undo = try restore(&(try f.snapshot()), &.{.{ .profile = "Basic", .seeded = true }});
     try testing.expectEqual(Undo.removed_key, undo[0]);
     const map = (try f.windowSettings()).object.get("Basic").?.object.get("keyMapBoundKeys").?.object;
     try testing.expect(map.get(shift_return) == null);
-    try testing.expectEqualStrings("mine", map.get("~F70C").?.string);
-    _ = arena;
+    try testing.expectEqualStrings("mine", map.get(own).?.string);
+}
+
+test "apple terminal: a step that has to succeed reports the tool's stderr" {
+    if (builtin.os.tag != .macos) return error.SkipZigTest;
+    const f = try Fixture.init();
+    defer f.deinit();
+    try f.seed(fresh_profiles);
+    const prefs = try f.snapshot();
+    clearFailure();
+    // Inserting a key that exists already fails in plutil.
+    try testing.expectError(error.ToolFailed, prefs.edit(&.{ plutil, "-insert", "Window Settings.Basic.name", "-string", "x", prefs.path }));
+    const why = lastFailure();
+    try testing.expect(std.mem.startsWith(u8, why, plutil ++ " -insert Window Settings.Basic.name -string x "));
+    try testing.expect(std.mem.indexOf(u8, why, "(exit ") != null);
+    // plutil says what went wrong; the exact wording is the system's.
+    try testing.expect(why.len > std.mem.indexOf(u8, why, "): ").? + 3);
 }
 
 test "apple terminal: what is left alone — another Shift+Return mapping, unsaved settings, odd names" {

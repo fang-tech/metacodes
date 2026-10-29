@@ -254,6 +254,7 @@ pub fn run(gpa: std.mem.Allocator, ctx: Context, req: Request, out: *std.Io.Writ
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
+    apple.clearFailure();
     return runIn(arena, ctx, req, out) catch |err| {
         say(out, "Terminal setup failed: {s}.", .{@errorName(err)});
         return .{ .outcome = .failed };
@@ -413,7 +414,7 @@ fn installApple(arena: std.mem.Allocator, ctx: Context, preview: bool, out: *std
     const work = try workPath(arena, dir, "work");
     defer files.remove(work);
     const prefs = apple.Prefs.exportTo(arena, ctx.apple, work) catch {
-        say(out, "Could not read Terminal's settings (`defaults export {s}` failed): left unchanged.", .{ctx.apple.domain});
+        say(out, "Could not read Terminal's settings: left unchanged. {s}", .{apple.lastFailure()});
         return .{ .outcome = .failed };
     };
     const plan = try apple.plan(&prefs);
@@ -473,8 +474,10 @@ fn installApple(arena: std.mem.Allocator, ctx: Context, preview: bool, out: *std
         break :blk apple.verify(arena, ctx.apple, verify_path, names) catch false;
     };
     if (!applied) {
+        const why = try arena.dupe(u8, apple.lastFailure());
         const rolled_back = rollback(arena, ctx.apple, backup);
         say(out, "Terminal's settings did not take the change; {s}.", .{if (rolled_back) "they are back as they were" else "restoring them failed too"});
+        if (why.len > 0) say(out, "  {s}", .{why});
         say(out, "To put them back by hand: defaults import {s} '{s}'", .{ ctx.apple.domain, backup });
         return .{ .outcome = .failed };
     }
@@ -549,7 +552,8 @@ fn restoreAll(arena: std.mem.Allocator, ctx: Context, target: ?Target, out: *std
             const prefs = apple.Prefs.exportTo(arena, store, work) catch break :blk null;
             break :blk apple.restore(&prefs, entry.profiles) catch null;
         } orelse {
-            say(out, "  Could not change Terminal's settings: left as they are. The settings from before setup: defaults import {s} '{s}'", .{ entry.domain, if (entry.backups.len > 0) entry.backups[0] else "(no backup recorded)" });
+            say(out, "  Could not change Terminal's settings: left as they are. {s}", .{apple.lastFailure()});
+            say(out, "  The settings from before setup: defaults import {s} '{s}'", .{ entry.domain, if (entry.backups.len > 0) entry.backups[0] else "(no backup recorded)" });
             outcome = .failed;
             break :apple_blk;
         };
