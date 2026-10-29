@@ -1462,6 +1462,27 @@ fn insertPaste(
     try insertAtCursor(editor, allocator, text);
 }
 
+const startup_text_cut = "Some of what was typed during startup did not fit in memory and was dropped.";
+const startup_text_lost = "What was typed during startup did not fit in memory and was dropped.";
+
+/// Put what was typed during startup into the first prompt (`editor`, still
+/// empty) as one paste. What memory could not hold, while it was read or now
+/// while it goes in (a large paste with no state root to store it in stays
+/// inline), is dropped, never left to be typed as keys; the notice returned
+/// says so, and the prompt comes up either way.
+fn insertStartupText(
+    editor: *input.LineEditor,
+    allocator: std.mem.Allocator,
+    state_root: []const u8,
+    startup: *const input.StartupText,
+) ?[]const u8 {
+    insertPaste(editor, allocator, state_root, startup.text()) catch {
+        editor.reset();
+        return startup_text_lost;
+    };
+    return if (startup.dropped) startup_text_cut else null;
+}
+
 /// 在光标处插入一段文本，光标移到插入末尾。
 fn insertAtCursor(editor: *input.LineEditor, allocator: std.mem.Allocator, text: []const u8) !void {
     const line = editor.view();
@@ -1716,8 +1737,7 @@ fn readLineRaw(
     if (input.takeStartupText()) |taken| {
         var startup = taken;
         defer startup.deinit();
-        try insertPaste(&editor, allocator, app.stateRoot(), startup.text());
-        if (startup.dropped) printNotice(app, app.theme.warn, "Some of what was typed during startup did not fit in memory and was dropped.");
+        if (insertStartupText(&editor, allocator, app.stateRoot(), &startup)) |notice| printNotice(app, app.theme.warn, notice);
     }
     // 初始画一个空输入框。
     region.setInput(editor.view(), editor.cursor);
@@ -2367,6 +2387,44 @@ fn codepointDisplayWidth(cp: u21) usize {
 // ============================================================================
 
 const testing = std.testing;
+
+test "insertStartupText: memory running out drops the startup text with a notice, and the prompt comes up" {
+    const a = std.testing.allocator;
+    var startup = input.StartupText.init(a);
+    defer startup.deinit();
+    startup.feed("line1\rline2");
+    startup.finish();
+    // It goes in whole: the text, no notice.
+    {
+        var editor = input.LineEditor.init(a);
+        defer editor.deinit();
+        try std.testing.expect(insertStartupText(&editor, a, "", &startup) == null);
+        try std.testing.expectEqualStrings("line1\nline2", editor.view());
+    }
+    // Memory runs out while it goes in: none of it stays, and the notice says so.
+    {
+        var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0, .resize_fail_index = 0 });
+        var editor = input.LineEditor.init(failing.allocator());
+        defer editor.deinit();
+        try std.testing.expectEqualStrings(startup_text_lost, insertStartupText(&editor, failing.allocator(), "", &startup).?);
+        try std.testing.expectEqualStrings("", editor.view());
+    }
+    // Memory ran out while it was read: what was kept goes in, with the notice.
+    {
+        var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 1, .resize_fail_index = 1 });
+        var cut = input.StartupText.init(failing.allocator());
+        defer cut.deinit();
+        var flood: [5000]u8 = undefined;
+        @memset(&flood, 'x');
+        cut.feed(&flood);
+        cut.finish();
+        try std.testing.expect(cut.dropped);
+        var editor = input.LineEditor.init(a);
+        defer editor.deinit();
+        try std.testing.expectEqualStrings(startup_text_cut, insertStartupText(&editor, a, "", &cut).?);
+        try std.testing.expectEqualStrings(cut.text(), editor.view());
+    }
+}
 
 test "displayWidthUpTo ASCII only" {
     try testing.expect(displayWidthUpTo("hello", 5) == 5);
