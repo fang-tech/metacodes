@@ -438,13 +438,19 @@ test "e2e: sandbox blocks write outside cwd, allows inside" {
 }
 
 /// 简易 `/bin/sh -c cmd` 捕获 stdout(测试用,复用 tools/common 的 spawn)。
+/// The capture runs with an empty environment, so on macOS `git` is Xcode's
+/// `/usr/bin/git` shim: 1-2.5 s a call while its xcrun cache is cold, more on
+/// a loaded runner. The e2e setup's three git calls overran a 10 s limit on a
+/// macOS runner (#401); the limit only bounds a hang, so it is generous.
+const RUN_SHELL_TIMEOUT_MS: u64 = 60_000;
+
 fn runShell(alloc: std.mem.Allocator, cmd: []const u8) ![]u8 {
     const common = @import("../tools/common.zig");
     const cmd_z = try alloc.dupeZ(u8, cmd);
     defer alloc.free(cmd_z);
     const argv0: [*:0]const u8 = "/bin/sh";
     var argv: [4]?[*:0]const u8 = .{ argv0, "-c", cmd_z.ptr, null };
-    const out = try common.spawnCaptureWithStderrTimed(argv[0..argv.len], alloc, null, 10_000, null, common.MAX_SPAWN_CAPTURE_BYTES, null);
+    const out = try common.spawnCaptureWithStderrTimed(argv[0..argv.len], alloc, null, RUN_SHELL_TIMEOUT_MS, null, common.MAX_SPAWN_CAPTURE_BYTES, null);
     alloc.free(out.stderr);
     return out.stdout;
 }
