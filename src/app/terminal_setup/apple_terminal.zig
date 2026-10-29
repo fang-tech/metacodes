@@ -14,8 +14,10 @@
 //!   reopened, and quitting it does not write the profiles back over the change.
 //! - The tools: `defaults export|import` go through cfprefsd, so there is no
 //!   stale cache to flush. `plutil` keypaths escape `.` as `\.` and cannot
-//!   spell a backslash. PlistBuddy is not used: it crashes on quoted profile
-//!   names and exits 0 when one of several commands fails.
+//!   spell a backslash; macOS 15's plutil aborts (SIGABRT) on a component
+//!   that starts with `@`, which 26's accepts. PlistBuddy is not used: it
+//!   crashes on quoted profile names and exits 0 when one of several commands
+//!   fails.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -51,10 +53,7 @@ fn run(arena: std.mem.Allocator, argv: []const []const u8) Error!Ran {
     z[argv.len] = null;
     const captured = process.capture(z, arena, .{ .timeout_ms = 30_000, .inherit_env = true }) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
-        else => {
-            noteFailure(argv, @errorName(err), "");
-            return error.ToolFailed;
-        },
+        else => return error.ToolFailed,
     };
     return .{ .ok = captured.exit_code == 0 and captured.capture_complete, .code = captured.exit_code, .out = captured.stdout, .err = captured.stderr };
 }
@@ -64,7 +63,10 @@ fn run(arena: std.mem.Allocator, argv: []const []const u8) Error!Ran {
 /// (and a failing CI run) shows why instead of only that it failed. Probes
 /// whose failure is an answer ("no such key") use `run`.
 fn must(arena: std.mem.Allocator, argv: []const []const u8) Error!Ran {
-    const r = try run(arena, argv);
+    const r = run(arena, argv) catch |err| {
+        if (err == error.ToolFailed) noteFailure(argv, "could not run it", "");
+        return err;
+    };
     if (!r.ok) {
         var code_buf: [24]u8 = undefined;
         // plutil reports some errors on stdout.
@@ -104,9 +106,11 @@ fn noteFailure(argv: []const []const u8, how: []const u8, stderr: []const u8) vo
 }
 
 /// `name` as one plutil keypath component (`.` escaped), or null when it holds
-/// a backslash, which a keypath cannot spell.
+/// a backslash, which a keypath cannot spell, or starts with `@`, on which
+/// macOS 15's plutil aborts.
 pub fn keypathComponent(arena: std.mem.Allocator, name: []const u8) error{OutOfMemory}!?[]const u8 {
     if (std.mem.indexOfScalar(u8, name, '\\') != null) return null;
+    if (name.len > 0 and name[0] == '@') return null;
     return try std.mem.replaceOwned(u8, arena, name, ".", "\\.");
 }
 
@@ -224,7 +228,7 @@ pub const Plan = union(enum) {
     conflict: struct { profile: []const u8, value: []const u8 },
     /// No saved profiles yet: Terminal writes them once it has run.
     not_saved,
-    /// A profile name with a backslash, which plutil cannot address.
+    /// A profile name plutil cannot address (`keypathComponent`).
     unaddressable: []const u8,
     /// The settings name a profile that is not among the saved ones.
     missing_profile: []const u8,
@@ -642,6 +646,10 @@ test "apple terminal: what is left alone — another Shift+Return mapping, unsav
     );
     try testing.expectEqualStrings("a\\b", (try plan(&(try f.snapshot()))).unaddressable);
     try f.seed(
+        \\{"Default Window Settings":"@work","Window Settings":{"@work":{}}}
+    );
+    try testing.expectEqualStrings("@work", (try plan(&(try f.snapshot()))).unaddressable);
+    try f.seed(
         \\{"Default Window Settings":"Gone","Window Settings":{"Basic":{}}}
     );
     try testing.expectEqualStrings("Gone", (try plan(&(try f.snapshot()))).missing_profile);
@@ -681,11 +689,13 @@ test "apple terminal: terminalPid walks the real process tree" {
     if (terminalPid()) |pid| try testing.expectEqualStrings("Terminal", std.mem.sliceTo(&shortInfo(pid).?.comm, 0));
 }
 
-test "keypathComponent escapes dots and refuses backslashes" {
+test "keypathComponent escapes dots and refuses backslashes and a leading @" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     try testing.expectEqualStrings("Bob's Profile\\.v2", (try keypathComponent(arena, "Bob's Profile.v2")).?);
     try testing.expectEqualStrings("Man Page", (try keypathComponent(arena, "Man Page")).?);
+    try testing.expectEqualStrings("me@work", (try keypathComponent(arena, "me@work")).?);
     try testing.expect((try keypathComponent(arena, "a\\b")) == null);
+    try testing.expect((try keypathComponent(arena, "@work")) == null);
 }

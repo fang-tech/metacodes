@@ -57,8 +57,9 @@ settings changes.
   instead of running the command.
 - Windows that use another profile are not changed. Run the command again after
   making that profile the default, or add the mapping by hand.
-- A profile whose name contains a backslash cannot be changed by the command
-  (the settings tools cannot address it); the command says so.
+- A profile whose name contains a backslash or starts with `@` cannot be changed
+  by the command (the settings tools cannot address it; macOS 15's `plutil`
+  aborts on the latter); the command says so.
 
 The command uses only the system's own tools: `defaults export` and
 `defaults import` for Terminal's settings (`com.apple.Terminal`), and `plutil`

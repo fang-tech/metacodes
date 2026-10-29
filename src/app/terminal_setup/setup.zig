@@ -425,7 +425,7 @@ fn installApple(arena: std.mem.Allocator, ctx: Context, preview: bool, out: *std
             return .{ .outcome = .refused };
         },
         .unaddressable => |name| {
-            say(out, "The profile \"{s}\" has a backslash in its name, which the settings tools cannot address: left unchanged. Rename the profile in Terminal > Settings > Profiles, then run this again.", .{name});
+            say(out, "The settings tools cannot address the profile \"{s}\" (a backslash in its name, or an @ at its start): left unchanged. Rename the profile in Terminal > Settings > Profiles, then run this again.", .{name});
             return .{ .outcome = .refused };
         },
         .missing_profile => |name| {
