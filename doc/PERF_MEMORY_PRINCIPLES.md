@@ -20,7 +20,7 @@
 **Linux x86_64(2026-10-29,WSL2 Ubuntu 22.04,`scripts/perf_baseline.sh` 各 5 次)**:`main` @ `8060498d` 本机构建
 6.60 MB / `--help` RSS 3120 KB,glibc 2.31 + baseline CPU 构建 6.56 MB / 3088 KB,体积与 RSS 两条红线均超。
 按 §3g 修完(#379 与其后续)后分别为 6098 KB / 2272 KB 与 6078 KB / 2620 KB,两条红线都回到线内,但体积余量只有 0.7% / 1.1%;
-再去掉 Linux 的 `.eh_frame`(#381,§3f)后为 5797 KB / 2516 KB 与 5777 KB / 2684 KB,体积余量 5.6% / 6.0%。
+再去掉 Linux 的 `.eh_frame`(#381,§3f),在 `main` @ `dd95365c`(含 #382、#383)上:本机构建 6117 → 5815 KB / RSS 2400 KB;发布构建(`-Dtarget=x86_64-linux-gnu.2.31 -Drelease-layout=true -Drelease-symbols=true`,objcopy 拆分后的 `bin/metacodes`)6097 → 5794 KB / 2376 KB;体积余量 5.4% / 5.7%。
 同一提交 Linux 比 macOS 大约 1 MB:arm64 默认开 LLVM MachineOutliner(x86_64 不开),`__text` 比 `.text` 小 1.6 MiB;
 macOS 保留的符号表(约 0.6 MB)抵掉一部分。`--help` RSS 的文件页部分随代码布局和内核页缓存而变(±0.2 MB)。
 
@@ -72,6 +72,11 @@ macOS 保留的符号表(约 0.6 MB)抵掉一部分。`--help` RSS 的文件页�
 
 ### 3f. 二进制体积:ReleaseSmall + 按需链接
 - 默认 ReleaseSmall(已 1.29 MB)。新依赖/大表(verb 库/工具 schema)评估体积。vendor 工具(ripgrep)进程外调用,不进二进制。
+- **Linux 发布件不带 `.eh_frame`**(`build.zig` 给 release_mod 设 `unwind_tables = .none`,仅 Linux;省 300 KB)。
+  - 程序自身从不读它:ReleaseSmall 默认 strip,`std.Options.allow_stack_tracing` 因此为 false,panic 只打印消息;没有任何依赖导入 `_Unwind_*` / `pthread_cancel` / `pthread_exit`。帧指针保留,`libc.so.6` 自带 `.eh_frame`。
+  - 取舍在外部调试工具:**没有符号文件时**,gdb 看 core 只能展开到第一个 Zig 帧,`perf --call-graph=dwarf`、systemd-coredump 这类靠 CFI 的展开也会退化;`perf --call-graph=fp` 照常可用。**有发布的符号文件时**(`-Drelease-symbols` 从同一次链接拆出的 `metacodes.debug`,其 DWARF 带 `.debug_frame`;见 [RELEASE_RUNNER.md](RELEASE_RUNNER.md#debug-symbols)),gdb 能完整展开、带函数名和源码行。
+  - 实测(#381,core 取自真实运行,停在第一次 `connect`):`gdb -s metacodes.debug -e bin/metacodes -c core` 三个线程 47 帧全部展开,参数值正确;从 `metacodes.debug` 删掉 `.debug_frame` 后帧名不变、参数读成 `0x0`。带 `.eh_frame` 的旧构建用同一命令也读成 `0x0`:`-e` 不从可执行文件取展开信息,`--only-keep-debug` 又把 `.eh_frame` 留成 NOBITS;去掉 unwind tables 后 LLVM 把 CFI 写进 `.debug_frame`,随符号文件走。
+  - macOS 与 Windows 不变(Windows x64 的 SEH 必须有 unwind 数据)。
 
 ### 3g. 大值类型的初始化与 `defer`(Zig 0.16 代码生成)
 - **现象**(2026-10-29 Linux x86_64 ReleaseSmall 实测):编译期整体已知的聚合值——字段默认值 `= .{}`、具名常量、带类型字面量 `T{ … }`、以及大载荷错误联合/optional/union 的 `return error.X` / `return null` / `return .tag`——被降级成"从只读常量 memcpy",其中 `undefined` 字节按 0 写进 `.rodata`。这类常量当时约 600 KB,最大一处是控制面事件环 138 KiB。

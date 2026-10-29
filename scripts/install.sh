@@ -179,14 +179,19 @@ latest_tag() {
   case "$final" in */tag/*) echo "${final##*/tag/}" ;; *) return 1 ;; esac
 }
 
-# The release target this host runs (release/LAYOUT.md).
+# The release target this host runs (release/LAYOUT.md). A shell running
+# under Rosetta on Apple Silicon reports x86_64; that Mac gets the native
+# arm64 unit.
 host_target() {
   os=$(uname -s); arch=$(uname -m)
   case "$os:$arch" in
     Darwin:arm64|Darwin:aarch64) echo "aarch64-macos" ;;
+    Darwin:x86_64)
+      if [ "$(sysctl -n sysctl.proc_translated 2>/dev/null)" = 1 ]; then echo "aarch64-macos"; else echo "x86_64-macos"; fi ;;
     Linux:x86_64|Linux:amd64) echo "x86_64-linux-gnu" ;;
+    Linux:aarch64|Linux:arm64) echo "aarch64-linux-gnu" ;;
     MINGW*|MSYS*|CYGWIN*) die "on Windows use scripts/install.ps1" ;;
-    *) die "no metacodes release is built for $os $arch (aarch64 macOS and x86_64 Linux are; --dev builds one from source)" ;;
+    *) die "no metacodes release is built for $os $arch (macOS and Linux on x86_64 and aarch64 are; --dev builds one from source)" ;;
   esac
 }
 

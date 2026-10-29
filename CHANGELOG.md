@@ -12,6 +12,22 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Added
 
+- **Release units for aarch64 Linux and Intel macOS** (#307). `release.yml`
+  builds `aarch64-linux-gnu` on GitHub's hosted arm64 Linux runner and
+  `x86_64-macos` on its Intel macOS runner (`macos-15-intel`), each natively
+  and through the same steps as the other units: both Lean kernels, the
+  release-configuration suite, `release:verify`, the AgentCore gate, the CLI
+  and AgentCore SDK archives and the byte-reproducibility check. Their
+  executables are built for the baseline CPU and the oldest system they
+  support, glibc 2.31 and macOS 13, not for the runner's CPU and C library:
+  the arm64 unit needs no CPU extension (SVE) that Graviton2, Ampere Altra,
+  Raspberry Pi 5 or Jetson boards lack. Releases
+  from the next one on ship five units. `scripts/install.sh` picks them on
+  Linux aarch64 and on Intel Macs; in a Rosetta shell on Apple Silicon it
+  picks the native arm64 unit instead. The AgentCore Rust link probe and
+  crate tests now know the `aarch64-unknown-linux-gnu` triple. Every POSIX
+  release job also installs its own archives the way `curl … install.sh |
+  sh` does, from a loopback mirror, so a wrong target pick fails the release.
 - **Linux releases ship their debug symbols as a separate asset.**
   - **What the asset is.** Each Linux unit gets
     `metacodes-<version>-<target-id>-debug.tar.gz` beside its archive, holding
@@ -174,6 +190,22 @@ status, compatibility boundaries, and entry points are defined by
   If metacodes panics mid-reply, the lines still waiting for the window are
   written before the panic message, and the live region no longer draws
   over the stack trace.
+
+- **The Linux release binary no longer carries unwind tables (`.eh_frame`),
+  saving 300 KB.** The program never read them. A panic in the stripped
+  binary prints its message without a stack trace either way, and frame
+  pointers are kept. What changes is post-mortem debugging with outside
+  tools:
+  - **With the release's debug-symbol asset** (`metacodes.debug`, above):
+    gdb unwinds every thread's whole stack, with function names and source
+    lines, from the `.debug_frame` the asset carries.
+  - **Without it:** gdb can no longer unwind a core past the first metacodes
+    frame, and CFI-based unwinders (`perf --call-graph=dwarf`,
+    systemd-coredump) degrade the same way. `perf --call-graph=fp` still
+    works.
+
+  macOS and Windows binaries are unchanged
+  (`doc/PERF_MEMORY_PRINCIPLES.md` §3f).
 
 - **Shift+Enter inserts a newline in any terminal that says it can, not only
   in the ones metacodes knows by name (#327).** The Kitty keyboard protocol

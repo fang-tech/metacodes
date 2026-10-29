@@ -46,21 +46,29 @@ env:
 
 jobs:
   build-posix:
-    name: Release (${{ matrix.os }})
+    name: Release (${{ matrix.os }} ${{ matrix.arch }})
     timeout-minutes: 90
     strategy:
-      # Every platform reports its own verdict: a rehearsal needs all three,
+      # Every platform reports its own verdict: a rehearsal needs all of them,
       # and the publish job already waits for all of them.
       fail-fast: false
+      # Each unit is built and verified natively on its own architecture: the
+      # Lean kernels, release:verify and the AgentCore gate all run what they
+      # build (doc/INSTALL_DESIGN.md §5, #307). aarch64-linux runs on GitHub's
+      # hosted arm64 Linux runner, x86_64-macos on its Intel macOS runner
+      # (macos-13 is retired; macos-15-intel is the oldest Intel image GitHub
+      # still hosts, and few Intel Macs run macOS 26).
+      #
       # cli_target: the Zig target the CLI executable is built for. Without
       # -Dtarget zig builds for the runner: its CPU, glibc and macOS. The
       # published 0.8.0 units needed GLIBC_2.36 and AVX2 (x86_64 Linux),
       # AVX-512 (Windows) and macOS 26.6 (aarch64 macOS), so they ran only on
       # machines like the runners. An explicit target means the baseline CPU,
       # and its version suffix is the oldest glibc or macOS the unit supports;
-      # scripts/check_binary_baseline.py holds the built executable to it.
-      # release:verify still runs the unit, because the target keeps the
-      # runner's OS, architecture and ABI.
+      # scripts/check_binary_baseline.py holds the built executable to it. The
+      # arm64 unit is for the Graviton, Ampere, Raspberry Pi 5 and Jetson boards
+      # #307 names: no SVE, and glibc 2.31. release:verify still runs the unit,
+      # because the target keeps the runner's OS, architecture and ABI.
       matrix:
         include:
           - os: Linux
@@ -68,11 +76,21 @@ jobs:
             runner: ubuntu-latest
             zig_target: x86_64-linux-gnu
             cli_target: x86_64-linux-gnu.2.31
+          - os: Linux
+            arch: ARM64
+            runner: ubuntu-24.04-arm
+            zig_target: aarch64-linux-gnu
+            cli_target: aarch64-linux-gnu.2.31
           - os: macOS
             arch: ARM64
             runner: macos-latest
             zig_target: aarch64-macos
             cli_target: aarch64-macos.13.0
+          - os: macOS
+            arch: X64
+            runner: macos-15-intel
+            zig_target: x86_64-macos
+            cli_target: x86_64-macos.13.0
     runs-on: ${{ matrix.runner }}
     env:
       # A Linux unit's executable ships stripped, and its debug symbols ship
@@ -107,6 +125,25 @@ jobs:
         run: python3 -m pip install --break-system-packages -r requirements-dev.txt
       - name: Vendored runtime assets are attested
         run: python3 scripts/verify_tinykg_binary.py && python3 scripts/verify_ripgrep_binary.py
+      # The suite's Glob and Grep tests resolve rg from PATH, as in ci.yml. The
+      # arm64 Linux image ships none, and its first dry run failed those tests
+      # with RipgrepNotFound (#307). There the vendored, attested binary the
+      # unit itself ships goes on PATH rather than a package manager's, so the
+      # job reaches no new network source.
+      - name: ripgrep for the test suite
+        shell: bash
+        env:
+          ZIG_TARGET: ${{ matrix.zig_target }}
+        run: |
+          set -euo pipefail
+          if ! command -v rg >/dev/null 2>&1; then
+            arch=${ZIG_TARGET%%-*}; os=${ZIG_TARGET#*-}; os=${os%%-*}
+            python3 scripts/stage_ripgrep_binary.py "$arch" "$os" "$RUNNER_TEMP/ripgrep"
+            echo "$RUNNER_TEMP/ripgrep" >> "$GITHUB_PATH"
+            export PATH="$RUNNER_TEMP/ripgrep:$PATH"
+          fi
+          command -v rg
+          rg --version
       # The unit ships both Lean kernels (manifest v2, release/LAYOUT.md),
       # built here natively and cold like everything else in a release: the
       # pinned elan, no Lean cache.
@@ -156,10 +193,28 @@ jobs:
           zig build release:archive -Drelease-layout=true -Doptimize=ReleaseSafe --prefix "$RUNNER_TEMP/release" $KERNEL_PINS -Dtarget=${{ matrix.cli_target }} $RELEASE_SYMBOLS -Drelease-archive-dir="$RUNNER_TEMP/dist-again"
           for archive in "$RUNNER_TEMP"/dist/metacodes-*.tar.gz; do cmp "$archive" "$RUNNER_TEMP/dist-again/$(basename "$archive")"; echo "reproducible: $(basename "$archive")"; done
           if [ -n "$RELEASE_SYMBOLS" ]; then ls "$RUNNER_TEMP"/dist/metacodes-*-${{ matrix.zig_target }}-debug.tar.gz; fi
-      # aarch64-linux has a vendored musl ripgrep since #86 and ci.yml proves
-      # the cross-staged assets. A release unit for it also needs both Lean
-      # kernels, which only a native aarch64 runner can build: adding it is a
-      # matrix change for a later issue (doc/INSTALL_DESIGN.md §5).
+      # What `curl … install.sh | sh` does on this machine: no archive named,
+      # so install.sh picks one by the host's target (host_target) from a
+      # release's SHA256SUMS. A loopback mirror serves this job's archives
+      # under their version as a release would, holding only this platform's
+      # unit, so a wrong pick fails the download; the note must also name the
+      # matrix target. The SDK is picked by the same target.
+      - name: install.sh picks this platform's archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["release"]["version"])' "$RUNNER_TEMP/release/manifest.json")
+          mkdir -p "$RUNNER_TEMP/mirror/download/$version"
+          cp "$RUNNER_TEMP"/dist/* "$RUNNER_TEMP/mirror/download/$version/"
+          python3 scripts/release_sums.py "$RUNNER_TEMP/mirror/download/$version" "$version"
+          python3 -m http.server 8765 --bind 127.0.0.1 --directory "$RUNNER_TEMP/mirror" > "$RUNNER_TEMP/mirror.log" 2>&1 &
+          server=$!
+          trap 'kill "$server" 2>/dev/null || true' EXIT
+          for _ in $(seq 50); do curl -fs -o /dev/null http://127.0.0.1:8765/ && break; sleep 0.2; done
+          sh scripts/install.sh --no-link --prefix "$RUNNER_TEMP/installed-release" --release-base http://127.0.0.1:8765 --version "$version" 2> "$RUNNER_TEMP/install.log" || { cat "$RUNNER_TEMP/install.log" "$RUNNER_TEMP/mirror.log"; exit 1; }
+          cat "$RUNNER_TEMP/install.log"
+          grep -F "metacodes $version for ${{ matrix.zig_target }} from" "$RUNNER_TEMP/install.log"
+          "$RUNNER_TEMP/installed-release/bin/metacodes" doctor --strict
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: archives-${{ matrix.os }}-${{ matrix.arch }}

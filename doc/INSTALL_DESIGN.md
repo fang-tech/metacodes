@@ -6,7 +6,8 @@ document records them so the implementation and reviews have one source.
 ## 1. Principles
 
 1. **Multi-platform and complete by default.** Every supported platform
-   (release targets: `x86_64-linux-gnu`, `aarch64-macos`, `x86_64-windows-gnu`)
+   (release targets: `x86_64-linux-gnu`, `aarch64-linux-gnu`, `aarch64-macos`,
+   `x86_64-macos`, `x86_64-windows-gnu`)
    installs with the TUI, the complete TinyKG (`tinykg` + `tinykgd`), and both
    Lean governance kernels. No user-side Lean toolchain is required.
 2. **The core is an SDK; the TUI is a thin shell.** `metacodes-core`
@@ -187,14 +188,16 @@ Git Bash on Windows), builds both kernels natively with their scripts (axiom
 audit, native smoke, `check_kernel_self_contained.py`, provenance), and builds
 the executable with the kernel digests pinned (`scripts/kernel_pins.py`). The
 kernels link the Lean runtime, GMP and libuv statically; their licence texts
-ship under `share/licenses/` (vendor/lean-runtime/). The executable is built
-for an explicit target, not the runner's own: the baseline CPU and the oldest
-glibc or macOS the platform supports (`doc/RELEASE_RUNNER.md`, "CLI target").
-Built for the runner, the 0.8.0 units needed GLIBC_2.36 and AVX2 on x86_64
-Linux, AVX-512 on Windows and macOS 26.6 on aarch64 macOS. The kernels were
-never affected: Lean builds them for the baseline CPU, and they need GLIBC_2.14
-at most. aarch64-linux stays a
-cross-staged asset check until a native aarch64 runner can build its kernels. `release/LAYOUT.md`,
+ship under `share/licenses/` (vendor/lean-runtime/). Every unit is built on a
+hosted runner of its own architecture, because the kernels, `release:verify`
+and the AgentCore gate all run what they build: aarch64-linux on the arm64
+Linux runner, x86_64-macos on the Intel macOS runner (#307). The executable is
+built for an explicit target, not the runner's own: the baseline CPU and the
+oldest glibc or macOS the platform supports (`doc/RELEASE_RUNNER.md`, "CLI
+target"). Built for the runner, the 0.8.0 units needed GLIBC_2.36 and AVX2 on
+x86_64 Linux, AVX-512 on Windows and macOS 26.6 on aarch64 macOS. The kernels
+were never affected: Lean builds them for the baseline CPU, and they need
+GLIBC_2.14 at most. `release/LAYOUT.md`,
 `release/manifest.schema.json` and `scripts/verify_install_prefix.py` list the
 kernels and `tinykgd` as required runtime assets.
 

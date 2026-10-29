@@ -664,6 +664,8 @@ fn agentcoreRustTarget(target: std.Target) ?[]const u8 {
     }
     if (target.cpu.arch == .x86_64 and target.os.tag == .linux and target.abi == .gnu)
         return "x86_64-unknown-linux-gnu";
+    if (target.cpu.arch == .aarch64 and target.os.tag == .linux and target.abi == .gnu)
+        return "aarch64-unknown-linux-gnu";
     if (target.cpu.arch == .x86_64 and target.os.tag == .macos) return "x86_64-apple-darwin";
     if (target.cpu.arch == .aarch64 and target.os.tag == .macos) return "aarch64-apple-darwin";
     return null;
@@ -837,6 +839,14 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = .ReleaseSmall,
         .link_libc = true,
+        // No .eh_frame on Linux: 300 KB the stripped executable never reads.
+        // std prints no panic stack trace without debug info, and nothing
+        // imports an unwinder. Frame pointers stay, so `perf --call-graph=fp`
+        // still walks the stack. gdb unwinds a core with metacodes.debug from
+        // -Drelease-symbols, whose DWARF keeps .debug_frame
+        // (doc/PERF_MEMORY_PRINCIPLES.md §3f). Windows x64 needs its unwind
+        // data for SEH; macOS is left as is.
+        .unwind_tables = if (target.result.os.tag == .linux) std.builtin.UnwindTables.none else null,
         // With symbols the link keeps DWARF for the split below. src/main.zig
         // turns stack tracing off for every ReleaseSmall build, which DWARF
         // would otherwise switch on (~100 KB), so the code stays within a few

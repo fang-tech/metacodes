@@ -23,7 +23,6 @@ import hashlib
 import http.server
 import io
 import os
-import platform
 import re
 import shutil
 import subprocess
@@ -118,19 +117,41 @@ class InstallShTest(unittest.TestCase):
             )
         return prefix
 
-    def install(self, unit, prefix, *options, shell="/bin/sh"):
+    def host(self, system, machine, translated=None):
+        """A PATH entry that makes install.sh see another host: `uname -s` /
+        `uname -m` answer `system` / `machine`, and `sysctl -n
+        sysctl.proc_translated` answers `translated` (1 in a Rosetta shell on
+        Apple Silicon) or fails as on Linux and older macOS."""
+        directory = Path(tempfile.mkdtemp(dir=self.tmp, prefix="host-"))
+        real_uname = shutil.which("uname")
+        (directory / "uname").write_text(
+            f'#!/bin/sh\ncase "$1" in -s) echo {system} ;; -m) echo {machine} ;; *) exec {real_uname} "$@" ;; esac\n',
+            encoding="utf-8",
+        )
+        answer = f"echo {translated}; exit 0" if translated is not None else "exit 1"
+        (directory / "sysctl").write_text(
+            f'#!/bin/sh\nif [ "$1 $2" = "-n sysctl.proc_translated" ]; then {answer}; fi\nexit 1\n',
+            encoding="utf-8",
+        )
+        for name in ("uname", "sysctl"):
+            (directory / name).chmod(0o755)
+        return directory
+
+    def install(self, unit, prefix, *options, shell="/bin/sh", host=None):
         """Runs install.sh; returns (exit code, stderr, the unit's install
         arguments or None when the unit was not asked to install). A `unit` of
-        None installs a published release (`options` name the mirror)."""
+        None installs a published release (`options` name the mirror); `host`
+        is a directory from host() to put first on PATH."""
         argv_file = self.tmp / "argv"
         if argv_file.exists():
             argv_file.unlink()
+        path = os.environ.get("PATH", os.defpath)
         completed = subprocess.run(
             [shell, str(INSTALL_SH), "--no-link", "--no-sdk", "--prefix", str(prefix), *options, *([str(unit)] if unit else [])],
             # A user locale whose collation is not ASCII order: the order must
             # not depend on it.
             env={
-                "PATH": os.environ.get("PATH", os.defpath),
+                "PATH": f"{host}{os.pathsep}{path}" if host else path,
                 "HOME": str(self.tmp / "home"),
                 "STUB_ARGV": str(argv_file),
                 "LC_ALL": "en_US.UTF-8",
@@ -201,15 +222,13 @@ class InstallShTest(unittest.TestCase):
         self.assertNotIn("--release-base", argv)
         self.assertNotIn("--checkout", argv)
 
-    @unittest.skipUnless(
-        (platform.system(), platform.machine()) in {("Darwin", "arm64"), ("Linux", "x86_64")},
-        "install.sh downloads releases only for aarch64-macos and x86_64-linux-gnu",
-    )
     def test_a_published_release_records_the_mirror_it_came_from(self):
-        target = "aarch64-macos" if platform.system() == "Darwin" else "x86_64-linux-gnu"
+        # Any host with a release does; this one is fixed so the test runs on
+        # every POSIX machine (the next test covers the others).
+        host = self.host("Linux", "x86_64")
         for sources in (True, False):
-            with self.subTest(sources=sources), ReleaseMirror(self, "0.8.0", target, sources) as mirror:
-                code, err, argv = self.install(None, self.prefix(None), "--release-base", mirror.base + "/")
+            with self.subTest(sources=sources), ReleaseMirror(self, "0.8.0", "x86_64-linux-gnu", sources) as mirror:
+                code, err, argv = self.install(None, self.prefix(None), "--release-base", mirror.base + "/", host=host)
                 self.assertEqual(code, 0, err)
                 self.assertEqual(argv[:4], ["install", "--prefix", str(self.tmp / "opt" / "metacodes"), "--upgrade"])
                 if sources:
@@ -218,6 +237,39 @@ class InstallShTest(unittest.TestCase):
                 else:
                     self.assertNotIn("--release-base", argv)  # it would reject it as unknown
                 self.assertTrue(mirror.served("/latest"))
+
+    def test_a_published_release_is_the_archive_of_the_hosts_target(self):
+        """host_target (#307): the mirror's release holds only the expected
+        target's archive, so any other pick fails its download."""
+        cases = (
+            ("Darwin", "arm64", None, "aarch64-macos"),
+            ("Darwin", "x86_64", "0", "x86_64-macos"),
+            ("Darwin", "x86_64", None, "x86_64-macos"),  # no sysctl.proc_translated (before macOS 11)
+            ("Darwin", "x86_64", "1", "aarch64-macos"),  # a Rosetta shell on Apple Silicon
+            ("Linux", "x86_64", None, "x86_64-linux-gnu"),
+            ("Linux", "aarch64", None, "aarch64-linux-gnu"),
+            ("Linux", "arm64", None, "aarch64-linux-gnu"),
+        )
+        for system, machine, translated, target in cases:
+            with self.subTest(system=system, machine=machine, translated=translated), \
+                    ReleaseMirror(self, "0.8.0", target, True) as mirror:
+                code, err, argv = self.install(None, self.prefix(None), "--release-base", mirror.base, "--version", "0.8.0",
+                                               host=self.host(system, machine, translated))
+                self.assertEqual(code, 0, err)
+                self.assertIn(f"metacodes 0.8.0 for {target} from {mirror.base}", err)
+                self.assertTrue(mirror.served(f"/download/0.8.0/metacodes-0.8.0-{target}.tar.gz"))
+                self.assertIsNotNone(argv)
+
+    def test_a_host_without_a_release_is_refused_before_any_download(self):
+        for system, machine in (("Linux", "riscv64"), ("Linux", "armv7l"), ("FreeBSD", "amd64")):
+            with self.subTest(system=system, machine=machine), \
+                    ReleaseMirror(self, "0.8.0", "x86_64-linux-gnu", True) as mirror:
+                code, err, argv = self.install(None, self.prefix(None), "--release-base", mirror.base, "--version", "0.8.0",
+                                               host=self.host(system, machine))
+                self.assertNotEqual(code, 0)
+                self.assertIn(f"no metacodes release is built for {system} {machine}", err)
+                self.assertEqual(mirror.requests, [])
+                self.assertIsNone(argv)
 
 
 class ReleaseMirror:
