@@ -775,7 +775,9 @@ typedef struct {
  * wins, and a tie at the highest is a source_conflict. 0 is the priority of
  * every unconfigured source, so zeroed fields keep the earlier resolution. The
  * two default_*_source_priority fields set it for
- * <workspace_home>/.agents/skills and <workspace_root>/.agents/skills. */
+ * <workspace_home>/.agents/skills and <workspace_root>/.agents/skills;
+ * default_user_source_priority is ignored when the canonical home and root
+ * are equal, since only the Workspace default source is registered then. */
 typedef struct {
     uint32_t struct_size;
     uint32_t reserved0;
