@@ -135,7 +135,9 @@ test "Gate capacity is enforced under concurrent callers" {
             var lease = self.gate.acquire(null) catch return;
             defer lease.release();
             const now = self.active.fetchAdd(1, .acq_rel) + 1;
-            if (now > self.max_active.load(.acquire)) self.max_active.store(now, .release);
+            // One read-modify-write: a load-then-store lets a later, smaller
+            // `now` overwrite a larger one, so the peak could read 1.
+            _ = self.max_active.fetchMax(now, .acq_rel);
             while (!self.release.load(.acquire)) std.Thread.yield() catch {};
             _ = self.active.fetchSub(1, .acq_rel);
         }
@@ -143,7 +145,9 @@ test "Gate capacity is enforced under concurrent callers" {
     var shared = Shared{};
     var threads: [4]std.Thread = undefined;
     for (&threads) |*thread| thread.* = try std.Thread.spawn(.{}, Shared.worker, .{&shared});
-    while (shared.active.load(.acquire) < 2) std.Thread.yield() catch {};
+    // Wait for the recorded peak, not `active`: a caller counts itself in
+    // `active` before it records the peak.
+    while (shared.max_active.load(.acquire) < 2) std.Thread.yield() catch {};
     // Give blocked callers ample scheduling opportunities; they must not enter above capacity.
     for (0..10_000) |_| std.Thread.yield() catch {};
     try std.testing.expectEqual(@as(usize, 2), shared.max_active.load(.acquire));
