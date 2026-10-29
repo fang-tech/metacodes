@@ -717,12 +717,13 @@ pub fn saveMode(fd: c_int) ?SavedMode {
 }
 
 /// 临时切 cooked 模式（行输入 + 回显 + 信号），供唤起外部编辑器等。复原走 restoreMode(saved)。
+/// Windows 上同时关掉 VT 输入:shell 交给程序的控制台不带它,编辑器按 shell 下的样子读键。
 pub fn setCooked(fd: c_int) void {
     if (is_windows) {
         const hin = GetStdHandle(STD_INPUT_HANDLE);
         var m: win.DWORD = 0;
         if (GetConsoleMode(hin, &m) == 0) return;
-        _ = SetConsoleMode(hin, m | ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_PROCESSED_INPUT);
+        _ = SetConsoleMode(hin, (m | ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_PROCESSED_INPUT) & ~ENABLE_VIRTUAL_TERMINAL_INPUT);
         return;
     }
     var t: std.c.termios = undefined;

@@ -347,6 +347,14 @@ status, compatibility boundaries, and entry points are defined by
   wraps the paste in `ESC[200~ … ESC[201~` and no longer warns, and classic
   conhost sends the markers as key records with the text. Measured in both
   with a pasted Chinese and ASCII text of 3 and of 80 lines.
+- **The editor a question's note opens with Ctrl+G gets a plain terminal
+  (#386).** The question dialog handed the terminal to `$EDITOR` in cooked
+  mode but left the escape modes on: bracketed paste and, where the terminal
+  speaks it, the Kitty keyboard protocol, so the editor read paste markers
+  and Kitty key codes. It now turns them off for the editor and on again
+  after it, as the prompt's own Ctrl+G does, together with a Windows
+  console's win32-input-mode; the console it hands over has no VT input
+  either.
 
 - **Release executables run beyond machines like the build runner.**
   `release.yml` built the CLI executable without `-Dtarget`, so zig targeted

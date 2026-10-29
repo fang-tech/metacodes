@@ -571,11 +571,18 @@ pub fn reconcileModes(fd: c_int) bool {
 const console_enable = "\x1b[?9001h" ++ "\x1b[?2004h";
 const console_disable = "\x1b[?2004l" ++ "\x1b[?9001l";
 
+/// 控制台模式(console_enable / console_disable)写到哪:控制台的输出(Windows 控制台不收写给
+/// stdin 的字节),只在 stdin/stdout 都是控制台时,与 TERM 无关(Windows 上通常没有 TERM)。
+/// 测试把它指到一个文件(g_console_out_for_testing)。
+fn consoleOut() ?c_int {
+    if (g_console_out_for_testing) |out| return out;
+    return if (platform_term.isConsole()) 1 else null;
+}
+var g_console_out_for_testing: ?c_int = null;
+
 fn emitEnableSequences(fd: c_int) void {
-    // 写到控制台输出(Windows 控制台不收写给 stdin 的字节);只在 stdin/stdout 都是控制台时,
-    // 与 TERM 无关(Windows 上通常没有 TERM)。
-    if (platform_term.isConsole()) {
-        _ = pfs.writeAll(1, console_enable);
+    if (consoleOut()) |out| {
+        _ = pfs.writeAll(out, console_enable);
         platform_term.decodeKeyRecords();
     }
     // Dumb terminals do not understand private modes; keep their output clean.
@@ -865,16 +872,38 @@ pub const StartupText = struct {
 };
 
 pub fn restoreMode(fd: c_int, orig: platform_term.SavedMode) void {
-    // 关 bracketed paste(始终)+ 键盘协议(仅发过 enable 的——对称 enterRawMode,同进程 env 不变、
-    // 探测答案只写一次,判定恒一致,不会发了 enable 没 disable;没发过的不发孤立 disable,避免
-    // Apple Terminal honor 它出异常)。
+    emitDisableSequences(fd);
+    platform_term.restoreMode(fd, orig); // POSIX tcsetattr / Windows SetConsoleMode
+}
+
+/// emitEnableSequences 开的转义模式关回去。关 bracketed paste(始终)+ 键盘协议(仅发过 enable
+/// 的——对称 enterRawMode,同进程 env 不变、探测答案只写一次,判定恒一致,不会发了 enable 没
+/// disable;没发过的不发孤立 disable,避免 Apple Terminal honor 它出异常)+ 控制台的
+/// win32-input-mode 与它的 bracketed paste。
+fn emitDisableSequences(fd: c_int) void {
     const disable_paste = "\x1b[?2004l";
     _ = pfs.writeAll(fd, disable_paste);
     if (shouldEnableKittyKeyboard()) {
         _ = pfs.writeAll(fd, kbd_disable_seq);
     }
-    if (platform_term.isConsole()) _ = pfs.writeAll(1, console_disable);
-    platform_term.restoreMode(fd, orig); // POSIX tcsetattr / Windows SetConsoleMode
+    if (consoleOut()) |out| _ = pfs.writeAll(out, console_disable);
+}
+
+/// 在 raw 模式里读键的地方把终端借给一个自己读终端的子进程(`$EDITOR`):终端回到 cooked,
+/// REPL 开的转义模式全关——否则编辑器收到的是括号粘贴标记、Kitty 键码,Windows 控制台上
+/// 每个键都是一条 win32-input-mode 记录 `ESC[…_`。返回借出前的模式,交给 takeBackTerminal;
+/// 不是终端 → null(什么都没动)。
+pub fn lendTerminal(fd: c_int) ?platform_term.SavedMode {
+    const saved = platform_term.saveMode(fd) orelse return null;
+    emitDisableSequences(fd);
+    platform_term.setCooked(fd);
+    return saved;
+}
+
+/// 子进程用完终端:回到借出前的模式,转义模式重新打开(Windows 控制台上 Shift+Enter 照旧换行)。
+pub fn takeBackTerminal(fd: c_int, saved: platform_term.SavedMode) void {
+    platform_term.restoreMode(fd, saved);
+    emitEnableSequences(fd);
 }
 
 /// 把 `current` 写临时文件,开 $VISUAL/$EDITOR(前台阻塞)编辑,读回(owned,去尾换行)。
@@ -1918,6 +1947,81 @@ test "readInput(Windows 控制台送按键记录):读出的是键,抬键记录�
     }
     try testing.expectEqualStrings("x\x1b[12", buf[0..got]);
     try testing.expect(!platform_term.lastReadWasKeyRecord());
+}
+
+test "readInput(Windows 控制台送按键记录):一条记录被 ReadConsoleW 的 256 字符一批切开,读出的仍是那个键" {
+    if (@import("builtin").os.tag != .windows) return error.SkipZigTest;
+    var console = try @import("platform").test_support.PrivateConsole.begin();
+    defer console.end();
+    defer platform_term.resetConsoleInputForTesting();
+    platform_term.decodeKeyRecords();
+    // 250 个终端写来的字,再一条 ↓ 记录(按下 19 字符 + 抬起):第一批 256 个字符在记录的第 6 个
+    // 字符处截断,剩下的还排在队列里。
+    try console.sendChars("x" ** 250 ++ "\x1b[40;80;0;1;288;1_\x1b[40;80;0;0;288;1_");
+    var got: [300]u8 = undefined;
+    var n: usize = 0;
+    var reads: usize = 0;
+    while (n < 253 and reads < 16) : (reads += 1) {
+        const r = platform_term.readInput(0, got[n..@min(n + 64, got.len)]);
+        try testing.expect(r > 0);
+        n += @intCast(r);
+    }
+    try testing.expectEqualStrings("x" ** 250 ++ "\x1b[B", got[0..n]);
+    try testing.expect(platform_term.lastReadWasKeyRecord());
+    try testing.expectEqual(@as(i32, 0), platform_term.waitReadable(0, 0)); // 抬起记录读走了,不产字节
+}
+
+test "lendTerminal(Windows 控制台):编辑器拿到的控制台没有 win32-input-mode 和括号粘贴,还回来再打开" {
+    if (@import("builtin").os.tag != .windows) return error.SkipZigTest;
+    var console = try @import("platform").test_support.PrivateConsole.begin();
+    defer console.end();
+    defer platform_term.resetConsoleInputForTesting();
+    // 控制台模式序列写进一个文件(这里 stdout 不是控制台),按写入顺序核对。
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, "{s}/metacodes-lend-test-{d}.txt", .{ ppaths.tempDir(), process.currentPid() });
+    const out = pfs.open(path.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o600));
+    try testing.expect(out >= 0);
+    defer pfs.unlinkPath(path.ptr) catch {};
+    defer _ = pfs.close(out);
+    g_console_out_for_testing = out;
+    defer g_console_out_for_testing = null;
+    const ENABLE_LINE_INPUT: u32 = 0x0002;
+    const ENABLE_VIRTUAL_TERMINAL_INPUT: u32 = 0x0200;
+
+    // REPL 的 raw 模式:9001 与 2004 开着。
+    const before = platform_term.enterRaw(0) orelse return error.TestUnexpectedResult;
+    defer platform_term.restoreMode(0, before);
+    emitEnableSequences(0);
+    try expectFile(path, console_enable);
+
+    // 编辑器运行期间:两者关着,控制台是 cooked(行输入),也不带 VT 输入。
+    const lent = lendTerminal(0) orelse return error.TestUnexpectedResult;
+    try expectFile(path, console_enable ++ console_disable);
+    const during = platform_term.saveMode(0).?;
+    try testing.expect(during.in_mode & ENABLE_LINE_INPUT != 0);
+    try testing.expect(during.in_mode & ENABLE_VIRTUAL_TERMINAL_INPUT == 0);
+
+    // 还回来:raw 模式,两者重新打开。
+    takeBackTerminal(0, lent);
+    try expectFile(path, console_enable ++ console_disable ++ console_enable);
+    const after = platform_term.saveMode(0).?;
+    try testing.expect(after.in_mode & ENABLE_LINE_INPUT == 0);
+    try testing.expect(after.in_mode & ENABLE_VIRTUAL_TERMINAL_INPUT != 0);
+}
+
+/// `path` 的全部内容是 `want`。
+fn expectFile(path: [:0]const u8, want: []const u8) !void {
+    const fd = pfs.open(path.ptr, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+    try testing.expect(fd >= 0);
+    defer _ = pfs.close(fd);
+    var buf: [128]u8 = undefined;
+    var n: usize = 0;
+    while (n < buf.len) {
+        const r = pfs.read(fd, buf[n..]); // no EINTR: regular file, not the terminal
+        if (r <= 0) break;
+        n += @intCast(r);
+    }
+    try testing.expectEqualStrings(want, buf[0..n]);
 }
 
 test "readKey(Windows 控制台送按键记录):Esc 记录后面排着 Enter 也是两个键;终端写来的 ESC CR 是 Shift+Enter" {

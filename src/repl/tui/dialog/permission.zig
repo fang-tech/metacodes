@@ -11,7 +11,7 @@
 //!
 //! 分层:
 //! - render():纯渲染 → []u8(可 snapshot 测试)
-//! - prompt():render + raw mode 读键循环(真 TTY 才用;非 TTY 由调用方退回文字)
+//! - promptLoop():render + 读键循环(调用方负责 raw mode 与终端接管,见 TuiBackend)
 
 const std = @import("std");
 const pfs = @import("platform").fs;
@@ -89,24 +89,10 @@ pub fn render(alloc: std.mem.Allocator, th: Theme, tool_name: []const u8, args: 
     });
 }
 
-/// 交互式询问(真 TTY)。渲染对话框 + raw mode 读键,返回选择。
-/// 非 TTY → 返回 null(调用方退回文字 prompt)。
-///
-/// input.zig 的 enterRawMode/restoreMode 复用。fd 默认 stdin(0),输出 fd 默认 stdout(1)。
-pub fn prompt(alloc: std.mem.Allocator, th: Theme, tool_name: []const u8, args: []const u8) ?PermissionChoice {
-    const in_fd: c_int = 0;
-
-    if (!term.isatty(in_fd)) return null;
-
-    const orig = input_mod.enterRawMode(in_fd) orelse return null;
-    defer input_mod.restoreMode(in_fd, orig);
-
-    return promptLoop(alloc, th, in_fd, 1, tool_name, args);
-}
-
 /// 渲染 + 读键循环(不管 raw mode / 终端接管——调用方负责)。
-/// 用于:① prompt() 自己进 raw mode 后调;② TuiBackend 终端接管(停 watcher+持锁)后调。
-/// out_fd 输出(prompt 用 stdout=1;TuiBackend 接管用 stderr=2 与 region 同流)。
+/// TuiBackend 终端接管(停 watcher+持锁)后调,生成期的 raw mode 由 loop 进好:对话框自己不再进
+/// 一层 raw mode(嵌套的 restoreMode 会把外层开着的括号粘贴、win32-input-mode 一起关掉)。
+/// out_fd 输出(TuiBackend 接管用 stderr=2 与 region 同流)。
 /// 重画用 render 实际行数(不再硬编码 8——参数长会折行变多行,硬编码会错位)。
 /// 回顶按终端现在的宽度数上一帧占的行:框比终端宽时画的那一刻就折了行,终端变窄后
 /// 又会把每行重排成多行(reflow.zig);回顶后 ED 0 清掉旧帧多出的行。
