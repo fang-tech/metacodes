@@ -725,7 +725,10 @@ fn collectStartupInput(fd: c_int) void {
 }
 
 /// What was typed before the first prompt, for it to insert as one paste.
-/// Null once taken, and when nothing was typed. The caller deinits it.
+/// Null once taken, and when nothing was typed. The caller deinits it. A
+/// turn that runs before the first prompt (a cron due at startup, a goal
+/// loop going on) leaves it alone: the reply's draft (`TuiBackend.draft`) is
+/// dropped when the reply ends, so the text waits for the first prompt.
 pub fn takeStartupText() ?StartupText {
     const text = g_startup_text orelse return null;
     g_startup_text = null;

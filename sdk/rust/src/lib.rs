@@ -176,6 +176,11 @@ impl SessionApi {
     pub fn submit_input(self) -> raw::metask_agentcore_session_submit_input_fn_v1 {
         self.table().submit_input
     }
+    /// Revision 25: replace the Session's provider credential in place, also
+    /// while a Run is active and from that Run's own callbacks.
+    pub fn update_credential(self) -> raw::metask_agentcore_session_update_credential_fn_v1 {
+        self.table().update_credential
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -368,6 +373,7 @@ unsafe fn validate_session_api(ptr: *const raw::metask_agentcore_session_api_v1)
         && table.run_input.is_some()
         && table.abort.is_some()
         && table.submit_input.is_some()
+        && table.update_credential.is_some()
 }
 
 unsafe fn validate_session_control_api(
@@ -704,7 +710,8 @@ mod tests {
 
     #[test]
     fn revision_fifteen_layout_codes_and_host_buffer_helpers_are_exact() {
-        assert_eq!(raw::METASK_AGENTCORE_ABI_REVISION, 24);
+        assert_eq!(raw::METASK_AGENTCORE_ABI_REVISION, 25);
+        assert_eq!(raw::METASK_AGENTCORE_MAX_CREDENTIAL_BYTES_V1, 16_384);
         assert_eq!(raw::METASK_AGENTCORE_MAX_SUBMITTED_INPUTS_V1, 64);
         assert_eq!(raw::METASK_AGENTCORE_MAX_SUBMITTED_INPUT_BYTES_V1, 16_777_216);
         assert_eq!(size_of::<raw::metask_agentcore_submitted_input_v1>(), 48);
@@ -758,7 +765,7 @@ mod tests {
         assert_eq!(raw::METASK_AGENTCORE_MCP_APPLY_SUPERSEDED, 2);
         assert_eq!(raw::METASK_AGENTCORE_MCP_APPLY_REJECTED, 3);
         assert_eq!(size_of::<raw::metask_agentcore_runtime_api_v1>(), 24);
-        assert_eq!(size_of::<raw::metask_agentcore_session_api_v1>(), 48);
+        assert_eq!(size_of::<raw::metask_agentcore_session_api_v1>(), 56);
         assert_eq!(
             size_of::<raw::metask_agentcore_session_control_api_v1>(),
             80

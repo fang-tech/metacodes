@@ -32,6 +32,7 @@ const agent_tree = @import("widget/agent_tree.zig");
 const agent_job_registry = @import("../../core/agent_job_registry.zig");
 const task_store = @import("../../core/task_store.zig");
 const ui_mod = @import("ui.zig");
+const frame_scheduler = @import("frame_scheduler.zig");
 const model_picker_view = @import("../model_picker_view.zig");
 const event_mod = @import("event.zig");
 const input = @import("../input.zig");
@@ -42,7 +43,31 @@ const Conversation = @import("../../core/conversation.zig").Conversation;
 const Theme = theme_mod.Theme;
 const ColorCapability = term.ColorCapability;
 
+/// The session region (the one with the merge window on, so the only one that
+/// can hold text it has not written yet). The panic hook finds it here.
+var panic_target: std.atomic.Value(?*RenderRegion) = .init(null);
+
+/// Called by the root panic handler (main.zig) before the default one prints
+/// the panic: write what the merge window still holds (`flushForPanic`).
+/// True when the region's lock was taken, and is still held.
+pub fn flushPendingOnPanic() bool {
+    const region = panic_target.load(.acquire) orelse return false;
+    return region.flushForPanic();
+}
+
 pub const RenderRegion = struct {
+    /// 生成期重画的合并窗口(#328,见 frame_scheduler.zig)。`merge` 非 null 时生效。
+    pub const MergeWindow = struct {
+        sched: frame_scheduler.Scheduler = .{},
+        /// 单调毫秒时钟(测试注入假时钟)。
+        now_ms: *const fn () i64 = util_time.nowMs,
+        /// 到期由定时线程画;false 时由调用方 pumpFrame(测试按假时钟逐步推进)。
+        timer: bool = true,
+        thread: ?std.Thread = null,
+        stop: bool = false,
+        wake: sync.Condition = .{},
+    };
+
     /// Ctrl+O 重开去抖窗口(ms)。键盘 auto-repeat 通常 ≤66ms/次(>15/s),故 120ms 能折叠
     /// "按住"连发,又远小于人为"开→关→再开"的有意间隔 → 不误伤故意快速 toggle。见 noteCtrloAndShouldSuppressReopen。
     const OVERLAY_REOPEN_DEBOUNCE_MS: i64 = 120;
@@ -67,15 +92,8 @@ pub const RenderRegion = struct {
     scratch: std.Io.Writer.Allocating,
     allocator: std.mem.Allocator, // queued buffer 用
 
-    // 输入期状态(由 loop 在每次按键后更新 view/cursor 再调 render)
-    input_view: []const u8 = "",
-    input_cursor: usize = 0,
-    prompt: []const u8 = "> ",
-
-    // 生成期状态
-    generating: bool = false,
-    // spinner/verb/工具/进度卡的真相源 = self.ui(UiState);drawGenRegion 读它。
-    // 旧的 spinner_frame/verb/gen_start_ms/current_tool*/tool_cards* 字段已删(单一真相源)。
+    // 阶段(输入期/生成期/idle)和阶段内的逻辑态——输入框内容、spinner、工具卡、help、菜单……——
+    // 只在 self.ui 里(#330:阶段是唯一真相源,见 inGeneration)。下面是生成期的**机制态**。
     text_pending_newline: bool = false,
     pending_col: u16 = 0, // 半行 chunk 累计显示列(消息穿过续接用)
     // 终端在生成期 resize 后会重排 scrollback。此时旧的半行列已经没有
@@ -97,9 +115,6 @@ pub const RenderRegion = struct {
     region_drawn_pending_col: u16 = 0,
     // 生成期 app 指针(enterGenerating 存),供 writeGenText 在 print 后重画区(无需经 RegionWriter 传)。
     gen_app: ?*const app_mod.App = null,
-    // 生成期输入框内容(watcher 线程的 LineEditor 视图,每次按键后由 watcher 经 setGenInput 更新)。
-    gen_view: []const u8 = "",
-    gen_cursor: usize = 0,
     // 生成期待发送队列指针(渲染预览用;watcher 入队后重画)。
     gen_queue: ?*msg_queue.MsgQueue = null,
     // 生成期行缓冲:LLM 文本逐 token 来,攒到遇 \n 才整行输出(避免逐字闪烁)。
@@ -120,6 +135,23 @@ pub const RenderRegion = struct {
     // 阶段1:overlay 逻辑态(help/transcript)由 UiState 承载;机制态(prev_rows 等)仍在上面。
     ui: ui_state_mod.UiState = .{},
 
+    // ---- 生成期重画合并窗口(#328)----
+    /// null = 每个重画请求当场画(默认:离线测试、/agent-churn-test 这类直接驱动区的用法)。
+    /// REPL 的会话 region 由 loop.zig 经 enableMergeWindow 打开。
+    merge: ?MergeWindow = null,
+    /// 合并窗口里攒下、还没写到终端的 scrollback 文本,按到达顺序;下一帧与区重画一起写出。
+    /// UiState/续接态照常同步更新,只有写终端被推迟(写出时才 updatePendingTail)。
+    pending_scroll: std.ArrayList(u8) = .empty,
+    /// 区内容变了(spinner、工具进度、输入框、help……),下一帧要重画区。
+    region_dirty: bool = false,
+    /// 边界(endScrollLine、leaveGenerating)收集缓冲残行时置位:emitToScroll 只攒不画,
+    /// 边界自己画一帧。
+    hold_paint: bool = false,
+    /// 生成期输入框内容的 region 自有副本。草稿(TuiBackend 的 `draft`)的缓冲会在下一个键时重分配,
+    /// 而区可能由别的线程(agent 主线程的文本帧、合并窗口的定时线程)在那之前画:借用它就会
+    /// 读到已释放的内存。生成期的 Interaction.editor 借用的是这份副本(持锁写)。
+    gen_editor: std.ArrayList(u8) = .empty,
+
     mutex: sync.Mutex = .{},
 
     /// Where flushed bytes go. Null in the product: stderr through
@@ -127,12 +159,28 @@ pub const RenderRegion = struct {
     /// tests point it at a buffer and replay the bytes through a virtual
     /// terminal (tests/component/vterm.zig).
     sink: ?*std.Io.Writer = null,
+    /// Test seam: the size `measureSize` reports instead of asking the fd.
+    /// Component tests run the region on fd -1, which has no size, so this is
+    /// how they resize it. Null in the product.
+    size_override: ?term.TermSize = null,
 
     fn lock(self: *RenderRegion) void {
         _ = self.mutex.lock();
     }
     fn unlock(self: *RenderRegion) void {
         _ = self.mutex.unlock();
+    }
+
+    /// The region lock, for a writer of state that frames read but the region
+    /// does not own (`app.model_picker`, see picker_host.Guard). Hold it for
+    /// the in-memory write only: never across IO, never with another lock
+    /// taken inside, never around a call into the region (it is not
+    /// recursive).
+    pub fn lockUi(self: *RenderRegion) void {
+        self.lock();
+    }
+    pub fn unlockUi(self: *RenderRegion) void {
+        self.unlock();
     }
 
     /// 生成期 overlay(全屏 transcript viewer,alt-screen)用:持渲染锁,使 agent_loop emit 线程
@@ -197,19 +245,21 @@ pub const RenderRegion = struct {
     pub fn enterExclusiveOverlay(self: *RenderRegion) void {
         self.lock();
         self.observeResize();
+        // 立即边界:攒着的文本先写出(在对话框/查看器之前),区随后擦掉。
+        self.paintLocked(.hidden, "");
         // 半行封口(text_pending_newline 时补 \n):旧 inline 模式为对齐 DECSC 存档点在行首。alt-screen 下
         // 不再用 DECSC,但补 \n 仍无害(保 scrollback 末行干净),保留不动。
-        if (self.generating and self.text_pending_newline) {
+        if (self.inGeneration() and self.text_pending_newline) {
             const w = &self.scratch.writer;
             self.resetScratch();
             w.writeAll("\n") catch {};
-            self.flush();
+            self.flushScratch();
             self.text_pending_newline = false;
             self.pending_col = 0;
         }
         // overlay_region_height:DEAD(viewer 丢弃 anchor_hint),保留不动,见上注。
         self.overlay_region_height = self.prev_rows;
-        if (self.generating and self.region_drawn) self.eraseRegion();
+        if (self.inGeneration() and self.region_drawn) self.eraseRegion();
         self.sealResizedLine();
         // 区状态清零:exit 从干净态 drawGenRegion 重画(对话由 alt-screen 退出自动恢复)。
         self.region_drawn = false;
@@ -226,14 +276,15 @@ pub const RenderRegion = struct {
         return rows - h + 1;
     }
     pub fn exitExclusiveOverlay(self: *RenderRegion, app: *const app_mod.App) void {
-        if (self.generating) {
+        if (self.inGeneration()) {
             // footer 残影根因(真机 Warp + DSR 诊断坐实):alt-screen 退出 `?1049l` 主缓冲恢复**不精确**
             // (游标列不还原、偶尔行偏 1),旧版"假设恢复干净直接重画"→ 旧固定区行残留。
             // 修复点不在这里特判,而在 drawGenRegion 开头的 `ESC[0J`(每次区重画都把区下方主动清净)——
             // 单一机制、不依赖 ?1049/DECRC 的恢复精度(DSR 证明 Warp 对 DECSC/DECRC 也不还原列,已删那条死路)。
-            // drawGenRegion 不自测尺寸:overlay 期间的 resize 在这里量。
-            self.observeResize();
-            self.drawGenRegion(app);
+            // overlay 期间的 resize 由 paintLocked 开头量。
+            _ = app;
+            self.region_dirty = true;
+            self.paintLocked(.as_needed, "");
         }
         self.unlock();
     }
@@ -264,7 +315,11 @@ pub const RenderRegion = struct {
     pub fn clearToolCard(self: *RenderRegion, id: []const u8) void {
         self.lock();
         defer self.unlock();
+        // 卡离场前先画掉还在等的那帧:它可能带着这张卡还没上屏的进度(9016b64a:`Found N`
+        // 在被完成态覆盖前至少要画出一帧)。合并只吞掉同一张卡被后续进度覆盖的中间态。
+        if (self.region_dirty and self.paintPending()) self.paintLocked(.as_needed, "");
         ui_state_mod.clearCard(&self.ui, id);
+        self.region_dirty = true; // 工具完成随后走立即通道(TuiBackend → flushGen)
     }
 
     /// 设置某张 per-toolUse 卡的进度第二行(对齐 cc onProgress→renderToolUseProgressMessage)。
@@ -273,13 +328,9 @@ pub const RenderRegion = struct {
     pub fn setToolProgress(self: *RenderRegion, id: []const u8, text: []const u8) void {
         self.lock();
         defer self.unlock();
-        ui_state_mod.setCardProgress(&self.ui, id, text);
-        // 立即重画(用 enterGenerating 存的 gen_app),让进度行至少渲染一帧。
-        if (self.generating) {
-            if (self.gen_app) |app| {
-                self.redrawFrameLocked(app);
-            }
-        }
+        // 普通通道(#328):孤立的进度当场画(与以前的立即重画同帧);窗口内接连到达的合并成一帧,
+        // 画的是最新那条。卡被移除前 clearToolCard 会先画掉待画帧,进度不会一帧都没画就消失。
+        self.requestRedrawLocked(ui_mod.dispatch(&self.ui, .{ .tool_progress = .{ .id = id, .text = text } }));
     }
 
     pub fn init(allocator: std.mem.Allocator, fd: c_int, theme: Theme, cap: ColorCapability) RenderRegion {
@@ -320,27 +371,250 @@ pub const RenderRegion = struct {
         self.use_unicode = themeUsesUnicode(theme);
     }
 
-    /// Clear the interaction state that belongs to one phase. Before the
-    /// region was shared, every input read and every reply built a fresh one,
-    /// so an agent list, the help footer, the slash highlight, the Ctrl+X
-    /// prefix or the paste hint never outlived the phase it was opened in. An
-    /// agent list left open by a reply would otherwise swallow the next
-    /// prompt's typing. The model picker crosses phases on purpose (#220);
-    /// the loop hands it off, so it is not reset here.
-    pub fn resetPhaseUi(self: *RenderRegion) void {
-        self.lock();
-        defer self.unlock();
-        self.resetPhaseUiLocked();
+    /// 生成期 ⟺ UiState 处于 generating 阶段。阶段只有一份真相(self.ui.phase),不另存 bool。
+    fn inGeneration(self: *const RenderRegion) bool {
+        return self.ui.phase == .generating;
     }
 
-    fn resetPhaseUiLocked(self: *RenderRegion) void {
-        self.ui.help_open = false;
-        self.ui.ctrl_x_armed = false;
-        self.ui.slash_sel = 0;
-        self.ui.paste_hint = false;
-        self.ui.agents = .{};
-        self.ui.press = .{};
-        self.ui.menu_dismissal = .{};
+    /// 打开生成期重画合并窗口(#328)。REPL 的会话 region 调一次;此后 region 的地址不能再变
+    /// (定时线程持有它,panic 钩子也记着它),deinit 时 join 并注销。
+    pub fn enableMergeWindow(self: *RenderRegion) void {
+        self.lock();
+        defer self.unlock();
+        if (self.merge == null) self.merge = .{};
+        panic_target.store(self, .release);
+    }
+
+    /// 合并窗口最多压着一个窗口(~16 ms)已经发出、还没写到终端的文本。进程 panic 时它们随进程
+    /// 一起丢掉,而它们常常正是 panic 之前最后发生的事。panic 钩子(main.zig)先调这里:
+    /// 拿得到锁才写——锁被占着(panic 的正是持锁画帧的线程,或别的线程正画到一半)时帧状态
+    /// 不可信,放弃,宁可少几行也不把屏幕写乱。写的是擦掉固定区、再按序写出攒着的文本,
+    /// 不再画区,panic 信息接着打在文本下面。
+    /// **不分配**:panic 可能正来自分配器——Zig 的 DebugAllocator 持着自己的锁报 invalid free /
+    /// double free——这时让 scratch 扩容会永远等那把锁,崩溃变成挂死。擦除字节拼在栈上的固定
+    /// 缓冲里(装不下就整个放弃),文本原样写出。这条路径上若再 panic,默认 handler 只报"panic
+    /// 期间又 panic",原来的信息就丢了;所以这里只做 tryLock、量尺寸、拼固定字节、写。
+    /// 擦前先量终端(与 paintLocked 开头同一步 observeResize:一次 ioctl / 控制台查询,不分配,
+    /// 量不到沿用旧值):最后一个窗口里 resize 过,climb 要按现在的宽度数行,否则重排后的区行
+    /// 留在屏上;画区时记的半行续接列也随重排失效,作废后按 paintLocked 的规矩封口。
+    /// 返回 true 时锁**仍被持有**:panic 信息打完之前,定时线程和别的线程不会再画区盖住它
+    /// (进程随后 abort,不放)。
+    pub fn flushForPanic(self: *RenderRegion) bool {
+        if (!self.mutex.tryLock()) return false;
+        const text = self.pending_scroll.items;
+        if (text.len == 0) return true;
+        self.observeResize();
+        var head_buf: [128]u8 = undefined;
+        var head: std.Io.Writer = .fixed(&head_buf);
+        if (self.region_drawn and self.prev_rows > 0) {
+            self.writeErase(&head) catch return true;
+            self.region_drawn = false;
+        }
+        if (self.resize_seal_pending) {
+            head.writeAll("\n") catch return true;
+            self.resize_seal_pending = false;
+        }
+        self.flush(head.buffered());
+        self.flush(text);
+        return true;
+    }
+
+    fn paintPending(self: *const RenderRegion) bool {
+        const m = self.merge orelse return false;
+        return m.sched.isPending();
+    }
+
+    /// dispatch 要求重画区 → 普通通道。立即通道不经 dispatch:它由事件来源决定(提交、工具完成、
+    /// 中断各自调 redrawGen/flushGen),同一个 redraw_region 来自按键时就是普通的。须已持锁。
+    fn requestRedrawLocked(self: *RenderRegion, eff: event_mod.Effect) void {
+        if (!eff.redraw_region or !self.inGeneration()) return;
+        self.region_dirty = true;
+        self.requestPaintLocked();
+    }
+
+    /// 一次普通重画请求:窗口内的请求合并成一帧,画的是到点那一刻的状态;没开合并窗口时当场画。
+    /// 须已持锁。
+    fn requestPaintLocked(self: *RenderRegion) void {
+        if (self.merge) |*m| {
+            if (m.sched.request(m.now_ms()) == .deferred) {
+                self.armTimerLocked();
+                return;
+            }
+        }
+        self.paintLocked(.as_needed, "");
+    }
+
+    /// 画一帧——生成期所有写终端的绘制都经这里,也是合并窗口的 flush:攒下的 scrollback 文本
+    /// (+ extra)写出(擦区 → 封口 → 文本 → 续接点),再按需重画区;一次 flush,区在屏时包成一个
+    /// DEC 2026 同步帧。`.as_needed`:区原本在屏或被请求重画就重画;`.hidden`:只写文本,区擦掉
+    /// 不重画(马上要收起区的边界:leaveGenerating、独占 overlay)。任一帧都满足待画请求。须已持锁。
+    fn paintLocked(self: *RenderRegion, region: enum { as_needed, hidden }, extra: []const u8) void {
+        self.observeResize();
+        const draw = region == .as_needed and (self.region_dirty or self.region_drawn) and
+            self.gen_app != null and self.inGeneration();
+        self.region_dirty = false;
+        const text = self.pending_scroll.items;
+        if (text.len == 0 and extra.len == 0 and !draw) {
+            // 没有可画的(区不在、也没有文本):请求作废,但这不算一帧,不推后下一个窗口。
+            if (self.merge) |*m| m.sched.cancel();
+            return;
+        }
+        if (self.merge) |*m| m.sched.painted(m.now_ms());
+        const w = &self.scratch.writer;
+        self.resetScratch();
+        // 擦/封口/画都写进这一份 scratch(frame_active 下它们不各自 flush),末尾一次呈现。
+        self.frame_active = true;
+        const framed = draw or self.region_drawn;
+        if (framed) w.writeAll(ansi.sync.begin) catch {};
+        if (self.region_drawn) self.eraseRegion();
+        self.sealResizedLine();
+        for ([_][]const u8{ text, extra }) |part| {
+            if (part.len == 0) continue;
+            w.writeAll(part) catch {};
+            self.updatePendingTail(part);
+        }
+        if (draw) self.drawGenRegion(self.gen_app.?);
+        if (framed) w.writeAll(ansi.sync.end) catch {};
+        self.frame_active = false;
+        self.flushScratch();
+        self.pending_scroll.clearRetainingCapacity();
+    }
+
+    /// 待画帧交给定时线程(首次推迟时惰性启动)。起不了线程就关掉合并窗口当场画:宁可多画,
+    /// 不能让一帧永远等下去。须已持锁。
+    fn armTimerLocked(self: *RenderRegion) void {
+        const m = &(self.merge orelse return);
+        if (!m.timer) return;
+        if (m.thread == null) {
+            m.thread = std.Thread.spawn(.{}, timerMain, .{self}) catch {
+                self.merge = null;
+                self.paintLocked(.as_needed, "");
+                return;
+            };
+        }
+        m.wake.signal();
+    }
+
+    /// 定时线程:睡到待画帧的期限,到点画掉。持锁运行,等待时经条件变量放锁。
+    fn timerMain(self: *RenderRegion) void {
+        self.lock();
+        defer self.unlock();
+        while (self.merge) |*m| {
+            if (m.stop) return;
+            const deadline = m.sched.deadline() orelse {
+                m.wake.wait(&self.mutex);
+                continue;
+            };
+            const now = m.now_ms();
+            if (now < deadline) {
+                _ = m.wake.timedWait(&self.mutex, @intCast((deadline - now) * std.time.ns_per_ms));
+                continue;
+            }
+            self.paintLocked(.as_needed, "");
+        }
+    }
+
+    fn stopTimer(self: *RenderRegion) void {
+        self.lock();
+        var thread: ?std.Thread = null;
+        if (self.merge) |*m| {
+            m.stop = true;
+            m.wake.signal();
+            thread = m.thread;
+            m.thread = null;
+        }
+        self.unlock();
+        if (thread) |t| t.join();
+    }
+
+    /// 定时线程做的事:待画帧到期就画掉。返回是否画了(测试关掉线程、按假时钟手动推进)。
+    pub fn pumpFrame(self: *RenderRegion) bool {
+        self.lock();
+        defer self.unlock();
+        const m = &(self.merge orelse return false);
+        if (!m.sched.due(m.now_ms())) return false;
+        self.paintLocked(.as_needed, "");
+        return true;
+    }
+
+    /// 立即通道(工具完成、中断):攒下的文本与区当场一帧画掉,窗口从这一帧重新算。
+    pub fn flushGen(self: *RenderRegion) void {
+        self.lock();
+        defer self.unlock();
+        if (!self.inGeneration()) return;
+        self.region_dirty = true;
+        self.paintLocked(.as_needed, "");
+    }
+
+    /// 阶段切换的唯一入口(#330):经 dispatch 的 `.phase_change` 事件,旧阶段拥有的全部
+    /// UiState——agent 列表、help、slash 高亮、Ctrl+X 前缀、粘贴提示、双击窗口、菜单关闭记录、
+    /// picker、输入框投影、spinner、工具卡——随它的 payload 一起销毁。以前每个边界各自重置一份
+    /// 清单(resetPhaseUi,#298),新加的状态得记得登记;现在状态放进阶段 payload 就归阶段所有。
+    /// 须已持锁。
+    fn changePhaseLocked(self: *RenderRegion, entry: ui_state_mod.PhaseEntry) void {
+        _ = ui_mod.dispatch(&self.ui, .{ .phase_change = entry });
+    }
+
+    /// 一次输入读取开始。`catalog` 借用这次读取的 arena,在 endInput 时随阶段一起失效。
+    /// 上一阶段(回复或上一次读取)打开的东西都已在它结束时关闭,不会吞掉这次读取的按键。
+    pub fn beginInput(self: *RenderRegion, catalog: complete.SlashCatalog) void {
+        self.lock();
+        defer self.unlock();
+        self.changePhaseLocked(.{ .input = .{ .slash_catalog = catalog } });
+    }
+
+    /// 一次输入读取结束:回 idle。幂等——不在输入期时(例如已经结束)什么也不做。
+    pub fn endInput(self: *RenderRegion) void {
+        self.lock();
+        defer self.unlock();
+        if (self.ui.phase != .input) return;
+        self.changePhaseLocked(.idle);
+    }
+
+    /// The model picker is the one widget the loop hands across a boundary
+    /// (#220, through `app.pending_overlay`); it asks here just before the
+    /// phase that owns the picker ends.
+    pub fn pickerOpen(self: *RenderRegion) bool {
+        self.lock();
+        defer self.unlock();
+        return self.pickerOpenLocked();
+    }
+
+    fn pickerOpenLocked(self: *const RenderRegion) bool {
+        const ix = self.ui.interactionConst() orelse return false;
+        return ix.picker_open;
+    }
+
+    fn helpOpen(self: *const RenderRegion) bool {
+        const ix = self.ui.interactionConst() orelse return false;
+        return ix.help_open;
+    }
+
+    fn agentView(self: *const RenderRegion) ui_state_mod.AgentView {
+        const ix = self.ui.interactionConst() orelse return .closed;
+        return ix.agents.view;
+    }
+
+    /// 当前阶段输入框的内容(输入期是 readLineRaw 的编辑器,生成期是 watcher 的);idle 时为空。
+    fn editorView(self: *const RenderRegion) []const u8 {
+        const ix = self.ui.interactionConst() orelse return "";
+        return ix.editor.view;
+    }
+
+    fn slashCatalog(self: *const RenderRegion) complete.SlashCatalog {
+        const ip = self.ui.inputPhaseConst() orelse return .builtin;
+        return ip.slash_catalog;
+    }
+
+    fn slashSel(self: *const RenderRegion) usize {
+        const ip = self.ui.inputPhaseConst() orelse return 0;
+        return ip.slash_sel;
+    }
+
+    /// Esc 关掉的建议菜单(按草稿记)。建议菜单只在输入期存在,其它阶段一律视为关着。
+    fn menusDismissed(self: *const RenderRegion, content: []const u8) bool {
+        const ip = self.ui.inputPhaseConst() orelse return true;
+        return ip.menu_dismissal.covers(content);
     }
 
     /// Idle tick: drop a double-press window that has run out. True when its
@@ -348,7 +622,8 @@ pub const RenderRegion = struct {
     pub fn expirePress(self: *RenderRegion, now_ms: i64) bool {
         self.lock();
         defer self.unlock();
-        return self.ui.press.expire(now_ms);
+        const ip = self.ui.inputPhase() orelse return false;
+        return ip.press.expire(now_ms);
     }
 
     fn exitHint(self: *const RenderRegion) ?[]const u8 {
@@ -360,6 +635,10 @@ pub const RenderRegion = struct {
     }
 
     pub fn deinit(self: *RenderRegion) void {
+        _ = panic_target.cmpxchgStrong(self, null, .acq_rel, .acquire);
+        self.stopTimer();
+        self.pending_scroll.deinit(self.allocator);
+        self.gen_editor.deinit(self.allocator);
         self.scratch.deinit();
         self.line_buf.deinit(self.allocator);
         self.md_buf.deinit(self.allocator);
@@ -367,19 +646,24 @@ pub const RenderRegion = struct {
         self.tbl_rows.deinit(self.allocator);
     }
 
-    /// 设置输入态(loop 每次按键后调,再调 render)。
+    /// 设置输入态(loop 每次按键后调,再调 render):写当前阶段的编辑器投影。
     pub fn setInput(self: *RenderRegion, view: []const u8, cursor: usize) void {
-        self.input_view = view;
-        self.input_cursor = cursor;
+        const ix = self.ui.interaction() orelse return;
+        ix.editor = .{ .view = view, .cursor = cursor };
     }
 
     fn resetScratch(self: *RenderRegion) void {
         self.scratch.writer.end = 0;
     }
 
-    /// 把 scratch 已写字节一次性输出(走 std.debug.print → lockStdErr;设了 sink 则写 sink)。
-    fn flush(self: *RenderRegion) void {
-        const bytes = self.scratch.written();
+    /// 把 scratch 已写字节一次性输出。
+    fn flushScratch(self: *RenderRegion) void {
+        self.flush(self.scratch.written());
+    }
+
+    /// 写终端的唯一出口(走 std.debug.print → lockStdErr;设了 sink 则写 sink)。不分配:
+    /// panic 钩子也经这里写(flushForPanic)。
+    fn flush(self: *RenderRegion, bytes: []const u8) void {
         if (bytes.len == 0) return;
         if (self.sink) |out| {
             out.writeAll(bytes) catch {};
@@ -395,9 +679,10 @@ pub const RenderRegion = struct {
         if (bytes.len == 0) return;
         self.lock();
         defer self.unlock();
+        if (!self.frame_active and self.pending_scroll.items.len > 0) self.paintLocked(.as_needed, "");
         if (!self.frame_active) self.resetScratch();
         self.scratch.writer.writeAll(bytes) catch return;
-        if (!self.frame_active) self.flush();
+        if (!self.frame_active) self.flushScratch();
     }
 
     /// 将格式化后的终端字节交给唯一 Renderer 输出，避免 TUI 调用点旁路
@@ -405,9 +690,10 @@ pub const RenderRegion = struct {
     pub fn emitTerminalFmt(self: *RenderRegion, comptime fmt: []const u8, args: anytype) void {
         self.lock();
         defer self.unlock();
+        if (!self.frame_active and self.pending_scroll.items.len > 0) self.paintLocked(.as_needed, "");
         if (!self.frame_active) self.resetScratch();
         self.scratch.writer.print(fmt, args) catch return;
-        if (!self.frame_active) self.flush();
+        if (!self.frame_active) self.flushScratch();
     }
 
     /// 将已经排版好的 scrollback 文本交给唯一 Renderer 输出。
@@ -416,7 +702,7 @@ pub const RenderRegion = struct {
     }
 
     fn measureSize(self: *RenderRegion) bool {
-        if (term.getSize(self.fd)) |sz| {
+        if (self.size_override orelse term.getSize(self.fd)) |sz| {
             const changed = sz.cols != self.cols or sz.rows != self.rows;
             self.cols = sz.cols;
             self.rows = sz.rows;
@@ -428,11 +714,11 @@ pub const RenderRegion = struct {
     /// Move from the cursor of the last frame to column 1 of the region's top
     /// row. Callers measure the terminal first: the climb counts the rows the
     /// last frame takes at the current width (reflow.zig).
-    fn climbToTop(self: *RenderRegion, w: *std.Io.Writer) void {
+    fn climbToTop(self: *const RenderRegion, w: *std.Io.Writer) std.Io.Writer.Error!void {
         var nbuf: [16]u8 = undefined;
         const up = self.anchor.climb(self.cols, self.reflows);
-        if (up > 0) w.writeAll(ansi.cursor.up(up, &nbuf)) catch {};
-        w.writeAll("\r") catch {};
+        if (up > 0) try w.writeAll(ansi.cursor.up(up, &nbuf));
+        try w.writeAll("\r");
     }
 
     /// Detect a terminal resize before any operation that relies on the
@@ -440,7 +726,7 @@ pub const RenderRegion = struct {
     /// `pending_col` stale; discard that continuation and seal the old line
     /// after the fixed region has been erased.
     fn observeResize(self: *RenderRegion) void {
-        if (!self.measureSize() or !self.generating) return;
+        if (!self.measureSize() or !self.inGeneration()) return;
         self.invalidateContinuationForResize();
     }
 
@@ -467,7 +753,7 @@ pub const RenderRegion = struct {
         if (!self.frame_active) self.resetScratch();
         self.scratch.writer.writeAll("\n") catch {};
         self.resize_seal_pending = false;
-        if (!self.frame_active) self.flush();
+        if (!self.frame_active) self.flushScratch();
     }
 
     // =====================================================================
@@ -481,7 +767,9 @@ pub const RenderRegion = struct {
     ///    ? for shortcuts · shift+tab to cycle (mode)        N tokens   ← footer(dim)
     /// 不持锁版本(内部用);公开 render 持锁。输入期 wrapper。
     fn renderInner(self: *RenderRegion, app: *const app_mod.App) void {
-        self.renderFrameInner(app, self.input_view, self.input_cursor);
+        // 固定区的输入形态只属于输入期:idle 时没有输入框可画。
+        const ip = self.ui.inputPhaseConst() orelse return;
+        self.renderFrameInner(app, ip.interaction.editor.view, ip.interaction.editor.cursor);
     }
 
     /// 【仅输入期】重画输入框:上边框 + ❯content(多行)+ 下边框 + [slash 菜单] + footer。
@@ -506,7 +794,7 @@ pub const RenderRegion = struct {
         // **完整对话历史(output_buf 视口,可 PageUp/Dn 滚)** + 分隔线,替代进度树/task。
         // 下方 drawAgentSwitcher 列表仍画(共存)。viewing 视口预算独立放宽(不受上面 12 行限制):
         // 扣死 框(3) + footer(1) + switcher(空行1+main1+agent_count) + 分隔头(1) + 余量后,剩给视口。
-        if (self.ui.agents.view == .viewing) {
+        if (self.agentView() == .viewing) {
             // viewing 时回写 agent_count(供 dispatch ↑↓ 钳制 + 下面预算计算)。
             if (app.agentJobsPtr()) |reg| {
                 const snaps = reg.snapshotJobsInScope(self.allocator, app.agentJobScope()) catch null;
@@ -644,7 +932,7 @@ pub const RenderRegion = struct {
         // 停在旧框里:框上方留旧横线、下方留旧 footer,每次 resize 各多一条。区是屏上最后的内容,
         // 区顶起一次 ED 0 清掉旧帧在新帧下方多出的行(收缩、重排都会多出来),不碰 scrollback。
         w.writeAll(ansi.cursor.hide) catch {};
-        self.climbToTop(w);
+        self.climbToTop(w) catch {};
         w.writeAll(ansi.clear.to_end_of_screen) catch {};
         const rows_start = self.scratch.writer.end;
 
@@ -720,13 +1008,13 @@ pub const RenderRegion = struct {
 
         // -- issue #16 model picker:开着时独占菜单区。旧的 /model 与 /models 菜单
         //    占同一块屏幕位置,同时画会互相盖掉。--
-        const picker_rows: u16 = if (self.ui.picker_open)
+        const picker_rows: u16 = if (self.pickerOpenLocked())
             model_picker_view.render(&app.model_picker, w, self.theme, self.cols)
         else
             0;
         new_rows += picker_rows;
         // Menus the draft opens stay closed after Esc until the draft changes.
-        const menus = picker_rows == 0 and !self.ui.menu_dismissal.covers(content);
+        const menus = picker_rows == 0 and !self.menusDismissed(content);
         // -- /models 两级菜单:账号 API key → 该 key 可用模型 --
         const models_menu_rows = if (menus) self.drawModelsPickerMenu(w, app, content) else 0;
         new_rows += models_menu_rows;
@@ -739,10 +1027,10 @@ pub const RenderRegion = struct {
         // -- slash 命令菜单(`/` 前缀,在下边框与 footer 之间垂直列出)--
         if (menus and models_menu_rows == 0 and model_menu_rows == 0) new_rows += self.drawSlashMenu(w, content);
         // -- @-mention 文件菜单(`@token`,同位置;对齐 cc DIFF#5)--
-        if (menus) new_rows += self.drawAtMenu(w, content, self.input_cursor);
+        if (menus) new_rows += self.drawAtMenu(w, content, cursor);
 
         // -- footer 区:help_open 时原地展开快捷键菜单(非模态,对齐 cc);否则正常 footer 行 --
-        if (self.ui.help_open) {
+        if (self.helpOpen()) {
             // renderHelpLines 每行末尾 \r\n;行首 clear.line 由下方 RegionLineWriter 注入。
             var hlw = RegionLineWriter{ .inner = w };
             const hrows = ui_mod.renderHelpLines(&hlw, self.theme, self.cols) catch 0;
@@ -793,7 +1081,7 @@ pub const RenderRegion = struct {
         if (own_frame) {
             self.frame_active = false;
             w.writeAll(ansi.sync.end) catch {};
-            self.flush();
+            self.flushScratch();
         }
     }
 
@@ -817,18 +1105,18 @@ pub const RenderRegion = struct {
     }
 
     /// 画 slash 命令菜单(`/` 前缀且无空格时)。每行 `  /cmd [hint]   描述`。
-    /// 选中项(self.ui.slash_sel)命令名用 accent 高亮,其余 dim(对齐 cc:↑↓ 移高亮)。
+    /// 选中项(输入期 slash_sel)命令名用 accent 高亮,其余 dim(对齐 cc:↑↓ 移高亮)。
     /// 匹配项多于 SLASH_MENU_MAX_ROWS 时按选中项滚动窗口,选中项永远可见;每行按终端宽截断,
     /// 保证"一项一行"(行数是导航与重画的前提)。skill 项在描述后标出来源层级 `(user)`。
     /// 返回新增行数(每行末尾 \r\n,光标停下一行行首供 footer 续画)。调用前光标停下边框下一行行首。
     fn drawSlashMenu(self: *RenderRegion, w: *std.Io.Writer, content: []const u8) u16 {
-        const catalog = self.ui.slash_catalog;
+        const catalog = self.slashCatalog();
         const total = complete.slashFilterCount(catalog, content);
         if (total == 0) return 0;
 
         const th = self.theme;
         const max_rows: usize = SLASH_MENU_MAX_ROWS;
-        const selected_idx = @min(self.ui.slash_sel, total - 1);
+        const selected_idx = @min(self.slashSel(), total - 1);
         const first = if (selected_idx < max_rows) 0 else selected_idx + 1 - max_rows;
         const last = @min(total, first + max_rows);
         const cols: usize = if (self.cols > 4) self.cols else 80;
@@ -916,7 +1204,7 @@ pub const RenderRegion = struct {
         // 标签用这条路由自己的词汇:目录只声明 max 的(Metask 网关 / GLM)顶档显示 max,
         // 不是内部枚举名 xhigh——用户选的是 provider 的档位。
         const vocabulary = if (model_idx < entries.len) entries[model_idx].effort_vocabulary else .neutral;
-        const selected_idx = @min(self.ui.slash_sel, efforts.len - 1);
+        const selected_idx = @min(self.slashSel(), efforts.len - 1);
         for (efforts, 0..) |effort, i| {
             const selected = i == selected_idx;
             const color = if (selected) th.accent else th.dim;
@@ -950,7 +1238,7 @@ pub const RenderRegion = struct {
             return rows + 1;
         }
 
-        const selected_idx = @min(self.ui.slash_sel, entries.len - 1);
+        const selected_idx = @min(self.slashSel(), entries.len - 1);
         const window = complete.menuWindow(entries.len, selected_idx, complete.MODEL_MENU_MAX_ROWS);
         for (entries[window.top..window.end], window.top..) |entry, i| {
             const selected = i == selected_idx;
@@ -1013,7 +1301,7 @@ pub const RenderRegion = struct {
         }
 
         const id_max: usize = if (self.cols > 42) self.cols - 42 else 24;
-        const selected_idx = @min(self.ui.slash_sel, entries.len - 1);
+        const selected_idx = @min(self.slashSel(), entries.len - 1);
         const window = complete.menuWindow(entries.len, selected_idx, complete.MODEL_MENU_MAX_ROWS);
         for (entries[window.top..window.end], window.top..) |entry, i| {
             const selected = i == selected_idx;
@@ -1036,7 +1324,7 @@ pub const RenderRegion = struct {
     }
 
     /// 画 @-mention 文件菜单(`@token`,下边框与 footer 之间)。每行 `+ <path>`(对齐 cc),
-    /// 选中项(self.ui.slash_sel)accent 高亮,其余 dim。候选来自 complete.atCandidates(文件路径)。
+    /// 选中项(输入期 slash_sel)accent 高亮,其余 dim。候选来自 complete.atCandidates(文件路径)。
     /// 返回新增行数。alloc 失败/无候选返回 0(不弹)。
     fn drawAtMenu(self: *RenderRegion, w: *std.Io.Writer, content: []const u8, cursor: usize) u16 {
         if (!complete.atMenuActive(content, cursor)) return 0;
@@ -1049,7 +1337,7 @@ pub const RenderRegion = struct {
         const MAX_ROWS: u16 = 10;
         for (r.candidates, 0..) |cand, i| {
             if (rows >= MAX_ROWS) break;
-            const selected = i == self.ui.slash_sel;
+            const selected = i == self.slashSel();
             w.writeAll(ansi.clear.line) catch {};
             // cc 文件项前缀 `+ `;选中 accent,非选中 dim。
             const color = if (selected) th.accent else th.dim;
@@ -1093,8 +1381,8 @@ pub const RenderRegion = struct {
         const title = sb.modeTitle(mode_pm);
         // 缓冲含粘贴占位符 `[Pasted text #N +M lines]`(空闲期)→ footer 整条换成
         // `paste again to expand`(对齐真 cc v2.1.172:连 mode part 一起替换),占位符删后自动复原。
-        const paste_placeholder = !self.generating and
-            std.mem.indexOf(u8, self.input_view, "[Pasted text #") != null;
+        const paste_placeholder = !self.inGeneration() and
+            std.mem.indexOf(u8, self.editorView(), "[Pasted text #") != null;
         const show_mode = title.len != 0 and !paste_placeholder; // default/prompt 或占位符态 → 不显 mode part
 
         // mode part 纯文本(用于宽度计算,不含 SGR)。cc 格式:非 default → `{sym} {title} on (shift+tab to cycle)`;
@@ -1105,7 +1393,7 @@ pub const RenderRegion = struct {
         else
             "";
         // default 态显 `? for shortcuts`;非 default 已在 mode part 含 cycle 提示,hint 留空。
-        // 生成期(self.generating):右接 `esc to interrupt`(对齐 cc:中断提示在 footer 非 spinner 行)。
+        // 生成期(self.inGeneration()):右接 `esc to interrupt`(对齐 cc:中断提示在 footer 非 spinner 行)。
         // cc 实测:非 default → `{mode part} · esc to interrupt`(有 `· ` 分隔);default → `esc to interrupt`。
         // agent 区域(对齐实拍 v2.1.168):
         //   生成期 + 有 running agent → 追加 ` · ↓ to manage`(进 switcher 选择)。
@@ -1121,7 +1409,7 @@ pub const RenderRegion = struct {
         }
         var hint_buf: [96]u8 = undefined;
         const hint: []const u8 = blk: {
-            if (self.generating) {
+            if (self.inGeneration()) {
                 const base = if (show_mode) " · esc to interrupt" else " esc to interrupt";
                 if (has_running_agents) {
                     break :blk std.fmt.bufPrint(&hint_buf, "{s} · ↓ to manage", .{base}) catch base;
@@ -1133,13 +1421,13 @@ pub const RenderRegion = struct {
             if (paste_placeholder) break :blk " paste again to expand";
             // 多行编辑中:显示当前终端的换行方式(对齐真 cc getNewlineInstructions,按 cc-zig 实际能力:
             // 白名单终端 shift+⏎,Apple Terminal 等 \+⏎)。提示最有用时=正在组多行。
-            const multiline = std.mem.indexOfScalar(u8, self.input_view, '\n') != null;
+            const multiline = std.mem.indexOfScalar(u8, self.editorView(), '\n') != null;
             if (multiline) {
                 break :blk std.fmt.bufPrint(&hint_buf, "  {s}", .{input.newlineHint()}) catch " ? for shortcuts";
             }
             // `?` and `←` only act on an empty prompt, so a draft hides both
             // hints (Claude Code).
-            if (self.input_view.len != 0) break :blk "";
+            if (self.editorView().len != 0) break :blk "";
             const base = if (show_mode) "" else " ? for shortcuts";
             if (has_any_agents) {
                 break :blk std.fmt.bufPrint(&hint_buf, "{s} · ← for agents", .{base}) catch base;
@@ -1187,8 +1475,9 @@ pub const RenderRegion = struct {
     pub fn setSpinnerVerb(self: *RenderRegion, verb: []const u8) []const u8 {
         self.lock();
         defer self.unlock();
-        const previous = self.ui.spinner.verb;
-        self.ui.spinner.verb = verb;
+        const g = self.ui.generatingPhase() orelse return ""; // 只有生成期有 spinner
+        const previous = g.spinner.verb;
+        g.spinner.verb = verb;
         return previous;
     }
 
@@ -1198,20 +1487,22 @@ pub const RenderRegion = struct {
     /// 的对话(prompt + 助手文本 + 工具行)。被查看对象由 viewing_id 解析(Enter 提交,↑↓ 不动)。
     /// viewing_committed=false 时落定 viewing_id;view_top_at_bottom/越界由本函数 clamp。返回画的行数。
     fn drawAgentViewing(self: *RenderRegion, w: *std.Io.Writer, app: *const app_mod.App, budget: u16) u16 {
-        if (self.ui.agents.view != .viewing) return 0;
+        const ix = self.ui.interaction() orelse return 0;
+        const ag = &ix.agents;
+        if (ag.view != .viewing) return 0;
         if (budget == 0) return 0;
         const reg = app.agentJobsPtr() orelse return 0;
-        const sel = self.ui.agents.sel;
+        const sel = ag.sel;
         const th = self.theme;
         const snaps = reg.snapshotJobsInScope(self.allocator, app.agentJobScope()) catch return 0;
         defer agent_job_registry.AgentJobRegistry.freeSnapshots(self.allocator, snaps);
 
         // viewing_id 落定(Enter 触发的 reconcile):未 committed 时把当前 sel 对应 agent 的 id 拷入。
-        if (!self.ui.agents.viewing_committed and sel > 0 and sel - 1 < snaps.len) {
-            self.ui.agents.commitViewingId(snaps[sel - 1].id);
+        if (!ag.viewing_committed and sel > 0 and sel - 1 < snaps.len) {
+            ag.commitViewingId(snaps[sel - 1].id);
         }
         // 按已落定的 viewing_id 找被查看 agent 的 desc + id(非 sel —— ↑↓ 移光标不切被查看对象)。
-        const vid = self.ui.agents.viewingIdSlice();
+        const vid = ag.viewingIdSlice();
         if (vid.len == 0) return 0;
         var desc: []const u8 = "";
         var found = false;
@@ -1255,13 +1546,13 @@ pub const RenderRegion = struct {
         // view_top clamp:max_top = max(0, total_lines - view_rows)。at_bottom 落定到 max_top。
         const total = countOutputLines(out);
         const max_top: usize = if (total > view_rows) total - view_rows else 0;
-        if (self.ui.agents.view_top_at_bottom) {
-            self.ui.agents.view_top = max_top;
-            self.ui.agents.view_top_at_bottom = false;
-        } else if (self.ui.agents.view_top > max_top) {
-            self.ui.agents.view_top = max_top; // PageDn 越界自愈
+        if (ag.view_top_at_bottom) {
+            ag.view_top = max_top;
+            ag.view_top_at_bottom = false;
+        } else if (ag.view_top > max_top) {
+            ag.view_top = max_top; // PageDn 越界自愈
         }
-        rows += drawOutputWindow(w, out, self.ui.agents.view_top, view_rows, cols, th);
+        rows += drawOutputWindow(w, out, ag.view_top, view_rows, cols, th);
         return rows;
     }
 
@@ -1272,14 +1563,15 @@ pub const RenderRegion = struct {
     /// 仅当 ui.agents.view != .closed 时画。返回画的行数(供 new_rows 累加)。
     /// 每行前置 `\r\n` + clear(承接 footer 行末光标);caller 据返回行数算几何。
     fn drawAgentSwitcher(self: *RenderRegion, w: *std.Io.Writer, app: *const app_mod.App) u16 {
-        if (self.ui.agents.view == .closed) return 0;
+        const ix = self.ui.interaction() orelse return 0;
+        if (ix.agents.view == .closed) return 0;
         const reg = app.agentJobsPtr() orelse return 0;
         const th = self.theme;
         const snaps = reg.snapshotJobsInScope(self.allocator, app.agentJobScope()) catch return 0;
         defer agent_job_registry.AgentJobRegistry.freeSnapshots(self.allocator, snaps);
 
         const cols: usize = if (self.ui.cols > 4) self.ui.cols else 80;
-        const ag = &self.ui.agents;
+        const ag = &ix.agents;
         var rows: u16 = 0;
 
         // 空行分隔(footer 与 switcher 间)。
@@ -1461,12 +1753,12 @@ pub const RenderRegion = struct {
     pub fn render(self: *RenderRegion, app: *const app_mod.App) void {
         self.lock();
         defer self.unlock();
-        if (self.generating) return; // 生成期不画多行区
+        if (self.inGeneration()) return; // 生成期不画多行区
         self.renderInner(app);
     }
 
     /// 阶段1:输入期按键先经 dispatch(锁内改 UiState + 据 Effect 重画)。
-    /// 调用方(readLineRaw)在调用前应同步 self.ui.editor(供 dispatch 判断"空 buffer + ?")。
+    /// 调用方(readLineRaw)在调用前应经 setInput 同步编辑器投影(供 dispatch 判断"空 buffer + ?")。
     /// conv 供 transcript overlay 生成 lines。返回 Effect.action 供主循环决定是否喂 LineEditor。
     pub fn applyEvent(
         self: *RenderRegion,
@@ -1480,7 +1772,7 @@ pub const RenderRegion = struct {
         const eff = ui_mod.dispatch(&self.ui, ev);
         // transcript 现走 alt-screen viewer(Ctrl+O → dispatch 上抛 .open_transcript,
         // 调用方进 alt-screen),不再嵌入式渲染。此处只处理输入框固定区重画。
-        if (eff.redraw_region and !self.generating) {
+        if (eff.redraw_region and self.ui.phase == .input) {
             self.renderInner(app);
         }
         return eff;
@@ -1499,14 +1791,13 @@ pub const RenderRegion = struct {
     ) event_mod.Effect {
         self.lock();
         defer self.unlock();
-        if (!self.generating) return .{};
+        if (!self.inGeneration()) return .{};
         _ = conv;
         // dispatch 判"空 buffer + ?"依赖 editor 投影,调前同步 watcher 的 LineEditor 视图。
-        self.ui.editor = .{ .view = ed_view, .cursor = ed_cursor };
+        self.setGenEditorLocked(ed_view, ed_cursor);
+        _ = app;
         const eff = ui_mod.dispatch(&self.ui, .{ .key = .{ .key = key } });
-        if (eff.redraw_region and self.generating) {
-            self.redrawFrameLocked(app);
-        }
+        self.requestRedrawLocked(eff);
         return eff;
     }
 
@@ -1550,7 +1841,7 @@ pub const RenderRegion = struct {
         // 回区顶:光标当前在区内第 anchor.rows_above 行(不一定最后一行)。相对上移,随滚屏有效。
         // 提交可能紧跟在 resize 之后、重画之前:先量尺寸,climb 才按终端现在的宽度数行。
         _ = self.measureSize();
-        self.climbToTop(w);
+        self.climbToTop(w) catch {};
         // 光标已在固定区顶行。一次 ED 0 清到屏底,不逐行用 \r\n/CUU 穿过屏幕底部;
         // Windows Console 在逐行移动时可能把旧顶线脱离固定区,进入后续 scrollback。
         // ED 0 不写换行,也不会清除 scrollback。光标留在区顶第一行行首——后续消息从这里打。
@@ -1563,7 +1854,7 @@ pub const RenderRegion = struct {
         if (own_frame) {
             self.frame_active = false;
             w.writeAll(ansi.sync.end) catch {};
-            self.flush();
+            self.flushScratch();
         }
     }
 
@@ -1578,17 +1869,26 @@ pub const RenderRegion = struct {
     pub fn resetScreen(self: *RenderRegion) void {
         self.lock();
         defer self.unlock();
+        // Text the merge window still holds arrived before the reset: it goes
+        // out first (with the region hidden), not onto the cleared screen (#328).
+        self.paintLocked(.hidden, "");
         self.resetScratch();
         self.scratch.writer.writeAll(ansi.sync.begin) catch {};
         self.frame_active = true;
         self.resetScreenInFrame();
         self.frame_active = false;
         self.scratch.writer.writeAll(ansi.sync.end) catch {};
-        self.flush();
+        self.flushScratch();
+        // The reset redrew the generating region with the current state, which
+        // is what a pending frame would have shown.
+        if (self.inGeneration()) {
+            self.region_dirty = false;
+            if (self.merge) |*m| m.sched.painted(m.now_ms());
+        }
     }
 
     fn resetScreenInFrame(self: *RenderRegion) void {
-        if (self.generating) {
+        if (self.inGeneration()) {
             self.observeResize(); // the climb counts rows at the current width
             self.eraseRegion();
         } else {
@@ -1602,7 +1902,7 @@ pub const RenderRegion = struct {
         self.region_drawn_pending_nl = false;
         self.region_drawn_pending_col = 0;
         self.resize_seal_pending = false;
-        if (self.generating) {
+        if (self.inGeneration()) {
             if (self.gen_app) |a| self.drawGenRegion(a);
         }
     }
@@ -1617,13 +1917,16 @@ pub const RenderRegion = struct {
         defer self.unlock();
         self.clearInner(); // 擦掉输入期框,光标回区顶行首(文本续接点)
         self.applyThemeLocked(app.theme); // 共享 region:/theme 可能在上一轮输入期间换过主题
-        self.resetPhaseUiLocked(); // 输入期打开的 agent 列表/help 等不带进生成期
+        // 新的回复阶段:spinner、工具卡、输入框、help、agent 列表都从零开始(上一阶段的已随它关闭)。
+        const now = util_time.nowMs();
+        self.changePhaseLocked(.{ .generating = .{ .verb = verbs.pick(@intCast(now & 0xffff)), .start_ms = now } });
         self.gen_app = app; // 供 writeGenText print 后重画区
         self.gen_queue = queue;
-        self.gen_view = "";
-        self.gen_cursor = 0;
         self.line_buf.clearRetainingCapacity(); // 新一轮:清行缓冲
-        self.generating = true;
+        self.pending_scroll.clearRetainingCapacity();
+        self.gen_editor.clearRetainingCapacity();
+        self.region_dirty = false;
+        if (self.merge) |*m| m.sched.reset(); // 新阶段:没有待画帧,也不用等上一阶段的窗口
         self.region_drawn = false; // 区不在屏:首个 tick 才画区
         self.prev_rows = 0; // 生成期 prev_rows = 上次 drawGenRegion 画的 R(eraseRegion 用)
         self.anchor = .{};
@@ -1632,11 +1935,6 @@ pub const RenderRegion = struct {
         self.resize_seal_pending = false;
         self.region_drawn_pending_nl = false;
         self.region_drawn_pending_col = 0;
-        // 生成期状态单一真相源 = self.ui(drawGenRegion 读它)。
-        self.ui.phase = .generating;
-        self.ui.spinner = .{ .frame = 0, .verb = verbs.pick(@intCast(util_time.nowMs() & 0xffff)), .start_ms = util_time.nowMs() };
-        self.ui.tools.current_len = 0;
-        self.ui.tools.cards_len = 0;
     }
 
     /// 离开生成期:擦掉固定区(若在)+ 提交完成态 spinner 行进 scrollback + 补半行换行 + 收尾。
@@ -1649,16 +1947,19 @@ pub const RenderRegion = struct {
         _ = app; // 完成态 spinner 不再读 usage(去 token);签名保留供 callers 稳定。
         self.lock();
         defer self.unlock();
-        if (!self.generating) return;
+        if (!self.inGeneration()) return;
         self.observeResize();
+        self.hold_paint = true;
         self.flushGenAssistantLocked(); // 助手文本残行(markdown)先 flush
         self.flushLineBuf(); // 再把行缓冲残行(无尾随 \n 的末行)输出,别丢
+        self.hold_paint = false;
+        self.paintLocked(.hidden, ""); // 立即边界:攒下的文本写出,区擦掉不重画
         self.eraseRegion(); // 擦掉固定区(若在),光标回文本续接点
         if (self.text_pending_newline) {
             const w = &self.scratch.writer;
             self.resetScratch();
             w.writeAll("\n") catch {}; // 半行文本尾补换行,下一轮从干净行起
-            self.flush();
+            self.flushScratch();
             self.text_pending_newline = false;
             self.pending_col = 0;
         }
@@ -1668,13 +1969,13 @@ pub const RenderRegion = struct {
         // `✻ Verb for Ns` 进历史消息区。旧版每轮(≥0.5s)都 commit 一行 → 1~2s 琐碎短轮也堆噪声
         // (用户实测 bug)。注:cc 默认有 turn_duration 系统消息(REPL.tsx:2970,仅 >30s 长轮),
         // 但用户明确要求 cc-zig 不要它 → 此处不对齐 cc,彻底不提交。
-        self.generating = false;
-        self.ui.phase = .input; // 同步:退生成期 → 输入期(双写过渡)
+        // 回复结束:它打开的一切(agent 列表、help、picker、spinner、工具卡、输入框投影)随之关闭。
+        self.changePhaseLocked(.idle);
+        self.region_dirty = false;
+        if (self.merge) |*m| m.sched.reset();
         self.region_drawn = false;
         self.gen_app = null;
         self.gen_queue = null;
-        self.gen_view = "";
-        self.gen_cursor = 0;
         self.prev_rows = 0;
         self.anchor = .{};
         self.region_drawn_pending_nl = false;
@@ -1687,48 +1988,56 @@ pub const RenderRegion = struct {
     pub fn isGenerating(self: *RenderRegion) bool {
         self.lock();
         defer self.unlock();
-        return self.generating;
+        return self.inGeneration();
     }
 
-    /// 设置生成期输入框内容(watcher 线程每次按键后调,再 redrawGen)。view 借用 watcher 的 editor.buf。
+    /// 设置生成期输入框内容(watcher 线程每次按键后调,再重画)。拷进 region 自有缓冲,不借用。
     pub fn setGenInput(self: *RenderRegion, view: []const u8, cursor: usize) void {
         self.lock();
         defer self.unlock();
-        self.gen_view = view;
-        self.gen_cursor = cursor;
+        self.setGenEditorLocked(view, cursor);
     }
 
-    /// 生成期重画(watcher 按键 / 入队后调):擦旧区(若在)+ 画新区。持锁。
-    /// 原子重画固定区(擦除+重画包成一帧,DEC 2026 同步输出):消除 Windows Terminal 在
-    /// erase→draw 两步之间呈现"空白帧"导致的输入框闪烁 + 分隔线分段。所有"擦了立刻重画
-    /// 固定区"的路径统一走这里。**须已持锁**。
-    fn redrawFrameLocked(self: *RenderRegion, app: *const app_mod.App) void {
-        self.observeResize();
-        self.resetScratch();
-        self.scratch.writer.writeAll(ansi.sync.begin) catch {};
-        self.frame_active = true;
-        if (self.region_drawn) self.eraseRegion(); // frame 内:不 reset 不 flush
-        self.sealResizedLine();
-        self.drawGenRegion(app); //                  frame 内:不 reset 不 flush
-        self.frame_active = false;
-        self.scratch.writer.writeAll(ansi.sync.end) catch {};
-        self.flush(); // 整帧一次性呈现
+    /// 生成期输入框投影 = region 自有的一份拷贝(见 gen_editor)。须已持锁。
+    fn setGenEditorLocked(self: *RenderRegion, view: []const u8, cursor: usize) void {
+        const g = self.ui.generatingPhase() orelse return;
+        self.gen_editor.clearRetainingCapacity();
+        self.gen_editor.appendSlice(self.allocator, view) catch {
+            // OOM:宁可画一个空框,也不借用别的线程随时会释放的缓冲。
+            g.interaction.editor = .{};
+            return;
+        };
+        g.interaction.editor = .{ .view = self.gen_editor.items, .cursor = @min(cursor, view.len) };
     }
 
+    /// 生成期立即重画(提交入队、权限模式、picker、杀后台……用户必须当场看到的变化):攒下的
+    /// 文本与区一帧画掉。擦除+重画包成一帧(DEC 2026 同步输出),消除 Windows Terminal 在
+    /// erase→draw 两步之间呈现"空白帧"导致的输入框闪烁 + 分隔线分段。
     pub fn redrawGen(self: *RenderRegion, app: *const app_mod.App) void {
+        _ = app;
         self.lock();
         defer self.unlock();
-        if (!self.generating) return;
-        self.redrawFrameLocked(app);
+        if (!self.inGeneration()) return;
+        self.region_dirty = true;
+        self.paintLocked(.as_needed, "");
     }
 
-    /// spinner tick(watcher 每 ~100ms)——推进帧 + 擦旧区(若在)+ 重画区。
-    pub fn tickSpinner(self: *RenderRegion, app: *const app_mod.App) void {
+    /// 生成期普通重画请求(打字回显):窗口内合并,≤ 一个窗口后画最新的输入框。
+    pub fn requestGenRedraw(self: *RenderRegion) void {
         self.lock();
         defer self.unlock();
-        if (!self.generating) return;
-        self.ui.spinner.frame +%= 1;
-        self.redrawFrameLocked(app);
+        if (!self.inGeneration()) return;
+        self.region_dirty = true;
+        self.requestPaintLocked();
+    }
+
+    /// spinner tick(watcher 每 ~100ms)——推进帧 + 普通重画请求。
+    pub fn tickSpinner(self: *RenderRegion, app: *const app_mod.App) void {
+        _ = app;
+        self.lock();
+        defer self.unlock();
+        if (!self.inGeneration()) return;
+        self.requestRedrawLocked(ui_mod.dispatch(&self.ui, .spinner_tick));
     }
 
     /// 生成期文本输出(RegionWriter 经此):**按行缓冲**——逐 token 攒进 line_buf,
@@ -1778,21 +2087,16 @@ pub const RenderRegion = struct {
         self.lock();
         defer self.unlock();
         self.observeResize();
+        self.hold_paint = true;
         self.flushGenAssistantLocked();
         self.flushLineBuf();
-        if (!self.text_pending_newline) return; // 已在行首 → 幂等 no-op
-        const was_drawn = self.region_drawn;
-        if (self.region_drawn) self.eraseRegion();
-        self.sealResizedLine();
-        const w = &self.scratch.writer;
-        self.resetScratch();
-        w.writeAll("\n") catch {};
-        self.flush();
-        self.text_pending_newline = false;
-        self.pending_col = 0;
-        if (was_drawn) {
-            if (self.gen_app) |a| self.drawGenRegion(a);
-        }
+        self.hold_paint = false;
+        // 末尾是半行 → 补 \n;已在行首 → 幂等 no-op。看的是"全部写出后"的末尾:攒着的文本优先。
+        const pending = self.pending_scroll.items;
+        const half_line = if (pending.len > 0) pending[pending.len - 1] != '\n' else self.text_pending_newline;
+        if (!half_line and pending.len == 0) return;
+        // 一次 provider 回复结束是立即边界:文本、换行、区一帧画掉(以前擦区/换行/重画是三次 flush)。
+        self.paintLocked(.as_needed, if (half_line) "\n" else "");
     }
 
     /// 助手文本段开始(stream_begin):重置 markdown 流式状态 + 标记段首(下一行用 ⏺ 前缀)。
@@ -2035,30 +2339,18 @@ pub const RenderRegion = struct {
         return @min(i + 2, s.len); // 两字节转义兜底
     }
 
-    /// 实际把一段文本输出到 scrollback:擦区(若在)→ print → 若刚才区在屏则重画区。
-    /// print 仅在 region_drawn==false 时发生(eraseRegion 后),draw/erase 成对、续接点用画区快照还原。
+    /// 一段文本进 scrollback(#328):攒进 pending_scroll,经普通通道成帧——下一帧按到达顺序写出,
+    /// 擦区 → 文本 → 区在屏则重画区,一个同步帧。孤立的文本当场写出;窗口内接连到达的多段
+    /// (一个 chunk 里的多行 markdown、并发工具卡)合成一帧,区只擦画一次。文本从不丢,只合并。
     fn emitToScroll(self: *RenderRegion, text: []const u8) void {
         if (text.len == 0) return;
-        self.observeResize();
-        const was_drawn = self.region_drawn;
-        // 区在屏时:擦区 + 文本流入 scrollback + 重画区 三步包成一帧(DEC 2026 同步输出),
-        // 否则 Windows 会先呈现"擦掉区的空白"再刷文本再刷区 → 输入框闪。区不在屏时纯输出文本。
-        const w = &self.scratch.writer;
-        self.resetScratch();
-        if (was_drawn) {
-            w.writeAll(ansi.sync.begin) catch {};
-            self.frame_active = true;
-            self.eraseRegion(); // frame 内:不 reset 不 flush,续接 scratch
-        }
-        self.sealResizedLine();
-        w.writeAll(text) catch {}; // 文本直接流入 scrollback
-        self.updatePendingTail(text);
-        if (was_drawn) {
-            if (self.gen_app) |a| self.drawGenRegion(a); // frame 内:不 reset 不 flush
-            self.frame_active = false;
-            w.writeAll(ansi.sync.end) catch {};
-        }
-        self.flush(); // 整帧(或纯文本)一次性呈现
+        self.pending_scroll.appendSlice(self.allocator, text) catch {
+            // OOM:攒不下就连同已攒的当场写出,别丢字。
+            self.paintLocked(.as_needed, text);
+            return;
+        };
+        if (self.hold_paint) return;
+        if (self.inGeneration()) self.requestPaintLocked() else self.paintLocked(.as_needed, "");
     }
 
     /// 擦掉固定区(R 行),光标回"文本续接点"。
@@ -2075,30 +2367,36 @@ pub const RenderRegion = struct {
             self.region_drawn = false;
             return;
         }
-        const w = &self.scratch.writer;
         if (!self.frame_active) self.resetScratch(); // 帧内:接续 frame 已写的 sync_begin,勿清
+        self.writeErase(&self.scratch.writer) catch {};
+        if (!self.frame_active) self.flushScratch(); // 帧内:由外层 frame 统一 flush(原子帧)
+        self.region_drawn = false;
+    }
+
+    /// eraseRegion 的字节,写进调用方给的 writer:不分配,panic 钩子给的是栈上的固定缓冲。
+    fn writeErase(self: *const RenderRegion, w: *std.Io.Writer) std.Io.Writer.Error!void {
         var nb: [16]u8 = undefined;
-        w.writeAll(ansi.cursor.hide) catch {};
+        try w.writeAll(ansi.cursor.hide);
         // 光标当前在区内 anchor.rows_above 行(编辑点)→ 先回区顶行首。
-        self.climbToTop(w);
+        try self.climbToTop(w);
         // 区顶起一次 ED 0 清到屏底:不逐行 \r\n 穿过屏幕底部,不改变 scrollback。
         // 光标留在区顶行首(= 文本末尾的下一行)。
-        w.writeAll(ansi.clear.to_end_of_screen) catch {};
+        try w.writeAll(ansi.clear.to_end_of_screen);
         // 半行续接:按"画区那一刻"的快照还原(不读 live flag)。区顶上一行是文本末尾半行,回其末尾列。
         if (self.region_drawn_pending_nl) {
-            w.writeAll(ansi.cursor.up(1, &nb)) catch {};
-            w.writeAll("\r") catch {};
-            if (self.region_drawn_pending_col > 0) w.writeAll(ansi.cursor.forward(self.region_drawn_pending_col, &nb)) catch {};
+            try w.writeAll(ansi.cursor.up(1, &nb));
+            try w.writeAll("\r");
+            if (self.region_drawn_pending_col > 0) try w.writeAll(ansi.cursor.forward(self.region_drawn_pending_col, &nb));
         }
-        w.writeAll(ansi.cursor.show) catch {};
-        if (!self.frame_active) self.flush(); // 帧内:由外层 frame 统一 flush(原子帧)
-        self.region_drawn = false;
+        try w.writeAll(ansi.cursor.show);
     }
 
     /// 画生成期固定区(spinner + 队列预览 + 上框 + ❯editor(多行) + 下框 + footer),文本流末尾下方。
     /// 前置 region_drawn=false;后置 region_drawn=true,**光标停在 editor 编辑点**(供 IME 候选窗对齐),
     /// 并记 anchor(距区顶行数 + 上方各行宽)供 eraseRegion 回顶。半行文本尾先 \n 封口让区独占整行。
     fn drawGenRegion(self: *RenderRegion, app: *const app_mod.App) void {
+        // 固定区的生成形态只属于生成期:离开生成期后不再有它可画(region_drawn 保持 false)。
+        const g = self.ui.generatingPhaseConst() orelse return;
         const w = &self.scratch.writer;
         if (!self.frame_active) self.resetScratch(); // 帧内:接续 frame(sync_begin + erase),勿清
         var nb: [16]u8 = undefined;
@@ -2123,32 +2421,32 @@ pub const RenderRegion = struct {
 
         const inner_w: usize = self.innerWidth();
         const border_color = self.borderColor(app.permMode());
-        const content = self.gen_view;
+        const content = g.interaction.editor.view;
 
         var vlines = VisualLines.init();
         layoutInput(content, &vlines, inner_w);
 
         var R: u16 = 0;
 
-        // -- spinner 行 --(读 self.ui.spinner/tools 单一真相源,不再读旧双写字段)
+        // -- spinner 行 --(读 g.spinner/tools 单一真相源,不再读旧双写字段)
         w.writeAll(ansi.clear.line) catch {};
-        const elapsed: u64 = @intCast(@max(util_time.nowMs() - self.ui.spinner.start_ms, 0));
-        const cur_tool = self.ui.tools.currentSlice();
-        const tool_ms: u64 = if (self.ui.tools.current_len > 0)
-            @intCast(@max(util_time.nowMs() - self.ui.tools.current_start_ms, 0))
+        const elapsed: u64 = @intCast(@max(util_time.nowMs() - g.spinner.start_ms, 0));
+        const cur_tool = g.tools.currentSlice();
+        const tool_ms: u64 = if (g.tools.current_len > 0)
+            @intCast(@max(util_time.nowMs() - g.tools.current_start_ms, 0))
         else
             0;
         // spinner 行只显普通工具段 `⚒ <tool>`(current)。hasProgressCard 工具(WebSearch)
         // 不进 current、改走下方 per-toolUse 多卡 → spinner 不显它们(对齐 cc)。
-        _ = StatusBar.renderGenerating(w, app, self.theme, self.use_unicode, self.ui.spinner.frame, self.ui.spinner.verb, elapsed, cur_tool, tool_ms, inner_w) catch {};
+        _ = StatusBar.renderGenerating(w, app, self.theme, self.use_unicode, g.spinner.frame, g.spinner.verb, elapsed, cur_tool, tool_ms, inner_w) catch {};
         R += 1;
         w.writeAll("\r\n") catch {};
 
-        // -- 执行中 per-toolUse 进度卡(读 self.ui.tools.cards 单一真相源)--
+        // -- 执行中 per-toolUse 进度卡(读 g.tools.cards 单一真相源)--
         {
             var ci: usize = 0;
-            while (ci < self.ui.tools.cards_len) : (ci += 1) {
-                R += self.drawToolProgressCard(w, &self.ui.tools.cards[ci]);
+            while (ci < g.tools.cards_len) : (ci += 1) {
+                R += self.drawToolProgressCard(w, &g.tools.cards[ci]);
             }
         }
 
@@ -2190,12 +2488,12 @@ pub const RenderRegion = struct {
         w.writeAll("\r\n") catch {};
 
         // -- issue #16 model picker(生成期也可用:改选择只影响下一轮)--
-        if (self.ui.picker_open) {
+        if (g.interaction.picker_open) {
             R += model_picker_view.render(&app.model_picker, w, self.theme, self.cols);
         }
 
         // -- footer(末行不 \r\n)或 help 菜单(help_open 时原地展开,对齐输入期 renderFrameInner)--
-        if (self.ui.help_open) {
+        if (g.interaction.help_open) {
             // renderHelpLines 末行也带 \r\n → 光标多下移 1 行,补 up(1) 与 footer 分支对齐
             // (否则 footer_rownum 偏移 1 → 下帧回区顶少 1 行 → 顶边框残留;本会话输入期已踩过)。
             var hlw = RegionLineWriter{ .inner = w };
@@ -2216,7 +2514,7 @@ pub const RenderRegion = struct {
 
         // -- 光标落在 editor 编辑点(供 IME 候选窗对齐)--
         // 编辑点区内行号 = 上边框行号 + 1(❯ 行)+ loc.vline;列 = 2(prefix)+ loc.vcol。
-        const loc = RenderRegion.locateCursor(content, self.gen_cursor, &vlines);
+        const loc = RenderRegion.locateCursor(content, g.interaction.editor.cursor, &vlines);
         const edit_row: u16 = top_border_rownum + 1 + @as(u16, @intCast(loc.vline));
         const footer_rownum: u16 = R - 1;
         if (footer_rownum > edit_row) {
@@ -2232,7 +2530,7 @@ pub const RenderRegion = struct {
         self.prev_rows = R;
         self.anchor = reflow.Anchor.measure(self.scratch.written()[rows_start..], edit_row, cursor_col, self.cols);
         self.region_drawn = true;
-        if (!self.frame_active) self.flush(); // 帧内:由外层 frame 统一 flush(原子帧)
+        if (!self.frame_active) self.flushScratch(); // 帧内:由外层 frame 统一 flush(原子帧)
     }
 
     /// 执行中 per-toolUse 进度卡(动态区,可刷新):⏺ <Tool> / ⎿ <progress>。对齐 cc 双段卡。
@@ -2677,28 +2975,93 @@ test "syncTheme: a /theme switch reaches the shared region's glyphs" {
     try std.testing.expectEqualStrings("─", r.theme.box_h);
 }
 
-test "resetPhaseUi: per-phase interaction state does not outlive its phase" {
+// #298 parity (#330): the boundary resets are gone; what used to be reset at
+// each boundary now cannot survive one, because it lives in the phase payload.
+// These replay the three boundaries the region crosses.
+
+test "#298 parity: nothing a reply opened survives into the next read" {
     var r = RenderRegion.init(std.testing.allocator, 2, theme_mod.select(.dark, .basic_16), .basic_16);
     defer r.deinit();
-    // A reply ended with the agent list open, help showing and a Ctrl+X armed.
-    r.ui.agents.view = .list;
-    r.ui.agents.selection_active = true;
-    r.ui.agents.sel = 2;
-    r.ui.help_open = true;
-    r.ui.ctrl_x_armed = true;
-    r.ui.slash_sel = 3;
-    r.ui.paste_hint = true;
-    r.ui.picker_open = true;
-    r.resetPhaseUi();
-    try std.testing.expectEqual(ui_state_mod.AgentView.closed, r.ui.agents.view);
-    try std.testing.expect(!r.ui.agents.selection_active);
-    try std.testing.expectEqual(@as(usize, 0), r.ui.agents.sel);
-    try std.testing.expect(!r.ui.help_open);
-    try std.testing.expect(!r.ui.ctrl_x_armed);
-    try std.testing.expectEqual(@as(usize, 0), r.ui.slash_sel);
-    try std.testing.expect(!r.ui.paste_hint);
-    // The model picker crosses phases on purpose (#220).
-    try std.testing.expect(r.ui.picker_open);
+    // A reply ended with the agent list open, help showing, a Ctrl+X armed,
+    // the picker up, a draft in the watcher's box and a tool card on screen.
+    r.changePhaseLocked(.{ .generating = .{ .verb = "Thinking", .start_ms = 5 } });
+    r.ui.agent_count = 3;
+    const gen_ix = r.ui.interaction().?;
+    gen_ix.agents.view = .list;
+    gen_ix.agents.selection_active = true;
+    gen_ix.agents.sel = 2;
+    gen_ix.help_open = true;
+    gen_ix.ctrl_x_armed = true;
+    gen_ix.picker_open = true;
+    gen_ix.editor = .{ .view = "queued draft", .cursor = 6 };
+    r.addToolCard("t1", "Bash", "{}", 0);
+    r.setCurrentTool("Bash", 0);
+
+    r.changePhaseLocked(.idle); // leaveGenerating
+    try std.testing.expect(r.ui.interaction() == null);
+    // A tool event that arrives after the reply has nothing to update.
+    r.addToolCard("late", "Bash", "{}", 0);
+    try std.testing.expect(ui_state_mod.findCard(&r.ui, "late") == null);
+
+    r.beginInput(.builtin);
+    const ix = r.ui.interaction().?;
+    try std.testing.expectEqual(ui_state_mod.AgentView.closed, ix.agents.view);
+    try std.testing.expect(!ix.agents.selection_active);
+    try std.testing.expectEqual(@as(usize, 0), ix.agents.sel);
+    try std.testing.expect(!ix.help_open);
+    try std.testing.expect(!ix.ctrl_x_armed);
+    try std.testing.expectEqualStrings("", ix.editor.view);
+    // The picker crosses only through the loop's hand-off (#220), never by
+    // being left in the region.
+    try std.testing.expect(!ix.picker_open);
+    try std.testing.expect(r.ui.generatingPhase() == null);
+    // The session-owned mirror is untouched.
+    try std.testing.expectEqual(@as(usize, 3), r.ui.agent_count);
+    // The #298 symptom: an agent list left open swallowed the prompt's typing.
+    const typed = ui_mod.dispatch(&r.ui, .{ .key = .{ .key = .{ .char = 'a' } } });
+    try std.testing.expectEqual(event_mod.LoopAction.pass_to_editor, typed.action);
+}
+
+test "#298 parity: nothing a read opened survives into the reply or the next read" {
+    var r = RenderRegion.init(std.testing.allocator, 2, theme_mod.select(.dark, .basic_16), .basic_16);
+    defer r.deinit();
+    const catalog_entries = [_]complete.SlashCmd{.{ .name = "/only", .desc = "", .kind = .skill }};
+    for ([_]ui_state_mod.PhaseEntry{ .{ .generating = .{} }, .{ .input = .{} } }) |next| {
+        r.beginInput(.{ .entries = &catalog_entries });
+        r.ui.agent_count = 1;
+        const ip = r.ui.inputPhase().?;
+        ip.interaction.agents.view = .viewing;
+        ip.interaction.agents.view_top = 9;
+        ip.interaction.help_open = true;
+        ip.interaction.ctrl_x_armed = true;
+        ip.slash_sel = 3;
+        ip.paste_hint = true;
+        _ = ip.press.press(.exit_ctrl_c, 100);
+        ip.menu_dismissal.dismiss("/he");
+        r.setInput("/he", 3);
+
+        r.endInput();
+        r.endInput(); // the read's defer may run after an explicit end
+        try std.testing.expect(r.ui.phase == .idle);
+        r.changePhaseLocked(next);
+        const ix = r.ui.interaction().?;
+        try std.testing.expectEqual(ui_state_mod.AgentView.closed, ix.agents.view);
+        try std.testing.expectEqual(@as(usize, 0), ix.agents.view_top);
+        try std.testing.expect(!ix.help_open);
+        try std.testing.expect(!ix.ctrl_x_armed);
+        try std.testing.expectEqualStrings("", ix.editor.view);
+        // The catalog borrowed the read's arena; it does not outlive the read.
+        try std.testing.expectEqual(complete.SlashCatalog.builtin.entries.ptr, r.slashCatalog().entries.ptr);
+        try std.testing.expectEqual(@as(usize, 0), r.slashSel());
+        try std.testing.expect(r.exitHint() == null);
+        try std.testing.expect(r.aboveBoxNotice() == null);
+        if (r.ui.inputPhase()) |fresh| {
+            try std.testing.expect(!fresh.menu_dismissal.covers("/he"));
+            r.endInput();
+        } else {
+            r.changePhaseLocked(.idle);
+        }
+    }
 }
 
 test "input box border is a full-width rule without corners" {
@@ -2766,7 +3129,7 @@ test "generation erase walks up from the edit row, clears with ED0, returns to t
 test "a screen reset during generation erases the region, then ED2, and drops the half line" {
     var r = RenderRegion.init(std.testing.allocator, -1, theme_mod.select(.dark, .none), .none);
     defer r.deinit();
-    r.generating = true;
+    r.changePhaseLocked(.{ .generating = .{} });
     r.region_drawn = true;
     r.prev_rows = 6;
     r.anchor = .{ .rows_above = 3 };
@@ -2906,15 +3269,14 @@ test "a generation resize with the cursor on the half-line seals it exactly once
 test "leaveGenerating is idempotent so a deferred fallback cannot double-finish" {
     var r = RenderRegion.init(std.testing.allocator, 2, theme_mod.select(.dark, .none), .none);
     defer r.deinit();
-    r.generating = true;
-    r.ui.phase = .generating;
+    r.changePhaseLocked(.{ .generating = .{} });
     r.prev_rows = 4;
     r.anchor = .{ .rows_above = 2 };
     // leaveGenerating ignores its App argument; the region is not drawn, so
     // nothing reaches the terminal.
     r.leaveGenerating(undefined);
     try std.testing.expect(!r.isGenerating());
-    try std.testing.expect(r.ui.phase == .input);
+    try std.testing.expect(r.ui.phase == .idle);
     try std.testing.expectEqual(@as(u16, 0), r.prev_rows);
     try std.testing.expectEqual(@as(u16, 0), r.anchor.rows_above);
     // A second call (the loop's defer after the explicit hand-off) is a no-op.
@@ -2926,53 +3288,57 @@ test "leaveGenerating is idempotent so a deferred fallback cannot double-finish"
 test "setCurrentTool/clearCurrentTool: 存取 + 截断 + 归零(读 ui.tools 真相源)" {
     var r = RenderRegion.init(std.testing.allocator, 2, theme_mod.select(.monochrome, .none), .none);
     defer r.deinit();
-    try std.testing.expectEqual(@as(u8, 0), r.ui.tools.current_len);
+    r.changePhaseLocked(.{ .generating = .{} });
+    const tools = &r.ui.phase.generating.tools;
+    try std.testing.expectEqual(@as(u8, 0), tools.current_len);
 
     r.setCurrentTool("Bash", 1000);
-    try std.testing.expectEqualStrings("Bash", r.ui.tools.currentSlice());
-    try std.testing.expectEqual(@as(i64, 1000), r.ui.tools.current_start_ms);
+    try std.testing.expectEqualStrings("Bash", tools.currentSlice());
+    try std.testing.expectEqual(@as(i64, 1000), tools.current_start_ms);
 
     // 超 48B 的工具名应截断到 48,不越界。
     const long = "ThisIsAnAbsurdlyLongToolNameThatExceedsFortyEightBytesForSure";
     r.setCurrentTool(long, 2000);
-    try std.testing.expectEqual(@as(u8, 48), r.ui.tools.current_len);
-    try std.testing.expectEqualStrings(long[0..48], r.ui.tools.currentSlice());
+    try std.testing.expectEqual(@as(u8, 48), tools.current_len);
+    try std.testing.expectEqualStrings(long[0..48], tools.currentSlice());
 
     r.clearCurrentTool();
-    try std.testing.expectEqual(@as(u8, 0), r.ui.tools.current_len);
+    try std.testing.expectEqual(@as(u8, 0), tools.current_len);
 }
 
 test "per-toolUse 多卡:按 id 各写各卡不互盖 + 增删(读 ui.tools 真相源)" {
     var r = RenderRegion.init(std.testing.allocator, 2, theme_mod.select(.monochrome, .none), .none);
     defer r.deinit();
-    try std.testing.expectEqual(@as(u8, 0), r.ui.tools.cards_len);
+    r.changePhaseLocked(.{ .generating = .{} });
+    const tools = &r.ui.phase.generating.tools;
+    try std.testing.expectEqual(@as(u8, 0), tools.cards_len);
 
     // 两个并发 WebSearch:各一张卡。
     r.addToolCard("id_a", "WebSearch", "{\"query\":\"alpha\"}", 100);
     r.addToolCard("id_b", "WebSearch", "{\"query\":\"beta\"}", 200);
-    try std.testing.expectEqual(@as(u8, 2), r.ui.tools.cards_len);
+    try std.testing.expectEqual(@as(u8, 2), tools.cards_len);
 
     // 各写各的 progress,不互盖。
     r.setToolProgress("id_a", "Searching: alpha");
     r.setToolProgress("id_b", "Searching: beta");
     const ia = ui_state_mod.findCard(&r.ui, "id_a").?;
     const ib = ui_state_mod.findCard(&r.ui, "id_b").?;
-    try std.testing.expectEqualStrings("Searching: alpha", r.ui.tools.cards[ia].progressSlice());
-    try std.testing.expectEqualStrings("Searching: beta", r.ui.tools.cards[ib].progressSlice());
+    try std.testing.expectEqualStrings("Searching: alpha", tools.cards[ia].progressSlice());
+    try std.testing.expectEqualStrings("Searching: beta", tools.cards[ib].progressSlice());
 
     // 重复 addToolCard 同 id 不新增。
     r.addToolCard("id_a", "WebSearch", "{\"query\":\"alpha\"}", 300);
-    try std.testing.expectEqual(@as(u8, 2), r.ui.tools.cards_len);
+    try std.testing.expectEqual(@as(u8, 2), tools.cards_len);
 
     // 删一张,另一张保留且 progress 不丢。
     r.clearToolCard("id_a");
-    try std.testing.expectEqual(@as(u8, 1), r.ui.tools.cards_len);
+    try std.testing.expectEqual(@as(u8, 1), tools.cards_len);
     try std.testing.expect(ui_state_mod.findCard(&r.ui, "id_a") == null);
     const ib2 = ui_state_mod.findCard(&r.ui, "id_b").?;
-    try std.testing.expectEqualStrings("Searching: beta", r.ui.tools.cards[ib2].progressSlice());
+    try std.testing.expectEqualStrings("Searching: beta", tools.cards[ib2].progressSlice());
 
     r.clearToolCard("id_b");
-    try std.testing.expectEqual(@as(u8, 0), r.ui.tools.cards_len);
+    try std.testing.expectEqual(@as(u8, 0), tools.cards_len);
 }
 
 test "nextCharBytes UTF-8 宽度" {
@@ -3150,8 +3516,8 @@ test "slash menu: skills appear, the window follows the selection, rows fit the 
             .source = if (index == 12) "user" else "",
         };
     }
-    r.ui.slash_catalog = .{ .entries = &entries };
-    r.ui.slash_sel = 12;
+    r.beginInput(.{ .entries = &entries });
+    r.ui.phase.input.slash_sel = 12;
 
     var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer out.deinit();
@@ -3171,4 +3537,286 @@ test "slash menu: skills appear, the window follows the selection, rows fit the 
         const visible = if (std.mem.lastIndexOfScalar(u8, line, 'K')) |k| line[k + 1 ..] else line;
         try std.testing.expect(displayWidth(visible) <= 40);
     }
+}
+
+// ---- #328: the generating region's merge window ----
+// Driven by a fake clock with the timer thread off (pumpFrame stands in for
+// it), bytes captured through `sink`. A real App, because drawing the region
+// reads it (footer mode, agent registry, task panel).
+
+const MergeFixture = struct {
+    var now: i64 = 0;
+    fn clock() i64 {
+        return now;
+    }
+
+    home_buf: [512]u8 = undefined,
+    home: [:0]const u8 = "",
+    old_home: ?[*:0]const u8 = null,
+    app_arena: std.heap.ArenaAllocator,
+    io_rt: std.Io.Threaded,
+    app: *app_mod.App,
+    out: std.Io.Writer.Allocating,
+    r: RenderRegion,
+
+    /// `merge` false keeps the default paint-through region.
+    fn init(f: *MergeFixture, merge: bool) !void {
+        const a = std.testing.allocator;
+        const ppaths = @import("platform").paths;
+        const util_fs = @import("../../util/fs.zig");
+        f.home = util_fs.testing.perPidDir(&f.home_buf, "cc-zig-merge-window");
+        _ = @import("platform").fs.mkdir(f.home.ptr, 0o755);
+        f.old_home = std.c.getenv("HOME");
+        ppaths.setEnv("HOME", f.home.ptr);
+        ppaths.setEnv("METACODES_NO_PROBE", "1");
+        f.app_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        f.io_rt = @import("platform").signal.threadedIo(a, .{});
+        f.app = try app_mod.App.init(f.app_arena.allocator(), f.io_rt.io(), .{ .model = "claude-sonnet-4-20250514" }, "test-key");
+        f.out = .init(a);
+        f.r = RenderRegion.init(a, -1, theme_mod.select(.monochrome, .none), .none);
+        f.r.sink = &f.out.writer;
+        if (merge) f.r.merge = .{ .now_ms = clock, .timer = false };
+        now = 10_000;
+        f.r.enterGenerating(f.app, null);
+    }
+
+    fn deinit(f: *MergeFixture) void {
+        f.r.deinit();
+        f.out.deinit();
+        f.app.deinit();
+        f.io_rt.deinit();
+        f.app_arena.deinit();
+        const ppaths = @import("platform").paths;
+        if (f.old_home) |h| ppaths.setEnv("HOME", h) else ppaths.unsetEnv("HOME");
+        @import("../../util/fs.zig").testing.rmrfBestEffort(f.home);
+    }
+
+    /// Frames that drew the region (each is one DEC 2026 synchronized update).
+    fn frames(f: *MergeFixture) usize {
+        return std.mem.count(u8, f.out.written(), ansi.sync.begin);
+    }
+};
+
+test "merge window: an isolated tick paints at once, ticks inside the window share one frame" {
+    var f: MergeFixture = undefined;
+    try f.init(true);
+    defer f.deinit();
+    f.r.tickSpinner(f.app);
+    try std.testing.expectEqual(@as(usize, 1), f.frames()); // nothing in the last window: same call
+    MergeFixture.now += 4;
+    f.r.tickSpinner(f.app);
+    MergeFixture.now += 4;
+    f.r.tickSpinner(f.app);
+    try std.testing.expectEqual(@as(usize, 1), f.frames()); // both wait for the window to end
+    MergeFixture.now += 7; // 15 ms after the first frame
+    try std.testing.expect(!f.r.pumpFrame());
+    MergeFixture.now += 1;
+    try std.testing.expect(f.r.pumpFrame());
+    try std.testing.expectEqual(@as(usize, 2), f.frames());
+    // The frame shows the latest state: three ticks advanced the spinner three times.
+    try std.testing.expectEqual(@as(u8, 3), f.r.ui.phase.generating.spinner.frame);
+    try std.testing.expect(!f.r.pumpFrame()); // nothing left
+}
+
+test "merge window: lines inside the window reach the terminal once, in order, with one region redraw" {
+    var f: MergeFixture = undefined;
+    try f.init(true);
+    defer f.deinit();
+    f.r.tickSpinner(f.app); // region on screen
+    const before = f.out.written().len;
+    var i: usize = 0;
+    while (i < 10) : (i += 1) {
+        MergeFixture.now += 1;
+        var buf: [16]u8 = undefined;
+        f.r.writeGenText(std.fmt.bufPrint(&buf, "line {d}\n", .{i}) catch unreachable);
+    }
+    try std.testing.expectEqual(before, f.out.written().len); // all ten wait for the window
+    MergeFixture.now += 6;
+    try std.testing.expect(f.r.pumpFrame());
+    const frame = f.out.written()[before..];
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, frame, ansi.sync.begin));
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, frame, ansi.clear.to_end_of_screen)); // one erase, one redraw
+    var at: usize = 0;
+    i = 0;
+    while (i < 10) : (i += 1) {
+        var buf: [16]u8 = undefined;
+        const line = std.fmt.bufPrint(&buf, "line {d}\n", .{i}) catch unreachable;
+        const idx = std.mem.indexOfPos(u8, frame, at, line) orelse return error.TestExpectedEqual;
+        at = idx + line.len;
+    }
+}
+
+test "merge window: without it every request paints at once (the default)" {
+    var f: MergeFixture = undefined;
+    try f.init(false);
+    defer f.deinit();
+    f.r.tickSpinner(f.app);
+    f.r.tickSpinner(f.app);
+    f.r.writeGenText("a\n");
+    f.r.writeGenText("b\n");
+    try std.testing.expectEqual(@as(usize, 4), f.frames());
+}
+
+test "merge window: an immediate transition paints at once and satisfies the pending frame" {
+    var f: MergeFixture = undefined;
+    try f.init(true);
+    defer f.deinit();
+    f.r.tickSpinner(f.app);
+    MergeFixture.now += 2;
+    f.r.writeGenText("tool output\n");
+    try std.testing.expect(std.mem.indexOf(u8, f.out.written(), "tool output") == null);
+    f.r.flushGen(); // tool completion / interrupt
+    try std.testing.expect(std.mem.indexOf(u8, f.out.written(), "tool output\n") != null);
+    try std.testing.expectEqual(@as(usize, 2), f.frames());
+    MergeFixture.now += 100;
+    try std.testing.expect(!f.r.pumpFrame()); // nothing was left for the timer
+}
+
+test "merge window: a card's last progress is painted before the card is removed" {
+    var f: MergeFixture = undefined;
+    try f.init(true);
+    defer f.deinit();
+    f.r.addToolCard("ws", "WebSearch", "{\"query\":\"q\"}", 0);
+    f.r.tickSpinner(f.app);
+    MergeFixture.now += 1;
+    f.r.setToolProgress("ws", "Searching: q");
+    MergeFixture.now += 1;
+    f.r.setToolProgress("ws", "Found 5 results for \"q\"");
+    const before = f.out.written().len;
+    MergeFixture.now += 1;
+    f.r.clearToolCard("ws"); // the tool completed inside the window
+    const shown = f.out.written()[before..];
+    // 9016b64a: the result line reaches the screen before the card goes; the
+    // superseded query line is the intermediate state the window drops.
+    try std.testing.expect(std.mem.indexOf(u8, shown, "Found 5 results") != null);
+    try std.testing.expect(std.mem.indexOf(u8, f.out.written(), "Searching: q") == null);
+    try std.testing.expect(ui_state_mod.findCard(&f.r.ui, "ws") == null);
+}
+
+test "merge window: leaveGenerating writes what is pending and leaves the timer nothing" {
+    var f: MergeFixture = undefined;
+    try f.init(true);
+    defer f.deinit();
+    f.r.tickSpinner(f.app);
+    MergeFixture.now += 1;
+    f.r.writeGenText("last words\n");
+    f.r.leaveGenerating(f.app);
+    try std.testing.expect(std.mem.indexOf(u8, f.out.written(), "last words\n") != null);
+    try std.testing.expect(!f.r.paintPending());
+    MergeFixture.now += 100;
+    try std.testing.expect(!f.r.pumpFrame());
+}
+
+test "endScrollLine: erase, the closing newline and the redraw are one frame" {
+    var f: MergeFixture = undefined;
+    try f.init(false);
+    defer f.deinit();
+    f.r.tickSpinner(f.app);
+    f.r.writeGenText("half"); // stays in the line buffer
+    const before = f.out.written().len;
+    f.r.endScrollLine();
+    const frame = f.out.written()[before..];
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, frame, ansi.sync.begin));
+    try std.testing.expect(std.mem.indexOf(u8, frame, "half\n") != null);
+    try std.testing.expect(!f.r.text_pending_newline);
+    // At a line start it is idempotent: nothing more is written.
+    const after = f.out.written().len;
+    f.r.endScrollLine();
+    try std.testing.expectEqual(after, f.out.written().len);
+}
+
+test "a seal after a generation resize is written once when the region is not drawn" {
+    var r = RenderRegion.init(std.testing.allocator, -1, theme_mod.select(.monochrome, .none), .none);
+    defer r.deinit();
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    r.sink = &out.writer;
+    r.changePhaseLocked(.{ .generating = .{} });
+    r.resize_seal_pending = true;
+    r.writeGenText("next\n");
+    // Before #328 the seal flushed its newline and stayed in the scratch, so it
+    // went out twice: a blank line after a resize.
+    try std.testing.expectEqualStrings("\nnext\n", out.written());
+}
+
+// The panic flush handles a resize the way a frame does: the half-line column
+// saved when the region was drawn is stale once the line re-wraps, and a half
+// line with no region under it is sealed before the pending text.
+test "the panic flush measures a resize before it erases" {
+    var nb: [16]u8 = undefined;
+    for ([_]bool{ true, false }) |drawn| {
+        var r = RenderRegion.init(std.testing.allocator, -1, theme_mod.select(.monochrome, .none), .none);
+        defer r.deinit();
+        var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer out.deinit();
+        r.sink = &out.writer;
+        r.changePhaseLocked(.{ .generating = .{} });
+        r.cols = 80;
+        r.rows = 24;
+        r.reflows = true;
+        r.text_pending_newline = true;
+        r.pending_col = 70;
+        if (drawn) {
+            r.region_drawn = true;
+            r.region_drawn_pending_nl = true;
+            r.region_drawn_pending_col = 70;
+            r.prev_rows = 2;
+            r.anchor = .{ .rows_above = 1 };
+        }
+        try r.pending_scroll.appendSlice(std.testing.allocator, "rest\n");
+        r.size_override = .{ .rows = 24, .cols = 50 }; // narrowed inside the window
+
+        try std.testing.expect(r.flushForPanic());
+        defer r.unlock();
+        try std.testing.expectEqual(@as(u16, 50), r.cols);
+        if (drawn) {
+            // Erased back to the region's top row, a fresh line: no move to
+            // the stale column, no extra newline.
+            try std.testing.expect(std.mem.indexOf(u8, out.written(), ansi.cursor.forward(70, &nb)) == null);
+            try std.testing.expect(std.mem.endsWith(u8, out.written(), ansi.cursor.show ++ "rest\n"));
+        } else {
+            try std.testing.expectEqualStrings("\nrest\n", out.written());
+        }
+    }
+}
+
+test "merge window: the timer thread paints a deferred frame and deinit joins it" {
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    var r = RenderRegion.init(std.testing.allocator, -1, theme_mod.select(.monochrome, .none), .none);
+    defer r.deinit(); // joins the timer thread
+    r.sink = &out.writer;
+    r.enableMergeWindow();
+    r.merge.?.sched.window_ms = 200; // wide enough that two back-to-back calls share it on a loaded host
+    r.changePhaseLocked(.{ .generating = .{} });
+    r.writeGenText("first\n"); // isolated: written in this call
+    r.writeGenText("second\n"); // inside the window: the timer writes it
+    r.lock();
+    const deferred = std.mem.indexOf(u8, out.written(), "second") == null;
+    r.unlock();
+    try std.testing.expect(deferred);
+    var waited: u32 = 0;
+    while (waited < 2000) : (waited += 5) {
+        r.lock();
+        const done = std.mem.indexOf(u8, out.written(), "second\n") != null;
+        r.unlock();
+        if (done) break;
+        util_time.sleepMs(5);
+    }
+    r.lock();
+    defer r.unlock();
+    try std.testing.expectEqualStrings("first\nsecond\n", out.written());
+}
+
+test "the generating input box is the region's own copy, not the watcher's buffer" {
+    var r = RenderRegion.init(std.testing.allocator, -1, theme_mod.select(.monochrome, .none), .none);
+    defer r.deinit();
+    r.changePhaseLocked(.{ .generating = .{} });
+    var watcher_buf = [_]u8{ 'd', 'r', 'a', 'f', 't' };
+    r.setGenInput(&watcher_buf, 5);
+    // The watcher's next key reallocates (here: overwrites) its buffer before
+    // anyone repaints; the region still shows what it was given.
+    @memset(&watcher_buf, 'X');
+    try std.testing.expectEqualStrings("draft", r.ui.phase.generating.interaction.editor.view);
+    try std.testing.expectEqual(@as(usize, 5), r.ui.phase.generating.interaction.editor.cursor);
 }

@@ -36,6 +36,10 @@ const PosixMutex = struct {
     pub fn lock(m: *PosixMutex) void {
         _ = std.c.pthread_mutex_lock(&m.inner);
     }
+    /// 拿得到就拿,被占着(包括被本线程占着)立刻返回 false,不等。
+    pub fn tryLock(m: *PosixMutex) bool {
+        return std.c.pthread_mutex_trylock(&m.inner) == .SUCCESS;
+    }
     pub fn unlock(m: *PosixMutex) void {
         _ = std.c.pthread_mutex_unlock(&m.inner);
     }
@@ -114,6 +118,10 @@ const WindowsMutex = struct {
     pub fn lock(m: *WindowsMutex) void {
         win.ntdll.RtlAcquireSRWLockExclusive(&m.inner);
     }
+    /// 拿得到就拿,被占着(包括被本线程占着)立刻返回 false,不等。
+    pub fn tryLock(m: *WindowsMutex) bool {
+        return win.ntdll.RtlTryAcquireSRWLockExclusive(&m.inner).toBool();
+    }
     pub fn unlock(m: *WindowsMutex) void {
         win.ntdll.RtlReleaseSRWLockExclusive(&m.inner);
     }
@@ -150,6 +158,18 @@ test "Mutex lock/unlock 基本" {
     m.unlock();
     // 再次可重入获取（非递归锁，unlock 后能再 lock）
     m.lock();
+    m.unlock();
+}
+
+test "Mutex tryLock:空闲时拿到,被占着(含本线程)时不等、返回 false" {
+    var m: Mutex = .{};
+    try std.testing.expect(m.tryLock());
+    try std.testing.expect(!m.tryLock());
+    m.unlock();
+    m.lock();
+    try std.testing.expect(!m.tryLock());
+    m.unlock();
+    try std.testing.expect(m.tryLock());
     m.unlock();
 }
 

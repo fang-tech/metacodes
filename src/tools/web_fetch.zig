@@ -95,8 +95,19 @@ fn undecodableBody(ctx: *const ToolContext, curl_stderr: []const u8) error{Fetch
 /// HTML stripping and JSON encoding each stream through bounded captures, so
 /// no stage owns the full downloaded page or the full encoded tool result.
 pub fn executeBody(ctx: *const ToolContext, args: []const u8) anyerror!ToolResultBody {
-    if (ctx.artifact_root.len == 0)
-        return ToolResultBody.initInline(try execute(ctx, args));
+    var body: ToolResultBody = undefined;
+    try executeBodyInto(&body, ctx, args);
+    return body;
+}
+
+/// `executeBody` writing its result to `out`. In a function returning a
+/// ToolResultBody, each `return error.X` would copy a 3.7 KiB constant, one
+/// per error name (doc/PERF_MEMORY_PRINCIPLES.md §3g).
+fn executeBodyInto(out: *ToolResultBody, ctx: *const ToolContext, args: []const u8) anyerror!void {
+    if (ctx.artifact_root.len == 0) {
+        out.* = .initInline(try execute(ctx, args));
+        return;
+    }
 
     const allocator = ctx.allocator;
     const url = common.extractJsonArg(args, "url") orelse return error.MissingUrl;
@@ -180,7 +191,7 @@ pub fn executeBody(ctx: *const ToolContext, args: []const u8) anyerror!ToolResul
     try result_writer.writer.writeAll("\"}");
     try result_writer.check();
     try result_capture.seal();
-    return result_spool.finishCaptureAsBody(
+    out.* = try result_spool.finishCaptureAsBody(
         allocator,
         ctx.artifact_root,
         &result_capture,

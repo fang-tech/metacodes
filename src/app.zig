@@ -219,10 +219,24 @@ fn executeCliProcessTool(
     args: []const u8,
     raw: ?*anyopaque,
 ) anyerror!@import("core/tool_result.zig").ToolResultBody {
+    var body: @import("core/tool_result.zig").ToolResultBody = undefined;
+    try executeCliProcessToolInto(&body, ctx, args, raw);
+    return body;
+}
+
+/// `executeCliProcessTool` writing its result to `out`. In a function
+/// returning a ToolResultBody, each `return error.X` would copy a 3.7 KiB
+/// constant, one per error name (doc/PERF_MEMORY_PRINCIPLES.md §3g).
+fn executeCliProcessToolInto(
+    out: *@import("core/tool_result.zig").ToolResultBody,
+    ctx: *const @import("tools/context.zig").ToolContext,
+    args: []const u8,
+    raw: ?*anyopaque,
+) anyerror!void {
     const isolated: *const @import("core/tool_catalog.zig").IsolatedTool =
         @ptrCast(@alignCast(raw orelse return error.ProcessPluginUnavailable));
     const outcome = try isolated.execute(isolated.ctx, ctx, args);
-    return switch (outcome) {
+    out.* = switch (outcome) {
         .ok => |body| body,
         .host_failed => |detail| {
             installCliProcessError(ctx, detail);
@@ -234,7 +248,7 @@ fn executeCliProcessTool(
         },
         // process.zig never produces fatal. Keep the legacy adapter fail-closed
         // if another isolated implementation violates that contract.
-        .host_fatal => error.ProcessPluginProtocolViolation,
+        .host_fatal => return error.ProcessPluginProtocolViolation,
     };
 }
 
@@ -1382,7 +1396,7 @@ pub const App = struct {
     /// (owned; `freeRouteAuthHeader`). Null when it cannot build one, as the
     /// client's own requests would then fail.
     fn routeAuthHeader(app: *App) ?@import("api/auth_header.zig").Header {
-        return @import("api/auth_header.zig").build(app.allocator, app.api_client.auth_scheme, app.api_client.api_key) catch null;
+        return app.api_client.credential.header(app.allocator, app.api_client.auth_scheme) catch null;
     }
 
     fn freeRouteAuthHeader(app: *App, header: @import("api/auth_header.zig").Header) void {
@@ -1728,14 +1742,39 @@ pub const App = struct {
     /// Refresh the picker's snapshot from the kernel. Called when the picker
     /// opens and whenever the catalog moves underneath it.
     pub fn refreshModelPicker(app: *App) !void {
+        var listing = try app.listModelOffers();
+        defer listing.deinit(app.allocator);
+        try app.adoptModelListing(&listing);
+    }
+
+    /// The kernel's model list, taken without touching the picker. A caller
+    /// whose picker other threads draw (a reply's, #328) lists outside its
+    /// lock and adopts under it (`picker_host`).
+    pub const ModelListing = struct {
+        page: std.ArrayList(provider_control_plane.OfferSummary) = .empty,
+        /// Borrows `page`. Null when the kernel could not list the catalog.
+        listed: ?provider_control_plane.ListPage = null,
+        current: ?provider_control_plane.OfferId = null,
+
+        pub fn deinit(listing: *ModelListing, allocator: std.mem.Allocator) void {
+            listing.page.deinit(allocator);
+        }
+    };
+
+    /// Fails only when the provider host cannot be built.
+    pub fn listModelOffers(app: *App) !ModelListing {
         const host = try app.providerHost();
-        var page: std.ArrayList(provider_control_plane.OfferSummary) = .empty;
-        defer page.deinit(app.allocator);
-        const listed = host.kernel.modelList(.{}, .{}, app.allocator, &page) catch {
-            app.model_picker.markFailed();
-            return;
-        };
-        try app.model_picker.adopt(listed, host.kernel.currentOfferId());
+        var listing: ModelListing = .{};
+        listing.listed = host.kernel.modelList(.{}, .{}, app.allocator, &listing.page) catch null;
+        listing.current = host.kernel.currentOfferId();
+        return listing;
+    }
+
+    /// Make `listing` the picker's snapshot; a catalog that could not be
+    /// listed marks the picker failed.
+    pub fn adoptModelListing(app: *App, listing: *const ModelListing) !void {
+        const listed = listing.listed orelse return app.model_picker.markFailed();
+        try app.model_picker.adopt(listed, listing.current);
     }
 
     /// Apply a picker commit: validate through the kernel, bind the winning
@@ -2065,17 +2104,17 @@ pub const App = struct {
         // the previous provider's endpoint.
         app.config.base_url = endpoint;
         app.api_key = secret;
-        app.api_client.api_key = secret;
+        app.api_client.credential = .{ .fixed = secret };
         app.api_client.base_url = endpoint;
         app.api_client.auth_scheme = binding.auth_scheme;
         if (app.openai_client) |*client| {
-            client.api_key = secret;
+            client.credential = .{ .fixed = secret };
             client.base_url = endpoint;
             client.protocol = binding.openai_protocol;
             client.auth_scheme = binding.auth_scheme;
         }
         if (app.gemini_client) |*client| {
-            client.api_key = secret;
+            client.credential = .{ .fixed = secret };
             client.base_url = endpoint;
         }
         // Every out-of-process UI learns the *route*, not just the model name: a
@@ -2122,9 +2161,9 @@ pub const App = struct {
         }
         app.selected_api_key_owned = owned;
         app.api_key = owned;
-        app.api_client.api_key = owned;
-        if (app.openai_client) |*oc| oc.api_key = owned;
-        if (app.gemini_client) |*gc| gc.api_key = owned;
+        app.api_client.credential = .{ .fixed = owned };
+        if (app.openai_client) |*oc| oc.credential = .{ .fixed = owned };
+        if (app.gemini_client) |*gc| gc.credential = .{ .fixed = owned };
         if (app.agent_jobs) |*aj| try aj.setApiKey(owned);
 
         app.api_client.catalog.deinit();
@@ -2738,9 +2777,9 @@ pub const App = struct {
         // request may still be reading it.
         app.route_strings.installSecret(token);
         app.api_key = token;
-        app.api_client.api_key = token;
-        if (app.openai_client) |*client| client.api_key = token;
-        if (app.gemini_client) |*client| client.api_key = token;
+        app.api_client.credential = .{ .fixed = token };
+        if (app.openai_client) |*client| client.credential = .{ .fixed = token };
+        if (app.gemini_client) |*client| client.credential = .{ .fixed = token };
         app.swarm.api_key = token;
         return true;
     }

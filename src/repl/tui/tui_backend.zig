@@ -157,6 +157,12 @@ pub const TuiBackend = struct {
     /// agent_loop 不再预算"喂哪个工具"——backend 据 tool_card 分类自决,层泄漏修复。
     spinner_fed: bool = false,
 
+    /// 生成期输入框里的草稿。归 backend(= 这一轮回复)所有,不归 watcher:权限/提问对话框会
+    /// stopInput 再 startInput,换一个 watcher 线程,而回复(生成阶段)还在继续——草稿、光标和
+    /// region 上它的投影都得跨过这次重启。首次 startInput 时建,deinit 时释放。
+    /// 只由存活的 watcher 线程读写;stopInput 与 startInput 之间没有 watcher,主线程也不碰它。
+    draft: ?input.LineEditor = null,
+
     pub fn init(region: *RenderRegion) TuiBackend {
         return .{ .region = region };
     }
@@ -237,6 +243,8 @@ pub const TuiBackend = struct {
                 } else {
                     self.renderCardResult(r);
                 }
+                // 工具完成走立即通道(#328):结果卡与收掉的动态卡当场一帧画出,不等合并窗口。
+                self.region.flushGen();
             },
             .usage => |u| {
                 if (self.usage_acc) |acc| acc.apply(u);
@@ -442,6 +450,7 @@ pub const TuiBackend = struct {
         // 不是不变量的真正强制者(真正强制靠 input_thread 这个 optional 的存在性 + 调用纪律)。多 session
         // 若要硬保证,得让 start 在 input_thread!=null 时返回 error 或先内部 stop(Linus #3 认知项)。
         std.debug.assert(self.input_thread == null);
+        if (self.draft == null) self.draft = input.LineEditor.init(allocator);
         self.input_ctx.set(fd, app, allocator); // 持 I 锁写;spawn 的 release 另给初值可见性
         self.input_stop.store(false, .release);
         self.cancel_sent = false;
@@ -467,6 +476,19 @@ pub const TuiBackend = struct {
             // 保"字段只在 I 内变"审美,反给 join 后的 self 读刨 null 窗口(ask_question defer 重启被迫绕)
             // → 自找复杂度,删之(Linus #1)。
         }
+    }
+
+    /// 回复结束:停 watcher(若还在),释放草稿。持有 backend 的一方 defer 调它,任何出口都走得到。
+    /// 出错返回时 defer 先跑这里、后离开生成阶段,所以释放前先撤掉 region 上的投影(持锁)。
+    /// 投影是 region 自己的副本(gen_editor),不会读到释放的缓冲;撤掉它是让这之间画出的帧
+    /// 不再显示一份已经没有回复接收的草稿。
+    pub fn deinit(self: *TuiBackend) void {
+        self.stopInput();
+        if (self.draft) |*d| {
+            self.region.setGenInput("", 0);
+            d.deinit();
+        }
+        self.draft = null;
     }
 
     /// 统一的终端接管骨架(三套 UI 请求曾各写一遍,现合一)。
@@ -581,10 +603,12 @@ pub const TuiBackend = struct {
         const snap = self.input_ctx.snapshot();
         const app = snap.app orelse return;
         const fd = snap.fd;
-        const allocator = snap.alloc orelse return;
+        _ = snap.alloc orelse return;
         var parser = input.KeyParser{}; // 本线程独占,不持锁
-        var editor = input.LineEditor.init(allocator);
-        defer editor.deinit();
+        // 草稿归 backend:对话框之后重启的 watcher 接着用同一个 editor(startInput 已建好)。
+        const editor = &self.draft.?;
+        // 重启后先把草稿重新交给 region:对话框期间没人动它,框里应该照旧是这份草稿和光标。
+        self.region.setGenInput(editor.view(), editor.cursor);
         var dead_reads: u32 = 0; // 连续"poll 可读却读不到字节"计数(终端 hangup 检测)
 
         while (!self.input_stop.load(.acquire)) {
@@ -597,9 +621,9 @@ pub const TuiBackend = struct {
             if (rc <= 0) {
                 // 超时:孤立 ESC 兑现 → 处理(可能中断);否则推进 spinner。
                 if (parser.flushEsc()) |k| {
-                    self.handleKey(snap, k, &editor);
+                    self.handleKey(snap, k, editor);
                     // Alt+] 兑现成 ESC 后,']'(和其后的数字)在 pending 里。
-                    while (parser.drain()) |k2| self.handleKey(snap, k2, &editor);
+                    while (parser.drain()) |k2| self.handleKey(snap, k2, editor);
                 } else {
                     // Ctrl+C 走 SIGINT handler,只能置原子标志;标志只在流事件之间被检查,
                     // 卡在 readv 里的读醒不了。这里代它 shutdown 在飞连接(一次)。
@@ -608,7 +632,7 @@ pub const TuiBackend = struct {
                     // The picker's sign-in runs on a worker thread (#67);
                     // this tick moves its transcript into the overlay and
                     // commits the pending route once the login lands.
-                    if (self.region.ui.picker_open) switch (picker_host.poll(app, &self.region.ui)) {
+                    if (self.region.pickerOpen()) switch (picker_host.poll(app, &self.region.ui, .of(self.region))) {
                         .committed => {
                             self.region.writeGenText(picker_host.lastNotice(app));
                             self.region.writeGenText("\n");
@@ -646,9 +670,9 @@ pub const TuiBackend = struct {
             dead_reads = 0;
 
             const key = parser.feed(b[0]) orelse continue; // 多字节(UTF-8/CSI)攒够再出 Key
-            self.handleKey(snap, key, &editor);
+            self.handleKey(snap, key, editor);
             // ESC + 普通字符:feed 吐 .esc 后第二个键在 pending,排空(否则字符被吞)。
-            while (parser.drain()) |k2| self.handleKey(snap, k2, &editor);
+            while (parser.drain()) |k2| self.handleKey(snap, k2, editor);
         }
     }
 
@@ -713,12 +737,14 @@ pub const TuiBackend = struct {
             .open_model_picker => {
                 // 生成期也能开(要求:picker 在流式回复期间可用)。不碰 alt-screen:
                 // picker 画在固定区内,回复继续往 scrollback 走;改动只影响下一轮。
-                picker_host.open(app, &self.region.ui);
+                // picker 的写者是本线程;agent 线程的帧、合并窗口的定时线程同时在读它。
+                // picker_host 只在内存修改时持 region 锁(Guard),IO 在锁外(§9.2「picker」)。
+                picker_host.open(app, &self.region.ui, .of(self.region));
                 self.region.redrawGen(app);
                 return;
             },
             .picker_key => {
-                if (picker_host.onKey(app, &self.region.ui, eff.picker_key) == .committed) {
+                if (picker_host.onKey(app, &self.region.ui, eff.picker_key, .of(self.region)) == .committed) {
                     // Mid-stream the confirmation goes into scrollback through
                     // the same path streamed text uses, so it survives the
                     // overlay closing without fighting the region for stdout.
@@ -780,18 +806,24 @@ pub const TuiBackend = struct {
                 }
                 ed.clear();
                 self.interruptCurrentRun(app);
-                return; // 中断不重画(主线程很快收尾)
+                // 中断走立即通道(#328):合并窗口里还在等的文本与清空的输入框当场画出,不排在窗口后。
+                self.region.setGenInput(ed.view(), ed.cursor);
+                self.region.flushGen();
+                return;
             },
             .ctrl_c => {
                 ed.clear();
                 self.interruptCurrentRun(app);
+                self.region.setGenInput(ed.view(), ed.cursor);
+                self.region.flushGen();
                 return;
             },
             else => {
-                // 普通编辑键 → 喂 LineEditor,重画生成区输入框。
+                // 普通编辑键 → 喂 LineEditor,重画生成区输入框。普通通道:连打/粘贴/按住键在一个
+                // 窗口内只画一帧(以前每个键一帧)。
                 _ = ed.handle(key) catch {};
                 self.region.setGenInput(ed.view(), ed.cursor);
-                self.region.redrawGen(app);
+                self.region.requestGenRedraw();
             },
         }
     }

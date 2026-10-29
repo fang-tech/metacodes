@@ -858,6 +858,37 @@ static napi_value session_submit(napi_env env, napi_callback_info info) {
     return value;
 }
 
+/* Zero a secret copy through volatile stores, which the compiler may not
+ * drop as dead before free, then release it. */
+static void erase_and_free(owned_t *bytes) {
+    volatile uint8_t *cursor = bytes->ptr;
+    for (size_t i = 0; cursor != NULL && i < bytes->len; i++) cursor[i] = 0;
+    free(bytes->ptr);
+    bytes->ptr = NULL;
+    bytes->len = 0;
+}
+
+/* sessionUpdateCredential(session, apiKey): Revision 25. Runs on the JS
+ * thread, which also owns destroy, so an update never races the release. */
+static napi_value session_update_credential(napi_env env, napi_callback_info info) {
+    size_t argc = 2;
+    napi_value argv[2];
+    napi_get_cb_info(env, info, &argc, argv, NULL, NULL);
+    session_t *session = get_session(env, argv[0]);
+    if (session == NULL) return NULL;
+    owned_t credential;
+    if (!get_string(env, argv[1], &credential)) return NULL;
+    metask_agentcore_owned_bytes_v1 diagnostic = {NULL, 0};
+    uint32_t status = g_api->session->update_credential(session->handle, view_of(&credential), &diagnostic);
+    erase_and_free(&credential);
+    if (status != METASK_AGENTCORE_STATUS_OK) {
+        throw_status(env, "session.update_credential", status, &diagnostic);
+        return NULL;
+    }
+    g_api->buffer_release(&diagnostic);
+    return NULL;
+}
+
 static napi_value session_describe(napi_env env, napi_callback_info info) {
     size_t argc = 1;
     napi_value argv[1];
@@ -983,7 +1014,7 @@ static napi_value load_library(napi_env env, napi_callback_info info) {
         if (!metask_agentcore_api_v1_is_compatible(api)) {
             dlclose(library);
             napi_throw_error(env, "ABI_MISMATCH",
-                             "library does not provide AgentCore ABI v1 revision " "24" " with the expected layout");
+                             "library does not provide AgentCore ABI v1 revision " "25" " with the expected layout");
             return NULL;
         }
         g_api = api; /* the library stays loaded for the life of the process */
@@ -1008,6 +1039,7 @@ NAPI_MODULE_INIT() {
     EXPORT("sessionRun", session_run);
     EXPORT("sessionAbort", session_abort);
     EXPORT("sessionSubmit", session_submit);
+    EXPORT("sessionUpdateCredential", session_update_credential);
     EXPORT("sessionDescribe", session_describe);
     EXPORT("sessionSetModel", session_set_model);
     EXPORT("sessionSetPermissionMode", session_set_permission_mode);

@@ -1,7 +1,7 @@
 # AgentCore SDK
 
 This directory contains source-free host bindings for the experimental AgentCore
-C ABI v1 revision 24:
+C ABI v1 revision 25:
 
 - `metask/agentcore.h` — normative C11/C++17 layout declarations;
 - `zig/` — typed Zig consumer bindings;
@@ -15,7 +15,7 @@ C ABI v1 revision 24:
 
 Do not copy individual files into a release. Consume the complete generated bundle
 and validate its manifest, hashes, target, ABI version, exact 80-byte root, all
-seven mandatory typed tables, function slots, and reserved fields. Revision 24 is
+seven mandatory typed tables, function slots, and reserved fields. Revision 25 is
 the Agent Runtime surface; it does not expose an independent Completion client.
 `SessionCreateConfigV1.prompt_profile` edits the named system-prompt sections
 (replace the identity, add Host sections; governance sections stay locked) and
@@ -25,6 +25,11 @@ one Run as user-role context instead of system-prompt text.
 `session_control->update_permission_mode` changes an existing Session's
 permission mode in place while idle: same handle and Conversation, a new policy
 generation, every Session grant revoked; `describe` reports `permission_mode`.
+`session->update_credential` replaces a Session's provider credential in place,
+idle or during a Run, from any thread or callback: every request sent afterwards
+(later turns, retries, compaction, Skills, tool providers, requests still
+waiting for a connection) carries it, a request already sent keeps the old one, and provider,
+scheme, `base_url` and model stay; refusals keep the previous credential.
 `session->submit_input` hands the active Run more user text from any thread or
 callback; the Run appends it at its next turn boundary and reports each
 adoption as `input_adopted`, and `RunResultV1.input_accepted_count` /

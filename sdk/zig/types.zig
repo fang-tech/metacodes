@@ -4,11 +4,11 @@
 /// doc/AGENTCORE_BINARY_ABI.md, Status). No stability promise: layouts and
 /// semantics may change incompatibly between commits. Pin an exact bundle.
 pub const ABI_VERSION_V1: u32 = 1;
-pub const ABI_REVISION: u32 = 24;
+pub const ABI_REVISION: u32 = 25;
 
 comptime {
     if (@sizeOf(usize) != 8)
-        @compileError("AgentCore ABI v1 revision 24 requires a 64-bit pointer ABI");
+        @compileError("AgentCore ABI v1 revision 25 requires a 64-bit pointer ABI");
 }
 
 pub const Status = enum(u32) {
@@ -215,6 +215,8 @@ pub const MAX_RUN_INPUT_PARTS_V1: u64 = 64;
 /// adopted or not, and the text bytes of all of them together.
 pub const MAX_SUBMITTED_INPUTS_V1: u64 = 64;
 pub const MAX_SUBMITTED_INPUT_BYTES_V1: u64 = 16 * 1024 * 1024;
+/// Revision 25: the longest credential `session.update_credential` accepts.
+pub const MAX_CREDENTIAL_BYTES_V1: u64 = 16 * 1024;
 /// Base64 payload cap for one image part. This is exactly the standard base64
 /// encoding of the Read tool's 3.75 MB raw-image limit, so an image that the
 /// built-in Read tool can attach is also submittable through the ABI.
@@ -804,6 +806,8 @@ pub const SessionHostConfigV1 = extern struct {
     provider_kind_code: u32,
     permission_mode_code: u32,
     shell_policy_code: u32,
+    /// 1..MAX_CREDENTIAL_BYTES_V1 bytes of printable ASCII (0x21-0x7E), the
+    /// rule `session.update_credential` applies too.
     api_key: BytesViewV1,
     base_url: BytesViewV1,
     workspace_root: BytesViewV1,
@@ -1256,6 +1260,23 @@ pub const SessionSubmitInputFnV1 = *const fn (
     out_receipt: ?*InputReceiptV1,
     out_diagnostic: ?*OwnedBytesV1,
 ) callconv(.c) u32;
+/// Revision 25 (#336). Replaces the Session's provider credential in place:
+/// a request reads the credential when it is sent, so every request sent
+/// after OK uses it, retries, requests of providers created earlier and
+/// requests still waiting for a connection included; a request already sent
+/// keeps the old one and is not interrupted. Provider, scheme,
+/// base URL and model stay. Like abort it may overlap a Run, from any thread
+/// or from inside that Run's callbacks; concurrent calls are linearized.
+/// The credential is borrowed for the call: 1..MAX_CREDENTIAL_BYTES_V1 bytes
+/// of printable ASCII (0x21-0x7E). Empty or other bytes are
+/// INVALID_ARGUMENT, longer is RESOURCE_LIMIT, a poisoned Session is
+/// INVALID_STATE; every refusal, OUT_OF_MEMORY included, keeps the previous
+/// credential. Never BUSY.
+pub const SessionUpdateCredentialFnV1 = *const fn (
+    session: ?*SessionHandle,
+    credential: BytesViewV1,
+    out_diagnostic: ?*OwnedBytesV1,
+) callconv(.c) u32;
 /// Replaces the prompt profile while the Session is idle (#184). Null clears
 /// it. The next Run renders its system prompt from the new profile: one
 /// prompt-cache boundary, announced by that Run's `prompt_manifest` event.
@@ -1360,6 +1381,7 @@ pub const SessionApiV1 = extern struct {
     run_input: ?SessionRunInputFnV1,
     abort: ?SessionAbortFnV1,
     submit_input: ?SessionSubmitInputFnV1,
+    update_credential: ?SessionUpdateCredentialFnV1,
 };
 
 pub const SessionControlApiV1 = extern struct {
@@ -1472,7 +1494,7 @@ test "ABI v1 public layouts are fixed on supported 64-bit targets" {
     try std.testing.expectEqual(@as(usize, 96), @sizeOf(CheckpointExportResultV1));
     try std.testing.expectEqual(@as(usize, 64), @sizeOf(SessionRestoreConfigV1));
     try std.testing.expectEqual(@as(usize, 24), @sizeOf(RuntimeApiV1));
-    try std.testing.expectEqual(@as(usize, 48), @sizeOf(SessionApiV1));
+    try std.testing.expectEqual(@as(usize, 56), @sizeOf(SessionApiV1));
     try std.testing.expectEqual(@as(usize, 80), @sizeOf(SessionControlApiV1));
     try std.testing.expectEqual(@as(usize, 32), @sizeOf(SkillApiV1));
     try std.testing.expectEqual(@as(usize, 40), @sizeOf(McpApiV1));
@@ -1560,6 +1582,7 @@ test "ABI v1 public layouts are fixed on supported 64-bit targets" {
     try std.testing.expectEqual(@as(usize, 32), @offsetOf(SubmittedInputV1, "reserved"));
     try std.testing.expectEqual(@as(usize, 4), @offsetOf(InputReceiptV1, "sequence"));
     try std.testing.expectEqual(@as(usize, 40), @offsetOf(SessionApiV1, "submit_input"));
+    try std.testing.expectEqual(@as(usize, 48), @offsetOf(SessionApiV1, "update_credential"));
     try std.testing.expectEqual(@as(usize, 32), @offsetOf(CheckpointExportResultV1, "digest"));
     try std.testing.expectEqual(@as(usize, 40), @offsetOf(SkillCatalogQueryV1, "workspace_epoch"));
     try std.testing.expectEqual(@as(usize, 56), @offsetOf(SkillCatalogQueryV1, "additional_sources"));
@@ -1622,9 +1645,9 @@ test "typed provider kind validates every public code" {
     );
 }
 
-test "Revision 24 keeps MCP wire codes stable" {
+test "Revision 25 keeps MCP wire codes stable" {
     const std = @import("std");
-    try std.testing.expectEqual(@as(u32, 24), ABI_REVISION);
+    try std.testing.expectEqual(@as(u32, 25), ABI_REVISION);
     try std.testing.expectEqual(@as(u32, 1), MCP_NEGOTIATION_AUTO);
     try std.testing.expectEqual(@as(u32, 2), MCP_NEGOTIATION_MODERN_ONLY);
     try std.testing.expectEqual(@as(u32, 3), MCP_NEGOTIATION_LEGACY_ONLY);

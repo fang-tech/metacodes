@@ -45,16 +45,36 @@ pub const VERSION = @import("version.zig").semver;
 /// ReleaseSmall binary the unused stack was 256 KiB of RSS in every thread,
 /// the main one included (the idle red line of
 /// doc/PERF_MEMORY_PRINCIPLES.md §2). Builds that install the handler keep it.
+///
+/// `allow_stack_tracing`: std defaults it to "built with debug info", and on it
+/// links in about 100 KB of std.debug unwinding code. The ReleaseSmall executable never
+/// traces. A stripped build already has it off, and is byte-identical with or
+/// without this line. With `-Drelease-symbols` the executable links with DWARF
+/// for the split symbol file, and this keeps its code within a few bytes of
+/// the stripped build's (doc/RELEASE_RUNNER.md, "Debug symbols").
 pub const std_options: std.Options = .{
     .unexpected_error_tracing = false,
     .signal_stack_size = if (std.debug.default_enable_segfault_handler) (std.Options{}).signal_stack_size else null,
+    .allow_stack_tracing = !builtin.strip_debug_info and builtin.mode != .ReleaseSmall,
 };
+
+/// Panics go through the default handler (message, stack trace, abort), after
+/// the TUI writes the reply text its merge window still holds (#328).
+pub const panic = std.debug.FullPanic(panicAfterPendingOutput);
+
+fn panicAfterPendingOutput(msg: []const u8, first_trace_addr: ?usize) noreturn {
+    @branchHint(.cold);
+    _ = tui_render_region.flushPendingOnPanic();
+    std.debug.defaultPanic(msg, first_trace_addr);
+}
 
 // Public re-exports for tests and future consumers.
 pub const api_stream = @import("api/stream.zig");
 pub const api_provider = @import("api/provider.zig");
 pub const api_provider_factory = @import("api/provider_factory.zig");
 pub const api_auth_header = @import("api/auth_header.zig");
+pub const api_credential_cell = @import("api/credential_cell.zig");
+pub const api_connection_gate = @import("api/connection_gate.zig");
 pub const fs_util = @import("util/fs.zig");
 // issue #16 provider offer kernel — re-exported for L2 component tests and for
 // embedders that drive model selection through the control plane.
@@ -3888,6 +3908,7 @@ test "Metask login dispatch uses JSON device flow except token import" {
 test {
     _ = &@import("json.zig");
     _ = &@import("client.zig");
+    _ = &@import("api/credential_cell.zig");
     _ = &@import("tools.zig");
     _ = &@import("symbols/symbol.zig");
     _ = &@import("tools/symbol_provider.zig");

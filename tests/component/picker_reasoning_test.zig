@@ -134,12 +134,12 @@ fn sendOneTurn(app: *App) !void {
 
 /// Open the picker as `/model` does and walk to the relay's options step.
 fn openRelayOptions(app: *App, ui: *cc.tui_ui_state.UiState) !void {
-    picker_host.open(app, ui);
+    picker_host.open(app, ui, .unguarded);
     // The whole id: the filter is a subsequence match, and "house" alone
     // also matches Metask's `anthropic/claude-sonnet-4-6`.
-    for ("house-relay") |byte| _ = picker_host.onKey(app, ui, .{ .char = byte });
-    _ = picker_host.onKey(app, ui, .enter); // provider
-    _ = picker_host.onKey(app, ui, .enter); // the one model; it declares a control
+    for ("house-relay") |byte| _ = picker_host.onKey(app, ui, .{ .char = byte }, .unguarded);
+    _ = picker_host.onKey(app, ui, .enter, .unguarded); // provider
+    _ = picker_host.onKey(app, ui, .enter, .unguarded); // the one model; it declares a control
     try std.testing.expectEqual(cc.repl_model_picker.Stage.options, app.model_picker.stage);
 }
 
@@ -161,11 +161,11 @@ test "L2 picker: a reasoning level chosen on the options step is the one the req
     var ui: cc.tui_ui_state.UiState = .{};
     try openRelayOptions(app, &ui);
     // → walks the vocabulary: low, then high.
-    _ = picker_host.onKey(app, &ui, .right);
-    _ = picker_host.onKey(app, &ui, .right);
+    _ = picker_host.onKey(app, &ui, .right, .unguarded);
+    _ = picker_host.onKey(app, &ui, .right, .unguarded);
     try std.testing.expect(app.model_picker.controls.get("reasoning_effort").?.text.eqlText("high"));
     // Enter applies the route with the value shown.
-    try std.testing.expectEqual(picker_host.Result.committed, picker_host.onKey(app, &ui, .enter));
+    try std.testing.expectEqual(picker_host.Result.committed, picker_host.onKey(app, &ui, .enter, .unguarded));
     try std.testing.expectEqualStrings("relay-reasoner", app.activeModel());
     try std.testing.expectEqual(@as(?cc.types_mod.ReasoningEffort, .high), app.config.reasoning_effort);
 
@@ -195,7 +195,7 @@ test "L2 picker: the level the session runs with starts selected and survives th
     try openRelayOptions(app, &ui);
     // The relay offers `max`, so it is already the selected value.
     try std.testing.expect(app.model_picker.controls.get("reasoning_effort").?.text.eqlText("max"));
-    try std.testing.expectEqual(picker_host.Result.committed, picker_host.onKey(app, &ui, .enter));
+    try std.testing.expectEqual(picker_host.Result.committed, picker_host.onKey(app, &ui, .enter, .unguarded));
     try std.testing.expectEqual(@as(?cc.types_mod.ReasoningEffort, .max), app.config.reasoning_effort);
 
     try sendOneTurn(app);

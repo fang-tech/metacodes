@@ -155,6 +155,9 @@ jobs:
       SUITES: ${{ needs.scope.outputs.suites }}
       # The suite steps' build runner jobs; see "Offline test suite" below.
       ZIG_BUILD_JOBS: "8"
+      # The release layout splits the Linux executable's debug symbols into
+      # their own archive, as release.yml does (doc/RELEASE_RUNNER.md).
+      RELEASE_SYMBOLS: "-Drelease-symbols=true"
     steps: &gates-steps
       - name: Release fast path
         env:
@@ -401,6 +404,39 @@ jobs:
       - name: Default install prefix
         if: matrix.release && env.FAST_PATH != 'true' && env.SUITES != 'false'
         run: zig build --prefix "$RUNNER_TEMP/install-prefix" && python3 scripts/verify_install_prefix.py "$RUNNER_TEMP/install-prefix" --doctor
+      # The footprint red lines of doc/PERF_MEMORY_PRINCIPLES.md §2 (the
+      # ReleaseSmall binary size, warm `--help` start, idle peak RSS), measured
+      # by scripts/perf_baseline.sh into the job summary (#303). Report-only
+      # until a few weeks of numbers exist: shared-runner timing noise must not
+      # block a merge, so a line over its limit marks this step failed and
+      # leaves the leg green. Here because the step above just built the same
+      # ReleaseSmall executable (its optimize mode ignores -Doptimize), so
+      # `--build` is a cache hit, not another LLVM build. The script needs
+      # /usr/bin/time (-l on macOS, -v on Linux), perl and bc; one missing on
+      # Linux is installed, and one missing anywhere fails the step instead of
+      # measuring zero.
+      - name: Footprint red lines (report-only)
+        if: matrix.release && env.FAST_PATH != 'true' && env.SUITES != 'false'
+        continue-on-error: true
+        shell: bash
+        run: |
+          missing=""
+          [ -x /usr/bin/time ] || missing="$missing time"
+          command -v perl >/dev/null 2>&1 || missing="$missing perl"
+          command -v bc >/dev/null 2>&1 || missing="$missing bc"
+          if [ -n "$missing" ] && [ "$RUNNER_OS" = Linux ]; then sudo apt-get install -y $missing; fi
+          status=0
+          scripts/perf_baseline.sh --build > "$RUNNER_TEMP/footprint.txt" 2>&1 || status=$?
+          cat "$RUNNER_TEMP/footprint.txt"
+          {
+            echo "### Footprint red lines, $RUNNER_OS $RUNNER_ARCH (report-only, #303)"
+            echo
+            echo '```text'
+            cat "$RUNNER_TEMP/footprint.txt"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$status" -ne 0 ]; then echo "::warning title=Footprint red lines::scripts/perf_baseline.sh exited $status on $RUNNER_OS $RUNNER_ARCH (report-only); see the job summary"; fi
+          exit "$status"
       # The sidecar the kernel build script wrote, read by the installed
       # product's own loader: the pairing no unit test can cover (the project
       # kernel's v6 sidecar was validated with the formal v4 loader for as long
@@ -422,7 +458,7 @@ jobs:
           echo "KERNEL_PINS=$pins" >> "$GITHUB_ENV"
       - name: Release layout prefix
         if: matrix.release && env.FAST_PATH != 'true' && env.SUITES != 'false'
-        run: zig build release:verify -Drelease-layout=true --prefix "$RUNNER_TEMP/release-prefix" $KERNEL_PINS && python3 scripts/verify_install_prefix.py "$RUNNER_TEMP/release-prefix" --release --doctor
+        run: zig build release:verify -Drelease-layout=true --prefix "$RUNNER_TEMP/release-prefix" $KERNEL_PINS $RELEASE_SYMBOLS && python3 scripts/verify_install_prefix.py "$RUNNER_TEMP/release-prefix" --release --doctor
       # The installer, through the same script users run, on the verified
       # unit: every file re-verified at the new prefix, an install record and
       # state root of its own, and the installed executable's doctor --strict.
@@ -435,18 +471,21 @@ jobs:
       - name: Release archive is reproducible
         if: matrix.release && env.FAST_PATH != 'true' && env.SUITES != 'false'
         run: |
-          zig build release:archive -Drelease-layout=true --prefix "$RUNNER_TEMP/release-prefix" $KERNEL_PINS -Drelease-archive-dir="$RUNNER_TEMP/dist-1"
-          zig build release:archive -Drelease-layout=true --prefix "$RUNNER_TEMP/release-prefix" $KERNEL_PINS -Drelease-archive-dir="$RUNNER_TEMP/dist-2"
-          if ! cmp "$RUNNER_TEMP"/dist-1/metacodes-*.tar.gz "$RUNNER_TEMP"/dist-2/metacodes-*.tar.gz; then
+          zig build release:archive -Drelease-layout=true --prefix "$RUNNER_TEMP/release-prefix" $KERNEL_PINS $RELEASE_SYMBOLS -Drelease-archive-dir="$RUNNER_TEMP/dist-1"
+          zig build release:archive -Drelease-layout=true --prefix "$RUNNER_TEMP/release-prefix" $KERNEL_PINS $RELEASE_SYMBOLS -Drelease-archive-dir="$RUNNER_TEMP/dist-2"
+          ls "$RUNNER_TEMP"/dist-1
+          same=true
+          for archive in "$RUNNER_TEMP"/dist-1/metacodes-*.tar.gz; do cmp "$archive" "$RUNNER_TEMP/dist-2/$(basename "$archive")" || same=false; done
+          if [ "$same" != true ]; then
             # Evidence for the next mismatch: which members differ.
             mkdir -p "$RUNNER_TEMP/unpacked-1" "$RUNNER_TEMP/unpacked-2"
-            tar -xzf "$RUNNER_TEMP"/dist-1/metacodes-*.tar.gz -C "$RUNNER_TEMP/unpacked-1"
-            tar -xzf "$RUNNER_TEMP"/dist-2/metacodes-*.tar.gz -C "$RUNNER_TEMP/unpacked-2"
+            for archive in "$RUNNER_TEMP"/dist-1/metacodes-*.tar.gz; do tar -xzf "$archive" -C "$RUNNER_TEMP/unpacked-1"; done
+            for archive in "$RUNNER_TEMP"/dist-2/metacodes-*.tar.gz; do tar -xzf "$archive" -C "$RUNNER_TEMP/unpacked-2"; done
             diff -rq "$RUNNER_TEMP/unpacked-1" "$RUNNER_TEMP/unpacked-2" || true
             cat "$RUNNER_TEMP"/unpacked-*/*/libexec/metacodes/*.build-receipt.json || true
             exit 1
           fi
-          zig build release:sums -Drelease-layout=true --prefix "$RUNNER_TEMP/release-prefix" $KERNEL_PINS -Drelease-archive-dir="$RUNNER_TEMP/dist-1"
+          zig build release:sums -Drelease-layout=true --prefix "$RUNNER_TEMP/release-prefix" $KERNEL_PINS $RELEASE_SYMBOLS -Drelease-archive-dir="$RUNNER_TEMP/dist-1"
           cat "$RUNNER_TEMP"/dist-1/metacodes-*-SHA256SUMS
       - name: Third-party notices check
         if: matrix.checks && runner.os == 'Linux' && env.FAST_PATH != 'true' && env.SUITES != 'false'
@@ -469,6 +508,9 @@ jobs:
       - name: Install script unit tests
         if: matrix.checks && env.FAST_PATH != 'true' && env.SUITES != 'false'
         run: python3 -m unittest scripts.tests.test_install_scripts -v
+      - name: Release binary baseline check unit tests
+        if: matrix.checks && env.FAST_PATH != 'true' && env.SUITES != 'false'
+        run: python3 -m unittest scripts.tests.test_check_binary_baseline -v
       - name: Kernel self-containment and pin unit tests
         if: matrix.checks && env.FAST_PATH != 'true' && env.SUITES != 'false'
         run: python3 -m unittest scripts.tests.test_check_kernel_self_contained scripts.tests.test_kernel_pins -v

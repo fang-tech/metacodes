@@ -35,6 +35,7 @@ test {
     _ = @import("component/agent_session_permission_scope_test.zig");
     _ = @import("component/agent_session_transcript_resume_test.zig");
     _ = @import("component/agent_session_runtime_config_test.zig");
+    _ = @import("component/agent_session_credential_test.zig");
     _ = @import("component/wire_contract_test.zig");
     _ = @import("component/frontend_capabilities_test.zig");
     _ = @import("component/session_host_test.zig");
@@ -110,6 +111,8 @@ test {
     _ = @import("component/render_region_test.zig");
     _ = @import("component/vterm_test.zig");
     _ = @import("component/render_region_contract_test.zig");
+    _ = @import("component/redraw_window_contract_test.zig");
+    _ = @import("component/picker_frame_race_test.zig");
     _ = @import("component/md_stream_convergence_test.zig");
     _ = @import("component/stream_retry_test.zig");
     _ = @import("component/ui_state_test.zig");
