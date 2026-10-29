@@ -86,9 +86,28 @@ pub const KeyParser = struct {
     // `ESC ]` 之后的数字(OSC 编号,至多 3 位):不是应答时原样还成键。
     osc_digits: [3]u8 = undefined,
     osc_digits_len: u8 = 0,
+    // win32-input-mode(Windows 控制台,`CSI ? 9001 h`):每个按键事件是一条记录
+    // `CSI Vk ; Sc ; Uc ; Kd ; Cs ; Rc _`。feed 先在原始字节里认记录(frame:ESC、`[`、数字和
+    // `;`,看到 `_` 才知道是);按下的还原成不开这个模式时控制台送来的 VT 字节(win32Press),
+    // 抬起的不要,不是记录的字节原样。它们按序排进 pending,由 drain 逐个交给状态机(step)。
+    // 记录自己开头的 ESC 因此碰不到状态机里还没兑现的 ESC:经典 conhost 把粘贴的
+    // `ESC[200~` 也拆成一个字符一条记录。
+    frame: [frame_capacity]u8 = undefined,
+    frame_len: u8 = 0,
+    pending: [pending_capacity]u8 = undefined,
+    pending_pos: u8 = 0,
+    pending_len: u8 = 0,
+    // UTF-16 高代理项:等下一条按下记录的低代理项拼成一个字符(emoji 分两条记录到)。
+    high_surrogate: u16 = 0,
 
     // ']' + 3 位数字 + 截断它的那个键。
     const queue_capacity = 5;
+    // ESC [ 加六段参数(每段至多 5 位数字)和五个 `;`。
+    const frame_capacity = 40;
+    // 一条记录还原出的字节(win32Press 至多 12 字节,按 Rc 重复,放得下为止),或攒着的
+    // frame 加截断它的那个字节。
+    const pending_capacity = 64;
+    const win32_field_count = 6;
 
     // csi_skip:一个认不出的 CSI(私有前缀 `?`/`<`/`>`/`=`、三段以上参数、`:` 子参数),
     // 吃到它的终结字节(0x40-0x7E)为止,整条报一个 .unknown。终端应答(DA1 `ESC[?62c`、
@@ -117,17 +136,35 @@ pub const KeyParser = struct {
     /// 等一个读周期都没来的后半截不会再来了(被下一次进 raw 的 TCSAFLUSH 丢了,或根本是
     /// 用户按的 Esc)。
     pub fn pendingEsc(self: *const KeyParser) bool {
-        return self.state != .normal;
+        return self.frame_len > 0 or self.state != .normal;
     }
 
     /// 取出 feed / flushEsc 暂存的下一个键(若有)。调用方每次 feed 后循环 drain 至 null。
-    /// 用于 ESC + 普通字符这类一次 feed 产出多键的场景(否则后面的字符被吞)。
+    /// 用于 ESC + 普通字符这类一次 feed 产出多键的场景(否则后面的字符被吞),以及一条
+    /// win32 记录还原出的几个字节(pending,逐个交给状态机,直到出一个键或交完)。
     pub fn drain(self: *KeyParser) ?Key {
-        if (self.queued_len == 0) return null;
-        const k = self.queued[self.queued_head];
-        self.queued_head = (self.queued_head + 1) % queue_capacity;
-        self.queued_len -= 1;
-        return k;
+        if (self.queued_len > 0) {
+            const k = self.queued[self.queued_head];
+            self.queued_head = (self.queued_head + 1) % queue_capacity;
+            self.queued_len -= 1;
+            return k;
+        }
+        while (self.pending_pos < self.pending_len) {
+            const b = self.pending[self.pending_pos];
+            self.pending_pos += 1;
+            if (self.step(b)) |k| return k;
+        }
+        return null;
+    }
+
+    /// 排在还没交给状态机的字节之后,放得下为止。
+    fn pend(self: *KeyParser, bytes: []const u8) void {
+        const left = self.pending_len - self.pending_pos;
+        std.mem.copyForwards(u8, self.pending[0..left], self.pending[self.pending_pos..self.pending_len]);
+        const n = @min(bytes.len, pending_capacity - left);
+        @memcpy(self.pending[left..][0..n], bytes[0..n]);
+        self.pending_pos = 0;
+        self.pending_len = @intCast(left + n);
     }
 
     fn push(self: *KeyParser, k: Key) void {
@@ -145,6 +182,14 @@ pub const KeyParser = struct {
     /// - CSI 参数、OSC 正文读到一半 → 整条作废,返回 null(不产生键)。
     /// 不在序列中间返 null。
     pub fn flushEsc(self: *KeyParser) ?Key {
+        // 还有没交出的键或字节:先照常交出(调用方每次 feed 后都排空,平时到不了这里)。
+        if (self.queued_len > 0 or self.pending_pos < self.pending_len) return self.drain();
+        // 等着看是不是 win32 记录的 ESC(或 ESC [ 数字…)不是记录:交给状态机。
+        if (self.frame_len > 0) {
+            self.pend(self.frame[0..self.frame_len]);
+            self.frame_len = 0;
+            if (self.drain()) |k| return k;
+        }
         const key: ?Key = switch (self.state) {
             .normal => return null,
             .esc_seen, .osc_st => .esc,
@@ -165,6 +210,100 @@ pub const KeyParser = struct {
     }
 
     pub fn feed(self: *KeyParser, b: u8) ?Key {
+        // 没开 win32-input-mode(POSIX、非控制台):字节直接进状态机,与以前逐字节相同。
+        if (!g_win32_input_on.load(.monotonic) and self.frame_len == 0 and self.pending_pos == self.pending_len) return self.step(b);
+        self.frameByte(b);
+        return self.drain();
+    }
+
+    /// 原始输入的一个字节。是不是 win32 按键记录,要到它的终结字节才看得出:ESC、`[`、
+    /// 数字和 `;` 先攒着,`_` 结束一条记录,别的字节说明不是,攒着的原样交出。
+    fn frameByte(self: *KeyParser, b: u8) void {
+        if (self.frame_len == 0) {
+            if (b == 0x1b) {
+                self.frame[0] = b;
+                self.frame_len = 1;
+            } else self.pend(&.{b});
+            return;
+        }
+        if (self.frame_len == 1) {
+            if (b == '[') {
+                self.frame[1] = b;
+                self.frame_len = 2;
+                return;
+            }
+        } else if (((b >= '0' and b <= '9') or b == ';') and self.frame_len < frame_capacity) {
+            self.frame[self.frame_len] = b;
+            self.frame_len += 1;
+            return;
+        } else if (b == '_' and self.win32Record(self.frame[2..self.frame_len])) {
+            self.frame_len = 0;
+            return;
+        }
+        // 不是记录:攒着的原样交出,这个字节从头再看(ESC 可能开始下一条)。
+        self.pend(self.frame[0..self.frame_len]);
+        self.frame_len = 0;
+        self.frameByte(b);
+    }
+
+    /// 一条记录的参数段(`Vk;Sc;Uc;Kd;Cs;Rc`,空段或省掉的段:Rc 为 1,其余为 0)。多于六段
+    /// 不是记录(false)。抬起的不是键;按下的还原成 win32Press 的字节,重复 Rc 次,排进
+    /// pending。UTF-16 代理对分两条记录到,高代理项等它的低代理项。
+    fn win32Record(self: *KeyParser, text: []const u8) bool {
+        var field = [win32_field_count]u32{ 0, 0, 0, 0, 0, 1 };
+        var i: usize = 0;
+        var empty = true;
+        for (text) |c| {
+            if (c == ';') {
+                i += 1;
+                if (i == win32_field_count) return false;
+                empty = true;
+                continue;
+            }
+            if (empty) field[i] = 0;
+            empty = false;
+            field[i] = field[i] *| 10 +| (c - '0');
+        }
+        g_win32_input_seen.store(true, .release);
+        if (field[3] == 0) return true; // 抬起
+        const vk = field[0];
+        const unit = field[2];
+        const cs = field[4];
+        const repeat = @max(field[5], 1);
+        var bytes: [pending_capacity]u8 = undefined;
+        var n: usize = 0;
+        if (unit >= 0xD800 and unit <= 0xDBFF) {
+            n += self.takeHighSurrogate(bytes[n..]);
+            self.high_surrogate = @intCast(unit);
+        } else {
+            var cp: u21 = @intCast(@min(unit, 0x10FFFF));
+            if (unit >= 0xDC00 and unit <= 0xDFFF and self.high_surrogate != 0) {
+                cp = 0x10000 + ((@as(u21, self.high_surrogate) - 0xD800) << 10) + (cp - 0xDC00);
+                self.high_surrogate = 0;
+            } else n += self.takeHighSurrogate(bytes[n..]);
+            var one: [win32_press_max]u8 = undefined;
+            const press = win32Press(vk, cp, cs, &one);
+            var r: u32 = 0;
+            while (r < repeat and n + press.len <= bytes.len) : (r += 1) {
+                @memcpy(bytes[n..][0..press.len], press);
+                n += press.len;
+            }
+        }
+        self.pend(bytes[0..n]);
+        return true;
+    }
+
+    /// 等不来低代理项的高代理项:按 WTF-8 原样交出(与 platform/terminal.zig 读控制台时
+    /// 对孤立代理项的处理一致)。
+    fn takeHighSurrogate(self: *KeyParser, out: []u8) usize {
+        if (self.high_surrogate == 0) return 0;
+        const n = std.unicode.wtf8Encode(self.high_surrogate, out) catch 0;
+        self.high_surrogate = 0;
+        return n;
+    }
+
+    /// 状态机:一次一个字节,来自 pending(原始输入或 win32 记录还原的字节)。
+    fn step(self: *KeyParser, b: u8) ?Key {
         switch (self.state) {
             .normal => {
                 if (b == 0x1b) {
@@ -381,7 +520,7 @@ pub const KeyParser = struct {
                 // 不是 OSC 应答:Alt+](和其后敲的数字)是键,b 是下一个键。
                 self.queueOscPrefix();
                 self.state = .normal;
-                if (self.feed(b)) |k| self.push(k);
+                if (self.step(b)) |k| self.push(k);
                 return .esc;
             },
             .osc_body => switch (b) {
@@ -407,7 +546,7 @@ pub const KeyParser = struct {
                 }
                 // ESC 开了别的序列:应答就此作废,ESC + b 照常解析。
                 self.state = .esc_seen;
-                return self.feed(b);
+                return self.step(b);
             },
         }
     }
@@ -439,6 +578,101 @@ fn byteToKey(b: u8) Key {
         // 终端在显示时会把完整 UTF-8 序列组合成一个字符
         else => if (b >= 0x20) Key{ .char = b } else .unknown,
     };
+}
+
+/// 解码过 win32-input-mode 的按键记录:Windows 控制台确实把修饰键状态送来了,
+/// Shift+Enter 能换行(newlineHint)。
+var g_win32_input_seen = std.atomic.Value(bool).init(false);
+
+/// 在 Windows 控制台上开过 win32-input-mode:KeyParser 从此在原始字节里认记录(frame)。
+/// 开过就不关:关掉之前已经排进队列的记录还会读到。
+var g_win32_input_on = std.atomic.Value(bool).init(false);
+
+const win32_press_max = 12;
+
+/// win32-input-mode 一条按下记录(虚拟键 vk、字符 cp、控制键状态 cs)的一次按键,
+/// 还原成不开这个模式时 Windows 控制台送来的 VT 字节。按 Windows Terminal 1.24 与经典
+/// conhost(Windows 11 26300)逐键实测对照:Backspace 是 0x7f、Ctrl+Backspace 0x08,
+/// Shift+Tab `ESC[Z`,Alt 加 ESC 前缀(AltGr 即 Ctrl+Alt 出可打印字符时不加),方向键与
+/// Home/End `ESC[X`、带修饰 `ESC[1;mX`,F1-F4 `ESC O X`,其余功能键与编辑键 `ESC[n~`、
+/// 带修饰 `ESC[n;m~`(m = 1 + Shift + 2·Alt + 4·Ctrl),Ctrl+Alt+字母(记录里没有字符)
+/// `ESC` + 控制字节。那些字节分不出的 Shift+Enter 是 Kitty 的 `CSI 13;2u`,与开了 Kitty
+/// 协议的终端同一个键。Ctrl+Enter 不另编,照旧是 `\n`:ConPTY 把粘贴里的换行也编成按着
+/// Ctrl 的 Enter(Uc 10),分不开。修饰键单按、Pause、Apps 等不产字符的键:空。
+fn win32Press(vk: u32, cp: u21, cs: u32, out: *[win32_press_max]u8) []const u8 {
+    const shift = cs & 0x10 != 0; // SHIFT_PRESSED
+    const alt = cs & 0x03 != 0; // RIGHT_ALT_PRESSED | LEFT_ALT_PRESSED
+    const ctrl = cs & 0x0c != 0; // RIGHT_CTRL_PRESSED | LEFT_CTRL_PRESSED
+    const mod: u8 = 1 + @as(u8, @intFromBool(shift)) + 2 * @as(u8, @intFromBool(alt)) + 4 * @as(u8, @intFromBool(ctrl));
+    if (vk == 0x0d and mod == 2) return "\x1b[13;2u"; // VK_RETURN
+    if (cp != 0) {
+        if (vk == 0x09 and shift) return "\x1b[Z"; // VK_TAB
+        const c: u21 = if (vk == 0x08) switch (cp) { // VK_BACK
+            0x08 => 0x7f,
+            0x7f => 0x08,
+            else => cp,
+        } else cp;
+        var n: usize = 0;
+        if (alt and !(ctrl and c >= 0x20)) {
+            out[0] = 0x1b;
+            n = 1;
+        }
+        n += std.unicode.wtf8Encode(c, out[n..]) catch return out[0..0];
+        return out[0..n];
+    }
+    if (ctrl and vk >= 'A' and vk <= 'Z') {
+        var n: usize = 0;
+        if (alt) {
+            out[0] = 0x1b;
+            n = 1;
+        }
+        out[n] = @intCast(vk - 0x40);
+        return out[0 .. n + 1];
+    }
+    const csi_final: ?u8 = switch (vk) {
+        0x25 => 'D', // VK_LEFT
+        0x26 => 'A', // VK_UP
+        0x27 => 'C', // VK_RIGHT
+        0x28 => 'B', // VK_DOWN
+        0x24 => 'H', // VK_HOME
+        0x23 => 'F', // VK_END
+        else => null,
+    };
+    if (csi_final) |f| return if (mod == 1)
+        std.fmt.bufPrint(out, "\x1b[{c}", .{f}) catch unreachable
+    else
+        std.fmt.bufPrint(out, "\x1b[1;{d}{c}", .{ mod, f }) catch unreachable;
+    const ss3_final: ?u8 = switch (vk) {
+        0x70 => 'P', // VK_F1
+        0x71 => 'Q',
+        0x72 => 'R',
+        0x73 => 'S', // VK_F4
+        else => null,
+    };
+    if (ss3_final) |f| return if (mod == 1)
+        std.fmt.bufPrint(out, "\x1bO{c}", .{f}) catch unreachable
+    else
+        std.fmt.bufPrint(out, "\x1b[1;{d}{c}", .{ mod, f }) catch unreachable;
+    const tilde: ?u8 = switch (vk) {
+        0x2d => 2, // VK_INSERT
+        0x2e => 3, // VK_DELETE
+        0x21 => 5, // VK_PRIOR
+        0x22 => 6, // VK_NEXT
+        0x74 => 15, // VK_F5
+        0x75 => 17,
+        0x76 => 18,
+        0x77 => 19,
+        0x78 => 20,
+        0x79 => 21,
+        0x7a => 23,
+        0x7b => 24, // VK_F12
+        else => null,
+    };
+    if (tilde) |t| return if (mod == 1)
+        std.fmt.bufPrint(out, "\x1b[{d}~", .{t}) catch unreachable
+    else
+        std.fmt.bufPrint(out, "\x1b[{d};{d}~", .{ t, mod }) catch unreachable;
+    return out[0..0];
 }
 
 // ============================================================================
@@ -533,7 +767,19 @@ pub fn reconcileModes(fd: c_int) bool {
     return true;
 }
 
+/// win32-input-mode(DECSET 9001):Windows 控制台把每个按键整条送来(虚拟键、字符、
+/// 按下/抬起、修饰键状态),KeyParser 还原;Shift+Enter 由此能和 Enter 区分。Windows
+/// Terminal 1.24(ConPTY)与经典 conhost 实测都认它。
+const win32_input_enable = "\x1b[?9001h";
+const win32_input_disable = "\x1b[?9001l";
+
 fn emitEnableSequences(fd: c_int) void {
+    // 写到控制台输出(Windows 控制台不收写给 stdin 的字节);只在 stdin/stdout 都是控制台时,
+    // 与 TERM 无关(Windows 上通常没有 TERM)。
+    if (platform_term.isConsole()) {
+        _ = pfs.writeAll(1, win32_input_enable);
+        g_win32_input_on.store(true, .release);
+    }
     // Dumb terminals do not understand private modes; keep their output clean.
     const term = std.c.getenv("TERM");
     const dumb = term == null or std.mem.eql(u8, std.mem.span(term.?), "dumb") or std.mem.span(term.?).len == 0;
@@ -665,8 +911,11 @@ pub fn shouldEnableKittyKeyboard() bool {
 /// - 没发(deny-list 的 Apple Terminal 等、探测说不支持或没答,Shift+Enter 发裸 \r=Enter 会提交)
 ///   → "\ + ⏎ for newline"(cc-zig 无 macOS 原生 modifier 检测,故 Apple Terminal 只能靠
 ///   backslash 续行,不能照抄真 cc 对 Apple 的 "shift+⏎" 文案——那会误导)。
+/// - Windows 控制台:开了 win32-input-mode 且按键确实整条送来了(解码过一条记录)→ "shift + ⏎"。
+///   提示只在输入框多于一行时出现,那时用户已经敲过键,所以这条判据不会晚。
 pub fn newlineHint() []const u8 {
-    return if (shouldEnableKittyKeyboard()) "shift + \xe2\x8f\x8e for newline" else "\\ + \xe2\x8f\x8e for newline";
+    const shift_newline = shouldEnableKittyKeyboard() or g_win32_input_seen.load(.acquire);
+    return if (shift_newline) "shift + \xe2\x8f\x8e for newline" else "\\ + \xe2\x8f\x8e for newline";
 }
 
 /// 进程第一次进 raw mode 之前,终端收到的都是启动期间敲的键(探测之后、启动动画期间、
@@ -814,6 +1063,7 @@ pub fn restoreMode(fd: c_int, orig: platform_term.SavedMode) void {
     if (shouldEnableKittyKeyboard()) {
         _ = pfs.writeAll(fd, kbd_disable_seq);
     }
+    if (platform_term.isConsole()) _ = pfs.writeAll(1, win32_input_disable);
     platform_term.restoreMode(fd, orig); // POSIX tcsetattr / Windows SetConsoleMode
 }
 
@@ -1944,6 +2194,198 @@ fn parseAll(stream: []const u8, out: []Key) []Key {
         }
     }
     return out[0..n];
+}
+
+/// Records as Windows Terminal 1.24 and classic conhost send them with
+/// win32-input-mode on (Windows 11 26300), each with the VT bytes the same key
+/// sent with it off. A key's modifier records (Shift, Ctrl, Alt down and up)
+/// come along, as they do on the wire.
+const win32_measured = [_]struct { name: []const u8, records: []const u8, vt: []const u8 }{
+    .{ .name = "a", .records = "\x1b[65;30;97;1;32;1_\x1b[65;30;97;0;32;1_", .vt = "a" },
+    .{ .name = "Shift+A", .records = "\x1b[16;42;0;1;48;1_\x1b[65;30;65;1;48;1_\x1b[65;30;65;0;48;1_\x1b[16;42;0;0;32;1_", .vt = "A" },
+    .{ .name = "Enter", .records = "\x1b[13;28;13;1;32;1_\x1b[13;28;13;0;32;1_", .vt = "\r" },
+    .{ .name = "Ctrl+Enter", .records = "\x1b[17;29;0;1;40;1_\x1b[13;28;10;1;40;1_\x1b[13;28;10;0;40;1_\x1b[17;29;0;0;32;1_", .vt = "\n" },
+    .{ .name = "Backspace", .records = "\x1b[8;14;8;1;32;1_\x1b[8;14;8;0;32;1_", .vt = "\x7f" },
+    .{ .name = "Ctrl+Backspace", .records = "\x1b[17;29;0;1;40;1_\x1b[8;14;127;1;40;1_\x1b[8;14;127;0;40;1_\x1b[17;29;0;0;32;1_", .vt = "\x08" },
+    .{ .name = "Alt+Backspace", .records = "\x1b[18;56;0;1;34;1_\x1b[8;14;8;1;34;1_\x1b[8;14;8;0;34;1_\x1b[18;56;0;0;32;1_", .vt = "\x1b\x7f" },
+    .{ .name = "Tab", .records = "\x1b[9;15;9;1;32;1_\x1b[9;15;9;0;32;1_", .vt = "\t" },
+    .{ .name = "Shift+Tab", .records = "\x1b[16;42;0;1;48;1_\x1b[9;15;9;1;48;1_\x1b[9;15;9;0;48;1_\x1b[16;42;0;0;32;1_", .vt = "\x1b[Z" },
+    .{ .name = "Esc", .records = "\x1b[27;1;27;1;32;1_\x1b[27;1;27;0;32;1_", .vt = "\x1b" },
+    .{ .name = "Space", .records = "\x1b[32;57;32;1;32;1_\x1b[32;57;32;0;32;1_", .vt = " " },
+    .{ .name = "Ctrl+Space", .records = "\x1b[17;29;0;1;40;1_\x1b[17;29;0;0;32;1_", .vt = "" },
+    .{ .name = "Left", .records = "\x1b[37;75;0;1;288;1_\x1b[37;75;0;0;288;1_", .vt = "\x1b[D" },
+    .{ .name = "Up", .records = "\x1b[38;72;0;1;288;1_", .vt = "\x1b[A" },
+    .{ .name = "Right", .records = "\x1b[39;77;0;1;288;1_", .vt = "\x1b[C" },
+    .{ .name = "Down", .records = "\x1b[40;80;0;1;288;1_", .vt = "\x1b[B" },
+    .{ .name = "Shift+Left", .records = "\x1b[16;42;0;1;48;1_\x1b[37;75;0;1;304;1_", .vt = "\x1b[1;2D" },
+    .{ .name = "Ctrl+Left", .records = "\x1b[17;29;0;1;40;1_\x1b[37;75;0;1;296;1_", .vt = "\x1b[1;5D" },
+    .{ .name = "Alt+Left", .records = "\x1b[18;56;0;1;34;1_\x1b[37;75;0;1;290;1_", .vt = "\x1b[1;3D" },
+    .{ .name = "Ctrl+Shift+Right", .records = "\x1b[39;77;0;1;312;1_", .vt = "\x1b[1;6C" },
+    .{ .name = "Home", .records = "\x1b[36;71;0;1;288;1_", .vt = "\x1b[H" },
+    .{ .name = "End", .records = "\x1b[35;79;0;1;288;1_", .vt = "\x1b[F" },
+    .{ .name = "Shift+Home", .records = "\x1b[36;71;0;1;304;1_", .vt = "\x1b[1;2H" },
+    .{ .name = "Insert", .records = "\x1b[45;82;0;1;288;1_", .vt = "\x1b[2~" },
+    .{ .name = "Delete", .records = "\x1b[46;83;0;1;288;1_", .vt = "\x1b[3~" },
+    .{ .name = "Shift+Delete", .records = "\x1b[46;83;0;1;304;1_", .vt = "\x1b[3;2~" },
+    .{ .name = "Ctrl+Delete", .records = "\x1b[46;83;0;1;296;1_", .vt = "\x1b[3;5~" },
+    .{ .name = "PgUp", .records = "\x1b[33;73;0;1;288;1_", .vt = "\x1b[5~" },
+    .{ .name = "PgDn", .records = "\x1b[34;81;0;1;288;1_", .vt = "\x1b[6~" },
+    .{ .name = "F1", .records = "\x1b[112;59;0;1;32;1_", .vt = "\x1bOP" },
+    .{ .name = "Ctrl+F1", .records = "\x1b[112;59;0;1;40;1_", .vt = "\x1b[1;5P" },
+    .{ .name = "F5", .records = "\x1b[116;63;0;1;32;1_", .vt = "\x1b[15~" },
+    .{ .name = "Shift+F5", .records = "\x1b[116;63;0;1;48;1_", .vt = "\x1b[15;2~" },
+    .{ .name = "F12", .records = "\x1b[123;88;0;1;32;1_", .vt = "\x1b[24~" },
+    .{ .name = "Ctrl+A", .records = "\x1b[17;29;0;1;40;1_\x1b[65;30;1;1;40;1_", .vt = "\x01" },
+    .{ .name = "Ctrl+D", .records = "\x1b[68;32;4;1;40;1_", .vt = "\x04" },
+    .{ .name = "Ctrl+Z", .records = "\x1b[90;44;26;1;40;1_", .vt = "\x1a" },
+    .{ .name = "Ctrl+Alt+A", .records = "\x1b[65;30;0;1;42;1_", .vt = "\x1b\x01" },
+    .{ .name = "Alt+B", .records = "\x1b[18;56;0;1;34;1_\x1b[66;48;98;1;34;1_", .vt = "\x1bb" },
+    .{ .name = "Alt+F", .records = "\x1b[70;33;102;1;34;1_", .vt = "\x1bf" },
+    .{ .name = "IME commit", .records = "\x1b[0;0;20320;1;32;1_", .vt = "你" },
+    .{ .name = "VK_PACKET text", .records = "\x1b[255;0;20013;1;32;1_\x1b[255;0;25991;1;32;1_", .vt = "中文" },
+    .{ .name = "emoji", .records = "\x1b[255;0;55357;1;32;1_\x1b[255;0;56832;1;32;1_", .vt = "😀" },
+    .{ .name = "Pause", .records = "\x1b[19;69;0;1;32;1_\x1b[19;69;0;0;32;1_", .vt = "" },
+};
+
+test "KeyParser: a win32-input-mode record is the key its VT bytes are, for every key measured" {
+    g_win32_input_on.store(true, .release);
+    defer g_win32_input_on.store(false, .release);
+    defer g_win32_input_seen.store(false, .release);
+    for (win32_measured) |m| {
+        errdefer std.debug.print("win32 record and VT bytes part ways: {s}\n", .{m.name});
+        var from_records: [16]Key = undefined;
+        var from_vt: [16]Key = undefined;
+        const a = parseAll(m.records, &from_records);
+        const b = parseAll(m.vt, &from_vt);
+        try testing.expectEqual(b.len, a.len);
+        for (a, b) |x, y| try testing.expect(std.meta.eql(x, y));
+    }
+}
+
+test "KeyParser: a Shift+Enter record is the key Kitty's CSI-u gives, not Enter" {
+    g_win32_input_on.store(true, .release);
+    defer g_win32_input_on.store(false, .release);
+    defer g_win32_input_seen.store(false, .release);
+    var buf: [8]Key = undefined;
+    // Shift down, Enter down with SHIFT_PRESSED, Enter up, Shift up (measured).
+    const shift_enter = parseAll("\x1b[16;42;0;1;48;1_\x1b[13;28;13;1;48;1_\x1b[13;28;13;0;48;1_\x1b[16;42;0;0;32;1_", &buf);
+    try testing.expectEqual(@as(usize, 1), shift_enter.len);
+    try testing.expect(shift_enter[0] == .shift_enter);
+    // Right Shift and the numpad Enter carry the same state.
+    try testing.expect(parseAll("\x1b[13;28;13;1;304;1_", &buf)[0] == .shift_enter);
+}
+
+test "KeyParser: a line break ConPTY pastes as a Ctrl+Enter record stays a line break of the paste" {
+    g_win32_input_on.store(true, .release);
+    defer g_win32_input_on.store(false, .release);
+    defer g_win32_input_seen.store(false, .release);
+    // "a\nb" written to the pseudo console: the LF comes back an Enter with
+    // LEFT_CTRL_PRESSED and Uc 10, the record a real Ctrl+Enter gives.
+    var buf: [8]Key = undefined;
+    const keys = parseAll("\x1b[200~a\x1b[13;28;10;1;8;1_\x1b[13;28;10;0;8;1_b\x1b[201~", &buf);
+    try testing.expectEqual(@as(usize, 5), keys.len);
+    try testing.expect(keys[0] == .paste_begin);
+    try testing.expectEqual(@as(u8, 'a'), keys[1].char);
+    try testing.expect(keys[2] == .enter);
+    try testing.expectEqual(@as(u8, 'b'), keys[3].char);
+    try testing.expect(keys[4] == .paste_end);
+}
+
+test "KeyParser: win32 key-up records, repeats, surrogate halves and omitted fields" {
+    g_win32_input_on.store(true, .release);
+    defer g_win32_input_on.store(false, .release);
+    defer g_win32_input_seen.store(false, .release);
+    var buf: [16]Key = undefined;
+    // Key-up records and modifier records alone are no key.
+    try testing.expectEqual(@as(usize, 0), parseAll("\x1b[65;30;97;0;32;1_\x1b[16;42;0;1;48;1_\x1b[16;42;0;0;32;1_", &buf).len);
+    // Rc repeats the key.
+    const held = parseAll("\x1b[66;48;98;1;32;3_", &buf);
+    try testing.expectEqual(@as(usize, 3), held.len);
+    for (held) |k| try testing.expectEqual(@as(u8, 'b'), k.char);
+    // A high surrogate whose low half never comes is handed over as WTF-8,
+    // ahead of the key that follows; a lone low half likewise.
+    const lone = parseAll("\x1b[255;0;55357;1;32;1_\x1b[65;30;97;1;32;1_\x1b[255;0;56832;1;32;1_", &buf);
+    var wtf8: [12]u8 = undefined;
+    const hi = try std.unicode.wtf8Encode(0xD83D, wtf8[0..]);
+    const lo = try std.unicode.wtf8Encode(0xDE00, wtf8[hi..]);
+    try testing.expectEqual(@as(usize, hi + 1 + lo), lone.len);
+    for (wtf8[0..hi], lone[0..hi]) |b, k| try testing.expectEqual(b, k.char);
+    try testing.expectEqual(@as(u8, 'a'), lone[hi].char);
+    // Fields left out: Cs and Rc take their defaults (0 and 1).
+    const short = parseAll("\x1b[65;;97;1_", &buf);
+    try testing.expectEqual(@as(usize, 1), short.len);
+    try testing.expectEqual(@as(u8, 'a'), short[0].char);
+    // A seventh field is no record: one unknown key, like any other long CSI.
+    const long = parseAll("\x1b[65;0;97;1;32;1;9_x", &buf);
+    try testing.expectEqual(@as(usize, 2), long.len);
+    try testing.expect(long[0] == .unknown);
+    try testing.expectEqual(@as(u8, 'x'), long[1].char);
+}
+
+test "KeyParser: Esc as records waits for the read timeout like a VT Esc, and records mix with plain text" {
+    g_win32_input_on.store(true, .release);
+    defer g_win32_input_on.store(false, .release);
+    defer g_win32_input_seen.store(false, .release);
+    var p = KeyParser{};
+    // Down and up: the Esc waits for what may follow, as a VT Esc does; the
+    // key-up record's own ESC does not settle it.
+    for ("\x1b[27;1;27;1;32;1_\x1b[27;1;27;0;32;1_") |b| try testing.expect(p.feed(b) == null);
+    try testing.expect(p.drain() == null);
+    try testing.expect(p.pendingEsc());
+    try testing.expect(p.flushEsc().? == .esc);
+    try testing.expect(p.drain() == null);
+    try testing.expect(!p.pendingEsc());
+    // Esc, then an arrow key a moment later: two keys, as with VT bytes.
+    var keys: [8]Key = undefined;
+    const esc_left = parseAll("\x1b[27;1;27;1;32;1_\x1b[37;75;0;1;288;1_", &keys);
+    try testing.expectEqual(@as(usize, 2), esc_left.len);
+    try testing.expect(esc_left[0] == .esc);
+    try testing.expect(esc_left[1] == .left);
+    // A Windows Terminal paste is plain text between records; IME text can be too.
+    var buf: [16]Key = undefined;
+    const mixed = parseAll("ab\x1b[67;46;99;1;32;1_\x1b[67;46;99;0;32;1_d", &buf);
+    try testing.expectEqual(@as(usize, 4), mixed.len);
+    for ("abcd", mixed) |c, k| try testing.expectEqual(c, k.char);
+}
+
+test "KeyParser: a classic conhost paste, markers and all as records, is the bracketed paste" {
+    g_win32_input_on.store(true, .release);
+    defer g_win32_input_on.store(false, .release);
+    defer g_win32_input_seen.store(false, .release);
+    // Right-click paste of "p\nq" with 2004 and 9001 on (measured shape): every
+    // character a down/up pair, the markers' bytes too (Vk 0), the line break an Enter.
+    var stream: std.ArrayList(u8) = .empty;
+    defer stream.deinit(testing.allocator);
+    for ("\x1b[200~p") |c| {
+        const vk: u32 = if (c == 'p') 80 else 0;
+        try stream.print(testing.allocator, "\x1b[{d};0;{d};1;0;1_\x1b[{d};0;{d};0;0;1_", .{ vk, c, vk, c });
+    }
+    try stream.appendSlice(testing.allocator, "\x1b[13;28;13;1;0;1_\x1b[13;28;13;0;0;1_");
+    for ("q\x1b[201~") |c| try stream.print(testing.allocator, "\x1b[0;0;{d};1;0;1_\x1b[0;0;{d};0;0;1_", .{ c, c });
+    var buf: [16]Key = undefined;
+    const keys = parseAll(stream.items, &buf);
+    try testing.expectEqual(@as(usize, 5), keys.len);
+    try testing.expect(keys[0] == .paste_begin);
+    try testing.expectEqual(@as(u8, 'p'), keys[1].char);
+    try testing.expect(keys[2] == .enter);
+    try testing.expectEqual(@as(u8, 'q'), keys[3].char);
+    try testing.expect(keys[4] == .paste_end);
+}
+
+test "newlineHint: Shift+Enter once a win32 record was decoded, backslash before" {
+    // Kitty on (the test's own terminal) says Shift+Enter either way.
+    if (shouldEnableKittyKeyboard()) return error.SkipZigTest;
+    defer g_win32_input_seen.store(false, .release);
+    var buf: [4]Key = undefined;
+    // Without the mode, bytes that look like a record are a CSI like any other.
+    _ = parseAll("\x1b[65;30;97;1;32;1_", &buf);
+    try testing.expect(!g_win32_input_seen.load(.acquire));
+    try testing.expectEqualStrings("\\ + \xe2\x8f\x8e for newline", newlineHint());
+    g_win32_input_on.store(true, .release);
+    defer g_win32_input_on.store(false, .release);
+    _ = parseAll("\x1b[65;30;97;1;32;1_", &buf);
+    try testing.expect(g_win32_input_seen.load(.acquire));
+    try testing.expectEqualStrings("shift + \xe2\x8f\x8e for newline", newlineHint());
 }
 
 test "KeyParser: 迟到的背景色应答(OSC 11,BEL 或 ST 结尾)整条吃掉,前后的字照常" {

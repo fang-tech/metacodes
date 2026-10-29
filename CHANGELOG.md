@@ -261,6 +261,23 @@ status, compatibility boundaries, and entry points are defined by
   one unknown key for each; a sequence whose rest has not come within one
   read wait is dropped instead of swallowing the next key; and rxvt's
   `$`-terminated Shift keys (`ESC [ 3 $`) stay one key.
+- **Shift+Enter inserts a newline in Windows Terminal and the classic
+  Windows console (#386).** A Windows console sends Shift+Enter as the same
+  `\r` as Enter, so it submitted the prompt and the footer said `\ + ⏎ for
+  newline`. When stdin and stdout are both console handles, the REPL now
+  turns on win32-input-mode (`CSI ? 9001 h`) as it enters raw mode and turns
+  it off as it restores the terminal; redirected streams and Linux binaries
+  under WSL leave it off. With it on, the console sends each key event as a
+  record `CSI Vk;Sc;Uc;Kd;Cs;Rc _`. The key parser drops key-up records,
+  types a record's character `Rc` times (a UTF-16 surrogate pair split over
+  two records is one character), and reads every other key as the VT bytes
+  the same key sends without the mode, so arrows, function keys, Esc, Alt and
+  Ctrl chords and bracketed-paste markers behave as before (checked key by key
+  against Windows Terminal 1.24 and conhost on Windows 11 26300). Shift+Enter
+  becomes Kitty's `CSI 13;2u`, a newline, and once a record has come the
+  footer says `shift + ⏎ for newline`. Ctrl+Enter still submits: the pseudo
+  console sends a pasted line break as an Enter with Ctrl held, the same
+  record. AltGr and dead keys were not measured.
 
 
 ### Fixed

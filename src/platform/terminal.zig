@@ -103,6 +103,17 @@ pub fn isatty(fd: c_int) bool {
     return std.c.isatty(fd) != 0;
 }
 
+/// Whether stdin and stdout are both a Windows console (conhost, or a pseudo
+/// console such as Windows Terminal's): the host of console modes like
+/// win32-input-mode. Redirected or piped handles are not, nor is anything on
+/// POSIX (a Linux binary under WSL included).
+pub fn isConsole() bool {
+    if (!is_windows) return false;
+    var mode: win.DWORD = 0;
+    return GetConsoleMode(GetStdHandle(STD_INPUT_HANDLE), &mode) != 0 and
+        GetConsoleMode(GetStdHandle(STD_OUTPUT_HANDLE), &mode) != 0;
+}
+
 // ── 可移植终端输入读 ─────────────────────────────────────────────────────────
 // Windows console 的 ReadFile/CRT read 在 CP65001 下对非 ASCII 输入返回**损坏字节**
 // (conhost 历史缺陷;ConPTY 实测 '你' → U+FFFD×2,CJK 输入全乱)。console 输入必须走
