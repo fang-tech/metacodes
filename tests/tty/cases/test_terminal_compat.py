@@ -229,7 +229,7 @@ def test_windows_console_shift_enter_record_is_a_newline(bin_path):
     a_key = _win32_records("65;30;97;1;32;1", "65;30;97;0;32;1")
     b_key = _win32_records("66;48;98;1;32;1", "66;48;98;0;32;1")
     shift_enter = _win32_records("16;42;0;1;16;1", "13;28;13;1;16;1", "13;28;13;0;16;1", "16;42;0;0;0;1")
-    raw = run(bin_path, ["sleep:0.8", a_key, a_key, shift_enter, b_key, b_key, "sleep:0.6"])
+    raw = run(bin_path, [READY, a_key, a_key, shift_enter, b_key, b_key, "sleep:0.6"])
     a = TTYAssert(raw)
     a.assert_box_height(2)
     top = a.box_top_row()
@@ -238,7 +238,7 @@ def test_windows_console_shift_enter_record_is_a_newline(bin_path):
     a.assert_line_contains(a.footer_row(), "shift + ")
 
     enter = _win32_records("13;28;13;1;0;1", "13;28;13;0;0;1")
-    raw = run(bin_path, ["sleep:0.8", "type:aa", enter, "sleep:0.8"])
+    raw = run(bin_path, [READY, "type:aa", enter, "sleep:0.8"])
     a = TTYAssert(raw)
     a.assert_input_echo("")
     sc = Screen(24, 80)
