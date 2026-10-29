@@ -13,6 +13,7 @@ const sync = @import("platform").sync;
 const time = @import("../util/time.zig");
 const ResponseStatus = @import("../api/http_status.zig").ResponseStatus;
 const no_redirects = @import("../api/http_status.zig").no_redirects;
+const http_connection = @import("../api/http_connection.zig");
 
 pub const protocol_version: u32 = 2;
 pub const control_plane_version: u32 = 1;
@@ -455,7 +456,7 @@ pub const WebTransport = struct {
         defer req.deinit();
         // A bodiless request still has to be written out; without this the
         // probe waited for a reply to a GET that never left the client.
-        req.sendBodiless() catch return Error.RequestFailed;
+        http_connection.sendBodiless(&req) catch return Error.RequestFailed;
         var redirect_buffer: [4096]u8 = undefined;
         const head = req.receiveHead(&redirect_buffer) catch return Error.RequestFailed;
         const status = ResponseStatus.capture(&head);
@@ -552,7 +553,7 @@ pub const WebTransport = struct {
             },
         }) catch return Error.RequestFailed;
         defer req.deinit();
-        req.sendBodyComplete(@constCast(body)) catch return Error.RequestFailed;
+        http_connection.sendBodyComplete(&req, @constCast(body)) catch return Error.RequestFailed;
         var redirect_buffer: [4096]u8 = undefined;
         const head = req.receiveHead(&redirect_buffer) catch return Error.RequestFailed;
         const status = ResponseStatus.capture(&head);

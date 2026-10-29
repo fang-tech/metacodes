@@ -38,6 +38,7 @@ const http = std.http;
 const connection_gate = @import("connection_gate.zig");
 const ResponseStatus = @import("http_status.zig").ResponseStatus;
 const http_status = @import("http_status.zig");
+const http_connection = @import("http_connection.zig");
 const no_redirects = http_status.no_redirects;
 const log = @import("../util/log.zig");
 const types = @import("../types.zig");
@@ -380,7 +381,7 @@ pub const GeminiClient = struct {
         );
         registered = true;
         req_ptr.transfer_encoding = .{ .content_length = body.len };
-        req_ptr.sendBodyComplete(@constCast(body)) catch |err| {
+        http_connection.sendBodyComplete(req_ptr, @constCast(body)) catch |err| {
             log.errId("gemini", rid, "send body failed: {s}", .{@errorName(err)});
             return error.RequestFailed;
         };

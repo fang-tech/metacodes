@@ -92,6 +92,13 @@ pub const MockServer = struct {
     /// flaky 模式:前 N 个连接读完请求后直接 close 不写响应(模拟服务端建连阶段断连,
     /// 客户端 receiveHead 拿到 ConnectionClosing/EOF)。serveLoop 每断一次递减,归 0 后正常服务。
     flaky_close_remaining: usize = 0,
+    /// Reset mid-upload: the first N connections are closed as soon as the
+    /// request head has arrived, with the body still unread. Closing a socket
+    /// that holds unread data sends RST, so a client still writing a large body
+    /// fails in its send, not in `receiveHead` as with `flaky_close_remaining`.
+    reset_upload_remaining: usize = 0,
+    /// Connections reset by `reset_upload_remaining` so far.
+    upload_resets: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     /// Deterministic concurrency gate for tests that must hold a provider
     /// request in-flight without relying on wall-clock sleeps.
     gate_next_response: std.atomic.Value(bool) = .init(false),
@@ -261,6 +268,30 @@ pub const MockServer = struct {
         return self;
     }
 
+    /// The first `reset_first_n` connections are reset while the client is
+    /// still sending its body (see `reset_upload_remaining`); later ones are
+    /// served `body`. A body that fits in the socket buffers is sent before
+    /// the reset lands, so the requests meant to be reset must be large.
+    pub fn startResetDuringUpload(body: []const u8, reset_first_n: usize) !*MockServer {
+        const listener = try net.listenLoopback(0, 16);
+        errdefer net.closeSocket(listener.sock);
+
+        const self = try std.heap.page_allocator.create(MockServer);
+        self.* = .{
+            .listen_sock = listener.sock,
+            .port = listener.port,
+            .thread = undefined,
+            .body = body,
+            .reset_upload_remaining = reset_first_n,
+        };
+        self.thread = try std.Thread.spawn(.{}, serveLoop, .{self});
+        return self;
+    }
+
+    pub fn uploadResets(self: *MockServer) u32 {
+        return self.upload_resets.load(.acquire);
+    }
+
     pub fn stop(self: *MockServer) void {
         // 停机三步:置 closing → **自连唤醒**可能阻塞在 accept 的服务线程 → 关 listen socket → join。
         // 只靠 closeSocket 唤醒阻塞中的 accept 在 Windows/POSIX 都无保证(Windows 实测竞态挂死),
@@ -401,6 +432,15 @@ pub const MockServer = struct {
                 net.closeSocket(conn); // stop() 的自连唤醒,不是真请求
                 return;
             }
+            if (self.reset_upload_remaining > 0) {
+                self.reset_upload_remaining -= 1;
+                readHead(conn);
+                // Counted before the reset: the client can see its failure and
+                // read the count before this thread runs again.
+                _ = self.upload_resets.fetchAdd(1, .release);
+                net.closeSocket(conn);
+                continue;
+            }
             // 选本轮 body
             const bodies = self.cassette orelse &[_][]const u8{self.body};
             const idx = @min(self.cassette_pos, bodies.len - 1);
@@ -499,6 +539,18 @@ pub const MockServer = struct {
         }
         self.captured_requests[self.captured_count] = owned;
         self.captured_count += 1;
+    }
+
+    /// Read up to the end of the request head and no further.
+    fn readHead(conn: net.Socket) void {
+        var head: [64 * 1024]u8 = undefined;
+        var total: usize = 0;
+        while (total < head.len) {
+            const n = net.recv(conn, head[total..]);
+            if (n <= 0) return;
+            total += @intCast(n);
+            if (std.mem.indexOf(u8, head[0..total], "\r\n\r\n") != null) return;
+        }
     }
 
     /// 读一个完整 HTTP 请求(headers + Content-Length body)进 buf,返回读到的总字节数。

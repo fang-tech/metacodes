@@ -19,6 +19,7 @@ const liveness_reader = @import("api/liveness_reader.zig");
 const sync = @import("platform").sync;
 const rng = @import("platform").rng;
 const connection_gate = @import("api/connection_gate.zig");
+const http_connection = @import("api/http_connection.zig");
 const models_pages = @import("api/models_pages.zig");
 const dialect_mod = @import("api/dialect.zig");
 const auth_header_mod = @import("api/auth_header.zig");
@@ -1059,6 +1060,8 @@ pub const Client = struct {
         // keep_alive=false:长驻(serve/--web)复用连接池,空闲后服务端关连接,首个 sendBody 撞
         // WriteFailed → 重试风暴(isTransientNetworkError 注释的病根)。新连接的握手洪峰由
         // process-wide connection_gate(MAX_CONNECTING_REQUESTS) 限制，不重新引入陈旧池连接。
+        // std 只在收到响应头后才执行 keep_alive=false:receiveHead 失败它自己关连接,
+        // 发送失败的连接靠 http_connection 丢弃。
         req_ptr.* = client.http_client.request(.POST, uri, .{
             .keep_alive = false,
             // The key rides in a header; a redirect would carry it to another host.
@@ -1090,8 +1093,9 @@ pub const Client = struct {
         );
         errdefer client.abort_registry.unregister(req_ptr);
 
-        // 发送 body
-        req_ptr.sendBodyComplete(@constCast(body)) catch |err| {
+        // 发送 body。失败的连接由 http_connection 标为 closing:std 会把收头前失败的连接
+        // 放回池里,重试会一直拿到同一条死连接(见 api/http_connection.zig)。
+        http_connection.sendBodyComplete(req_ptr, @constCast(body)) catch |err| {
             log.errId("client", rid, "sendBody failed: {s}", .{@errorName(err)});
             if (isTransientNetworkError(err)) {
                 last_error.recordNamed("连接失败", @errorName(err));
@@ -1297,7 +1301,7 @@ fn getModelsPage(
     }) catch return error.RequestFailed;
     defer req.deinit();
 
-    req.sendBodiless() catch return error.RequestFailed;
+    http_connection.sendBodiless(&req) catch return error.RequestFailed;
     var redirect_buf: [4096]u8 = undefined;
     const http_response = req.receiveHead(&redirect_buf) catch return error.RequestFailed;
     const response_status = ResponseStatus.capture(&http_response);
@@ -2002,7 +2006,7 @@ test "estimateTokens" {
 test "getModelsList uses sendBodiless (no sendBodyComplete on GET)" {
     const src = @embedFile("client.zig");
     // 确认函数里有 sendBodiless 调用
-    try std.testing.expect(std.mem.indexOf(u8, src, "req.sendBodiless()") != null);
+    try std.testing.expect(std.mem.indexOf(u8, src, "http_connection.sendBodiless(&req)") != null);
     // 确认没人回退到 sendBodyComplete("") 模式
     try std.testing.expect(std.mem.indexOf(u8, src, "sendBodyComplete(@constCast(\"\"))") == null);
 }

@@ -28,6 +28,7 @@ const std = @import("std");
 const sync = @import("platform").sync;
 const question = @import("question.zig");
 const ResponseStatus = @import("../api/http_status.zig").ResponseStatus;
+const http_connection = @import("../api/http_connection.zig");
 const log = @import("../util/log.zig");
 const util_time = @import("../util/time.zig");
 const AbortSignal = @import("../util/abort.zig").AbortSignal;
@@ -262,7 +263,7 @@ pub const Client = struct {
             },
         }) catch return error.TransportFailed;
         defer request.deinit();
-        request.sendBodyComplete(@constCast(body)) catch return error.TransportFailed;
+        http_connection.sendBodyComplete(&request, @constCast(body)) catch return error.TransportFailed;
         var redirect_buffer: [1024]u8 = undefined;
         const response = request.receiveHead(&redirect_buffer) catch return error.TransportFailed;
         const status = ResponseStatus.capture(&response);
