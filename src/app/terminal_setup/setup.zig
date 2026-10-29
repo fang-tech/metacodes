@@ -210,6 +210,9 @@ pub const Context = struct {
     now_unix: i64,
     /// The Terminal.app process this one runs under (`apple.terminalPid`).
     terminal_pid: ?i32 = null,
+    /// The REPL turned the Kitty keyboard protocol on for this terminal (it is
+    /// on the allow-list, or answered the startup query): Shift+Enter works.
+    keyboard_protocol: bool = false,
     /// How to spell the undo command where the report is read.
     restore_hint: []const u8 = "metacodes terminal-setup --restore",
 };
@@ -280,6 +283,10 @@ fn runIn(arena: std.mem.Allocator, ctx: Context, req: Request, out: *std.Io.Writ
             return .{ .outcome = .refused };
         },
         .other => |name| {
+            if (ctx.keyboard_protocol) {
+                say(out, "Terminal: {s}. It answered metacodes' keyboard-protocol query, so Shift+Enter already inserts a newline. Nothing to set up.", .{name orelse "not named (TERM_PROGRAM is not set)"});
+                return .{ .outcome = .unchanged };
+            }
             say(out, "Terminal: {s}. metacodes has no setup for it.", .{name orelse "not recognized (TERM_PROGRAM is not set)"});
             say(out, "To get a newline from Shift+Enter, bind Shift+Enter in the terminal's own settings to send Esc followed by Return (the bytes 1b 0d, often written \\e\\r or \\u001b\\r); metacodes reads that as a newline.", .{});
             say(out, "  Alacritty (alacritty.toml): [[keyboard.bindings]] key = \"Return\", mods = \"Shift\", chars = \"\\u001b\\r\"", .{});
@@ -696,6 +703,16 @@ test "detect: the terminals with a setup, the native ones, and the rest" {
     try testing.expect(detect(.{}).other == null);
 }
 
+test "detect: the native terminals are the ones input.zig turns the keyboard protocol on for" {
+    const input = @import("../../repl/input.zig");
+    for (native_term_programs) |entry| try testing.expect(input.classifyKittyKeyboard(entry[0], "xterm-256color", false));
+    try testing.expect(input.classifyKittyKeyboard(null, "xterm-kitty", false));
+    try testing.expect(input.classifyKittyKeyboard(null, "xterm-ghostty", false));
+    // The two this command sets up are the ones it leaves off.
+    try testing.expect(!input.classifyKittyKeyboard("Apple_Terminal", "xterm-256color", false));
+    try testing.expect(!input.classifyKittyKeyboard("vscode", "xterm-256color", false));
+}
+
 const Harness = struct {
     arena_state: std.heap.ArenaAllocator,
     tmp: std.testing.TmpDir,
@@ -852,6 +869,12 @@ test "run: native terminals, tmux and unknown ones change nothing" {
     h.reset();
     try testing.expectEqual(Outcome.unchanged, run(testing.allocator, try h.ctx(.{ .term_program = "Hyper" }), .{}, &h.out.writer).outcome);
     try testing.expect(std.mem.indexOf(u8, h.report(), "\\e\\r") != null);
+    // A terminal the startup probe found speaking the keyboard protocol needs nothing.
+    h.reset();
+    var probed = try h.ctx(.{ .term_program = "SomeNewTerminal" });
+    probed.keyboard_protocol = true;
+    try testing.expectEqual(Outcome.unchanged, run(testing.allocator, probed, .{}, &h.out.writer).outcome);
+    try testing.expect(std.mem.indexOf(u8, h.report(), "already inserts a newline") != null);
     h.reset();
     try testing.expectEqual(Outcome.refused, run(testing.allocator, try h.ctx(.{ .term_program = "vscode", .remote_session = true }), .{}, &h.out.writer).outcome);
     try testing.expect(std.mem.indexOf(u8, h.report(), "workbench.action.terminal.sendSequence") != null);

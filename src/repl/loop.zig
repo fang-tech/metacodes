@@ -4724,6 +4724,7 @@ fn handleTerminalSetup(app: *app_mod.App, allocator: std.mem.Allocator, rest: []
         .state_root = app.stateRoot(),
         .now_unix = util_time.nowUnix(),
         .terminal_pid = @import("../app/terminal_setup/apple_terminal.zig").terminalPid(),
+        .keyboard_protocol = input.shouldEnableKittyKeyboard(),
         .restore_hint = "/terminal-setup restore (or metacodes terminal-setup --restore)",
     }, .{ .action = action }, &out.writer);
     cmd_output.print("{s}", .{out.written()});

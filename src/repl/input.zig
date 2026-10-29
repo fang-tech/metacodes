@@ -418,7 +418,7 @@ pub const kbd_disable_seq = "\x1b[<u" ++ "\x1b[>4m"; // DISABLE_KITTY(pop) + DIS
 const kitty_term_programs = [_][]const u8{ "iTerm.app", "WezTerm", "ghostty", "WarpTerminal" };
 
 /// 纯函数(便于纯单测,不依赖真 env):据 TERM_PROGRAM / TERM / TMUX 判断是否发 Kitty 协议。
-fn classifyKittyKeyboard(term_program: ?[]const u8, term: ?[]const u8, has_tmux: bool) bool {
+pub fn classifyKittyKeyboard(term_program: ?[]const u8, term: ?[]const u8, has_tmux: bool) bool {
     if (has_tmux) return true; // tmux 接受 modifyOtherKeys 且不转发 Kitty 给外层(对齐真 cc)
     if (term_program) |tp| {
         for (kitty_term_programs) |n| if (std.mem.eql(u8, tp, n)) return true;

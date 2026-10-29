@@ -93,6 +93,22 @@ def test_apple_terminal_backslash_newline_no_exit(bin_path):
     a.assert_line_contains(top + 1, "abc")  # 第一行是 abc(\ 已删)
 
 
+def test_esc_cr_inserts_a_newline(bin_path):
+    # /terminal-setup (#386) makes Apple Terminal's Shift+Return and VS Code's shift+enter send
+    # ESC CR (Meta+Return): a newline that stays in the input box, where a bare CR submits.
+    raw = run(
+        bin_path,
+        ["sleep:0.8", "type:abc", "raw:\\x1b\\x0d", "type:def", "sleep:0.4"],
+        env={"TERM_PROGRAM": "Apple_Terminal", "TERM": "xterm-256color"},
+    )
+    assert b"Goodbye" not in raw, "ESC CR must not submit or exit"
+    a = TTYAssert(raw)
+    a.assert_box_height(2)
+    top = a.box_top_row()
+    a.assert_line_contains(top + 1, "abc")
+    a.assert_line_contains(top + 2, "def")
+
+
 def _multiline_footer(bin_path, term_program):
     # 组多行(backslash 续行)后抓 footer 文案。Apple 用裸回车续行,Kitty 终端用 shift_enter。
     if term_program == "Apple_Terminal":

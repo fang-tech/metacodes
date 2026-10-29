@@ -147,7 +147,15 @@ and reading the bytes the tty received (metacodes#386): Shift+Return sends `1b 0
 with the mapping and `0d` without it; a key map holding only Shift+Return drops
 F5 (`ESC [15~`), Shift+Right (`ESC [1;2C`) and Option+Left (`ESC b`); a running
 Terminal keeps the old mapping in old and new windows until it is reopened, and
-quitting it does not write its profiles back over the change. The macOS CI
-suite runs the edit, the backup and the restore with the real `plutil` and
+quitting it does not write its profiles back over the change. The same runs
+took the metacodes binary through the whole flow inside Terminal: setup, the
+same Terminal still sending `0d`, the reopened one sending `1b 0d` with F5,
+Shift+Right and Option+Left unchanged, a two-line prompt from Shift+Return
+under the `shift + ⏎` footer, and restore leaving the profile as it was before.
+zsh binds `ESC CR` to `self-insert-unmeta`; bash leaves it unbound. The macOS
+CI suite runs the edit, the backup and the restore with the real `plutil` and
 `defaults` against a temporary settings domain
-(`src/app/terminal_setup/apple_terminal.zig`, `setup.zig`).
+(`src/app/terminal_setup/apple_terminal.zig`, `setup.zig`). The VS Code side was
+driven the same way on Windows (VS Code 1.105, a separate instance with its own
+user data): Shift+Enter reached a console program as `0d` before setup and as
+`1b 0d` after, without a restart.
