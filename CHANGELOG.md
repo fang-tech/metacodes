@@ -19,6 +19,12 @@ status, compatibility boundaries, and entry points are defined by
   [--dry-run | --restore] [--terminal …] [--keybindings <file>]`, makes the
   terminal send `ESC CR`, which the key parser now reads as Shift+Enter (the
   sequence Claude Code's VS Code binding sends, so that binding counts too).
+  - **`ESC CR` is a newline only when both bytes arrive together**, as a
+    terminal writes them for one key. An Esc pressed and then Enter stay two
+    keys: vim mode still goes to NORMAL and submits, and reverse search still
+    cancels. Bracketed pastes keep their line breaks. Alt+Enter in terminals
+    that send `ESC CR` for it (xterm, VTE terminals, Konsole, Alacritty) now
+    inserts a newline too.
   - **Apple Terminal:** Shift+Return in the default profile's key map, through
     `defaults export|import` and `plutil`. A profile without a key map of its
     own gets a copy of Terminal's built-in map first, since its own map
@@ -27,12 +33,19 @@ status, compatibility boundaries, and entry points are defined by
     is reopened.
   - **VS Code, Cursor, Windsurf, VSCodium and other builds:** a
     `keybindings.json` entry, spliced in with comments and trailing commas
-    kept; the file is found through the build's `product.json`.
+    kept. The file is found through the build's `product.json`. A file that is
+    a symbolic link stays one: the file it points to changes. Profiles with
+    shortcuts of their own read their own file: they are listed with the
+    `--keybindings` command for each, and the footer waits for all of them.
+    Key spellings follow VS Code's parser (`shift-enter` counts).
   - An existing Shift+Return mapping or terminal Shift+Enter binding is never
     replaced. Every change is backed up into `<state root>/terminal-setup/`
-    and recorded there, and `--restore` (`/terminal-setup restore`) undoes
-    exactly that. iTerm2, WezTerm, Ghostty, kitty and Warp are reported as
-    needing nothing; other terminals get the manual setup.
+    and recorded there first; an unreadable record stops the command before
+    any change. `--restore` (`/terminal-setup restore`) undoes exactly what is
+    recorded, narrowed by `--terminal` or `--keybindings` (naming one with
+    nothing recorded fails), and keeps an entry whose file no longer parses.
+    iTerm2, WezTerm, Ghostty, kitty and Warp are reported as needing nothing;
+    other terminals get the manual setup.
   - The footer says `shift + ⏎ for newline` once the binding works: at once in
     VS Code, after Terminal is reopened in Apple Terminal. See
     [doc/TERMINAL_SETUP.md](doc/TERMINAL_SETUP.md).

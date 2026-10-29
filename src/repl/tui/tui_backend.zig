@@ -667,7 +667,7 @@ pub const TuiBackend = struct {
             }
             dead_reads = 0;
 
-            const key = parser.feed(b[0]) orelse continue; // 多字节(UTF-8/CSI)攒够再出 Key
+            const key = parser.feedRead(fd, b[0]) orelse continue; // 多字节(UTF-8/CSI)攒够再出 Key
             self.handleKey(snap, key, editor);
             // ESC + 普通字符:feed 吐 .esc 后第二个键在 pending,排空(否则字符被吞)。
             while (parser.drain()) |k2| self.handleKey(snap, k2, editor);

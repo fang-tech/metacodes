@@ -19,6 +19,14 @@ Both setups make Shift+Enter send Esc followed by Return (`ESC CR`, the bytes
 `1b 0d`), which metacodes reads as a newline. It is the sequence Claude Code's
 VS Code binding sends, so a binding Claude Code installed already counts.
 
+metacodes takes `ESC CR` for a newline only when the two bytes arrive together,
+as a terminal writes them for one key press. An Esc you press and then an
+Enter are two keys even when they come quickly: in vim mode Esc still goes to
+NORMAL and Enter submits, and in reverse search Esc still cancels. Pasted text
+keeps its line breaks. Terminals that send `ESC CR` for Alt+Enter (xterm, VTE
+terminals such as GNOME Terminal, Konsole, Alacritty) now get a newline from
+Alt+Enter too.
+
 ```sh
 /terminal-setup                 # in the TUI: set up this terminal
 /terminal-setup status          # say what it would change, change nothing
@@ -56,10 +64,17 @@ settings changes.
   to the shell and to other programs too; zsh, for one, inserts a line break
   instead of running the command.
 - Windows that use another profile are not changed. Run the command again after
-  making that profile the default, or add the mapping by hand.
+  making that profile the default, or add the mapping by hand. Which profile a
+  window uses is not visible from inside it, so the footer assumes one of the
+  profiles the command changed.
 - A profile whose name contains a backslash or starts with `@` cannot be changed
   by the command (the settings tools cannot address it; macOS 15's `plutil`
   aborts on the latter); the command says so.
+- After a macOS update that changes Terminal's built-in key map, a copy the
+  command made earlier keeps the old map, and restore then takes out only
+  Shift+Return (the copy no longer matches the built-in map) and leaves that old
+  copy in the profile. Remove it by hand in the profile's Keyboard settings
+  (Restore Defaults), or import the backup.
 
 The command uses only the system's own tools: `defaults export` and
 `defaults import` for Terminal's settings (`com.apple.Terminal`), and `plutil`
@@ -88,8 +103,19 @@ It appends this entry to the user `keybindings.json` (on macOS
   `when` at all. The command shows it and stops.
 - Which build runs the terminal comes from its `product.json` (found through
   `VSCODE_GIT_ASKPASS_MAIN`), so forks get their own folder; `VSCODE_PORTABLE`
-  is honoured. For an install started with `--user-data-dir`, or a VS Code
-  profile with its own shortcuts, name the file: `--keybindings <file>`.
+  is honoured. For an install started with `--user-data-dir`, name the file:
+  `--keybindings <file>`.
+- **Profiles.** The entry goes into the Default profile's file. A window that
+  uses a profile with keyboard shortcuts of its own reads that profile's
+  `User/profiles/<id>/keybindings.json` instead (measured: such a window kept
+  sending a plain Return). The command lists those profiles (from
+  `User/globalStorage/storage.json`) with the `--keybindings` command for each,
+  and the footer shows `shift + ⏎` only once every one of them has the entry,
+  since which profile a window uses is not visible from inside it.
+- A `keybindings.json` that is a symbolic link (home-manager, stow, chezmoi)
+  stays a link: the file it points to is the one changed. If that file cannot be
+  written (the Nix store), add the entry where it is managed. A link to nothing
+  is left alone.
 - In a remote window (Remote-SSH, WSL, a dev container, Codespaces) the key
   bindings live on the machine that shows the window, so the command prints
   the entry to add there instead.
@@ -103,8 +129,15 @@ Each change is backed up first, into `<state root>/terminal-setup/`
 `<build>-keybindings-<UTC time>.json`. The same directory holds
 `installed.json`, the record of what the command changed.
 
+The record is written before the change and kept in step with it. If it cannot
+be read, nothing is changed (it would otherwise be saved over) until it is
+fixed or moved away.
+
 `/terminal-setup restore` (or `metacodes terminal-setup --restore`) undoes what
-the record lists, and only that:
+the record lists, and only that; `--terminal <name>` or `--keybindings <file>`
+narrows it to that terminal or file, and naming one with nothing recorded is an
+error. A file that does not parse any more is left as it is and stays in the
+record, so the restore can be run again once the file is fixed.
 
 - Apple Terminal: Shift+Return comes out of each profile it was added to; a key
   map the command copied in goes too, unless you edited other keys in it since.
@@ -135,10 +168,12 @@ in CSI u form (see `extended-keys` and `extended-keys-format` in tmux(1)).
 ## The footer hint
 
 The footer says `shift + ⏎ for newline` when Shift+Enter inserts a newline: the
-terminal speaks the keyboard protocol, VS Code's `keybindings.json` holds the
-binding (whoever added it), or `/terminal-setup` mapped it in Apple Terminal
-and Terminal has been reopened since (a Terminal process other than the one
-running at setup) with the mapping still in its settings.
+terminal speaks the keyboard protocol; VS Code's `keybindings.json` holds the
+binding (whoever added it), and so does that of every profile with shortcuts of
+its own; or `/terminal-setup` mapped it in Apple Terminal, the Terminal running
+now is not the one that was running at setup (setup records it even when run
+from another terminal), and the mapping is still in one of the profiles it
+changed.
 
 ## How this was established
 
@@ -159,4 +194,8 @@ CI suite runs the edit, the backup and the restore with the real `plutil` and
 (`src/app/terminal_setup/apple_terminal.zig`, `setup.zig`). The VS Code side was
 driven the same way on Windows (VS Code 1.105, a separate instance with its own
 user data): Shift+Enter reached a console program as `0d` before setup and as
-`1b 0d` after, without a restart.
+`1b 0d` after, without a restart; a window opened with `--profile` (a profile
+with its own shortcuts) still sent `0d` with the entry only in the Default
+profile's file. The key spelling rules come from VS Code's own keybinding
+parser (in the 1.105 bundle): modifiers first, `+` or `-` between, so
+`shift-enter` counts and `enter+shift` names no key.

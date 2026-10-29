@@ -141,14 +141,18 @@ pub const Record = struct {
     pub const AppleEntry = struct {
         domain: []const u8,
         profiles: []const apple.Installed,
-        /// The Terminal process that was running when the mapping went in: it
-        /// still sends a plain Return, a later one does not.
+        /// The Terminal process that was running when the mapping went in (or
+        /// null: none was): it still sends a plain Return, a later one does not.
         terminal_pid: ?i32 = null,
         backups: []const []const u8 = &.{},
     };
 
     pub const VscodeEntry = struct {
+        /// The path setup was given (a link stays a link; its file was changed).
         keybindings: []const u8,
+        /// The build's user-data folder (`Code`, `Cursor`, …); null for a file
+        /// named with `--keybindings`.
+        product: ?[]const u8 = null,
         /// The file before the binding went in; null when there was no file.
         backup: ?[]const u8 = null,
     };
@@ -162,12 +166,34 @@ fn recordPath(arena: std.mem.Allocator, state_root: []const u8) error{OutOfMemor
     return std.fs.path.join(arena, &.{ state_root, "terminal-setup", "installed.json" });
 }
 
-/// The record under `state_root`; empty when there is none (or it is not one).
-pub fn loadRecord(arena: std.mem.Allocator, state_root: []const u8) Record {
+pub const RecordError = error{ OutOfMemory, RecordUnreadable };
+
+/// The record under `state_root`, empty when there is none. A record file that
+/// cannot be read or parsed is `error.RecordUnreadable`: saving over it would
+/// drop what it lists, so nothing changes until it is fixed.
+pub fn loadRecord(arena: std.mem.Allocator, state_root: []const u8) RecordError!Record {
     if (state_root.len == 0) return .{};
-    const path = recordPath(arena, state_root) catch return .{};
-    const bytes = files.read(arena, path) catch return .{};
-    return std.json.parseFromSliceLeaky(Record, arena, bytes, .{ .ignore_unknown_fields = true, .allocate = .alloc_always }) catch .{};
+    const path = try recordPath(arena, state_root);
+    const bytes = files.read(arena, path) catch |err| switch (err) {
+        error.NotFound => return .{},
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.RecordUnreadable,
+    };
+    return std.json.parseFromSliceLeaky(Record, arena, bytes, .{ .ignore_unknown_fields = true, .allocate = .alloc_always }) catch |err| switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => error.RecordUnreadable,
+    };
+}
+
+/// `loadRecord`, saying why it stops when the record cannot be read.
+fn loadRecordOrSay(arena: std.mem.Allocator, state_root: []const u8, out: *std.Io.Writer) error{OutOfMemory}!?Record {
+    return loadRecord(arena, state_root) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.RecordUnreadable => {
+            say(out, "The install record {s} cannot be read: nothing changed. Fix it or move it away, then run this again.", .{try recordPath(arena, state_root)});
+            return null;
+        },
+    };
 }
 
 fn saveRecord(arena: std.mem.Allocator, state_root: []const u8, record: Record) !void {
@@ -208,10 +234,10 @@ pub const Context = struct {
     state_root: []const u8,
     apple: apple.Store = .{},
     now_unix: i64,
-    /// The Terminal.app process this one runs under (`apple.terminalPid`).
+    /// The Terminal.app process running now (`apple.runningTerminalPid`).
     terminal_pid: ?i32 = null,
-    /// The REPL turned the Kitty keyboard protocol on for this terminal (it is
-    /// on the allow-list, or answered the startup query): Shift+Enter works.
+    /// The REPL turns the Kitty keyboard protocol on for this terminal
+    /// (`input.shouldEnableKittyKeyboard`): Shift+Enter works without setup.
     keyboard_protocol: bool = false,
     /// How to spell the undo command where the report is read.
     restore_hint: []const u8 = "metacodes terminal-setup --restore",
@@ -285,7 +311,7 @@ fn runIn(arena: std.mem.Allocator, ctx: Context, req: Request, out: *std.Io.Writ
         },
         .other => |name| {
             if (ctx.keyboard_protocol) {
-                say(out, "Terminal: {s}. It answered metacodes' keyboard-protocol query, so Shift+Enter already inserts a newline. Nothing to set up.", .{name orelse "not named (TERM_PROGRAM is not set)"});
+                say(out, "Terminal: {s}. metacodes turns its keyboard protocol on for this terminal, so Shift+Enter already inserts a newline. Nothing to set up.", .{name orelse "not named (TERM_PROGRAM is not set)"});
                 return .{ .outcome = .unchanged };
             }
             say(out, "Terminal: {s}. metacodes has no setup for it.", .{name orelse "not recognized (TERM_PROGRAM is not set)"});
@@ -309,52 +335,127 @@ fn runIn(arena: std.mem.Allocator, ctx: Context, req: Request, out: *std.Io.Writ
             };
             break :blk installVscode(arena, ctx, p.display, p.data_folder, path, req.action == .preview, out);
         },
-        .keybindings => |path| installVscode(arena, ctx, "VS Code", "vscode", path, req.action == .preview, out),
+        .keybindings => |path| installVscode(arena, ctx, "VS Code", null, path, req.action == .preview, out),
     };
 }
 
-fn installVscode(arena: std.mem.Allocator, ctx: Context, display: []const u8, folder: []const u8, path: []const u8, preview: bool, out: *std.Io.Writer) !Report {
+/// The file a configuration path stands for: itself, or the file a link
+/// resolves to (writing the link would replace it with a plain file). null
+/// after saying why for a link to nothing.
+fn resolveConfig(arena: std.mem.Allocator, path: []const u8, out: *std.Io.Writer) error{OutOfMemory}!?[]const u8 {
+    return switch (try files.link(arena, path)) {
+        .none => path,
+        .to => |real| blk: {
+            say(out, "{s} is a link to {s}: that file is the one changed, and the link stays.", .{ path, real });
+            break :blk real;
+        },
+        .dangling => blk: {
+            say(out, "{s} is a link to a file that does not exist: left unchanged. Fix the link, then run this again.", .{path});
+            break :blk null;
+        },
+    };
+}
+
+fn sayWriteFailed(out: *std.Io.Writer, path: []const u8, real: []const u8, err: anyerror) void {
+    if (std.mem.eql(u8, path, real)) {
+        say(out, "Could not write {s} ({s}): left unchanged.", .{ path, @errorName(err) });
+    } else {
+        say(out, "Could not write {s} ({s}), the file {s} links to: left unchanged. If another tool manages that file (home-manager, a dotfiles repository), add the binding there.", .{ real, @errorName(err), path });
+    }
+}
+
+/// Whether the binding is in every `keybindings.json` a window of this build
+/// may read: the Default profile's (`default_installed`) and the file of each
+/// profile with shortcuts of its own. Unknown profiles count as missing it.
+fn inEveryProfile(arena: std.mem.Allocator, default_installed: bool, profiles: vscode.Profiles) bool {
+    if (!default_installed) return false;
+    switch (profiles) {
+        .unknown => return false,
+        .known => |list| for (list) |p| {
+            const file = p.keybindings orelse return false;
+            const src = files.read(arena, file) catch return false;
+            if ((vscode.classify(arena, src) catch return false) != .installed) return false;
+        },
+    }
+    return true;
+}
+
+/// Tells which profiles read a `keybindings.json` of their own, and how to
+/// set each up.
+fn sayProfiles(arena: std.mem.Allocator, out: *std.Io.Writer, display: []const u8, profiles: vscode.Profiles) void {
+    switch (profiles) {
+        .unknown => say(out, "{s}'s profile list (globalStorage/storage.json) could not be read. A window that uses a profile with keyboard shortcuts of its own reads that profile's keybindings.json: set it up with metacodes terminal-setup --keybindings <that file>.", .{display}),
+        .known => |list| {
+            if (list.len == 0) return;
+            say(out, "{s} has profiles with keyboard shortcuts of their own; a window that uses one reads that profile's keybindings.json, not this one:", .{display});
+            for (list) |p| {
+                const file = p.keybindings orelse {
+                    say(out, "  \"{s}\": its folder could not be placed; add the binding through Preferences: Open Keyboard Shortcuts (JSON) in a window that uses it.", .{p.name});
+                    continue;
+                };
+                const has = blk: {
+                    const src = files.read(arena, file) catch break :blk false;
+                    break :blk (vscode.classify(arena, src) catch break :blk false) == .installed;
+                };
+                if (has) {
+                    say(out, "  \"{s}\": set up already ({s}).", .{ p.name, file });
+                } else {
+                    say(out, "  \"{s}\": metacodes terminal-setup --keybindings '{s}'", .{ p.name, file });
+                }
+            }
+        },
+    }
+}
+
+fn installVscode(arena: std.mem.Allocator, ctx: Context, display: []const u8, product: ?[]const u8, path: []const u8, preview: bool, out: *std.Io.Writer) !Report {
     say(out, "Terminal: {s} (integrated terminal).", .{display});
     const user_dir = std.fs.path.dirname(path) orelse path;
     if (!files.exists(user_dir)) {
         say(out, "Its settings folder is not at {s}. For an install started with --user-data-dir, a portable one, or a profile with its own shortcuts, name the file: metacodes terminal-setup --keybindings <path to keybindings.json>.", .{user_dir});
         return .{ .outcome = .refused };
     }
-    const src: ?[]const u8 = files.read(arena, path) catch |err| switch (err) {
+    var record = try loadRecordOrSay(arena, ctx.state_root, out) orelse return .{ .outcome = .refused };
+    const real = try resolveConfig(arena, path, out) orelse return .{ .outcome = .refused };
+    const src: ?[]const u8 = files.read(arena, real) catch |err| switch (err) {
         error.NotFound => null,
         else => {
-            say(out, "Could not read {s} ({s}).", .{ path, @errorName(err) });
+            say(out, "Could not read {s} ({s}).", .{ real, @errorName(err) });
             return .{ .outcome = .failed };
         },
     };
     const status = vscode.classify(arena, src) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.InvalidJsonc, error.NotAnArray => {
-            say(out, "{s} is not a list of key bindings ({s}): left unchanged. Fix it in {s}, then run this again.", .{ path, if (err == error.NotAnArray) "its top level is not an array" else "it does not parse", display });
+            say(out, "{s} is not a list of key bindings ({s}): left unchanged. Fix it in {s}, then run this again.", .{ real, if (err == error.NotAnArray) "its top level is not an array" else "it does not parse", display });
             return .{ .outcome = .refused };
         },
     };
+    // Profiles matter for the build's own file; a file named with
+    // --keybindings is the one the user means.
+    const profiles: vscode.Profiles = if (product != null) try vscode.ownShortcutProfiles(arena, user_dir) else .{ .known = &.{} };
     switch (status) {
         .installed => {
-            say(out, "Already set up: {s} makes Shift+Enter send Esc+Return in the terminal, which metacodes reads as a newline. Nothing changed.", .{path});
-            return .{ .outcome = .unchanged, .binding_live = true };
+            say(out, "Already set up: {s} makes Shift+Enter send Esc+Return in the terminal, which metacodes reads as a newline. Nothing changed.", .{real});
+            sayProfiles(arena, out, display, profiles);
+            return .{ .outcome = .unchanged, .binding_live = inEveryProfile(arena, true, profiles) };
         },
         .conflict => |text| {
-            say(out, "{s} already binds Shift+Enter in the terminal:", .{path});
+            say(out, "{s} already binds Shift+Enter in the terminal:", .{real});
             say(out, "{s}", .{text});
             say(out, "Left unchanged. Remove that binding, or give it a \"when\" that leaves the terminal out (\"editorTextFocus\"), then run this again.", .{});
             return .{ .outcome = .refused };
         },
         .absent => {},
     }
-    say(out, "Adds to {s}{s}:", .{ path, if (src == null) " (a new file)" else "" });
+    say(out, "Adds to {s}{s}:", .{ real, if (src == null) " (a new file)" else "" });
     say(out, "  shift+enter -> workbench.action.terminal.sendSequence \"\\u001b\\r\" (when terminalFocus)", .{});
     const dir = try setupDir(arena, ctx.state_root);
-    const stem = try std.fmt.allocPrint(arena, "{s}-keybindings", .{try fileStem(arena, folder)});
+    const stem = try std.fmt.allocPrint(arena, "{s}-keybindings", .{try fileStem(arena, product orelse "vscode")});
     const backup: ?[]const u8 = if (src != null) try files.freshName(arena, dir, stem, ".json", ctx.now_unix) else null;
     if (backup) |b| say(out, "Backup: {s}", .{b});
     if (preview) {
         say(out, "Dry run: nothing changed.", .{});
+        sayProfiles(arena, out, display, profiles);
         return .{ .outcome = .unchanged };
     }
     const updated = try vscode.withBinding(arena, src);
@@ -362,27 +463,38 @@ fn installVscode(arena: std.mem.Allocator, ctx: Context, display: []const u8, fo
         say(out, "Could not write the backup ({s}): left unchanged.", .{@errorName(err)});
         return .{ .outcome = .failed };
     };
-    files.writeAtomic(path, updated, false) catch |err| {
-        say(out, "Could not write {s} ({s}): left unchanged.", .{ path, @errorName(err) });
+    // The record first: the file changes only once the record lists the change,
+    // so --restore always knows what it has to undo.
+    const before = record;
+    var entries: std.ArrayList(Record.VscodeEntry) = .empty;
+    for (record.vscode) |e| if (!std.mem.eql(u8, e.keybindings, path)) try entries.append(arena, e);
+    try entries.append(arena, .{ .keybindings = path, .product = product, .backup = backup });
+    record.vscode = entries.items;
+    saveRecord(arena, ctx.state_root, record) catch |err| {
+        say(out, "Could not save the install record ({s}): left unchanged.", .{@errorName(err)});
         return .{ .outcome = .failed };
     };
-    const written = files.read(arena, path) catch null;
+    files.writeAtomic(real, updated, false) catch |err| {
+        saveRecord(arena, ctx.state_root, before) catch {};
+        sayWriteFailed(out, path, real, err);
+        return .{ .outcome = .failed };
+    };
+    const written = files.read(arena, real) catch null;
     if (written == null or (vscode.classify(arena, written) catch Status.absent) != .installed) {
-        say(out, "{s} did not read back with the binding in it.", .{path});
+        say(out, "{s} did not read back with the binding in it. The record keeps the change: {s} undoes it.", .{ real, ctx.restore_hint });
         return .{ .outcome = .failed };
     }
 
-    var record = loadRecord(arena, ctx.state_root);
-    var entries: std.ArrayList(Record.VscodeEntry) = .empty;
-    for (record.vscode) |e| if (!std.mem.eql(u8, e.keybindings, path)) try entries.append(arena, e);
-    try entries.append(arena, .{ .keybindings = path, .backup = backup });
-    record.vscode = entries.items;
-    saveRecord(arena, ctx.state_root, record) catch |err| say(out, "Note: could not save the install record ({s}); undo it by hand from the backup.", .{@errorName(err)});
-
-    say(out, "Done. {s} reloads keybindings.json by itself: Shift+Enter inserts a newline in metacodes now.", .{display});
+    const everywhere = inEveryProfile(arena, true, profiles);
+    if (everywhere) {
+        say(out, "Done. {s} reloads keybindings.json by itself: Shift+Enter inserts a newline in metacodes now.", .{display});
+    } else {
+        say(out, "Done for windows that use the Default profile: {s} reloads keybindings.json by itself.", .{display});
+        sayProfiles(arena, out, display, profiles);
+    }
     say(out, "{s}", .{effect_note});
     say(out, "Undo: {s}", .{ctx.restore_hint});
-    return .{ .outcome = .changed, .binding_live = true };
+    return .{ .outcome = .changed, .binding_live = everywhere };
 }
 
 const Status = vscode.Status;
@@ -406,6 +518,7 @@ fn installApple(arena: std.mem.Allocator, ctx: Context, preview: bool, out: *std
         say(out, "Its settings are on the Mac it runs on: run `metacodes terminal-setup` there.", .{});
         return .{ .outcome = .refused };
     }
+    var record = try loadRecordOrSay(arena, ctx.state_root, out) orelse return .{ .outcome = .refused };
     const dir = try setupDir(arena, ctx.state_root);
     util_fs.mkdirParents(dir) catch {
         say(out, "Could not create {s} for the backup: left unchanged.", .{dir});
@@ -438,11 +551,11 @@ fn installApple(arena: std.mem.Allocator, ctx: Context, preview: bool, out: *std
             return .{ .outcome = .refused };
         },
     };
-    const previous = loadRecord(arena, ctx.state_root).apple_terminal;
+    const previous = record.apple_terminal;
     if (ready.steps.len == 0) {
         say(out, "Already set up: Shift+Return in the profile{s} {s} sends Esc+Return, which metacodes reads as a newline. Nothing changed.", .{ if (ready.already.len > 1) "s" else "", try quotedList(arena, ready.already) });
         if (previous) |p| if (p.terminal_pid != null and ctx.terminal_pid != null and p.terminal_pid.? == ctx.terminal_pid.?)
-            say(out, "This Terminal was running when it was set up: quit it (Cmd+Q) and open it again for Shift+Return to send the newline.", .{});
+            say(out, "The Terminal running now was running when it was set up: quit it (Cmd+Q) and open it again for Shift+Return to send the newline.", .{});
         return .{ .outcome = .unchanged };
     }
 
@@ -465,24 +578,9 @@ fn installApple(arena: std.mem.Allocator, ctx: Context, preview: bool, out: *std
         say(out, "Could not write the backup ({s}): left unchanged.", .{@errorName(err)});
         return .{ .outcome = .failed };
     };
-    const names = try arena.alloc([]const u8, ready.steps.len);
-    for (ready.steps, names) |step, *n| n.* = step.profile;
-    const verify_path = try workPath(arena, dir, "verify");
-    defer files.remove(verify_path);
-    const applied = blk: {
-        apple.apply(&prefs, ready.steps) catch break :blk false;
-        break :blk apple.verify(arena, ctx.apple, verify_path, names) catch false;
-    };
-    if (!applied) {
-        const why = try arena.dupe(u8, apple.lastFailure());
-        const rolled_back = rollback(arena, ctx.apple, backup);
-        say(out, "Terminal's settings did not take the change; {s}.", .{if (rolled_back) "they are back as they were" else "restoring them failed too"});
-        if (why.len > 0) say(out, "  {s}", .{why});
-        say(out, "To put them back by hand: defaults import {s} '{s}'", .{ ctx.apple.domain, backup });
-        return .{ .outcome = .failed };
-    }
 
-    var record = loadRecord(arena, ctx.state_root);
+    // The record first, as for VS Code.
+    const before = record;
     var installed: std.ArrayList(apple.Installed) = .empty;
     var backups: std.ArrayList([]const u8) = .empty;
     if (previous) |p| {
@@ -499,9 +597,30 @@ fn installApple(arena: std.mem.Allocator, ctx: Context, preview: bool, out: *std
     }
     try backups.append(arena, backup);
     record.apple_terminal = .{ .domain = ctx.apple.domain, .profiles = installed.items, .terminal_pid = ctx.terminal_pid, .backups = backups.items };
-    saveRecord(arena, ctx.state_root, record) catch |err| say(out, "Note: could not save the install record ({s}); `--restore` will not find this change. The backup above has the settings as they were.", .{@errorName(err)});
+    saveRecord(arena, ctx.state_root, record) catch |err| {
+        say(out, "Could not save the install record ({s}): left unchanged.", .{@errorName(err)});
+        return .{ .outcome = .failed };
+    };
 
-    say(out, "Done. Quit Terminal (Cmd+Q) and open it again: it reads its profiles when it starts, so this window and any new one keep sending a plain Return until then.", .{});
+    const names = try arena.alloc([]const u8, ready.steps.len);
+    for (ready.steps, names) |step, *n| n.* = step.profile;
+    const verify_path = try workPath(arena, dir, "verify");
+    defer files.remove(verify_path);
+    const applied = blk: {
+        apple.apply(&prefs, ready.steps) catch break :blk false;
+        break :blk apple.verify(arena, ctx.apple, verify_path, names) catch false;
+    };
+    if (!applied) {
+        const why = try arena.dupe(u8, apple.lastFailure());
+        const rolled_back = rollback(arena, ctx.apple, backup);
+        if (rolled_back) saveRecord(arena, ctx.state_root, before) catch {};
+        say(out, "Terminal's settings did not take the change; {s}.", .{if (rolled_back) "they are back as they were" else "restoring them failed too"});
+        if (why.len > 0) say(out, "  {s}", .{why});
+        say(out, "To put them back by hand: defaults import {s} '{s}'", .{ ctx.apple.domain, backup });
+        return .{ .outcome = .failed };
+    }
+
+    say(out, "Done. Quit Terminal (Cmd+Q) and open it again: it reads its profiles when it starts, so its windows keep sending a plain Return until then.", .{});
     say(out, "{s}", .{effect_note});
     say(out, "Undo: {s}. To put back all of Terminal's settings as they were: defaults import {s} '{s}' (with Terminal quit).", .{ ctx.restore_hint, ctx.apple.domain, backups.items[0] });
     return .{ .outcome = .changed };
@@ -522,14 +641,42 @@ fn quotedList(arena: std.mem.Allocator, names: []const []const u8) error{OutOfMe
     return out.items;
 }
 
+/// Whether a recorded VS Code entry is the one `target` names: the same file
+/// for `--keybindings`; for a build, an entry recorded for it, or for its
+/// default file.
+fn entryMatches(arena: std.mem.Allocator, ctx: Context, entry: Record.VscodeEntry, target: ?Target) error{OutOfMemory}!bool {
+    const t = target orelse return true;
+    return switch (t) {
+        .apple_terminal => false,
+        .keybindings => |path| std.mem.eql(u8, path, entry.keybindings),
+        .vscode => |p| blk: {
+            if (entry.product) |folder| break :blk std.mem.eql(u8, folder, p.data_folder);
+            const default_file = try vscode.keybindingsPath(arena, ctx.env, p) orelse break :blk false;
+            break :blk std.mem.eql(u8, default_file, entry.keybindings);
+        },
+    };
+}
+
 fn restoreAll(arena: std.mem.Allocator, ctx: Context, target: ?Target, out: *std.Io.Writer) !Report {
-    var record = loadRecord(arena, ctx.state_root);
+    var record = try loadRecordOrSay(arena, ctx.state_root, out) orelse return .{ .outcome = .failed };
     const want_apple = if (target) |t| t == .apple_terminal else true;
-    const want_vscode = if (target) |t| t != .apple_terminal else true;
     const has_apple = want_apple and record.apple_terminal != null;
-    const has_vscode = want_vscode and record.vscode.len > 0;
-    if (!has_apple and !has_vscode) {
+    var matched: usize = 0;
+    for (record.vscode) |entry| {
+        if (try entryMatches(arena, ctx, entry, target)) matched += 1;
+    }
+    if (!has_apple and matched == 0) {
         const where = if (ctx.state_root.len > 0) try recordPath(arena, ctx.state_root) else "(no state directory)";
+        if (target) |t| {
+            // A named terminal with nothing recorded is a mistake worth a non-zero exit.
+            const what: []const u8 = switch (t) {
+                .apple_terminal => "Apple Terminal",
+                .vscode => |p| p.display,
+                .keybindings => |path| path,
+            };
+            say(out, "Nothing to undo for {s}: no terminal setup of it is recorded in {s}.", .{ what, where });
+            return .{ .outcome = .refused };
+        }
         say(out, "Nothing to undo: no terminal setup is recorded in {s}.", .{where});
         return .{ .outcome = .unchanged };
     }
@@ -575,41 +722,60 @@ fn restoreAll(arena: std.mem.Allocator, ctx: Context, target: ?Target, out: *std
         if (entry.backups.len > 0) say(out, "  Backups kept in {s}.", .{dir});
     }
 
-    if (has_vscode) {
-        var kept: std.ArrayList(Record.VscodeEntry) = .empty;
-        for (record.vscode) |entry| {
-            if (target) |t| if (t == .keybindings and !std.mem.eql(u8, t.keybindings, entry.keybindings)) {
-                try kept.append(arena, entry);
-                continue;
-            };
-            const src = files.read(arena, entry.keybindings) catch |err| {
-                if (err == error.NotFound) {
-                    say(out, "{s}: gone; nothing to undo.", .{entry.keybindings});
-                } else {
-                    say(out, "{s}: could not read it ({s}); left as it is.", .{ entry.keybindings, @errorName(err) });
-                    try kept.append(arena, entry);
-                    outcome = .failed;
-                }
-                continue;
-            };
-            const updated = (vscode.withoutBinding(arena, src) catch null) orelse {
-                say(out, "{s}: the binding setup added is not in it any more; nothing to undo.", .{entry.keybindings});
-                continue;
-            };
-            files.writeAtomic(entry.keybindings, updated, false) catch |err| {
-                say(out, "{s}: could not write it ({s}); left as it is.", .{ entry.keybindings, @errorName(err) });
+    var kept: std.ArrayList(Record.VscodeEntry) = .empty;
+    for (record.vscode) |entry| {
+        if (!try entryMatches(arena, ctx, entry, target)) {
+            try kept.append(arena, entry);
+            continue;
+        }
+        const real = switch (try files.link(arena, entry.keybindings)) {
+            .none => entry.keybindings,
+            .to => |file| file,
+            .dangling => {
+                say(out, "{s}: a link to a file that does not exist; left as it is (the record keeps it).", .{entry.keybindings});
                 try kept.append(arena, entry);
                 outcome = .failed;
                 continue;
-            };
-            say(out, "{s}: the Shift+Enter binding setup added is removed.", .{entry.keybindings});
-            if (entry.backup) |b| say(out, "  The file as it was before setup: {s}", .{b});
-            if (outcome != .failed) outcome = .changed;
-            binding_live = (vscode.classify(arena, updated) catch Status.absent) == .installed;
-        }
-        record.vscode = kept.items;
+            },
+        };
+        const src = files.read(arena, real) catch |err| {
+            if (err == error.NotFound) {
+                say(out, "{s}: gone; nothing to undo.", .{entry.keybindings});
+            } else {
+                say(out, "{s}: could not read it ({s}); left as it is (the record keeps it).", .{ real, @errorName(err) });
+                try kept.append(arena, entry);
+                outcome = .failed;
+            }
+            continue;
+        };
+        const updated = vscode.withoutBinding(arena, src) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.InvalidJsonc, error.NotAnArray => {
+                say(out, "{s}: {s}, so the binding cannot be taken out; left as it is (the record keeps it). Fix the file, then run this again.", .{ real, if (err == error.NotAnArray) "its top level is not an array" else "it does not parse" });
+                try kept.append(arena, entry);
+                outcome = .failed;
+                continue;
+            },
+        } orelse {
+            say(out, "{s}: the binding setup added is not in it any more; nothing to undo.", .{entry.keybindings});
+            continue;
+        };
+        files.writeAtomic(real, updated, false) catch |err| {
+            sayWriteFailed(out, entry.keybindings, real, err);
+            try kept.append(arena, entry);
+            outcome = .failed;
+            continue;
+        };
+        say(out, "{s}: the Shift+Enter binding setup added is removed.", .{real});
+        if (entry.backup) |b| say(out, "  The file as it was before setup: {s}", .{b});
+        if (outcome != .failed) outcome = .changed;
+        binding_live = false;
     }
-    if (ctx.state_root.len > 0) saveRecord(arena, ctx.state_root, record) catch |err| say(out, "Note: could not update the install record ({s}).", .{@errorName(err)});
+    record.vscode = kept.items;
+    if (ctx.state_root.len > 0) saveRecord(arena, ctx.state_root, record) catch |err| {
+        say(out, "Could not update the install record ({s}).", .{@errorName(err)});
+        outcome = .failed;
+    };
     return .{ .outcome = outcome, .binding_live = binding_live };
 }
 
@@ -624,10 +790,14 @@ fn profileNames(arena: std.mem.Allocator, profiles: []const apple.Installed) err
 /// Whether Shift+Enter reaches this session as a newline through a terminal
 /// binding, so the footer can say so (`input.recordNewlineBinding`):
 /// - VS Code: its `keybindings.json` binds Shift+Enter to the newline sequence
-///   (whoever wrote it; a file read);
-/// - Apple Terminal: this command recorded a mapping, Terminal has been
-///   reopened since (a different pid), and the mapping is still in its
-///   preferences (one plutil run, paid only by sessions that ran setup).
+///   (whoever wrote it), and so does that of every profile with shortcuts of
+///   its own, since which profile this window uses is not visible from here;
+/// - Apple Terminal: this command recorded a mapping, the Terminal running now
+///   is not the one that was running then (it reads profiles at launch), and
+///   the mapping is still in its preferences (one plutil run, paid only by
+///   sessions that ran setup). Which profile this window uses is not visible
+///   either: one of the recorded ones (the default and startup profiles) is
+///   assumed.
 pub fn bindingLive(gpa: std.mem.Allocator, env: Env, state_root: []const u8) bool {
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
@@ -636,11 +806,15 @@ pub fn bindingLive(gpa: std.mem.Allocator, env: Env, state_root: []const u8) boo
         .vscode => {
             const path = (vscode.keybindingsPath(arena, env, vscode.product(arena, env)) catch return false) orelse return false;
             const src = files.read(arena, path) catch return false;
-            return (vscode.classify(arena, src) catch return false) == .installed;
+            const installed = (vscode.classify(arena, src) catch return false) == .installed;
+            const user_dir = std.fs.path.dirname(path) orelse return false;
+            const profiles = vscode.ownShortcutProfiles(arena, user_dir) catch return false;
+            return inEveryProfile(arena, installed, profiles);
         },
         .apple_terminal => {
             if (builtin.os.tag != .macos) return false;
-            const entry = loadRecord(arena, state_root).apple_terminal orelse return false;
+            const record = loadRecord(arena, state_root) catch return false;
+            const entry = record.apple_terminal orelse return false;
             return appleLive(arena, entry, apple.terminalPid(), env.home);
         },
         else => return false,
@@ -666,9 +840,10 @@ fn prefsFile(arena: std.mem.Allocator, domain: []const u8, home: ?[]const u8) er
 
 fn appleLive(arena: std.mem.Allocator, entry: Record.AppleEntry, terminal_pid: ?i32, home: ?[]const u8) bool {
     // Not under Terminal, or under the very Terminal that was running when the
-    // mapping went in: it sends a plain Return still.
+    // mapping went in: it sends a plain Return still. No Terminal running then
+    // (null): any Terminal now has read the mapping.
     const pid = terminal_pid orelse return false;
-    if (entry.terminal_pid) |installed_under| if (installed_under == pid) return false;
+    if (entry.terminal_pid) |running_then| if (running_then == pid) return false;
     const file = (prefsFile(arena, entry.domain, home) catch return false) orelse return false;
     const names = profileNames(arena, entry.profiles) catch return false;
     return apple.mapped(arena, file, names);
@@ -683,8 +858,9 @@ test "the newline sequence is what KeyParser reads as Shift+Enter" {
     var parser: input.KeyParser = .{};
     var keys: std.ArrayList(input.Key) = .empty;
     defer keys.deinit(testing.allocator);
-    for (newline_sequence) |b| {
-        if (parser.feed(b)) |k| try keys.append(testing.allocator, k);
+    // A terminal writes the binding's two bytes at once.
+    for (newline_sequence, 0..) |b, i| {
+        if (parser.feedQueued(b, i + 1 < newline_sequence.len)) |k| try keys.append(testing.allocator, k);
         while (parser.drain()) |k| try keys.append(testing.allocator, k);
     }
     try testing.expectEqual(@as(usize, 1), keys.items.len);
@@ -788,7 +964,7 @@ test "run vscode: a missing file is created, a second run changes nothing, resto
     try testing.expectEqual(Status.absent, try vscode.classify(testing.allocator, after));
     try testing.expect(!bindingLive(testing.allocator, env, ctx.state_root));
     // The record is gone with the last entry.
-    try testing.expect(loadRecord(h.arena_state.allocator(), ctx.state_root).vscode.len == 0);
+    try testing.expect((try loadRecord(h.arena_state.allocator(), ctx.state_root)).vscode.len == 0);
     h.reset();
     try testing.expectEqual(Outcome.unchanged, run(testing.allocator, ctx, .{ .action = .restore }, &h.out.writer).outcome);
     try testing.expect(std.mem.indexOf(u8, h.report(), "Nothing to undo") != null);
@@ -862,6 +1038,157 @@ test "run vscode: a conflicting binding and a broken file are left alone, withou
     try testing.expect(std.mem.indexOf(u8, h.report(), "--keybindings") != null);
 }
 
+test "run vscode: a keybindings.json that is a link: the file it links to changes, the link stays" {
+    const h = try Harness.init();
+    defer h.deinit();
+    const arena = h.arena_state.allocator();
+    const original = "[\n]\n";
+    try h.tmp.dir.createDirPath(testing.io, "dotfiles");
+    try h.tmp.dir.writeFile(testing.io, .{ .sub_path = "dotfiles/keybindings.json", .data = original });
+    try h.tmp.dir.createDirPath(testing.io, "cfg/Code/User");
+    const target = try h.join(&.{ "dotfiles", "keybindings.json" });
+    try @import("platform").test_support.symlinkOrSkip(h.tmp.dir, testing.io, target, "cfg/Code/User/keybindings.json", .{});
+    const env: Env = .{ .term_program = "vscode", .os = .other, .home = h.root, .xdg_config_home = try h.join(&.{"cfg"}) };
+    const ctx = try h.ctx(env);
+    const link_path = try h.join(&.{ "cfg", "Code", "User", "keybindings.json" });
+
+    try testing.expectEqual(Outcome.changed, run(testing.allocator, ctx, .{}, &h.out.writer).outcome);
+    try testing.expect(std.mem.indexOf(u8, h.report(), "is a link to") != null);
+    var buf: [std.fs.max_path_bytes:0]u8 = undefined;
+    @memcpy(buf[0..link_path.len], link_path);
+    buf[link_path.len] = 0;
+    try testing.expect(@import("platform").fs.isSymlink(buf[0..link_path.len :0]));
+    try testing.expectEqual(Status.installed, try vscode.classify(arena, try files.read(arena, target)));
+
+    h.reset();
+    try testing.expectEqual(Outcome.changed, run(testing.allocator, ctx, .{ .action = .restore }, &h.out.writer).outcome);
+    try testing.expect(@import("platform").fs.isSymlink(buf[0..link_path.len :0]));
+    try testing.expectEqualStrings(original, try files.read(arena, target));
+
+    // A link to nothing is refused, and nothing is created behind it.
+    h.reset();
+    try h.tmp.dir.createDirPath(testing.io, "cfg2/Code/User");
+    try @import("platform").test_support.symlinkOrSkip(h.tmp.dir, testing.io, try h.join(&.{ "dotfiles", "gone.json" }), "cfg2/Code/User/keybindings.json", .{});
+    const dangling: Env = .{ .term_program = "vscode", .os = .other, .home = h.root, .xdg_config_home = try h.join(&.{"cfg2"}) };
+    try testing.expectEqual(Outcome.refused, run(testing.allocator, try h.ctx(dangling), .{}, &h.out.writer).outcome);
+    try testing.expect(std.mem.indexOf(u8, h.report(), "does not exist") != null);
+    try testing.expect(!files.exists(try h.join(&.{ "dotfiles", "gone.json" })));
+}
+
+test "run vscode: --restore --terminal undoes only that build; a named file with nothing recorded fails" {
+    const h = try Harness.init();
+    defer h.deinit();
+    const arena = h.arena_state.allocator();
+    try h.tmp.dir.createDirPath(testing.io, "cfg/Code/User");
+    try h.tmp.dir.createDirPath(testing.io, "cfg/Cursor/User");
+    const code_env: Env = .{ .term_program = "vscode", .os = .other, .home = h.root, .xdg_config_home = try h.join(&.{"cfg"}) };
+    var cursor_env = code_env;
+    cursor_env.cursor_trace_id = true;
+    try testing.expectEqual(Outcome.changed, run(testing.allocator, try h.ctx(code_env), .{}, &h.out.writer).outcome);
+    try testing.expectEqual(Outcome.changed, run(testing.allocator, try h.ctx(cursor_env), .{}, &h.out.writer).outcome);
+    const code_file = try h.join(&.{ "cfg", "Code", "User", "keybindings.json" });
+    const cursor_file = try h.join(&.{ "cfg", "Cursor", "User", "keybindings.json" });
+
+    h.reset();
+    const undo = run(testing.allocator, try h.ctx(code_env), .{ .action = .restore, .target = .{ .vscode = vscode.cursor } }, &h.out.writer);
+    try testing.expectEqual(Outcome.changed, undo.outcome);
+    try testing.expectEqual(Status.absent, try vscode.classify(arena, try files.read(arena, cursor_file)));
+    try testing.expectEqual(Status.installed, try vscode.classify(arena, try files.read(arena, code_file)));
+    const left = try loadRecord(arena, (try h.ctx(code_env)).state_root);
+    try testing.expectEqual(@as(usize, 1), left.vscode.len);
+    try testing.expectEqualStrings("Code", left.vscode[0].product.?);
+
+    // Undoing Cursor again, or a file never set up: said, and not a success.
+    h.reset();
+    try testing.expectEqual(Outcome.refused, run(testing.allocator, try h.ctx(code_env), .{ .action = .restore, .target = .{ .vscode = vscode.cursor } }, &h.out.writer).outcome);
+    try testing.expect(std.mem.indexOf(u8, h.report(), "Nothing to undo for Cursor") != null);
+    h.reset();
+    const other = try h.join(&.{ "elsewhere", "keybindings.json" });
+    try testing.expectEqual(Outcome.refused, run(testing.allocator, try h.ctx(code_env), .{ .action = .restore, .target = .{ .keybindings = other } }, &h.out.writer).outcome);
+    try testing.expect(std.mem.indexOf(u8, h.report(), other) != null);
+    try testing.expectEqual(Status.installed, try vscode.classify(arena, try files.read(arena, code_file)));
+}
+
+test "run vscode: restore keeps the record when the file does not parse, and finishes once it does" {
+    const h = try Harness.init();
+    defer h.deinit();
+    const arena = h.arena_state.allocator();
+    try h.tmp.dir.createDirPath(testing.io, "cfg/Code/User");
+    const env: Env = .{ .term_program = "vscode", .os = .other, .home = h.root, .xdg_config_home = try h.join(&.{"cfg"}) };
+    const ctx = try h.ctx(env);
+    try testing.expectEqual(Outcome.changed, run(testing.allocator, ctx, .{}, &h.out.writer).outcome);
+    const file = try h.join(&.{ "cfg", "Code", "User", "keybindings.json" });
+    const good = try files.read(arena, file);
+    // The user leaves a stray comma before the end.
+    const broken = try std.mem.concat(arena, u8, &.{ good[0..std.mem.lastIndexOfScalar(u8, good, ']').?], ",,]\n" });
+    try files.writeAtomic(file, broken, false);
+
+    h.reset();
+    try testing.expectEqual(Outcome.failed, run(testing.allocator, ctx, .{ .action = .restore }, &h.out.writer).outcome);
+    try testing.expect(std.mem.indexOf(u8, h.report(), "does not parse") != null);
+    try testing.expectEqualStrings(broken, try files.read(arena, file));
+    try testing.expectEqual(@as(usize, 1), (try loadRecord(arena, ctx.state_root)).vscode.len);
+
+    try files.writeAtomic(file, good, false);
+    h.reset();
+    try testing.expectEqual(Outcome.changed, run(testing.allocator, ctx, .{ .action = .restore }, &h.out.writer).outcome);
+    try testing.expectEqual(Status.absent, try vscode.classify(arena, try files.read(arena, file)));
+    try testing.expectEqual(@as(usize, 0), (try loadRecord(arena, ctx.state_root)).vscode.len);
+}
+
+test "run: a record that cannot be read stops install and restore before anything changes" {
+    const h = try Harness.init();
+    defer h.deinit();
+    const arena = h.arena_state.allocator();
+    try h.tmp.dir.createDirPath(testing.io, "cfg/Code/User");
+    try h.tmp.dir.createDirPath(testing.io, "state/terminal-setup");
+    const garbage = "{\"vscode\": [ {\"keybindings\": \"/other/file\"";
+    try h.tmp.dir.writeFile(testing.io, .{ .sub_path = "state/terminal-setup/installed.json", .data = garbage });
+    const env: Env = .{ .term_program = "vscode", .os = .other, .home = h.root, .xdg_config_home = try h.join(&.{"cfg"}) };
+    const ctx = try h.ctx(env);
+
+    try testing.expectEqual(Outcome.refused, run(testing.allocator, ctx, .{}, &h.out.writer).outcome);
+    try testing.expect(std.mem.indexOf(u8, h.report(), "cannot be read") != null);
+    try testing.expect(!files.exists(try h.join(&.{ "cfg", "Code", "User", "keybindings.json" })));
+    h.reset();
+    try testing.expectEqual(Outcome.failed, run(testing.allocator, ctx, .{ .action = .restore }, &h.out.writer).outcome);
+    // The record is left exactly as it was.
+    try testing.expectEqualStrings(garbage, try files.read(arena, try h.join(&.{ "state", "terminal-setup", "installed.json" })));
+}
+
+test "run vscode: profiles with their own shortcuts are named, and the footer waits for all of them" {
+    const h = try Harness.init();
+    defer h.deinit();
+    const arena = h.arena_state.allocator();
+    try h.tmp.dir.createDirPath(testing.io, "cfg/Code/User/globalStorage");
+    try h.tmp.dir.createDirPath(testing.io, "cfg/Code/User/profiles/1d77a59e");
+    try h.tmp.dir.writeFile(testing.io, .{ .sub_path = "cfg/Code/User/globalStorage/storage.json", .data =
+        \\{"userDataProfiles":[{"location":"1d77a59e","name":"tsprobe"},{"location":"5c2e","name":"shared","useDefaultFlags":{"keybindings":true}}]}
+    });
+    const env: Env = .{ .term_program = "vscode", .os = .other, .home = h.root, .xdg_config_home = try h.join(&.{"cfg"}) };
+    const ctx = try h.ctx(env);
+    const profile_file = try h.join(&.{ "cfg", "Code", "User", "profiles", "1d77a59e", "keybindings.json" });
+
+    const first = run(testing.allocator, ctx, .{}, &h.out.writer);
+    try testing.expectEqual(Outcome.changed, first.outcome);
+    try testing.expectEqual(@as(?bool, false), first.binding_live);
+    try testing.expect(std.mem.indexOf(u8, h.report(), "Done for windows that use the Default profile") != null);
+    try testing.expect(std.mem.indexOf(u8, h.report(), profile_file) != null);
+    // The profile that shares the Default's shortcuts is not listed.
+    try testing.expect(std.mem.indexOf(u8, h.report(), "\"shared\"") == null);
+    try testing.expect(!bindingLive(testing.allocator, env, ctx.state_root));
+
+    // Setting up the profile's own file as told; now every window has it.
+    h.reset();
+    try testing.expectEqual(Outcome.changed, run(testing.allocator, ctx, .{ .target = .{ .keybindings = profile_file } }, &h.out.writer).outcome);
+    try testing.expect(bindingLive(testing.allocator, env, ctx.state_root));
+    h.reset();
+    const again = run(testing.allocator, ctx, .{}, &h.out.writer);
+    try testing.expectEqual(@as(?bool, true), again.binding_live);
+    try testing.expect(std.mem.indexOf(u8, h.report(), "set up already") != null);
+    try testing.expectEqual(@as(usize, 2), (try loadRecord(arena, ctx.state_root)).vscode.len);
+}
+
 test "run: native terminals, tmux and unknown ones change nothing" {
     const h = try Harness.init();
     defer h.deinit();
@@ -910,17 +1237,17 @@ test "record: round trip, and an empty record removes the file" {
         .vscode = &.{.{ .keybindings = "/k.json", .backup = null }},
     };
     try saveRecord(arena, root, rec);
-    const back = loadRecord(arena, root);
+    const back = try loadRecord(arena, root);
     try testing.expectEqualStrings("Clear Dark", back.apple_terminal.?.profiles[0].profile);
     try testing.expect(back.apple_terminal.?.profiles[0].seeded);
     try testing.expectEqual(@as(?i32, 4064), back.apple_terminal.?.terminal_pid);
     try testing.expectEqualStrings("/k.json", back.vscode[0].keybindings);
     try saveRecord(arena, root, .{});
     try testing.expect(!files.exists(try recordPath(arena, root)));
-    // Garbage reads as no record.
+    // A record that cannot be read is an error, never an empty record a save would overwrite.
     try h.tmp.dir.createDirPath(testing.io, "state/terminal-setup");
     try h.tmp.dir.writeFile(testing.io, .{ .sub_path = "state/terminal-setup/installed.json", .data = "{nope" });
-    try testing.expect(loadRecord(arena, root).apple_terminal == null);
+    try testing.expectError(error.RecordUnreadable, loadRecord(arena, root));
 }
 
 test "printable spells out control characters" {
@@ -957,7 +1284,7 @@ test "run apple terminal (macOS): set up, a dry run, a second run, the record, r
 
     try testing.expectEqual(Outcome.unchanged, run(testing.allocator, ctx, .{ .action = .preview }, &h.out.writer).outcome);
     try testing.expect(std.mem.indexOf(u8, h.report(), "copy of Terminal's built-in one") != null);
-    try testing.expect(loadRecord(arena, ctx.state_root).apple_terminal == null);
+    try testing.expect((try loadRecord(arena, ctx.state_root)).apple_terminal == null);
 
     h.reset();
     const r = run(testing.allocator, ctx, .{}, &h.out.writer);
@@ -966,7 +1293,7 @@ test "run apple terminal (macOS): set up, a dry run, a second run, the record, r
     try testing.expect(std.mem.indexOf(u8, h.report(), "Quit Terminal") != null);
     const backup = try h.join(&.{ "state", "terminal-setup", "apple-terminal-20261029-021534.plist" });
     try testing.expect(files.exists(backup));
-    const rec = loadRecord(arena, ctx.state_root).apple_terminal.?;
+    const rec = (try loadRecord(arena, ctx.state_root)).apple_terminal.?;
     try testing.expectEqualStrings("Basic", rec.profiles[0].profile);
     try testing.expect(rec.profiles[0].seeded);
     try testing.expectEqual(@as(?i32, 4242), rec.terminal_pid);
@@ -985,7 +1312,7 @@ test "run apple terminal (macOS): set up, a dry run, a second run, the record, r
     h.reset();
     try testing.expectEqual(Outcome.changed, run(testing.allocator, ctx, .{ .action = .restore }, &h.out.writer).outcome);
     try testing.expect(std.mem.indexOf(u8, h.report(), "built-in one again") != null);
-    try testing.expect(loadRecord(arena, ctx.state_root).apple_terminal == null);
+    try testing.expect((try loadRecord(arena, ctx.state_root)).apple_terminal == null);
     try testing.expect(!appleLive(arena, rec, 4343, h.root));
     try testing.expect(files.exists(backup));
 }

@@ -109,6 +109,66 @@ def test_esc_cr_inserts_a_newline(bin_path):
     a.assert_line_contains(top + 2, "def")
 
 
+# A person's Esc, then Enter, inside the ESC wait (200 ms) but in two writes: two keys.
+# Only an ESC CR that arrives in one write (a terminal's Meta+Return) is a newline.
+SEPARATE_ESC_ENTER = ["raw:\\x1b", "strictsleep:0.06", "raw:\\x0d"]
+APPLE = {"TERM_PROGRAM": "Apple_Terminal", "TERM": "xterm-256color"}
+
+
+def _screen_text(raw):
+    sc = Screen(24, 80)
+    sc.feed(raw)
+    return "\n".join(sc.line_text(r) for r in range(sc.rows))
+
+
+def test_esc_then_enter_pressed_apart_still_submits(bin_path):
+    raw = run(bin_path, ["sleep:0.8", "type:abc"] + SEPARATE_ESC_ENTER + ["sleep:0.8"],
+              env=APPLE, per_key_drain=0.02)
+    a = TTYAssert(raw)
+    a.assert_box_present()
+    a.assert_input_echo("")  # submitted: the box is empty again
+    assert "abc" in _screen_text(raw), "the submitted prompt should be echoed above the box"
+
+
+def test_vim_insert_esc_then_enter_apart_goes_normal_then_submits(bin_path):
+    events = ["sleep:0.8", "type:/vim", "key:enter", "wait:Editor mode: vim:5", "type:abc"]
+    raw = run(bin_path, events + SEPARATE_ESC_ENTER + ["sleep:0.8"], env=APPLE, per_key_drain=0.02)
+    a = TTYAssert(raw)
+    a.assert_input_echo("")  # Esc → NORMAL, Enter → submit, as before ESC CR was a key
+
+
+def test_vim_insert_esc_cr_in_one_write_is_a_newline(bin_path):
+    events = ["sleep:0.8", "type:/vim", "key:enter", "wait:Editor mode: vim:5", "type:abc",
+              "raw:\\x1b\\x0d", "type:def", "sleep:0.4"]
+    raw = run(bin_path, events, env=APPLE, per_key_drain=0.02)
+    a = TTYAssert(raw)
+    a.assert_box_height(2)
+    top = a.box_top_row()
+    a.assert_line_contains(top + 1, "abc")
+    a.assert_line_contains(top + 2, "def")
+
+
+def test_reverse_search_esc_then_enter_apart_cancels(bin_path):
+    events = ["sleep:0.8", "type:hello", "key:enter", "sleep:1.0",
+              "key:ctrl_r", "wait:(reverse-search):5", "type:hel", "sleep:0.3"]
+    raw = run(bin_path, events + SEPARATE_ESC_ENTER + ["sleep:0.8"], env=APPLE, per_key_drain=0.02)
+    a = TTYAssert(raw)
+    # Esc cancelled the search (the prompt keeps its empty input); accepting would
+    # have put "hello" back in the box.
+    a.assert_input_echo("")
+    tail = _screen_text(raw).splitlines()[-4:]
+    assert not any("(reverse-search)" in line for line in tail), "the search should be closed:\n" + "\n".join(tail)
+
+
+def test_paste_keeps_esc_cr_as_a_line_break(bin_path):
+    raw = run(bin_path, ["sleep:0.8", "raw:\\x1b[200~a\\x1b\\x0db\\x1b[201~", "sleep:0.5"], env=APPLE)
+    a = TTYAssert(raw)
+    a.assert_box_height(2)
+    top = a.box_top_row()
+    a.assert_line_contains(top + 1, "a")
+    a.assert_line_contains(top + 2, "b")
+
+
 def _multiline_footer(bin_path, term_program):
     # 组多行(backslash 续行)后抓 footer 文案。Apple 用裸回车续行,Kitty 终端用 shift_enter。
     if term_program == "Apple_Terminal":

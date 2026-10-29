@@ -22,6 +22,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const process = @import("platform").process;
+const process_scan = @import("platform").process_scan;
 const log = @import("../../util/log.zig");
 const files = @import("files.zig");
 const setup = @import("setup.zig");
@@ -392,6 +393,23 @@ fn shortInfo(pid: c_int) ?ShortBsdInfo {
     return info;
 }
 
+/// The Terminal.app process running now for this user, or null when none is:
+/// the one this process runs under, else any (setup run from iTerm2 with
+/// `--terminal apple-terminal`). Recorded at install: that Terminal keeps the
+/// profiles it read at launch, a later one has the mapping.
+pub fn runningTerminalPid(arena: std.mem.Allocator, io: std.Io) ?i32 {
+    if (builtin.os.tag != .macos) return null;
+    if (terminalPid()) |pid| return pid;
+    const procs = process_scan.listUnder(arena, io, default_app) catch return null;
+    const uid = std.c.getuid();
+    for (procs) |p| {
+        if (!std.mem.endsWith(u8, p.exe, "/Contents/MacOS/Terminal")) continue;
+        const info = shortInfo(@intCast(p.pid)) orelse continue;
+        if (info.uid == uid) return @intCast(p.pid);
+    }
+    return null;
+}
+
 /// The pid of the Terminal.app process this one runs under, or null (not
 /// macOS, not in Terminal, or the walk could not read an ancestor). Terminal
 /// gets a new pid when it is reopened, so a pid that differs from the one
@@ -687,6 +705,15 @@ test "apple terminal: terminalPid walks the real process tree" {
     // The test runner is not under Terminal.app on CI; under it, the pid found
     // is an ancestor named Terminal.
     if (terminalPid()) |pid| try testing.expectEqualStrings("Terminal", std.mem.sliceTo(&shortInfo(pid).?.comm, 0));
+    // runningTerminalPid also finds a Terminal that is not an ancestor; whatever
+    // it finds is a Terminal of this user.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    if (runningTerminalPid(arena_state.allocator(), testing.io)) |pid| {
+        const info = shortInfo(pid).?;
+        try testing.expectEqualStrings("Terminal", std.mem.sliceTo(&info.comm, 0));
+        try testing.expectEqual(@as(u32, std.c.getuid()), info.uid);
+    }
 }
 
 test "keypathComponent escapes dots and refuses backslashes and a leading @" {

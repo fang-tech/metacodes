@@ -1809,7 +1809,7 @@ fn readLineRaw(
                 continue;
             }
 
-            break :blk parser.feed(b[0]) orelse continue;
+            break :blk parser.feedRead(fd, b[0]) orelse continue;
         };
 
         // vim INSERT 模式下 Esc → 回 NORMAL(不走 LineEditor 的 esc 语义)
@@ -4723,7 +4723,7 @@ fn handleTerminalSetup(app: *app_mod.App, allocator: std.mem.Allocator, rest: []
         .env = env,
         .state_root = app.stateRoot(),
         .now_unix = util_time.nowUnix(),
-        .terminal_pid = @import("../app/terminal_setup/apple_terminal.zig").terminalPid(),
+        .terminal_pid = @import("../app/terminal_setup/apple_terminal.zig").runningTerminalPid(arena_state.allocator(), app.io),
         .keyboard_protocol = input.shouldEnableKittyKeyboard(),
         .restore_hint = "/terminal-setup restore (or metacodes terminal-setup --restore)",
     }, .{ .action = action }, &out.writer);

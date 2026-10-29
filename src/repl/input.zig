@@ -70,7 +70,8 @@ pub const Key = union(enum) {
 ///   ESC [ <num>;<mod> u   CSI u（xterm modifyOtherKeys kitty 扩展）
 ///     - 13;2 u = Shift+Enter
 ///     - 13;5 u = Ctrl+Enter
-///   ESC CR            Meta+Return = Shift+Enter(/terminal-setup 装进终端的绑定)
+///   ESC CR            Meta+Return = Shift+Enter(/terminal-setup 装进终端的绑定),仅当两字节
+///                     同批到达(feedRead / feedQueued);一字节一字节的 feed 仍是 Esc + Enter
 pub const KeyParser = struct {
     state: State = .normal,
     num1: u32 = 0,
@@ -78,6 +79,9 @@ pub const KeyParser = struct {
     // 一字节 feed 偶尔需吐两个键(ESC 后紧跟普通字符 = 孤立 ESC + 该字符):
     // feed 返回第一个(.esc),把第二个键暂存这里,调用方 feed 后须 while(drain())|k| 排空。
     pending: ?Key = null,
+    // 待定 ESC 读进来时,后面的字节是否已在输入队列里(feedRead 查 waitReadable(fd, 0))。终端把
+    // Meta+Return 一次写出 ESC CR,读到 ESC 时 CR 已在队列;人先按 Esc 再按 Enter 是两次输入。
+    esc_burst: bool = false,
 
     const State = enum { normal, esc_seen, csi_seen, csi_num1, csi_semi, csi_num2 };
 
@@ -102,7 +106,21 @@ pub const KeyParser = struct {
         return .esc;
     }
 
+    /// 从终端读到的一个字节:ESC 时记下它后面是否已有字节在等(同一批写入)。读终端的调用方用它;
+    /// 括号粘贴里的字节用 feed(粘贴内容按原样,ESC CR 不当换行键)。
+    pub fn feedRead(self: *KeyParser, fd: c_int, b: u8) ?Key {
+        return self.feedQueued(b, b == 0x1b and platform_term.waitReadable(fd, 0) > 0);
+    }
+
+    /// feedRead 去掉终端:`more_queued` = 这个字节读进来时后面已有字节在等(仅对 ESC 有意义)。
+    pub fn feedQueued(self: *KeyParser, b: u8, more_queued: bool) ?Key {
+        const key = self.feed(b);
+        if (b == 0x1b) self.esc_burst = more_queued;
+        return key;
+    }
+
     pub fn feed(self: *KeyParser, b: u8) ?Key {
+        if (b == 0x1b) self.esc_burst = false;
         switch (self.state) {
             .normal => {
                 if (b == 0x1b) {
@@ -123,9 +141,11 @@ pub const KeyParser = struct {
                 switch (b) {
                     'b', 'B' => return .alt_b,
                     'f', 'F' => return .alt_f,
-                    // ESC CR(Meta+Return)= 换行,同 Kitty 的 13;2u:/terminal-setup 让 Apple Terminal 的
-                    // Shift+Return、VS Code 的 shift+enter 发的就是它(Claude Code 的 VS Code 绑定同款)。
-                    '\r' => return .shift_enter,
+                    // 同批到达的 ESC CR(Meta+Return)= 换行,同 Kitty 的 13;2u:/terminal-setup 让
+                    // Apple Terminal 的 Shift+Return、VS Code 的 shift+enter 发的就是它(Claude Code 的
+                    // VS Code 绑定同款;xterm/VTE/Konsole/Alacritty 的 Alt+Enter 也是)。分两次到达的是
+                    // 人按的 Esc 再按 Enter:照旧两个键(vim 回 NORMAL 后提交、反向搜索取消)。
+                    '\r' => if (self.esc_burst) return .shift_enter,
                     else => {},
                 }
                 // ESC ESC:第二个 ESC 重新开始一个待定序列。兑现第一个 .esc,自身回 esc_seen
@@ -365,7 +385,7 @@ pub fn readKey(fd: c_int, parser: *KeyParser) KeyRead {
         const n = platform_term.readInput(fd, &b);
         if (n < 0) return if (retryInterruptedRead(fd)) .interrupted else .closed;
         if (n == 0) return .closed;
-        if (parser.feed(b[0])) |key| return .{ .key = key };
+        if (parser.feedRead(fd, b[0])) |key| return .{ .key = key };
     }
 }
 
@@ -1403,29 +1423,50 @@ test "LineEditor: multi-key stream through KeyParser" {
     try testing.expectEqualStrings("abc", ed.view());
 }
 
-test "KeyParser: ESC CR(/terminal-setup 绑定发的 Meta+Return)是 Shift+Enter" {
+test "KeyParser: 同批到达的 ESC CR(/terminal-setup 绑定发的 Meta+Return)是 Shift+Enter" {
     var p = KeyParser{};
-    try testing.expect(p.feed(0x1b) == null);
-    try testing.expect(p.feed('\r').? == .shift_enter);
+    // 终端一次写出 ESC CR:读到 ESC 时 CR 已在队列。
+    try testing.expect(p.feedQueued(0x1b, true) == null);
+    try testing.expect(p.feedQueued('\r', false).? == .shift_enter);
     try testing.expect(p.drain() == null);
     try testing.expect(!p.pendingEsc());
-    // 读循环已按超时兑现的 Esc 仍是 Esc,随后的 CR 照常提交。
-    try testing.expect(p.feed(0x1b) == null);
-    try testing.expect(p.flushEsc().? == .esc);
-    try testing.expect(p.feed('\r').? == .enter);
     // ESC LF 不是这个绑定:照旧 Esc + Enter 两键。
-    try testing.expect(p.feed(0x1b) == null);
-    try testing.expect(p.feed('\n').? == .esc);
+    try testing.expect(p.feedQueued(0x1b, true) == null);
+    try testing.expect(p.feedQueued('\n', false).? == .esc);
     try testing.expect(p.drain().? == .enter);
 }
 
-test "LineEditor: ESC CR 经 KeyParser 插换行,单独的 CR 提交" {
+test "KeyParser: 人按的 Esc 再按 Enter(分两次到达)仍是 Esc + Enter" {
+    var p = KeyParser{};
+    // 读到 ESC 时后面没有字节在等:哪怕 Enter 在 ESC 超时前到达,也是两个键。
+    try testing.expect(p.feedQueued(0x1b, false) == null);
+    try testing.expect(p.feedQueued('\r', false).? == .esc);
+    try testing.expect(p.drain().? == .enter);
+    // 读循环已按超时兑现的 Esc 同样。
+    try testing.expect(p.feedQueued(0x1b, false) == null);
+    try testing.expect(p.flushEsc().? == .esc);
+    try testing.expect(p.feedQueued('\r', false).? == .enter);
+    // 逐字节 feed(括号粘贴的读法)不知道批次:ESC CR 照旧是 Esc + Enter,粘贴内容不变。
+    try testing.expect(p.feed(0x1b) == null);
+    try testing.expect(p.feed('\r').? == .esc);
+    try testing.expect(p.drain().? == .enter);
+    // 上一个 ESC 的"同批"不会粘到下一个 ESC 上。
+    try testing.expect(p.feedQueued(0x1b, true) == null);
+    try testing.expect(p.feedQueued('x', false).? == .esc);
+    try testing.expectEqual(@as(u8, 'x'), p.drain().?.char);
+    try testing.expect(p.feed(0x1b) == null);
+    try testing.expect(p.feed('\r').? == .esc);
+    try testing.expect(p.drain().? == .enter);
+}
+
+test "LineEditor: 同批的 ESC CR 经 KeyParser 插换行,单独的 CR 提交" {
     var ed = LineEditor.init(testing.allocator);
     defer ed.deinit();
     var p = KeyParser{};
     var last: Action = .none;
-    for ("a\x1b\rb\r") |b| {
-        if (p.feed(b)) |k| last = try ed.handle(k);
+    const typed = "a\x1b\rb\r";
+    for (typed, 0..) |b, i| {
+        if (p.feedQueued(b, i + 1 < typed.len)) |k| last = try ed.handle(k);
         while (p.drain()) |k| last = try ed.handle(k);
     }
     try testing.expectEqualStrings("a\nb", ed.view());

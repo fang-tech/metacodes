@@ -73,6 +73,28 @@ pub fn writeAtomic(path: []const u8, bytes: []const u8, make_parents: bool) Erro
     }
 }
 
+/// What a configuration file's path is on disk. A symbolic link is common for
+/// dotfiles (home-manager links into the Nix store, stow and chezmoi into a
+/// repository); `writeAtomic` on the link itself would replace it with a plain
+/// file, so callers write the file it resolves to instead.
+pub const Link = union(enum) {
+    /// The path is the file itself (or nothing yet).
+    none,
+    /// A symbolic link: the file it resolves to.
+    to: []const u8,
+    /// A symbolic link to nothing.
+    dangling,
+};
+
+pub fn link(arena: std.mem.Allocator, path: []const u8) error{OutOfMemory}!Link {
+    var buf: [std.fs.max_path_bytes:0]u8 = undefined;
+    const z = pathZ(&buf, path) catch return .none;
+    if (!pfs.isSymlink(z)) return .none;
+    var out: [std.fs.max_path_bytes]u8 = undefined;
+    const real = pfs.finalPath(z, &out) orelse return .dangling;
+    return .{ .to = try arena.dupe(u8, std.mem.span(real)) };
+}
+
 pub fn remove(path: []const u8) void {
     var buf: [std.fs.max_path_bytes:0]u8 = undefined;
     pfs.unlinkPath(pathZ(&buf, path) catch return) catch {};
@@ -140,4 +162,30 @@ test "files: read, atomic write over an existing file, and a fresh backup name" 
     const second = try freshName(gpa, backups, "keybindings", ".json", 1_793_240_134);
     defer gpa.free(second);
     try testing.expect(std.mem.endsWith(u8, second, "keybindings-20261029-021534-2.json"));
+}
+
+test "files: link tells a plain file, a symbolic link and a dangling one apart" {
+    const gpa = testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buf[0..try tmp.dir.realPath(testing.io, &root_buf)];
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "real.json", .data = "[]" });
+    try @import("platform").test_support.symlinkOrSkip(tmp.dir, testing.io, "real.json", "link.json", .{});
+    try @import("platform").test_support.symlinkOrSkip(tmp.dir, testing.io, "missing.json", "dangling.json", .{});
+
+    try testing.expect(try link(arena, try std.fs.path.join(arena, &.{ root, "real.json" })) == .none);
+    try testing.expect(try link(arena, try std.fs.path.join(arena, &.{ root, "nothing.json" })) == .none);
+    try testing.expect(try link(arena, try std.fs.path.join(arena, &.{ root, "dangling.json" })) == .dangling);
+    const to = (try link(arena, try std.fs.path.join(arena, &.{ root, "link.json" }))).to;
+    try testing.expect(std.mem.endsWith(u8, to, "real.json"));
+    // Writing the resolved file keeps the link a link.
+    try writeAtomic(to, "[1]", false);
+    const via_link = try read(arena, try std.fs.path.join(arena, &.{ root, "link.json" }));
+    try testing.expectEqualStrings("[1]", via_link);
+    var lbuf: [std.fs.max_path_bytes:0]u8 = undefined;
+    try testing.expect(pfs.isSymlink(try pathZ(&lbuf, try std.fs.path.join(arena, &.{ root, "link.json" }))));
 }

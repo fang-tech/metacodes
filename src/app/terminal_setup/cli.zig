@@ -21,7 +21,7 @@ pub const usage =
     \\  VS Code and forks a keybindings.json entry for the integrated terminal
     \\Without --terminal it sets up the terminal it runs in.
     \\  --dry-run       say what would change, change nothing
-    \\  --restore       undo what terminal-setup changed (all of it, or the --terminal named)
+    \\  --restore       undo what terminal-setup changed (all of it, or the --terminal / --keybindings named)
     \\  --keybindings   the keybindings.json to edit (a custom --user-data-dir, a profile)
     \\
 ;
@@ -80,7 +80,7 @@ pub fn parse(arena: std.mem.Allocator, args: []const []const u8) error{OutOfMemo
 /// Runs `metacodes terminal-setup …` and returns the exit code: 0 when the
 /// terminal is set up (or needs nothing), 1 when it was left alone or the
 /// change failed, 2 for a usage error.
-pub fn run(args: *std.process.Args.Iterator, gpa: std.mem.Allocator, state_root: []const u8) u8 {
+pub fn run(args: *std.process.Args.Iterator, gpa: std.mem.Allocator, io: std.Io, state_root: []const u8) u8 {
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -112,7 +112,7 @@ pub fn run(args: *std.process.Args.Iterator, gpa: std.mem.Allocator, state_root:
         .env = env,
         .state_root = state_root,
         .now_unix = util_time.nowUnix(),
-        .terminal_pid = apple.terminalPid(),
+        .terminal_pid = apple.runningTerminalPid(arena, io),
     }, req, &out.writer);
     stdoutWrite(out.written());
     return switch (report.outcome) {

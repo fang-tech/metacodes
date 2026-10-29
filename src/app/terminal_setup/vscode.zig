@@ -61,19 +61,32 @@ fn stringField(object: std.json.ObjectMap, name: []const u8) ?[]const u8 {
     return if (v == .string) v.string else null;
 }
 
-/// `shift+enter` in any case and modifier order; a chord (`ctrl+k shift+enter`)
-/// is a different key.
+/// Whether VS Code reads `key` as Shift+Enter, by its own parser
+/// (`KeybindingParser`, read in the 1.105 bundle): lower-cased and trimmed,
+/// then `ctrl`, `shift`, `alt`, `meta`, `win` or `cmd` each followed by `+` or
+/// `-` are taken off the front, in any order and repeated; the rest up to a
+/// space is the key, and anything after a space is a further chord. So
+/// `Shift-Enter` and `shift+[Enter]` (the scan code) are Shift+Enter, while
+/// `enter+shift` names no key at all and `ctrl+k shift+enter` is a chord.
 fn isShiftEnter(key: []const u8) bool {
-    const k = std.mem.trim(u8, key, " \t");
-    if (std.mem.indexOfAny(u8, k, " \t") != null) return false;
-    var it = std.mem.splitScalar(u8, k, '+');
+    var buf: [64]u8 = undefined;
+    const trimmed = std.mem.trim(u8, key, " \t\r\n");
+    if (trimmed.len > buf.len) return false;
+    var rest = std.ascii.lowerString(&buf, trimmed);
     var shift = false;
-    var enter = false;
-    var parts: usize = 0;
-    while (it.next()) |part| : (parts += 1) {
-        if (std.ascii.eqlIgnoreCase(part, "shift")) shift = true else if (std.ascii.eqlIgnoreCase(part, "enter")) enter = true else return false;
+    var other_modifier = false;
+    outer: while (true) {
+        inline for (.{ "ctrl", "shift", "alt", "meta", "win", "cmd" }) |name| {
+            if (rest.len > name.len and std.mem.startsWith(u8, rest, name) and (rest[name.len] == '+' or rest[name.len] == '-')) {
+                if (comptime std.mem.eql(u8, name, "shift")) shift = true else other_modifier = true;
+                rest = rest[name.len + 1 ..];
+                continue :outer;
+            }
+        }
+        break;
     }
-    return parts == 2 and shift and enter;
+    if (std.mem.indexOfScalar(u8, rest, ' ') != null) return false;
+    return shift and !other_modifier and (std.mem.eql(u8, rest, "enter") or std.mem.eql(u8, rest, "[enter]"));
 }
 
 /// Whether a binding with this `when` can take effect while the terminal has
@@ -371,6 +384,57 @@ pub fn keybindingsPath(arena: std.mem.Allocator, env: setup.Env, p: Product) err
     };
 }
 
+/// A VS Code profile with keyboard shortcuts of its own: a window that uses it
+/// reads that profile's `keybindings.json`, not the Default profile's
+/// (measured on VS Code 1.105: a window opened with `--profile` kept sending a
+/// plain Return with the binding in the Default profile's file).
+pub const Profile = struct {
+    name: []const u8,
+    /// null when the profile lives somewhere this cannot place.
+    keybindings: ?[]const u8,
+};
+
+pub const Profiles = union(enum) {
+    /// Possibly none.
+    known: []const Profile,
+    /// `storage.json` is there but does not read as VS Code's: which profiles
+    /// have their own shortcuts is not known.
+    unknown,
+};
+
+/// The profiles with their own shortcuts, from `<User>/globalStorage/storage.json`
+/// (`userDataProfiles: [{location, name, useDefaultFlags?}]`; the profile's
+/// files are in `<User>/profiles/<location>/`). One whose
+/// `useDefaultFlags.keybindings` is true reads the Default profile's file and is
+/// left out, as VS Code resolves `keybindingsResource`.
+pub fn ownShortcutProfiles(arena: std.mem.Allocator, user_dir: []const u8) error{OutOfMemory}!Profiles {
+    const path = try std.fs.path.join(arena, &.{ user_dir, "globalStorage", "storage.json" });
+    const bytes = files.read(arena, path) catch |err| switch (err) {
+        error.NotFound => return .{ .known = &.{} },
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return .unknown,
+    };
+    const root = std.json.parseFromSliceLeaky(std.json.Value, arena, bytes, .{ .duplicate_field_behavior = .use_last }) catch return .unknown;
+    if (root != .object) return .unknown;
+    const list = root.object.get("userDataProfiles") orelse return .{ .known = &.{} };
+    if (list != .array) return .unknown;
+    var out: std.ArrayList(Profile) = .empty;
+    for (list.array.items) |item| {
+        if (item != .object) return .unknown;
+        if (item.object.get("useDefaultFlags")) |flags| if (flags == .object) if (flags.object.get("keybindings")) |shared| {
+            if (shared == .bool and shared.bool) continue;
+        };
+        const name = stringField(item.object, "name") orelse "(unnamed)";
+        const location = stringField(item.object, "location");
+        const keybindings: ?[]const u8 = if (location) |loc|
+            (if (plainFolderName(loc)) try std.fs.path.join(arena, &.{ user_dir, "profiles", loc, "keybindings.json" }) else null)
+        else
+            null;
+        try out.append(arena, .{ .name = name, .keybindings = keybindings });
+    }
+    return .{ .known = out.items };
+}
+
 /// The binding as a user would paste it into `keybindings.json` by hand.
 pub const manual_snippet =
     \\{
@@ -399,11 +463,15 @@ test "classify: no file, the template, ours (also Claude Code's), and the claims
         \\ { "key": "ctrl+k shift+enter", "command": "x", "when": "terminalFocus" },
         \\ { "key": "shift+enter", "command": "-workbench.action.terminal.sendSequence", "when": "terminalFocus" }]
     ));
-    // Claude Code writes exactly this; key spelling and modifier order vary.
+    // Claude Code writes exactly this; VS Code also takes `-` and any case.
     try testing.expectEqual(Status.installed, try classify(gpa,
         \\[ // claude code
-        \\  { "key": "Enter+Shift", "command": "workbench.action.terminal.sendSequence", "args": { "text": "\u001b\r" }, "when": "terminalFocus" },
+        \\  { "key": "Shift-Enter", "command": "workbench.action.terminal.sendSequence", "args": { "text": "\u001b\r" }, "when": "terminalFocus" },
         \\]
+    ));
+    // `enter+shift` is no key to VS Code (modifiers come first): not a binding of Shift+Enter.
+    try testing.expectEqual(Status.absent, try classify(gpa,
+        \\[{ "key": "enter+shift", "command": "workbench.action.terminal.sendSequence", "args": { "text": "\u001b\r" }, "when": "terminalFocus" }]
     ));
     const other =
         \\[
@@ -419,6 +487,15 @@ test "classify: no file, the template, ours (also Claude Code's), and the claims
     try testing.expect(try classify(gpa, "[{\"key\":\"shift+enter\",\"command\":\"editor.action.insertLineAfter\"}]") == .conflict);
     try testing.expectError(error.NotAnArray, classify(gpa, "{}"));
     try testing.expectError(error.InvalidJsonc, classify(gpa, "[{]"));
+}
+
+test "isShiftEnter follows VS Code's keybinding parser" {
+    for ([_][]const u8{ "shift+enter", "Shift-Enter", "  SHIFT+ENTER ", "shift+[Enter]", "shift-shift+enter" }) |k| {
+        try testing.expect(isShiftEnter(k));
+    }
+    for ([_][]const u8{ "enter+shift", "enter", "ctrl+shift+enter", "shift+alt+enter", "cmd+shift+enter", "shift+enter shift+enter", "ctrl+k shift+enter", "shift+return", "shift", "shift+" }) |k| {
+        try testing.expect(!isShiftEnter(k));
+    }
 }
 
 fn expectAdded(src: ?[]const u8, want: []const u8) !void {
@@ -528,6 +605,36 @@ test "product and keybindingsPath: product.json beside the askpass script, fork 
     const portable = (try keybindingsPath(arena, .{ .os = .other, .home = "/home/a", .vscode_portable = "/opt/code/data" }, vscode)).?;
     try testing.expect(std.mem.endsWith(u8, portable, "data" ++ sep ++ "user-data" ++ sep ++ "User" ++ sep ++ "keybindings.json"));
     try testing.expect((try keybindingsPath(arena, .{ .os = .other }, vscode)) == null);
+}
+
+test "ownShortcutProfiles: VS Code's storage.json, shared and own shortcuts, nothing and garbage" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const user = root_buf[0..try tmp.dir.realPath(testing.io, &root_buf)];
+    // No storage.json, or no profiles in it: none.
+    try testing.expectEqual(@as(usize, 0), (try ownShortcutProfiles(arena, user)).known.len);
+    try tmp.dir.createDirPath(testing.io, "globalStorage");
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "globalStorage/storage.json", .data = "{\"theme\":\"vs-dark\"}" });
+    try testing.expectEqual(@as(usize, 0), (try ownShortcutProfiles(arena, user)).known.len);
+    // As VS Code 1.105 wrote it for `--profile tsprobe`, plus one sharing the Default's shortcuts.
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "globalStorage/storage.json", .data =
+        \\{"userDataProfiles":[{"location":"1d77a59e","name":"tsprobe"},
+        \\  {"location":"5c2e","name":"shared","useDefaultFlags":{"keybindings":true,"settings":false}},
+        \\  {"location":"../x","name":"odd"}]}
+    });
+    const known = (try ownShortcutProfiles(arena, user)).known;
+    try testing.expectEqual(@as(usize, 2), known.len);
+    try testing.expectEqualStrings("tsprobe", known[0].name);
+    const sep = std.fs.path.sep_str;
+    try testing.expect(std.mem.endsWith(u8, known[0].keybindings.?, "profiles" ++ sep ++ "1d77a59e" ++ sep ++ "keybindings.json"));
+    try testing.expectEqualStrings("odd", known[1].name);
+    try testing.expect(known[1].keybindings == null);
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "globalStorage/storage.json", .data = "{not json" });
+    try testing.expect(try ownShortcutProfiles(arena, user) == .unknown);
 }
 
 test "isRemote: server installs and remote-session variables" {
