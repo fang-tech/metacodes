@@ -622,6 +622,8 @@ pub const TuiBackend = struct {
                 // 超时:孤立 ESC 兑现 → 处理(可能中断);否则推进 spinner。
                 if (parser.flushEsc()) |k| {
                     self.handleKey(snap, k, editor);
+                    // Alt+] 兑现成 ESC 后,']'(和其后的数字)在 pending 里。
+                    while (parser.drain()) |k2| self.handleKey(snap, k2, editor);
                 } else {
                     // Ctrl+C 走 SIGINT handler,只能置原子标志;标志只在流事件之间被检查,
                     // 卡在 readv 里的读醒不了。这里代它 shutdown 在飞连接(一次)。

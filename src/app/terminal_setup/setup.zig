@@ -897,12 +897,13 @@ test "detect: the terminals with a setup, the native ones, and the rest" {
 
 test "detect: the native terminals are the ones input.zig turns the keyboard protocol on for" {
     const input = @import("../../repl/input.zig");
-    for (native_term_programs) |entry| try testing.expect(input.classifyKittyKeyboard(entry[0], "xterm-256color", false));
-    try testing.expect(input.classifyKittyKeyboard(null, "xterm-kitty", false));
-    try testing.expect(input.classifyKittyKeyboard(null, "xterm-ghostty", false));
-    // The two this command sets up are the ones it leaves off.
-    try testing.expect(!input.classifyKittyKeyboard("Apple_Terminal", "xterm-256color", false));
-    try testing.expect(!input.classifyKittyKeyboard("vscode", "xterm-256color", false));
+    for (native_term_programs) |entry| try testing.expect(input.classifyKittyKeyboard(entry[0], "xterm-256color", .none) == .enable);
+    try testing.expect(input.classifyKittyKeyboard(null, "xterm-kitty", .none) == .enable);
+    try testing.expect(input.classifyKittyKeyboard(null, "xterm-ghostty", .none) == .enable);
+    // The two this command sets up are the ones it leaves off, without asking
+    // the terminal.
+    try testing.expect(input.classifyKittyKeyboard("Apple_Terminal", "xterm-256color", .none) == .disable);
+    try testing.expect(input.classifyKittyKeyboard("vscode", "xterm-256color", .none) == .disable);
 }
 
 const Harness = struct {

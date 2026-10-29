@@ -72,7 +72,7 @@ ALLOWED_SINKS = {
     # Modes, queries and titles: nothing lands on the grid.
     (Path("src/repl/input.zig"), "emitEnableSequences"): "keyboard protocol and bracketed paste on",
     (Path("src/repl/input.zig"), "restoreMode"): "keyboard protocol and bracketed paste off",
-    (Path("src/repl/tui/bg_probe.zig"), "probeBackground"): "OSC 11 background query at startup",
+    (Path("src/repl/tui/bg_probe.zig"), "sendQuery"): "OSC 11, Kitty flags and DA1 queries at startup",
     (Path("src/repl/tui/terminal_title.zig"), "writeAll"): "OSC 0 window title",
     # Regular files, not the terminal.
     (Path("src/repl/history.zig"), "saveToFile"): "history file",

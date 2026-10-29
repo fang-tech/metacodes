@@ -30,6 +30,9 @@
     的输入(用 SIGSTOP 卡住 REPL 复现过:旧的 `sleep:0.2` 后接着打的 `/goal budget 42` 整条
     丢失)。所以提交后先等 READY(新的空输入框)再打字;要在生成期按键,先
     wait_for("esc to interrupt") 等进入生成态;生成结束后再发键,等 IDLE。
+    进程第一次进 raw mode 例外:启动期间(探测、启动动画、App.init)敲的键都留给第一个
+    输入框(input.enterRawMode),而且整体作为一次粘贴进去——换行是文本、不提交;要在启动后
+    提交命令,先等 READY 再打字。
   - 生成期的 sleep: 本身会等(spinner 每 100ms 重画,turn 结束才静默),但只等到静默,
     不保证下一个输入框已经画出来。
 """
