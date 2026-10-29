@@ -769,15 +769,18 @@ pub fn reconcileModes(fd: c_int) bool {
 
 /// win32-input-mode(DECSET 9001):Windows 控制台把每个按键整条送来(虚拟键、字符、
 /// 按下/抬起、修饰键状态),KeyParser 还原;Shift+Enter 由此能和 Enter 区分。Windows
-/// Terminal 1.24(ConPTY)与经典 conhost 实测都认它。
-const win32_input_enable = "\x1b[?9001h";
-const win32_input_disable = "\x1b[?9001l";
+/// Terminal 1.24(ConPTY)与经典 conhost 实测都认它。bracketed paste(DECSET 2004)与它一起
+/// 写给控制台:开着时 Windows Terminal 把粘贴包进 `ESC[200~ … ESC[201~` 送来,经典 conhost 把
+/// 标记连同每个字符编成记录送来;没开时 Windows Terminal 先弹多行粘贴警告,两者都把每个换行
+/// 当 Enter 送来,逐行提交。
+const console_enable = "\x1b[?9001h" ++ "\x1b[?2004h";
+const console_disable = "\x1b[?2004l" ++ "\x1b[?9001l";
 
 fn emitEnableSequences(fd: c_int) void {
     // 写到控制台输出(Windows 控制台不收写给 stdin 的字节);只在 stdin/stdout 都是控制台时,
     // 与 TERM 无关(Windows 上通常没有 TERM)。
     if (platform_term.isConsole()) {
-        _ = pfs.writeAll(1, win32_input_enable);
+        _ = pfs.writeAll(1, console_enable);
         g_win32_input_on.store(true, .release);
     }
     // Dumb terminals do not understand private modes; keep their output clean.
@@ -1063,7 +1066,7 @@ pub fn restoreMode(fd: c_int, orig: platform_term.SavedMode) void {
     if (shouldEnableKittyKeyboard()) {
         _ = pfs.writeAll(fd, kbd_disable_seq);
     }
-    if (platform_term.isConsole()) _ = pfs.writeAll(1, win32_input_disable);
+    if (platform_term.isConsole()) _ = pfs.writeAll(1, console_disable);
     platform_term.restoreMode(fd, orig); // POSIX tcsetattr / Windows SetConsoleMode
 }
 
@@ -2273,6 +2276,25 @@ test "KeyParser: a Shift+Enter record is the key Kitty's CSI-u gives, not Enter"
     try testing.expect(shift_enter[0] == .shift_enter);
     // Right Shift and the numpad Enter carry the same state.
     try testing.expect(parseAll("\x1b[13;28;13;1;304;1_", &buf)[0] == .shift_enter);
+}
+
+test "KeyParser: ESC CR a terminal writes in one go reaches the parser as ESC CR with win32-input-mode on" {
+    // VS Code's Shift+Enter binding writes ESC CR to the pseudo console; ConPTY
+    // hands it on as those two bytes, not as an Alt+Enter record (measured). It
+    // is whatever key ESC CR is without the mode, and so is an Alt+Enter record.
+    var off: [8]Key = undefined;
+    const vt = parseAll("a\x1b\rb", &off);
+    g_win32_input_on.store(true, .release);
+    defer g_win32_input_on.store(false, .release);
+    defer g_win32_input_seen.store(false, .release);
+    var on: [8]Key = undefined;
+    const passed = parseAll("a\x1b\rb", &on);
+    try testing.expectEqual(vt.len, passed.len);
+    for (vt, passed) |x, y| try testing.expect(std.meta.eql(x, y));
+    var rec: [8]Key = undefined;
+    const alt_enter = parseAll("a\x1b[13;28;13;1;2;1_\x1b[13;28;13;0;2;1_b", &rec);
+    try testing.expectEqual(vt.len, alt_enter.len);
+    for (vt, alt_enter) |x, y| try testing.expect(std.meta.eql(x, y));
 }
 
 test "KeyParser: a line break ConPTY pastes as a Ctrl+Enter record stays a line break of the paste" {

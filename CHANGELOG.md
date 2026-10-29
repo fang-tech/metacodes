@@ -276,11 +276,25 @@ status, compatibility boundaries, and entry points are defined by
   against Windows Terminal 1.24 and conhost on Windows 11 26300). Shift+Enter
   becomes Kitty's `CSI 13;2u`, a newline, and once a record has come the
   footer says `shift + ⏎ for newline`. Ctrl+Enter still submits: the pseudo
-  console sends a pasted line break as an Enter with Ctrl held, the same
-  record. AltGr and dead keys were not measured.
+  console sends a line break written to it as an Enter with Ctrl held, the
+  same record. Bytes a terminal writes in one go, such as the `ESC CR` of a
+  Shift+Enter key binding in VS Code, reach the key parser as those bytes, not
+  as records. AltGr and dead keys were not measured.
 
 
 ### Fixed
+
+- **A multi-line paste in Windows Terminal or the classic Windows console
+  stays in the prompt instead of submitting every line but the last
+  (#386).** On Windows the REPL never turned on bracketed paste: `TERM` is
+  usually unset there, so the terminal counted as dumb, and with `TERM` set
+  the sequence went to stdin, which a console does not show. Windows Terminal
+  first warned about the multi-line paste, then both hosts sent each line
+  break as Enter. On a console the REPL now writes `CSI ? 2004 h` to stdout
+  with win32-input-mode and turns both off again on restore: Windows Terminal
+  wraps the paste in `ESC[200~ … ESC[201~` and no longer warns, and classic
+  conhost sends the markers as key records with the text. Measured in both
+  with a pasted Chinese and ASCII text of 3 and of 80 lines.
 
 - **Release executables run beyond machines like the build runner.**
   `release.yml` built the CLI executable without `-Dtarget`, so zig targeted
