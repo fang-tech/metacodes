@@ -1189,6 +1189,7 @@ fn cloneSkillRecord(arena: std.mem.Allocator, source: SkillRecord) error{OutOfMe
             .name = try arena.dupe(u8, source.definition.name),
             .description = try arena.dupe(u8, source.definition.description),
             .description_source = source.definition.description_source,
+            .warnings = source.definition.warnings,
             .when_to_use = try arena.dupe(u8, source.definition.when_to_use),
             .argument_hint = try arena.dupe(u8, source.definition.argument_hint),
             .body = try arena.dupe(u8, source.definition.body),
@@ -2047,6 +2048,7 @@ test "catalog identity validation rejects duplicates and preserves allocation fa
         .disable_model_invocation = false,
         .when_to_use = "",
         .description_source = .missing,
+        .warnings = .{},
         .argument_hint = "",
         .user_invocable = true,
         .context = .inline_ctx,
@@ -2662,6 +2664,46 @@ test "compat: Claude Code precedence, Unicode names and description fallback" {
     // The invalid name is a typed issue, not a silent drop.
     try std.testing.expectEqual(@as(usize, 1), snapshot.issues.len);
     try std.testing.expectEqual(IssueCode.invalid_invocation_name, snapshot.issues[0].code);
+}
+
+test "blank name and description load in both profiles, read as absent, with warnings" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var fixture = try CompatFixture.init();
+    defer fixture.deinit();
+
+    // The #395 reproduction.
+    try fixture.write(a, "skills/demo/SKILL.md", "---\nname: \"\"\ndescription: \"\"\n---\n\nUse for demonstrating an empty frontmatter.\n");
+    try fixture.write(a, "skills/plain/SKILL.md", "---\nname: plain\ndescription: Plain things\n---\nbody\n");
+    const both = definition_mod.Warnings.init(.{ .blank_name = true, .blank_description = true });
+
+    // Compat (the CLI hosts): Claude Code's first-line fallback stands in.
+    const compat_sources = [_]Source{fixture.source(a, "skills", .project, 1000)};
+    const compat = try build(std.testing.allocator, std.testing.io, compat_scope_id, "", &compat_sources, .{});
+    defer compat.deinit();
+    try std.testing.expectEqual(Health.healthy, compat.health);
+    try std.testing.expectEqual(@as(usize, 0), compat.issues.len);
+    const demo = try expectSkill(compat, "demo");
+    try std.testing.expectEqualStrings("demo", demo.definition.name);
+    try std.testing.expectEqualStrings("Use for demonstrating an empty frontmatter.", demo.definition.description);
+    try std.testing.expectEqual(definition_mod.DescriptionSource.body_first_line, demo.definition.description_source);
+    try std.testing.expect(both.eql(demo.definition.warnings));
+    try std.testing.expectEqual(@as(usize, 0), (try expectSkill(compat, "plain")).definition.warnings.count());
+
+    // Canonical (AgentCore): no fallback, so the description stays empty, as
+    // when absent; the slot is still valid, not an `invalid_definition` issue.
+    const canonical_sources = [_]Source{.{ .root = fixture.path(a, "skills"), .scope = .project, .priority = 1 }};
+    const canonical = try build(std.testing.allocator, std.testing.io, compat_scope_id, "", &canonical_sources, .{});
+    defer canonical.deinit();
+    try std.testing.expectEqual(Health.healthy, canonical.health);
+    try std.testing.expectEqual(@as(usize, 0), canonical.issues.len);
+    const strict = try expectSkill(canonical, "demo");
+    try std.testing.expectEqualStrings("demo", strict.definition.name);
+    try std.testing.expectEqualStrings("", strict.definition.description);
+    try std.testing.expectEqual(definition_mod.DescriptionSource.missing, strict.definition.description_source);
+    try std.testing.expect(both.eql(strict.definition.warnings));
+    try std.testing.expect(std.mem.indexOf(u8, canonical.descriptor_json, "\"display_name\":\"demo\",\"description\":\"\"") != null);
 }
 
 test "compat: an unreadable root is skipped and reported; siblings still load" {

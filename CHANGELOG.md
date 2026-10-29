@@ -336,6 +336,22 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- **A Skill whose `name` or `description` is empty or only whitespace is
+  read as if the field were absent, and `/skills` reports it (#395).** The
+  Agent Skills specification requires both to be non-empty. A blank `name`
+  already fell back to the directory name, but silently, and a whitespace-only
+  one was kept as the display name. A blank `description` got no fallback at
+  all, so `name: ""` with `description: ""` was listed to the model as the
+  bare name (`- **demo**`). Both now get the fallback an absent field gets:
+  the directory name, and the first body line (Claude Code reads a blank
+  `description` the same way; Codex reads both as absent). The Skill still
+  loads. The blank field is a typed warning in the definition
+  (`definition.Warning`), and `/skills` names it: "SKILL.md has a blank
+  `description`" under "No description", and a new "Blank name" list. The
+  startup banner and `/doctor` count each such Skill once. With no body line
+  either, the Skill is listed with no description, as when `description` is
+  absent. AgentCore's canonical catalog has no body fallback: there a blank
+  `description` is now empty, as an absent one is, instead of the blank text.
 - **The first prompt no longer waits up to 2 s for the startup suggestion.**
   The `suggestion: explain or improve <file>` line comes from `git log -1
   --name-only`, which ran before the first prompt with a 2 s limit. On macOS

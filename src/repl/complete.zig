@@ -527,6 +527,7 @@ test "slash catalog: skills join the built-ins, collisions and model-only skills
         .name = "deploy",
         .description = "Deploy\n  the service",
         .description_source = .frontmatter,
+        .warnings = .{},
         .when_to_use = "",
         .argument_hint = "[env]",
         .body = "",

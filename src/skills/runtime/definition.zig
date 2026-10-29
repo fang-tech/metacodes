@@ -19,18 +19,36 @@ pub const ModelActivation = enum {
 pub const DescriptionSource = enum {
     /// The frontmatter's own `description`.
     frontmatter,
-    /// Absent from the frontmatter; the first non-empty body line stands in
-    /// (Claude Code's fallback, `ParseOptions.description_fallback`).
+    /// Absent or blank in the frontmatter; the first non-empty body line
+    /// stands in (Claude Code's fallback, `ParseOptions.description_fallback`).
     body_first_line,
     /// Absent or blank, and nothing stands in: listings show no description.
     missing,
 };
+
+/// A SKILL.md that breaks the Agent Skills specification in a way the parser
+/// repairs instead of refusing. A refusal is a `ParseError` (the catalog's
+/// `invalid_definition`: the Skill does not load); a warning leaves the Skill
+/// loaded, and `/skills` reports it.
+pub const Warning = enum {
+    /// `name` is empty or whitespace-only. It is read as absent, so the
+    /// directory name stands in, as in Codex.
+    blank_name,
+    /// `description` is empty or whitespace-only. It is read as absent, so
+    /// the first body line stands in where the profile falls back, as in
+    /// Claude Code; `description_source` says what the listings got.
+    blank_description,
+};
+
+pub const Warnings = std.EnumSet(Warning);
 
 /// Canonical parsed SKILL.md definition shared by every product adapter.
 pub const Skill = struct {
     name: []const u8,
     description: []const u8,
     description_source: DescriptionSource,
+    /// Required, like `description_source`, so a clone cannot drop it.
+    warnings: Warnings,
     /// Claude Code `when_to_use`: appended to the description in listings.
     when_to_use: []const u8,
     /// Claude Code `argument-hint`: shown beside the command in the `/` menu.
@@ -58,6 +76,12 @@ pub const Skill = struct {
 
     pub fn isSealed(self: *const Skill) bool {
         return self.sealed_skill_id.len != 0;
+    }
+
+    /// Loaded, but with something `/skills` reports: no `description` of its
+    /// own, or a warning.
+    pub fn hasDefinitionProblem(self: *const Skill) bool {
+        return self.description_source != .frontmatter or self.warnings.count() != 0;
     }
 
     pub fn deinit(self: Skill, allocator: std.mem.Allocator) void {
@@ -103,6 +127,7 @@ pub const ParseOptions = struct {
 };
 
 /// Parse SKILL.md, using the directory name when frontmatter omits `name`.
+/// A blank `name` or `description` counts as omitted and adds a `Warning`.
 ///
 /// The frontmatter is YAML (Claude Code and Codex both parse it as such), read
 /// through the bounded subset parser in `frontmatter.zig`. Unknown keys are
@@ -174,15 +199,27 @@ pub fn parseSkillMdWithOptions(
         break :blk value;
     } else "bash";
 
-    if (name == null or name.?.len == 0) name = dir_name;
+    // The Agent Skills specification requires both to be non-empty. Claude
+    // Code (description) and Codex (both) read a blank one as absent, so the
+    // same fallback stands in for it; the warning keeps the defect visible.
+    var warnings: Warnings = .{};
+    if (name != null and isBlank(name.?)) {
+        name = null;
+        warnings.insert(.blank_name);
+    }
+    if (description != null and isBlank(description.?)) {
+        description = null;
+        warnings.insert(.blank_description);
+    }
+
+    if (name == null) name = dir_name;
     if (name.?.len == 0) return error.MissingSkillName;
     var description_source: DescriptionSource = .frontmatter;
     if (description == null and options.description_fallback) {
         description = firstBodyLine(body);
         description_source = .body_first_line;
     }
-    if (description == null or std.mem.trim(u8, description.?, " \t\r\n").len == 0)
-        description_source = .missing;
+    if (description == null) description_source = .missing;
 
     const allowed_tools = try optionalList(allocator, root, &.{ "allowed-tools", "allowed_tools" });
     errdefer freeStringList(allocator, allowed_tools);
@@ -220,6 +257,7 @@ pub fn parseSkillMdWithOptions(
         .name = owned_name,
         .description = owned_description,
         .description_source = description_source,
+        .warnings = warnings,
         .when_to_use = owned_when_to_use,
         .argument_hint = owned_argument_hint,
         .body = owned_body,
@@ -325,6 +363,10 @@ fn optionalList(
         },
         .mapping => return error.InvalidFieldType,
     }
+}
+
+fn isBlank(text: []const u8) bool {
+    return std.mem.trim(u8, text, " \t\r\n").len == 0;
 }
 
 fn firstBodyLine(body: []const u8) ?[]const u8 {
@@ -657,14 +699,19 @@ test "description falls back to the first body line only when asked" {
 
 test "description source records the frontmatter, the fallback, or nothing" {
     const a = std.testing.allocator;
-    const Case = struct { md: []const u8, fallback: bool, source: DescriptionSource, description: []const u8 };
+    const Case = struct { md: []const u8, fallback: bool, source: DescriptionSource, description: []const u8, blank: bool = false };
     const cases = [_]Case{
         .{ .md = "---\nname: x\ndescription: Review diffs\n---\nbody\n", .fallback = true, .source = .frontmatter, .description = "Review diffs" },
         .{ .md = "---\nname: x\ndescription: Review diffs\n---\nbody\n", .fallback = false, .source = .frontmatter, .description = "Review diffs" },
         .{ .md = "---\nname: x\n---\n\nFirst line\n", .fallback = true, .source = .body_first_line, .description = "First line" },
         .{ .md = "---\nname: x\n---\n\nFirst line\n", .fallback = false, .source = .missing, .description = "" },
         .{ .md = "---\nname: x\n---\n \n", .fallback = true, .source = .missing, .description = "" },
-        .{ .md = "---\nname: x\ndescription: \"  \"\n---\nbody\n", .fallback = true, .source = .missing, .description = "  " },
+        // A blank `description` is read as absent (#395): it gets the same
+        // fallback, or none, and records a warning. It used to be listed as
+        // the blank text, with no fallback.
+        .{ .md = "---\nname: x\ndescription: \"  \"\n---\nbody\n", .fallback = true, .source = .body_first_line, .description = "body", .blank = true },
+        .{ .md = "---\nname: x\ndescription: \"  \"\n---\nbody\n", .fallback = false, .source = .missing, .description = "", .blank = true },
+        .{ .md = "---\nname: x\ndescription: \"  \"\n---\n \n", .fallback = true, .source = .missing, .description = "", .blank = true },
         .{ .md = "No frontmatter at all\n", .fallback = true, .source = .body_first_line, .description = "No frontmatter at all" },
     };
     for (cases) |case| {
@@ -672,7 +719,70 @@ test "description source records the frontmatter, the fallback, or nothing" {
         defer skill.deinit(a);
         try std.testing.expectEqual(case.source, skill.description_source);
         try std.testing.expectEqualStrings(case.description, skill.description);
+        try std.testing.expectEqual(case.blank, skill.warnings.contains(.blank_description));
+        try std.testing.expectEqual(case.source != .frontmatter, skill.hasDefinitionProblem());
     }
+}
+
+test "a blank name or description is read as absent, with a warning; an absent one has none" {
+    const a = std.testing.allocator;
+    const body = "\nUse for demonstrating an empty frontmatter.\n";
+    const Case = struct {
+        frontmatter: []const u8,
+        name: []const u8,
+        description: []const u8,
+        source: DescriptionSource,
+        warnings: Warnings,
+    };
+    const cases = [_]Case{
+        // The #395 reproduction: both explicitly empty.
+        .{ .frontmatter = "name: \"\"\ndescription: \"\"\n", .name = "demo", .description = "Use for demonstrating an empty frontmatter.", .source = .body_first_line, .warnings = .init(.{ .blank_name = true, .blank_description = true }) },
+        // Explicitly empty, one field at a time; single quotes and a bare key.
+        .{ .frontmatter = "name: ''\ndescription: Demo things\n", .name = "demo", .description = "Demo things", .source = .frontmatter, .warnings = .init(.{ .blank_name = true }) },
+        .{ .frontmatter = "name: shown\ndescription:\n", .name = "shown", .description = "Use for demonstrating an empty frontmatter.", .source = .body_first_line, .warnings = .init(.{ .blank_description = true }) },
+        // Whitespace-only, including a folded block with no text.
+        .{ .frontmatter = "name: \"  \"\ndescription: \"\\t \"\n", .name = "demo", .description = "Use for demonstrating an empty frontmatter.", .source = .body_first_line, .warnings = .init(.{ .blank_name = true, .blank_description = true }) },
+        .{ .frontmatter = "name: shown\ndescription: >\n\n", .name = "shown", .description = "Use for demonstrating an empty frontmatter.", .source = .body_first_line, .warnings = .init(.{ .blank_description = true }) },
+        // Absent: the same fallbacks, and no warning.
+        .{ .frontmatter = "description: Demo things\n", .name = "demo", .description = "Demo things", .source = .frontmatter, .warnings = .{} },
+        .{ .frontmatter = "name: shown\n", .name = "shown", .description = "Use for demonstrating an empty frontmatter.", .source = .body_first_line, .warnings = .{} },
+        .{ .frontmatter = "license: MIT\n", .name = "demo", .description = "Use for demonstrating an empty frontmatter.", .source = .body_first_line, .warnings = .{} },
+        // Present: kept as written.
+        .{ .frontmatter = "name: shown\ndescription: Demo things\n", .name = "shown", .description = "Demo things", .source = .frontmatter, .warnings = .{} },
+    };
+    for (cases) |case| {
+        const md = try std.mem.concat(a, u8, &.{ "---\n", case.frontmatter, "---\n", body });
+        defer a.free(md);
+        const skill = try parseSkillMdWithOptions(a, md, "/x", "demo", .{ .description_fallback = true });
+        defer skill.deinit(a);
+        try std.testing.expectEqualStrings(case.name, skill.name);
+        try std.testing.expectEqualStrings(case.description, skill.description);
+        try std.testing.expectEqual(case.source, skill.description_source);
+        try std.testing.expect(case.warnings.eql(skill.warnings));
+        try std.testing.expectEqual(case.source != .frontmatter or case.warnings.count() != 0, skill.hasDefinitionProblem());
+    }
+}
+
+test "a blank field never refuses a Skill that loads when the field is absent" {
+    const a = std.testing.allocator;
+    // Without a fallback the description stays empty, exactly as when absent.
+    const strict = try parseSkillMdWithOptions(a, "---\nname: \"\"\ndescription: \"\"\n---\nbody\n", "/x", "demo", .{});
+    defer strict.deinit(a);
+    try std.testing.expectEqualStrings("demo", strict.name);
+    try std.testing.expectEqualStrings("", strict.description);
+    try std.testing.expectEqual(DescriptionSource.missing, strict.description_source);
+    try std.testing.expect(strict.warnings.eql(.init(.{ .blank_name = true, .blank_description = true })));
+
+    // An empty body leaves nothing to fall back to: listed with no description.
+    const hollow = try parseSkillMdWithOptions(a, "---\ndescription: \" \"\n---\n", "/x", "hollow", .{ .description_fallback = true });
+    defer hollow.deinit(a);
+    try std.testing.expectEqualStrings("", hollow.description);
+    try std.testing.expectEqual(DescriptionSource.missing, hollow.description_source);
+    try std.testing.expect(hollow.warnings.eql(.init(.{ .blank_description = true })));
+
+    // Only the lack of any name refuses, blank or absent alike.
+    try std.testing.expectError(error.MissingSkillName, parseSkillMd(a, "---\nname: \" \"\ndescription: d\n---\nbody\n", "/x"));
+    try std.testing.expectError(error.MissingSkillName, parseSkillMd(a, "---\ndescription: d\n---\nbody\n", "/x"));
 }
 
 test "Codex sidecar: implicit invocation policy, fail-open on malformed YAML" {
