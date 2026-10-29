@@ -686,23 +686,31 @@ pub fn enterRawMode(fd: c_int) ?platform_term.SavedMode {
         return null;
     };
     emitEnableSequences(fd);
-    if (startup) collectStartupInput(fd);
+    if (startup) collectStartupInput(fd, startupSettleMs(bg_probe.roundTripMs()));
     return original orelse orig;
 }
 
 /// 启动期输入,等第一个输入框取走(takeStartupText)。只在主线程上读写。
 var g_startup_text: ?StartupText = null;
 
-/// 终端读空之后再等这么久:一段粘贴的后半截可能还在路上(pty 一次只放行约 4 KiB)。
-const startup_settle_ms: i32 = 50;
+/// 终端读空之后再等多久才算启动期输入到齐:一段粘贴的后半截可能还在路上。pty 一次只放行约
+/// 4 KiB;慢链路上更是分批到达,批与批相隔约一个往返(SSH 空闲后重新发送,初始拥塞窗口约
+/// 14 KB;mosh 也分帧)。启动探测量过往返时间就等它的两倍,至少 50 ms;至多 500 ms,一个
+/// 离谱的测量值不该拖慢启动。没探测(Windows、什么都不问)等 50 ms。
+fn startupSettleMs(round_trip_ms: ?i64) i32 {
+    const rtt = round_trip_ms orelse return startup_settle_min_ms;
+    return @intCast(std.math.clamp(2 * rtt, startup_settle_min_ms, startup_settle_max_ms));
+}
+const startup_settle_min_ms: i32 = 50;
+const startup_settle_max_ms: i32 = 500;
 
 /// 首个输入框出现之前留下的启动期输入(探测、启动动画、App.init 期间敲的键或粘贴的文字)
 /// 整体作为一次粘贴交给它:那时括号粘贴还没打开(第一个输入框才开),一段多行粘贴里的每个
 /// 换行都是 Enter——第一行单独提交给了模型。这里把已到的全部读出(探测交回 stdin 的在前,
-/// 终端的在后),还原成正文(StartupText),直到终端读空、再等 startup_settle_ms 也没有新的;
+/// 终端的在后),还原成正文(StartupText),直到终端读空、再等 settle_ms 也没有新的;
 /// 第一个输入框把它插入(loop.readLineRaw):换行是文本,用户按 Enter 才提交,大段粘贴照常
 /// 落盘成占位符。不设长度上限,一个字节也不留给后面当按键。
-fn collectStartupInput(fd: c_int) void {
+fn collectStartupInput(fd: c_int, settle_ms: i32) void {
     var text = StartupText.init(std.heap.c_allocator);
     var chunk: [256]u8 = undefined;
     var read_any = false;
@@ -710,7 +718,7 @@ fn collectStartupInput(fd: c_int) void {
         // Windows:不产字符的按键排在队首时 ReadConsoleW 会一直等下一个产字符的键。
         platform_term.dropSilentInput(fd);
         if (platform_term.waitReadable(fd, 0) <= 0) {
-            if (read_any and platform_term.waitReadable(fd, startup_settle_ms) > 0) continue;
+            if (read_any and platform_term.waitReadable(fd, settle_ms) > 0) continue;
             break;
         }
         const n = platform_term.readInput(fd, &chunk); // no EINTR: waitReadable reported data
@@ -2101,7 +2109,7 @@ test "collectStartupInput: what the probe handed back, then all the terminal hol
     try testing.expect(pfs.writeAll(fds[1], "\x1b[Dd"));
     try testing.expect(pfs.writeAll(fds[1], &lines));
 
-    collectStartupInput(r);
+    collectStartupInput(r, startupSettleMs(null));
     var t = takeStartupText() orelse return error.TestUnexpectedResult;
     defer t.deinit();
     try testing.expect(takeStartupText() == null);
@@ -2115,16 +2123,58 @@ test "collectStartupInput: what the probe handed back, then all the terminal hol
     try testing.expectEqual(@as(usize, 99), std.mem.count(u8, text, "\n"));
 }
 
+test "collectStartupInput: it waits two round trips of the terminal for the rest of a paste, between 50 and 500 ms" {
+    try testing.expectEqual(@as(i32, 50), startupSettleMs(null)); // not probed (Windows)
+    try testing.expectEqual(@as(i32, 50), startupSettleMs(1));
+    try testing.expectEqual(@as(i32, 240), startupSettleMs(120));
+    try testing.expectEqual(@as(i32, 500), startupSettleMs(5000));
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest; // pipe as the terminal
+    // A paste whose second half comes `gap_ms` after the first, as a slow
+    // link delivers it a round trip apart.
+    const cases = [_]struct { round_trip_ms: ?i64, gap_ms: u64, whole: bool }{
+        // 120 ms round trip, 100 ms apart: one paste.
+        .{ .round_trip_ms = 120, .gap_ms = 100, .whole = true },
+        // Waiting only 50 ms, the second half is left to arrive as keys.
+        .{ .round_trip_ms = null, .gap_ms = 150, .whole = false },
+    };
+    for (cases) |case| {
+        var fds: [2]c_int = undefined;
+        try testing.expectEqual(@as(c_int, 0), std.c.pipe(&fds));
+        defer _ = std.c.close(fds[0]);
+        defer _ = std.c.close(fds[1]);
+        var rest: [32]u8 = undefined;
+        defer _ = drainStdinForTest(fds[0], &rest);
+        try testing.expect(pfs.writeAll(fds[1], "line1\rline2\r"));
+        const Later = struct {
+            fn send(fd: c_int, gap_ms: u64) void {
+                @import("../util/time.zig").sleepMs(gap_ms);
+                _ = pfs.writeAll(fd, "line3\rline4");
+            }
+        };
+        const sender = try std.Thread.spawn(.{}, Later.send, .{ fds[1], case.gap_ms });
+        collectStartupInput(fds[0], startupSettleMs(case.round_trip_ms));
+        sender.join();
+        var got = takeStartupText() orelse return error.TestUnexpectedResult;
+        defer got.deinit();
+        if (case.whole) {
+            try testing.expectEqualStrings("line1\nline2\nline3\nline4", got.text());
+        } else {
+            try testing.expectEqualStrings("line1\nline2", got.text());
+            try testing.expectEqualStrings("line3\rline4", drainStdinForTest(fds[0], &rest));
+        }
+    }
+}
+
 test "collectStartupInput: nothing typed, or only Enter to skip the startup animation, leaves the prompt empty" {
     if (@import("builtin").os.tag == .windows) return error.SkipZigTest; // pipe as the terminal
     var fds: [2]c_int = undefined;
     try testing.expectEqual(@as(c_int, 0), std.c.pipe(&fds));
     defer _ = std.c.close(fds[0]);
     defer _ = std.c.close(fds[1]);
-    collectStartupInput(fds[0]);
+    collectStartupInput(fds[0], startupSettleMs(null));
     try testing.expect(takeStartupText() == null);
     try testing.expect(pfs.writeAll(fds[1], "\r"));
-    collectStartupInput(fds[0]);
+    collectStartupInput(fds[0], startupSettleMs(null));
     try testing.expect(takeStartupText() == null);
     try testing.expectEqual(@as(i32, 0), platform_term.waitReadable(fds[0], 0));
 }

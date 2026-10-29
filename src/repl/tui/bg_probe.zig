@@ -441,6 +441,9 @@ pub fn probe(want: Want, hand_over: bool) Result {
     const started = util_time.nowNs();
     var io: TerminalIo = .{ .fd = fd };
     var round = runRound(&io, asked, budget_ms);
+    // DA1 ends the round: the time it took is the terminal's round trip. A
+    // round the deadline ended took at least that long (`Late` may learn more).
+    g_round_trip_ms = @intCast(@divTrunc(util_time.nowNs() - started, std.time.ns_per_ms));
     const late = !round.done() and fd == 0 and hand_over and platform_term.enterQuiet(fd, saved);
     if (!late) round.finish();
     log.debug("probe", "terminal answered in {d}us: sentinel={} keyboard={s} background={} typed={d}B", .{
@@ -456,8 +459,21 @@ pub fn probe(want: Want, hand_over: bool) Result {
         round.clearTyped();
         platform_term.restoreAtExit(fd, saved);
         g_late = Late.init(fd, saved, round);
+        g_late.?.asked_ms = @intCast(@divTrunc(started, std.time.ns_per_ms));
     } else platform_term.restoreModeKeepingInput(fd, saved);
     return round.result;
+}
+
+/// How long the terminal took to answer the startup probe, in ms, for a
+/// reader that waits for the rest of what the terminal is sending
+/// (`input.collectStartupInput`: a paste split by a slow link). Null when no
+/// round was run (Windows, nothing asked). Written before the REPL's first
+/// raw-mode entry reads it (by the splash's thread when a late DA1 comes
+/// while it plays, which has ended by then).
+var g_round_trip_ms: ?i64 = null;
+
+pub fn roundTripMs() ?i64 {
+    return g_round_trip_ms;
 }
 
 /// How long an open answer in `Late` waits for the rest of it before what
@@ -494,6 +510,9 @@ const Late = struct {
     /// then. From there on every byte must fit its tail and none restarts the
     /// wait. Null while it waits.
     overdue_from: ?usize = null,
+    /// When the round's query went out: a DA1 that comes now tells the
+    /// terminal's real round trip (`roundTripMs`).
+    asked_ms: ?i64 = null,
 
     fn init(fd: c_int, original: platform_term.SavedMode, scanner: Scanner) Late {
         return .{
@@ -534,7 +553,11 @@ const Late = struct {
         const s = &self.scanner;
         if (s.seq_len > 0 and self.overdue_from == null and now - self.progress_ms >= late_tail_ms) self.overdue_from = s.seq_len;
         if (self.overdue_from != null and !s.tailFits(&.{b})) self.giveUp();
+        const answered = s.done();
         s.feed(&.{b});
+        if (!answered and s.done()) if (self.asked_ms) |asked| {
+            g_round_trip_ms = now - asked;
+        };
         if (s.begun != self.begun) {
             // Another sequence began: it waits afresh.
             self.begun = s.begun;
@@ -1160,6 +1183,29 @@ test "Late: keys typed one by one after a cut answer went overdue are typed, tho
         var rest: [8]u8 = undefined;
         try testing.expectEqualStrings(case.prompt, drainForTest(r, &owed, &rest).owed);
     }
+}
+
+test "Late: a DA1 that comes after the deadline gives the terminal's round trip" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest; // a pipe stands in for the terminal
+    var fds: [2]c_int = undefined;
+    try testing.expectEqual(@as(c_int, 0), std.c.pipe(&fds));
+    defer _ = std.c.close(fds[0]);
+    defer _ = std.c.close(fds[1]);
+    const r = fds[0];
+    defer forgetOwedForTest(r);
+    defer g_round_trip_ms = null;
+    // The round ended on its deadline: the round trip is at least that.
+    g_round_trip_ms = budget_ms;
+    g_late = Late.init(r, std.mem.zeroes(platform_term.SavedMode), Scanner.init(both));
+    defer g_late = null;
+    g_late.?.asked_ms = util_time.nowMs() - 300;
+    // An OSC 11 answer is not the end of the round; DA1 is.
+    try testing.expect(pfs.writeAll(fds[1], "\x1b]11;rgb:0/0/0\x07"));
+    try testing.expect(lateAnswersOnly(r));
+    try testing.expectEqual(@as(?i64, budget_ms), roundTripMs());
+    try testing.expect(pfs.writeAll(fds[1], "\x1b[?62;22c"));
+    try testing.expect(lateAnswersOnly(r));
+    try testing.expect(roundTripMs().? >= 300);
 }
 
 test "Scanner.tailFits: an answer's own bytes fit it, typed text does not" {

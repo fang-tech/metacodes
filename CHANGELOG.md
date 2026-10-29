@@ -386,7 +386,9 @@ status, compatibility boundaries, and entry points are defined by
   large paste becomes the usual placeholder, and nothing is sent until Enter.
   The newlines it starts or ends with (the Enter that skipped the animation,
   the one after the last line) are left out, and input that is only blanks
-  leaves the prompt empty.
+  leaves the prompt empty. Startup input is read until the terminal has been
+  quiet for two of its round trips, as the startup probe measured them (50
+  to 500 ms), so a paste a slow link delivers in parts is still one paste.
 
 
 ## 0.8.1 — 2026-10-28
