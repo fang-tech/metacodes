@@ -1265,6 +1265,11 @@ fn runTurn(host: *const TurnHost, kind: TurnKind, synthetic_user_input: ?[]const
     if (result.stop_reason == .tool_error) {
         cmd_output.print("\x1b[31mA tool failed in a way that cannot be retried; the turn stopped. See the error above.\x1b[0m\n", .{});
     }
+    // 续写预算耗尽后仍被 token 上限截断(#394):上方可见正文只是没写完的前缀,明确告知,
+    // 不让它读起来像完整回答。对话完整保留,下一句输入即续接。
+    if (result.stop_reason == .max_tokens_exhausted) {
+        cmd_output.print("\x1b[33mStopped: the reply was still cut off at the output token limit after {d} continuations, so it is incomplete.\nType your next step to continue.\x1b[0m\n", .{result.continuations});
+    }
     // 成本预算撞墙(次闸):明确告知累计成本,非静默,不自动续——由用户决定是否继续烧钱。
     if (result.stop_reason == .budget) {
         cmd_output.print("\x1b[33mCost budget reached (${d:.4} this session); the turn stopped.\nType your next step to continue, or raise METACODES_COST_BUDGET.\x1b[0m\n", .{app.usage.costUsd(app.activeModel())});

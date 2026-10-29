@@ -201,6 +201,11 @@ const ReconstructionProbe = struct {
     group_id: u32 = 0,
     answer: [256]u8 = undefined,
     answer_len: usize = 0,
+    /// Visible output of a group that closed as partial: shown, never the answer.
+    partial: [256]u8 = undefined,
+    partial_len: usize = 0,
+    /// The last RunState phase seen: the terminal one once the Run returned.
+    last_phase: ?sdk.protocol.RunStatePhase = null,
     thinking: [128]u8 = undefined,
     thinking_len: usize = 0,
     stream_done_count: usize = 0,
@@ -286,6 +291,11 @@ const ReconstructionProbe = struct {
                         self.commentary_count += 1;
                     },
                     .partial => {
+                        if (self.group_len != 0 and self.group_id != segment.group) return wire.EVENT_FATAL;
+                        if (self.current_len > self.partial.len - self.group_len) return wire.EVENT_FATAL;
+                        @memcpy(self.partial[0..self.group_len], self.group[0..self.group_len]);
+                        @memcpy(self.partial[self.group_len..][0..self.current_len], self.current[0..self.current_len]);
+                        self.partial_len = self.group_len + self.current_len;
                         self.group_len = 0;
                         self.partial_count += 1;
                     },
@@ -293,6 +303,7 @@ const ReconstructionProbe = struct {
                 }
                 self.current_len = 0;
             },
+            .run_state => |state| self.last_phase = state.phase,
             .usage => |usage| {
                 if (!checkedAdd(&self.usage.input_tokens, usage.input_tokens) or
                     !checkedAdd(&self.usage.output_tokens, usage.output_tokens) or
@@ -1025,9 +1036,13 @@ const PublicSessionFixture = struct {
     }
 
     fn runText(self: *PublicSessionFixture, run_id: u64, prompt: []const u8) !wire.RunResultV1 {
+        return self.runTextTurns(run_id, prompt, 1);
+    }
+
+    fn runTextTurns(self: *PublicSessionFixture, run_id: u64, prompt: []const u8, max_turns: u32) !wire.RunResultV1 {
         var options = std.mem.zeroes(wire.RunOptionsV1);
         options.struct_size = @sizeOf(wire.RunOptionsV1);
-        options.max_turns = 1;
+        options.max_turns = max_turns;
         var result = std.mem.zeroes(wire.RunResultV1);
         try std.testing.expectEqual(
             wire.STATUS_OK,
@@ -4793,6 +4808,92 @@ test "L2 public events reconstruct continuation output and observable run usage"
     try std.testing.expectEqual(@as(usize, 0), probe.discarded_count);
     try std.testing.expectEqual(@as(u64, 11), probe.usage.input_tokens);
     try std.testing.expectEqual(@as(u64, 5), probe.usage.output_tokens);
+}
+
+/// One Anthropic response cut at the output-token limit, carrying `text`
+/// (none when empty).
+fn maxTokensCutSse(comptime text: []const u8) []const u8 {
+    return "data: {\"type\":\"message_start\",\"message\":{\"id\":\"cut\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\n" ++
+        (if (text.len == 0) "" else "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n" ++
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"" ++ text ++ "\"}}\n\n" ++
+            "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n") ++
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"max_tokens\"},\"usage\":{\"output_tokens\":2}}\n\n" ++
+        "data: {\"type\":\"message_stop\"}\n\n";
+}
+
+fn expectExhaustionThroughAbi(comptime text: []const u8) !void {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try rootPath(&tmp, &root_buf);
+    // The initial request and its three continuations are all cut; the
+    // fifth response answers the next Run.
+    const cut = comptime maxTokensCutSse(text);
+    const bodies = [_][]const u8{ cut, cut, cut, cut, FINAL_SSE };
+    var server = try harness.MockServer.startCassette(&bodies, 0);
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+    var probe = ReconstructionProbe{};
+    var fixture = try PublicSessionFixture.initObserved(root, url, "test-model", null, &probe, ReconstructionProbe.event);
+    defer fixture.deinit();
+
+    var result = try fixture.runTextTurns(1, "write the report", 8);
+    try std.testing.expectEqual(wire.STOP_API_ERROR, result.stop_reason_code);
+    try std.testing.expectEqual(@as(u32, 4), result.turns);
+    try std.testing.expectEqual(@as(usize, 4), server.requestCount());
+    // A Run outcome, not a facade failure: no diagnostic.
+    try std.testing.expectEqual(@as(u64, 0), fixture.diagnostic.len);
+    // The Host got every visible byte, closed as partial and never as the
+    // answer, and a failed (not poisoned) terminal RunState.
+    try std.testing.expectEqual(@as(usize, 3), probe.continued_count);
+    try std.testing.expectEqual(@as(usize, 1), probe.partial_count);
+    try std.testing.expectEqual(@as(usize, 0), probe.final_count);
+    try std.testing.expectEqualStrings(text ** 4, probe.partial[0..probe.partial_len]);
+    try std.testing.expectEqual(@as(?sdk.protocol.RunStatePhase, .failed), probe.last_phase);
+
+    // The same Session takes the next Run.
+    result = try fixture.runTextTurns(2, "try again", 8);
+    try std.testing.expectEqual(wire.STOP_END_TURN, result.stop_reason_code);
+    try std.testing.expectEqual(@as(usize, 5), server.requestCount());
+    try std.testing.expectEqualStrings("done", probe.answer[0..probe.answer_len]);
+    try std.testing.expectEqual(@as(?sdk.protocol.RunStatePhase, .completed), probe.last_phase);
+}
+
+test "L2 issue #394: max-token exhaustion with visible text crosses AgentCore as api_error and leaves the Session usable" {
+    try expectExhaustionThroughAbi("cut ");
+}
+
+test "L2 issue #394: max-token exhaustion without text crosses AgentCore as api_error and leaves the Session usable" {
+    // Before #394 this poisoned the facade (INTERNAL_ERROR, then INVALID_STATE).
+    try expectExhaustionThroughAbi("");
+}
+
+test "L2 issue #394 control: a truncation that recovers on the last continuation is still END_TURN through AgentCore" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try rootPath(&tmp, &root_buf);
+    const cut = comptime maxTokensCutSse("cut ");
+    const bodies = [_][]const u8{ cut, cut, cut, CONTINUATION_TAIL_SSE };
+    var server = try harness.MockServer.startCassette(&bodies, 0);
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+    var probe = ReconstructionProbe{};
+    var fixture = try PublicSessionFixture.initObserved(root, url, "test-model", null, &probe, ReconstructionProbe.event);
+    defer fixture.deinit();
+
+    const result = try fixture.runTextTurns(1, "write the report", 8);
+    try std.testing.expectEqual(wire.STOP_END_TURN, result.stop_reason_code);
+    try std.testing.expectEqual(@as(usize, 4), server.requestCount());
+    try std.testing.expectEqual(@as(usize, 3), probe.continued_count);
+    try std.testing.expectEqual(@as(usize, 1), probe.final_count);
+    try std.testing.expectEqual(@as(usize, 0), probe.partial_count);
+    try std.testing.expectEqualStrings("cut cut cut tail", probe.answer[0..probe.answer_len]);
+    try std.testing.expectEqual(@as(?sdk.protocol.RunStatePhase, .completed), probe.last_phase);
 }
 
 test "L2 public AgentCore OpenAI chat delivers text from usage:null chunks to the Host (issue #258)" {

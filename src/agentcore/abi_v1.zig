@@ -4872,11 +4872,16 @@ fn stopReason(self: *AbiSession, reason: core.agent_loop.StopReason) error{Unsup
         .max_turns => wire.STOP_MAX_TURNS,
         .aborted => wire.STOP_ABORTED,
         .tool_error => wire.STOP_TOOL_ERROR,
-        .api_error => wire.STOP_API_ERROR,
+        // The provider still cut the answer at its output-token limit after
+        // the last continuation: a provider outcome the Run reports, not a
+        // contract failure. The frozen v1 wire enum does not grow, so it
+        // projects onto the provider-failure code and the Session stays
+        // usable (#394).
+        .api_error, .max_tokens_exhausted => wire.STOP_API_ERROR,
         // The stall gate is a controlled breaker stop; the frozen v1 wire
         // enum does not grow, so it projects onto the breaker code.
         .tool_loop, .stalled => wire.STOP_TOOL_LOOP,
-        .suspended, .backgrounded, .budget, .max_tokens_exhausted => {
+        .suspended, .backgrounded, .budget => {
             // The stateful Run has already committed Conversation changes.
             // Returning an error while leaving the facade reusable would make
             // a Host retry ambiguous and could repeat side effects.
@@ -11248,6 +11253,18 @@ test "internal continuation states poison the ABI facade" {
     fake.facade_poisoned.store(false, .release);
     try std.testing.expectError(error.UnsupportedStopReason, stopReason(&fake, .budget));
     try std.testing.expect(fake.facade_poisoned.load(.acquire));
+}
+
+test "issue #394: max-token exhaustion projects onto api_error without poisoning the facade" {
+    var fake = AbiSession{
+        .callbacks = std.mem.zeroes(wire.SessionCallbacksV1),
+        .callback_status = .init(wire.STATUS_OK),
+        .facade_poisoned = .init(false),
+        .core_session = undefined,
+    };
+    try std.testing.expectEqual(wire.STOP_API_ERROR, try stopReason(&fake, .max_tokens_exhausted));
+    try std.testing.expect(!fake.facade_poisoned.load(.acquire));
+    try std.testing.expectEqual(terminalPhaseForStopReason(.api_error), terminalPhaseForStopReason(.max_tokens_exhausted));
 }
 
 test "metadata limits enforce per-field and aggregate budgets" {

@@ -218,6 +218,7 @@ pub const cache_break = @import("core/cache_break.zig");
 pub const core_message = @import("core/message.zig");
 pub const transcript = @import("core/transcript.zig");
 pub const repl_headless = @import("repl/headless.zig");
+pub const repl_stream_json = @import("repl/stream_json_backend.zig");
 pub const repl_loop = @import("repl/loop.zig");
 pub const app_module = @import("app.zig");
 pub const app_route_strings = @import("app/route_strings.zig");

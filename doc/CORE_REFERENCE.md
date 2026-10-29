@@ -162,7 +162,7 @@ core 因此把它**已经知道**的判定发出来。一个 **段** = 一次 pr
 | `commentary` | 可见过程信息(本轮跟着工具调用,或主机拒绝了这次"过早的最终答案") |
 | `final` | Run 的完成结果 |
 | `continued` | 被 max_tokens 截断,与**同 `group`** 的下一段合成一个结果 |
-| `partial` | 可见但未完成(abort / 预算终止 / 二次拒绝) |
+| `partial` | 可见但未完成(abort / 预算终止 / 二次拒绝 / 续写额度用尽后仍被截断) |
 | `discarded` | 从未进入 Conversation(流内失败回滚),前端须丢弃已缓冲的该段字节 |
 
 `index` 在 Run 内单调,**被丢弃的段也占一个索引**("回滚过"与"没发生过"必须可区分)。
@@ -967,6 +967,16 @@ Session 加入宿主调度的 team。lead 的 `SpawnTeammate` 不起线程,只�
   `RunResult.continuations` 记本次 `run` 的
   max_tokens 续写次数,headless `--json` 结果行同名字段携带它:续写后的正文是无缝拼接,只看结果
   的消费者没有别的办法知道回答被截断过。
+- **续写额度用尽后仍被截断 = 显式未完成**(issue #394):一个 `run` 至多续写 `MAX_CONTINUATIONS`
+  (3)次。额度用尽后,没有 tool_use 的一轮仍以 max-token 终止(Anthropic `max_tokens`、chat
+  `length`、Responses `response.incomplete` + `max_output_tokens`、Gemini `MAX_TOKENS`)→
+  `stop_reason=max_tokens_exhausted`,该段定性 `partial`,不再走主机门、Stop hook 与 `final`
+  收尾。有没有可见正文都一样:正文照样交付(`Ledger.partialText()` 是整个续写组的拼接),
+  headless 结果行 `text_kind=partial`、退出码 1,`--stream-json` 时间线是
+  `continued → … → partial`;AgentCore ABI v1 报 `api_error`(RunState `failed`),Session
+  可接着跑下一个 Run(`AGENTCORE_BINARY_ABI.md`)。此前只有无正文的一轮走这里,带正文的被当成完成的回答
+  (`end_turn` / `final`,退出码 0)。完整的 tool_use 照常执行,不算耗尽;续写中途正常收尾
+  的仍是一个 `final` 回答。
 - **permission 门不可挂起**:权限确认是 `executeSlots` 前的同步门,异步挂起暂不覆盖(out of scope)。
 - **文件修改契约只覆盖类型化文件工具**(Write/Edit/NotebookEdit/ApplyPatch,§3.2.2)。`Bash` 或
   任意终端命令改动文件系统**不会**产生 `file_changes`——要覆盖它需要文件系统级观测,不在本契约内。

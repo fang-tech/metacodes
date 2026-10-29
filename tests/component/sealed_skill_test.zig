@@ -1141,6 +1141,55 @@ test "L2 sealed: under disclosure: fail a quoting final ends the run and nothing
     try std.testing.expect(std.mem.indexOf(u8, ledger, "\"step_kind\":\"failed\"") != null);
 }
 
+/// One brain turn with `text`, cut at the output-token limit.
+fn cutSse(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
+    const escaped = try escapeJson(allocator, text);
+    defer allocator.free(escaped);
+    return std.fmt.allocPrint(
+        allocator,
+        "data: {{\"type\":\"message_start\",\"message\":{{\"id\":\"msg_cut\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{{\"input_tokens\":40,\"output_tokens\":1}}}}}}\n\n" ++
+            "data: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{{\"type\":\"text\",\"text\":\"\"}}}}\n\n" ++
+            "data: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":\"{s}\"}}}}\n\n" ++
+            "data: {{\"type\":\"content_block_stop\",\"index\":0}}\n\n" ++
+            "data: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"max_tokens\"}},\"usage\":{{\"output_tokens\":5}}}}\n\n" ++
+            "data: {{\"type\":\"message_stop\"}}\n\n",
+        .{escaped},
+    );
+}
+
+test "L2 sealed: an answer still cut at the output-token limit fails the run without leaking its text (#394)" {
+    const a = std.testing.allocator;
+    var lab: Lab = undefined;
+    // The first request and its three continuations are all cut.
+    const cut = try cutSse(a, "half-sealed-answer ");
+    defer a.free(cut);
+    try lab.start(a, "cc-zig-sealed-max-tokens", &.{ cut, cut, cut, cut }, protocol.TEST_MANIFEST_JSON, .{});
+    defer lab.stop();
+    try lab.install("");
+    try lab.loadCatalog();
+
+    const output = try lab.runSkill("{\"name\":\"erp-post\",\"values\":[\"write the report\"]}");
+    defer a.free(output);
+    try std.testing.expectEqual(@as(usize, 4), lab.model.requestCount());
+    try std.testing.expect(std.mem.indexOf(u8, output, "[sealed skill failed: skill_error: the Skill's output was still cut off at the model's output-token limit after 3 continuations]") != null);
+    // Not a `final`, and nothing of the truncated answer reaches the client.
+    try std.testing.expect(std.mem.indexOf(u8, output, "half-sealed-answer") == null);
+    const ledger = (try lab.ledger()) orelse return error.LedgerMissing;
+    defer a.free(ledger);
+    try std.testing.expect(std.mem.indexOf(u8, ledger, "half-sealed-answer") == null);
+    try std.testing.expect(std.mem.indexOf(u8, ledger, "\"step_kind\":\"failed\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ledger, "\"step_kind\":\"final\"") == null);
+    // Charged like any other failed run that used the model: the Step
+    // carries the four calls' cost and the run has its charge.
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(ledger, "\"kind\":\"step\""));
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(ledger, "\"kind\":\"charge\""));
+    var lines = std.mem.splitScalar(u8, ledger, '\n');
+    while (lines.next()) |line| {
+        if (std.mem.indexOf(u8, line, "\"kind\":\"step\"") == null) continue;
+        try std.testing.expect(std.mem.indexOf(u8, line, "\"cost_micros\":0,") == null);
+    }
+}
+
 // ── confirm: true (§4.3, §6.2) ────────────────────────────────────────────
 
 const CONFIRM_READ_MANIFEST = "{\"schema\":\"metask.sealed-skill.manifest/v1\",\"skill_id\":\"ssk_test\",\"version\":\"1.0.0\",\"name\":\"erp-post\",\"description\":\"Posts invoices.\",\"tools\":{\"allow\":[\"Read\"]},\"confirmation\":{\"required_for\":[\"Read\"]},\"egress\":{\"classes\":[\"file_contents\"]}}";

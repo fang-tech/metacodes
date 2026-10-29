@@ -2973,16 +2973,17 @@ fn runCounted(
                 log.infoId("agent", rid, "learning turn done passes={d} lessons={d} refused={d}", .{ report.passes, report.lessons_accepted, report.lessons_refused });
                 return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .end_turn, .turns = turns + 1, .tool_calls = total_tool_calls });
             }
-            if (turn_stop_reason == .max_tokens and
-                continuations.* >= MAX_CONTINUATIONS and
-                assistant_text.items.len == 0)
-            {
-                // The provider exhausted the continuation budget without
-                // producing answer text or a tool call. Preserve the
-                // distinction from a normal completion so callers can surface
-                // the truncated, empty run instead of treating it as success.
+            if (turn_stop_reason == .max_tokens and continuations.* >= MAX_CONTINUATIONS) {
+                // The provider cut this turn at its output-token limit again
+                // after the last allowed continuation, and the turn has no
+                // tool call to act on. Any text it streamed is the visible
+                // prefix of an answer that never finished, so it closes as
+                // partial and the Run ends in the explicit exhaustion state,
+                // with or without that text (#394). Only the no-text case
+                // stopped here before; visible text fell through to the
+                // common tail and was reported as a completed answer.
                 output_channel.close(.partial, assistant_text.items);
-                log.warnId("agent", rid, "max_tokens continuation budget exhausted without actionable output", .{});
+                log.warnId("agent", rid, "max_tokens continuation budget exhausted; last turn still truncated ({d} visible bytes)", .{assistant_text.items.len});
                 return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .max_tokens_exhausted, .turns = turns + 1, .tool_calls = total_tool_calls });
             }
             // Some Anthropic-compatible gateways accept but ignore a forced
@@ -7537,9 +7538,11 @@ const CandidateSegments = struct {
 };
 
 /// Provider fixture for the continuation-budget boundary. Every response is
-/// cut off with no content, with an optional tool call on the final response.
+/// cut off, carrying `text` (none when empty), with an optional tool call on
+/// the final response.
 const MaxTokensFake = struct {
     allocator: std.mem.Allocator,
+    text: []const u8 = "",
     include_final_tool: bool = false,
     sends: u32 = 0,
     stream_step: u8 = 0,
@@ -7552,6 +7555,9 @@ const MaxTokensFake = struct {
     fn next(ctx: *anyopaque) anyerror!?api_stream.StreamEvent {
         const self = state(ctx);
         defer self.stream_step += 1;
+        if (self.text.len > 0 and self.stream_step == 0) {
+            return .{ .text = try self.allocator.dupe(u8, self.text) };
+        }
         if (self.include_final_tool and self.sends == 4 and self.stream_step == 0) {
             return .{ .tool_use_start = .{
                 .id = try self.allocator.dupe(u8, "tu_final"),
@@ -7739,34 +7745,53 @@ test "a candidate observation reaches the boundary before the response completes
     try std.testing.expectEqual(output_semantics.Disposition.final, segments.dispositions.items[0]);
 }
 
-test "max_tokens_exhausted with no actionable output is an explicit terminal stop" {
+test "max_tokens_exhausted is an explicit terminal stop with or without visible text" {
+    // #394: the no-text case always stopped here; a turn that still streamed
+    // text used to fall through to the common tail and close as `final`.
     const a = std.testing.allocator;
-    var conversation = Conversation.init(a);
-    defer conversation.deinit();
-    try conversation.appendText(.user, "go");
+    for ([_][]const u8{ "", "still cut " }) |text| {
+        errdefer std.debug.print("text=\"{s}\"\n", .{text});
+        var conversation = Conversation.init(a);
+        defer conversation.deinit();
+        try conversation.appendText(.user, "go");
 
-    var fake = MaxTokensFake{ .allocator = a };
-    var segments = CandidateSegments{ .allocator = a };
-    defer segments.deinit();
-    const backend = UiBackend{ .ctx = @ptrCast(&segments), .emit = CandidateSegments.emit, .poll = CandidateSegments.poll };
-    const perm = permission_mod.createContext(.bypass_permissions, a);
+        var fake = MaxTokensFake{ .allocator = a, .text = text };
+        var segments = CandidateSegments{ .allocator = a };
+        defer segments.deinit();
+        var ledger = output_semantics.Ledger.init(a);
+        defer ledger.deinit();
+        const backend = UiBackend{ .ctx = @ptrCast(&segments), .emit = CandidateSegments.emit, .poll = CandidateSegments.poll };
+        const perm = permission_mod.createContext(.bypass_permissions, a);
 
-    const result = try run(
-        &conversation,
-        fake.provider(),
-        &.{},
-        &perm,
-        .{ .max_turns = 4, .colorize = false },
-        &backend,
-        a,
-    );
+        const result = try run(
+            &conversation,
+            fake.provider(),
+            &.{},
+            &perm,
+            .{ .max_turns = 4, .colorize = false, .output_ledger = &ledger },
+            &backend,
+            a,
+        );
 
-    try std.testing.expectEqual(StopReason.max_tokens_exhausted, result.stop_reason);
-    try std.testing.expectEqual(@as(u32, 4), fake.sends);
-    try std.testing.expectEqual(@as(u32, 4), result.turns);
-    try std.testing.expectEqual(@as(usize, 4), conversation.len());
-    try std.testing.expectEqual(@as(usize, 4), segments.dispositions.items.len);
-    try std.testing.expectEqual(output_semantics.Disposition.partial, segments.dispositions.items[3]);
+        try std.testing.expectEqual(StopReason.max_tokens_exhausted, result.stop_reason);
+        try std.testing.expectEqual(@as(u32, 4), fake.sends);
+        try std.testing.expectEqual(@as(u32, 4), result.turns);
+        try std.testing.expectEqual(@as(u32, 3), result.continuations);
+        // Each response with text is committed as an assistant message
+        // between the host's continuation prompts.
+        try std.testing.expectEqual(@as(usize, if (text.len == 0) 4 else 8), conversation.len());
+        try std.testing.expectEqualSlices(
+            output_semantics.Disposition,
+            &.{ .continued, .continued, .continued, .partial },
+            segments.dispositions.items,
+        );
+        // The text is delivered, marked partial, and never as the answer.
+        try std.testing.expect(ledger.finalText() == null);
+        const expected = try std.mem.concat(a, u8, &.{ text, text, text, text });
+        defer a.free(expected);
+        try std.testing.expectEqualStrings(expected, ledger.partialText().?);
+        try std.testing.expectEqualStrings(expected, segments.text.items);
+    }
 }
 
 test "max_tokens_exhausted preserves a complete tool_use instead of failing" {
