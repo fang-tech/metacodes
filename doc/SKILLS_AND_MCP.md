@@ -48,7 +48,7 @@ ignored.
 
 | Field | Meaning |
 |---|---|
-| `name` | display name (the invocation name is the directory name) |
+| `name` | display name (the invocation name is the directory name); when absent, the directory name |
 | `description` | listed to the model; when absent, the first body line (Claude Code), and `/skills` reports the Skill |
 | `when_to_use` | appended to the description in listings |
 | `argument-hint` | shown beside the command in the `/` menu |
@@ -65,6 +65,18 @@ false` hides the Skill from the model like `disable-model-invocation`.
 A malformed policy value (`context`, `shell`, a boolean, `model-activation`) or
 malformed YAML makes the Skill a typed `invalid_definition` issue rather than
 silently changing its meaning.
+
+The [Agent Skills specification](https://github.com/agentskills/agentskills/blob/main/docs/specification.mdx#frontmatter)
+requires `name` and `description` to be non-empty. A `name` or `description`
+that is empty or only whitespace (`name: ""`, `description: "  "`,
+`description:` with no value) counts as absent, as in Claude Code
+(`description`) and Codex (both), so the fallbacks above stand in. The Skill
+still loads: a blank field is a typed warning in its definition
+(`definition.Warning`), not an `invalid_definition` issue, and `/skills` names
+the field. When the body has no line to stand in either, the Skill is listed
+with no description (`- **name**`), exactly as when `description` is absent.
+AgentCore's canonical catalog has no body fallback: a blank `description` is
+empty there, as an absent one is.
 
 ### What the model sees
 
@@ -135,8 +147,9 @@ no change leaves the request bytes as they were.
   new listing. Without a terminal (and as the data behind it) `/skills`
   prints the full report: tier, any override state, and directory, the
   Skills without a `description` (listed with their first body line or with
-  nothing), the Skills that did not load and why, and skipped roots. The
-  startup banner and `/doctor` count these, together with hook and agent
+  nothing), those with a blank `name`, the Skills that did not load and why,
+  and skipped roots. The startup banner and `/doctor` count these (a Skill
+  once, however many of its fields are blank), together with hook and agent
   configuration problems (`/hooks`, `/agents`), so a broken file is noticed
   without knowing where to look.
 

@@ -351,7 +351,62 @@ test "skills: described Skills report nothing" {
     const out = try fx.report(cc.repl_loop.writeSkillsReport);
     try expectContains(out, "Skills (2):");
     try expectLacks(out, "No description");
+    try expectLacks(out, "Blank name");
     try std.testing.expectEqual(@as(usize, 0), fx.app.configProblems().skills);
+}
+
+test "skills: a blank name or description reads as absent, falls back, and is reported (#395)" {
+    var fx: Fixture = undefined;
+    try fx.setup(&.{
+        // The #395 reproduction.
+        .{ .path = "repo/.agents/skills/demo/SKILL.md", .data = "---\nname: \"\"\ndescription: \"\"\n---\n\nUse for demonstrating an empty frontmatter.\n" },
+        // Whitespace-only, with no body line to fall back to.
+        .{ .path = "home/.claude/skills/hollow/SKILL.md", .data = "---\nname: hollow\ndescription: \"   \"\n---\n" },
+        .{ .path = "home/.claude/skills/described/SKILL.md", .data = "---\nname: described\ndescription: Review the staged diff\n---\nReview it.\n" },
+    });
+    defer fx.deinit();
+    const snapshot = fx.app.skill_runtime.snapshot orelse return error.NoCatalog;
+    const definition = cc.skills_runtime.definition;
+
+    // All three load; the blank fields get the fallbacks an absent one gets.
+    try std.testing.expectEqual(@as(usize, 3), snapshot.skills.len);
+    try std.testing.expectEqual(@as(usize, 0), snapshot.issues.len);
+    const demo = snapshot.findByInvocation("demo") orelse return error.MissingSkill;
+    try std.testing.expectEqualStrings("demo", demo.definition.name);
+    try std.testing.expectEqualStrings("Use for demonstrating an empty frontmatter.", demo.definition.description);
+    try std.testing.expectEqual(definition.DescriptionSource.body_first_line, demo.definition.description_source);
+    try std.testing.expect(demo.definition.warnings.eql(.init(.{ .blank_name = true, .blank_description = true })));
+    const hollow = snapshot.findByInvocation("hollow") orelse return error.MissingSkill;
+    try std.testing.expectEqualStrings("", hollow.definition.description);
+    try std.testing.expectEqual(definition.DescriptionSource.missing, hollow.definition.description_source);
+    try std.testing.expect(hollow.definition.warnings.eql(.init(.{ .blank_description = true })));
+
+    // What `--dump-prompt` prints: the system prompt, then each tool's
+    // description. The model now sees the fallback instead of a bare name.
+    const prompt = fx.app.system_prompt orelse return error.NoSystemPrompt;
+    try expectContains(prompt, "- **demo** — Use for demonstrating an empty frontmatter.\n");
+    try expectContains(prompt, "- **hollow**\n");
+    try expectContains(prompt, "- **described** — Review the staged diff\n");
+    const skill_tool = for (fx.app.tool_defs) |tool| {
+        if (std.mem.eql(u8, tool.name, "Skill")) break tool;
+    } else return error.NoSkillTool;
+    try expectContains(skill_tool.description, "- demo: Use for demonstrating an empty frontmatter.\n");
+    try expectContains(skill_tool.description, "- described: Review the staged diff\n");
+
+    // `/skills` says which field was blank and what stood in for it.
+    const out = try fx.report(cc.repl_loop.writeSkillsReport);
+    try expectContains(out, "No description (2):");
+    try expectContains(out, "/demo: SKILL.md has a blank `description`; listings show its first line instead: \"Use for demonstrating an empty frontmatter.\"");
+    try expectContains(out, "/hollow: SKILL.md has a blank `description`; listings say nothing about when to use it");
+    try expectContains(out, "Blank name (1):");
+    try expectContains(out, "/demo: SKILL.md has a blank `name`; the directory name stands in");
+    try expectLacks(out, "/described: SKILL.md has");
+    try expectLacks(out, "/hollow: SKILL.md has a blank `name`");
+    try expectLacks(out, "Not loaded");
+
+    // Counted once per Skill, however many fields were blank.
+    try std.testing.expectEqual(@as(usize, 2), fx.app.configProblems().skills);
+    try std.testing.expectEqualStrings("config issues: 2 skills · see /skills", try fx.banner());
 }
 
 test "agents: a broken file and a missing description are reported; the rest load" {

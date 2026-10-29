@@ -161,12 +161,12 @@ Freeze the surfaces hosts depend on. Preconditions are already written down:
       then pass the reference-closure audit and the real-consumer gate
       ([doc/AGENTCORE_BINARY_ABI.md](doc/AGENTCORE_BINARY_ABI.md)).
 - [ ] Re-verify the full supported-target matrix at the frozen revision
-      (`x86_64-windows-msvc` passed the full native gate at revision 25
-      locally on 2026-10-28, and the `release.yml` dry run 40787422095 on
-      2026-10-28 passed it natively on `x86_64-linux-gnu`,
+      (`x86_64-windows-msvc` passed the full native gate at revision 26
+      locally on 2026-10-29, and the `release.yml` dry run 40787422095 on
+      2026-10-28 passed revision 25 natively on `x86_64-linux-gnu`,
       `aarch64-linux-gnu`, `aarch64-macos`, `x86_64-macos` and
-      `x86_64-windows-gnu`; the Windows ARM64 targets are not yet
-      verified at revision 25).
+      `x86_64-windows-gnu`; no other target is verified at revision 26
+      yet).
 - [ ] Plugin manifest/process-protocol v1 freeze with negative-test coverage.
 - [ ] CLI: versioned `--version`/`--help` surface and changelog discipline for
       flag changes.

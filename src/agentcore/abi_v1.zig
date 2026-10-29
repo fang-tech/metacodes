@@ -5031,6 +5031,7 @@ fn parseAdditionalSkillSources(
     const sources = try scratch.alloc(skill_catalog_handles.AdditionalSource, count);
     for (raw_sources, sources) |raw, *source| {
         if (raw.struct_size != @sizeOf(wire.SkillSourceV1) or
+            raw.reserved0 != 0 or
             !allZero(raw.reserved)) return error.InvalidArgument;
         const scope: skill_catalog_handles.AuthorityScope = switch (raw.scope_code) {
             wire.SKILL_SOURCE_USER => .user,
@@ -5063,6 +5064,7 @@ fn parseAdditionalSkillSources(
             .root = canonical.root,
             .scope = scope,
             .source_instance_id = source_instance_id,
+            .priority = raw.priority,
         };
         // `scratch` is an Arena in every caller; the canonical strings remain
         // live through the synchronous query and are released with the Arena.
@@ -5744,8 +5746,7 @@ fn runtimeQuerySkillCatalog(
     const descriptor_out = out_descriptor_json orelse
         return fail(wire.STATUS_INVALID_ARGUMENT, "out_descriptor_json is required", out_error);
     if (query.struct_size != @sizeOf(wire.SkillCatalogQueryV1) or
-        query.reserved0 != 0 or
-        !allZero(query.reserved))
+        query.reserved0 != 0)
         return fail(wire.STATUS_INVALID_ARGUMENT, "invalid SkillCatalogQueryV1", out_error);
 
     var metadata: u64 = 0;
@@ -5785,6 +5786,10 @@ fn runtimeQuerySkillCatalog(
         runtime.materializations.io,
         &workspace,
         epoch,
+        .{
+            .user = query.default_user_source_priority,
+            .workspace = query.default_workspace_source_priority,
+        },
         additional_sources,
         .{},
     ) catch |err| return failError(catalogQueryStatus(err), err, out_error);
@@ -8666,7 +8671,7 @@ test "ABI discovery is versioned" {
     try std.testing.expect(metask_agentcore_get_api(0) == null);
     const raw = metask_agentcore_get_api(wire.ABI_VERSION_V1) orelse return error.MissingApi;
     const api: *const wire.ApiV1 = @ptrCast(@alignCast(raw));
-    try std.testing.expectEqual(@as(u32, 25), api.abi_revision);
+    try std.testing.expectEqual(@as(u32, 26), api.abi_revision);
     try std.testing.expectEqual(@as(usize, 80), api.struct_size);
     try std.testing.expectEqual(@as(u32, 56), api.session.?.struct_size);
     try std.testing.expect(api.session.?.update_credential != null);
@@ -12211,6 +12216,7 @@ test "Revision 12 AgentCore restore uses execution identity and degrades unavail
             .disable_model_invocation = false,
             .when_to_use = "",
             .description_source = .frontmatter,
+            .warnings = .{},
             .argument_hint = "",
             .user_invocable = true,
             .context = .inline_ctx,
@@ -13632,6 +13638,7 @@ test "disabled AgentCore Skill fails before admission and materialization" {
             .disable_model_invocation = false,
             .when_to_use = "",
             .description_source = .frontmatter,
+            .warnings = .{},
             .argument_hint = "",
             .user_invocable = true,
             .context = .inline_ctx,
@@ -14393,6 +14400,7 @@ test "Skill materialization is post-admission and pre-Conversation" {
             .disable_model_invocation = false,
             .when_to_use = "",
             .description_source = .frontmatter,
+            .warnings = .{},
             .argument_hint = "",
             .user_invocable = true,
             .context = .inline_ctx,
@@ -14535,6 +14543,7 @@ test "typed Skill invocation record is deterministic and JSON-safe" {
             .disable_model_invocation = false,
             .when_to_use = "",
             .description_source = .frontmatter,
+            .warnings = .{},
             .argument_hint = "",
             .user_invocable = true,
             .context = .inline_ctx,

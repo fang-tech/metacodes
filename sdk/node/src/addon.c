@@ -1014,7 +1014,7 @@ static napi_value load_library(napi_env env, napi_callback_info info) {
         if (!metask_agentcore_api_v1_is_compatible(api)) {
             dlclose(library);
             napi_throw_error(env, "ABI_MISMATCH",
-                             "library does not provide AgentCore ABI v1 revision " "25" " with the expected layout");
+                             "library does not provide AgentCore ABI v1 revision " "26" " with the expected layout");
             return NULL;
         }
         g_api = api; /* the library stays loaded for the life of the process */

@@ -21,7 +21,7 @@ fn readGoal(
 }
 
 comptime {
-    if (wire.ABI_REVISION != 25 or
+    if (wire.ABI_REVISION != 26 or
         wire.MAX_CREDENTIAL_BYTES_V1 != 16 * 1024 or
         wire.MAX_SUBMITTED_INPUTS_V1 != 64 or
         wire.MAX_SUBMITTED_INPUT_BYTES_V1 != 16 * 1024 * 1024 or
@@ -74,7 +74,7 @@ comptime {
         wire.TEAM_ROLE_MEMBER != 2 or
         wire.MAX_TEAM_NAME_BYTES_V1 != 64 or
         wire.MAX_TEAM_MEMBER_BYTES_V1 != 64)
-        @compileError("source-free Revision 23-25 codes must match the public contract");
+        @compileError("source-free Revision 23-26 codes must match the public contract");
     if (@hasDecl(wire, "SessionRefreshSkillCatalogFnV1") or
         @hasField(wire.ApiV1, "session_refresh_skill_catalog"))
         @compileError("revision 24 must not expose the removed catalog refresh entry");
@@ -682,7 +682,8 @@ pub fn main(init: std.process.Init) !void {
         .workspace_epoch = sdk.bytesView("fixture-epoch"),
         .additional_sources = null,
         .additional_source_count = 0,
-        .reserved = [_]u64{0} ** 1,
+        .default_user_source_priority = 0,
+        .default_workspace_source_priority = 0,
     };
     var catalog: ?*wire.SkillCatalogHandle = null;
     defer if (catalog) |handle| {
@@ -1170,7 +1171,7 @@ pub fn main(init: std.process.Init) !void {
     try expectStatus(.ok, api.runtime().destroy()(runtime, &diagnostic), diagnostic);
     runtime = null;
 
-    std.debug.print("AgentCore source-free consumer: Revision 25 Agent Runtime, credential rotation, goals, host-scheduled team, time context, Host model capabilities, active-Run input, prompt profile, permission mode update, OpenAI Responses, multimodal input, active-Run journal, Host/MCP streaming, process-plugin configuration, Workspace Skill Catalog, tools, checkpoint, Runtime rebuild, restore and continued Run OK\n", .{});
+    std.debug.print("AgentCore source-free consumer: Revision 26 Agent Runtime, credential rotation, goals, host-scheduled team, time context, Host model capabilities, active-Run input, prompt profile, permission mode update, OpenAI Responses, multimodal input, active-Run journal, Host/MCP streaming, process-plugin configuration, Workspace Skill Catalog, tools, checkpoint, Runtime rebuild, restore and continued Run OK\n", .{});
 }
 
 /// Revision 25 (#336): one Session's provider credential, rotated twice
