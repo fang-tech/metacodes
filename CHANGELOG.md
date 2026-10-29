@@ -359,6 +359,18 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- **The first prompt no longer waits up to 2 s for the startup suggestion.**
+  The `suggestion: explain or improve <file>` line comes from `git log -1
+  --name-only`, which ran before the first prompt with a 2 s limit. On macOS
+  that git is Xcode's `/usr/bin/git` shim (the capture runs it with an empty
+  environment), which takes 1.1-2.5 s while its xcrun cache is cold. git now
+  starts on a thread of its own as the REPL starts, and the first prompt
+  waits for it at most 250 ms. A git still running then is left to finish,
+  so a cold shim writes its cache and the next start has the suggestion
+  (killed early, it would stay cold at every start); it is stopped when the
+  REPL ends. On macOS 26, 15 and 15 Intel runners with the cache cleared, the
+  first prompt came after 0.26-0.43 s instead of 1.2-2.3 s, and the start
+  after it showed the suggestion after 28-55 ms. Linux is unchanged (5-8 ms).
 - **A multi-line paste in Windows Terminal or the classic Windows console
   stays in the prompt instead of submitting every line but the last
   (#386).** On Windows the REPL never turned on bracketed paste: `TERM` is
