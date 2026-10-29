@@ -35,6 +35,7 @@ const std = @import("std");
 const AbortSignal = @import("../util/abort.zig").AbortSignal;
 const provider = @import("../api/provider.zig");
 const http_status = @import("../api/http_status.zig");
+const http_connection = @import("../api/http_connection.zig");
 const util_time = @import("../util/time.zig");
 const Capture = @import("../core/tool_result_artifact.zig").Capture;
 
@@ -273,7 +274,7 @@ pub const HttpTransport = struct {
             .extra_headers = extra.items,
         });
         defer request.deinit();
-        try request.sendBodiless();
+        try http_connection.sendBodiless(&request);
         var redirect: [1024]u8 = undefined;
         _ = try request.receiveHead(&redirect);
     }
@@ -432,14 +433,15 @@ const Exchange = struct {
         if (self.registered) transport.registry.unregister(@ptrCast(&self.request));
         self.pending.deinit(transport.allocator);
         // Back to the pool when its response was read to the end, closed
-        // otherwise (std.http.Client.Request.deinit).
+        // otherwise: by std.http.Client.Request.deinit when the response was
+        // cut short, by http_connection when the send failed.
         self.request.deinit();
         transport.allocator.destroy(self);
     }
 
     /// Send `json` and read the response head.
     fn exchangeHead(self: *Exchange, json: []const u8, redirect: []u8) !void {
-        try self.request.sendBodyComplete(@constCast(json));
+        try http_connection.sendBodyComplete(&self.request, @constCast(json));
         self.response = try self.request.receiveHead(redirect);
         self.has_response = true;
     }

@@ -23,6 +23,7 @@ const time = @import("../util/time.zig");
 const types = @import("../types.zig");
 const ResponseStatus = @import("../api/http_status.zig").ResponseStatus;
 const no_redirects = @import("../api/http_status.zig").no_redirects;
+const http_connection = @import("../api/http_connection.zig");
 const AbortSignal = @import("../util/abort.zig").AbortSignal;
 const util_json = @import("../util/json.zig");
 
@@ -642,7 +643,7 @@ fn postTokenForm(allocator: std.mem.Allocator, form: []const u8) ![]u8 {
         },
     }) catch return error.OAuthTokenExchangeFailed;
     defer req.deinit();
-    req.sendBodyComplete(@constCast(form)) catch return error.OAuthTokenExchangeFailed;
+    http_connection.sendBodyComplete(&req, @constCast(form)) catch return error.OAuthTokenExchangeFailed;
     var redirect_buf: [4096]u8 = undefined;
     const http_response = req.receiveHead(&redirect_buf) catch return error.OAuthTokenExchangeFailed;
     const status = ResponseStatus.capture(&http_response);
@@ -845,7 +846,7 @@ fn refreshOAuthCredential(allocator: std.mem.Allocator, old: *const OAuthCredent
     }) catch return error.OAuthRefreshFailed;
     defer req.deinit();
 
-    req.sendBodyComplete(@constCast(body)) catch return error.OAuthRefreshFailed;
+    http_connection.sendBodyComplete(&req, @constCast(body)) catch return error.OAuthRefreshFailed;
     var redirect_buf: [4096]u8 = undefined;
     const http_response = req.receiveHead(&redirect_buf) catch return error.OAuthRefreshFailed;
     const status = ResponseStatus.capture(&http_response);

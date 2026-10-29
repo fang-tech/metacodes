@@ -27,6 +27,7 @@
 const std = @import("std");
 const auth = @import("../core/auth.zig");
 const http_status = @import("http_status.zig");
+const http_connection = @import("http_connection.zig");
 const util_time = @import("../util/time.zig");
 const AbortSignal = @import("../util/abort.zig").AbortSignal;
 
@@ -407,7 +408,7 @@ fn postFormRaw(
         },
     }) catch return error.OAuthTokenExchangeFailed;
     defer request.deinit();
-    request.sendBodyComplete(@constCast(form)) catch return error.OAuthTokenExchangeFailed;
+    http_connection.sendBodyComplete(&request, @constCast(form)) catch return error.OAuthTokenExchangeFailed;
     var redirect_buffer: [4096]u8 = undefined;
     const head = request.receiveHead(&redirect_buffer) catch return error.OAuthTokenExchangeFailed;
     // `std.http.Status` is non-exhaustive; capture it before anything can

@@ -10,6 +10,7 @@ const std = @import("std");
 const auth = @import("../core/auth.zig");
 const oauth = @import("../provider/oauth.zig");
 const http_status = @import("http_status.zig");
+const http_connection = @import("http_connection.zig");
 const util_time = @import("../util/time.zig");
 const util_json = @import("../util/json.zig");
 const AbortSignal = @import("../util/abort.zig").AbortSignal;
@@ -229,7 +230,7 @@ fn postJson(allocator: std.mem.Allocator, io: std.Io, url: []const u8, body: []c
         .{ .name = "accept", .value = "application/json" },
     } }) catch return error.RequestFailed;
     defer request.deinit();
-    request.sendBodyComplete(@constCast(body)) catch return error.RequestFailed;
+    http_connection.sendBodyComplete(&request, @constCast(body)) catch return error.RequestFailed;
     var redirect: [4096]u8 = undefined;
     const response = request.receiveHead(&redirect) catch return error.RequestFailed;
     const status = http_status.ResponseStatus.capture(&response);

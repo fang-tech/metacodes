@@ -9,6 +9,7 @@
 const std = @import("std");
 const ResponseStatus = @import("http_status.zig").ResponseStatus;
 const no_redirects = @import("http_status.zig").no_redirects;
+const http_connection = @import("http_connection.zig");
 
 pub const API_KEYS_URL_ENV = "METACODE_API_KEYS_URL";
 
@@ -205,7 +206,7 @@ pub fn fetchInto(
     }) catch return error.RequestFailed;
     defer req.deinit();
 
-    req.sendBodiless() catch return error.RequestFailed;
+    http_connection.sendBodiless(&req) catch return error.RequestFailed;
     var redirect_buf: [4096]u8 = undefined;
     const resp = req.receiveHead(&redirect_buf) catch return error.RequestFailed;
     const status = ResponseStatus.capture(&resp);

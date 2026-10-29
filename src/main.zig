@@ -108,6 +108,7 @@ pub const api_capability = @import("api/capability.zig");
 pub const api_capability_activation = @import("api/capability_activation.zig");
 pub const api_cache = @import("api/cache.zig");
 pub const api_http_status = @import("api/http_status.zig");
+pub const api_http_connection = @import("api/http_connection.zig"); // L2 send-failure tests drive it on a raw std client
 pub const api_openai = @import("api/openai_client.zig");
 pub const api_gemini = @import("api/gemini_client.zig");
 pub const api_dialect = @import("api/dialect.zig");

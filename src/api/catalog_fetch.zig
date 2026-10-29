@@ -12,6 +12,7 @@
 
 const std = @import("std");
 const http_status = @import("http_status.zig");
+const http_connection = @import("http_connection.zig");
 const models_pages = @import("models_pages.zig");
 
 pub const FetchError = error{
@@ -88,7 +89,7 @@ pub fn fetch(
     }) catch return error.RequestFailed;
     defer http_request.deinit();
 
-    http_request.sendBodiless() catch return error.RequestFailed;
+    http_connection.sendBodiless(&http_request) catch return error.RequestFailed;
     var redirect_buffer: [4096]u8 = undefined;
     const response = http_request.receiveHead(&redirect_buffer) catch return error.RequestFailed;
     const status = http_status.ResponseStatus.capture(&response);

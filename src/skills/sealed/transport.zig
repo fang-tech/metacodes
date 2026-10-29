@@ -13,6 +13,7 @@ const log = @import("../../util/log.zig");
 const util_time = @import("../../util/time.zig");
 const provider = @import("../../api/provider.zig");
 const http_status = @import("../../api/http_status.zig");
+const http_connection = @import("../../api/http_connection.zig");
 const AbortSignal = @import("../../util/abort.zig").AbortSignal;
 
 /// Silence allowed on one gateway call before the liveness monitor gives up.
@@ -152,7 +153,7 @@ pub const Client = struct {
             return error.OutOfMemory;
         defer self.registry.unregister(@ptrCast(&request));
 
-        request.sendBodyComplete(@constCast(json)) catch return self.transportError(abort, &request);
+        http_connection.sendBodyComplete(&request, @constCast(json)) catch return self.transportError(abort, &request);
         var redirect: [4096]u8 = undefined;
         var response = request.receiveHead(&redirect) catch return self.transportError(abort, &request);
         const status = http_status.ResponseStatus.capture(&response).code;

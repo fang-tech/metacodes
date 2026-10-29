@@ -75,7 +75,12 @@ Step. It does **not** yet reuse the upstream TCP/TLS connection, because
 every provider client in this tree opens a fresh connection per request
 (`keep_alive = false`, a deliberate trade of handshake cost for immunity to
 stale pooled connections; see the header of `src/api/openai_client.zig`).
-The cache is the precondition for changing that: once the gateway's clients
+That holds only with `src/api/http_connection.zig`: std applies
+`keep_alive = false` once a response head arrives, so until 2026-10-29 a
+connection whose send failed went back to the pool and every later request
+in the process failed on it. Every send now goes through that file, which
+closes such a connection — also what makes the stale-connection retry below
+reach a fresh one. The cache is the precondition for changing that: once the gateway's clients
 may keep connections alive — with a retry on the first write to a stale
 one — the handshake disappears per Step with no further structural change.
 That is the next item in §11.

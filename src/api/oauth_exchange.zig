@@ -14,6 +14,7 @@ const std = @import("std");
 const oauth = @import("../provider/oauth.zig");
 const ids = @import("../provider/ids.zig");
 const http_status = @import("http_status.zig");
+const http_connection = @import("http_connection.zig");
 const metask_oauth = @import("metask_oauth.zig");
 
 pub const Slug = ids.Slug;
@@ -58,7 +59,7 @@ pub const HttpExchange = struct {
         }) catch return error.RefreshFailed;
         defer request.deinit();
 
-        request.sendBodyComplete(@constCast(body)) catch return error.RefreshFailed;
+        http_connection.sendBodyComplete(&request, @constCast(body)) catch return error.RefreshFailed;
         var redirect_buffer: [4096]u8 = undefined;
         const response = request.receiveHead(&redirect_buffer) catch return error.RefreshFailed;
         // The wire status crosses into process code only through this boundary:
@@ -108,7 +109,7 @@ pub const MetaskHttpExchange = struct {
             .{ .name = "accept", .value = "application/json" },
         } }) catch return error.RefreshFailed;
         defer request.deinit();
-        request.sendBodyComplete(body) catch return error.RefreshFailed;
+        http_connection.sendBodyComplete(&request, body) catch return error.RefreshFailed;
         var redirect: [4096]u8 = undefined;
         const response = request.receiveHead(&redirect) catch return error.RefreshFailed;
         const status = http_status.ResponseStatus.capture(&response);
