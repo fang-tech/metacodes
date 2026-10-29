@@ -290,9 +290,10 @@ def test_a_flood_typed_after_a_timed_out_round_does_not_crash(bin_path):
         QUERY_SENT,
         "strictsleep:0.3",
         "raw:" + flood + "\\x1b[Dd",
-        IDLE,
+        wait_for("[Pasted text #1"),
     ], _unknown_terminal(), per_key_drain=0.01)
     assert b"panic" not in raw and b"unreachable" not in raw, raw[-400:].decode("utf-8", "replace")
-    # The prompt is up (the flood makes the box taller than the screen; its footer is the last row).
+    # Typed before the first prompt, all of it is one paste, closed: the prompt holds it as a
+    # placeholder, and none of it spilled out as keys (an unclosed paste, then `Esc again`).
     _, screen = _screen(raw)
-    assert "bypass permissions on" in screen.splitlines()[-1], screen
+    assert "[Pasted text #1 " in screen and "#2" not in screen and "Esc again" not in screen, screen

@@ -669,18 +669,130 @@ pub fn newlineHint() []const u8 {
     return if (shouldEnableKittyKeyboard()) "shift + \xe2\x8f\x8e for newline" else "\\ + \xe2\x8f\x8e for newline";
 }
 
+/// 进程第一次进 raw mode 之前,终端收到的都是启动期间敲的键(探测之后、启动动画期间、
+/// App.init 期间):它们是给第一个输入框的,这一次切换保留它们,整段读出留给它
+/// (collectStartupInput)。此后的切换照旧丢掉终端已收、未读的输入(TCSAFLUSH:两次读输入之间
+/// 的键,见 tests/tty/tty_driver.py)。
+var g_first_raw_entry = std.atomic.Value(bool).init(true);
+
 pub fn enterRawMode(fd: c_int) ?platform_term.SavedMode {
     // 启动探测到期、应答还在路上时终端一直是安静模式(bg_probe.Late):接管它,返回探测前的
     // 模式供 restoreMode 复原(当前的安静模式不是要复原的那个)。
     const original = bg_probe.handOver(fd);
     // 模式切换走可移植 platform/terminal(POSIX termios / Windows console mode)。
-    const orig = platform_term.enterRaw(fd) orelse {
+    const startup = g_first_raw_entry.swap(false, .acq_rel);
+    const orig = (if (startup) platform_term.enterRawKeepingInput(fd) else platform_term.enterRaw(fd)) orelse {
         if (original) |o| platform_term.restoreModeKeepingInput(fd, o);
         return null;
     };
     emitEnableSequences(fd);
+    if (startup) collectStartupInput(fd);
     return original orelse orig;
 }
+
+/// 启动期输入,等第一个输入框取走(takeStartupText)。只在主线程上读写。
+var g_startup_text: ?StartupText = null;
+
+/// 终端读空之后再等这么久:一段粘贴的后半截可能还在路上(pty 一次只放行约 4 KiB)。
+const startup_settle_ms: i32 = 50;
+
+/// 首个输入框出现之前留下的启动期输入(探测、启动动画、App.init 期间敲的键或粘贴的文字)
+/// 整体作为一次粘贴交给它:那时括号粘贴还没打开(第一个输入框才开),一段多行粘贴里的每个
+/// 换行都是 Enter——第一行单独提交给了模型。这里把已到的全部读出(探测交回 stdin 的在前,
+/// 终端的在后),还原成正文(StartupText),直到终端读空、再等 startup_settle_ms 也没有新的;
+/// 第一个输入框把它插入(loop.readLineRaw):换行是文本,用户按 Enter 才提交,大段粘贴照常
+/// 落盘成占位符。不设长度上限,一个字节也不留给后面当按键。
+fn collectStartupInput(fd: c_int) void {
+    var text = StartupText.init(std.heap.c_allocator);
+    var chunk: [256]u8 = undefined;
+    var read_any = false;
+    while (true) {
+        // Windows:不产字符的按键排在队首时 ReadConsoleW 会一直等下一个产字符的键。
+        platform_term.dropSilentInput(fd);
+        if (platform_term.waitReadable(fd, 0) <= 0) {
+            if (read_any and platform_term.waitReadable(fd, startup_settle_ms) > 0) continue;
+            break;
+        }
+        const n = platform_term.readInput(fd, &chunk); // no EINTR: waitReadable reported data
+        if (n <= 0) break;
+        read_any = true;
+        text.feed(chunk[0..@intCast(n)]);
+    }
+    text.finish();
+    @import("../util/log.zig").debug("input", "startup input before the first prompt: {d} bytes of text", .{text.text().len});
+    if (text.text().len == 0 and !text.dropped) return text.deinit();
+    g_startup_text = text;
+}
+
+/// What was typed before the first prompt, for it to insert as one paste.
+/// Null once taken, and when nothing was typed. The caller deinits it.
+pub fn takeStartupText() ?StartupText {
+    const text = g_startup_text orelse return null;
+    g_startup_text = null;
+    return text;
+}
+
+/// 启动期输入 → 粘贴正文:按键还原(KeyParser),字符、换行、Tab 留下,退格删掉前一个
+/// UTF-8 字符(启动期间打错了改的字照样生效),其它键(方向键、Esc、Ctrl 组合)丢掉。
+pub const StartupText = struct {
+    gpa: std.mem.Allocator,
+    buf: std.ArrayList(u8) = .empty,
+    parser: KeyParser = .{},
+    /// Memory ran out: what came after was read and dropped, not left as keys.
+    dropped: bool = false,
+
+    pub fn init(gpa: std.mem.Allocator) StartupText {
+        return .{ .gpa = gpa };
+    }
+
+    pub fn deinit(self: *StartupText) void {
+        self.buf.deinit(self.gpa);
+    }
+
+    pub fn feed(self: *StartupText, input_bytes: []const u8) void {
+        for (input_bytes) |b| {
+            if (self.parser.feed(b)) |k| self.apply(k);
+            while (self.parser.drain()) |k| self.apply(k);
+        }
+    }
+
+    /// Nothing more comes: a sequence still open is resolved (a lone Esc is
+    /// dropped like any key that types nothing).
+    pub fn finish(self: *StartupText) void {
+        if (self.parser.flushEsc()) |k| self.apply(k);
+        while (self.parser.drain()) |k| self.apply(k);
+    }
+
+    /// The text to insert, without the newlines it starts or ends with (the
+    /// Enter that skipped the startup animation, the one after the last
+    /// line): nothing is submitted, so they would only leave empty lines.
+    /// Empty when it is only blanks.
+    pub fn text(self: *const StartupText) []const u8 {
+        const t = std.mem.trim(u8, self.buf.items, "\n");
+        return if (std.mem.trim(u8, t, " \t\n").len == 0) t[0..0] else t;
+    }
+
+    fn apply(self: *StartupText, k: Key) void {
+        if (self.dropped) return;
+        switch (k) {
+            .char => |c| self.push(c),
+            .enter, .shift_enter => self.push('\n'),
+            .tab => self.push('\t'),
+            .backspace => while (self.buf.items.len > 0) {
+                const last = self.buf.items[self.buf.items.len - 1];
+                self.buf.items.len -= 1;
+                if (last & 0xC0 != 0x80) break; // a lead byte: the whole character is gone
+            },
+            else => {},
+        }
+    }
+
+    fn push(self: *StartupText, c: u8) void {
+        self.buf.append(self.gpa, c) catch {
+            self.dropped = true;
+        };
+    }
+};
 
 pub fn restoreMode(fd: c_int, orig: platform_term.SavedMode) void {
     // 关 bracketed paste(始终)+ 键盘协议(仅发过 enable 的——对称 enterRawMode,同进程 env 不变、
@@ -1890,6 +2002,128 @@ test "KeyParser: 读到一半的序列等不来后半截 → 超时兑现时丢�
     try testing.expect(p.pendingEsc());
     try testing.expect(p.flushEsc().? == .esc);
     try testing.expectEqual(@as(u8, 'a'), p.feed('a').?.char);
+}
+
+fn startupText(input_bytes: []const u8) StartupText {
+    var t = StartupText.init(testing.allocator);
+    t.feed(input_bytes);
+    t.finish();
+    return t;
+}
+
+fn expectStartupText(want: []const u8, input_bytes: []const u8) !void {
+    var t = startupText(input_bytes);
+    defer t.deinit();
+    try testing.expectEqualStrings(want, t.text());
+}
+
+test "StartupText: 启动期粘贴的换行是文本,退格删前一个字,其它键不进正文" {
+    // 没有括号粘贴的多行粘贴:换行是 CR(终端的 Enter)或 LF。
+    try expectStartupText("line1\nline2\nline3", "line1\rline2\nline3");
+    // 打错了退格改:按 UTF-8 字符删。
+    try expectStartupText("fix the bug", "fix teh\x7f\x7fhe bug");
+    try expectStartupText("a", "a你\x08");
+    try expectStartupText("", "\x7f\x7f");
+    // 方向键、Esc、Ctrl 组合、Alt+]、截断的序列都不进正文(正文里不会有 ESC)。
+    var t = startupText("a\x1b[Db\x1b\x03c\x1b]x\td\x1b[1;5");
+    defer t.deinit();
+    try testing.expectEqualStrings("abc]x\td", t.text());
+    try testing.expect(std.mem.indexOfScalar(u8, t.text(), 0x1b) == null);
+}
+
+test "StartupText: 首尾的换行不进输入框,只有空白时整段不要" {
+    // 结尾的 Enter 不提交,留着只会在框里多一个空行(三行就成了四行,折成占位符)。
+    try expectStartupText("fix tests", "fix tests\r");
+    try expectStartupText("line1\nline2\nline3", "line1\rline2\rline3\r");
+    // 按 Enter 跳过启动动画,别的什么都没敲。
+    try expectStartupText("", "\r");
+    try expectStartupText("", "\r \t\r\r");
+    try expectStartupText("line1", "\r\rline1");
+    // 行首的缩进是正文。
+    try expectStartupText("  code\n  more", "\r  code\r  more\r");
+}
+
+test "StartupText: 不设上限;内存不够时其余的丢掉,不留作按键" {
+    var big: [10000]u8 = undefined;
+    var want: [10000]u8 = undefined;
+    for (&big, &want, 0..) |*c, *w, i| {
+        c.* = if (i % 50 == 49) '\r' else 'x';
+        w.* = if (c.* == '\r') '\n' else c.*;
+    }
+    var t = startupText(&big);
+    defer t.deinit();
+    try testing.expect(!t.dropped);
+    try testing.expectEqualStrings(want[0 .. want.len - 1], t.text());
+
+    var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 2, .resize_fail_index = 2 });
+    var s = StartupText.init(failing.allocator());
+    defer s.deinit();
+    s.feed(&big);
+    s.finish();
+    try testing.expect(s.dropped);
+    // What it kept is the beginning, whole: nothing after the first loss.
+    try testing.expect(s.buf.items.len < want.len);
+    try testing.expect(std.mem.startsWith(u8, &want, s.buf.items));
+}
+
+/// Read what stdin's replay owes `fd`, then what the pipe holds.
+fn drainStdinForTest(fd: c_int, out: []u8) []u8 {
+    var n: usize = 0;
+    while (n < out.len and platform_term.waitReadable(fd, 0) > 0) {
+        const k = platform_term.readInput(fd, out[n..]); // no EINTR: the replay buffer, or a test pipe poll reported readable
+        if (k <= 0) break;
+        n += @intCast(k);
+    }
+    return out[0..n];
+}
+
+test "collectStartupInput: what the probe handed back, then all the terminal holds, in order, for the first prompt" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest; // pipe as the terminal
+    var fds: [2]c_int = undefined;
+    try testing.expectEqual(@as(c_int, 0), std.c.pipe(&fds));
+    defer _ = std.c.close(fds[0]);
+    defer _ = std.c.close(fds[1]);
+    const r = fds[0];
+    var got: [64]u8 = undefined;
+    defer _ = drainStdinForTest(r, &got);
+    // A probe round that timed out handed back a flood typed during startup:
+    // stdin's replay owes all it can but one byte. A Left arrow, a key and
+    // 5000 bytes of lines (more than a replay holds) are still with the
+    // terminal.
+    var flood: [platform_term.replay_capacity - 1]u8 = undefined;
+    @memset(&flood, 'p');
+    try testing.expectEqual(flood.len, platform_term.replayInput(r, &flood));
+    var lines: [5000]u8 = undefined;
+    for (&lines, 0..) |*c, i| c.* = if (i % 50 == 49) '\r' else 'x';
+    try testing.expect(pfs.writeAll(fds[1], "\x1b[Dd"));
+    try testing.expect(pfs.writeAll(fds[1], &lines));
+
+    collectStartupInput(r);
+    var t = takeStartupText() orelse return error.TestUnexpectedResult;
+    defer t.deinit();
+    try testing.expect(takeStartupText() == null);
+    // Nothing is left to be read as keys: no line of it can submit.
+    try testing.expectEqual(@as(usize, 0), drainStdinForTest(r, &got).len);
+    // All of it, in order: the flood, `d` (the arrow types nothing), the
+    // lines without the last Enter.
+    const text = t.text();
+    try testing.expectEqual(flood.len + 1 + lines.len - 1, text.len);
+    try testing.expectEqualStrings("pdx", text[flood.len - 1 ..][0..3]);
+    try testing.expectEqual(@as(usize, 99), std.mem.count(u8, text, "\n"));
+}
+
+test "collectStartupInput: nothing typed, or only Enter to skip the startup animation, leaves the prompt empty" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest; // pipe as the terminal
+    var fds: [2]c_int = undefined;
+    try testing.expectEqual(@as(c_int, 0), std.c.pipe(&fds));
+    defer _ = std.c.close(fds[0]);
+    defer _ = std.c.close(fds[1]);
+    collectStartupInput(fds[0]);
+    try testing.expect(takeStartupText() == null);
+    try testing.expect(pfs.writeAll(fds[1], "\r"));
+    collectStartupInput(fds[0]);
+    try testing.expect(takeStartupText() == null);
+    try testing.expectEqual(@as(i32, 0), platform_term.waitReadable(fds[0], 0));
 }
 
 test "KeyParser: 超长的数字参数饱和而不溢出,整条仍是一个认不出的键" {

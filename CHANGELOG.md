@@ -96,6 +96,30 @@ status, compatibility boundaries, and entry points are defined by
   permission-target test compares paths as paths, since AgentCore names
   Windows paths with forward slashes.
 
+- **Everything typed while metacodes starts reaches the first prompt, in
+  order.** The key that skipped the startup animation was consumed by it (on
+  Windows the skip flushed the console's whole input queue, so `abc` typed at
+  startup became `bc` or nothing), and on macOS and Linux the input box's
+  first raw-mode entry (`TCSAFLUSH`) dropped whatever was typed after the
+  animation while startup still ran (connecting MCP servers, fetching the
+  model list). The animation still ends on the first key, but leaves the key
+  for the prompt (only a key that types nothing, a bare modifier on Windows,
+  is dropped: a console read would wait behind it for the next key that
+  types); it enters and leaves raw mode without discarding input; and
+  the process's first raw-mode entry keeps what the terminal has received.
+  Later entries still drop keys typed between two prompts, as before.
+- **A multi-line paste made before the first prompt lands in it as one paste
+  and is not submitted line by line.** Bracketed paste is turned on with the
+  first prompt, so a paste right after starting arrived as typed keys and
+  every newline was an Enter: the first line went to the model on its own,
+  and the rest was dropped or queued as the next turn. Everything typed
+  before the first prompt, of any length, now goes into it as one paste:
+  newlines stay text, Backspace still deletes, other keys are left out, a
+  large paste becomes the usual placeholder, and nothing is sent until Enter.
+  The newlines it starts or ends with (the Enter that skipped the animation,
+  the one after the last line) are left out, and input that is only blanks
+  leaves the prompt empty.
+
 ### Changed
 
 - **Smaller Linux footprint: idle RSS back under its red line, binary

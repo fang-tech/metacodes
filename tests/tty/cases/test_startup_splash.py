@@ -3,7 +3,8 @@
 动画默认开;tty_driver 为其它用例默认关(METACODES_NO_STARTUP_ANIMATION=1),本文件经
 env 传 None 打开。断言的都是用户看得见的结果:原地重绘了几十帧、定格的 "Metask Lab"
 字标(只用 M e t a s k L b 这几个字母)留在 banner 框正上方、任意键跳到定格帧且这个键
-被吃掉、env 与 config.json 两个开关各自关得掉、窄终端不播。
+进输入框、启动期间(动画中、动画后 App.init 还在等)敲的键按序进输入框、env 与 config.json
+两个开关各自关得掉、窄终端不播。
 
 ConPTY 会把输出流整屏重合成,原始字节(帧前缀、cursor-up 计数)在 Windows 上不可断言:
 那两条用例在 Windows 上 SkipTest,其余只看屏幕终态,两平台都跑。
@@ -28,6 +29,8 @@ FIRST_FRAME = b"\x1b[?25l\x1b[?2026h\r"
 REDRAW = b"\x1b[?2026h\x1b[8A"
 ON = {"METACODES_NO_STARTUP_ANIMATION": None}
 PALETTE = set("MetaskLb")
+# FIRST_FRAME as a driver event (`waitbytes:` takes \xNN escapes).
+FIRST_FRAME_EVENT = "\\x1b[?25l\\x1b[?2026h\\r"
 
 
 def _banner_top(a):
@@ -92,8 +95,8 @@ def test_splash_any_key_skips_to_the_same_settled_wordmark(bin_path):
     assert 1 <= redraws < 10, f"{redraws} redraws: the key did not cut the animation short"
     # 定格帧与跳过时刻无关。
     assert _assert_settled_wordmark(a) == _assert_settled_wordmark(full)
-    # 跳过键被动画吃掉,没有漏进输入框。
-    a.assert_cursor_on_content("")
+    # 跳过键是用户打的第一个字:动画跳过,这个键进输入框(以前被动画吃掉)。
+    a.assert_input_echo("x")
     a.assert_box_at_bottom()
 
 
@@ -142,6 +145,109 @@ def test_splash_plays_while_startup_waits(bin_path):
     assert settled is not None and banner is not None
     assert settled < answered, f"the splash settled {settled - answered:.2f}s after init's wait ended"
     assert banner >= answered, "banner drawn before App.init finished"
+
+
+def _typed_during_startup(bin_path, env, first_key_after):
+    """Start with `/v1/models` answering after 2.5 s (App.init waits for it),
+    type `a`, then `b` 0.6 s later while App.init still waits, and return the
+    screen once the prompt shows them. `first_key_after` is the event that
+    marks when `a` goes out."""
+    server, base_url = SlowModels.serve(2.5)
+    try:
+        raw = run(bin_path, [first_key_after, "raw:a", "strictsleep:0.6", "raw:b", wait_for("❯ ab"), IDLE],
+                  term_size=SIZE, env=dict(env, METACODES_NO_PROBE=None), base_url=base_url, startup_drain=0)
+    finally:
+        server.shutdown()
+    assert SlowModels.answered, "App.init did not wait for /v1/models: nothing was typed during startup"
+    return TTYAssert(raw, *SIZE), raw
+
+
+# The Windows driver sends the first key only after the first frame that shows the
+# cursor (tty_driver._run_windows): with the splash off that is the input box, so keys
+# "typed during startup" would reach a prompt that is already up. With the splash on it is
+# the splash's settled frame, and App.init is still waiting: keys sent then are startup input.
+WINDOWS_TYPES_AFTER_FIRST_FRAME = (
+    "the Windows driver sends keys only after the first frame (tty_driver._run_windows): "
+    "it cannot type during the splash or before an input box drawn without one"
+)
+
+
+def _sent_during_startup(bin_path, raw_text, shown):
+    """`raw_text` arrives after the splash, while App.init still waits for
+    `/v1/models` (4 s), on both platforms; then the case waits for `shown`
+    and 1.5 s more (a submitted line would be echoed above the box by then)."""
+    if IS_WINDOWS:
+        first = ["strictsleep:0.3"]  # the driver has waited for the splash's settled frame
+    else:
+        first = [f"waitbytes:{FIRST_FRAME_EVENT}:30", "strictsleep:1.8"]
+    server, base_url = SlowModels.serve(4.0)
+    try:
+        raw = run(bin_path, first + ["raw:" + raw_text, shown, "strictsleep:1.5"],
+                  term_size=SIZE, env=dict(ON, METACODES_NO_PROBE=None), base_url=base_url, startup_drain=0)
+    finally:
+        server.shutdown()
+    assert SlowModels.answered, "App.init did not wait for /v1/models"
+    a = TTYAssert(raw, *SIZE)
+    return a, "\n".join(a.final.line_text(r) for r in range(a.final.rows))
+
+
+def test_lines_pasted_during_startup_land_in_the_prompt_unsubmitted(bin_path):
+    """A multi-line paste right after starting, before the prompt is up, comes
+    without bracketed paste (the REPL turns it on with its first prompt), so
+    every newline is an Enter. It used to submit `line1` on its own and drop or
+    queue the other lines. Now everything typed before the first prompt goes
+    into it as one paste: three lines in the box, nothing submitted until the
+    user presses Enter. The Enter after the last line is left out: kept, it
+    made a fourth, empty line, and four lines fold into a placeholder."""
+    a, screen = _sent_during_startup(bin_path, "line1\\rline2\\rline3\\r", wait_for("line3"))
+    a.assert_box_height(3)
+    top = a.box_top_row()
+    for i, line in enumerate(("line1", "line2", "line3"), 1):
+        a.assert_line_contains(top + i, line)
+    # Submitted, `line1` would also be echoed above the box.
+    assert sum("line1" in a.final.line_text(r) for r in range(a.final.rows)) == 1, "line1 was submitted:\n" + screen
+
+
+def test_a_paste_longer_than_4_kib_during_startup_is_one_paste_unsubmitted(bin_path):
+    """5000 bytes, a hundred lines. Only the first 4 KiB used to make the
+    paste; the rest stayed with the terminal as typed keys, and its first
+    newline submitted the cut paste with half a line."""
+    a, screen = _sent_during_startup(bin_path, ("x" * 49 + "\\r") * 100, wait_for("[Pasted text #1"))
+    assert "[Pasted text #1 " in screen and "#2" not in screen, screen
+    assert "x" * 20 not in screen, "part of the paste was typed or submitted:\n" + screen
+    assert "API request failed" not in screen and "Error" not in screen, "something was submitted:\n" + screen
+
+
+def test_enter_that_skips_the_splash_leaves_the_prompt_empty(bin_path):
+    """Enter is a key like any other for ending the splash; the newline it
+    types is not kept, so the first prompt is empty, not a blank line with the
+    cursor on a second one."""
+    a, _ = _sent_during_startup(bin_path, "\\r", IDLE)
+    a.assert_box_height(1)
+    a.assert_input_echo("")
+
+
+def test_keys_typed_during_the_splash_and_after_it_reach_the_prompt_in_order(bin_path):
+    """`a` skips the splash, `b` comes while App.init still waits: both are the
+    start of what the user types. The splash used to consume `a` (on Windows
+    it flushed the console's whole input queue), and on POSIX the input box's
+    raw-mode entry (TCSAFLUSH) dropped `b`. On Windows this was checked in
+    Windows Terminal by hand (`skipped_by_key`, `abc` kept)."""
+    if IS_WINDOWS:
+        raise SkipTest(WINDOWS_TYPES_AFTER_FIRST_FRAME)
+    a, raw = _typed_during_startup(bin_path, ON, f"waitbytes:{FIRST_FRAME_EVENT}:30")
+    assert raw.count(REDRAW) < 10, "`a` did not cut the splash short"
+    a.assert_input_echo("ab")
+    a.assert_box_at_bottom()
+
+
+def test_keys_typed_while_startup_waits_reach_the_prompt(bin_path):
+    """No splash: everything typed before the prompt is up goes into it, in order."""
+    if IS_WINDOWS:
+        raise SkipTest(WINDOWS_TYPES_AFTER_FIRST_FRAME)
+    a, _ = _typed_during_startup(bin_path, {}, "strictsleep:0.4")
+    a.assert_input_echo("ab")
+    a.assert_box_at_bottom()
 
 
 def _assert_splash_ended_before(raw, error_text):

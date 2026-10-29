@@ -1429,7 +1429,16 @@ fn handlePaste(
         if (done) break;
     }
 
-    const text = pasted.items;
+    try insertPaste(editor, allocator, state_root, pasted.items);
+}
+
+/// 插入一段粘贴的文字:小粘贴内联;大粘贴存 ~/.metacodes/pastes/<N>.txt 并插入占位符。
+fn insertPaste(
+    editor: *input.LineEditor,
+    allocator: std.mem.Allocator,
+    state_root: []const u8,
+    text: []const u8,
+) !void {
     if (text.len == 0) return;
 
     if (paste_mod.isLarge(text)) {
@@ -1689,6 +1698,14 @@ fn readLineRaw(
 
     // Sign-ins cancelled mid-request have usually settled by now.
     app.reapLoginWorkers();
+    // 第一个输入框:启动期间敲的键、粘贴的文字整段作为一次粘贴放进来(input.collectStartupInput),
+    // 换行是文本,用户按 Enter 才提交。
+    if (input.takeStartupText()) |taken| {
+        var startup = taken;
+        defer startup.deinit();
+        try insertPaste(&editor, allocator, app.stateRoot(), startup.text());
+        if (startup.dropped) printNotice(app, app.theme.warn, "Some of what was typed during startup did not fit in memory and was dropped.");
+    }
     // 初始画一个空输入框。
     region.setInput(editor.view(), editor.cursor);
     region.render(app);
