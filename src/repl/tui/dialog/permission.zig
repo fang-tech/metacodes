@@ -221,3 +221,25 @@ test "VISUAL demo (打印到 stderr,看真实渲染)" {
     defer testing.allocator.free(s);
     std.debug.print("\n{s}\n", .{s});
 }
+
+test "promptLoop 读 Windows 控制台送来的按键记录:y、n、Ctrl+C 各是一个回答" {
+    // win32-input-mode 开着时每个键都是一条记录(控制台逐字符排进队列,sendChars)。对话框读的是
+    // 还原后的键;读原始字节时一个也认不出,工具调用一直等着(#388 审查)。
+    if (@import("builtin").os.tag != .windows) return error.SkipZigTest;
+    var console = try @import("platform").test_support.PrivateConsole.begin();
+    defer console.end();
+    defer platform_term.resetConsoleInputForTesting();
+    platform_term.decodeKeyRecords();
+    const sink = pfs.open("NUL", .{ .ACCMODE = .WRONLY }, 0);
+    try testing.expect(sink >= 0);
+    defer _ = pfs.close(sink);
+    const cases = [_]struct { records: []const u8, choice: PermissionChoice }{
+        .{ .records = "\x1b[89;21;121;1;32;1_\x1b[89;21;121;0;32;1_", .choice = .allow_once },
+        .{ .records = "\x1b[78;49;110;1;32;1_\x1b[78;49;110;0;32;1_", .choice = .deny_once },
+        .{ .records = "\x1b[17;29;0;1;40;1_\x1b[67;46;3;1;40;1_\x1b[67;46;3;0;40;1_\x1b[17;29;0;0;32;1_", .choice = .deny_once },
+    };
+    for (cases) |c| {
+        try console.sendChars(c.records);
+        try testing.expectEqual(c.choice, promptLoop(testing.allocator, theme_mod.dark, 0, sink, "Write", "{}").?);
+    }
+}

@@ -327,9 +327,11 @@ status, compatibility boundaries, and entry points are defined by
   Ctrl+letter but never for text, and its Shift+Enter still submits.
   Ctrl+Enter still submits: the pseudo console sends a line break written to
   it as an Enter with Ctrl held, the same record. Bytes a terminal writes in
-  one go, such as the `ESC CR` of a Shift+Enter key binding in VS Code, reach
-  the key parser as those bytes, not as records. AltGr and dead keys were not
-  measured.
+  one go, such as the `ESC CR` of a Shift+Enter key binding in VS Code
+  (`/terminal-setup`), reach the key parser as those bytes, not as records,
+  and stay a newline; an Esc pressed on the keyboard is a record and never
+  counts as that binding's ESC, however soon Enter follows it. AltGr and dead
+  keys were not measured.
 
 
 ### Fixed

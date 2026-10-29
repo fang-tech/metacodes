@@ -176,8 +176,10 @@ pub fn decodeConsoleInputForTesting(stream: []const u8) void {
     _ = g_decoder.take(&sink);
 }
 
-/// Tests: forget the console input read and what it showed of the host.
+/// Tests: forget the console input read and what it showed of the host, and
+/// read the console as without win32-input-mode again.
 pub fn resetConsoleInputForTesting() void {
+    g_key_records.store(false, .release);
     g_conin_len = 0;
     g_conin_pos = 0;
     g_decoder = .{};

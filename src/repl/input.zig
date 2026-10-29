@@ -171,9 +171,12 @@ pub const KeyParser = struct {
     }
 
     /// 从终端读到的一个字节:ESC 时记下它后面是否已有字节在等(同一批写入)。读终端的调用方用它;
-    /// 括号粘贴里的字节用 feed(粘贴内容按原样,ESC CR 不当换行键)。
+    /// 括号粘贴里的字节用 feed(粘贴内容按原样,ESC CR 不当换行键)。Windows 控制台开着
+    /// win32-input-mode 时,人按的 Esc 是一条按键记录(platform_term.lastReadWasKeyRecord),
+    /// 不管后面排着什么都不算同批:Esc 之后紧跟的 Enter 记录也已在队列里。终端一次写出的
+    /// ESC CR(VS Code 的绑定)经 ConPTY 原样是两个字节,照旧算。
     pub fn feedRead(self: *KeyParser, fd: c_int, b: u8) ?Key {
-        return self.feedQueued(b, b == 0x1b and platform_term.waitReadable(fd, 0) > 0);
+        return self.feedQueued(b, b == 0x1b and !platform_term.lastReadWasKeyRecord() and platform_term.waitReadable(fd, 0) > 0);
     }
 
     /// feedRead 去掉终端:`more_queued` = 这个字节读进来时后面已有字节在等(仅对 ESC 有意义)。
@@ -1878,6 +1881,61 @@ test "readKey(Windows 控制台):ESC CR 同批读到是 Shift+Enter,ESC 读走�
     try console.send(&.{ .{ .down = '\r' }, .{ .up = '\r' } });
     try testing.expect(readKey(0, &p).key == .esc);
     try testing.expect(readKey(0, &p).key == .enter);
+}
+
+test "readInput(Windows 控制台送按键记录):读出的是键,抬键记录不叫醒等待,半截的不是记录照原样" {
+    // win32-input-mode 开着时控制台把一条记录逐字符排进队列(sendChars),与真机同形。
+    if (@import("builtin").os.tag != .windows) return error.SkipZigTest;
+    var console = try @import("platform").test_support.PrivateConsole.begin();
+    defer console.end();
+    defer platform_term.resetConsoleInputForTesting();
+    platform_term.decodeKeyRecords();
+    var buf: [8]u8 = undefined;
+
+    // ↓ 按下 + 抬起:对话框一次读 8 字节,读到的是 ↓ 的 VT 字节,不是记录。
+    try console.sendChars("\x1b[40;80;0;1;288;1_\x1b[40;80;0;0;288;1_");
+    try testing.expectEqual(@as(isize, 3), platform_term.readInput(0, &buf));
+    try testing.expectEqualStrings("\x1b[B", buf[0..3]);
+    try testing.expect(platform_term.lastReadWasKeyRecord());
+
+    // Esc 读走之后才到的抬键记录不产字节:等 Esc 后续的那一轮等待照旧到时(0),不被它叫醒,
+    // 它也被取走了。
+    try console.sendChars("\x1b[27;1;27;1;32;1_");
+    try testing.expectEqual(@as(isize, 1), platform_term.readInput(0, buf[0..1]));
+    try testing.expectEqual(@as(u8, 0x1b), buf[0]);
+    try console.sendChars("\x1b[27;1;27;0;32;1_");
+    try testing.expectEqual(@as(i32, 0), platform_term.waitReadable(0, 100));
+    try testing.expectEqual(@as(usize, 0), console.keyDownsQueued());
+
+    // 队列到头时还没成记录的字节(这里是终端写来的 x 和 ESC [ 1 2):原样交出,不等下一个键。
+    try console.sendChars("x\x1b[12");
+    var got: usize = 0;
+    var reads: usize = 0;
+    while (got < 5 and reads < 3) : (reads += 1) {
+        const n = platform_term.readInput(0, buf[got..]);
+        try testing.expect(n > 0);
+        got += @intCast(n);
+    }
+    try testing.expectEqualStrings("x\x1b[12", buf[0..got]);
+    try testing.expect(!platform_term.lastReadWasKeyRecord());
+}
+
+test "readKey(Windows 控制台送按键记录):Esc 记录后面排着 Enter 也是两个键;终端写来的 ESC CR 是 Shift+Enter" {
+    if (@import("builtin").os.tag != .windows) return error.SkipZigTest;
+    var console = try @import("platform").test_support.PrivateConsole.begin();
+    defer console.end();
+    defer platform_term.resetConsoleInputForTesting();
+    platform_term.decodeKeyRecords();
+    var p = KeyParser{};
+
+    // 人连按 Esc、Enter:两条记录一起排在队列里,Esc 也不算同批(它是按键记录)。
+    try console.sendChars("\x1b[27;1;27;1;32;1_\x1b[27;1;27;0;32;1_\x1b[13;28;13;1;32;1_\x1b[13;28;13;0;32;1_");
+    try testing.expect(readKey(0, &p).key == .esc);
+    try testing.expect(readKey(0, &p).key == .enter);
+
+    // VS Code 的 Shift+Enter 绑定一次写出 ESC CR:ConPTY 原样排成两个字符,不是记录。
+    try console.sendChars("\x1b\r");
+    try testing.expect(readKey(0, &p).key == .shift_enter);
 }
 
 test "LineEditor: 同批的 ESC CR 经 KeyParser 插换行,单独的 CR 提交" {

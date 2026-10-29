@@ -249,6 +249,19 @@ pub const PrivateConsole = struct {
         if (WriteConsoleInputW(self.conin, &records, @intCast(events.len), &written) == 0 or written != events.len) return error.PrivateConsoleFailed;
     }
 
+    /// `text` 的每个字符各排一条按下记录:开着 win32-input-mode 时控制台就是这样把一条按键记录
+    /// `ESC [ Vk;Sc;Uc;Kd;Cs;Rc _` 排进输入队列的(一个字符一个事件,实测)。
+    pub fn sendChars(self: *const PrivateConsole, text: []const u8) !void {
+        var rest = text;
+        while (rest.len > 0) {
+            const n = @min(rest.len, 16);
+            var events: [16]Event = undefined;
+            for (rest[0..n], events[0..n]) |c, *e| e.* = .{ .down = c };
+            try self.send(events[0..n]);
+            rest = rest[n..];
+        }
+    }
+
     /// 队列里还有几条按键按下的记录(只看不取)。
     pub fn keyDownsQueued(self: *const PrivateConsole) usize {
         if (builtin.os.tag != .windows) return 0;
