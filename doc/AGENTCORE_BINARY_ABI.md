@@ -637,7 +637,11 @@ the public durable-budget terminals
 also reported through `RunResultV1.checkpoint_outcome_code` and result flags.
 The Core `stalled` stop (the stall gate ended a run whose tool rounds kept
 returning nothing new) is a controlled breaker stop and is reported as
-`tool_loop`. Internal `suspended`, `backgrounded`, and a raw unprojected Core `budget` stop
+`tool_loop`. The Core `max_tokens_exhausted` stop (the provider still cut the
+output at its max-token limit after the last allowed continuation) is a
+provider outcome and is reported as `api_error`. Its terminal RunState is
+`failed`, its visible text arrives as an output group that ends `partial`, and
+the Session stays usable for the next Run. Internal `suspended`, `backgrounded`, and a raw unprojected Core `budget` stop
 remain unrepresentable in v1. If one of those internal states reaches the
 facade it is a contract failure, not an additional public stop code. Because
 the stateful Run may already have committed Conversation changes, that failure

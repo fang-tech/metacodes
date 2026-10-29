@@ -72,6 +72,7 @@ test {
     _ = @import("component/mcp_background_startup_test.zig");
     _ = @import("component/prompt_model_identity_test.zig");
     _ = @import("component/stream_terminator_test.zig");
+    _ = @import("component/max_tokens_exhaustion_test.zig");
     _ = @import("component/time_context_test.zig");
     _ = @import("component/file_change_test.zig");
     _ = @import("component/compound_perm_test.zig");

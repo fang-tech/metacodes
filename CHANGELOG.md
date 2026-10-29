@@ -336,6 +336,26 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Fixed
 
+- **An answer still cut at the output-token limit after the last
+  continuation ends the Run as incomplete, even when it has text (#394).**
+  After the initial request and its three continuations, a last turn that
+  still ended on the wire's max-token report (Anthropic `max_tokens`, Chat
+  Completions `length`, Responses `response.incomplete` with
+  `max_output_tokens`, Gemini `MAX_TOKENS`) only reached
+  `max_tokens_exhausted` when it streamed no text. With visible text it was
+  closed as the final answer, so headless `--json` reported
+  `stop_reason=end_turn`, `text_kind=final` and exit 0, and the
+  `--stream-json` timeline read `continued → continued → continued → final`.
+  Such a turn now ends in `max_tokens_exhausted` either way. The whole
+  continued text is still delivered, as `text_kind=partial`, with exit 1 and
+  a timeline that closes with `partial`. The REPL now says the reply was cut
+  off instead of ending silently. AgentCore ABI v1 reports the stop as
+  `api_error` with a `failed` RunState, and the Session takes the next Run.
+  Before, `max_tokens_exhausted` (then reached only without text) returned
+  `INTERNAL_ERROR` and poisoned the Session. No wire code is added. A
+  complete tool call on that turn still runs, and a continuation that ends
+  normally is still one final answer. Tested on all four wires against a
+  loopback mock.
 - **A multi-line paste in Windows Terminal or the classic Windows console
   stays in the prompt instead of submitting every line but the last
   (#386).** On Windows the REPL never turned on bracketed paste: `TERM` is
