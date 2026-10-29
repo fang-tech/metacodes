@@ -380,10 +380,10 @@ fn inEveryProfile(arena: std.mem.Allocator, default_installed: bool, profiles: v
     return true;
 }
 
-/// `arg` as one word of a command for `os`'s shell: in double quotes for
-/// cmd.exe and PowerShell (cmd keeps single quotes as part of the word, and a
-/// Windows file name cannot hold `"`), in single quotes for a POSIX shell,
-/// with each `'` written as `'\''`.
+/// `arg` as one word of a command for `os`'s shell. Windows: in double quotes,
+/// one word for cmd.exe (which keeps single quotes as part of the word) and
+/// for PowerShell unless the path holds `$` or a backtick; a Windows file name
+/// cannot hold `"`. POSIX: in single quotes, each `'` written as `'\''`.
 fn shellArg(arena: std.mem.Allocator, os: Env.Os, arg: []const u8) error{OutOfMemory}![]const u8 {
     if (os == .windows) return std.fmt.allocPrint(arena, "\"{s}\"", .{arg});
     return std.fmt.allocPrint(arena, "'{s}'", .{try std.mem.replaceOwned(u8, arena, arg, "'", "'\\''")});

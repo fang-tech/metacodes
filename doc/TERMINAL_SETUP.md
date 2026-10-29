@@ -10,7 +10,7 @@ that where the terminal's own settings can.
 | Terminal | Shift+Enter without setup | What `/terminal-setup` does |
 | --- | --- | --- |
 | iTerm2, WezTerm, Ghostty, kitty, Warp | newline (metacodes turns on the Kitty keyboard protocol) | nothing; says so |
-| Other terminals that answer the keyboard-protocol query at startup | newline | nothing to set up |
+| Other terminals that answer the keyboard-protocol query at startup | newline | nothing; says so (in the TUI, which has the answer) |
 | Apple Terminal | submits | maps Shift+Return in the default profile |
 | VS Code, Cursor, Windsurf, VSCodium, other VS Code builds | submits | adds a `keybindings.json` entry |
 | tmux, anything else | depends on the terminal | explains the manual setup; changes nothing |

@@ -44,8 +44,9 @@ status, compatibility boundaries, and entry points are defined by
     any change. `--restore` (`/terminal-setup restore`) undoes exactly what is
     recorded, narrowed by `--terminal` or `--keybindings` (naming one with
     nothing recorded fails), and keeps an entry whose file no longer parses.
-    iTerm2, WezTerm, Ghostty, kitty and Warp are reported as needing nothing;
-    other terminals get the manual setup.
+    iTerm2, WezTerm, Ghostty, kitty and Warp are reported as needing nothing,
+    and so, in the TUI, is a terminal that answered the startup
+    keyboard-protocol probe; other terminals get the manual setup.
   - The footer says `shift + ⏎ for newline` once the binding works: at once in
     VS Code, after Terminal is reopened in Apple Terminal. See
     [doc/TERMINAL_SETUP.md](doc/TERMINAL_SETUP.md).
