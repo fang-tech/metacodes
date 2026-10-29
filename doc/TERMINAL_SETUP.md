@@ -27,6 +27,11 @@ keeps its line breaks. Terminals that send `ESC CR` for Alt+Enter (xterm, VTE
 terminals such as GNOME Terminal, Konsole, Alacritty) now get a newline from
 Alt+Enter too.
 
+One limit is inferred, not measured: a connection that delivers keys in bursts,
+such as mosh or an SSH session over a link that loses packets, can bring an Esc
+and an Enter pressed in quick succession in one batch. metacodes then reads
+them as `ESC CR`, a newline, instead of Esc followed by Enter.
+
 ```sh
 /terminal-setup                 # in the TUI: set up this terminal
 /terminal-setup status          # say what it would change, change nothing

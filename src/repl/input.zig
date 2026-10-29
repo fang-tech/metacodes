@@ -1459,6 +1459,45 @@ test "KeyParser: 人按的 Esc 再按 Enter(分两次到达)仍是 Esc + Enter" 
     try testing.expect(p.drain().? == .enter);
 }
 
+test "readKey(Windows 控制台):ESC CR 同批读到是 Shift+Enter,ESC 读走后才到的 CR 是两个键" {
+    // 往测试自己的控制台输入队列里写键盘记录,走真实的 readInput / waitReadable,不依赖 ConPTY 时序。
+    var console = try @import("platform").test_support.PrivateConsole.begin();
+    defer console.end();
+    var p = KeyParser{};
+    var b: [1]u8 = undefined;
+
+    // 同批,在 readInput 的缓冲里:两个键都排好了才开读,ReadConsoleW 一次拿走两个字符,
+    // 队列里不再有按下记录。读出 ESC 后,CR 还在缓冲里。
+    try console.send(&.{ .{ .down = 0x1b }, .{ .up = 0x1b }, .{ .down = '\r' }, .{ .up = '\r' } });
+    try testing.expectEqual(@as(isize, 1), platform_term.readInput(0, &b));
+    try testing.expectEqual(@as(u8, 0x1b), b[0]);
+    try testing.expectEqual(@as(usize, 0), console.keyDownsQueued());
+    try testing.expectEqual(@as(i32, 1), platform_term.waitReadable(0, 0));
+    try testing.expect(p.feedRead(0, b[0]) == null);
+    try testing.expect(readKey(0, &p).key == .shift_enter);
+
+    // 同批,在记录队列里:ReadConsoleW 只拿到 ESC,CR 的按下记录随后进队,前面夹着 ESC 的抬起和
+    // 一次焦点变化(都不产字节)。waitReadable 跳过它们,数到 CR 的按下。
+    try console.send(&.{.{ .down = 0x1b }});
+    try testing.expectEqual(@as(isize, 1), platform_term.readInput(0, &b));
+    try testing.expectEqual(@as(u8, 0x1b), b[0]);
+    try console.send(&.{ .{ .up = 0x1b }, .focus, .{ .down = '\r' }, .{ .up = '\r' } });
+    try testing.expectEqual(@as(i32, 1), platform_term.waitReadable(0, 0));
+    try testing.expect(p.feedRead(0, b[0]) == null);
+    try testing.expect(readKey(0, &p).key == .shift_enter);
+
+    // 分两次:读走 ESC 时队列里只有抬起和焦点记录,waitReadable 把它们取走、答"没有"。Enter
+    // 在 ESC 的等待期内才到,仍是 Esc + Enter 两个键。
+    try console.send(&.{.{ .down = 0x1b }});
+    try testing.expectEqual(@as(isize, 1), platform_term.readInput(0, &b));
+    try console.send(&.{ .{ .up = 0x1b }, .focus });
+    try testing.expectEqual(@as(i32, 0), platform_term.waitReadable(0, 0));
+    try testing.expect(p.feedRead(0, b[0]) == null);
+    try console.send(&.{ .{ .down = '\r' }, .{ .up = '\r' } });
+    try testing.expect(readKey(0, &p).key == .esc);
+    try testing.expect(readKey(0, &p).key == .enter);
+}
+
 test "LineEditor: 同批的 ESC CR 经 KeyParser 插换行,单独的 CR 提交" {
     var ed = LineEditor.init(testing.allocator);
     defer ed.deinit();

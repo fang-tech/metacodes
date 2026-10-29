@@ -380,9 +380,18 @@ fn inEveryProfile(arena: std.mem.Allocator, default_installed: bool, profiles: v
     return true;
 }
 
+/// `arg` as one word of a command for `os`'s shell: in double quotes for
+/// cmd.exe and PowerShell (cmd keeps single quotes as part of the word, and a
+/// Windows file name cannot hold `"`), in single quotes for a POSIX shell,
+/// with each `'` written as `'\''`.
+fn shellArg(arena: std.mem.Allocator, os: Env.Os, arg: []const u8) error{OutOfMemory}![]const u8 {
+    if (os == .windows) return std.fmt.allocPrint(arena, "\"{s}\"", .{arg});
+    return std.fmt.allocPrint(arena, "'{s}'", .{try std.mem.replaceOwned(u8, arena, arg, "'", "'\\''")});
+}
+
 /// Tells which profiles read a `keybindings.json` of their own, and how to
 /// set each up.
-fn sayProfiles(arena: std.mem.Allocator, out: *std.Io.Writer, display: []const u8, profiles: vscode.Profiles) void {
+fn sayProfiles(arena: std.mem.Allocator, out: *std.Io.Writer, os: Env.Os, display: []const u8, profiles: vscode.Profiles) void {
     switch (profiles) {
         .unknown => say(out, "{s}'s profile list (globalStorage/storage.json) could not be read. A window that uses a profile with keyboard shortcuts of its own reads that profile's keybindings.json: set it up with metacodes terminal-setup --keybindings <that file>.", .{display}),
         .known => |list| {
@@ -400,7 +409,8 @@ fn sayProfiles(arena: std.mem.Allocator, out: *std.Io.Writer, display: []const u
                 if (has) {
                     say(out, "  \"{s}\": set up already ({s}).", .{ p.name, file });
                 } else {
-                    say(out, "  \"{s}\": metacodes terminal-setup --keybindings '{s}'", .{ p.name, file });
+                    const word = shellArg(arena, os, file) catch file;
+                    say(out, "  \"{s}\": metacodes terminal-setup --keybindings {s}", .{ p.name, word });
                 }
             }
         },
@@ -436,7 +446,7 @@ fn installVscode(arena: std.mem.Allocator, ctx: Context, display: []const u8, pr
     switch (status) {
         .installed => {
             say(out, "Already set up: {s} makes Shift+Enter send Esc+Return in the terminal, which metacodes reads as a newline. Nothing changed.", .{real});
-            sayProfiles(arena, out, display, profiles);
+            sayProfiles(arena, out, ctx.env.os, display, profiles);
             return .{ .outcome = .unchanged, .binding_live = inEveryProfile(arena, true, profiles) };
         },
         .conflict => |text| {
@@ -455,7 +465,7 @@ fn installVscode(arena: std.mem.Allocator, ctx: Context, display: []const u8, pr
     if (backup) |b| say(out, "Backup: {s}", .{b});
     if (preview) {
         say(out, "Dry run: nothing changed.", .{});
-        sayProfiles(arena, out, display, profiles);
+        sayProfiles(arena, out, ctx.env.os, display, profiles);
         return .{ .outcome = .unchanged };
     }
     const updated = try vscode.withBinding(arena, src);
@@ -490,7 +500,7 @@ fn installVscode(arena: std.mem.Allocator, ctx: Context, display: []const u8, pr
         say(out, "Done. {s} reloads keybindings.json by itself: Shift+Enter inserts a newline in metacodes now.", .{display});
     } else {
         say(out, "Done for windows that use the Default profile: {s} reloads keybindings.json by itself.", .{display});
-        sayProfiles(arena, out, display, profiles);
+        sayProfiles(arena, out, ctx.env.os, display, profiles);
     }
     say(out, "{s}", .{effect_note});
     say(out, "Undo: {s}", .{ctx.restore_hint});
@@ -616,13 +626,13 @@ fn installApple(arena: std.mem.Allocator, ctx: Context, preview: bool, out: *std
         if (rolled_back) saveRecord(arena, ctx.state_root, before) catch {};
         say(out, "Terminal's settings did not take the change; {s}.", .{if (rolled_back) "they are back as they were" else "restoring them failed too"});
         if (why.len > 0) say(out, "  {s}", .{why});
-        say(out, "To put them back by hand: defaults import {s} '{s}'", .{ ctx.apple.domain, backup });
+        say(out, "To put them back by hand: defaults import {s} {s}", .{ ctx.apple.domain, try shellArg(arena, .macos, backup) });
         return .{ .outcome = .failed };
     }
 
     say(out, "Done. Quit Terminal (Cmd+Q) and open it again: it reads its profiles when it starts, so its windows keep sending a plain Return until then.", .{});
     say(out, "{s}", .{effect_note});
-    say(out, "Undo: {s}. To put back all of Terminal's settings as they were: defaults import {s} '{s}' (with Terminal quit).", .{ ctx.restore_hint, ctx.apple.domain, backups.items[0] });
+    say(out, "Undo: {s}. To put back all of Terminal's settings as they were: defaults import {s} {s} (with Terminal quit).", .{ ctx.restore_hint, ctx.apple.domain, try shellArg(arena, .macos, backups.items[0]) });
     return .{ .outcome = .changed };
 }
 
@@ -700,7 +710,9 @@ fn restoreAll(arena: std.mem.Allocator, ctx: Context, target: ?Target, out: *std
             break :blk apple.restore(&prefs, entry.profiles) catch null;
         } orelse {
             say(out, "  Could not change Terminal's settings: left as they are. {s}", .{apple.lastFailure()});
-            say(out, "  The settings from before setup: defaults import {s} '{s}'", .{ entry.domain, if (entry.backups.len > 0) entry.backups[0] else "(no backup recorded)" });
+            if (entry.backups.len > 0) {
+                say(out, "  The settings from before setup: defaults import {s} {s}", .{ entry.domain, try shellArg(arena, .macos, entry.backups[0]) });
+            } else say(out, "  No backup of the settings from before setup is recorded.", .{});
             outcome = .failed;
             break :apple_blk;
         };
@@ -1075,6 +1087,105 @@ test "run vscode: a keybindings.json that is a link: the file it links to change
     try testing.expect(!files.exists(try h.join(&.{ "dotfiles", "gone.json" })));
 }
 
+/// A non-empty directory at `sub_path`: no file can be created there and it
+/// cannot be unlinked. At `<file>.metacodes-tmp` it makes `files.writeAtomic`
+/// of `<file>` fail where it creates its temporary file, as a directory that
+/// takes no new files (the Nix store) does.
+fn occupy(h: *Harness, sub_path: []const u8) !void {
+    try h.tmp.dir.createDirPath(testing.io, sub_path);
+    try h.tmp.dir.writeFile(testing.io, .{ .sub_path = try std.fmt.allocPrint(h.arena_state.allocator(), "{s}/keep", .{sub_path}), .data = "x" });
+}
+
+test "run vscode: a keybindings.json that cannot be written is left alone, and the record put back" {
+    const h = try Harness.init();
+    defer h.deinit();
+    const arena = h.arena_state.allocator();
+    try h.tmp.dir.createDirPath(testing.io, "cfg/Code/User");
+    try h.tmp.dir.createDirPath(testing.io, "cfg/Cursor/User");
+    const code_env: Env = .{ .term_program = "vscode", .os = .other, .home = h.root, .xdg_config_home = try h.join(&.{"cfg"}) };
+    var cursor_env = code_env;
+    cursor_env.cursor_trace_id = true;
+    // The record lists Cursor's file already.
+    try testing.expectEqual(Outcome.changed, run(testing.allocator, try h.ctx(cursor_env), .{}, &h.out.writer).outcome);
+    const record_file = try h.join(&.{ "state", "terminal-setup", "installed.json" });
+    const record_before = try files.read(arena, record_file);
+    const original = "// mine\n[\n]\n";
+    try h.tmp.dir.writeFile(testing.io, .{ .sub_path = "cfg/Code/User/keybindings.json", .data = original });
+    try occupy(h, "cfg/Code/User/keybindings.json.metacodes-tmp");
+
+    h.reset();
+    try testing.expectEqual(Outcome.failed, run(testing.allocator, try h.ctx(code_env), .{}, &h.out.writer).outcome);
+    try testing.expect(std.mem.indexOf(u8, h.report(), "Could not write") != null);
+    // A plain file: no word about a tool that manages it.
+    try testing.expect(std.mem.indexOf(u8, h.report(), "home-manager") == null);
+    try testing.expectEqualStrings(original, try files.read(arena, try h.join(&.{ "cfg", "Code", "User", "keybindings.json" })));
+    // Cursor's entry and nothing for Code, byte for byte as before.
+    try testing.expectEqualStrings(record_before, try files.read(arena, record_file));
+    try testing.expect(!bindingLive(testing.allocator, code_env, (try h.ctx(code_env)).state_root));
+}
+
+test "run vscode: a link to a file that cannot be written says to add the binding where it is managed" {
+    const h = try Harness.init();
+    defer h.deinit();
+    const arena = h.arena_state.allocator();
+    try h.tmp.dir.createDirPath(testing.io, "store");
+    try h.tmp.dir.writeFile(testing.io, .{ .sub_path = "store/keybindings.json", .data = "[\n]\n" });
+    try h.tmp.dir.createDirPath(testing.io, "cfg/Code/User");
+    const target = try h.join(&.{ "store", "keybindings.json" });
+    try @import("platform").test_support.symlinkOrSkip(h.tmp.dir, testing.io, target, "cfg/Code/User/keybindings.json", .{});
+    try occupy(h, "store/keybindings.json.metacodes-tmp");
+    const env: Env = .{ .term_program = "vscode", .os = .other, .home = h.root, .xdg_config_home = try h.join(&.{"cfg"}) };
+    const link_path = try h.join(&.{ "cfg", "Code", "User", "keybindings.json" });
+
+    try testing.expectEqual(Outcome.failed, run(testing.allocator, try h.ctx(env), .{}, &h.out.writer).outcome);
+    try testing.expect(std.mem.indexOf(u8, h.report(), "home-manager") != null);
+    try testing.expect(std.mem.indexOf(u8, h.report(), target) != null);
+    try testing.expect(std.mem.indexOf(u8, h.report(), link_path) != null);
+    try testing.expectEqualStrings("[\n]\n", try files.read(arena, target));
+    var buf: [std.fs.max_path_bytes:0]u8 = undefined;
+    @memcpy(buf[0..link_path.len], link_path);
+    buf[link_path.len] = 0;
+    try testing.expect(@import("platform").fs.isSymlink(buf[0..link_path.len :0]));
+    // There was no record before, and there is none now.
+    try testing.expect(!files.exists(try h.join(&.{ "state", "terminal-setup", "installed.json" })));
+}
+
+test "shellArg: double quotes for Windows, single quotes with ' escaped for POSIX" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try testing.expectEqualStrings("'/home/a/k.json'", try shellArg(arena, .other, "/home/a/k.json"));
+    try testing.expectEqualStrings("'/Users/o'\\''brien/k.json'", try shellArg(arena, .macos, "/Users/o'brien/k.json"));
+    try testing.expectEqualStrings("\"C:\\Users\\O'Brien\\k.json\"", try shellArg(arena, .windows, "C:\\Users\\O'Brien\\k.json"));
+}
+
+test "run vscode: the command for a profile quotes its file for the shell it is typed in" {
+    const h = try Harness.init();
+    defer h.deinit();
+    const storage =
+        \\{"userDataProfiles":[{"location":"1d77a59e","name":"tsprobe"}]}
+    ;
+    // POSIX: a ' in the path.
+    try h.tmp.dir.createDirPath(testing.io, "it's/Code/User/globalStorage");
+    try h.tmp.dir.writeFile(testing.io, .{ .sub_path = "it's/Code/User/globalStorage/storage.json", .data = storage });
+    const posix: Env = .{ .term_program = "vscode", .os = .other, .home = h.root, .xdg_config_home = try h.join(&.{"it's"}) };
+    try testing.expectEqual(Outcome.unchanged, run(testing.allocator, try h.ctx(posix), .{ .action = .preview }, &h.out.writer).outcome);
+    const posix_file = try h.join(&.{ "it's", "Code", "User", "profiles", "1d77a59e", "keybindings.json" });
+    const posix_cmd = try std.fmt.allocPrint(h.arena_state.allocator(), "--keybindings {s}\n", .{try shellArg(h.arena_state.allocator(), .other, posix_file)});
+    try testing.expect(std.mem.indexOf(u8, posix_cmd, "'\\''") != null);
+    try testing.expect(std.mem.indexOf(u8, h.report(), posix_cmd) != null);
+
+    // Windows: cmd.exe keeps single quotes, so double ones.
+    h.reset();
+    try h.tmp.dir.createDirPath(testing.io, "app data/Code/User/globalStorage");
+    try h.tmp.dir.writeFile(testing.io, .{ .sub_path = "app data/Code/User/globalStorage/storage.json", .data = storage });
+    const windows: Env = .{ .term_program = "vscode", .os = .windows, .home = h.root, .appdata = try h.join(&.{"app data"}) };
+    try testing.expectEqual(Outcome.unchanged, run(testing.allocator, try h.ctx(windows), .{ .action = .preview }, &h.out.writer).outcome);
+    const windows_file = try h.join(&.{ "app data", "Code", "User", "profiles", "1d77a59e", "keybindings.json" });
+    const windows_cmd = try std.fmt.allocPrint(h.arena_state.allocator(), "--keybindings \"{s}\"\n", .{windows_file});
+    try testing.expect(std.mem.indexOf(u8, h.report(), windows_cmd) != null);
+}
+
 test "run vscode: --restore --terminal undoes only that build; a named file with nothing recorded fails" {
     const h = try Harness.init();
     defer h.deinit();
@@ -1257,26 +1368,41 @@ test "printable spells out control characters" {
     try testing.expectEqualStrings("\\e\\r\\x01", try printable(arena_state.allocator(), "\x1b\r\x01"));
 }
 
+/// A path domain under the temporary directory, never the runner's own, holding
+/// `profiles` (JSON) and, as Terminal's colours and fonts are, a data value.
+fn seedTerminalDomain(h: *Harness, profiles: []const u8) !apple.Store {
+    const arena = h.arena_state.allocator();
+    try h.tmp.dir.createDirPath(testing.io, "domain");
+    const store: apple.Store = .{ .domain = try h.join(&.{ "domain", "terminal" }) };
+    const seed_json = try h.join(&.{"seed.json"});
+    const seed_plist = try h.join(&.{"seed.plist"});
+    try h.tmp.dir.writeFile(testing.io, .{ .sub_path = "seed.json", .data = profiles });
+    const plist_ok = (try process.capture(&.{ "/usr/bin/plutil", "-convert", "binary1", "-o", (try arena.dupeZ(u8, seed_plist)).ptr, (try arena.dupeZ(u8, seed_json)).ptr, null }, arena, .{})).exit_code == 0;
+    try testing.expect(plist_ok);
+    // JSON cannot hold data, so it goes in afterwards.
+    const data_ok = (try process.capture(&.{ "/usr/bin/plutil", "-insert", "NSWindow Data", "-data", "AAEC", (try arena.dupeZ(u8, seed_plist)).ptr, null }, arena, .{})).exit_code == 0;
+    try testing.expect(data_ok);
+    const import_ok = (try process.capture(&.{ "/usr/bin/defaults", "import", (try arena.dupeZ(u8, store.domain)).ptr, (try arena.dupeZ(u8, seed_plist)).ptr, null }, arena, .{ .inherit_env = true })).exit_code == 0;
+    try testing.expect(import_ok);
+    return store;
+}
+
+/// Everything in `domain`, as `defaults export` writes it.
+fn exportDomain(h: *Harness, domain: []const u8) ![]const u8 {
+    const arena = h.arena_state.allocator();
+    const r = try process.capture(&.{ "/usr/bin/defaults", "export", (try arena.dupeZ(u8, domain)).ptr, "-", null }, arena, .{ .inherit_env = true });
+    try testing.expectEqual(@as(i32, 0), r.exit_code);
+    return r.stdout;
+}
+
 test "run apple terminal (macOS): set up, a dry run, a second run, the record, restore" {
     if (builtin.os.tag != .macos) return error.SkipZigTest;
     const h = try Harness.init();
     defer h.deinit();
     const arena = h.arena_state.allocator();
-    try h.tmp.dir.createDirPath(testing.io, "domain");
-    // A path domain under the temporary directory, never the runner's own.
-    const store: apple.Store = .{ .domain = try h.join(&.{ "domain", "terminal" }) };
-    const seed_json = try h.join(&.{"seed.json"});
-    const seed_plist = try h.join(&.{"seed.plist"});
-    try h.tmp.dir.writeFile(testing.io, .{ .sub_path = "seed.json", .data =
+    const store = try seedTerminalDomain(h,
         \\{"Default Window Settings":"Basic","Startup Window Settings":"Basic","Window Settings":{"Basic":{"name":"Basic"}}}
-    });
-    const plist_ok = (try process.capture(&.{ "/usr/bin/plutil", "-convert", "binary1", "-o", (try arena.dupeZ(u8, seed_plist)).ptr, (try arena.dupeZ(u8, seed_json)).ptr, null }, arena, .{})).exit_code == 0;
-    try testing.expect(plist_ok);
-    // Terminal keeps colours and fonts as data, which JSON cannot hold.
-    const data_ok = (try process.capture(&.{ "/usr/bin/plutil", "-insert", "NSWindow Data", "-data", "AAEC", (try arena.dupeZ(u8, seed_plist)).ptr, null }, arena, .{})).exit_code == 0;
-    try testing.expect(data_ok);
-    const import_ok = (try process.capture(&.{ "/usr/bin/defaults", "import", (try arena.dupeZ(u8, store.domain)).ptr, (try arena.dupeZ(u8, seed_plist)).ptr, null }, arena, .{ .inherit_env = true })).exit_code == 0;
-    try testing.expect(import_ok);
+    );
 
     var ctx = try h.ctx(.{ .term_program = "Apple_Terminal", .home = h.root });
     ctx.apple = store;
@@ -1315,4 +1441,45 @@ test "run apple terminal (macOS): set up, a dry run, a second run, the record, r
     try testing.expect((try loadRecord(arena, ctx.state_root)).apple_terminal == null);
     try testing.expect(!appleLive(arena, rec, 4343, h.root));
     try testing.expect(files.exists(backup));
+}
+
+test "run apple terminal (macOS): a change that does not take is rolled back, and the record with it" {
+    if (builtin.os.tag != .macos) return error.SkipZigTest;
+    const h = try Harness.init();
+    defer h.deinit();
+    const arena = h.arena_state.allocator();
+    // The record lists a VS Code file already; that entry has to come through.
+    try h.tmp.dir.createDirPath(testing.io, "cfg/Code/User");
+    const code_env: Env = .{ .term_program = "vscode", .os = .other, .home = h.root, .xdg_config_home = try h.join(&.{"cfg"}) };
+    try testing.expectEqual(Outcome.changed, run(testing.allocator, try h.ctx(code_env), .{}, &h.out.writer).outcome);
+    const record_file = try h.join(&.{ "state", "terminal-setup", "installed.json" });
+    const record_before = try files.read(arena, record_file);
+    const store = try seedTerminalDomain(h,
+        \\{"Default Window Settings":"Basic","Startup Window Settings":"Basic","Window Settings":{"Basic":{"name":"Basic"}}}
+    );
+    const prefs_before = try exportDomain(h, store.domain);
+    var ctx = try h.ctx(.{ .term_program = "Apple_Terminal", .home = h.root });
+    ctx.terminal_pid = 4242;
+
+    // The edit fails before anything is imported: this Terminal.app has no
+    // built-in key map to copy into the profile.
+    ctx.apple = .{ .domain = store.domain, .app = try h.join(&.{"NoSuch.app"}) };
+    h.reset();
+    try testing.expectEqual(Outcome.failed, run(testing.allocator, ctx, .{}, &h.out.writer).outcome);
+    try testing.expect(std.mem.indexOf(u8, h.report(), "they are back as they were") != null);
+    try testing.expect(std.mem.indexOf(u8, h.report(), "plutil -convert json") != null);
+    try testing.expectEqualStrings(record_before, try files.read(arena, record_file));
+    try testing.expectEqualStrings(prefs_before, try exportDomain(h, store.domain));
+
+    // The change is imported, and reading it back fails (a directory where the
+    // read-back export goes): the backup is imported over it.
+    ctx.apple = store;
+    const verify_path = try workPath(arena, try setupDir(arena, ctx.state_root), "verify");
+    try occupy(h, try std.fmt.allocPrint(arena, "state/terminal-setup/{s}", .{std.fs.path.basename(verify_path)}));
+    h.reset();
+    try testing.expectEqual(Outcome.failed, run(testing.allocator, ctx, .{}, &h.out.writer).outcome);
+    try testing.expect(std.mem.indexOf(u8, h.report(), "they are back as they were") != null);
+    try testing.expect(std.mem.indexOf(u8, h.report(), "/usr/bin/defaults export") != null);
+    try testing.expectEqualStrings(record_before, try files.read(arena, record_file));
+    try testing.expectEqualStrings(prefs_before, try exportDomain(h, store.domain));
 }
