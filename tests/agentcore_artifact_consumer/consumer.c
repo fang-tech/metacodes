@@ -6,10 +6,10 @@
 #include <string.h>
 
 #if defined(METASK_AGENTCORE_CALLBACK_CONTINUE) || defined(METASK_AGENTCORE_CALLBACK_FATAL)
-#error "revision 25 must not retain historical callback aliases"
+#error "revision 26 must not retain historical callback aliases"
 #endif
 
-#if METASK_AGENTCORE_ABI_REVISION != 25u || \
+#if METASK_AGENTCORE_ABI_REVISION != 26u || \
     METASK_AGENTCORE_MAX_CREDENTIAL_BYTES_V1 != 16384u || \
     METASK_AGENTCORE_MAX_SUBMITTED_INPUTS_V1 != 64u || \
     METASK_AGENTCORE_MAX_SUBMITTED_INPUT_BYTES_V1 != 16777216u || \
@@ -61,7 +61,7 @@
     METASK_AGENTCORE_TEAM_ROLE_MEMBER != 2u || \
     METASK_AGENTCORE_MAX_TEAM_NAME_BYTES_V1 != 64u || \
     METASK_AGENTCORE_MAX_TEAM_MEMBER_BYTES_V1 != 64u
-#error "source-free Revision 23-25 codes must match the public contract"
+#error "source-free Revision 23-26 codes must match the public contract"
 #endif
 
 #ifdef _WIN32

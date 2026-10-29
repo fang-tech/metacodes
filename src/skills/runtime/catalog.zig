@@ -69,10 +69,12 @@ pub const COMPAT_MAX_SCAN_ENTRIES: usize = 20000;
 
 /// Higher numeric priority wins. Equal-priority candidates for the same
 /// invocation name are a conflict, independent of source enumeration order.
+/// `scope` does not rank candidates: a caller that orders scopes encodes that
+/// order in `priority` (the CLI's bands below, AgentCore's scope bands).
 pub const Source = struct {
     root: []const u8,
     scope: SourceScope,
-    priority: u32,
+    priority: u64,
     namespace: []const u8 = "",
     /// Logical parser/provider identity. This is metadata only; the shared
     /// catalog keeps owning canonical parsing and resolution.
@@ -375,7 +377,7 @@ const Candidate = struct {
     scope: SourceScope,
     provider_id: []const u8 = DEFAULT_PROVIDER_ID,
     source_instance_id: []const u8 = "",
-    priority: u32,
+    priority: u64,
     state: State,
 
     const State = union(enum) {

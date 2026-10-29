@@ -1,7 +1,7 @@
 # AgentCore SDK
 
 This directory contains source-free host bindings for the experimental AgentCore
-C ABI v1 revision 25:
+C ABI v1 revision 26:
 
 - `metask/agentcore.h` — normative C11/C++17 layout declarations;
 - `zig/` — typed Zig consumer bindings;
@@ -15,7 +15,7 @@ C ABI v1 revision 25:
 
 Do not copy individual files into a release. Consume the complete generated bundle
 and validate its manifest, hashes, target, ABI version, exact 80-byte root, all
-seven mandatory typed tables, function slots, and reserved fields. Revision 25 is
+seven mandatory typed tables, function slots, and reserved fields. Revision 26 is
 the Agent Runtime surface; it does not expose an independent Completion client.
 `SessionCreateConfigV1.prompt_profile` edits the named system-prompt sections
 (replace the identity, add Host sections; governance sections stay locked) and
@@ -34,6 +34,13 @@ scheme, `base_url` and model stay; refusals keep the previous credential.
 callback; the Run appends it at its next turn boundary and reports each
 adoption as `input_adopted`, and `RunResultV1.input_accepted_count` /
 `input_adopted_count` reconcile every submitted input on every return.
+`skill->resolve_catalog` merges the default `.agents/skills` sources with up to
+64 Host-registered sources. Their source priorities (`SkillSourceV1.priority`,
+`SkillCatalogQueryV1.default_user_source_priority` and
+`default_workspace_source_priority`, all 0 by default) rank same-scope sources
+that define one Skill name: the higher one wins instead of both becoming a
+`source_conflict`. Workspace still beats User, and a tie at the top still
+conflicts.
 `session_run_input` accepts text, typed Skill, and multimodal inputs; a
 `RUN_INPUT_MULTIMODAL` Run submits an ordered `RunInputPartV1` array of text and
 base64 image parts, preflighted against the Session model's image capability.

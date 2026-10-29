@@ -4056,7 +4056,7 @@ test "L2 public MCP checkpoint restore facade preserves Conversation under narro
 
     var abi_revision_bytes: [4]u8 = undefined;
     @memcpy(&abi_revision_bytes, checkpoint.bytes.items[20..24]);
-    try std.testing.expectEqual(@as(u32, 25), wire.ABI_REVISION);
+    try std.testing.expectEqual(@as(u32, 26), wire.ABI_REVISION);
     // A Session without a prompt profile keeps the marker-8 envelope across
     // ABI revisions; the marker is independent of the table revision.
     try std.testing.expectEqual(
@@ -5273,7 +5273,8 @@ test "L2 Revision 7 catalog and explicit selection bind before Session" {
         .workspace_epoch = sdk.bytesView("epoch-1"),
         .additional_sources = null,
         .additional_source_count = 0,
-        .reserved = [_]u64{0} ** 1,
+        .default_user_source_priority = 0,
+        .default_workspace_source_priority = 0,
     };
     var catalog: ?*wire.SkillCatalogHandle = null;
     defer if (catalog) |handle| {
@@ -5604,7 +5605,8 @@ test "L2 Revision 10 catalog resolves one Workspace authority and rejects reserv
         .workspace_epoch = sdk.bytesView("scope-epoch"),
         .additional_sources = null,
         .additional_source_count = 0,
-        .reserved = [_]u64{0} ** 1,
+        .default_user_source_priority = 0,
+        .default_workspace_source_priority = 0,
     };
     var catalog: ?*wire.SkillCatalogHandle = null;
     var descriptor = std.mem.zeroes(wire.OwnedBytesV1);
@@ -5640,7 +5642,9 @@ test "L2 Revision 10 catalog resolves one Workspace authority and rejects reserv
         .scope_code = wire.SKILL_SOURCE_WORKSPACE,
         .root = sdk.bytesView(explicit_root),
         .source_instance_id = sdk.bytesView("consumer.claude.compatible"),
-        .reserved = [_]u64{0} ** 3,
+        .priority = 0,
+        .reserved0 = 0,
+        .reserved = [_]u64{0} ** 2,
     };
     query.additional_sources = @ptrCast(&explicit_source);
     query.additional_source_count = 1;
@@ -5674,7 +5678,9 @@ test "L2 Revision 10 catalog resolves one Workspace authority and rejects reserv
         .scope_code = wire.SKILL_SOURCE_WORKSPACE,
         .root = sdk.bytesView(conflict_root),
         .source_instance_id = sdk.bytesView("consumer.codex.compatible"),
-        .reserved = [_]u64{0} ** 3,
+        .priority = 0,
+        .reserved0 = 0,
+        .reserved = [_]u64{0} ** 2,
     };
     const explicit_sources = [_]wire.SkillSourceV1{ explicit_source, conflict_source };
     query.additional_sources = &explicit_sources;
@@ -5696,6 +5702,286 @@ test "L2 Revision 10 catalog resolves one Workspace authority and rejects reserv
         try std.testing.expectEqualStrings("shared", issue.skill_policy_key.?);
     }
     try std.testing.expect(found_conflict);
+}
+
+test "L2 Revision 26 Skill source priorities pick the Host's winner through the public ABI (#390)" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var base_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const base = try rootPath(&tmp, &base_buf);
+    const project = try std.fs.path.join(a, &.{ base, "project" });
+    defer a.free(project);
+    const home = try std.fs.path.join(a, &.{ base, "home" });
+    defer a.free(home);
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, project);
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, home);
+    // The issue's layout: `.codex/skills` and `.claude/skills` both define
+    // `review`; `zig` and `release` exist in one source each.
+    try writeSkillFixtureInSource(a, project, ".codex", "review", "---\nname: Codex Review\n---\nCODEX_REVIEW_SENTINEL");
+    try writeSkillFixtureInSource(a, project, ".codex", "zig", "---\nname: Codex Zig\n---\nCODEX_ZIG_SENTINEL");
+    try writeSkillFixtureInSource(a, project, ".claude", "review", "---\nname: Claude Review\n---\nCLAUDE_REVIEW_SENTINEL");
+    try writeSkillFixtureInSource(a, project, ".claude", "release", "---\nname: Claude Release\n---\nCLAUDE_RELEASE_SENTINEL");
+    // The default Workspace source defines `review` too. User sources ranked
+    // above every other source still lose to Workspace.
+    try writeSkillFixture(a, project, "review", "---\nname: Workspace Default Review\n---\nWORKSPACE_DEFAULT_REVIEW_SENTINEL");
+    try writeSkillFixture(a, home, "review", "---\nname: User Default Review\n---\nUSER_DEFAULT_REVIEW_SENTINEL");
+    try writeSkillFixtureInSource(a, home, ".claude", "review", "---\nname: User Review\n---\nUSER_REVIEW_SENTINEL");
+    const codex_root = try std.fs.path.join(a, &.{ project, ".codex", "skills" });
+    defer a.free(codex_root);
+    const claude_root = try std.fs.path.join(a, &.{ project, ".claude", "skills" });
+    defer a.free(claude_root);
+    const user_root = try std.fs.path.join(a, &.{ home, ".claude", "skills" });
+    defer a.free(user_root);
+
+    const bodies = [_][]const u8{ FINAL_SSE, FINAL_SSE };
+    var server = try harness.MockServer.startCassette(&bodies, 0);
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+
+    const raw_api = abi.metask_agentcore_get_api(wire.ABI_VERSION_V1) orelse
+        return error.MissingApi;
+    const api = try sdk.Api.validate(@ptrCast(@alignCast(raw_api)));
+    var diagnostic = std.mem.zeroes(wire.OwnedBytesV1);
+    defer api.bufferRelease()(&diagnostic);
+    var runtime_config = std.mem.zeroes(wire.RuntimeConfigV1);
+    runtime_config.struct_size = @sizeOf(wire.RuntimeConfigV1);
+    var runtime: ?*wire.RuntimeHandle = null;
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.runtime().create()(&runtime_config, null, &runtime, &diagnostic),
+    );
+    defer if (runtime) |handle| {
+        _ = api.runtime().destroy()(handle, &diagnostic);
+    };
+
+    var sources = [_]wire.SkillSourceV1{
+        .{
+            .struct_size = @sizeOf(wire.SkillSourceV1),
+            .scope_code = wire.SKILL_SOURCE_WORKSPACE,
+            .root = sdk.bytesView(codex_root),
+            .source_instance_id = sdk.bytesView("consumer.codex"),
+            .priority = 0,
+            .reserved0 = 0,
+            .reserved = [_]u64{0} ** 2,
+        },
+        .{
+            .struct_size = @sizeOf(wire.SkillSourceV1),
+            .scope_code = wire.SKILL_SOURCE_WORKSPACE,
+            .root = sdk.bytesView(claude_root),
+            .source_instance_id = sdk.bytesView("consumer.claude"),
+            .priority = 0,
+            .reserved0 = 0,
+            .reserved = [_]u64{0} ** 2,
+        },
+        .{
+            .struct_size = @sizeOf(wire.SkillSourceV1),
+            .scope_code = wire.SKILL_SOURCE_USER,
+            .root = sdk.bytesView(user_root),
+            .source_instance_id = sdk.bytesView("consumer.user.claude"),
+            .priority = std.math.maxInt(i32),
+            .reserved0 = 0,
+            .reserved = [_]u64{0} ** 2,
+        },
+    };
+    var query = wire.SkillCatalogQueryV1{
+        .struct_size = @sizeOf(wire.SkillCatalogQueryV1),
+        .reserved0 = 0,
+        .workspace_root = sdk.bytesView(project),
+        .workspace_home = sdk.bytesView(home),
+        .workspace_epoch = sdk.bytesView("priority-epoch"),
+        .additional_sources = &sources,
+        .additional_source_count = sources.len,
+        .default_user_source_priority = std.math.maxInt(i32),
+        .default_workspace_source_priority = 0,
+    };
+
+    // Without Workspace priorities the three Workspace `review` candidates
+    // conflict, as in Revision 25; names unique to one source stay available.
+    var catalog: ?*wire.SkillCatalogHandle = null;
+    defer if (catalog) |handle| {
+        _ = api.skill().releaseCatalog()(handle, &diagnostic);
+    };
+    var descriptor = std.mem.zeroes(wire.OwnedBytesV1);
+    defer api.bufferRelease()(&descriptor);
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.skill().resolveCatalog()(runtime, &query, &catalog, &descriptor, &diagnostic),
+    );
+    {
+        const bytes = try sdk.borrowedBytes(.{ .ptr = descriptor.ptr, .len = descriptor.len });
+        var decoded = try sdk.decodeSkillCatalog(a, bytes);
+        defer decoded.deinit();
+        try std.testing.expectEqual(sdk.SkillCatalogHealth.degraded, decoded.value.health);
+        try std.testing.expectEqual(@as(usize, 1), decoded.value.issues.len);
+        try std.testing.expectEqual(sdk.SkillCatalogIssueCode.source_conflict, decoded.value.issues[0].code);
+        try std.testing.expectEqualStrings("review", decoded.value.issues[0].skill_policy_key.?);
+        try std.testing.expectEqual(@as(usize, 2), decoded.value.skills.len);
+        for (decoded.value.skills) |skill| {
+            try std.testing.expect(!std.mem.eql(u8, skill.invocation_name, "review"));
+        }
+    }
+    try std.testing.expectEqual(wire.STATUS_OK, api.skill().releaseCatalog()(catalog, &diagnostic));
+    catalog = null;
+    api.bufferRelease()(&descriptor);
+
+    // `.claude` ranked above `.codex` and the default Workspace source, which
+    // stay tied at 0: its `review` wins, nothing conflicts.
+    sources[1].priority = 10;
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.skill().resolveCatalog()(runtime, &query, &catalog, &descriptor, &diagnostic),
+    );
+    const ranked_bytes = try a.dupe(u8, try sdk.borrowedBytes(.{ .ptr = descriptor.ptr, .len = descriptor.len }));
+    defer a.free(ranked_bytes);
+    var ranked = try DecodedSkillPolicy.init(a, ranked_bytes);
+    defer ranked.deinit();
+    try std.testing.expectEqual(sdk.SkillCatalogHealth.healthy, ranked.catalog.value.health);
+    try std.testing.expectEqual(@as(usize, 0), ranked.catalog.value.issues.len);
+    try std.testing.expectEqual(@as(usize, 3), ranked.catalog.value.skills.len);
+    const Expected = struct { name: []const u8, source: []const u8, display: []const u8 };
+    for ([_]Expected{
+        .{ .name = "review", .source = "consumer.claude", .display = "Claude Review" },
+        .{ .name = "zig", .source = "consumer.codex", .display = "Codex Zig" },
+        .{ .name = "release", .source = "consumer.claude", .display = "Claude Release" },
+    }) |expected| {
+        var found = false;
+        for (ranked.catalog.value.skills) |skill| {
+            if (!std.mem.eql(u8, skill.invocation_name, expected.name)) continue;
+            found = true;
+            try std.testing.expectEqual(sdk.SkillSourceScope.workspace, skill.source.source_scope);
+            try std.testing.expectEqualStrings(expected.source, skill.source.source_instance_id);
+            try std.testing.expectEqualStrings(expected.display, skill.display_name);
+        }
+        try std.testing.expect(found);
+    }
+    api.bufferRelease()(&descriptor);
+
+    // Registration order does not matter: the reversed list resolves to the
+    // same descriptor bytes.
+    {
+        const reversed = [_]wire.SkillSourceV1{ sources[2], sources[1], sources[0] };
+        var reversed_query = query;
+        reversed_query.additional_sources = &reversed;
+        var reversed_catalog: ?*wire.SkillCatalogHandle = null;
+        var reversed_descriptor = std.mem.zeroes(wire.OwnedBytesV1);
+        defer api.bufferRelease()(&reversed_descriptor);
+        try std.testing.expectEqual(
+            wire.STATUS_OK,
+            api.skill().resolveCatalog()(runtime, &reversed_query, &reversed_catalog, &reversed_descriptor, &diagnostic),
+        );
+        defer _ = api.skill().releaseCatalog()(reversed_catalog, &diagnostic);
+        try std.testing.expectEqualStrings(
+            ranked_bytes,
+            try sdk.borrowedBytes(.{ .ptr = reversed_descriptor.ptr, .len = reversed_descriptor.len }),
+        );
+    }
+
+    // The default Workspace source takes its own priority from the query.
+    {
+        var default_query = query;
+        default_query.default_workspace_source_priority = 11;
+        var default_catalog: ?*wire.SkillCatalogHandle = null;
+        var default_descriptor = std.mem.zeroes(wire.OwnedBytesV1);
+        defer api.bufferRelease()(&default_descriptor);
+        try std.testing.expectEqual(
+            wire.STATUS_OK,
+            api.skill().resolveCatalog()(runtime, &default_query, &default_catalog, &default_descriptor, &diagnostic),
+        );
+        defer _ = api.skill().releaseCatalog()(default_catalog, &diagnostic);
+        const bytes = try sdk.borrowedBytes(.{ .ptr = default_descriptor.ptr, .len = default_descriptor.len });
+        var decoded = try sdk.decodeSkillCatalog(a, bytes);
+        defer decoded.deinit();
+        try std.testing.expectEqual(sdk.SkillCatalogHealth.healthy, decoded.value.health);
+        var found_default = false;
+        for (decoded.value.skills) |skill| {
+            if (!std.mem.eql(u8, skill.invocation_name, "review")) continue;
+            found_default = true;
+            try std.testing.expectEqualStrings("agents.workspace.default", skill.source.source_instance_id);
+            try std.testing.expectEqualStrings("Workspace Default Review", skill.display_name);
+        }
+        try std.testing.expect(found_default);
+    }
+
+    // The words beside `priority` stay reserved.
+    for ([_]u8{ 0, 1 }) |field| {
+        if (field == 0) sources[0].reserved0 = 1 else sources[0].reserved[1] = 1;
+        var rejected: ?*wire.SkillCatalogHandle = null;
+        var rejected_descriptor = std.mem.zeroes(wire.OwnedBytesV1);
+        try std.testing.expectEqual(
+            wire.STATUS_INVALID_ARGUMENT,
+            api.skill().resolveCatalog()(runtime, &query, &rejected, &rejected_descriptor, &diagnostic),
+        );
+        try std.testing.expectEqual(@as(?*wire.SkillCatalogHandle, null), rejected);
+        try std.testing.expectEqual(@as(u64, 0), rejected_descriptor.len);
+        api.bufferRelease()(&diagnostic);
+        sources[0].reserved0 = 0;
+        sources[0].reserved[1] = 0;
+    }
+
+    // Authorization and execution use the same winner the descriptor names.
+    var host_config = std.mem.zeroes(wire.SessionHostConfigV1);
+    host_config.struct_size = @sizeOf(wire.SessionHostConfigV1);
+    host_config.provider_kind_code = wire.PROVIDER_ANTHROPIC;
+    host_config.permission_mode_code = wire.PERMISSION_FULL_ACCESS;
+    host_config.shell_policy_code = wire.SHELL_DISABLED;
+    host_config.api_key = sdk.bytesView("test-key");
+    host_config.base_url = sdk.bytesView(url);
+    host_config.workspace_root = sdk.bytesView(project);
+    host_config.workspace_home = sdk.bytesView(home);
+    host_config.skill_catalog = catalog;
+    host_config.skill_policy = &ranked.policy;
+    var session_config = sessionCreateConfig(&host_config, "test-model");
+    var callbacks = std.mem.zeroes(wire.SessionCallbacksV1);
+    callbacks.struct_size = @sizeOf(wire.SessionCallbacksV1);
+    callbacks.on_event = acceptEvent;
+    var session: ?*wire.SessionHandle = null;
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.session().create()(runtime, &session_config, &callbacks, &session, &diagnostic),
+    );
+    defer if (session) |handle| {
+        _ = api.session().destroy()(handle, &diagnostic);
+    };
+    try std.testing.expectEqual(wire.STATUS_OK, api.skill().releaseCatalog()(catalog, &diagnostic));
+    catalog = null;
+
+    var options = std.mem.zeroes(wire.RunOptionsV1);
+    options.struct_size = @sizeOf(wire.RunOptionsV1);
+    options.max_turns = 1;
+    var result = std.mem.zeroes(wire.RunResultV1);
+    const empty_arguments = try sdk.encodeSkillArguments(a, &.{});
+    defer a.free(empty_arguments);
+    for ([_][]const u8{ "review", "zig" }, 1..) |name, run_id| {
+        const ids = try extractCatalogIdentities(a, ranked_bytes, name);
+        defer a.free(ids.revision);
+        defer a.free(ids.skill_id);
+        try std.testing.expectEqual(
+            wire.STATUS_OK,
+            api.session().runSkill(
+                session,
+                run_id,
+                sdk.bytesView(ids.skill_id),
+                sdk.bytesView(ids.revision),
+                sdk.bytesView(empty_arguments),
+                &options,
+                &result,
+                &diagnostic,
+            ),
+        );
+        try std.testing.expectEqual(wire.STOP_END_TURN, result.stop_reason_code);
+    }
+    try std.testing.expectEqual(@as(usize, 2), server.requestCount());
+    const review_request = (server.requestAt(0) orelse return error.NoRequestCaptured).body();
+    try std.testing.expect(std.mem.indexOf(u8, review_request, "CLAUDE_REVIEW_SENTINEL") != null);
+    try std.testing.expect(std.mem.indexOf(u8, review_request, "CODEX_REVIEW_SENTINEL") == null);
+    try std.testing.expect(std.mem.indexOf(u8, review_request, "USER_REVIEW_SENTINEL") == null);
+    try std.testing.expect(std.mem.indexOf(u8, review_request, "WORKSPACE_DEFAULT_REVIEW_SENTINEL") == null);
+    try std.testing.expect(std.mem.indexOf(u8, review_request, "USER_DEFAULT_REVIEW_SENTINEL") == null);
+    const zig_request = (server.requestAt(1) orelse return error.NoRequestCaptured).body();
+    try std.testing.expect(std.mem.indexOf(u8, zig_request, "CODEX_ZIG_SENTINEL") != null);
+    try std.testing.expect(!server.captureOverflowed());
 }
 
 test "L2 Revision 10 Skill execution pins content and incomplete observation preserves last good binding" {
@@ -5740,7 +6026,8 @@ test "L2 Revision 10 Skill execution pins content and incomplete observation pre
         .workspace_epoch = sdk.bytesView("pinned-epoch"),
         .additional_sources = null,
         .additional_source_count = 0,
-        .reserved = [_]u64{0} ** 1,
+        .default_user_source_priority = 0,
+        .default_workspace_source_priority = 0,
     };
     var original_catalog: ?*wire.SkillCatalogHandle = null;
     var original_descriptor = std.mem.zeroes(wire.OwnedBytesV1);
@@ -5860,7 +6147,9 @@ test "L2 Revision 10 Skill execution pins content and incomplete observation pre
         .scope_code = wire.SKILL_SOURCE_WORKSPACE,
         .root = sdk.bytesView(unavailable_source_path),
         .source_instance_id = sdk.bytesView("temporary.unavailable"),
-        .reserved = [_]u64{0} ** 3,
+        .priority = 0,
+        .reserved0 = 0,
+        .reserved = [_]u64{0} ** 2,
     };
     query.additional_sources = @ptrCast(&unavailable_source);
     query.additional_source_count = 1;
@@ -5958,7 +6247,8 @@ test "L2 AgentCore Skill forks cannot override the Session model" {
         .workspace_epoch = sdk.bytesView("model-binding-epoch"),
         .additional_sources = null,
         .additional_source_count = 0,
-        .reserved = [_]u64{0} ** 1,
+        .default_user_source_priority = 0,
+        .default_workspace_source_priority = 0,
     };
     var catalog: ?*wire.SkillCatalogHandle = null;
     defer if (catalog) |handle| {
@@ -6273,7 +6563,8 @@ test "L2 bound catalog executes model Skill and preserves nested policy lineage"
         .workspace_epoch = sdk.bytesView("model-tool-epoch"),
         .additional_sources = null,
         .additional_source_count = 0,
-        .reserved = [_]u64{0} ** 1,
+        .default_user_source_priority = 0,
+        .default_workspace_source_priority = 0,
     };
     var catalog: ?*wire.SkillCatalogHandle = null;
     defer if (catalog) |handle| {
@@ -9152,7 +9443,8 @@ test "L2 RunState: a Skill aborted during activation still closes run_state as a
         .workspace_epoch = sdk.bytesView("epoch-1"),
         .additional_sources = null,
         .additional_source_count = 0,
-        .reserved = [_]u64{0} ** 1,
+        .default_user_source_priority = 0,
+        .default_workspace_source_priority = 0,
     };
     var catalog: ?*wire.SkillCatalogHandle = null;
     defer if (catalog) |handle| {
@@ -11667,7 +11959,8 @@ test "L2 Revision 20 a forked Skill Run refuses input it could never adopt (#270
         .workspace_epoch = sdk.bytesView("run-input-fork-epoch"),
         .additional_sources = null,
         .additional_source_count = 0,
-        .reserved = [_]u64{0} ** 1,
+        .default_user_source_priority = 0,
+        .default_workspace_source_priority = 0,
     };
     var catalog: ?*wire.SkillCatalogHandle = null;
     var descriptor = std.mem.zeroes(wire.OwnedBytesV1);
@@ -12207,7 +12500,8 @@ test "L2 Revision 23 a Skill invocation Run in its own context is charged to the
         .workspace_epoch = sdk.bytesView("goal-fork-epoch"),
         .additional_sources = null,
         .additional_source_count = 0,
-        .reserved = [_]u64{0} ** 1,
+        .default_user_source_priority = 0,
+        .default_workspace_source_priority = 0,
     };
     var catalog: ?*wire.SkillCatalogHandle = null;
     var descriptor = std.mem.zeroes(wire.OwnedBytesV1);
@@ -12970,7 +13264,8 @@ test "L2 Revision 25 compaction summary and forked Skill requests carry the upda
         .workspace_epoch = sdk.bytesView("credential-fork-epoch"),
         .additional_sources = null,
         .additional_source_count = 0,
-        .reserved = [_]u64{0} ** 1,
+        .default_user_source_priority = 0,
+        .default_workspace_source_priority = 0,
     };
     var catalog: ?*wire.SkillCatalogHandle = null;
     var descriptor = std.mem.zeroes(wire.OwnedBytesV1);

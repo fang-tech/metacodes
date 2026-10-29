@@ -11,7 +11,7 @@ artifact store, and TinyKG admission are not replaceable extensions.
 | CLI | `metacodes-<version>-<target-id>/bin/metacodes` (the release unit, `release/LAYOUT.md`; `zig-out/bin/metacodes` in a development tree) | pre-1.0 | flags may evolve with changelog notice; `manifest.json` records version, commit, target, contract numbers and every file's digest |
 | Provider control plane | `src/provider/` kernel API | experimental | schema-versioned documents and revisioned mutations |
 | Zig source API | `@import("metacodes-core")` | experimental | pin repository commit and Zig toolchain |
-| AgentCore C ABI | `metask_agentcore_get_api(1)` | experimental rev 25 | exact root/child layouts and bundle manifest |
+| AgentCore C ABI | `metask_agentcore_get_api(1)` | experimental rev 26 | exact root/child layouts and bundle manifest |
 | Python package | `import metacodes` ([sdk/python](../sdk/python/README.md)) | experimental, unpublished | speaks exactly the AgentCore ABI revision it was built for and refuses any other |
 | Node package | `require('metacodes')` ([sdk/node](../sdk/node/README.md)) | experimental, unpublished; macOS and Linux | same exact-revision rule; the addon is rebuilt per platform |
 | Process plugins | strict manifest + stdio protocol | versioned v1 | reject unknown fields and digest drift |
@@ -725,7 +725,7 @@ non-null value with `error.AgentEffortUnsupportedProvider`.
 `WorkspaceConfig.additional_dirs` widens exactly what the workspace root grants:
 `accept_edits` auto-approval of Write/Edit/NotebookEdit and sandboxed shell
 writes. It is not named in the system prompt. These two are source-level only;
-AgentCore revision 25 does not carry them.
+AgentCore revision 26 does not carry them.
 
 ### Permission modes the settings disable
 
@@ -962,7 +962,7 @@ The source-free bundle is one coordinate root: `sdk/metask/agentcore.h`
 (C11/C++17), the `sdk/zig` and `sdk/rust` bindings, one target-specific static
 library, the manifest-pinned ripgrep runtime asset, and a manifest whose file
 allow-list and SHA-256 values are mandatory. Consumers call only
-`metask_agentcore_get_api(METASK_AGENTCORE_ABI_V1)` and must validate ABI revision 25,
+`metask_agentcore_get_api(METASK_AGENTCORE_ABI_V1)` and must validate ABI revision 26,
 the exact 80-byte root, all seven mandatory typed tables, reserved zeros, function
 slots, and the schema-1 bundle manifest. The ABI is experimental, with no
 compatibility shim between revisions: pin a bundle, not only a semantic version.
@@ -971,7 +971,10 @@ observation stream and its visible-output tags, input submitted to an active
 Run (`session->submit_input`, the `input_adopted` event and the `RunResultV1`
 input counts), the in-place credential update (`session->update_credential`), the Session goal (the `goal` table, goal-continuation Runs, the
 `goal_updated` event), the host-scheduled team (`enable_teams`, the `team`
-config, and the `team` table's `describe` and `poll`), process plugins, Host streaming tools, journal profiles,
+config, and the `team` table's `describe` and `poll`), the Workspace Skill
+catalog and its source priorities (`SkillSourceV1.priority` and the query's
+`default_user_source_priority` / `default_workspace_source_priority`, which
+pick one winner among same-scope sources defining one Skill name), process plugins, Host streaming tools, journal profiles,
 and the Completion boundary are specified once in
 [AGENTCORE_BINARY_ABI.md](AGENTCORE_BINARY_ABI.md) and not repeated here.
 
