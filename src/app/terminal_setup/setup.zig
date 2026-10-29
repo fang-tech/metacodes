@@ -1472,15 +1472,19 @@ test "run apple terminal (macOS): a change that does not take is rolled back, an
     try testing.expectEqualStrings(record_before, try files.read(arena, record_file));
     try testing.expectEqualStrings(prefs_before, try exportDomain(h, store.domain));
 
-    // The change is imported, and reading it back fails (a directory where the
-    // read-back export goes): the backup is imported over it.
+    // The change is imported, and reading it back fails (a directory sits where
+    // the read-back export goes, so the mapping is not found there): the backup
+    // is imported over it.
     ctx.apple = store;
     const verify_path = try workPath(arena, try setupDir(arena, ctx.state_root), "verify");
     try occupy(h, try std.fmt.allocPrint(arena, "state/terminal-setup/{s}", .{std.fs.path.basename(verify_path)}));
     h.reset();
     try testing.expectEqual(Outcome.failed, run(testing.allocator, ctx, .{}, &h.out.writer).outcome);
     try testing.expect(std.mem.indexOf(u8, h.report(), "they are back as they were") != null);
-    try testing.expect(std.mem.indexOf(u8, h.report(), "/usr/bin/defaults export") != null);
+    // No edit and no import failed (either would be named, as above): the
+    // change went in before the read-back.
+    try testing.expect(std.mem.indexOf(u8, h.report(), "/usr/bin/plutil") == null);
+    try testing.expect(std.mem.indexOf(u8, h.report(), "/usr/bin/defaults import") == null);
     try testing.expectEqualStrings(record_before, try files.read(arena, record_file));
     try testing.expectEqualStrings(prefs_before, try exportDomain(h, store.domain));
 }
