@@ -4,9 +4,10 @@
 乱码/键失常。改成白名单 gate(对齐真 cc terminal.ts:167)。这些 case 验 cc-zig **发什么字节**
 (pty 能测);真终端如何响应需用户真机抓。
 """
+import os
 import sys
 
-from tty_driver import run
+from tty_driver import case_tmpdir, run
 from asserts import TTYAssert
 from screen import Screen
 
@@ -148,16 +149,30 @@ def test_vim_insert_esc_cr_in_one_write_is_a_newline(bin_path):
     a.assert_line_contains(top + 2, "def")
 
 
+def _reverse_search_hel(bin_path, keys):
+    # A history with "hello" (seeded, so no turn runs), Ctrl+R, "hel", then `keys`.
+    state = case_tmpdir("cc-tty-revsearch-")
+    with open(os.path.join(state, "history"), "w", encoding="utf-8") as f:
+        f.write('"hello"\n')
+    events = ["sleep:0.8", "key:ctrl_r", "wait:(reverse-search)`hel:3", "type:hel", "wait:hello:3", "sleep:0.3"]
+    raw = run(bin_path, events + keys + ["sleep:0.8"], env=APPLE, per_key_drain=0.02,
+              extra_args=["--state-dir", state])
+    assert b"(reverse-search)`hel': hello" in raw, "reverse search did not find the seeded history entry"
+    return raw
+
+
 def test_reverse_search_esc_then_enter_apart_cancels(bin_path):
-    events = ["sleep:0.8", "type:hello", "key:enter", "sleep:1.0",
-              "key:ctrl_r", "wait:(reverse-search):5", "type:hel", "sleep:0.3"]
-    raw = run(bin_path, events + SEPARATE_ESC_ENTER + ["sleep:0.8"], env=APPLE, per_key_drain=0.02)
-    a = TTYAssert(raw)
-    # Esc cancelled the search (the prompt keeps its empty input); accepting would
-    # have put "hello" back in the box.
-    a.assert_input_echo("")
-    tail = _screen_text(raw).splitlines()[-4:]
-    assert not any("(reverse-search)" in line for line in tail), "the search should be closed:\n" + "\n".join(tail)
+    raw = _reverse_search_hel(bin_path, SEPARATE_ESC_ENTER)
+    # Esc cancelled the search: the prompt keeps its empty input. Accepting would
+    # have put "hello" in the box.
+    TTYAssert(raw).assert_input_echo("")
+
+
+def test_reverse_search_esc_cr_in_one_write_accepts(bin_path):
+    # The terminal's Shift+Enter binding (ESC CR in one write) is Shift+Enter, which
+    # reverse search takes as Enter: the match goes into the box.
+    raw = _reverse_search_hel(bin_path, ["raw:\\x1b\\x0d"])
+    TTYAssert(raw).assert_input_echo("hello")
 
 
 def test_paste_keeps_esc_cr_as_a_line_break(bin_path):
