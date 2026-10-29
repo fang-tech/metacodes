@@ -13594,6 +13594,18 @@ test "L2 MCP endpoint swap asks again instead of reusing an allow_session grant 
     try std.testing.expectEqual(@as(usize, 0), toolCallsReceived(endpoint_b));
     // The request names B's identity, not the one A's grant is bound to.
     try std.testing.expect(!std.mem.eql(u8, &probe.bindings[0], &probe.bindings[1]));
+    // The Run that first saw B dropped A's grant, which can never decide
+    // again, and the Session says so.
+    {
+        const described = try decodeDescription(api, session);
+        defer described.deinit();
+        try std.testing.expectEqual(sdk.protocol.RestoreHealth.degraded, described.value.restore.health);
+        try std.testing.expectEqual(@as(u32, 1), described.value.restore.invalidated_mcp_bindings);
+        try std.testing.expectEqualStrings(
+            &probe.bindings[1],
+            described.value.mcp.tools[0].permission_binding,
+        );
+    }
 
     // A fresh allow_session answer authorizes B.
     try swapRun(api, session, 4);
@@ -13615,6 +13627,45 @@ test "L2 MCP endpoint swap asks again instead of reusing an allow_session grant 
     try std.testing.expectEqual(@as(usize, 2), toolCallsReceived(endpoint_b));
     try std.testing.expectEqual(@as(usize, 2), toolCallsReceived(endpoint_a));
     try std.testing.expectEqual(probe.asks, probe.ui_releases);
+
+    // Nothing stale is left to export: restored at B, the checkpoint brings
+    // back B's grant and loses nothing.
+    var checkpoint = PublicCheckpointBuffer{};
+    defer checkpoint.deinit();
+    var limits = publicCheckpointLimits();
+    var sink = checkpoint.sink();
+    var export_config = std.mem.zeroes(wire.CheckpointExportConfigV1);
+    export_config.struct_size = @sizeOf(wire.CheckpointExportConfigV1);
+    export_config.limits = &limits;
+    export_config.sink = &sink;
+    var export_result = std.mem.zeroes(wire.CheckpointExportResultV1);
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.sessionControl().exportCheckpoint()(session, &export_config, &export_result, &diagnostic),
+    );
+    try std.testing.expectEqual(wire.STATUS_OK, api.session().destroy()(session, &diagnostic));
+    session = null;
+    var source = checkpoint.source();
+    var restore_config = std.mem.zeroes(wire.SessionRestoreConfigV1);
+    restore_config.struct_size = @sizeOf(wire.SessionRestoreConfigV1);
+    restore_config.host = &host;
+    restore_config.source = &source;
+    restore_config.limits = &limits;
+    var restore_report = std.mem.zeroes(wire.OwnedBytesV1);
+    defer api.bufferRelease()(&restore_report);
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.sessionControl().restore()(runtime, &restore_config, &callbacks, &session, &restore_report, &diagnostic),
+    );
+    const decoded = try sdk.decodeRestoreReport(a, try sdk.borrowedBytes(.{
+        .ptr = restore_report.ptr,
+        .len = restore_report.len,
+    }));
+    defer decoded.deinit();
+    try std.testing.expectEqual(sdk.protocol.RestoreHealth.complete, decoded.value.health);
+    try std.testing.expectEqual(@as(u32, 1), decoded.value.permission.restored_rules);
+    try std.testing.expectEqual(@as(u32, 0), decoded.value.permission.invalidated_rules);
+    try std.testing.expectEqual(@as(usize, 0), decoded.value.issues.len);
 }
 
 test "L2 MCP checkpoint restore binds an allow_session grant to its endpoint (#389)" {

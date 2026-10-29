@@ -504,13 +504,19 @@ status, compatibility boundaries, and entry points are defined by
   checkpoint restored the grant the same way. The MCP `permission_binding`
   now also binds the server's `configuration_fingerprint`, the Host's name
   for the connection. After such a change the Tool stays selected and its
-  next call asks again; restore and `update_selection` drop the old grant and
-  report it as an invalidated `permission` rule. A change that keeps the
-  fingerprint (namespace, client info, timeout, negotiation policy, protocol
-  limits) keeps the grants. Hosts must change the fingerprint whenever the
-  endpoint, the transport target or the authentication context changes. MCP
-  Session grants in checkpoints exported before this change carry the old
-  binding, so restore invalidates them (`degraded`) and their next call asks.
+  next call asks again (or falls back to the permission mode); a
+  `deny_session` answer does not carry over either, and Host allow and deny
+  rules still decide by name. The old grant is dropped where the change is
+  first seen: by the next Run and by `update_selection`, counted in Session
+  `describe` as `restore.invalidated_mcp_bindings`; by restore, as an
+  invalidated `permission` rule with an issue. Either way health turns
+  `degraded`. A change that keeps the fingerprint (namespace, client info,
+  timeout, negotiation policy, protocol limits) keeps the grants. Hosts must
+  change the fingerprint whenever the endpoint, the transport target or the
+  authenticated principal changes, and keep it when only a credential for
+  the same principal rotates. MCP Session grants in checkpoints exported
+  before this change carry the old binding, so restore invalidates them
+  (`degraded`) and their next call asks.
   See [MCP Runtime catalog and Session
   view](doc/AGENTCORE_BINARY_ABI.md#mcp-runtime-catalog-and-session-view).
 

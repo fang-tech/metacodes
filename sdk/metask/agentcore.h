@@ -457,7 +457,10 @@ typedef struct {
     uint32_t reserved1;
     metask_agentcore_mcp_connector_v1 connector;
     const metask_agentcore_mcp_protocol_limits_v1 *protocol_limits;
-    /* Nonzero stable, non-secret identity of connection-relevant configuration. */
+    /* Nonzero stable, non-secret identity of connection-relevant configuration.
+     * MCP Session permission grants are bound to it: change it whenever the
+     * endpoint, the transport target or the authenticated principal changes,
+     * and keep it when only a credential for the same principal rotates. */
     uint8_t configuration_fingerprint[32];
 } metask_agentcore_mcp_server_v1;
 

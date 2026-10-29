@@ -633,7 +633,10 @@ pub const McpServerV1 = extern struct {
     /// Stable, non-secret identity of every connection-relevant input. A
     /// changed value replaces the ServerInstance; secret bytes and
     /// secret-derived digests must never be supplied here. The value must not
-    /// be all zero.
+    /// be all zero. MCP Session permission grants are bound to it: change it
+    /// whenever the endpoint, the transport target or the authenticated
+    /// principal changes, and keep it when only a credential for the same
+    /// principal rotates.
     configuration_fingerprint: [32]u8,
 };
 

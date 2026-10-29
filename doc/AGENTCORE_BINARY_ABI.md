@@ -1721,31 +1721,41 @@ environment until terminal completion.
 
 `McpServerV1.configuration_fingerprint` is the Host's nonzero, non-secret name
 for the connection a server binding reaches: its endpoint, transport target
-and authentication context, as the Host defines them. AgentCore never sees the
-endpoint, so this value is the connection identity it trusts. Each MCP Tool's
-permission binding (`permission_binding` in `runtime_describe_mcp` and
-Session `describe`, `tool.binding` in Permission requests and
-`permission_provenance`) binds the server binding, the MCP Tool name, the
-semantic schema and that fingerprint, and Session grants match on it (#389):
+and the principal it authenticates as, as the Host defines them. AgentCore
+never sees the endpoint, so this value is the connection identity it trusts.
+Each MCP Tool's permission binding (`permission_binding` in
+`runtime_describe_mcp` and Session `describe`, `tool.binding` in Permission
+requests and `permission_provenance`) binds the server binding, the MCP Tool
+name, the semantic schema and that fingerprint, and Session grants match on
+it (#389):
 
 - **Endpoint moved.** When `apply_configuration` keeps a server binding, Tool
   name and schema but changes the fingerprint, a Session that selected the
-  Tool keeps it, and its next call asks again. An `allow_session` or
-  `deny_session` answer given over the old connection matches that connection
-  only; a configuration that declares the old fingerprint again matches it
-  again.
+  Tool keeps it, and its next call asks again or falls back to the
+  permission mode. An `allow_session` or `deny_session` answer given over the
+  old connection never decides for the new one. A Host allow or deny rule
+  names a Tool, not a connection, so it decides on either.
 - **Same connection.** A change that keeps the fingerprint (namespace, client
   information, timeout, negotiation policy, protocol limits) is the same
   connection. The Runtime may reconnect, and grants keep deciding.
 - **Host duty.** A Host changes the fingerprint whenever the endpoint, the
-  transport target or the authentication context changes. A fingerprint that
-  hides such a change lets grants follow it.
-- **Rebuilt authority.** Restore and `update_selection` resolve each MCP
-  grant against the current catalog and drop one whose connection is no
-  longer the server's, as an invalidated `permission` rule with an issue
-  (reason `unavailable`). Session `describe` reports each Tool's binding as
-  of its selection (create, `update_selection` or restore); a Run binds to
-  the server's current fingerprint.
+  transport target or the authenticated principal changes, and keeps it when
+  only a credential for the same principal rotates; secret bytes and digests
+  of them never go into it. A fingerprint that hides a move lets grants
+  follow it; one that changes on every token refresh asks again each time.
+- **Old grants are dropped.** A grant bound to a connection its server has
+  left can never decide again, so the Session drops it at the first point
+  that sees the change, and reports it:
+
+  | Where | Dropped grants are reported as |
+  |---|---|
+  | The next Run call, before admission | Session `describe`: `restore.invalidated_mcp_bindings`, `restore.health` `degraded`; no issue |
+  | `update_selection` | The same |
+  | Restore | Restore report `permission.invalidated_rules` with a `permission` issue (reason `unavailable`, the grant's binding); health `degraded` |
+
+  A change undone before any of these sees it changes nothing. Session
+  `describe` reports each Tool's binding for the connection the Session last
+  saw: at create, `update_selection`, restore or that Run.
 
 One server's transport, protocol, or catalog resource-limit failure produces a
 server-scoped issue and does not suppress healthy servers in the same refresh.
