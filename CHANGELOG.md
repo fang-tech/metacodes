@@ -268,18 +268,30 @@ status, compatibility boundaries, and entry points are defined by
   turns on win32-input-mode (`CSI ? 9001 h`) as it enters raw mode and turns
   it off as it restores the terminal; redirected streams and Linux binaries
   under WSL leave it off. With it on, the console sends each key event as a
-  record `CSI Vk;Sc;Uc;Kd;Cs;Rc _`. The key parser drops key-up records,
-  types a record's character `Rc` times (a UTF-16 surrogate pair split over
-  two records is one character), and reads every other key as the VT bytes
-  the same key sends without the mode, so arrows, function keys, Esc, Alt and
-  Ctrl chords and bracketed-paste markers behave as before (checked key by key
-  against Windows Terminal 1.24 and conhost on Windows 11 26300). Shift+Enter
-  becomes Kitty's `CSI 13;2u`, a newline, and once a record has come the
-  footer says `shift + ⏎ for newline`. Ctrl+Enter still submits: the pseudo
-  console sends a line break written to it as an Enter with Ctrl held, the
-  same record. Bytes a terminal writes in one go, such as the `ESC CR` of a
-  Shift+Enter key binding in VS Code, reach the key parser as those bytes, not
-  as records. AltGr and dead keys were not measured.
+  record `CSI Vk;Sc;Uc;Kd;Cs;Rc _`. The console input is read in one place
+  (`platform/terminal.zig` `readInput`), and that is where the records are
+  turned back into the VT bytes the same keys send without the mode, for
+  every reader: the prompt, the permission and question dialogs, the pager
+  and vim's normal mode, which read single bytes past the prompt's key parser
+  (the dialogs read the console with the C runtime's `read` before and now go
+  through `readInput` too; a guard test keeps any other read away from the
+  terminal). Key-up records give nothing, and a wait for input is not woken
+  by them, so an Esc's own key-up does not restart the wait that tells Esc
+  from an escape sequence. A record's character is typed `Rc` times, at most
+  256 (a UTF-16 surrogate pair split over two records is one character), and
+  a key that types nothing is never repeated. Arrows, function keys, Esc, Alt
+  and Ctrl chords and bracketed-paste markers decode to their VT bytes
+  (checked byte for byte against Windows Terminal 1.24 and conhost on Windows
+  11 26300). Shift+Enter becomes Kitty's `CSI 13;2u`, a newline. The footer
+  says `shift + ⏎ for newline` once a record has typed text: Windows Terminal
+  and conhost send records for every key, while a terminal that sends only VT
+  bytes through ConPTY (Alacritty) gets records for its lone CR, ESC or
+  Ctrl+letter but never for text, and its Shift+Enter still submits.
+  Ctrl+Enter still submits: the pseudo console sends a line break written to
+  it as an Enter with Ctrl held, the same record. Bytes a terminal writes in
+  one go, such as the `ESC CR` of a Shift+Enter key binding in VS Code, reach
+  the key parser as those bytes, not as records. AltGr and dead keys were not
+  measured.
 
 
 ### Fixed

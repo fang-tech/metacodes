@@ -108,16 +108,12 @@ def _multiline_footer(bin_path, term_program):
 
 def test_newline_hint_per_terminal(bin_path):
     # 多行编辑时 footer 显当前终端的换行方式(对齐真 cc getNewlineInstructions,按 cc-zig 能力)。
+    # Windows 上这正是只发 VT 字节的终端经 ConPTY:字原样到,单独的 CR 被做成记录,
+    # 没有一条记录打出过字 → 分不出 Shift+Enter,照旧显 backslash。
     apple = _multiline_footer(bin_path, "Apple_Terminal")
-    if sys.platform == "win32":
-        # 伪控制台上 win32-input-mode 开着,Shift+Enter 是带 SHIFT 状态的记录,分得出,
-        # TERM_PROGRAM 说什么都显 shift+⏎。
-        assert "shift + " in apple and "for newline" in apple, \
-            f"Windows 控制台开了 win32-input-mode 应显 shift+⏎ 换行提示,实际:{apple!r}"
-    else:
-        assert "\\ + " in apple and "for newline" in apple, \
-            f"Apple Terminal 应显 backslash 换行提示,实际 footer 区:{apple!r}"
-        assert "shift + " not in apple, "Apple Terminal 不应显 shift+⏎(它区分不了,会误导)"
+    assert "\\ + " in apple and "for newline" in apple, \
+        f"Apple Terminal 应显 backslash 换行提示,实际 footer 区:{apple!r}"
+    assert "shift + " not in apple, "Apple Terminal 不应显 shift+⏎(它区分不了,会误导)"
 
     warp = _multiline_footer(bin_path, "WarpTerminal")
     assert "shift + " in warp and "for newline" in warp, \
@@ -133,11 +129,14 @@ def _win32_records(*records):
 def test_windows_console_shift_enter_record_is_a_newline(bin_path):
     """Windows 控制台:Shift+Enter 是带 SHIFT_PRESSED 的 Enter 记录 → 换行;不带修饰的 Enter
     记录照旧提交。伪控制台收得下宿主侧写的键记录(Windows Terminal 就这么发),走一遍
-    ConPTY → win32-input-mode → KeyParser,不是 key:shift_enter 的 CSI-u 捷径。"""
+    ConPTY → win32-input-mode → 读控制台时还原 → KeyParser,不是 key:shift_enter 的 CSI-u 捷径。
+    字也按记录敲(Windows Terminal 就这么送):有记录打出过字,footer 才说 shift+⏎。"""
     if sys.platform != "win32":
         raise SkipTest("win32-input-mode 只在 Windows 控制台上开")
+    a_key = _win32_records("65;30;97;1;32;1", "65;30;97;0;32;1")
+    b_key = _win32_records("66;48;98;1;32;1", "66;48;98;0;32;1")
     shift_enter = _win32_records("16;42;0;1;16;1", "13;28;13;1;16;1", "13;28;13;0;16;1", "16;42;0;0;0;1")
-    raw = run(bin_path, ["sleep:0.8", "type:aa", shift_enter, "type:bb", "sleep:0.6"])
+    raw = run(bin_path, ["sleep:0.8", a_key, a_key, shift_enter, b_key, b_key, "sleep:0.6"])
     a = TTYAssert(raw)
     a.assert_box_height(2)
     top = a.box_top_row()

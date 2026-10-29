@@ -26,6 +26,7 @@
 
 const std = @import("std");
 const pfs = @import("platform").fs;
+const platform_term = @import("platform").terminal;
 const ansi = @import("../ansi.zig");
 const theme_mod = @import("../theme.zig");
 const term = @import("../term.zig");
@@ -151,7 +152,7 @@ pub fn page(alloc: std.mem.Allocator, th: Theme, content: []const u8, opts: Page
 
         // 读键
         var buf: [8]u8 = undefined;
-        const n = pfs.read(in_fd, &buf);
+        const n = platform_term.readInput(in_fd, &buf); // decodes a console's key records
         if (n <= 0) {
             if (n < 0 and input_mod.retryInterruptedRead(in_fd)) continue;
             break;

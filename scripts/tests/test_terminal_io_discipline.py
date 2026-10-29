@@ -13,7 +13,12 @@ In ``src/repl/`` and ``src/permission/prompt.zig``:
   (``retryInterruptedRead(`` or prompt.zig's ``readInterrupted(``). Modal loops
   read whole keys through ``input.readKey``, which does both;
 * a raw write (``pfs.write(``, ``std.c.write(``, ``posix.write(``) does not
-  appear at all: terminal writes go through ``pfs.writeAll``, which retries.
+  appear at all: terminal writes go through ``pfs.writeAll``, which retries;
+* the terminal is read through ``platform_term.readInput`` only, never
+  ``pfs.read(`` or ``std.c.read(``: readInput is where a Windows console's
+  win32-input-mode key records become the VT bytes the readers parse (#386),
+  and where the bytes the startup probe hands back are replayed. A read of
+  anything else says so on its line: ``// ... not the terminal``.
 
 A call that cannot see EINTR (a regular file, a read after poll reported data)
 says why on its own line: ``// no EINTR: <reason>``. Test blocks are not
@@ -33,6 +38,8 @@ SCOPE_FILES = (Path("src/permission/prompt.zig"),)
 RAW_READ = re.compile(r"\b(?:platform_term\.readInput|pfs\.read|std\.c\.read)\s*\(")
 RAW_WRITE = re.compile(r"\b(?:pfs\.write|std\.c\.write|posix\.write)\s*\(")
 RETRY = re.compile(r"\b(?:retryInterruptedRead|readInterrupted)\s*\(")
+BYPASS_READ = re.compile(r"\b(?:pfs\.read|std\.c\.read)\s*\(")
+NOT_TERMINAL = "not the terminal"
 EXEMPT = "no EINTR:"
 # The retry check must come right after the read, before another call can
 # overwrite errno; three lines covers `const n = read(...); if (n < 0) {`.
@@ -73,15 +80,18 @@ def code_lines(text: str) -> list[tuple[int, str, str]]:
 
 
 def violations(root: Path) -> list[str]:
-    """`path:line: what` for every raw terminal read without the retry check
-    and every raw write, in the governed files under root."""
+    """`path:line: what` for every raw terminal read without the retry check,
+    every read past platform_term.readInput and every raw write, in the
+    governed files under root."""
     found = []
     for relative in governed_sources(root):
         lines = code_lines((root / relative).read_text(encoding="utf-8"))
         for index, (number, code, comment) in enumerate(lines):
+            where = f"{relative.as_posix()}:{number}"
+            if BYPASS_READ.search(code) and NOT_TERMINAL not in comment:
+                found.append(f"{where}: read past platform_term.readInput (key records are decoded there)")
             if EXEMPT in comment:
                 continue
-            where = f"{relative.as_posix()}:{number}"
             if RAW_WRITE.search(code):
                 found.append(f"{where}: raw write (use pfs.writeAll)")
             if RAW_READ.search(code):
@@ -104,7 +114,9 @@ class TerminalIoDisciplineTest(unittest.TestCase):
             [],
             "a resize (SIGWINCH, no SA_RESTART) interrupts these calls with EINTR: read keys "
             "through input.readKey or check input.retryInterruptedRead right after the read, "
-            "write through pfs.writeAll, or say `// no EINTR: <reason>` on the line",
+            "write through pfs.writeAll, or say `// no EINTR: <reason>` on the line; read the "
+            "terminal through platform_term.readInput, and say `// ... not the terminal` on any "
+            "other pfs.read",
         )
 
     def test_the_rule_still_sees_the_repl(self):
@@ -135,11 +147,21 @@ class TerminalIoDisciplineTest(unittest.TestCase):
                 "    }\n"
                 "    _ = pfs.writeAll(fd, frame);\n"
                 "    _ = pfs.write(log_fd, line); // no EINTR: regular file\n"
+                "    _ = pfs.read(cfg_fd, &raw); // no EINTR: regular file, not the terminal\n"
                 "    // pfs.write(fd, frame) in a comment is not a call\n"
                 "}\n"
                 'test "pipes are not the terminal" {\n'
                 "    _ = std.c.write(pipe[1], \"x\", 1);\n"
                 "    _ = pfs.read(pipe[0], &b);\n"
+                "}\n",
+            )
+            write(
+                root,
+                "src/repl/dialog.zig",
+                "fn run() void {\n"
+                "    const n = pfs.read(in_fd, &buf);\n"
+                "    if (n < 0 and input.retryInterruptedRead(in_fd)) continue;\n"
+                "    _ = std.c.read(0, &b, 1); // no EINTR: poll reported data\n"
                 "}\n",
             )
             write(root, "src/permission/prompt.zig", "const n = platform_term.readInput(0, &buf);\n")
@@ -148,6 +170,8 @@ class TerminalIoDisciplineTest(unittest.TestCase):
                 violations(root),
                 [
                     "src/permission/prompt.zig:1: raw read without the EINTR retry (use input.readKey)",
+                    "src/repl/dialog.zig:2: read past platform_term.readInput (key records are decoded there)",
+                    "src/repl/dialog.zig:4: read past platform_term.readInput (key records are decoded there)",
                     "src/repl/viewer.zig:2: raw read without the EINTR retry (use input.readKey)",
                     "src/repl/viewer.zig:4: raw write (use pfs.writeAll)",
                     "src/repl/viewer.zig:5: raw write (use pfs.writeAll)",
@@ -160,7 +184,7 @@ class TerminalIoDisciplineTest(unittest.TestCase):
             write(
                 root,
                 "src/repl/late.zig",
-                "const n = pfs.read(in_fd, &buf);\n"
+                "const n = platform_term.readInput(in_fd, &buf);\n"
                 "log(n);\n"
                 "redraw();\n"
                 "flush();\n"

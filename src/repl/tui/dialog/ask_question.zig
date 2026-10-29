@@ -611,7 +611,7 @@ pub fn run(
         drawn = reflow.Anchor.atEnd(r.frame, frame_cols);
 
         var buf: [8]u8 = undefined;
-        const n = pfs.read(in_fd, &buf);
+        const n = platform_term.readInput(in_fd, &buf); // decodes a console's key records
         if (n <= 0) {
             if (n < 0 and input_mod.retryInterruptedRead(in_fd)) continue;
             return error.InputAborted;
