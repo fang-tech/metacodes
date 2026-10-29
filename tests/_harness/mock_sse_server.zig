@@ -96,6 +96,9 @@ pub const MockServer = struct {
     /// request head has arrived, with the body still unread. Closing a socket
     /// that holds unread data sends RST, so a client still writing a large body
     /// fails in its send, not in `receiveHead` as with `flaky_close_remaining`.
+    /// The listener's receive buffer is kept small (`RESET_UPLOAD_RCVBUF`) so
+    /// the client cannot finish that body before the reset: without it a
+    /// 16 MB send completed on Windows CI and only `receiveHead` failed.
     reset_upload_remaining: usize = 0,
     /// Connections reset by `reset_upload_remaining` so far.
     upload_resets: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
@@ -268,6 +271,8 @@ pub const MockServer = struct {
         return self;
     }
 
+    const RESET_UPLOAD_RCVBUF: u31 = 8 * 1024;
+
     /// The first `reset_first_n` connections are reset while the client is
     /// still sending its body (see `reset_upload_remaining`); later ones are
     /// served `body`. A body that fits in the socket buffers is sent before
@@ -275,6 +280,7 @@ pub const MockServer = struct {
     pub fn startResetDuringUpload(body: []const u8, reset_first_n: usize) !*MockServer {
         const listener = try net.listenLoopback(0, 16);
         errdefer net.closeSocket(listener.sock);
+        net.setRecvBufferBytes(listener.sock, RESET_UPLOAD_RCVBUF);
 
         const self = try std.heap.page_allocator.create(MockServer);
         self.* = .{

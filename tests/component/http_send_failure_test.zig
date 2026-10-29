@@ -246,7 +246,11 @@ fn collectZigFiles(allocator: std.mem.Allocator, root: []const u8, out: *std.Arr
     defer walker.deinit();
     while (try walker.next(std.testing.io)) |entry| {
         if (entry.kind != .file or !std.mem.endsWith(u8, entry.path, ".zig")) continue;
-        try out.append(allocator, try std.fs.path.join(allocator, &.{ root, entry.path }));
+        // `/` on every platform: HELPER_FILE is compared as written, and the
+        // walker gives Windows paths with backslashes.
+        const path = try std.fs.path.join(allocator, &.{ root, entry.path });
+        std.mem.replaceScalar(u8, path, '\\', '/');
+        try out.append(allocator, path);
     }
 }
 
