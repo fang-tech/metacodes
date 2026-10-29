@@ -12,6 +12,30 @@ status, compatibility boundaries, and entry points are defined by
 
 ### Added
 
+- **`/terminal-setup` binds Shift+Enter to a newline in Apple Terminal and VS
+  Code** (#386, part 1). Neither reports Shift+Enter on its own (Apple Terminal
+  has no keyboard protocol; VS Code's xterm.js is on its deny-list), so there
+  Shift+Enter submitted. The command, also `metacodes terminal-setup
+  [--dry-run | --restore] [--terminal …] [--keybindings <file>]`, makes the
+  terminal send `ESC CR`, which the key parser now reads as Shift+Enter (the
+  sequence Claude Code's VS Code binding sends, so that binding counts too).
+  - **Apple Terminal:** Shift+Return in the default profile's key map, through
+    `defaults export|import` and `plutil`. A profile without a key map of its
+    own gets a copy of Terminal's built-in map first, since its own map
+    replaces the built-in one whole (measured: a map holding only Shift+Return
+    turns off F5, Shift+arrows and Option+arrows). Terminal applies it once it
+    is reopened.
+  - **VS Code, Cursor, Windsurf, VSCodium and other builds:** a
+    `keybindings.json` entry, spliced in with comments and trailing commas
+    kept; the file is found through the build's `product.json`.
+  - An existing Shift+Return mapping or terminal Shift+Enter binding is never
+    replaced. Every change is backed up into `<state root>/terminal-setup/`
+    and recorded there, and `--restore` (`/terminal-setup restore`) undoes
+    exactly that. iTerm2, WezTerm, Ghostty, kitty and Warp are reported as
+    needing nothing; other terminals get the manual setup.
+  - The footer says `shift + ⏎ for newline` once the binding works: at once in
+    VS Code, after Terminal is reopened in Apple Terminal. See
+    [doc/TERMINAL_SETUP.md](doc/TERMINAL_SETUP.md).
 - **Release units for aarch64 Linux and Intel macOS** (#307). `release.yml`
   builds `aarch64-linux-gnu` on GitHub's hosted arm64 Linux runner and
   `x86_64-macos` on its Intel macOS runner (`macos-15-intel`), each natively

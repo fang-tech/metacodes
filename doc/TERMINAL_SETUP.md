@@ -1,0 +1,153 @@
+# Terminal setup: Shift+Enter for a newline
+
+In the metacodes prompt, Enter submits and Shift+Enter starts a new line. A
+terminal can only report Shift+Enter when it tells it apart from Enter, and
+not every terminal does. When the footer says `\ + ⏎ for newline`, Shift+Enter
+submits in this terminal; ending a line with `\` and pressing Enter inserts the
+line break instead. `/terminal-setup` (or `metacodes terminal-setup`) fixes
+that where the terminal's own settings can.
+
+| Terminal | Shift+Enter without setup | What `/terminal-setup` does |
+| --- | --- | --- |
+| iTerm2, WezTerm, Ghostty, kitty, Warp | newline (metacodes turns on the Kitty keyboard protocol) | nothing; says so |
+| Other terminals that answer the keyboard-protocol query at startup | newline | nothing to set up |
+| Apple Terminal | submits | maps Shift+Return in the default profile |
+| VS Code, Cursor, Windsurf, VSCodium, other VS Code builds | submits | adds a `keybindings.json` entry |
+| tmux, anything else | depends on the terminal | explains the manual setup; changes nothing |
+
+Both setups make Shift+Enter send Esc followed by Return (`ESC CR`, the bytes
+`1b 0d`), which metacodes reads as a newline. It is the sequence Claude Code's
+VS Code binding sends, so a binding Claude Code installed already counts.
+
+```sh
+/terminal-setup                 # in the TUI: set up this terminal
+/terminal-setup status          # say what it would change, change nothing
+/terminal-setup restore         # undo what it set up
+
+metacodes terminal-setup [--dry-run | --restore]
+                         [--terminal apple-terminal|vscode|vscode-insiders|cursor|windsurf|vscodium]
+                         [--keybindings <keybindings.json>]
+```
+
+Without `--terminal`, the command sets up the terminal it runs in (from
+`TERM_PROGRAM` and the variables VS Code sets). `--terminal` sets up another
+one, for example Apple Terminal from iTerm2. Before it changes anything it
+prints the file it will change, what it adds and where the backup goes.
+
+## Apple Terminal
+
+It adds Shift+Return → `ESC CR` to the key map (Settings › Profiles ›
+Keyboard) of the profile new windows use (`Default Window Settings`, and
+`Startup Window Settings` when that is another profile). Nothing else in the
+settings changes.
+
+- **Restart Terminal afterwards.** Terminal reads its profiles when it starts:
+  until you quit it (⌘Q) and open it again, this window and any new one still
+  send a plain Return. The footer keeps saying `\ + ⏎` until then.
+- **A profile without its own key map gets a copy of the built-in one.** A
+  profile's key map replaces Terminal's built-in map as a whole, so a map
+  holding only Shift+Return would turn off F1–F20, Shift+arrows and
+  Option+arrows. The command copies the built-in map
+  (`Terminal.app/Contents/Resources/keyMappings.plist`) into the profile and
+  adds Shift+Return to it; restore takes the copy out again.
+- **An existing Shift+Return mapping is never replaced.** The command says what
+  it sends and stops; remove it in the profile's Keyboard settings first.
+- **It applies to every program in that profile.** Shift+Return sends Esc+Return
+  to the shell and to other programs too; zsh, for one, inserts a line break
+  instead of running the command.
+- Windows that use another profile are not changed. Run the command again after
+  making that profile the default, or add the mapping by hand.
+- A profile whose name contains a backslash cannot be changed by the command
+  (the settings tools cannot address it); the command says so.
+
+The command uses only the system's own tools: `defaults export` and
+`defaults import` for Terminal's settings (`com.apple.Terminal`), and `plutil`
+for the edit.
+
+## VS Code and its forks
+
+It appends this entry to the user `keybindings.json` (on macOS
+`~/Library/Application Support/<Code|Cursor|…>/User/`, on Linux
+`~/.config/<…>/User/`, on Windows `%APPDATA%\<…>\User\`):
+
+```json
+{
+    "key": "shift+enter",
+    "command": "workbench.action.terminal.sendSequence",
+    "args": { "text": "\u001b\r" },
+    "when": "terminalFocus"
+}
+```
+
+- VS Code picks the change up at once; there is nothing to restart.
+- Comments, trailing commas and the existing entries' formatting are kept. A
+  missing file is created; a file that is not a list of bindings is left alone.
+- **A binding that already holds Shift+Enter in the terminal is not
+  replaced**: one whose `when` names the terminal (`terminalFocus`, …) or has no
+  `when` at all. The command shows it and stops.
+- Which build runs the terminal comes from its `product.json` (found through
+  `VSCODE_GIT_ASKPASS_MAIN`), so forks get their own folder; `VSCODE_PORTABLE`
+  is honoured. For an install started with `--user-data-dir`, or a VS Code
+  profile with its own shortcuts, name the file: `--keybindings <file>`.
+- In a remote window (Remote-SSH, WSL, a dev container, Codespaces) the key
+  bindings live on the machine that shows the window, so the command prints
+  the entry to add there instead.
+- It applies to every program in the integrated terminal, as above.
+
+## Backups and undo
+
+Each change is backed up first, into `<state root>/terminal-setup/`
+(`metacodes doctor` shows the state root): the whole of Terminal's settings as
+`apple-terminal-<UTC time>.plist`, the `keybindings.json` as it was as
+`<build>-keybindings-<UTC time>.json`. The same directory holds
+`installed.json`, the record of what the command changed.
+
+`/terminal-setup restore` (or `metacodes terminal-setup --restore`) undoes what
+the record lists, and only that:
+
+- Apple Terminal: Shift+Return comes out of each profile it was added to; a key
+  map the command copied in goes too, unless you edited other keys in it since.
+  A Shift+Return mapping that sends something else by now is left alone. Quit
+  and reopen Terminal for the change to take effect.
+- VS Code: the entry the command added comes out; your own entries, comments
+  and edits stay.
+
+The backups stay. To put back all of Terminal's settings exactly as they were,
+quit Terminal and run `defaults import com.apple.Terminal <backup>`; for
+`keybindings.json`, copy the backup over it.
+
+## Other terminals
+
+Bind Shift+Enter in the terminal's own settings to send `ESC CR` (often written
+`\e\r` or `\u001b\r`). For Alacritty (`alacritty.toml`):
+
+```toml
+[[keyboard.bindings]]
+key = "Return"
+mods = "Shift"
+chars = "\u001b\r"
+```
+
+Inside tmux, Shift+Enter reaches metacodes only when tmux forwards extended keys
+in CSI u form (see `extended-keys` and `extended-keys-format` in tmux(1)).
+
+## The footer hint
+
+The footer says `shift + ⏎ for newline` when Shift+Enter inserts a newline: the
+terminal speaks the keyboard protocol, VS Code's `keybindings.json` holds the
+binding (whoever added it), or `/terminal-setup` mapped it in Apple Terminal
+and Terminal has been reopened since (a Terminal process other than the one
+running at setup) with the mapping still in its settings.
+
+## How this was established
+
+The Apple Terminal behaviour above was measured on macOS 15.7 (Intel) and
+26.6 (Apple silicon) GitHub runners, driving Terminal.app with System Events
+and reading the bytes the tty received (metacodes#386): Shift+Return sends `1b 0d`
+with the mapping and `0d` without it; a key map holding only Shift+Return drops
+F5 (`ESC [15~`), Shift+Right (`ESC [1;2C`) and Option+Left (`ESC b`); a running
+Terminal keeps the old mapping in old and new windows until it is reopened, and
+quitting it does not write its profiles back over the change. The macOS CI
+suite runs the edit, the backup and the restore with the real `plutil` and
+`defaults` against a temporary settings domain
+(`src/app/terminal_setup/apple_terminal.zig`, `setup.zig`).

@@ -648,6 +648,10 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, startup: Startup) !v
             handleTheme(app, rest);
             continue;
         }
+        if (std.mem.eql(u8, trimmed, "/terminal-setup") or std.mem.startsWith(u8, trimmed, "/terminal-setup ")) {
+            handleTerminalSetup(app, allocator, std.mem.trim(u8, trimmed["/terminal-setup".len..], " \t"));
+            continue;
+        }
         if (std.mem.startsWith(u8, trimmed, "/add-dir")) {
             const rest = std.mem.trim(u8, trimmed[8..], " \t");
             if (rest.len == 0) {
@@ -4689,6 +4693,41 @@ fn handleTheme(app: *app_mod.App, rest: []const u8) void {
         .err_name => |e| cmd_output.print("{s}Not saved: {s}{s}\n", .{ app.theme.warn, e, app.theme.reset }),
         else => {},
     }
+}
+
+/// `/terminal-setup [restore | status]` (#386): bind Shift+Enter to a newline
+/// in this terminal's own settings (`app/terminal_setup/setup.zig`), undo it,
+/// or say what it would change. A VS Code binding takes effect at once, so the
+/// footer hint follows the result; Apple Terminal's waits for a restart.
+fn handleTerminalSetup(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u8) void {
+    const terminal_setup = @import("../app/terminal_setup/setup.zig");
+    const action: terminal_setup.Action = if (rest.len == 0)
+        .install
+    else if (std.mem.eql(u8, rest, "restore") or std.mem.eql(u8, rest, "--restore"))
+        .restore
+    else if (std.mem.eql(u8, rest, "status") or std.mem.eql(u8, rest, "--dry-run"))
+        .preview
+    else {
+        cmd_output.print("Usage: /terminal-setup [restore | status]\n", .{});
+        return;
+    };
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const env = terminal_setup.Env.fromProcess(arena_state.allocator()) catch {
+        cmd_output.print("{s}Terminal setup: out of memory{s}\n", .{ app.theme.danger, app.theme.reset });
+        return;
+    };
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    const report = terminal_setup.run(allocator, .{
+        .env = env,
+        .state_root = app.stateRoot(),
+        .now_unix = util_time.nowUnix(),
+        .terminal_pid = @import("../app/terminal_setup/apple_terminal.zig").terminalPid(),
+        .restore_hint = "/terminal-setup restore (or metacodes terminal-setup --restore)",
+    }, .{ .action = action }, &out.writer);
+    cmd_output.print("{s}", .{out.written()});
+    if (report.binding_live) |live| input.recordNewlineBinding(live);
 }
 
 /// libc system(3)(0.16 std.c 无绑定):fork + /bin/sh -c + waitpid,stdio 继承父进程。

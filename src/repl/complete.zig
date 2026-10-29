@@ -108,6 +108,7 @@ pub const SLASH_COMMAND_TABLE = [_]SlashCmd{
     .{ .name = "/retry", .desc = "Resend the last message" },
     .{ .name = "/review", .desc = "Review the current diff" },
     .{ .name = "/skills", .desc = "List available skills" },
+    .{ .name = "/terminal-setup", .desc = "Make Shift+Enter insert a newline in this terminal" },
     .{ .name = "/theme", .desc = "Show or switch the color theme" },
     .{ .name = "/tools", .desc = "List available tools" },
     .{ .name = "/transcript", .desc = "Browse the conversation (Ctrl+X Ctrl+O)" },

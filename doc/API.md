@@ -177,8 +177,13 @@ provenance}]}` with `name` in `ripgrep`, `tinykg`, `formal_kernel`,
 be built. `--strict` exits 1 when a binary is unresolved or mismatched, when a
 resolved kernel's `provenance` is not `true`, or when an environment override
 was present but resolved nothing (`source: "env"` with a null `resolved_path`);
-an unpinned kernel or daemon may be absent. The flag
-surface is fail-closed: an unknown flag or positional argument exits with code
+an unpinned kernel or daemon may be absent. `metacodes terminal-setup
+[--dry-run | --restore] [--terminal <name>] [--keybindings <file>]` (also
+`/terminal-setup` in the TUI) binds Shift+Enter to a newline in Apple Terminal
+or a VS Code build's `keybindings.json` after a backup, and `--restore` undoes
+it; it exits 0 when the terminal is set up or needs nothing, 1 when it left the
+terminal alone or the change failed ([TERMINAL_SETUP.md](TERMINAL_SETUP.md)).
+The flag surface is fail-closed: an unknown flag or positional argument exits with code
 2 and names the offender — nothing is silently ignored, because evaluation
 harnesses pass treatment configuration through this surface. Headless
 automation uses `-p/--print` (or `-` for stdin) with `--json`/`--stream-json`

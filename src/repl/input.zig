@@ -70,6 +70,7 @@ pub const Key = union(enum) {
 ///   ESC [ <num>;<mod> u   CSI u（xterm modifyOtherKeys kitty 扩展）
 ///     - 13;2 u = Shift+Enter
 ///     - 13;5 u = Ctrl+Enter
+///   ESC CR            Meta+Return = Shift+Enter(/terminal-setup 装进终端的绑定)
 pub const KeyParser = struct {
     state: State = .normal,
     num1: u32 = 0,
@@ -122,6 +123,9 @@ pub const KeyParser = struct {
                 switch (b) {
                     'b', 'B' => return .alt_b,
                     'f', 'F' => return .alt_f,
+                    // ESC CR(Meta+Return)= 换行,同 Kitty 的 13;2u:/terminal-setup 让 Apple Terminal 的
+                    // Shift+Return、VS Code 的 shift+enter 发的就是它(Claude Code 的 VS Code 绑定同款)。
+                    '\r' => return .shift_enter,
                     else => {},
                 }
                 // ESC ESC:第二个 ESC 重新开始一个待定序列。兑现第一个 .esc,自身回 esc_seen
@@ -439,8 +443,18 @@ pub fn shouldEnableKittyKeyboard() bool {
 /// - 非白名单(Apple Terminal 等,Shift+Enter 发裸 \r=Enter 会提交)→ "\ + ⏎ for newline"
 ///   (cc-zig 无 macOS 原生 modifier 检测,故 Apple Terminal 只能靠 backslash 续行,
 ///    不能照抄真 cc 对 Apple 的 "shift+⏎" 文案——那会误导)。
+/// - 终端自己把 Shift+Enter 绑成了 ESC CR(/terminal-setup,#386;recordNewlineBinding)→ 也是 shift。
 pub fn newlineHint() []const u8 {
-    return if (shouldEnableKittyKeyboard()) "shift + \xe2\x8f\x8e for newline" else "\\ + \xe2\x8f\x8e for newline";
+    return if (shouldEnableKittyKeyboard() or g_newline_binding.load(.acquire)) "shift + \xe2\x8f\x8e for newline" else "\\ + \xe2\x8f\x8e for newline";
+}
+
+/// 终端配置里的 Shift+Enter 绑定(发 ESC CR,KeyParser 读成 .shift_enter)此刻生效与否:启动时据
+/// terminal_setup.bindingLive 写一次,/terminal-setup 装上 / 撤销后再写(VS Code 当场生效;Apple Terminal
+/// 要重开,本进程不改)。
+var g_newline_binding = std.atomic.Value(bool).init(false);
+
+pub fn recordNewlineBinding(live: bool) void {
+    g_newline_binding.store(live, .release);
 }
 
 pub fn enterRawMode(fd: c_int) ?platform_term.SavedMode {
@@ -1387,6 +1401,43 @@ test "LineEditor: multi-key stream through KeyParser" {
         if (p.feed(b)) |k| _ = try ed.handle(k);
     }
     try testing.expectEqualStrings("abc", ed.view());
+}
+
+test "KeyParser: ESC CR(/terminal-setup 绑定发的 Meta+Return)是 Shift+Enter" {
+    var p = KeyParser{};
+    try testing.expect(p.feed(0x1b) == null);
+    try testing.expect(p.feed('\r').? == .shift_enter);
+    try testing.expect(p.drain() == null);
+    try testing.expect(!p.pendingEsc());
+    // 读循环已按超时兑现的 Esc 仍是 Esc,随后的 CR 照常提交。
+    try testing.expect(p.feed(0x1b) == null);
+    try testing.expect(p.flushEsc().? == .esc);
+    try testing.expect(p.feed('\r').? == .enter);
+    // ESC LF 不是这个绑定:照旧 Esc + Enter 两键。
+    try testing.expect(p.feed(0x1b) == null);
+    try testing.expect(p.feed('\n').? == .esc);
+    try testing.expect(p.drain().? == .enter);
+}
+
+test "LineEditor: ESC CR 经 KeyParser 插换行,单独的 CR 提交" {
+    var ed = LineEditor.init(testing.allocator);
+    defer ed.deinit();
+    var p = KeyParser{};
+    var last: Action = .none;
+    for ("a\x1b\rb\r") |b| {
+        if (p.feed(b)) |k| last = try ed.handle(k);
+        while (p.drain()) |k| last = try ed.handle(k);
+    }
+    try testing.expectEqualStrings("a\nb", ed.view());
+    try testing.expectEqual(Action.commit, last);
+}
+
+test "newlineHint:终端里装了 Shift+Enter 绑定(recordNewlineBinding)就提示 Shift+Enter" {
+    defer recordNewlineBinding(false);
+    recordNewlineBinding(true);
+    try testing.expectEqualStrings("shift + \xe2\x8f\x8e for newline", newlineHint());
+    recordNewlineBinding(false);
+    if (!shouldEnableKittyKeyboard()) try testing.expectEqualStrings("\\ + \xe2\x8f\x8e for newline", newlineHint());
 }
 
 test "enterRawMode on non-tty returns null or restores cleanly" {

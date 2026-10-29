@@ -970,6 +970,9 @@ pub fn main(init: std.process.Init) !void {
         init_options.theme_variant = variant;
         splash = repl.startSplash(gpa, variant, config.state_root);
     }
+    // A Shift+Enter binding `/terminal-setup` put into the terminal (or one
+    // that sends the same newline) turns the footer's hint to Shift+Enter.
+    if (interactive_tui) @import("repl/input.zig").recordNewlineBinding(@import("app/terminal_setup/setup.zig").bindingLiveHere(gpa, config.state_root));
     const app = app: {
         errdefer repl.stopSplash(splash);
         break :app try app_mod.App.initWithOptions(gpa, init.io, config, api_key, init_options);
@@ -1817,7 +1820,7 @@ fn maybeRunAuthCommand(init: std.process.Init, allocator: std.mem.Allocator, lea
     _ = args.next(); // 跳过 argv[0](程序名)
     for (0..leading) |_| _ = args.next(); // a leading --state-dir, already applied
     const cmd = args.next() orelse return null;
-    const subcommands = [_][]const u8{ "doctor", "install", "kgd", "kg", "ledger", "logout", "login", "sealed", "update" };
+    const subcommands = [_][]const u8{ "doctor", "install", "kgd", "kg", "ledger", "logout", "login", "sealed", "terminal-setup", "update" };
     for (subcommands) |name| {
         if (std.mem.eql(u8, cmd, name)) break;
     } else return null;
@@ -1833,6 +1836,7 @@ fn maybeRunAuthCommand(init: std.process.Init, allocator: std.mem.Allocator, lea
     if (std.mem.eql(u8, cmd, "kgd")) return runKgd(&args, allocator);
     if (std.mem.eql(u8, cmd, "kg")) return runKg(&args, allocator);
     if (std.mem.eql(u8, cmd, "sealed")) return @import("app/sealed_cli.zig").run(&args, allocator, init.io, state_dir);
+    if (std.mem.eql(u8, cmd, "terminal-setup")) return @import("app/terminal_setup/cli.zig").run(&args, allocator, state_dir);
     if (std.mem.eql(u8, cmd, "ledger")) {
         const provider = args.next() orelse {
             std.debug.print("usage: metacodes ledger metask\n", .{});
@@ -3752,6 +3756,9 @@ fn printHelp() void {
         \\  --version             Print version and build identity and exit (--json: one JSON document)
         \\  doctor [--json | --plain] [--strict]
         \\                        Report where ripgrep and TinyKG resolve from and whether they match this build
+        \\  terminal-setup [--dry-run | --restore] [--terminal <name>] [--keybindings <file>]
+        \\                        Bind Shift+Enter to a newline in Apple Terminal or VS Code (and forks),
+        \\                        after a backup; --restore undoes it (terminal-setup --help for more)
         \\  update [--check] [--version X.Y.Z] [--release-base <url>] [--pull] [--allow-downgrade]
         \\         [--no-sdk] [--ignore-running] [--json]
         \\                        Bring this install up to date: the latest release (from its recorded
@@ -3956,6 +3963,12 @@ test {
     _ = &@import("app/release_fetch.zig");
     _ = &@import("app/update.zig");
     _ = &@import("app/kg_autostart.zig");
+    _ = &@import("app/terminal_setup/jsonc.zig");
+    _ = &@import("app/terminal_setup/files.zig");
+    _ = &@import("app/terminal_setup/vscode.zig");
+    _ = &@import("app/terminal_setup/apple_terminal.zig");
+    _ = &@import("app/terminal_setup/setup.zig");
+    _ = &@import("app/terminal_setup/cli.zig");
     _ = &@import("session_service.zig");
     _ = &@import("repl/loop.zig");
     _ = &@import("repl/replay.zig");
