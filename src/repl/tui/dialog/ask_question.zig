@@ -611,7 +611,7 @@ pub fn run(
         drawn = reflow.Anchor.atEnd(r.frame, frame_cols);
 
         var buf: [8]u8 = undefined;
-        const n = pfs.read(in_fd, &buf);
+        const n = platform_term.readInput(in_fd, &buf); // decodes a console's key records
         if (n <= 0) {
             if (n < 0 and input_mod.retryInterruptedRead(in_fd)) continue;
             return error.InputAborted;
@@ -826,22 +826,17 @@ fn finalizeAll(alloc: std.mem.Allocator, questions: []const ctx.AskQuestion, qs:
 /// 失败(无 $EDITOR/spawn 失败)静默忽略(note 保持原样,不崩)。
 fn editNoteInEditor(alloc: std.mem.Allocator, fd: c_int, st: *QState, oi: usize) void {
     if (oi >= MAX_OPT) return;
-    // 1. 存当前(raw)模式,临时回 cooked 给编辑器(可移植:POSIX termios / Windows console mode)。
-    const saved = platform_term.saveMode(fd) orelse return;
-    platform_term.setCooked(fd);
+    // 1. 终端借给编辑器:cooked,REPL 开的转义模式全关(括号粘贴、Kitty、Windows 控制台的
+    //    win32-input-mode);编辑完(或失败)拿回来,对话框继续读键。
+    const saved = input_mod.lendTerminal(fd) orelse return;
+    defer input_mod.takeBackTerminal(fd, saved);
 
     // 2. 唤起编辑器(前台阻塞),传入当前 note 文本。
     const cur = st.note_buf[oi][0..st.note_len[oi]];
-    const edited = input_mod.externalEdit(alloc, cur) catch {
-        platform_term.restoreMode(fd, saved); // 失败也要恢复 raw
-        return;
-    };
+    const edited = input_mod.externalEdit(alloc, cur) catch return;
     defer alloc.free(edited);
 
-    // 3. 恢复 raw 模式(对话框继续读键)。
-    platform_term.restoreMode(fd, saved);
-
-    // 4. 回填编辑结果(截断到 buf 上限;只取首行,note 是单行语义)。
+    // 3. 回填编辑结果(截断到 buf 上限;只取首行,note 是单行语义)。
     const line_end = std.mem.indexOfScalar(u8, edited, '\n') orelse edited.len;
     const n = @min(line_end, st.note_buf[oi].len - 1);
     @memcpy(st.note_buf[oi][0..n], edited[0..n]);

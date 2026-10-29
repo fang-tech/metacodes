@@ -12,6 +12,7 @@ const std = @import("std");
 const ppaths = @import("platform").paths;
 const pfs = @import("platform").fs;
 const platform_term = @import("platform").terminal;
+const win32_input = @import("platform").win32_input;
 const platform_signal = @import("platform").signal;
 const process = @import("platform").process;
 const shutdown = @import("../core/shutdown.zig");
@@ -170,9 +171,12 @@ pub const KeyParser = struct {
     }
 
     /// 从终端读到的一个字节:ESC 时记下它后面是否已有字节在等(同一批写入)。读终端的调用方用它;
-    /// 括号粘贴里的字节用 feed(粘贴内容按原样,ESC CR 不当换行键)。
+    /// 括号粘贴里的字节用 feed(粘贴内容按原样,ESC CR 不当换行键)。Windows 控制台开着
+    /// win32-input-mode 时,人按的 Esc 是一条按键记录(platform_term.lastReadWasKeyRecord),
+    /// 不管后面排着什么都不算同批:Esc 之后紧跟的 Enter 记录也已在队列里。终端一次写出的
+    /// ESC CR(VS Code 的绑定)经 ConPTY 原样是两个字节,照旧算。
     pub fn feedRead(self: *KeyParser, fd: c_int, b: u8) ?Key {
-        return self.feedQueued(b, b == 0x1b and platform_term.waitReadable(fd, 0) > 0);
+        return self.feedQueued(b, b == 0x1b and !platform_term.lastReadWasKeyRecord() and platform_term.waitReadable(fd, 0) > 0);
     }
 
     /// feedRead 去掉终端:`more_queued` = 这个字节读进来时后面已有字节在等(仅对 ESC 有意义)。
@@ -557,7 +561,30 @@ pub fn reconcileModes(fd: c_int) bool {
     return true;
 }
 
+/// win32-input-mode(DECSET 9001):Windows 控制台把每个按键整条送来(虚拟键、字符、
+/// 按下/抬起、修饰键状态),读控制台输入的地方(platform/terminal.zig readInput)还原成
+/// VT 字节;Shift+Enter 由此能和 Enter 区分。Windows Terminal 1.24(ConPTY)与经典 conhost
+/// 实测都认它。bracketed paste(DECSET 2004)与它一起
+/// 写给控制台:开着时 Windows Terminal 把粘贴包进 `ESC[200~ … ESC[201~` 送来,经典 conhost 把
+/// 标记连同每个字符编成记录送来;没开时 Windows Terminal 先弹多行粘贴警告,两者都把每个换行
+/// 当 Enter 送来,逐行提交。
+const console_enable = "\x1b[?9001h" ++ "\x1b[?2004h";
+const console_disable = "\x1b[?2004l" ++ "\x1b[?9001l";
+
+/// 控制台模式(console_enable / console_disable)写到哪:控制台的输出(Windows 控制台不收写给
+/// stdin 的字节),只在 stdin/stdout 都是控制台时,与 TERM 无关(Windows 上通常没有 TERM)。
+/// 测试把它指到一个文件(g_console_out_for_testing)。
+fn consoleOut() ?c_int {
+    if (g_console_out_for_testing) |out| return out;
+    return if (platform_term.isConsole()) 1 else null;
+}
+var g_console_out_for_testing: ?c_int = null;
+
 fn emitEnableSequences(fd: c_int) void {
+    if (consoleOut()) |out| {
+        _ = pfs.writeAll(out, console_enable);
+        platform_term.decodeKeyRecords();
+    }
     // Dumb terminals do not understand private modes; keep their output clean.
     const term = std.c.getenv("TERM");
     const dumb = term == null or std.mem.eql(u8, std.mem.span(term.?), "dumb") or std.mem.span(term.?).len == 0;
@@ -689,9 +716,14 @@ pub fn shouldEnableKittyKeyboard() bool {
 /// - 没发(deny-list 的 Apple Terminal 等、探测说不支持或没答,Shift+Enter 发裸 \r=Enter 会提交)
 ///   → "\ + ⏎ for newline"(cc-zig 无 macOS 原生 modifier 检测,故 Apple Terminal 只能靠
 ///   backslash 续行,不能照抄真 cc 对 Apple 的 "shift+⏎" 文案——那会误导)。
+/// - Windows 控制台:开了 win32-input-mode,且有按键记录打出过字(platform_term.keyRecordsTypeText:
+///   宿主送的是键盘上真实的按键,修饰键状态在里面)→ "shift + ⏎"。只发 VT 字节的终端经 ConPTY
+///   时,单独的 CR/ESC 也被做成记录,但字从来不是,那里 Shift+Enter 照旧提交。提示只在输入框多于
+///   一行时出现,那时用户已经敲过字,所以这条判据不会晚。
 /// - 终端自己把 Shift+Enter 绑成了 ESC CR(/terminal-setup,#386;recordNewlineBinding)→ 也是 shift。
 pub fn newlineHint() []const u8 {
-    return if (shouldEnableKittyKeyboard() or g_newline_binding.load(.acquire)) "shift + \xe2\x8f\x8e for newline" else "\\ + \xe2\x8f\x8e for newline";
+    const shift_newline = shouldEnableKittyKeyboard() or platform_term.keyRecordsTypeText() or g_newline_binding.load(.acquire);
+    return if (shift_newline) "shift + \xe2\x8f\x8e for newline" else "\\ + \xe2\x8f\x8e for newline";
 }
 
 /// 终端配置里的 Shift+Enter 绑定(发 ESC CR,KeyParser 读成 .shift_enter)此刻生效与否:启动时据
@@ -840,15 +872,38 @@ pub const StartupText = struct {
 };
 
 pub fn restoreMode(fd: c_int, orig: platform_term.SavedMode) void {
-    // 关 bracketed paste(始终)+ 键盘协议(仅发过 enable 的——对称 enterRawMode,同进程 env 不变、
-    // 探测答案只写一次,判定恒一致,不会发了 enable 没 disable;没发过的不发孤立 disable,避免
-    // Apple Terminal honor 它出异常)。
+    emitDisableSequences(fd);
+    platform_term.restoreMode(fd, orig); // POSIX tcsetattr / Windows SetConsoleMode
+}
+
+/// emitEnableSequences 开的转义模式关回去。关 bracketed paste(始终)+ 键盘协议(仅发过 enable
+/// 的——对称 enterRawMode,同进程 env 不变、探测答案只写一次,判定恒一致,不会发了 enable 没
+/// disable;没发过的不发孤立 disable,避免 Apple Terminal honor 它出异常)+ 控制台的
+/// win32-input-mode 与它的 bracketed paste。
+fn emitDisableSequences(fd: c_int) void {
     const disable_paste = "\x1b[?2004l";
     _ = pfs.writeAll(fd, disable_paste);
     if (shouldEnableKittyKeyboard()) {
         _ = pfs.writeAll(fd, kbd_disable_seq);
     }
-    platform_term.restoreMode(fd, orig); // POSIX tcsetattr / Windows SetConsoleMode
+    if (consoleOut()) |out| _ = pfs.writeAll(out, console_disable);
+}
+
+/// 在 raw 模式里读键的地方把终端借给一个自己读终端的子进程(`$EDITOR`):终端回到 cooked,
+/// REPL 开的转义模式全关——否则编辑器收到的是括号粘贴标记、Kitty 键码,Windows 控制台上
+/// 每个键都是一条 win32-input-mode 记录 `ESC[…_`。返回借出前的模式,交给 takeBackTerminal;
+/// 不是终端 → null(什么都没动)。
+pub fn lendTerminal(fd: c_int) ?platform_term.SavedMode {
+    const saved = platform_term.saveMode(fd) orelse return null;
+    emitDisableSequences(fd);
+    platform_term.setCooked(fd);
+    return saved;
+}
+
+/// 子进程用完终端:回到借出前的模式,转义模式重新打开(Windows 控制台上 Shift+Enter 照旧换行)。
+pub fn takeBackTerminal(fd: c_int, saved: platform_term.SavedMode) void {
+    platform_term.restoreMode(fd, saved);
+    emitEnableSequences(fd);
 }
 
 /// 把 `current` 写临时文件,开 $VISUAL/$EDITOR(前台阻塞)编辑,读回(owned,去尾换行)。
@@ -888,7 +943,7 @@ pub fn externalEdit(allocator: std.mem.Allocator, current: []const u8) ![]u8 {
     errdefer out.deinit(allocator);
     var buf: [4096]u8 = undefined;
     while (true) {
-        const n = pfs.read(rfd, buf[0..buf.len]); // no EINTR: regular file
+        const n = pfs.read(rfd, buf[0..buf.len]); // no EINTR: regular file, not the terminal
         if (n <= 0) break;
         try out.appendSlice(allocator, buf[0..@intCast(n)]);
     }
@@ -1857,6 +1912,136 @@ test "readKey(Windows 控制台):ESC CR 同批读到是 Shift+Enter,ESC 读走�
     try testing.expect(readKey(0, &p).key == .enter);
 }
 
+test "readInput(Windows 控制台送按键记录):读出的是键,抬键记录不叫醒等待,半截的不是记录照原样" {
+    // win32-input-mode 开着时控制台把一条记录逐字符排进队列(sendChars),与真机同形。
+    if (@import("builtin").os.tag != .windows) return error.SkipZigTest;
+    var console = try @import("platform").test_support.PrivateConsole.begin();
+    defer console.end();
+    defer platform_term.resetConsoleInputForTesting();
+    platform_term.decodeKeyRecords();
+    var buf: [8]u8 = undefined;
+
+    // ↓ 按下 + 抬起:对话框一次读 8 字节,读到的是 ↓ 的 VT 字节,不是记录。
+    try console.sendChars("\x1b[40;80;0;1;288;1_\x1b[40;80;0;0;288;1_");
+    try testing.expectEqual(@as(isize, 3), platform_term.readInput(0, &buf));
+    try testing.expectEqualStrings("\x1b[B", buf[0..3]);
+    try testing.expect(platform_term.lastReadWasKeyRecord());
+
+    // Esc 读走之后才到的抬键记录不产字节:等 Esc 后续的那一轮等待照旧到时(0),不被它叫醒,
+    // 它也被取走了。
+    try console.sendChars("\x1b[27;1;27;1;32;1_");
+    try testing.expectEqual(@as(isize, 1), platform_term.readInput(0, buf[0..1]));
+    try testing.expectEqual(@as(u8, 0x1b), buf[0]);
+    try console.sendChars("\x1b[27;1;27;0;32;1_");
+    try testing.expectEqual(@as(i32, 0), platform_term.waitReadable(0, 100));
+    try testing.expectEqual(@as(usize, 0), console.keyDownsQueued());
+
+    // 队列到头时还没成记录的字节(这里是终端写来的 x 和 ESC [ 1 2):原样交出,不等下一个键。
+    try console.sendChars("x\x1b[12");
+    var got: usize = 0;
+    var reads: usize = 0;
+    while (got < 5 and reads < 3) : (reads += 1) {
+        const n = platform_term.readInput(0, buf[got..]);
+        try testing.expect(n > 0);
+        got += @intCast(n);
+    }
+    try testing.expectEqualStrings("x\x1b[12", buf[0..got]);
+    try testing.expect(!platform_term.lastReadWasKeyRecord());
+}
+
+test "readInput(Windows 控制台送按键记录):一条记录被 ReadConsoleW 的 256 字符一批切开,读出的仍是那个键" {
+    if (@import("builtin").os.tag != .windows) return error.SkipZigTest;
+    var console = try @import("platform").test_support.PrivateConsole.begin();
+    defer console.end();
+    defer platform_term.resetConsoleInputForTesting();
+    platform_term.decodeKeyRecords();
+    // 250 个终端写来的字,再一条 ↓ 记录(按下 19 字符 + 抬起):第一批 256 个字符在记录的第 6 个
+    // 字符处截断,剩下的还排在队列里。
+    try console.sendChars("x" ** 250 ++ "\x1b[40;80;0;1;288;1_\x1b[40;80;0;0;288;1_");
+    var got: [300]u8 = undefined;
+    var n: usize = 0;
+    var reads: usize = 0;
+    while (n < 253 and reads < 16) : (reads += 1) {
+        const r = platform_term.readInput(0, got[n..@min(n + 64, got.len)]);
+        try testing.expect(r > 0);
+        n += @intCast(r);
+    }
+    try testing.expectEqualStrings("x" ** 250 ++ "\x1b[B", got[0..n]);
+    try testing.expect(platform_term.lastReadWasKeyRecord());
+    try testing.expectEqual(@as(i32, 0), platform_term.waitReadable(0, 0)); // 抬起记录读走了,不产字节
+}
+
+test "lendTerminal(Windows 控制台):编辑器拿到的控制台没有 win32-input-mode 和括号粘贴,还回来再打开" {
+    if (@import("builtin").os.tag != .windows) return error.SkipZigTest;
+    var console = try @import("platform").test_support.PrivateConsole.begin();
+    defer console.end();
+    defer platform_term.resetConsoleInputForTesting();
+    // 控制台模式序列写进一个文件(这里 stdout 不是控制台),按写入顺序核对。
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, "{s}/metacodes-lend-test-{d}.txt", .{ ppaths.tempDir(), process.currentPid() });
+    const out = pfs.open(path.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o600));
+    try testing.expect(out >= 0);
+    defer pfs.unlinkPath(path.ptr) catch {};
+    defer _ = pfs.close(out);
+    g_console_out_for_testing = out;
+    defer g_console_out_for_testing = null;
+    const ENABLE_LINE_INPUT: u32 = 0x0002;
+    const ENABLE_VIRTUAL_TERMINAL_INPUT: u32 = 0x0200;
+
+    // REPL 的 raw 模式:9001 与 2004 开着。
+    const before = platform_term.enterRaw(0) orelse return error.TestUnexpectedResult;
+    defer platform_term.restoreMode(0, before);
+    emitEnableSequences(0);
+    try expectFile(path, console_enable);
+
+    // 编辑器运行期间:两者关着,控制台是 cooked(行输入),也不带 VT 输入。
+    const lent = lendTerminal(0) orelse return error.TestUnexpectedResult;
+    try expectFile(path, console_enable ++ console_disable);
+    const during = platform_term.saveMode(0).?;
+    try testing.expect(during.in_mode & ENABLE_LINE_INPUT != 0);
+    try testing.expect(during.in_mode & ENABLE_VIRTUAL_TERMINAL_INPUT == 0);
+
+    // 还回来:raw 模式,两者重新打开。
+    takeBackTerminal(0, lent);
+    try expectFile(path, console_enable ++ console_disable ++ console_enable);
+    const after = platform_term.saveMode(0).?;
+    try testing.expect(after.in_mode & ENABLE_LINE_INPUT == 0);
+    try testing.expect(after.in_mode & ENABLE_VIRTUAL_TERMINAL_INPUT != 0);
+}
+
+/// `path` 的全部内容是 `want`。
+fn expectFile(path: [:0]const u8, want: []const u8) !void {
+    const fd = pfs.open(path.ptr, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+    try testing.expect(fd >= 0);
+    defer _ = pfs.close(fd);
+    var buf: [128]u8 = undefined;
+    var n: usize = 0;
+    while (n < buf.len) {
+        const r = pfs.read(fd, buf[n..]); // no EINTR: regular file, not the terminal
+        if (r <= 0) break;
+        n += @intCast(r);
+    }
+    try testing.expectEqualStrings(want, buf[0..n]);
+}
+
+test "readKey(Windows 控制台送按键记录):Esc 记录后面排着 Enter 也是两个键;终端写来的 ESC CR 是 Shift+Enter" {
+    if (@import("builtin").os.tag != .windows) return error.SkipZigTest;
+    var console = try @import("platform").test_support.PrivateConsole.begin();
+    defer console.end();
+    defer platform_term.resetConsoleInputForTesting();
+    platform_term.decodeKeyRecords();
+    var p = KeyParser{};
+
+    // 人连按 Esc、Enter:两条记录一起排在队列里,Esc 也不算同批(它是按键记录)。
+    try console.sendChars("\x1b[27;1;27;1;32;1_\x1b[27;1;27;0;32;1_\x1b[13;28;13;1;32;1_\x1b[13;28;13;0;32;1_");
+    try testing.expect(readKey(0, &p).key == .esc);
+    try testing.expect(readKey(0, &p).key == .enter);
+
+    // VS Code 的 Shift+Enter 绑定一次写出 ESC CR:ConPTY 原样排成两个字符,不是记录。
+    try console.sendChars("\x1b\r");
+    try testing.expect(readKey(0, &p).key == .shift_enter);
+}
+
 test "LineEditor: 同批的 ESC CR 经 KeyParser 插换行,单独的 CR 提交" {
     var ed = LineEditor.init(testing.allocator);
     defer ed.deinit();
@@ -2078,6 +2263,71 @@ fn parseAll(stream: []const u8, out: []Key) []Key {
         }
     }
     return out[0..n];
+}
+
+/// `stream` read the way platform/terminal.zig reads a console that sends
+/// win32-input-mode key records, then parsed like parseAll.
+fn parseRecords(stream: []const u8, out: []Key) []Key {
+    var d: win32_input.Decoder = .{};
+    var bytes: [256]u8 = undefined;
+    var n: usize = 0;
+    for (stream) |b| {
+        n += d.take(bytes[n..]);
+        d.put(b);
+    }
+    n += d.take(bytes[n..]);
+    d.endOfInput();
+    n += d.take(bytes[n..]);
+    return parseAll(bytes[0..n], out);
+}
+
+test "KeyParser: a Shift+Enter key record is the key Kitty's CSI-u gives, an Enter record Enter" {
+    var buf: [8]Key = undefined;
+    // Shift down, Enter down with SHIFT_PRESSED, Enter up, Shift up (measured).
+    const shift_enter = parseRecords("\x1b[16;42;0;1;48;1_\x1b[13;28;13;1;48;1_\x1b[13;28;13;0;48;1_\x1b[16;42;0;0;32;1_", &buf);
+    try testing.expectEqual(@as(usize, 1), shift_enter.len);
+    try testing.expect(shift_enter[0] == .shift_enter);
+    const enter = parseRecords("\x1b[13;28;13;1;32;1_\x1b[13;28;13;0;32;1_", &buf);
+    try testing.expectEqual(@as(usize, 1), enter.len);
+    try testing.expect(enter[0] == .enter);
+}
+
+test "KeyParser: Esc as key records waits for the read timeout like a VT Esc" {
+    var p = KeyParser{};
+    var bytes: [8]u8 = undefined;
+    var d: win32_input.Decoder = .{};
+    var n: usize = 0;
+    for ("\x1b[27;1;27;1;32;1_\x1b[27;1;27;0;32;1_") |b| {
+        n += d.take(bytes[n..]);
+        d.put(b);
+    }
+    n += d.take(bytes[n..]);
+    // The key-up adds nothing: one ESC, and the parser waits for what may follow.
+    try testing.expectEqualStrings("\x1b", bytes[0..n]);
+    try testing.expect(p.feed(bytes[0]) == null);
+    try testing.expect(p.pendingEsc());
+    try testing.expect(p.flushEsc().? == .esc);
+    // Esc, then an arrow a moment later: two keys, as with VT bytes.
+    var keys: [8]Key = undefined;
+    const esc_left = parseRecords("\x1b[27;1;27;1;32;1_\x1b[37;75;0;1;288;1_", &keys);
+    try testing.expectEqual(@as(usize, 2), esc_left.len);
+    try testing.expect(esc_left[0] == .esc);
+    try testing.expect(esc_left[1] == .left);
+}
+
+test "newlineHint: Shift+Enter once a key record typed text, not for a VT-only terminal's records" {
+    // Kitty on (the test's own terminal) says Shift+Enter either way.
+    if (shouldEnableKittyKeyboard()) return error.SkipZigTest;
+    defer platform_term.resetConsoleInputForTesting();
+    platform_term.resetConsoleInputForTesting();
+    try testing.expectEqualStrings("\\ + \xe2\x8f\x8e for newline", newlineHint());
+    // What ConPTY makes of the CR, ESC and Ctrl+A a VT-only terminal (Alacritty)
+    // writes: records, with Ctrl state, but no text. Shift+Enter there is Enter.
+    platform_term.decodeConsoleInputForTesting("\x1b[13;28;13;1;0;1_\x1b[13;28;13;0;0;1_\x1b[27;1;27;1;0;1_\x1b[17;29;0;1;8;1_\x1b[65;30;1;1;8;1_");
+    try testing.expectEqualStrings("\\ + \xe2\x8f\x8e for newline", newlineHint());
+    // A typed letter as a record: Windows Terminal or conhost.
+    platform_term.decodeConsoleInputForTesting("\x1b[65;30;97;1;32;1_\x1b[65;30;97;0;32;1_");
+    try testing.expectEqualStrings("shift + \xe2\x8f\x8e for newline", newlineHint());
 }
 
 test "KeyParser: 迟到的背景色应答(OSC 11,BEL 或 ST 结尾)整条吃掉,前后的字照常" {

@@ -299,9 +299,62 @@ status, compatibility boundaries, and entry points are defined by
   one unknown key for each; a sequence whose rest has not come within one
   read wait is dropped instead of swallowing the next key; and rxvt's
   `$`-terminated Shift keys (`ESC [ 3 $`) stay one key.
+- **Shift+Enter inserts a newline in Windows Terminal and the classic
+  Windows console (#386).** A Windows console sends Shift+Enter as the same
+  `\r` as Enter, so it submitted the prompt and the footer said `\ + ⏎ for
+  newline`. When stdin and stdout are both console handles, the REPL now
+  turns on win32-input-mode (`CSI ? 9001 h`) as it enters raw mode and turns
+  it off as it restores the terminal; redirected streams and Linux binaries
+  under WSL leave it off. With it on, the console sends each key event as a
+  record `CSI Vk;Sc;Uc;Kd;Cs;Rc _`. The console input is read in one place
+  (`platform/terminal.zig` `readInput`), and that is where the records are
+  turned back into the VT bytes the same keys send without the mode, for
+  every reader: the prompt, the permission and question dialogs, the pager
+  and vim's normal mode, which read single bytes past the prompt's key parser
+  (the dialogs read the console with the C runtime's `read` before and now go
+  through `readInput` too; a guard test keeps any other read away from the
+  terminal). Key-up records give nothing, and a wait for input is not woken
+  by them, so an Esc's own key-up does not restart the wait that tells Esc
+  from an escape sequence. A record's character is typed `Rc` times, at most
+  256 (a UTF-16 surrogate pair split over two records is one character), and
+  a key that types nothing is never repeated. Arrows, function keys, Esc, Alt
+  and Ctrl chords and bracketed-paste markers decode to their VT bytes
+  (checked byte for byte against Windows Terminal 1.24 and conhost on Windows
+  11 26300). Shift+Enter becomes Kitty's `CSI 13;2u`, a newline. The footer
+  says `shift + ⏎ for newline` once a record has typed text: Windows Terminal
+  and conhost send records for every key, while a terminal that sends only VT
+  bytes through ConPTY (Alacritty) gets records for its lone CR, ESC or
+  Ctrl+letter but never for text, and its Shift+Enter still submits.
+  Ctrl+Enter still submits: the pseudo console sends a line break written to
+  it as an Enter with Ctrl held, the same record. Bytes a terminal writes in
+  one go, such as the `ESC CR` of a Shift+Enter key binding in VS Code
+  (`/terminal-setup`), reach the key parser as those bytes, not as records,
+  and stay a newline; an Esc pressed on the keyboard is a record and never
+  counts as that binding's ESC, however soon Enter follows it. AltGr and dead
+  keys were not measured.
 
 
 ### Fixed
+
+- **A multi-line paste in Windows Terminal or the classic Windows console
+  stays in the prompt instead of submitting every line but the last
+  (#386).** On Windows the REPL never turned on bracketed paste: `TERM` is
+  usually unset there, so the terminal counted as dumb, and with `TERM` set
+  the sequence went to stdin, which a console does not show. Windows Terminal
+  first warned about the multi-line paste, then both hosts sent each line
+  break as Enter. On a console the REPL now writes `CSI ? 2004 h` to stdout
+  with win32-input-mode and turns both off again on restore: Windows Terminal
+  wraps the paste in `ESC[200~ … ESC[201~` and no longer warns, and classic
+  conhost sends the markers as key records with the text. Measured in both
+  with a pasted Chinese and ASCII text of 3 and of 80 lines.
+- **The editor a question's note opens with Ctrl+G gets a plain terminal
+  (#386).** The question dialog handed the terminal to `$EDITOR` in cooked
+  mode but left the escape modes on: bracketed paste and, where the terminal
+  speaks it, the Kitty keyboard protocol, so the editor read paste markers
+  and Kitty key codes. It now turns them off for the editor and on again
+  after it, as the prompt's own Ctrl+G does, together with a Windows
+  console's win32-input-mode; the console it hands over has no VT input
+  either.
 
 - **Release executables run beyond machines like the build runner.**
   `release.yml` built the CLI executable without `-Dtarget`, so zig targeted

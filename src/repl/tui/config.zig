@@ -103,7 +103,7 @@ fn readFile(alloc: std.mem.Allocator, path: []const u8) ![]u8 {
     errdefer all.deinit(alloc);
     var buf: [4096]u8 = undefined;
     while (true) {
-        const n = pfs.read(fd, buf[0..buf.len]); // no EINTR: regular file
+        const n = pfs.read(fd, buf[0..buf.len]); // no EINTR: regular file, not the terminal
         if (n < 0) return error.ReadFailed;
         if (n == 0) break;
         try all.appendSlice(alloc, buf[0..@intCast(n)]);

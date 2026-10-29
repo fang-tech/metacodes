@@ -103,6 +103,17 @@ pub fn isatty(fd: c_int) bool {
     return std.c.isatty(fd) != 0;
 }
 
+/// Whether stdin and stdout are both a Windows console (conhost, or a pseudo
+/// console such as Windows Terminal's): the host of console modes like
+/// win32-input-mode. Redirected or piped handles are not, nor is anything on
+/// POSIX (a Linux binary under WSL included).
+pub fn isConsole() bool {
+    if (!is_windows) return false;
+    var mode: win.DWORD = 0;
+    return GetConsoleMode(GetStdHandle(STD_INPUT_HANDLE), &mode) != 0 and
+        GetConsoleMode(GetStdHandle(STD_OUTPUT_HANDLE), &mode) != 0;
+}
+
 // ── 可移植终端输入读 ─────────────────────────────────────────────────────────
 // Windows console 的 ReadFile/CRT read 在 CP65001 下对非 ASCII 输入返回**损坏字节**
 // (conhost 历史缺陷;ConPTY 实测 '你' → U+FFFD×2,CJK 输入全乱)。console 输入必须走
@@ -113,6 +124,70 @@ var g_conin_buf: [1024]u8 = undefined;
 var g_conin_len: usize = 0;
 var g_conin_pos: usize = 0;
 
+// ── win32-input-mode 按键记录 ───────────────────────────────────────────────
+// The REPL turns win32-input-mode on (repl/input.zig, `CSI ? 9001 h`) so that
+// Shift+Enter is not Enter; the console then sends every key as a record.
+// Every reader of the console reads through readInput/waitReadable, and these
+// decode the records there (win32_input.zig): the permission dialog, the
+// question dialog, the pager and vim's normal mode read the bytes they read
+// without the mode, not the records. Once on it stays on: records already
+// queued when the mode goes off are still to be read, and the decoder passes
+// every byte that is no record as it came.
+const win32_input = @import("win32_input.zig");
+var g_key_records = std.atomic.Value(bool).init(false);
+var g_decoder: win32_input.Decoder = .{};
+var g_last_read_key_record: bool = false;
+var g_key_records_type_text = std.atomic.Value(bool).init(false);
+
+/// Read the console's input as win32-input-mode key records from now on,
+/// right after `CSI ? 9001 h` went to the console. Windows only.
+pub fn decodeKeyRecords() void {
+    if (is_windows) g_key_records.store(true, .release);
+}
+
+/// Whether the last byte readInput handed out came from a key record, a key
+/// pressed on the console, rather than as a byte the terminal wrote (the
+/// `ESC CR` of a Shift+Enter key binding, text, a replay). False off Windows.
+pub fn lastReadWasKeyRecord() bool {
+    return g_last_read_key_record;
+}
+
+/// Whether a key record typed text: the console's host sends the keys it
+/// reads off the keyboard, modifier state included (Windows Terminal, classic
+/// conhost), so Shift+Enter arrives as itself. A terminal that sends only VT
+/// bytes through ConPTY gets records for its lone control characters, never
+/// for text (win32_input.Decoder.typed_text).
+pub fn keyRecordsTypeText() bool {
+    return g_key_records_type_text.load(.acquire);
+}
+
+/// Tests: `stream` through the console's decoder as if ReadConsoleW had
+/// returned it; the decoded bytes are dropped.
+pub fn decodeConsoleInputForTesting(stream: []const u8) void {
+    @memcpy(g_conin_buf[0..stream.len], stream);
+    g_conin_len = stream.len;
+    g_conin_pos = 0;
+    var sink: [64]u8 = undefined;
+    while (g_conin_pos < g_conin_len or g_decoder.holding()) {
+        decodeRead();
+        _ = g_decoder.take(&sink);
+    }
+    g_decoder.endOfInput();
+    _ = g_decoder.take(&sink);
+}
+
+/// Tests: forget the console input read and what it showed of the host, and
+/// read the console as without win32-input-mode again.
+pub fn resetConsoleInputForTesting() void {
+    g_key_records.store(false, .release);
+    g_conin_len = 0;
+    g_conin_pos = 0;
+    g_decoder = .{};
+    g_last_read_key_record = false;
+    g_key_records_type_text.store(false, .release);
+}
+
+extern "kernel32" fn GetTickCount64() callconv(.winapi) u64;
 extern "kernel32" fn ReadConsoleW(hConsoleInput: win.HANDLE, lpBuffer: [*]u16, nNumberOfCharsToRead: win.DWORD, lpNumberOfCharsRead: *win.DWORD, pInputControl: ?*anyopaque) callconv(.winapi) c_int;
 
 // ── 回放:已从终端读走、还欠下一个读者的输入 ─────────────────────────────────
@@ -194,6 +269,7 @@ pub fn readInput(fd: c_int, buf: []u8) isize {
         const n = @min(buf.len, owed.len);
         @memcpy(buf[0..n], owed[0..n]);
         g_replay_pos += n;
+        g_last_read_key_record = false;
         return @intCast(n);
     }
     return readTerminal(fd, buf);
@@ -205,18 +281,10 @@ fn readTerminal(fd: c_int, buf: []u8) isize {
         const h = GetStdHandle(STD_INPUT_HANDLE);
         var mode: win.DWORD = 0;
         if (GetConsoleMode(h, &mode) != 0) {
+            if (g_key_records.load(.acquire)) return readDecoded(h, buf);
             if (g_conin_pos >= g_conin_len) {
-                var wbuf: [256]u16 = undefined;
-                var got: win.DWORD = 0;
-                if (ReadConsoleW(h, &wbuf, wbuf.len, &got, null) == 0) return -1;
-                if (got == 0) return 0;
-                // wtf16LeToWtf8(非 utf16 严格版,review-2 F3):批边界恰好截断 surrogate
-                // pair(大段 emoji 粘贴可构造)或 IME 孤立 surrogate 时,严格版整批失败 →
-                // 丢输入 + ReadError。WTF-8 版永不失败:孤立 half 各自编成 3 字节(跨批的
-                // pair 两半**不合并**,极端场景显示降级为两个替换符),但零丢字节零报错。
-                // 输出无边界检查:1024 ≥ 256×3 最坏膨胀,恒安全。
-                g_conin_len = std.unicode.wtf16LeToWtf8(&g_conin_buf, wbuf[0..got]);
-                g_conin_pos = 0;
+                const got = fillConin(h);
+                if (got <= 0) return got;
             }
             const n = @min(buf.len, g_conin_len - g_conin_pos);
             @memcpy(buf[0..n], g_conin_buf[g_conin_pos..][0..n]);
@@ -228,12 +296,122 @@ fn readTerminal(fd: c_int, buf: []u8) isize {
     return fs_mod.read(fd, buf);
 }
 
+/// One ReadConsoleW into the UTF-8 buffer, which must be read out: it blocks
+/// until the console has a character. Characters read, 0, or <0 on error.
+fn fillConin(h: win.HANDLE) isize {
+    var wbuf: [256]u16 = undefined;
+    var got: win.DWORD = 0;
+    if (ReadConsoleW(h, &wbuf, wbuf.len, &got, null) == 0) return -1;
+    if (got == 0) return 0;
+    // wtf16LeToWtf8(非 utf16 严格版,review-2 F3):批边界恰好截断 surrogate
+    // pair(大段 emoji 粘贴可构造)或 IME 孤立 surrogate 时,严格版整批失败 →
+    // 丢输入 + ReadError。WTF-8 版永不失败:孤立 half 各自编成 3 字节(跨批的
+    // pair 两半**不合并**,极端场景显示降级为两个替换符),但零丢字节零报错。
+    // 输出无边界检查:1024 ≥ 256×3 最坏膨胀,恒安全。
+    g_conin_len = std.unicode.wtf16LeToWtf8(&g_conin_buf, wbuf[0..got]);
+    g_conin_pos = 0;
+    return @intCast(got);
+}
+
+/// Bytes read from the console but not yet through the decoder go through it
+/// until it has something to hand out.
+fn decodeRead() void {
+    while (!g_decoder.holding() and g_conin_pos < g_conin_len) {
+        g_decoder.put(g_conin_buf[g_conin_pos]);
+        g_conin_pos += 1;
+    }
+    if (g_decoder.typed_text) g_key_records_type_text.store(true, .release);
+}
+
+/// readTerminal on a console that sends key records: the decoded bytes, as
+/// many as are ready, waiting for the console only when none are. A record
+/// the read cut in two waits for its rest, which the console queued with it;
+/// with nothing queued, what was read of it is the bytes it was.
+fn readDecoded(h: win.HANDLE, buf: []u8) isize {
+    var n: usize = 0;
+    while (true) {
+        n += g_decoder.take(buf[n..]);
+        if (n > 0) g_last_read_key_record = g_decoder.last_from_record;
+        if (n == buf.len) return @intCast(n);
+        if (g_conin_pos < g_conin_len) {
+            decodeRead();
+            continue;
+        }
+        if (n > 0) return @intCast(n);
+        if (g_decoder.framing() and !keyDownQueued(h)) {
+            g_decoder.endOfInput();
+            continue;
+        }
+        const got = fillConin(h);
+        if (got <= 0) return got;
+    }
+}
+
+/// Consume the events at the head of the queue that are no key-down (resize,
+/// focus, mouse, key-up): ReadConsoleW reads no character from them. Whether
+/// a key-down is left at the head.
+fn keyDownQueued(h: win.HANDLE) bool {
+    while (true) {
+        var pending: win.DWORD = 0;
+        if (GetNumberOfConsoleInputEvents(h, &pending) == 0 or pending == 0) return false;
+        var rec: INPUT_RECORD = undefined;
+        var got: win.DWORD = 0;
+        if (PeekConsoleInputW(h, &rec, 1, &got) == 0 or got == 0) return false;
+        if (rec.EventType == KEY_EVENT and rec.Event.KeyEvent.bKeyDown != 0) return true;
+        _ = ReadConsoleInputW(h, &rec, 1, &got);
+    }
+}
+
+/// Whether the key-down at the head of the queue carries a character, so
+/// that ReadConsoleW returns at once. Every character of a key record does;
+/// with win32-input-mode off, a bare modifier does not, and ReadConsoleW
+/// would wait for the next key that types.
+fn queuedKeyTypes(h: win.HANDLE) bool {
+    var rec: INPUT_RECORD = undefined;
+    var got: win.DWORD = 0;
+    if (PeekConsoleInputW(h, &rec, 1, &got) == 0 or got == 0) return false;
+    return rec.EventType == KEY_EVENT and rec.Event.KeyEvent.bKeyDown != 0 and !typesNothing(rec.Event.KeyEvent);
+}
+
+/// waitTerminal on a console that sends key records: readable once there are
+/// decoded bytes to read. A record that types nothing (a key-up, a modifier
+/// alone) is read and dropped here and the wait goes on to its end: a reader
+/// waiting to tell Esc from the start of a sequence is not woken by the Esc's
+/// own key-up. A wake-up for an event that is no key (resize, focus) still
+/// ends the wait early, as in waitTerminal, so the caller looks at the size.
+fn waitDecoded(h: win.HANDLE, timeout_ms: i32) i32 {
+    const deadline = GetTickCount64() + @as(u64, @intCast(@max(timeout_ms, 0)));
+    while (true) {
+        decodeRead();
+        if (g_decoder.holding()) return 1;
+        if (keyDownQueued(h)) {
+            if (!queuedKeyTypes(h)) return 1;
+            const got = fillConin(h);
+            if (got < 0) return -1;
+            if (got == 0) return 0;
+            continue;
+        }
+        if (g_decoder.framing()) {
+            g_decoder.endOfInput();
+            continue;
+        }
+        const now = GetTickCount64();
+        if (now >= deadline) return 0;
+        const rc = WaitForSingleObject(h, @intCast(@min(deadline - now, std.math.maxInt(u32) - 1)));
+        if (rc == 0x102) return 0; // WAIT_TIMEOUT
+        if (rc != 0) return -1;
+        if (!keyDownQueued(h)) return 0;
+    }
+}
+
 /// 等 fd 可读,最多 timeout_ms。返回 >0=可读、0=超时、<0=错误。
 /// POSIX:poll(POLLIN)。Windows:WaitForSingleObject 控制台输入句柄 + **非键盘记录过滤**:
 /// resize/focus/mouse/键抬起等 INPUT_RECORD 也会把句柄置 signaled,但 ReadFile 读不出字节——
 /// 不过滤的话 resize 一发生,调用方 read 直接阻塞到下一次真按键(TUI 卡死,ConPTY 实测)。
 /// 这里把队首的非产字节记录消费掉再判定;只剩非键记录时按"超时"返回,让调用方的
 /// 超时分支(查 resize 标志/轮询尺寸)跑起来。replayInput 交回的字节还没吐完 → 立即可读。
+/// 控制台送 win32-input-mode 按键记录时(decodeKeyRecords):可读 = 有还原好的字节可读,
+/// 不产字节的记录(抬键、单按修饰键)不算,等待照旧到时(waitDecoded)。
 pub fn waitReadable(fd: c_int, timeout_ms: i32) i32 {
     if (replayOwed(fd).len > 0) return 1;
     return waitTerminal(fd, timeout_ms);
@@ -242,12 +420,14 @@ pub fn waitReadable(fd: c_int, timeout_ms: i32) i32 {
 /// waitReadable without the replay: whether the terminal itself has input.
 fn waitTerminal(fd: c_int, timeout_ms: i32) i32 {
     if (is_windows) {
-        // readInput 的内部 UTF-8 缓冲还有余量 → 立即可读(否则宽读一批后调用方在
-        // waitReadable 上等 console 新事件,缓冲里的字节被卡住直到下一次按键)。
-        if (g_conin_pos < g_conin_len) return 1;
         // fd(0=stdin)→ 控制台输入句柄。用 STD_INPUT_HANDLE 而非 _get_osfhandle:
         // 交互输入恒是控制台。
         const h = GetStdHandle(STD_INPUT_HANDLE);
+        var mode: win.DWORD = 0;
+        if (fd == 0 and g_key_records.load(.acquire) and GetConsoleMode(h, &mode) != 0) return waitDecoded(h, timeout_ms);
+        // readInput 的内部 UTF-8 缓冲还有余量 → 立即可读(否则宽读一批后调用方在
+        // waitReadable 上等 console 新事件,缓冲里的字节被卡住直到下一次按键)。
+        if (g_conin_pos < g_conin_len) return 1;
         // 先清队首非键盘记录(仅当句柄真是 console;管道/重定向 GetNumberOfConsoleInputEvents
         // 失败 → 跳过,走纯 Wait 语义)。注:纯修饰键(单按 Shift)的 keydown 也不产字节,
         // 此处不过滤——与旧行为一致,最多多醒一次,read 等到下个真键,无卡死风险放大。
@@ -307,6 +487,7 @@ pub fn discardPendingInput(fd: c_int) void {
             _ = FlushConsoleInputBuffer(h);
             g_conin_len = 0;
             g_conin_pos = 0;
+            g_decoder.reset();
             return;
         }
     }
@@ -536,12 +717,13 @@ pub fn saveMode(fd: c_int) ?SavedMode {
 }
 
 /// 临时切 cooked 模式（行输入 + 回显 + 信号），供唤起外部编辑器等。复原走 restoreMode(saved)。
+/// Windows 上同时关掉 VT 输入:shell 交给程序的控制台不带它,编辑器按 shell 下的样子读键。
 pub fn setCooked(fd: c_int) void {
     if (is_windows) {
         const hin = GetStdHandle(STD_INPUT_HANDLE);
         var m: win.DWORD = 0;
         if (GetConsoleMode(hin, &m) == 0) return;
-        _ = SetConsoleMode(hin, m | ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_PROCESSED_INPUT);
+        _ = SetConsoleMode(hin, (m | ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_PROCESSED_INPUT) & ~ENABLE_VIRTUAL_TERMINAL_INPUT);
         return;
     }
     var t: std.c.termios = undefined;

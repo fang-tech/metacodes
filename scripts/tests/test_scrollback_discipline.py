@@ -70,8 +70,8 @@ ALLOWED_SINKS = {
     # Before the region exists.
     (Path("src/repl/tui/splash_player.zig"), "writeAll"): "startup splash, before the first read",
     # Modes, queries and titles: nothing lands on the grid.
-    (Path("src/repl/input.zig"), "emitEnableSequences"): "keyboard protocol and bracketed paste on",
-    (Path("src/repl/input.zig"), "restoreMode"): "keyboard protocol and bracketed paste off",
+    (Path("src/repl/input.zig"), "emitEnableSequences"): "keyboard protocol, bracketed paste and win32-input-mode on",
+    (Path("src/repl/input.zig"), "emitDisableSequences"): "keyboard protocol, bracketed paste and win32-input-mode off",
     (Path("src/repl/tui/bg_probe.zig"), "sendQuery"): "OSC 11, Kitty flags and DA1 queries at startup",
     (Path("src/repl/tui/terminal_title.zig"), "writeAll"): "OSC 0 window title",
     # Regular files, not the terminal.
