@@ -10,6 +10,8 @@ status, compatibility boundaries, and entry points are defined by
 
 ## Unreleased
 
+## 0.9.0 — 2026-10-29
+
 ### Added
 
 - **`/terminal-setup` binds Shift+Enter to a newline in Apple Terminal and VS
