@@ -148,17 +148,38 @@ pub const ToolIdentity = struct {
     name: []const u8,
     schema_fingerprint: [32]u8,
 
-    /// Permission binds the Host/Runtime-assigned server authority, the exact
-    /// MCP name and the semantic input/output schema. Server self-reporting is
-    /// intentionally absent.
-    pub fn permissionBinding(self: ToolIdentity) [32]u8 {
+    /// The Tool authority: the Host/Runtime-assigned server, the exact MCP
+    /// name and the semantic input/output schema. Server self-reporting is
+    /// intentionally absent. A Session selection names this authority; a
+    /// Session grant additionally names the connection (`permissionBinding`).
+    pub fn authorityBinding(self: ToolIdentity) [32]u8 {
         var hasher = std.crypto.hash.sha2.Sha256.init(.{});
         // Stable Revision 6 domain: era is provenance and must not churn the
-        // permission identity of an otherwise identical external Tool.
+        // identity of an otherwise identical external Tool.
         hasher.update("agentcore-r6-mcp-tool-binding\x00");
         hasher.update(&self.server_binding_identity);
         hashBytes(&hasher, self.name);
         hasher.update(&self.schema_fingerprint);
+        var digest: [32]u8 = undefined;
+        hasher.final(&digest);
+        if (allZero(&digest)) digest[0] = 1;
+        return digest;
+    }
+
+    /// Permission binds the Tool authority to the server's Host-declared
+    /// `configuration_fingerprint`, the identity of the connection that
+    /// receives the arguments (#389). A configuration that keeps the server
+    /// binding, name and schema but moves the endpoint changes the
+    /// fingerprint, so an answer given for one endpoint never authorizes
+    /// another. Era stays out for the reason `authorityBinding` gives.
+    pub fn permissionBinding(
+        self: ToolIdentity,
+        configuration_fingerprint: *const [32]u8,
+    ) [32]u8 {
+        var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+        hasher.update("agentcore-mcp-tool-connection-permission\x00");
+        hasher.update(&self.authorityBinding());
+        hasher.update(configuration_fingerprint);
         var digest: [32]u8 = undefined;
         hasher.final(&digest);
         if (allZero(&digest)) digest[0] = 1;
@@ -615,7 +636,7 @@ test "schema fingerprint ignores object key order but covers output schema" {
     try std.testing.expect(!std.mem.eql(u8, &no_output, &with_output));
 }
 
-test "MCP permission identity binds server name and schema" {
+test "MCP permission identity binds server name schema and connection" {
     const base = ToolIdentity{
         .server_binding_identity = [_]u8{1} ** 32,
         .name = "weather",
@@ -631,9 +652,20 @@ test "MCP permission identity binds server name and schema" {
         .name = base.name,
         .schema_fingerprint = base.schema_fingerprint,
     };
-    try std.testing.expect(!allZero(&base.permissionBinding()));
-    try std.testing.expect(!std.mem.eql(u8, &base.permissionBinding(), &renamed.permissionBinding()));
-    try std.testing.expect(!std.mem.eql(u8, &base.permissionBinding(), &other_server.permissionBinding()));
+    try std.testing.expect(!allZero(&base.authorityBinding()));
+    try std.testing.expect(!std.mem.eql(u8, &base.authorityBinding(), &renamed.authorityBinding()));
+    try std.testing.expect(!std.mem.eql(u8, &base.authorityBinding(), &other_server.authorityBinding()));
+
+    const endpoint_a = [_]u8{0xa0} ** 32;
+    const endpoint_b = [_]u8{0xb0} ** 32;
+    const granted = base.permissionBinding(&endpoint_a);
+    try std.testing.expect(!allZero(&granted));
+    try std.testing.expectEqualSlices(u8, &granted, &base.permissionBinding(&endpoint_a));
+    // The same Tool reached through another connection is another identity.
+    try std.testing.expect(!std.mem.eql(u8, &granted, &base.permissionBinding(&endpoint_b)));
+    try std.testing.expect(!std.mem.eql(u8, &granted, &base.authorityBinding()));
+    try std.testing.expect(!std.mem.eql(u8, &granted, &renamed.permissionBinding(&endpoint_a)));
+    try std.testing.expect(!std.mem.eql(u8, &granted, &other_server.permissionBinding(&endpoint_a)));
 }
 
 test "canonical encoding rejects escaped output before allocating" {

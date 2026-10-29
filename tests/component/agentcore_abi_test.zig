@@ -13237,3 +13237,552 @@ test "L2 Revision 25 create and restore refuse a credential a header cannot carr
     try expectBearer(server, 0, CREDENTIAL_A);
     try expectBearer(server, 1, CREDENTIAL_B);
 }
+
+// #389: one MCP server binding S moves from endpoint A to endpoint B while
+// its server_binding_identity, tool name and schema stay the same. Both ends
+// are real Streamable HTTP endpoints (`PublicHttpMcpConnector` against a
+// local cassette server). A Modern AUTO connection sends a disposable
+// `server/discover` probe, then `server/discover` and `tools/list` on the
+// actual connection, whose JSON-RPC ids then count up per `tools/call`.
+const SWAP_MCP_DISCOVER =
+    "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"resultType\":\"complete\",\"supportedVersions\":[\"2026-07-28\"],\"capabilities\":{},\"ttlMs\":60000,\"cacheScope\":\"private\"}}";
+const SWAP_MCP_LIST =
+    "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"resultType\":\"complete\",\"tools\":[{\"name\":\"echo\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"text\":{\"type\":\"string\"}},\"required\":[\"text\"]}}],\"ttlMs\":60000,\"cacheScope\":\"private\"}}";
+const SWAP_MCP_OK = "HTTP/1.1 200 OK";
+
+fn swapMcpCall(comptime id: u8, comptime endpoint: []const u8) []const u8 {
+    return std.fmt.comptimePrint(
+        "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"result\":{{\"resultType\":\"complete\",\"content\":[{{\"type\":\"text\",\"text\":\"from-{s}\"}}]}}}}",
+        .{ id, endpoint },
+    );
+}
+
+const SWAP_BINDING = [_]u8{0x89} ** 32;
+const SWAP_FINGERPRINT_A = [_]u8{0xa0} ** 32;
+const SWAP_FINGERPRINT_B = [_]u8{0xb0} ** 32;
+
+fn swapMcpServer(
+    connector: *PublicHttpMcpConnector,
+    fingerprint: [32]u8,
+    timeout_ms: u32,
+) wire.McpServerV1 {
+    var server = std.mem.zeroes(wire.McpServerV1);
+    server.struct_size = @sizeOf(wire.McpServerV1);
+    server.transport_code = wire.MCP_TRANSPORT_STREAMABLE_HTTP;
+    server.negotiation_policy_code = wire.MCP_NEGOTIATION_AUTO;
+    server.server_binding_identity = SWAP_BINDING;
+    server.configuration_fingerprint = fingerprint;
+    server.namespace = sdk.bytesView("swap");
+    server.client_name = sdk.bytesView("agentcore-endpoint-swap-test");
+    server.client_version = sdk.bytesView("1");
+    server.timeout_ms = timeout_ms;
+    server.connector = connector.connector();
+    return server;
+}
+
+fn swapToolSse(allocator: std.mem.Allocator, model_name: []const u8) ![]u8 {
+    return std.fmt.allocPrint(
+        allocator,
+        "data: {{\"type\":\"message_start\",\"message\":{{\"id\":\"msg_swap\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{{\"input_tokens\":1,\"output_tokens\":1}}}}}}\n\n" ++
+            "data: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{{\"type\":\"tool_use\",\"id\":\"tu_swap\",\"name\":\"{s}\",\"input\":{{}}}}}}\n\n" ++
+            "data: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"input_json_delta\",\"partial_json\":\"{{\\\"text\\\":\\\"hello\\\"}}\"}}}}\n\n" ++
+            "data: {{\"type\":\"content_block_stop\",\"index\":0}}\n\n" ++
+            "data: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"tool_use\"}},\"usage\":{{\"output_tokens\":1}}}}\n\n" ++
+            "data: {{\"type\":\"message_stop\"}}\n\n",
+        .{model_name},
+    );
+}
+
+/// Answers each MCP Permission request with the next scripted choice and
+/// records what reached the model and the final decision of the last call.
+const McpEndpointSwapProbe = struct {
+    answers: []const sdk.protocol.PermissionChoice,
+    asks: u32 = 0,
+    ui_releases: u32 = 0,
+    bindings: [8][64]u8 = undefined,
+    results_from_a: u32 = 0,
+    results_from_b: u32 = 0,
+    denied_results: u32 = 0,
+    last_source: ?sdk.protocol.PermissionDecisionSource = null,
+    last_decision: ?sdk.protocol.PermissionDecision = null,
+    last_used_session_rule: bool = false,
+
+    fn event(
+        raw: ?*anyopaque,
+        _: ?*const wire.RunContextV1,
+        event_json: wire.BytesViewV1,
+    ) callconv(.c) u32 {
+        const self: *@This() = @ptrCast(@alignCast(raw orelse return wire.EVENT_FATAL));
+        const encoded = sdk.borrowedBytes(event_json) catch return wire.EVENT_FATAL;
+        const parsed = sdk.decodeCoreEvent(std.heap.c_allocator, encoded) catch return wire.EVENT_FATAL;
+        defer parsed.deinit();
+        const known = switch (parsed.value) {
+            .known => |value| value,
+            .unknown => return wire.EVENT_CONTINUE,
+        };
+        switch (known) {
+            .permission_provenance => |provenance| {
+                if (provenance.tool.namespace != .mcp or
+                    !std.mem.eql(u8, provenance.tool.name, "echo"))
+                    return wire.EVENT_FATAL;
+                self.last_source = provenance.source;
+                self.last_decision = provenance.decision;
+                self.last_used_session_rule = provenance.used_session_rule;
+            },
+            .tool_result => |result| {
+                if (std.mem.indexOf(u8, result.content, "from-A") != null) {
+                    self.results_from_a += 1;
+                } else if (std.mem.indexOf(u8, result.content, "from-B") != null) {
+                    self.results_from_b += 1;
+                } else if (result.is_error) {
+                    self.denied_results += 1;
+                }
+            },
+            else => {},
+        }
+        return wire.EVENT_CONTINUE;
+    }
+
+    fn ui(
+        raw: ?*anyopaque,
+        _: ?*const wire.RunContextV1,
+        request_json: wire.BytesViewV1,
+        out_response: ?*wire.OwnedBytesV1,
+    ) callconv(.c) u32 {
+        const self: *@This() = @ptrCast(@alignCast(raw orelse return wire.UI_FATAL));
+        const encoded = sdk.borrowedBytes(request_json) catch return wire.UI_FATAL;
+        const parsed = sdk.decodeUiRequest(std.heap.c_allocator, encoded) catch return wire.UI_FATAL;
+        defer parsed.deinit();
+        const request = switch (parsed.value) {
+            .permission => |value| value,
+            else => return wire.UI_FATAL,
+        };
+        if (request.tool.namespace != .mcp or
+            !std.mem.eql(u8, request.tool.name, "echo") or
+            request.tool.binding.len != 64 or
+            self.asks == self.answers.len or
+            self.asks == self.bindings.len)
+            return wire.UI_FATAL;
+        @memcpy(&self.bindings[self.asks], request.tool.binding);
+        const choice = self.answers[self.asks];
+        const session_choice = choice == .allow_session or choice == .deny_session;
+        const candidate = request.candidate orelse return wire.UI_FATAL;
+        const response_json = sdk.encodeUiResponse(
+            std.heap.c_allocator,
+            parsed.value,
+            .{ .permission = .{
+                .permission = choice,
+                .request_id = request.request_id,
+                .policy_generation = request.policy_generation,
+                .rule_id = if (session_choice) candidate.rule_id else null,
+            } },
+        ) catch return wire.UI_FATAL;
+        const out = out_response orelse {
+            std.heap.c_allocator.free(response_json);
+            return wire.UI_FATAL;
+        };
+        out.* = .{ .ptr = response_json.ptr, .len = response_json.len };
+        self.asks += 1;
+        return wire.UI_ANSWERED;
+    }
+
+    fn releaseUi(raw: ?*anyopaque, response: ?*wire.OwnedBytesV1) callconv(.c) void {
+        const self: *@This() = @ptrCast(@alignCast(raw orelse return));
+        const out = response orelse return;
+        if (out.ptr) |ptr| {
+            const len = std.math.cast(usize, out.len) orelse return;
+            std.heap.c_allocator.free(ptr[0..len]);
+            self.ui_releases += 1;
+        }
+        out.* = .{ .ptr = null, .len = 0 };
+    }
+
+    fn callbacks(self: *@This()) wire.SessionCallbacksV1 {
+        var result = std.mem.zeroes(wire.SessionCallbacksV1);
+        result.struct_size = @sizeOf(wire.SessionCallbacksV1);
+        result.ctx = self;
+        result.on_event = event;
+        result.on_ui_request = ui;
+        result.release_response = releaseUi;
+        return result;
+    }
+
+    fn expectLastCall(
+        self: *const @This(),
+        decision: sdk.protocol.PermissionDecision,
+        source: sdk.protocol.PermissionDecisionSource,
+    ) !void {
+        try std.testing.expectEqual(decision, self.last_decision.?);
+        try std.testing.expectEqual(source, self.last_source.?);
+        try std.testing.expectEqual(source == .session_allow, self.last_used_session_rule);
+    }
+};
+
+fn applySwapConfiguration(
+    api: sdk.Api,
+    runtime: ?*wire.RuntimeHandle,
+    revision: u64,
+    server: *const wire.McpServerV1,
+    expected_generation: u64,
+) !void {
+    var configuration = std.mem.zeroes(wire.McpConfigurationV1);
+    configuration.struct_size = @sizeOf(wire.McpConfigurationV1);
+    configuration.desired_revision = revision;
+    configuration.servers = @ptrCast(server);
+    configuration.server_count = 1;
+    var report = std.mem.zeroes(wire.McpApplyReportV1);
+    var diagnostic = std.mem.zeroes(wire.OwnedBytesV1);
+    defer api.bufferRelease()(&diagnostic);
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.mcp().applyConfiguration()(runtime, &configuration, &report, &diagnostic),
+    );
+    try std.testing.expectEqual(wire.MCP_APPLY_APPLIED, report.disposition_code);
+    try std.testing.expectEqual(expected_generation, report.catalog_generation);
+}
+
+fn swapHostConfig(
+    base_url: []const u8,
+    root: []const u8,
+    selection: *const wire.McpSelectionV1,
+) wire.SessionHostConfigV1 {
+    var host = std.mem.zeroes(wire.SessionHostConfigV1);
+    host.struct_size = @sizeOf(wire.SessionHostConfigV1);
+    host.provider_kind_code = wire.PROVIDER_ANTHROPIC;
+    host.permission_mode_code = wire.PERMISSION_DEFAULT;
+    host.shell_policy_code = wire.SHELL_DISABLED;
+    host.api_key = sdk.bytesView("test-key");
+    host.base_url = sdk.bytesView(base_url);
+    host.workspace_root = sdk.bytesView(root);
+    host.workspace_home = sdk.bytesView(root);
+    host.mcp_selection = selection;
+    return host;
+}
+
+fn swapSelector() wire.McpSelectorV1 {
+    var selector = std.mem.zeroes(wire.McpSelectorV1);
+    selector.struct_size = @sizeOf(wire.McpSelectorV1);
+    selector.server_binding_identity = SWAP_BINDING;
+    selector.tool_name = sdk.bytesView("echo");
+    return selector;
+}
+
+fn swapRun(api: sdk.Api, session: ?*wire.SessionHandle, run_id: u64) !void {
+    var options = std.mem.zeroes(wire.RunOptionsV1);
+    options.struct_size = @sizeOf(wire.RunOptionsV1);
+    options.max_turns = 2;
+    var result = std.mem.zeroes(wire.RunResultV1);
+    var diagnostic = std.mem.zeroes(wire.OwnedBytesV1);
+    defer api.bufferRelease()(&diagnostic);
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.session().runText(session, run_id, sdk.bytesView("echo hello"), &options, &result, &diagnostic),
+    );
+    try std.testing.expectEqual(@as(u32, 1), result.tool_calls);
+}
+
+/// Counts the `tools/call` requests one cassette endpoint received.
+fn toolCallsReceived(server: *harness.MockServer) usize {
+    var calls: usize = 0;
+    var index: usize = 0;
+    while (server.requestAt(index)) |captured| : (index += 1) {
+        if (std.mem.indexOf(u8, captured.raw, "\"tools/call\"") != null) calls += 1;
+    }
+    return calls;
+}
+
+test "L2 MCP endpoint swap asks again instead of reusing an allow_session grant (#389)" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try rootPath(&tmp, &root_buffer);
+    var provider_bodies = [_][]const u8{ FINAL_SSE, FINAL_SSE } ** 5;
+    var provider = try harness.MockServer.startCassette(&provider_bodies, 0);
+    defer provider.stop();
+    const base_url = try provider.urlOwned(a);
+    defer a.free(base_url);
+
+    const a_bodies = [_][]const u8{
+        SWAP_MCP_DISCOVER,
+        SWAP_MCP_DISCOVER,
+        SWAP_MCP_LIST,
+        swapMcpCall(3, "A"),
+        swapMcpCall(4, "A"),
+    };
+    const a_statuses = [_][]const u8{SWAP_MCP_OK} ** a_bodies.len;
+    var endpoint_a = try harness.MockServer.startHttpCassette(&a_bodies, &a_statuses);
+    defer endpoint_a.stop();
+    const a_url = try endpoint_a.urlOwned(a);
+    defer a.free(a_url);
+    var connector_a = PublicHttpMcpConnector{ .url = a_url };
+    // B serves one connection, then a second after the timeout-only change.
+    const b_bodies = [_][]const u8{
+        SWAP_MCP_DISCOVER, SWAP_MCP_DISCOVER, SWAP_MCP_LIST, swapMcpCall(3, "B"),
+        SWAP_MCP_DISCOVER, SWAP_MCP_DISCOVER, SWAP_MCP_LIST, swapMcpCall(3, "B"),
+    };
+    const b_statuses = [_][]const u8{SWAP_MCP_OK} ** b_bodies.len;
+    var endpoint_b = try harness.MockServer.startHttpCassette(&b_bodies, &b_statuses);
+    defer endpoint_b.stop();
+    const b_url = try endpoint_b.urlOwned(a);
+    defer a.free(b_url);
+    var connector_b = PublicHttpMcpConnector{ .url = b_url };
+
+    const raw_api = abi.metask_agentcore_get_api(wire.ABI_VERSION_V1) orelse
+        return error.MissingApi;
+    const api = try sdk.Api.validate(@ptrCast(@alignCast(raw_api)));
+    var diagnostic = std.mem.zeroes(wire.OwnedBytesV1);
+    defer api.bufferRelease()(&diagnostic);
+    var runtime_config = std.mem.zeroes(wire.RuntimeConfigV1);
+    runtime_config.struct_size = @sizeOf(wire.RuntimeConfigV1);
+    var runtime: ?*wire.RuntimeHandle = null;
+    var session: ?*wire.SessionHandle = null;
+    defer {
+        if (session) |handle| _ = api.session().destroy()(handle, &diagnostic);
+        if (runtime) |handle| _ = api.runtime().destroy()(handle, &diagnostic);
+    }
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.runtime().create()(&runtime_config, null, &runtime, &diagnostic),
+    );
+    const server_a = swapMcpServer(&connector_a, SWAP_FINGERPRINT_A, 5000);
+    try applySwapConfiguration(api, runtime, 1, &server_a, 1);
+
+    const selectors = [_]wire.McpSelectorV1{swapSelector()};
+    var selection = std.mem.zeroes(wire.McpSelectionV1);
+    selection.struct_size = @sizeOf(wire.McpSelectionV1);
+    selection.selectors = &selectors;
+    selection.selector_count = selectors.len;
+    var host = swapHostConfig(base_url, root, &selection);
+    var create_config = sessionCreateConfig(&host, "test-model");
+    var probe = McpEndpointSwapProbe{
+        .answers = &.{ .allow_session, .deny_once, .allow_session },
+    };
+    var callbacks = probe.callbacks();
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.session().create()(runtime, &create_config, &callbacks, &session, &diagnostic),
+    );
+    const tool_sse = blk: {
+        const described = try decodeDescription(api, session);
+        defer described.deinit();
+        try std.testing.expectEqual(@as(usize, 1), described.value.mcp.tools.len);
+        break :blk try swapToolSse(a, described.value.mcp.tools[0].model_name);
+    };
+    defer a.free(tool_sse);
+    for (0..5) |run| provider_bodies[run * 2] = tool_sse;
+
+    // A: the first call asks, and its allow_session answer covers the next.
+    try swapRun(api, session, 1);
+    try std.testing.expectEqual(@as(u32, 1), probe.asks);
+    try probe.expectLastCall(.allow, .callback);
+    try swapRun(api, session, 2);
+    try std.testing.expectEqual(@as(u32, 1), probe.asks);
+    try probe.expectLastCall(.allow, .session_allow);
+    try std.testing.expectEqual(@as(u32, 2), probe.results_from_a);
+    try std.testing.expectEqual(@as(usize, 2), toolCallsReceived(endpoint_a));
+
+    // S now points at B under a new configuration fingerprint. The grant A
+    // earned does not reach B: the same call asks again, and the deny_once
+    // answer keeps the arguments away from B.
+    const server_b = swapMcpServer(&connector_b, SWAP_FINGERPRINT_B, 5000);
+    try applySwapConfiguration(api, runtime, 2, &server_b, 2);
+    try swapRun(api, session, 3);
+    try std.testing.expectEqual(@as(u32, 2), probe.asks);
+    try probe.expectLastCall(.deny, .callback);
+    try std.testing.expectEqual(@as(u32, 1), probe.denied_results);
+    try std.testing.expectEqual(@as(usize, 0), toolCallsReceived(endpoint_b));
+    // The request names B's identity, not the one A's grant is bound to.
+    try std.testing.expect(!std.mem.eql(u8, &probe.bindings[0], &probe.bindings[1]));
+
+    // A fresh allow_session answer authorizes B.
+    try swapRun(api, session, 4);
+    try std.testing.expectEqual(@as(u32, 3), probe.asks);
+    try probe.expectLastCall(.allow, .callback);
+    try std.testing.expectEqualSlices(u8, &probe.bindings[1], &probe.bindings[2]);
+    try std.testing.expectEqual(@as(u32, 1), probe.results_from_b);
+    try std.testing.expectEqual(@as(usize, 1), toolCallsReceived(endpoint_b));
+
+    // A configuration change that keeps the fingerprint (here only the
+    // timeout) is the same connection identity: the Runtime reconnects to B
+    // and the grant still applies.
+    const server_b_slow = swapMcpServer(&connector_b, SWAP_FINGERPRINT_B, 7000);
+    try applySwapConfiguration(api, runtime, 3, &server_b_slow, 3);
+    try swapRun(api, session, 5);
+    try std.testing.expectEqual(@as(u32, 3), probe.asks);
+    try probe.expectLastCall(.allow, .session_allow);
+    try std.testing.expectEqual(@as(u32, 2), probe.results_from_b);
+    try std.testing.expectEqual(@as(usize, 2), toolCallsReceived(endpoint_b));
+    try std.testing.expectEqual(@as(usize, 2), toolCallsReceived(endpoint_a));
+    try std.testing.expectEqual(probe.asks, probe.ui_releases);
+}
+
+test "L2 MCP checkpoint restore binds an allow_session grant to its endpoint (#389)" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try rootPath(&tmp, &root_buffer);
+    var provider_bodies = [_][]const u8{ FINAL_SSE, FINAL_SSE } ** 3;
+    var provider = try harness.MockServer.startCassette(&provider_bodies, 0);
+    defer provider.stop();
+    const base_url = try provider.urlOwned(a);
+    defer a.free(base_url);
+
+    const a_bodies = [_][]const u8{
+        SWAP_MCP_DISCOVER,
+        SWAP_MCP_DISCOVER,
+        SWAP_MCP_LIST,
+        swapMcpCall(3, "A"),
+        swapMcpCall(4, "A"),
+    };
+    const a_statuses = [_][]const u8{SWAP_MCP_OK} ** a_bodies.len;
+    var endpoint_a = try harness.MockServer.startHttpCassette(&a_bodies, &a_statuses);
+    defer endpoint_a.stop();
+    const a_url = try endpoint_a.urlOwned(a);
+    defer a.free(a_url);
+    var connector_a = PublicHttpMcpConnector{ .url = a_url };
+    const b_bodies = [_][]const u8{
+        SWAP_MCP_DISCOVER, SWAP_MCP_DISCOVER, SWAP_MCP_LIST, swapMcpCall(3, "B"),
+    };
+    const b_statuses = [_][]const u8{SWAP_MCP_OK} ** b_bodies.len;
+    var endpoint_b = try harness.MockServer.startHttpCassette(&b_bodies, &b_statuses);
+    defer endpoint_b.stop();
+    const b_url = try endpoint_b.urlOwned(a);
+    defer a.free(b_url);
+    var connector_b = PublicHttpMcpConnector{ .url = b_url };
+
+    const raw_api = abi.metask_agentcore_get_api(wire.ABI_VERSION_V1) orelse
+        return error.MissingApi;
+    const api = try sdk.Api.validate(@ptrCast(@alignCast(raw_api)));
+    var diagnostic = std.mem.zeroes(wire.OwnedBytesV1);
+    defer api.bufferRelease()(&diagnostic);
+    var runtime_config = std.mem.zeroes(wire.RuntimeConfigV1);
+    runtime_config.struct_size = @sizeOf(wire.RuntimeConfigV1);
+    var runtime: ?*wire.RuntimeHandle = null;
+    var session: ?*wire.SessionHandle = null;
+    defer {
+        if (session) |handle| _ = api.session().destroy()(handle, &diagnostic);
+        if (runtime) |handle| _ = api.runtime().destroy()(handle, &diagnostic);
+    }
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.runtime().create()(&runtime_config, null, &runtime, &diagnostic),
+    );
+    const server_a = swapMcpServer(&connector_a, SWAP_FINGERPRINT_A, 5000);
+    try applySwapConfiguration(api, runtime, 1, &server_a, 1);
+
+    const selectors = [_]wire.McpSelectorV1{swapSelector()};
+    var selection = std.mem.zeroes(wire.McpSelectionV1);
+    selection.struct_size = @sizeOf(wire.McpSelectionV1);
+    selection.selectors = &selectors;
+    selection.selector_count = selectors.len;
+    var host = swapHostConfig(base_url, root, &selection);
+    var create_config = sessionCreateConfig(&host, "test-model");
+    var probe = McpEndpointSwapProbe{
+        .answers = &.{ .allow_session, .allow_once },
+    };
+    var callbacks = probe.callbacks();
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.session().create()(runtime, &create_config, &callbacks, &session, &diagnostic),
+    );
+    const tool_sse = blk: {
+        const described = try decodeDescription(api, session);
+        defer described.deinit();
+        break :blk try swapToolSse(a, described.value.mcp.tools[0].model_name);
+    };
+    defer a.free(tool_sse);
+    for (0..3) |run| provider_bodies[run * 2] = tool_sse;
+
+    try swapRun(api, session, 1);
+    try std.testing.expectEqual(@as(u32, 1), probe.asks);
+    try probe.expectLastCall(.allow, .callback);
+
+    // The checkpoint carries the allow_session grant A earned.
+    var checkpoint = PublicCheckpointBuffer{};
+    defer checkpoint.deinit();
+    var limits = publicCheckpointLimits();
+    var sink = checkpoint.sink();
+    var export_config = std.mem.zeroes(wire.CheckpointExportConfigV1);
+    export_config.struct_size = @sizeOf(wire.CheckpointExportConfigV1);
+    export_config.limits = &limits;
+    export_config.sink = &sink;
+    var export_result = std.mem.zeroes(wire.CheckpointExportResultV1);
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.sessionControl().exportCheckpoint()(session, &export_config, &export_result, &diagnostic),
+    );
+    try std.testing.expectEqual(wire.STATUS_OK, api.session().destroy()(session, &diagnostic));
+    session = null;
+
+    var restore_config = std.mem.zeroes(wire.SessionRestoreConfigV1);
+    restore_config.struct_size = @sizeOf(wire.SessionRestoreConfigV1);
+    restore_config.host = &host;
+    restore_config.limits = &limits;
+    var restore_report = std.mem.zeroes(wire.OwnedBytesV1);
+    defer api.bufferRelease()(&restore_report);
+
+    // Restored while S still points at A, the grant comes back and covers
+    // the same call without a prompt.
+    var source = checkpoint.source();
+    restore_config.source = &source;
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.sessionControl().restore()(runtime, &restore_config, &callbacks, &session, &restore_report, &diagnostic),
+    );
+    {
+        const decoded = try sdk.decodeRestoreReport(a, try sdk.borrowedBytes(.{
+            .ptr = restore_report.ptr,
+            .len = restore_report.len,
+        }));
+        defer decoded.deinit();
+        try std.testing.expectEqual(sdk.protocol.RestoreHealth.complete, decoded.value.health);
+        try std.testing.expectEqual(@as(u32, 1), decoded.value.permission.restored_rules);
+        try std.testing.expectEqual(@as(u32, 0), decoded.value.permission.invalidated_rules);
+        try std.testing.expectEqual(@as(u32, 1), decoded.value.mcp.restored_bindings);
+    }
+    api.bufferRelease()(&restore_report);
+    try swapRun(api, session, 2);
+    try std.testing.expectEqual(@as(u32, 1), probe.asks);
+    try probe.expectLastCall(.allow, .session_allow);
+    try std.testing.expectEqual(@as(u32, 2), probe.results_from_a);
+    try std.testing.expectEqual(wire.STATUS_OK, api.session().destroy()(session, &diagnostic));
+    session = null;
+
+    // Restored after S moved to B, the Tool is still selected but the grant
+    // is invalidated and reported, so the same call asks again.
+    const server_b = swapMcpServer(&connector_b, SWAP_FINGERPRINT_B, 5000);
+    try applySwapConfiguration(api, runtime, 2, &server_b, 2);
+    source = checkpoint.source();
+    restore_config.source = &source;
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.sessionControl().restore()(runtime, &restore_config, &callbacks, &session, &restore_report, &diagnostic),
+    );
+    {
+        const decoded = try sdk.decodeRestoreReport(a, try sdk.borrowedBytes(.{
+            .ptr = restore_report.ptr,
+            .len = restore_report.len,
+        }));
+        defer decoded.deinit();
+        try std.testing.expectEqual(sdk.protocol.RestoreHealth.degraded, decoded.value.health);
+        try std.testing.expectEqual(@as(u32, 0), decoded.value.permission.restored_rules);
+        try std.testing.expectEqual(@as(u32, 1), decoded.value.permission.invalidated_rules);
+        try std.testing.expectEqual(@as(u32, 1), decoded.value.mcp.restored_bindings);
+        try std.testing.expectEqual(@as(u32, 0), decoded.value.mcp.invalidated_bindings);
+        try std.testing.expectEqual(@as(usize, 1), decoded.value.issues.len);
+        try std.testing.expectEqual(
+            sdk.protocol.AuthoritySubsystem.permission,
+            decoded.value.issues[0].subsystem,
+        );
+    }
+    try swapRun(api, session, 3);
+    try std.testing.expectEqual(@as(u32, 2), probe.asks);
+    try probe.expectLastCall(.allow, .callback);
+    try std.testing.expect(!std.mem.eql(u8, &probe.bindings[0], &probe.bindings[1]));
+    try std.testing.expectEqual(@as(u32, 1), probe.results_from_b);
+    try std.testing.expectEqual(@as(usize, 1), toolCallsReceived(endpoint_b));
+    try std.testing.expectEqual(@as(usize, 2), toolCallsReceived(endpoint_a));
+    try std.testing.expectEqual(probe.asks, probe.ui_releases);
+}

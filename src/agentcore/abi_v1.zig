@@ -6583,7 +6583,8 @@ fn restoreCheckpoint(
                 else
                     .unavailable,
                 .server_binding_identity = entry.server_binding_identity,
-                .authority_binding = identity.permissionBinding(),
+                // A selection names the Tool, not a connection.
+                .authority_binding = identity.authorityBinding(),
                 .canonical_name = entry.tool_name,
             });
         }
@@ -10573,6 +10574,288 @@ test "checkpoint restores compatible MCP view and exact Session grant" {
         &changed_description.authority_issues[0].issue_id,
     );
     try std.testing.expectEqual(@as(usize, 0), changed_description.mcp_tools.len);
+}
+
+/// #389 fixture: one server binding whose configuration the tests replace.
+const EndpointSwapFixture = struct {
+    const fixture = @import("mcp_test_support.zig");
+    const binding = [_]u8{0x7a} ** 32;
+    const fingerprint_a = [_]u8{0xa0} ** 32;
+    const fingerprint_b = [_]u8{0xb0} ** 32;
+    const arguments_json = "{\"city\":\"Paris\"}";
+    const selectors = [_]mcp_session.Selector{.{
+        .server_binding_identity = binding,
+        .tool_name = "weather",
+    }};
+
+    native_runtime: *core.agent_session.AgentRuntime,
+    runtime: AbiRuntime,
+    endpoint_a: fixture.Server = .{},
+    endpoint_b: fixture.Server = .{},
+    revision: u64 = 0,
+
+    fn init(self: *EndpointSwapFixture) !void {
+        self.* = .{
+            .native_runtime = try core.agent_session.AgentRuntime.create(
+                std.testing.allocator,
+                .{ .builtin_tools = &.{} },
+            ),
+            .runtime = undefined,
+        };
+        errdefer self.native_runtime.destroy() catch unreachable;
+        self.runtime = .{
+            .core_runtime = self.native_runtime,
+            .host_tools = &.{},
+            .catalogs = skill_catalog_handles.RuntimeCatalogs.initWithSecret(
+                std.testing.allocator,
+                [_]u8{0x7b} ** 32,
+            ),
+            .materializations = undefined,
+            .mcp_manager = try mcp_catalog.Manager.init(std.testing.allocator, &.{}, .{}),
+        };
+    }
+
+    fn deinit(self: *EndpointSwapFixture) void {
+        if (self.runtime.mcp_manager) |*manager| manager.deinit();
+        self.runtime.mcp_manager = null;
+        self.runtime.catalogs.tryBeginDestroy() catch unreachable;
+        self.runtime.catalogs.finishDestroy();
+        self.native_runtime.destroy() catch unreachable;
+    }
+
+    /// Point the binding at `endpoint` under `fingerprint` as a newer
+    /// desired revision.
+    fn apply(
+        self: *EndpointSwapFixture,
+        endpoint: *fixture.Server,
+        fingerprint: [32]u8,
+        timeout_ms: u32,
+    ) !void {
+        self.revision += 1;
+        const report = try self.runtime.mcp_manager.?.apply(self.revision, &.{.{
+            .binding = binding,
+            .namespace = "weather",
+            .configuration_fingerprint = fingerprint,
+            .connector = endpoint.connector(),
+            .transport = .stdio,
+            .client = .{ .name = "agentcore-test", .version = "1" },
+            .timeout_ms = timeout_ms,
+        }});
+        try std.testing.expectEqual(mcp_catalog.ApplyDisposition.applied, report.disposition);
+    }
+
+    fn createSession(self: *EndpointSwapFixture, cwd: []const u8) !*AbiSession {
+        return buildAbiSession(&self.runtime, .{
+            .callbacks = std.mem.zeroes(wire.SessionCallbacksV1),
+            .provider_kind = .anthropic,
+            .api_key = "test-key",
+            .model = "test-model",
+            .base_url = null,
+            .permission_mode = .default,
+            .permission_rules = null,
+            .workspace = .{ .root = cwd, .home = cwd },
+            .allowed_tools = &.{},
+            .workspace_scope_id = [_]u8{0} ** 64,
+            .skill_binding = null,
+            .mcp_selectors = &selectors,
+        });
+    }
+
+    fn destroySession(session: *AbiSession) void {
+        var diagnostic = std.mem.zeroes(wire.OwnedBytesV1);
+        const status = sessionDestroy(session.handle(), &diagnostic);
+        bufferRelease(&diagnostic);
+        std.debug.assert(status == wire.STATUS_OK);
+    }
+
+    /// The identity a Run admitted now binds Permission to.
+    fn runIdentity(session: *AbiSession) !session_permission.ToolIdentity {
+        var run_view = (try session.materializeMcpRunView()).?;
+        defer run_view.deinit();
+        try std.testing.expectEqual(@as(usize, 1), run_view.entries.len);
+        return run_view.entries[0].permissionIdentity();
+    }
+
+    /// The live Permission decision of a Run admitted now, through the same
+    /// seam a real MCP call takes.
+    fn decide(session: *AbiSession) !core.permission.PermissionResult {
+        var run_view = (try session.materializeMcpRunView()).?;
+        defer run_view.deinit();
+        var environment = try mcp_session.Environment.init(
+            std.testing.allocator,
+            &run_view,
+            session.core_session.tools.definitions,
+            session.core_session.tools.dispatcher(),
+            null,
+        );
+        defer environment.deinit();
+        session.active_mcp_environment = &environment;
+        defer session.active_mcp_environment = null;
+        return core.permission.checkPermission(
+            &session.core_session.permission_ctx,
+            run_view.entries[0].model_name,
+            arguments_json,
+        );
+    }
+
+    fn grantSession(session: *AbiSession) !void {
+        const digest = try session_permission.digestCanonicalArguments(
+            std.testing.allocator,
+            arguments_json,
+            .{},
+        );
+        _ = try session.permission_state.remember(
+            .allow_session,
+            (try session_permission.deriveRuleCandidate(try runIdentity(session), digest)).?,
+            session.policy_generation,
+        );
+    }
+};
+
+test "MCP Session grant follows the server configuration fingerprint, not the binding alone (#389)" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const cwd = root_buffer[0..root_len];
+    var swap: EndpointSwapFixture = undefined;
+    try swap.init();
+    defer swap.deinit();
+    try swap.apply(&swap.endpoint_a, EndpointSwapFixture.fingerprint_a, 30_000);
+    const session = try swap.createSession(cwd);
+    defer EndpointSwapFixture.destroySession(session);
+
+    try std.testing.expectEqual(core.permission.PermissionResult.ask, try EndpointSwapFixture.decide(session));
+    try EndpointSwapFixture.grantSession(session);
+    const granted = try EndpointSwapFixture.runIdentity(session);
+    try std.testing.expectEqual(core.permission.PermissionResult.allow, try EndpointSwapFixture.decide(session));
+
+    // A change that keeps the fingerprint reconnects but is the same
+    // connection identity, so the grant still decides.
+    const opens_before = swap.endpoint_a.opens;
+    try swap.apply(&swap.endpoint_a, EndpointSwapFixture.fingerprint_a, 20_000);
+    try std.testing.expect(swap.endpoint_a.opens > opens_before);
+    try std.testing.expectEqual(core.permission.PermissionResult.allow, try EndpointSwapFixture.decide(session));
+
+    // The binding, name and schema stay; the endpoint and fingerprint move.
+    // The Session still selects the Tool, and the call asks again under an
+    // identity A's grant does not name.
+    try swap.apply(&swap.endpoint_b, EndpointSwapFixture.fingerprint_b, 30_000);
+    try std.testing.expectEqual(core.permission.PermissionResult.ask, try EndpointSwapFixture.decide(session));
+    const pending = session.pending_permission.?;
+    try std.testing.expectEqual(session_permission.ToolNamespace.mcp, pending.tool_namespace);
+    try std.testing.expect(!std.mem.eql(u8, &granted.binding, &pending.binding));
+    try std.testing.expectEqual(@as(usize, 1), session.permission_state.ruleCount());
+
+    // AgentCore cannot see endpoints: the Host's fingerprint is the
+    // connection identity. A new fingerprint over the same connector asks.
+    const fingerprint_c = [_]u8{0xc0} ** 32;
+    try swap.apply(&swap.endpoint_a, fingerprint_c, 30_000);
+    try std.testing.expectEqual(core.permission.PermissionResult.ask, try EndpointSwapFixture.decide(session));
+
+    // The grant names A's connection, so declaring A again revives it.
+    try swap.apply(&swap.endpoint_a, EndpointSwapFixture.fingerprint_a, 30_000);
+    try std.testing.expectEqual(core.permission.PermissionResult.allow, try EndpointSwapFixture.decide(session));
+
+    // Reselecting while S points at B rebuilds the Session's authority from
+    // the current catalog and drops A's grant, as a restore would.
+    try swap.apply(&swap.endpoint_b, EndpointSwapFixture.fingerprint_b, 30_000);
+    try session.updateMcpSelection(&EndpointSwapFixture.selectors, .fresh);
+    try std.testing.expectEqual(@as(usize, 0), session.permission_state.ruleCount());
+    try std.testing.expectEqual(@as(u32, 1), session.invalidated_mcp_bindings);
+    try std.testing.expectEqual(session_authority.RestoreHealth.degraded, session.restore_health);
+    try std.testing.expectEqualSlices(
+        u8,
+        &(try EndpointSwapFixture.runIdentity(session)).binding,
+        &session.mcp_selection.?.entries[0].permissionIdentity().binding,
+    );
+    try std.testing.expectEqual(core.permission.PermissionResult.ask, try EndpointSwapFixture.decide(session));
+}
+
+test "checkpoint restore keeps an MCP Session grant only on its own connection (#389)" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const cwd = root_buffer[0..root_len];
+    var swap: EndpointSwapFixture = undefined;
+    try swap.init();
+    defer swap.deinit();
+    try swap.apply(&swap.endpoint_a, EndpointSwapFixture.fingerprint_a, 30_000);
+    const original = try swap.createSession(cwd);
+    var original_live = true;
+    defer if (original_live) EndpointSwapFixture.destroySession(original);
+    try EndpointSwapFixture.grantSession(original);
+    const granted = try EndpointSwapFixture.runIdentity(original);
+    var checkpoint = TestCheckpointBuffer{ .allocator = std.testing.allocator };
+    defer checkpoint.deinit();
+    const limits = session_checkpoint.Limits{ .hard_bytes = 1024 * 1024 };
+    _ = try original.exportCheckpoint(limits, checkpoint.sink());
+    EndpointSwapFixture.destroySession(original);
+    original_live = false;
+
+    const restore_config = RestoreHostConfig{
+        .callbacks = std.mem.zeroes(wire.SessionCallbacksV1),
+        .provider_kind = .anthropic,
+        .api_key = "test-key",
+        .base_url = null,
+        .permission_mode = .default,
+        .permission_rules = null,
+        .workspace = .{ .root = cwd, .home = cwd },
+        .allowed_tools = &.{},
+        .mcp_selectors = &EndpointSwapFixture.selectors,
+        .workspace_scope_id = [_]u8{0} ** 64,
+    };
+    var no_binding: ?SkillBinding = null;
+
+    // Same connection identity, even over a reconnected instance: the grant
+    // restores and decides.
+    try swap.apply(&swap.endpoint_a, EndpointSwapFixture.fingerprint_a, 20_000);
+    {
+        const restored = try restoreCheckpoint(
+            &swap.runtime,
+            restore_config,
+            &no_binding,
+            checkpoint.source(),
+            limits,
+        );
+        defer EndpointSwapFixture.destroySession(restored.session);
+        try std.testing.expectEqual(session_authority.RestoreHealth.complete, restored.report.health);
+        try std.testing.expectEqual(@as(u32, 1), restored.report.permission_rules_restored);
+        try std.testing.expectEqual(@as(u32, 0), restored.report.permission_rules_invalidated);
+        try std.testing.expectEqual(@as(u32, 1), restored.report.mcp_bindings_restored);
+        try std.testing.expectEqual(
+            core.permission.PermissionResult.allow,
+            try EndpointSwapFixture.decide(restored.session),
+        );
+    }
+
+    // After S moves to B the Tool still restores, but the grant does not:
+    // it is reported, and the same call asks again, as on the live Session.
+    try swap.apply(&swap.endpoint_b, EndpointSwapFixture.fingerprint_b, 30_000);
+    const moved = try restoreCheckpoint(
+        &swap.runtime,
+        restore_config,
+        &no_binding,
+        checkpoint.source(),
+        limits,
+    );
+    defer EndpointSwapFixture.destroySession(moved.session);
+    try std.testing.expectEqual(session_authority.RestoreHealth.degraded, moved.report.health);
+    try std.testing.expectEqual(@as(u32, 0), moved.report.permission_rules_restored);
+    try std.testing.expectEqual(@as(u32, 1), moved.report.permission_rules_invalidated);
+    try std.testing.expectEqual(@as(u32, 1), moved.report.mcp_bindings_restored);
+    try std.testing.expectEqual(@as(u32, 0), moved.report.mcp_bindings_invalidated);
+    try std.testing.expectEqual(@as(usize, 0), moved.session.permission_state.ruleCount());
+    try std.testing.expectEqual(@as(usize, 1), moved.report.issues.len);
+    const issue = moved.report.issues[0];
+    try std.testing.expectEqual(session_authority.AuthoritySubsystem.permission, issue.subsystem);
+    try std.testing.expectEqual(session_authority.AuthorityIssueReason.unavailable, issue.reason);
+    try std.testing.expectEqualSlices(u8, &granted.binding, &issue.authority_binding);
+    try std.testing.expectEqual(
+        core.permission.PermissionResult.ask,
+        try EndpointSwapFixture.decide(moved.session),
+    );
 }
 
 test "AgentCore event JSON sanitizes only invalid file-change diffs" {

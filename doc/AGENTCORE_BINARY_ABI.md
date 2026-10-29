@@ -1719,6 +1719,34 @@ expired, restore degrades and invalidates that authority, and a newly admitted
 Run never receives stale MCP Tools. An already admitted Run keeps its immutable
 environment until terminal completion.
 
+`McpServerV1.configuration_fingerprint` is the Host's nonzero, non-secret name
+for the connection a server binding reaches: its endpoint, transport target
+and authentication context, as the Host defines them. AgentCore never sees the
+endpoint, so this value is the connection identity it trusts. Each MCP Tool's
+`permission_binding` (in `runtime_describe_mcp`, Session `describe`,
+Permission requests and `permission_provenance`) binds the server binding,
+the MCP Tool name, the semantic schema and that fingerprint, and Session
+grants match on it (#389):
+
+- **Endpoint moved.** When `apply_configuration` keeps a server binding, Tool
+  name and schema but changes the fingerprint, a Session that selected the
+  Tool keeps it, and its next call asks again. An `allow_session` or
+  `deny_session` answer given over the old connection matches that connection
+  only; a configuration that declares the old fingerprint again matches it
+  again.
+- **Same connection.** A change that keeps the fingerprint (namespace, client
+  information, timeout, negotiation policy, protocol limits) is the same
+  connection. The Runtime may reconnect, and grants keep deciding.
+- **Host duty.** A Host changes the fingerprint whenever the endpoint, the
+  transport target or the authentication context changes. A fingerprint that
+  hides such a change lets grants follow it.
+- **Rebuilt authority.** Restore and `update_selection` resolve each MCP
+  grant against the current catalog and drop one whose connection is no
+  longer the server's, as an invalidated `permission` rule with an issue
+  (reason `unavailable`). Session `describe` reports each Tool's binding as
+  of its selection (create, `update_selection` or restore); a Run binds to
+  the server's current fingerprint.
+
 One server's transport, protocol, or catalog resource-limit failure produces a
 server-scoped issue and does not suppress healthy servers in the same refresh.
 Only Runtime-local failures such as allocation exhaustion abort the refresh.
@@ -1788,6 +1816,11 @@ outside Revision 25.
 The value-only MCP checkpoint section has one current `MCPSEL` format and no
 independent revision axis. Its decoder rejects every earlier `R6MCP`/`R7MCP`
 encoding. Era remains provenance rather than a selection fingerprint input.
+The section records no configuration fingerprint: restore binds the selected
+Tools to the current catalog's, and the permission section's grants restore
+only where their binding names that connection. MCP grants in checkpoints
+exported before #389 carry the earlier connection-free binding, so restore
+invalidates them.
 The outer AgentCore ABI Revision 25 remains the sole compatibility boundary.
 
 ### Model-visible MCP diagnostics
@@ -1980,7 +2013,9 @@ part in later decisions; `deny_session`/`allow_session` echo its `rule_id`.
 `scope` says how far the answer reaches:
 
 - `exact_arguments` (every eligible Tool; `target` is null): later calls of
-  the same Tool identity with the same canonical argument value.
+  the same Tool identity with the same canonical argument value. An MCP Tool
+  identity includes the connection the call reaches; see [MCP Runtime catalog
+  and Session view](#mcp-runtime-catalog-and-session-view).
 - `file_target` (built-in `Write` and `Edit` only): later calls of the same
   Tool on the same canonical file, whatever their content or edit strings.
   `target` is that file's canonical path, for the Host to show the user.

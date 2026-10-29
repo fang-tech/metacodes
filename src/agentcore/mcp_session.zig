@@ -44,11 +44,15 @@ pub const Entry = struct {
     model_name: []const u8,
     prepared: schema.PreparedTool,
 
+    /// Bound to the connection this Run reaches, so a grant earned over one
+    /// server configuration cannot authorize a call over another (#389).
     pub fn permissionIdentity(self: *const Entry) session_permission.ToolIdentity {
         return .{
             .namespace = .mcp,
             .name = self.tool.identity.name,
-            .binding = self.tool.identity.permissionBinding(),
+            .binding = self.tool.identity.permissionBinding(
+                &self.server.configuration_fingerprint,
+            ),
         };
     }
 
@@ -84,6 +88,9 @@ pub const Selection = struct {
     pub const SelectedEntry = struct {
         server_binding_identity: [32]u8,
         schema_fingerprint: [32]u8,
+        /// The server's connection identity when this entry was selected or
+        /// restored. A Run binds Permission to the then-current one instead.
+        configuration_fingerprint: [32]u8,
         tool_name: []const u8,
         model_name: []const u8,
         namespace: []const u8,
@@ -98,7 +105,7 @@ pub const Selection = struct {
             return .{
                 .namespace = .mcp,
                 .name = self.tool_name,
-                .binding = identity.permissionBinding(),
+                .binding = identity.permissionBinding(&self.configuration_fingerprint),
             };
         }
     };
@@ -133,6 +140,7 @@ pub const Selection = struct {
             selected.* = .{
                 .server_binding_identity = entry.tool.identity.server_binding_identity,
                 .schema_fingerprint = entry.tool.identity.schema_fingerprint,
+                .configuration_fingerprint = entry.server.configuration_fingerprint,
                 .tool_name = tool_name,
                 .model_name = a.dupe(u8, entry.model_name) catch
                     return error.OutOfMemory,
@@ -885,7 +893,9 @@ test "Session MCP view binds identity validates argument envelope and retains ge
     try std.testing.expectEqualStrings("weather", identity.name);
     try std.testing.expectEqualSlices(
         u8,
-        &first.entries[0].tool.identity.permissionBinding(),
+        &first.entries[0].tool.identity.permissionBinding(
+            &first.entries[0].server.configuration_fingerprint,
+        ),
         &identity.binding,
     );
     try std.testing.expect(first.validatesInvocation(model_name, "{\"city\":\"Paris\"}"));
