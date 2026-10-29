@@ -120,6 +120,9 @@ pub const TickServicedClock = struct {
 /// 队列的人的按键一样,却不经过 ConPTY 管道那一层的时序:同批、分两次、只剩抬键,测试想造哪种就是哪种。
 /// 实现:一个伪控制台,里面跑一个不读输入的 `ping` 让它有客户端,本进程 `AttachConsole` 上去。
 /// 非 Windows 跳过;本进程 stdout/stderr 是控制台时也跳过(`FreeConsole` 会让它们失效)。
+/// 用它的测试要在编译期跳过别的平台(`if (builtin.os.tag != .windows) return error.SkipZigTest;`):
+/// `begin` 只在运行时报跳过,编译器照样分析后面的调用。各方法在别的平台上直接返回、不碰 Windows
+/// API,所以引用它们的代码也能编译。
 pub const PrivateConsole = struct {
     hpc: HPCON,
     child: win.HANDLE,
@@ -211,6 +214,7 @@ pub const PrivateConsole = struct {
     }
 
     pub fn end(self: *PrivateConsole) void {
+        if (builtin.os.tag != .windows) return;
         // readInput 的缓冲是进程级的:别留给后面的测试。
         terminal.discardPendingInput(0);
         closeAll(&.{self.conin});
@@ -224,6 +228,7 @@ pub const PrivateConsole = struct {
 
     /// 把 `events` 一次排进输入队列。
     pub fn send(self: *const PrivateConsole, events: []const Event) !void {
+        if (builtin.os.tag != .windows) return error.SkipZigTest;
         var records: [16]INPUT_RECORD = undefined;
         for (events, records[0..events.len]) |e, *r| r.* = switch (e) {
             .down, .up => |c| .{ .EventType = KEY_EVENT, .Event = .{ .KeyEvent = .{
@@ -246,6 +251,7 @@ pub const PrivateConsole = struct {
 
     /// 队列里还有几条按键按下的记录(只看不取)。
     pub fn keyDownsQueued(self: *const PrivateConsole) usize {
+        if (builtin.os.tag != .windows) return 0;
         var records: [64]INPUT_RECORD = undefined;
         var got: win.DWORD = 0;
         if (PeekConsoleInputW(self.conin, &records, records.len, &got) == 0) return 0;

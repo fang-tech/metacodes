@@ -1817,6 +1817,9 @@ test "KeyParser: 人按的 Esc 再按 Enter(分两次到达)仍是 Esc + Enter" 
 
 test "readKey(Windows 控制台):ESC CR 同批读到是 Shift+Enter,ESC 读走后才到的 CR 是两个键" {
     // 往测试自己的控制台输入队列里写键盘记录,走真实的 readInput / waitReadable,不依赖 ConPTY 时序。
+    // 编译期跳过:否则别的平台也要分析下面对 Windows API 的调用(macOS 不认 winapi 调用约定,
+    // Linux 链接不到 kernel32 的符号)。
+    if (@import("builtin").os.tag != .windows) return error.SkipZigTest;
     var console = try @import("platform").test_support.PrivateConsole.begin();
     defer console.end();
     var p = KeyParser{};
