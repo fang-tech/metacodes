@@ -2130,12 +2130,14 @@ test "collectStartupInput: it waits two round trips of the terminal for the rest
     try testing.expectEqual(@as(i32, 500), startupSettleMs(5000));
     if (@import("builtin").os.tag == .windows) return error.SkipZigTest; // pipe as the terminal
     // A paste whose second half comes `gap_ms` after the first, as a slow
-    // link delivers it a round trip apart.
+    // link delivers it a round trip apart. Each case leaves 400 ms or more
+    // between the gap and the wait, so a thread a loaded runner wakes late
+    // (100 ms and more seen on macOS) does not change the outcome.
     const cases = [_]struct { round_trip_ms: ?i64, gap_ms: u64, whole: bool }{
-        // 120 ms round trip, 100 ms apart: one paste.
-        .{ .round_trip_ms = 120, .gap_ms = 100, .whole = true },
-        // Waiting only 50 ms, the second half is left to arrive as keys.
-        .{ .round_trip_ms = null, .gap_ms = 150, .whole = false },
+        // 250 ms round trip (500 ms wait), 100 ms apart: one paste.
+        .{ .round_trip_ms = 250, .gap_ms = 100, .whole = true },
+        // Waiting only 50 ms, the second half 500 ms later arrives as keys.
+        .{ .round_trip_ms = null, .gap_ms = 500, .whole = false },
     };
     for (cases) |case| {
         var fds: [2]c_int = undefined;
