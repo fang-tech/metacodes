@@ -10,6 +10,7 @@
 const std = @import("std");
 const pfs = @import("platform").fs;
 const platform_signal = @import("platform").signal;
+const platform_sync = @import("platform").sync;
 const platform_term = @import("platform").terminal;
 const posix = std.posix;
 const app_mod = @import("../app.zig");
@@ -152,12 +153,17 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, startup: Startup) !v
     else
         null;
 
+    // 启动 prompt 建议:基于 git 最近改动的文件给一条灰色提示(对齐 Claude Code)。它的 git log
+    // 先在后台跑起来,与 banner 并行;首个输入框至多等它 STARTUP_SUGGESTION_WAIT_MS。
+    // A resumed session goes on with its conversation; the suggestion is for a new one.
+    var suggestion_git: StartupSuggestionGit = .{};
+    if (startup.resumed == null and platform_term.isatty(1)) suggestion_git.start();
+    defer suggestion_git.finish();
+
     printStartupBanner(app, allocator, splash);
     splash = .off; // ended (and freed) by the banner
 
-    // 启动 prompt 建议:基于 git 最近改动的文件给一条灰色提示(对齐 Claude Code)。
-    // A resumed session goes on with its conversation; the suggestion is for a new one.
-    if (startup.resumed == null) printStartupSuggestion(allocator);
+    printStartupSuggestion(&suggestion_git);
 
     // U11(issue #3):config/会话 mutation 统一走 SessionService(web/daemon 同一命令面);
     // 渲染仍留 TUI。借 *App、不持 backend,方法只在本(driver)线程调。
@@ -5067,12 +5073,10 @@ fn prefixToDisplayWidth(s: []const u8, max_cols: usize) []const u8 {
     return s[0..i];
 }
 
-/// 启动建议:跑 `git log` 找最近改动文件,给一条灰色提示。失败静默。
-fn printStartupSuggestion(allocator: std.mem.Allocator) void {
-    if (!platform_term.isatty(1)) return; // 非 TTY 不显示
-    const argv = [_]?[*:0]const u8{ "/usr/bin/env", "git", "log", "-1", "--name-only", "--pretty=format:", null };
-    const out = @import("../tools/common.zig").spawnCaptureStdoutAbortableTimed(argv[0..], allocator, null, 2000) catch return;
-    defer allocator.free(out);
+/// 启动建议:`git log` 找到的最近改动文件,给一条灰色提示。git 失败、没在时限内答复则静默。
+fn printStartupSuggestion(git: *StartupSuggestionGit) void {
+    const out = git.take() orelse return;
+    defer std.heap.c_allocator.free(out);
     // 取第一个非空行作为最近改动文件
     var it = std.mem.splitScalar(u8, out, '\n');
     while (it.next()) |line| {
@@ -5082,6 +5086,83 @@ fn printStartupSuggestion(allocator: std.mem.Allocator) void {
         return;
     }
 }
+
+/// How long the first prompt waits for the startup suggestion's `git log`,
+/// counted from the start of the REPL; past it this session has no
+/// suggestion. The capture runs git with an empty environment, so on macOS
+/// it is `/usr/bin/git`, Xcode's shim: 20-40 ms warm on macOS 26, 15 and 15
+/// Intel runners (3 ms on Linux), but 1.1-2.5 s while the xcrun cache is
+/// cold, when its first calls run `xcodebuild -license check` and `-find
+/// git`. The old code waited for it up to 2 s (2026-10-29).
+const STARTUP_SUGGESTION_WAIT_MS: i64 = 250;
+
+/// How long the suggestion's git may run in the background after the first
+/// prompt stopped waiting for it. A cold shim killed before it finishes
+/// never writes its cache (measured: killed at 250 ms three times, the next
+/// call still took 1.1-1.8 s), so every later start would find it cold
+/// again and never show a suggestion. The old 2 s limit cut the slowest
+/// ones off too (2.2-2.5 s on a macOS 15 Intel runner). Let run to its end,
+/// it warms, and the next start has the suggestion.
+const STARTUP_SUGGESTION_GIT_LIMIT_MS: u64 = 10_000;
+
+/// The startup suggestion's `git log`, on a thread of its own from the start
+/// of the REPL (it runs while the banner prints). `take` waits for its answer
+/// until STARTUP_SUGGESTION_WAIT_MS; a git still running then goes on, up to
+/// STARTUP_SUGGESTION_GIT_LIMIT_MS, and `finish` stops it when the REPL ends
+/// (the capture kills its process group), so none outlives the session.
+const StartupSuggestionGit = struct {
+    mutex: platform_sync.Mutex = .{},
+    cond: platform_sync.Condition = .{},
+    /// Raised by `finish`; the capture checks it while it waits on git.
+    stop: @import("../util/abort.zig").AbortSignal = .init(),
+    thread: ?std.Thread = null,
+    started_ms: i64 = 0,
+    done: bool = false,
+    /// git's stdout (c_allocator) once done, until `take` hands it over.
+    out: ?[]u8 = null,
+
+    fn start(self: *StartupSuggestionGit) void {
+        self.started_ms = util_time.nowMs();
+        self.thread = std.Thread.spawn(.{}, fetch, .{self}) catch null;
+    }
+
+    fn fetch(self: *StartupSuggestionGit) void {
+        const argv = [_]?[*:0]const u8{ "/usr/bin/env", "git", "log", "-1", "--name-only", "--pretty=format:", null };
+        const out = @import("../tools/common.zig").spawnCaptureStdoutAbortableTimed(argv[0..], std.heap.c_allocator, &self.stop, STARTUP_SUGGESTION_GIT_LIMIT_MS) catch null;
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.out = out;
+        self.done = true;
+        self.cond.signal();
+    }
+
+    /// git's stdout if it answered in time (the caller frees it with
+    /// c_allocator); null if it failed, was not started, or is still running.
+    fn take(self: *StartupSuggestionGit) ?[]u8 {
+        if (self.thread == null) return null;
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const deadline = self.started_ms + STARTUP_SUGGESTION_WAIT_MS;
+        while (!self.done) {
+            const left = deadline - util_time.nowMs();
+            if (left <= 0) return null;
+            _ = self.cond.timedWait(&self.mutex, @as(u64, @intCast(left)) * std.time.ns_per_ms);
+        }
+        const out = self.out;
+        self.out = null;
+        return out;
+    }
+
+    /// The REPL ends: a git still running is stopped, and an answer nobody
+    /// took is freed. Waits at most one of the capture's polls (100 ms) and
+    /// its kill.
+    fn finish(self: *StartupSuggestionGit) void {
+        const thread = self.thread orelse return;
+        self.stop.abort(.timeout); // the capture reads only that it was raised
+        thread.join();
+        if (self.out) |out| std.heap.c_allocator.free(out);
+    }
+};
 
 /// 取终端行数(失败回退 24)。
 fn termRows() usize {
