@@ -185,6 +185,13 @@ Leaving a session that has run a turn prints the command that reopens it,
 `metacodes --resume <id>`; inside the TUI, `/resume` lists this directory's
 sessions.
 
+In the prompt, Enter submits and Shift+Enter starts a new line where the
+terminal can tell the two apart. When the footer says `\ + ⏎ for newline`, end
+the line with `\` and press Enter instead, or run `/terminal-setup` once: in
+Apple Terminal and in VS Code (and its forks) it binds Shift+Enter in the
+terminal's own settings, after a backup, and `/terminal-setup restore` undoes
+it ([Terminal setup](TERMINAL_SETUP.md)).
+
 `metacodes --help` lists every flag. Embedding the runtime in your own process
 (Zig module or the AgentCore C ABI) starts at [API.md](API.md).
 

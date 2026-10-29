@@ -60,6 +60,7 @@ pub const BUILTIN_VERBS = [_]VerbSpec{
     .{ .name = "hooks", .class = .local },
     .{ .name = "permissions", .class = .local },
     .{ .name = "memory", .class = .local }, // edit 走 $EDITOR(tty),终端宏
+    .{ .name = "terminal-setup", .class = .local }, // 改的是本机终端的配置,只对终端前端有意义
     // 离线渲染测试钩子(终端专属)
     .{ .name = "task-test", .class = .local, .colon_payload = true },
     .{ .name = "task-test-done", .class = .local, .colon_payload = true },
