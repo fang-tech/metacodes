@@ -713,17 +713,6 @@ pub fn setSendTimeoutMs(s: Socket, ms: u32) void {
     setTimeoutMs(s, .send, ms);
 }
 
-/// 收缓冲(SO_RCVBUF),即对端能填满的窗口上限。accept 出来的 socket 继承监听 socket 的值,
-/// 所以要在对端连上之前设在监听 socket 上。
-pub fn setRecvBufferBytes(s: Socket, bytes: u31) void {
-    const size: i32 = bytes;
-    if (is_windows) {
-        _ = sys.setsockopt(s, ws2.SOL.SOCKET, ws2.SO.RCVBUF, @ptrCast(&size), @sizeOf(i32));
-    } else {
-        _ = std.c.setsockopt(s, std.c.SOL.SOCKET, std.c.SO.RCVBUF, &size, @sizeOf(i32));
-    }
-}
-
 // optname 在 POSIX 是 u32、Windows 是 i32,类型不一,故不跨平台传参,分支内各取常量。
 fn setTimeoutMs(s: Socket, which: enum { recv, send }, ms: u32) void {
     if (is_windows) {

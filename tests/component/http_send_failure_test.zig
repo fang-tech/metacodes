@@ -15,6 +15,7 @@
 //! unread, which resets the connection while the client is still writing.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const harness = @import("harness");
 const cc = @import("cc");
 
@@ -22,6 +23,17 @@ const http_connection = cc.api_http_connection;
 
 /// Far more than loopback socket buffers hold, so the reset lands mid-send.
 const LARGE_BODY_BYTES: usize = 16 * 1024 * 1024;
+
+/// The behaviour cases need a send that fails partway through its body.
+/// Windows does not produce one: there a large loopback send completes once
+/// it is queued, and on CI (runs 40867836680 and 40870213906) the 16 MB send
+/// returned without error, even against an 8 KB receive window, and the
+/// reset surfaced in `receiveHead`, where std closes the connection itself.
+/// The wrapper and the source guard do not depend on the platform; the guard
+/// runs everywhere.
+fn requireSendFailingMidBody() !void {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+}
 
 const ANTHROPIC_SSE =
     "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":0,\"output_tokens\":0}}}\n\n" ++
@@ -65,6 +77,7 @@ fn expectServed(client: *std.http.Client, uri: std.Uri) !void {
 // The second half shows the helper's bodiless send recovering a pool that a
 // raw send left poisoned.
 test "L2 send failure: std pools the connection a failed send leaves behind; sendBodiless drops it" {
+    try requireSendFailingMidBody();
     const a = std.testing.allocator;
     var srv = try harness.MockServer.startResetDuringUpload(ANTHROPIC_SSE, 1);
     defer srv.stop();
@@ -100,6 +113,7 @@ test "L2 send failure: std pools the connection a failed send leaves behind; sen
 }
 
 test "L2 send failure: http_connection.sendBodyComplete closes the connection and the next request opens a new one" {
+    try requireSendFailingMidBody();
     const a = std.testing.allocator;
     var srv = try harness.MockServer.startResetDuringUpload(ANTHROPIC_SSE, 1);
     defer srv.stop();
@@ -149,6 +163,7 @@ fn expectProviderRecovers(provider: cc.api_provider.Provider, srv: *harness.Mock
 }
 
 test "L2 send failure: each provider client opens a new connection after an upload is reset" {
+    try requireSendFailingMidBody();
     const a = std.testing.allocator;
     var io_runtime = @import("platform").signal.threadedIo(a, .{});
     defer io_runtime.deinit();
