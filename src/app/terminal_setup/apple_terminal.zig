@@ -20,6 +20,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const process = @import("platform").process;
+const files = @import("files.zig");
 const setup = @import("setup.zig");
 
 pub const default_domain = "com.apple.Terminal";
@@ -94,8 +95,15 @@ pub const Prefs = struct {
         return if (std.mem.endsWith(u8, r.out, "\n")) r.out[0 .. r.out.len - 1] else r.out;
     }
 
+    /// A dictionary of strings as JSON, or null when there is none. Two steps:
+    /// macOS 15's `plutil -extract … json` refuses when anything anywhere in
+    /// the file has no JSON form (Terminal's colours and fonts are data), so
+    /// the value is extracted as XML into a file of its own and converted there.
     fn json(self: *const Prefs, keypath: []const u8) Error!?[]const u8 {
-        const r = try run(self.arena, &.{ plutil, "-extract", keypath, "json", "-o", "-", self.path });
+        const part = try std.fmt.allocPrint(self.arena, "{s}.part.plist", .{self.path});
+        defer files.remove(part);
+        if (!(try run(self.arena, &.{ plutil, "-extract", keypath, "xml1", "-o", part, self.path })).ok) return null;
+        const r = try run(self.arena, &.{ plutil, "-convert", "json", "-o", "-", part });
         return if (r.ok) r.out else null;
     }
 
@@ -383,13 +391,15 @@ const Fixture = struct {
         return std.fmt.allocPrint(f.arena_state.allocator(), "{s}/{d}-{s}", .{ f.root, f.n, name });
     }
 
-    /// Seeds the domain from JSON.
+    /// Seeds the domain from JSON, plus a data value the way Terminal keeps
+    /// colours and fonts: a document JSON cannot represent as a whole.
     fn seed(f: *Fixture, body: []const u8) !void {
         const arena = f.arena_state.allocator();
         const json_path = try f.path("seed.json");
         const plist_path = try f.path("seed.plist");
         try f.tmp.dir.writeFile(testing.io, .{ .sub_path = std.fs.path.basename(json_path), .data = body });
         try testing.expect((try run(arena, &.{ plutil, "-convert", "binary1", "-o", plist_path, json_path })).ok);
+        try testing.expect((try run(arena, &.{ plutil, "-insert", "NSWindow Data", "-data", "AAEC", plist_path })).ok);
         try testing.expect((try run(arena, &.{ defaults, "import", f.store.domain, plist_path })).ok);
     }
 

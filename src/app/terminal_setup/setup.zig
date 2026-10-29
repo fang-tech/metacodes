@@ -941,6 +941,9 @@ test "run apple terminal (macOS): set up, a dry run, a second run, the record, r
     });
     const plist_ok = (try process.capture(&.{ "/usr/bin/plutil", "-convert", "binary1", "-o", (try arena.dupeZ(u8, seed_plist)).ptr, (try arena.dupeZ(u8, seed_json)).ptr, null }, arena, .{})).exit_code == 0;
     try testing.expect(plist_ok);
+    // Terminal keeps colours and fonts as data, which JSON cannot hold.
+    const data_ok = (try process.capture(&.{ "/usr/bin/plutil", "-insert", "NSWindow Data", "-data", "AAEC", (try arena.dupeZ(u8, seed_plist)).ptr, null }, arena, .{})).exit_code == 0;
+    try testing.expect(data_ok);
     const import_ok = (try process.capture(&.{ "/usr/bin/defaults", "import", (try arena.dupeZ(u8, store.domain)).ptr, (try arena.dupeZ(u8, seed_plist)).ptr, null }, arena, .{ .inherit_env = true })).exit_code == 0;
     try testing.expect(import_ok);
 

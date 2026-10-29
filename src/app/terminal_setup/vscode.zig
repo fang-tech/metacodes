@@ -334,14 +334,19 @@ fn fromInstall(arena: std.mem.Allocator, askpass: []const u8) ?Product {
 
 /// The window runs on another machine (Remote-SSH, WSL, a dev container,
 /// Codespaces): its keybindings live on the machine that shows the window.
-/// The server installs that serve such windows sit in `*-server` directories
-/// (`~/.vscode-server`, `~/.cursor-server`, …); local installs never do.
+/// The server installs that serve such windows sit in hidden `.<build>-server`
+/// directories (`~/.vscode-server`, `~/.vscode-server-insiders`,
+/// `~/.cursor-server`, …) or, in containers, `vscode-server`; local installs
+/// never do.
 pub fn isRemote(env: setup.Env) bool {
     if (env.remote_session) return true;
     for ([_]?[]const u8{ env.vscode_askpass_main, env.path }) |maybe| {
         const value = maybe orelse continue;
         var it = std.mem.tokenizeAny(u8, value, "/\\:;");
-        while (it.next()) |part| if (part.len > "-server".len and std.mem.endsWith(u8, part, "-server")) return true;
+        while (it.next()) |part| {
+            if (std.mem.eql(u8, part, "vscode-server")) return true;
+            if (part.len > 1 and part[0] == '.' and std.mem.indexOf(u8, part, "-server") != null) return true;
+        }
     }
     return false;
 }
@@ -530,5 +535,9 @@ test "isRemote: server installs and remote-session variables" {
     try testing.expect(!isRemote(.{ .vscode_askpass_main = "D:\\bin\\vscode\\resources\\app\\extensions\\git\\dist\\askpass-main.js", .path = "C:\\Windows;D:\\bin\\vscode\\bin" }));
     try testing.expect(isRemote(.{ .vscode_askpass_main = "/home/a/.vscode-server/bin/abc/extensions/git/dist/askpass-main.js" }));
     try testing.expect(isRemote(.{ .path = "/home/a/.cursor-server/bin/abc/bin/remote-cli:/usr/bin" }));
+    try testing.expect(isRemote(.{ .path = "/home/a/.vscode-server-insiders/bin/abc/bin/remote-cli:/usr/bin" }));
+    try testing.expect(isRemote(.{ .vscode_askpass_main = "/vscode/vscode-server/bin/linux-x64/abc/extensions/git/dist/askpass-main.js" }));
     try testing.expect(isRemote(.{ .remote_session = true }));
+    // An ordinary directory named like a server is not a remote window.
+    try testing.expect(!isRemote(.{ .path = "/opt/mysql-server/bin:/usr/local/minio-server:/usr/bin" }));
 }
