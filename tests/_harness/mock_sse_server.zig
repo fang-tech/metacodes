@@ -580,7 +580,9 @@ pub const MockServer = struct {
             const end = std.mem.indexOfPos(u8, effective_body, cursor, "\n\n") orelse effective_body.len;
             const chunk_end = @min(end + 2, effective_body.len);
             const chunk = effective_body[cursor..chunk_end];
-            writeChunk(conn, chunk);
+            // 写失败 = 客户端已挂断(如空闲监视判 stall 后关了连接):余下的事件没人收,不再按
+            // chunk_delay 睡完。cassette 串行服务,客户端的重试连接正排在这一条后面。
+            if (!tryWriteChunk(conn, chunk)) return;
             cursor = chunk_end;
             if (self.chunk_delay_ms > 0) {
                 psync.sleepMs(self.chunk_delay_ms);
@@ -591,11 +593,14 @@ pub const MockServer = struct {
     }
 
     fn writeChunk(conn: net.Socket, bytes: []const u8) void {
+        _ = tryWriteChunk(conn, bytes);
+    }
+
+    /// writeChunk that says whether all of it was sent: false once the client has hung up.
+    fn tryWriteChunk(conn: net.Socket, bytes: []const u8) bool {
         var hex_buf: [32]u8 = undefined;
-        const hdr = std.fmt.bufPrint(&hex_buf, "{x}\r\n", .{bytes.len}) catch return;
-        sendAll(conn, hdr);
-        sendAll(conn, bytes);
-        sendAll(conn, "\r\n");
+        const hdr = std.fmt.bufPrint(&hex_buf, "{x}\r\n", .{bytes.len}) catch return false;
+        return trySendAll(conn, hdr) and trySendAll(conn, bytes) and trySendAll(conn, "\r\n");
     }
 
     fn parseContentLength(headers: []const u8) usize {
@@ -614,14 +619,20 @@ pub const MockServer = struct {
 };
 
 /// 发完整 buffer(send 可能部分写,循环补齐)。失败(对端断开)静默返回——mock 语境
-/// 下客户端提前断开是合法场景,server 不需要区分。
+/// 下客户端提前断开是合法场景;只有逐事件滴流的循环要知道(trySendAll),好不再睡完余下的事件。
 fn sendAll(conn: net.Socket, bytes: []const u8) void {
+    _ = trySendAll(conn, bytes);
+}
+
+/// sendAll that says whether all of `bytes` was sent.
+fn trySendAll(conn: net.Socket, bytes: []const u8) bool {
     var off: usize = 0;
     while (off < bytes.len) {
         const n = net.send(conn, bytes[off..]);
-        if (n <= 0) return;
+        if (n <= 0) return false;
         off += @intCast(n);
     }
+    return true;
 }
 
 /// 测试客户端:连 127.0.0.1:port,发 raw bytes,读响应直到 until 出现(null = 读到对端关闭)。
