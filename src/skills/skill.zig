@@ -101,6 +101,7 @@ fn cloneProjection(allocator: std.mem.Allocator, record: catalog.SkillRecord) !S
         .name = name,
         .description = description,
         .description_source = source.description_source,
+        .warnings = source.warnings,
         .when_to_use = when_to_use,
         .argument_hint = argument_hint,
         .body = body,

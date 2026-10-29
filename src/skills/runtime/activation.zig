@@ -436,6 +436,7 @@ const TestFixture = struct {
                 .disable_model_invocation = false,
                 .when_to_use = "",
                 .description_source = .frontmatter,
+                .warnings = .{},
                 .argument_hint = "",
                 .user_invocable = true,
                 .context = .inline_ctx,
