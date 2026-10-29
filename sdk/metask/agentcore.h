@@ -5,7 +5,7 @@
 #include <stdint.h>
 
 #if !defined(UINTPTR_MAX) || !defined(UINT64_MAX) || UINTPTR_MAX != UINT64_MAX
-#error "AgentCore ABI v1 revision 25 requires a 64-bit pointer ABI"
+#error "AgentCore ABI v1 revision 26 requires a 64-bit pointer ABI"
 #endif
 
 #ifdef __cplusplus
@@ -13,11 +13,11 @@ extern "C" {
 #endif
 
 /* sdk/zig/types.zig is the normative fixed-layout schema. This header is its
- * Revision 25 C projection; sdk/rust/src/raw.rs is generated from this file.
+ * Revision 26 C projection; sdk/rust/src/raw.rs is generated from this file.
  * AgentCore ABI v1 remains experimental. Consumers pin an exact bundle and
  * must validate the exact root and mandatory child-table layouts together. */
 #define METASK_AGENTCORE_ABI_V1 1u
-#define METASK_AGENTCORE_ABI_REVISION 25u
+#define METASK_AGENTCORE_ABI_REVISION 26u
 
 #define METASK_AGENTCORE_STATUS_OK 0u
 #define METASK_AGENTCORE_STATUS_INVALID_ARGUMENT 1u
@@ -755,16 +755,27 @@ typedef struct {
     uint64_t reserved[3];
 } metask_agentcore_session_create_config_v1;
 
+/* Revision 26: `priority` ranks this source against the other sources of its
+ * scope (see metask_agentcore_skill_catalog_query_v1); reserved fields are
+ * zero. */
 typedef struct {
     uint32_t struct_size;
     uint32_t scope_code;
     metask_agentcore_bytes_view_v1 root;
     metask_agentcore_bytes_view_v1 source_instance_id;
-    uint64_t reserved[3];
+    int32_t priority;
+    uint32_t reserved0;
+    uint64_t reserved[2];
 } metask_agentcore_skill_source_v1;
 
 /* Resolves one complete Workspace authority. The raw function-table slot keeps
- * its historical name; SDKs expose this as resolveWorkspaceSkillCatalog. */
+ * its historical name; SDKs expose this as resolveWorkspaceSkillCatalog.
+ * Revision 26 source priorities: for one invocation name a Workspace candidate
+ * beats every User candidate; within that scope the highest source priority
+ * wins, and a tie at the highest is a source_conflict. 0 is the priority of
+ * every unconfigured source, so zeroed fields keep the earlier resolution. The
+ * two default_*_source_priority fields set it for
+ * <workspace_home>/.agents/skills and <workspace_root>/.agents/skills. */
 typedef struct {
     uint32_t struct_size;
     uint32_t reserved0;
@@ -773,7 +784,8 @@ typedef struct {
     metask_agentcore_bytes_view_v1 workspace_epoch;
     const metask_agentcore_skill_source_v1 *additional_sources;
     uint64_t additional_source_count;
-    uint64_t reserved[1];
+    int32_t default_user_source_priority;
+    int32_t default_workspace_source_priority;
 } metask_agentcore_skill_catalog_query_v1;
 
 /* One ordered part of a RUN_INPUT_MULTIMODAL user record. Exactly the fields
@@ -1057,7 +1069,7 @@ typedef uint32_t (*metask_agentcore_team_poll_fn_v1)(
 typedef void (*metask_agentcore_buffer_release_fn_v1)(
     metask_agentcore_owned_bytes_v1 *);
 
-/* Function-table order is fixed within Revision 25. No earlier revision layout
+/* Function-table order is fixed within Revision 26. No earlier revision layout
  * is accepted, probed, aliased, or dispatched. */
 typedef struct metask_agentcore_runtime_api_v1 {
     uint32_t struct_size;
@@ -1280,8 +1292,8 @@ metask_agentcore_owned_bytes_v1_release(
 #define METASK_AGENTCORE_ASSERT_OFFSET(type, field, offset) \
     METASK_AGENTCORE_STATIC_ASSERT(offsetof(type, field) == (offset), #type "." #field " offset")
 
-METASK_AGENTCORE_STATIC_ASSERT(METASK_AGENTCORE_ABI_REVISION == 25u,
-                               "AgentCore revision 25");
+METASK_AGENTCORE_STATIC_ASSERT(METASK_AGENTCORE_ABI_REVISION == 26u,
+                               "AgentCore revision 26");
 METASK_AGENTCORE_STATIC_ASSERT(METASK_AGENTCORE_MCP_NEGOTIATION_AUTO == 1u,
                                "MCP auto code");
 METASK_AGENTCORE_STATIC_ASSERT(METASK_AGENTCORE_MCP_NEGOTIATION_MODERN_ONLY == 2u,
@@ -1403,6 +1415,11 @@ METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_context_block_v1, label, 8);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_context_block_v1, text, 24);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_skill_catalog_query_v1, additional_sources, 56);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_skill_catalog_query_v1, additional_source_count, 64);
+METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_skill_catalog_query_v1, default_user_source_priority, 72);
+METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_skill_catalog_query_v1, default_workspace_source_priority, 76);
+METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_skill_source_v1, priority, 40);
+METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_skill_source_v1, reserved0, 44);
+METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_skill_source_v1, reserved, 48);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_mcp_selector_v1, tool_name, 40);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_run_input_part_v1, text, 8);
 METASK_AGENTCORE_ASSERT_OFFSET(metask_agentcore_run_input_part_v1, media_type, 24);

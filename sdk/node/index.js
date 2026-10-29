@@ -6,7 +6,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 
-const ABI_REVISION = 25;
+const ABI_REVISION = 26;
 const BUILTIN_TOOLS = [
   'Read', 'Write', 'Edit', 'Glob', 'Grep', 'Bash', 'BashOutput', 'KillShell',
   'WebSearch', 'WebFetch', 'AskUserQuestion',

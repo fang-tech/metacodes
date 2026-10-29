@@ -142,6 +142,29 @@ status, compatibility boundaries, and entry points are defined by
   rules and the policy on which `CoreEvent`/`UiRequest` changes bump
   `SCHEMA_VERSION` are in the new [doc/WIRE_PROTOCOL.md](doc/WIRE_PROTOCOL.md);
   `tests/fixtures/wire/v1` pins the frames and replies.
+- **AgentCore Skill sources carry a priority within their scope** (#390). Two
+  Host-registered sources of one scope that both defined a Skill name used to
+  tie: the name became a `source_conflict`, left `skills[]`, and degraded the
+  catalog, so registering `.claude/skills` beside `.codex/skills` could hide a
+  `review` Skill both define, and dropping one source also dropped the Skills
+  only it had. AgentCore ABI Revision 26 gives every source a signed 32-bit
+  priority: `SkillSourceV1.priority` for a Host source, and
+  `SkillCatalogQueryV1.default_user_source_priority` /
+  `default_workspace_source_priority` for the two `.agents/skills` defaults.
+  They take former reserved words; no struct, table, or descriptor changes
+  size.
+  - A Workspace candidate still beats every User candidate. Within the scope,
+    the highest priority wins without an issue and the catalog stays
+    `healthy`; a tie at the highest priority is still a `source_conflict`,
+    while ties below a unique winner do not matter. Names that only a
+    lower-priority source defines stay available.
+  - A broken selected candidate reports its issue and never falls back to a
+    lower-priority version. Registration order, root paths and source ids
+    never choose a winner, and the published Skill, its `source_instance_id`,
+    policy grant and execution all name the winner.
+  - Every unconfigured source has priority 0, so a zeroed query resolves
+    byte-for-byte as Revision 25 did. The Zig and Rust SDKs and the C header
+    carry the fields. SDK 0.13.0-dev.
 - **An AgentCore Session's provider credential can be replaced in place,
   also during a Run** (#336). An expiring access token used to mean exporting
   a checkpoint, restoring a new Session and destroying the old one, which only

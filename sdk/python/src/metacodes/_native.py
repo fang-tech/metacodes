@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Optional
 
 ABI_V1 = 1
-ABI_REVISION = 25
+ABI_REVISION = 26
 
 # Status codes (METASK_AGENTCORE_STATUS_*).
 STATUS_NAMES = {
@@ -410,8 +410,8 @@ class ApiV1(ctypes.Structure):
     ]
 
 
-assert ctypes.sizeof(ApiV1) == 80, "AgentCore Revision 25 root is 80 bytes"
-assert ctypes.sizeof(SessionApi) == 56, "AgentCore Revision 25 Session table is 56 bytes"
+assert ctypes.sizeof(ApiV1) == 80, "AgentCore Revision 26 root is 80 bytes"
+assert ctypes.sizeof(SessionApi) == 56, "AgentCore Revision 26 Session table is 56 bytes"
 
 
 class AgentCoreError(RuntimeError):

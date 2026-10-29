@@ -4,11 +4,11 @@
 /// doc/AGENTCORE_BINARY_ABI.md, Status). No stability promise: layouts and
 /// semantics may change incompatibly between commits. Pin an exact bundle.
 pub const ABI_VERSION_V1: u32 = 1;
-pub const ABI_REVISION: u32 = 25;
+pub const ABI_REVISION: u32 = 26;
 
 comptime {
     if (@sizeOf(usize) != 8)
-        @compileError("AgentCore ABI v1 revision 25 requires a 64-bit pointer ABI");
+        @compileError("AgentCore ABI v1 revision 26 requires a 64-bit pointer ABI");
 }
 
 pub const Status = enum(u32) {
@@ -946,17 +946,27 @@ pub const SessionCreateConfigV1 = extern struct {
 
 /// One additional directory using the canonical Agent Skill format. Registering
 /// a path does not install a `.claude`/`.codex` format adapter.
+/// Revision 26: `priority` ranks this source against the other sources of its
+/// scope (see SkillCatalogQueryV1); `reserved0` and `reserved` are zero.
 pub const SkillSourceV1 = extern struct {
     struct_size: u32,
     scope_code: u32,
     root: BytesViewV1,
     source_instance_id: BytesViewV1,
-    reserved: [3]u64,
+    priority: i32,
+    reserved0: u32,
+    reserved: [2]u64,
 };
 
 /// Resolves the complete effective Catalog for one Workspace authority.
 /// Default discovery is limited to user/workspace `.agents/skills`; optional
 /// sources add directories in the same canonical format. `reserved0` is zero.
+/// Revision 26 source priorities: for one invocation name a Workspace
+/// candidate beats every User candidate; within that scope the highest source
+/// priority wins, and a tie at the highest is a `source_conflict`. 0 is the
+/// priority of every unconfigured source, so zeroed fields keep the earlier
+/// resolution. The two `default_*_source_priority` fields set it for
+/// `<workspace_home>/.agents/skills` and `<workspace_root>/.agents/skills`.
 pub const SkillCatalogQueryV1 = extern struct {
     struct_size: u32,
     reserved0: u32,
@@ -965,7 +975,8 @@ pub const SkillCatalogQueryV1 = extern struct {
     workspace_epoch: BytesViewV1,
     additional_sources: ?[*]const SkillSourceV1,
     additional_source_count: u64,
-    reserved: [1]u64,
+    default_user_source_priority: i32,
+    default_workspace_source_priority: i32,
 };
 
 /// One ordered part of a RUN_INPUT_MULTIMODAL user record. Exactly the fields
@@ -1587,6 +1598,11 @@ test "ABI v1 public layouts are fixed on supported 64-bit targets" {
     try std.testing.expectEqual(@as(usize, 40), @offsetOf(SkillCatalogQueryV1, "workspace_epoch"));
     try std.testing.expectEqual(@as(usize, 56), @offsetOf(SkillCatalogQueryV1, "additional_sources"));
     try std.testing.expectEqual(@as(usize, 64), @offsetOf(SkillCatalogQueryV1, "additional_source_count"));
+    try std.testing.expectEqual(@as(usize, 72), @offsetOf(SkillCatalogQueryV1, "default_user_source_priority"));
+    try std.testing.expectEqual(@as(usize, 76), @offsetOf(SkillCatalogQueryV1, "default_workspace_source_priority"));
+    try std.testing.expectEqual(@as(usize, 40), @offsetOf(SkillSourceV1, "priority"));
+    try std.testing.expectEqual(@as(usize, 44), @offsetOf(SkillSourceV1, "reserved0"));
+    try std.testing.expectEqual(@as(usize, 48), @offsetOf(SkillSourceV1, "reserved"));
     try std.testing.expectEqual(@as(usize, 8), @offsetOf(RunInputPartV1, "text"));
     try std.testing.expectEqual(@as(usize, 24), @offsetOf(RunInputPartV1, "media_type"));
     try std.testing.expectEqual(@as(usize, 40), @offsetOf(RunInputPartV1, "data"));
@@ -1645,9 +1661,9 @@ test "typed provider kind validates every public code" {
     );
 }
 
-test "Revision 25 keeps MCP wire codes stable" {
+test "Revision 26 keeps MCP wire codes stable" {
     const std = @import("std");
-    try std.testing.expectEqual(@as(u32, 25), ABI_REVISION);
+    try std.testing.expectEqual(@as(u32, 26), ABI_REVISION);
     try std.testing.expectEqual(@as(u32, 1), MCP_NEGOTIATION_AUTO);
     try std.testing.expectEqual(@as(u32, 2), MCP_NEGOTIATION_MODERN_ONLY);
     try std.testing.expectEqual(@as(u32, 3), MCP_NEGOTIATION_LEGACY_ONLY);
