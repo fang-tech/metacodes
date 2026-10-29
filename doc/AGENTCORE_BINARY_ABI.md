@@ -1723,10 +1723,10 @@ environment until terminal completion.
 for the connection a server binding reaches: its endpoint, transport target
 and authentication context, as the Host defines them. AgentCore never sees the
 endpoint, so this value is the connection identity it trusts. Each MCP Tool's
-`permission_binding` (in `runtime_describe_mcp`, Session `describe`,
-Permission requests and `permission_provenance`) binds the server binding,
-the MCP Tool name, the semantic schema and that fingerprint, and Session
-grants match on it (#389):
+permission binding (`permission_binding` in `runtime_describe_mcp` and
+Session `describe`, `tool.binding` in Permission requests and
+`permission_provenance`) binds the server binding, the MCP Tool name, the
+semantic schema and that fingerprint, and Session grants match on it (#389):
 
 - **Endpoint moved.** When `apply_configuration` keeps a server binding, Tool
   name and schema but changes the fingerprint, a Session that selected the
