@@ -60,23 +60,23 @@ const MID_STREAM_PREFIX_WITH_TEXT: usize = blk: {
     break :blk third;
 };
 
-/// 完整的 tool_use 参数,拆成 6 条 input_json_delta 滴流。老代码只在语义事件处 touch,而这 6 条
-/// 全是 `continue`——content_block_start 到 content_block_stop 之间时钟一动不动。
-const TOOL_INPUT_JSON = "{\"file_path\":\"/tmp/liveness.txt\",\"content\":\"0123456789\"}";
+/// 完整的 tool_use 参数,拆成 TOOL_CONTENT_FRAMES + 2 条 input_json_delta 滴流:开头一条,content
+/// 每 10 个字符一条,收尾一条。老代码只在语义事件处 touch,而这些帧全是 `continue`——
+/// content_block_start 到 content_block_stop 之间时钟一动不动。
+const TOOL_CONTENT_FRAMES = 28;
+const TOOL_CONTENT_PIECE = "0123456789";
+const TOOL_INPUT_JSON = "{\"file_path\":\"/tmp/liveness.txt\",\"content\":\"" ++ TOOL_CONTENT_PIECE ** TOOL_CONTENT_FRAMES ++ "\"}";
 const TOOL_SSE =
     "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n" ++
     "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"Write\",\"input\":{}}}\n\n" ++
-    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"file_path\\\":\\\"\"}}\n\n" ++
-    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"/tmp/live\"}}\n\n" ++
-    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"ness.txt\\\",\"}}\n\n" ++
-    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"\\\"content\\\":\"}}\n\n" ++
-    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"\\\"01234\"}}\n\n" ++
-    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"56789\\\"}\"}}\n\n" ++
+    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"file_path\\\":\\\"/tmp/liveness.txt\\\",\\\"content\\\":\\\"\"}}\n\n" ++
+    ("data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"" ++ TOOL_CONTENT_PIECE ++ "\"}}\n\n") ** TOOL_CONTENT_FRAMES ++
+    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"\\\"}\"}}\n\n" ++
     "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n" ++
     "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":9}}\n\n" ++
     "data: {\"type\":\"message_stop\"}\n\n";
 /// TOOL_SSE 的 SSE 事件数(MockServer 每个事件之间 sleep chunk_delay)。
-const TOOL_SSE_EVENTS: u64 = 11;
+const TOOL_SSE_EVENTS: u64 = TOOL_CONTENT_FRAMES + 7;
 
 /// ping 之间夹着真实进展:每两条 text_delta 之间一个 ping,任意相邻两条**进展**行的间隔 = 2 × TRICKLE_MS
 /// < IDLE_MS。ping 不续命也不该被杀——续命的是 text_delta。
@@ -93,28 +93,34 @@ const PING_PROGRESS_SSE =
     "data: {\"type\":\"message_stop\"}\n\n";
 const PING_PROGRESS_SSE_EVENTS: u64 = 10;
 
-/// 只靠 ping 保活的响应:文本块开了之后是 14 个 ping(14 × TRICKLE_MS = 2100ms > PING_ONLY_BODY_MS),
-/// 再来正文。这是 2026-09-23 的形状:网关 keepalive 一直到,模型什么都没产出。
-/// 正文上限用 1.5s 而不是 IDLE_MS(400ms):transport 空闲 ≤ 一个 ping 周期(150ms)+ 调度漂移,
-/// 与 progress 空闲(≥1500ms)拉开 10× 的距离,"keepalive 仍在到达"的判定在满载 CI 上也稳。
-const PING_ONLY_BODY_MS: u64 = 1_500;
+/// 只靠 ping 保活的响应:文本块开了之后是 PING_ONLY_PINGS 个 ping(28 × TRICKLE_MS = 4.2s >
+/// PING_ONLY_BODY_MS),再来正文。这是 2026-09-23 的形状:网关 keepalive 一直到,模型什么都没产出。
+/// 正文上限 3s:"keepalive 仍在到达"的判定是 transport 空闲 × 2 < progress 空闲,transport 空闲是
+/// 一个 ping 周期(150ms)加上判定前的一次晚醒。上限 1.5s 时晚醒到 600ms 判定就翻成"无任何字节"
+/// (整进程 SIGSTOP 500-900ms 实测 10 次 1 次),3s 容得下约 1.3s;ping 比上限多出的 1.2s
+/// 让判定同样稳稳赶在正文之前。
+const PING_ONLY_BODY_MS: u64 = 3_000;
+const PING_ONLY_PINGS = 28;
 const PING_EVENT = "event: ping\ndata: {\"type\": \"ping\"}\n\n";
 const PING_SSE =
     "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n" ++
     "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n" ++
-    PING_EVENT ++ PING_EVENT ++ PING_EVENT ++ PING_EVENT ++ PING_EVENT ++ PING_EVENT ++ PING_EVENT ++
-    PING_EVENT ++ PING_EVENT ++ PING_EVENT ++ PING_EVENT ++ PING_EVENT ++ PING_EVENT ++ PING_EVENT ++
+    PING_EVENT ** PING_ONLY_PINGS ++
     "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"alive\"}}\n\n" ++
     "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n" ++
     "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n" ++
     "data: {\"type\":\"message_stop\"}\n\n";
-const PING_SSE_EVENTS: u64 = 20;
+const PING_SSE_EVENTS: u64 = PING_ONLY_PINGS + 6;
 
 /// 测试用空闲上限:秒级可复现,又远大于 MockServer 正常回包的耗时。
 const IDLE_MS: u64 = 400;
 /// 滴流帧间隔:小于空闲上限(每一帧都该续命),但整条响应的总时长远超上限——
 /// 只有按字节续命才能活过去,按语义事件续命必死。
 const TRICKLE_MS: u32 = 150;
+/// ⑤ 的正文上限,帧间隔的 10 倍。⑤ 证明的是每一帧都续命:帧间隔离上限越远,负载高的 runner 上
+/// mock 线程晚醒越不会被误判成 stall。用 IDLE_MS 时只留 250 ms,macos-26 上被一次晚醒撑破过
+/// (run 40832171832);帧数随之加长,content_block_start 到 content_block_stop 仍是上限的 3 倍。
+const TRICKLE_BODY_MS: u64 = 1_500;
 /// 单个用例的墙钟上限:空闲上限 + 监视 tick + 一次重试退避(≤625ms)+ 余量。真挂死会远超。
 const BOUND_MS: i64 = 8_000;
 
@@ -376,14 +382,15 @@ test "L2 liveness ④: 父 abort → watchdog 同时 cancel 在飞请求:空闲�
 test "L2 liveness ⑤: input_json_delta 帧滴流(帧间隔 < 空闲上限,总时长 ≫ 上限)→ 按字节续命,完整 tool_use 收齐" {
     const a = std.testing.allocator;
     // 每个 SSE 事件之间 sleep TRICKLE_MS:任意相邻两帧的间隔都在上限之内,但从 content_block_start
-    // 到 content_block_stop 之间没有任何语义事件,总时长 ≥ 10 × 150ms ≫ 400ms。
+    // 到 content_block_stop 之间没有任何语义事件,总时长 (TOOL_CONTENT_FRAMES + 3) × 150ms ≈ 4.6s,
+    // 是上限 1.5s 的 3 倍。
     var srv = try harness.MockServer.startCassette(&[_][]const u8{TOOL_SSE}, TRICKLE_MS);
     defer srv.stop();
     const url = try srv.urlOwned(a);
     defer a.free(url);
     var io_rt = @import("platform").signal.threadedIo(a, .{});
     defer io_rt.deinit();
-    var client = mkClient(a, io_rt.io(), url, IDLE_MS, IDLE_MS);
+    var client = mkClient(a, io_rt.io(), url, IDLE_MS, TRICKLE_BODY_MS);
     defer client.deinit();
     clearLastError();
 
@@ -413,8 +420,10 @@ test "L2 liveness ⑤: input_json_delta 帧滴流(帧间隔 < 空闲上限,总�
     try std.testing.expect(tool_name_ok);
     try std.testing.expectEqualStrings(TOOL_INPUT_JSON, tool_input.?);
     // 流确实活过了空闲上限好几倍——这不是"上限没触发"而是"字节续了命"。
-    try std.testing.expect(elapsed >= @as(i64, @intCast((TOOL_SSE_EVENTS - 1) * TRICKLE_MS)));
-    try std.testing.expect(elapsed < BOUND_MS);
+    const trickle_ms: i64 = @intCast((TOOL_SSE_EVENTS - 1) * TRICKLE_MS);
+    try std.testing.expect(elapsed >= trickle_ms);
+    // 挂死的上界:滴流本身的时长之外,和其它用例一样留 BOUND_MS。
+    try std.testing.expect(elapsed < trickle_ms + BOUND_MS);
     var buf: [cc.api_last_error.SUMMARY_BUF_LEN]u8 = undefined;
     try std.testing.expect(takeLastError(&buf) == null);
 }
@@ -427,8 +436,8 @@ test "L2 liveness ⑥: 只有 ping 的保活不算进展 → 超过正文上限�
     defer a.free(url);
     var io_rt = @import("platform").signal.threadedIo(a, .{});
     defer io_rt.deinit();
-    // 收头上限放宽:cassette 模式串行服务,第一条响应要滴流满 20 × 150ms 才轮到重发的连接;
-    // 400ms 的收头上限会把这段排队误判成收头 stall(本用例只看正文阶段)。
+    // 收头上限放宽:cassette 模式串行服务,客户端断开后 MockServer 要到下一次写失败(一两个滴流间隔)
+    // 才轮到重发的连接;400ms 的收头上限会把这段排队误判成收头 stall(本用例只看正文阶段)。
     var client = mkClient(a, io_rt.io(), url, 10_000, PING_ONLY_BODY_MS);
     defer client.deinit();
     clearLastError();
@@ -440,13 +449,14 @@ test "L2 liveness ⑥: 只有 ping 的保活不算进展 → 超过正文上限�
     // 两次都在任何可见输出之前 stall:第一次兜底重发,第二次用尽(SILENT_STREAM_RETRY_FLOOR = 1)。
     try std.testing.expectEqual(@as(usize, 2), srv.requestCount());
     try std.testing.expect(elapsed >= @as(i64, @intCast(2 * PING_ONLY_BODY_MS)));
-    try std.testing.expect(elapsed < BOUND_MS);
+    // 挂死的上界:两次 stall,第一次的上限之外和其它用例一样留 BOUND_MS。
+    try std.testing.expect(elapsed < @as(i64, @intCast(PING_ONLY_BODY_MS)) + BOUND_MS);
     // 文案必须区分"keepalive 撑着的死上游"和"连接死了":前者查网关/上游,后者查网络。
     var buf: [cc.api_last_error.SUMMARY_BUF_LEN]u8 = undefined;
     const detail = takeLastError(&buf) orelse return error.TestExpectedLastError;
     try std.testing.expect(std.mem.startsWith(u8, detail, "正文空闲超时: "));
     try std.testing.expect(std.mem.indexOf(u8, detail, "网关 keepalive 仍在到达") != null);
-    try std.testing.expect(std.mem.indexOf(u8, detail, "(上限 1500 ms)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, detail, "(上限 3000 ms)") != null);
 }
 
 test "L2 liveness ⑥b: ping 之间夹着真实进展(进展间隔 < 上限)→ 正常 end_turn,ping 既不续命也不致命" {
@@ -457,8 +467,8 @@ test "L2 liveness ⑥b: ping 之间夹着真实进展(进展间隔 < 上限)→ 
     defer a.free(url);
     var io_rt = @import("platform").signal.threadedIo(a, .{});
     defer io_rt.deinit();
-    // 进展间隔 2 × TRICKLE_MS = 300ms;正文上限 1.5s 留 5× 余量给满载 CI(⑤ 的 150ms/400ms 已是下限)。
-    var client = mkClient(a, io_rt.io(), url, IDLE_MS, PING_ONLY_BODY_MS);
+    // 进展间隔 2 × TRICKLE_MS = 300ms;正文上限 1.5s 留 5× 余量给满载 CI(与 ⑤ 同一个上限)。
+    var client = mkClient(a, io_rt.io(), url, IDLE_MS, TRICKLE_BODY_MS);
     defer client.deinit();
     clearLastError();
 
