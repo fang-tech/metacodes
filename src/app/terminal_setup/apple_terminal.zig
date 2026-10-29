@@ -100,7 +100,7 @@ fn noteFailure(argv: []const []const u8, how: []const u8, stderr: []const u8) vo
     }
     w.print(" ({s}): {s}", .{ how, std.mem.trim(u8, stderr, " \t\r\n") }) catch {};
     last_failure_len = w.end;
-    log.warn("terminal_setup", "{s}", .{lastFailure()});
+    log.err("terminal_setup", "{s}", .{lastFailure()});
 }
 
 /// `name` as one plutil keypath component (`.` escaped), or null when it holds
@@ -586,10 +586,10 @@ test "apple terminal: a seeded map the user edited since keeps the edit on resto
     const prefs = try f.snapshot();
     try apply(&prefs, (try plan(&prefs)).ready.steps);
     // The user adds a mapping of their own in Terminal's settings: a key the
-    // built-in map does not have (it maps no Command keys), checked here
-    // rather than assumed for every macOS.
+    // built-in map does not have, checked here rather than assumed for every
+    // macOS. No `@` (Command): macOS 15's plutil refuses it in a keypath.
     const base = parseMap(arena, try builtInMap(arena, f.store)).?;
-    const own = for ([_][]const u8{ "@F70C", "@~F70C", "@^F70C", "@$F70C" }) |key| {
+    const own = for ([_][]const u8{ "^~F70C", "^$F70C", "$~F70C", "^~F70D" }) |key| {
         if (base.get(key) == null) break key;
     } else return error.TestUnexpectedResult;
     const own_keypath = try std.fmt.allocPrint(arena, "Window Settings.Basic.keyMapBoundKeys.{s}", .{own});
