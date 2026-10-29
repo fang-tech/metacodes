@@ -3601,7 +3601,7 @@ pub const App = struct {
         /// `/hooks`: each skipped file, event, entry or hook.
         hooks: usize = 0,
         /// `/skills`: Skills that did not load, skipped roots, and Skills
-        /// without a `description`.
+        /// without a `description` or with a blank `name`, once each.
         skills: usize = 0,
         /// `/agents`: agent files that did not load, and agents without a
         /// `description`.
@@ -3617,7 +3617,7 @@ pub const App = struct {
         if (app.hook_diagnostics) |*diag| problems.hooks = diag.items().len;
         if (app.skill_runtime.snapshot) |snapshot| {
             problems.skills = snapshot.issues.len + snapshot.skipped_sources.len;
-            for (snapshot.skills) |record| problems.skills += @intFromBool(record.definition.description_source != .frontmatter);
+            for (snapshot.skills) |record| problems.skills += @intFromBool(record.definition.hasDefinitionProblem());
         }
         problems.agents = app.agents.load_failures.items.len + app.agents.missingDescriptionCount();
         return problems;

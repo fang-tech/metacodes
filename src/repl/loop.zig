@@ -4332,7 +4332,8 @@ fn writeCommandList(w: *std.Io.Writer, catalog: complete.SlashCatalog, kind: com
 }
 
 /// /skills:列出已加载 skill(来源 scope + 根目录)、加载失败的 skill(issue)、被跳过的根目录,
-/// 以及缺 `description` 的 skill(列给模型的是首行正文或空)。失败、跳过与缺描述都必须可见——
+/// 以及缺(或空写)`description` 的 skill(列给模型的是首行正文或空)、空写 `name` 的 skill
+/// (以目录名代替)。失败、跳过与缺描述都必须可见——
 /// 静默丢 skill 或静默降级正是兼容问题最难排查的形态。
 pub fn writeSkillsReport(w: *std.Io.Writer, app: *const app_mod.App) std.Io.Writer.Error!void {
     const catalog = @import("../skills/runtime/catalog.zig");
@@ -4382,14 +4383,29 @@ pub fn writeSkillsReport(w: *std.Io.Writer, app: *const app_mod.App) std.Io.Writ
         try w.print("\x1b[33mNo description ({d}):\x1b[0m\n", .{undescribed});
         for (snapshot.skills) |record| {
             var line_buf: [96]u8 = undefined;
+            // A blank `description` is read as absent; say which one it was.
+            const lack = if (record.definition.warnings.contains(.blank_description))
+                "has a blank `description`"
+            else
+                "has no `description`";
             switch (record.definition.description_source) {
                 .frontmatter => {},
-                .body_first_line => try w.print("  /{s}: SKILL.md has no `description`; listings show its first line instead: \"{s}\"\n", .{
+                .body_first_line => try w.print("  /{s}: SKILL.md {s}; listings show its first line instead: \"{s}\"\n", .{
                     record.invocation_name,
+                    lack,
                     oneLine(&line_buf, record.definition.description),
                 }),
-                .missing => try w.print("  /{s}: SKILL.md has no `description`; listings say nothing about when to use it\n", .{record.invocation_name}),
+                .missing => try w.print("  /{s}: SKILL.md {s}; listings say nothing about when to use it\n", .{ record.invocation_name, lack }),
             }
+        }
+    }
+    var unnamed: usize = 0;
+    for (snapshot.skills) |record| unnamed += @intFromBool(record.definition.warnings.contains(.blank_name));
+    if (unnamed != 0) {
+        try w.print("\x1b[33mBlank name ({d}):\x1b[0m\n", .{unnamed});
+        for (snapshot.skills) |record| {
+            if (record.definition.warnings.contains(.blank_name))
+                try w.print("  /{s}: SKILL.md has a blank `name`; the directory name stands in\n", .{record.invocation_name});
         }
     }
     if (snapshot.issues.len != 0) {

@@ -130,14 +130,27 @@ pub const Runtime = struct {
             .{},
         );
         errdefer next_snapshot.deinit();
-        for (next_snapshot.skills) |record| switch (record.definition.description_source) {
-            .frontmatter => {},
-            .body_first_line, .missing => @import("../util/log.zig").warn(
+        const log = @import("../util/log.zig");
+        for (next_snapshot.skills) |record| {
+            const definition = &record.definition;
+            if (definition.warnings.contains(.blank_name)) log.warn(
                 "skill",
-                "/{s}: SKILL.md has no `description`; listings use {s} (see /skills)",
-                .{ record.invocation_name, if (record.definition.description_source == .missing) "nothing" else "its first line" },
-            ),
-        };
+                "/{s}: SKILL.md has a blank `name`; the directory name stands in (see /skills)",
+                .{record.invocation_name},
+            );
+            switch (definition.description_source) {
+                .frontmatter => {},
+                .body_first_line, .missing => log.warn(
+                    "skill",
+                    "/{s}: SKILL.md {s}; listings use {s} (see /skills)",
+                    .{
+                        record.invocation_name,
+                        if (definition.warnings.contains(.blank_description)) "has a blank `description`" else "has no `description`",
+                        if (definition.description_source == .missing) "nothing" else "its first line",
+                    },
+                ),
+            }
+        }
 
         var next_materializations: ?runtime.materialization.Manager =
             runtime.materialization.Manager.initWithBorrowedIo(
