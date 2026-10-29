@@ -961,14 +961,16 @@ pub fn main(init: std.process.Init) !void {
     // The startup splash plays while App.init runs (MCP connects, catalog
     // fetches), not after it. Only when init's logs cannot reach the
     // terminal: a frame redraws its rows relative to the cursor, and a line
-    // written between frames would shift them. The theme is settled first:
-    // its terminal query reads stdin, which is the splash's until it ends.
+    // written between frames would shift them. The REPL's terminal is settled
+    // first, theme and keyboard protocol in one round trip (#327): its query
+    // reads stdin, which is the splash's until it ends, and the protocol must
+    // be known before the REPL first enters raw mode.
     var splash: repl.Splash = .not_started;
     var init_options: app_mod.App.InitOptions = .{ .models_cache = interactive_tui };
-    if (interactive_tui and (quiet_stderr or !platform_term.isatty(2))) {
-        const variant = app_mod.resolveThemeVariant(allocator, config.no_theme, config.state_root);
+    if (interactive_tui) {
+        const variant = app_mod.resolveInteractiveTerminal(allocator, config.no_theme, config.state_root);
         init_options.theme_variant = variant;
-        splash = repl.startSplash(gpa, variant, config.state_root);
+        if (quiet_stderr or !platform_term.isatty(2)) splash = repl.startSplash(gpa, variant, config.state_root);
     }
     const app = app: {
         errdefer repl.stopSplash(splash);

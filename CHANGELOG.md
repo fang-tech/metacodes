@@ -207,6 +207,62 @@ status, compatibility boundaries, and entry points are defined by
   macOS and Windows binaries are unchanged
   (`doc/PERF_MEMORY_PRINCIPLES.md` §3f).
 
+- **Shift+Enter inserts a newline in any terminal that says it can, not only
+  in the ones metacodes knows by name (#327).** The Kitty keyboard protocol
+  used to be turned on only when `TERM_PROGRAM`/`TERM` named iTerm2, WezTerm,
+  Ghostty, Warp, kitty or tmux. Every other terminal, including any terminal
+  reached over SSH (which forwards `TERM` but not `TERM_PROGRAM`), fell back
+  to bare Enter, so Shift+Enter submitted and the footer said `\ + ⏎ for
+  newline`. At startup the interactive REPL now asks a terminal it cannot
+  place the Kitty flags question (`CSI ? u`) followed by a DA1 request, in
+  the same write as the background-colour query: every terminal answers DA1
+  and answers in order, so DA1 arriving without a flags answer is a definite
+  no, and the round ends as soon as it does. The 120 ms deadline is only a
+  fallback (no answer: the protocol stays off). The named terminals and tmux
+  are still turned on without asking. Apple Terminal and the xterm.js hosts
+  (VS Code, Hyper) are now a deny-list that is neither asked nor turned on
+  (Claude Code #23350); a terminal whose own `TERM` names it (kitty,
+  Ghostty) is still turned on when it was started from one of them and
+  inherited their `TERM_PROGRAM`. A dumb terminal, GNU screen, zellij and
+  `METACODES_NO_PROBE` are not asked either. Windows consoles are not asked:
+  on Windows Terminal 1.24 the console host answers DA1 itself (in about
+  0.1 ms) and never the flags question. With the protocol on, Alt+B and
+  Alt+F arrive as `CSI 98;3u` / `CSI 102;3u`; the key parser now reads them
+  as word movement (it dropped them, in kitty, WezTerm and Ghostty too).
+- **Keys typed while metacodes starts are no longer lost to its terminal
+  query.** The background-colour probe discarded every byte it read that was
+  not its answer, and switched modes with `TCSAFLUSH`, which discards typed
+  input outright. The startup probe now keeps the input already received and
+  hands every byte that is not an answer back to the REPL's input, in order,
+  ahead of what the terminal sends next. Answers already queued before the
+  query (left unread by a program that ran before) are read first and
+  dropped, so another program's DA1 is not taken for this round's.
+- **A terminal's answer that arrives after the startup probe gave up (a
+  link slower than 120 ms) is no longer echoed, taken for a key, or typed
+  into the prompt.** Until the REPL takes the terminal it stays quiet (no
+  echo; Ctrl+C still works; restored at exit if startup fails), and what
+  arrives is read through the probe's answer scanner: answers are dropped,
+  keys are kept. A late answer used to be printed above the banner
+  (`^[[?62;22c`) or end the startup animation as if it were the key that
+  skips it. An answer the deadline cut in half is dropped rather than handed
+  to the prompt, where its missing tail took the user's next key; one still
+  open when queued input was thrown away since (a `TCSAFLUSH` mode switch
+  that found input waiting) is given up, and after a read wait without its
+  tail, each byte that follows is taken for its tail only while it fits
+  (digits up to `c`/`u`, a colour up to BEL) and none restarts the wait;
+  when one does not fit, the answer is given up and the bytes it took since
+  are typed, so text typed key by key is not read as its tail (`fix the
+  bug` used to leave only `bug`). Reading what queued up stops where
+  stdin's replay is full instead of overrunning it (a 4 KiB burst typed
+  during such a startup crashed a Debug or ReleaseSafe build). The key
+  parser also consumes a whole private-marker CSI (`ESC [ ? … c`,
+  `ESC [ ? … u`), any CSI with more parameters than it decodes (xterm's
+  `ESC [ 27 ; 2 ; 13 ~`), and an OSC answer (`ESC ] 11 ; … BEL`), reporting
+  one unknown key for each; a sequence whose rest has not come within one
+  read wait is dropped instead of swallowing the next key; and rxvt's
+  `$`-terminated Shift keys (`ESC [ 3 $`) stay one key.
+
+
 ### Fixed
 
 - **Release executables run beyond machines like the build runner.**
@@ -307,6 +363,33 @@ status, compatibility boundaries, and entry points are defined by
   The native build is now 6098 KB and the glibc 2.31 baseline build
   6078 KB, 0.7% and 1.1% under the red line; idle RSS is 2272 and 2620 KB
   (`doc/PERF_MEMORY_PRINCIPLES.md` §1, §3g).
+
+- **Everything typed while metacodes starts reaches the first prompt, in
+  order.** The key that skipped the startup animation was consumed by it (on
+  Windows the skip flushed the console's whole input queue, so `abc` typed at
+  startup became `bc` or nothing), and on macOS and Linux the input box's
+  first raw-mode entry (`TCSAFLUSH`) dropped whatever was typed after the
+  animation while startup still ran (connecting MCP servers, fetching the
+  model list). The animation still ends on the first key, but leaves the key
+  for the prompt (only a key that types nothing, a bare modifier on Windows,
+  is dropped: a console read would wait behind it for the next key that
+  types); it enters and leaves raw mode without discarding input; and
+  the process's first raw-mode entry keeps what the terminal has received.
+  Later entries still drop keys typed between two prompts, as before.
+- **A multi-line paste made before the first prompt lands in it as one paste
+  and is not submitted line by line.** Bracketed paste is turned on with the
+  first prompt, so a paste right after starting arrived as typed keys and
+  every newline was an Enter: the first line went to the model on its own,
+  and the rest was dropped or queued as the next turn. Everything typed
+  before the first prompt, of any length, now goes into it as one paste:
+  newlines stay text, Backspace still deletes, other keys are left out, a
+  large paste becomes the usual placeholder, and nothing is sent until Enter.
+  The newlines it starts or ends with (the Enter that skipped the animation,
+  the one after the last line) are left out, and input that is only blanks
+  leaves the prompt empty. Startup input is read until the terminal has been
+  quiet for two of its round trips, as the startup probe measured them (50
+  to 500 ms), so a paste a slow link delivers in parts is still one paste.
+
 
 ## 0.8.1 — 2026-10-28
 

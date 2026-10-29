@@ -1,8 +1,9 @@
-"""终端兼容性:Kitty 协议按 TERM_PROGRAM 白名单分流 + Apple Terminal backslash 换行。
+"""终端兼容性:Kitty 协议按 TERM_PROGRAM 分流 + Apple Terminal backslash 换行。
 
 背景:cc-zig 曾无条件发 Kitty 协议(\x1b[>1u),Apple Terminal 不支持 → honor 后发回
-乱码/键失常。改成白名单 gate(对齐真 cc terminal.ts:167)。这些 case 验 cc-zig **发什么字节**
-(pty 能测);真终端如何响应需用户真机抓。
+乱码/键失常。改成按终端 gate(对齐真 cc terminal.ts:167):认得出的直接发,deny-list
+(Apple Terminal 等)不发,认不出的启动时探测(test_keyboard_probe.py)。这些 case 验
+cc-zig **发什么字节**(pty 能测);真终端如何响应需用户真机抓。
 """
 import sys
 
