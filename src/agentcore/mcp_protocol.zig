@@ -63,8 +63,8 @@ test "dual era tool catalogs project the same executable identity" {
     );
     try std.testing.expectEqualSlices(
         u8,
-        &modern_catalog.tools[0].identity.permissionBinding(),
-        &legacy_catalog.tools[0].identity.permissionBinding(),
+        &modern_catalog.tools[0].identity.authorityBinding(),
+        &legacy_catalog.tools[0].identity.authorityBinding(),
     );
 }
 

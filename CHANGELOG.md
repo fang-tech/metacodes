@@ -567,6 +567,33 @@ status, compatibility boundaries, and entry points are defined by
   quiet for two of its round trips, as the startup probe measured them (50
   to 500 ms), so a paste a slow link delivers in parts is still one paste.
 
+### Security
+
+- **An AgentCore MCP Session grant no longer follows a server to a new
+  endpoint** (#389). A Session grant (`allow_session`, `deny_session`) was
+  bound to the server binding, the MCP Tool name and its schema. When
+  `apply_configuration` kept those three but pointed the server binding at
+  another endpoint under a new `configuration_fingerprint`, an existing
+  Session sent the same call to the new endpoint without asking, and a
+  checkpoint restored the grant the same way. The MCP `permission_binding`
+  now also binds the server's `configuration_fingerprint`, the Host's name
+  for the connection. After such a change the Tool stays selected and its
+  next call asks again (or falls back to the permission mode); a
+  `deny_session` answer does not carry over either, and Host allow and deny
+  rules still decide by name. The old grant is dropped where the change is
+  first seen: by the next Run and by `update_selection`, counted in Session
+  `describe` as `restore.invalidated_mcp_bindings`; by restore, as an
+  invalidated `permission` rule with an issue. Either way health turns
+  `degraded`. A change that keeps the fingerprint (namespace, client info,
+  timeout, negotiation policy, protocol limits) keeps the grants. Hosts must
+  change the fingerprint whenever the endpoint, the transport target or the
+  authenticated principal changes, and keep it when only a credential for
+  the same principal rotates. MCP Session grants in checkpoints exported
+  before this change carry the old binding, so restore invalidates them
+  (`degraded`) and their next call asks.
+  See [MCP Runtime catalog and Session
+  view](doc/AGENTCORE_BINARY_ABI.md#mcp-runtime-catalog-and-session-view).
+
 
 ## 0.8.1 — 2026-10-28
 

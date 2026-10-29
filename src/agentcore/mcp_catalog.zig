@@ -95,6 +95,9 @@ pub const CatalogIssue = struct {
 pub const ServerRecord = struct {
     namespace: []const u8,
     server_binding_identity: [32]u8,
+    /// The Host-declared identity of the connection this record reached.
+    /// Session grants are bound to it (`ToolIdentity.permissionBinding`).
+    configuration_fingerprint: [32]u8,
     instance_id: instance_pool.InstanceId,
     era: canonical.Era,
     protocol_limits: canonical.Limits,
@@ -272,7 +275,9 @@ pub const Snapshot = struct {
                     .canonical_name = a.dupe(u8, tool.identity.name) catch
                         return error.OutOfMemory,
                     .schema_fingerprint = tool.identity.schema_fingerprint,
-                    .permission_binding = tool.identity.permissionBinding(),
+                    .permission_binding = tool.identity.permissionBinding(
+                        &server.configuration_fingerprint,
+                    ),
                 };
             }
             tool_offset += admitted_count;
@@ -920,6 +925,7 @@ pub const Manager = struct {
             servers.append(a, .{
                 .namespace = namespace,
                 .server_binding_identity = spec.binding,
+                .configuration_fingerprint = spec.configuration_fingerprint,
                 .instance_id = instance_id,
                 .era = client.era,
                 .protocol_limits = spec.protocol_limits,
@@ -991,6 +997,7 @@ fn cloneServerRecord(
         .namespace = allocator.dupe(u8, namespace) catch
             return error.OutOfMemory,
         .server_binding_identity = source.server_binding_identity,
+        .configuration_fingerprint = source.configuration_fingerprint,
         .instance_id = source.instance_id,
         .era = source.era,
         .protocol_limits = source.protocol_limits,

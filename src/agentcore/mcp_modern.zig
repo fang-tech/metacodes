@@ -641,7 +641,7 @@ test "modern tools list preserves full schemas and derives bound identity" {
     try std.testing.expectEqual(@as(usize, 1), catalog.tools.len);
     try std.testing.expect(std.mem.indexOf(u8, catalog.tools[0].input_schema_json, "$defs") != null);
     try std.testing.expect(std.mem.indexOf(u8, catalog.tools[0].output_schema_json.?, "oneOf") != null);
-    try std.testing.expect(!std.mem.allEqual(u8, &catalog.tools[0].identity.permissionBinding(), 0));
+    try std.testing.expect(!std.mem.allEqual(u8, &catalog.tools[0].identity.authorityBinding(), 0));
 }
 
 test "modern call treats a missing result type as complete and returns typed input required" {
