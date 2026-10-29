@@ -270,7 +270,7 @@ dropped from the queue until the reopen PR has merged.
 What the fast path gives up is the pre-tag rehearsal of the stable-channel
 release layout on the candidate (`check_version_state.py --rehearse` followed
 by `release:verify` / `release:archive`). Stage C builds and verifies the
-same layout from the tag on all three platforms, and the draft is published
+same layout from the tag on every release target, and the draft is published
 only after that passes; when a change touches the release path, rehearse it
 first with `release.yml` `dry_run` on `main`.
 
@@ -336,9 +336,6 @@ by setting the workflow's `base` input; nothing in the scripts assumes `main`.
 
 - Provenance attestation (`actions/attest-build-provenance`) on the archives
   and `SHA256SUMS`; SBOM (`OPEN_SOURCE_READINESS.md` launch-gate items).
-- Extending the release matrix to every vendored target (`x86_64-macos`,
-  `aarch64-linux`): needs a runner-independent `release:verify` path (see
-  `ci.yml` cross-target `release:check` comment).
 
 ## 8. Change list
 
