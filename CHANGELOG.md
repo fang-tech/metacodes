@@ -343,17 +343,32 @@ status, compatibility boundaries, and entry points are defined by
   Completions `length`, Responses `response.incomplete` with
   `max_output_tokens`, Gemini `MAX_TOKENS`) only reached
   `max_tokens_exhausted` when it streamed no text. With visible text it was
-  closed as the final answer, so headless `--json` reported
-  `stop_reason=end_turn`, `text_kind=final` and exit 0, and the
-  `--stream-json` timeline read `continued → continued → continued → final`.
-  Such a turn now ends in `max_tokens_exhausted` either way. The whole
-  continued text is still delivered, as `text_kind=partial`, with exit 1 and
-  a timeline that closes with `partial`. The REPL now says the reply was cut
-  off instead of ending silently. AgentCore ABI v1 reports the stop as
-  `api_error` with a `failed` RunState, and the Session takes the next Run.
-  Before, `max_tokens_exhausted` (then reached only without text) returned
-  `INTERNAL_ERROR` and poisoned the Session. No wire code is added. A
-  complete tool call on that turn still runs, and a continuation that ends
+  closed as the final answer. Such a turn now ends in `max_tokens_exhausted`
+  either way, and its text is still delivered, marked incomplete:
+  - Headless `--json` reports `stop_reason=max_tokens_exhausted` and
+    `text_kind=partial` (the whole continued text) instead of `end_turn` and
+    `final`, and **the process exits 1 instead of 0**: a script that reads
+    exit 0 as success now sees such a Run as failed. The `--stream-json`
+    timeline ends `continued → … → partial` instead of `… → final`.
+  - The REPL says the reply was cut off instead of ending silently.
+  - A `TaskBatch` item keeps its `final_text`, marked `"incomplete":true`
+    with its `stop_reason`, and counts toward `failed` instead of
+    `completed`. Provider errors and aborts are still an `error` with no text.
+  - AgentCore ABI v1 reports the stop as `api_error` with a `failed`
+    RunState, and the Session takes the next Run. Before,
+    `max_tokens_exhausted` (then reached only without text) returned
+    `INTERNAL_ERROR` and poisoned the Session. No wire code is added. In the
+    Python and Node SDKs, `text` holds only a final answer and is empty for
+    this stop; the cut text is in `segments`, closed as `partial`.
+  - Swarm teammates report `needs_continuation` instead of `available`.
+  - **A sealed Skill run whose last turn is still cut now fails**: its Step
+    is `failed` with `skill_error` and a message naming the cut, where it
+    returned the truncated text as `final` before. A `failed` Step has no
+    `text`, so the truncated answer stays on the gateway. Carrying it would
+    need a Sealed Skill protocol revision with the disclosure screen, which
+    is left for later.
+
+  A complete tool call on that turn still runs, and a continuation that ends
   normally is still one final answer. Tested on all four wires against a
   loopback mock.
 - **The first prompt no longer waits up to 2 s for the startup suggestion.**

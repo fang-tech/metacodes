@@ -163,6 +163,69 @@ test "P1.2 e2e: 部分失败——一个 item 报错记 error,其它 completed(�
     try std.testing.expect(std.mem.indexOf(u8, res, "\"failed\":0") == null); // failed 非 0
 }
 
+/// 被 token 上限截断的文本回合(stop_reason=max_tokens)。
+fn cutSSE(comptime body: []const u8) []const u8 {
+    return "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n" ++
+        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n" ++
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"" ++ body ++ "\"}}\n\n" ++
+        "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n" ++
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"max_tokens\"},\"usage\":{\"output_tokens\":1}}\n\n" ++
+        "data: {\"type\":\"message_stop\"}\n\n";
+}
+
+test "#394 e2e: 续写耗尽的子 agent 带正文 + incomplete,api_error 的仍只有 error" {
+    const a = std.testing.allocator;
+    // item0:首请求 + 3 次续写全被截断 → max_tokens_exhausted,正文是四段拼接。
+    // item1:error_event → api_error(多给几条兜住重试)。
+    const cut = cutSSE("part ");
+    var srv = try harness.MockServer.startCassette(&[_][]const u8{ cut, cut, cut, cut, ERROR_SSE, ERROR_SSE, ERROR_SSE, ERROR_SSE }, 0);
+    defer srv.stop();
+    const url = try srv.urlOwned(a);
+    defer a.free(url);
+
+    var io_rt = @import("platform").signal.threadedIo(a, .{});
+    defer io_rt.deinit();
+    var client = cc.client_mod.Client.initWithBaseUrl(a, io_rt.io(), "k", "claude-3-5-haiku-20241022", url);
+    defer client.deinit();
+
+    const perm = cc.permission.createContext(.bypass_permissions, a);
+    const empty_defs: []const cc.json_mod.ToolDefinition = &.{};
+    var ctx = cc.tool_context.ToolContext{
+        .allocator = a,
+        .api_client = &client,
+        .tool_defs = empty_defs,
+        .permission_ctx = @constCast(&perm),
+        .agent_depth = 0,
+    };
+
+    const args =
+        \\{"prompt_template":"report on {x}","items":[{"x":"first"},{"x":"second"}]}
+    ;
+    const res = try @import("cc").tools_task_batch.execute(&ctx, args);
+    defer a.free(res);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, res, .{});
+    defer parsed.deinit();
+    const root = parsed.value.object;
+    const results = root.get("results").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), results.len);
+    // The truncated report reaches the parent, marked as not a complete result.
+    const cut_item = results[0].object;
+    const final_text = cut_item.get("final_text") orelse return error.TestExpectedFinalText;
+    try std.testing.expectEqualStrings("part part part part ", final_text.string);
+    const incomplete = cut_item.get("incomplete") orelse return error.TestExpectedIncompleteMarker;
+    try std.testing.expect(incomplete.bool);
+    try std.testing.expectEqualStrings("max_tokens_exhausted", cut_item.get("stop_reason").?.string);
+    try std.testing.expect(cut_item.get("error") == null);
+    // A provider failure stays an error without text.
+    const failed_item = results[1].object;
+    try std.testing.expectEqualStrings("api_error", failed_item.get("error").?.string);
+    try std.testing.expect(failed_item.get("final_text") == null);
+    try std.testing.expect(failed_item.get("incomplete") == null);
+    try std.testing.expectEqual(@as(i64, 0), root.get("completed").?.integer);
+    try std.testing.expectEqual(@as(i64, 2), root.get("failed").?.integer);
+}
+
 test "P1.2: TaskBatch 拒绝空 items / 超限 items" {
     const a = std.testing.allocator;
     var ctx = cc.tool_context.ToolContext{ .allocator = a, .agent_depth = 0 };

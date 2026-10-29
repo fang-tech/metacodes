@@ -68,6 +68,8 @@ const BatchJob = struct {
     done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false), // worker 结束置;watchdog 读
     // 输出(runBatchJob 写):
     result_text: ?[]u8 = null, // c_allocator owned
+    /// result_text 是没写完的回答(StopClass.incomplete):照样交给父,标 incomplete,计入 failed。
+    incomplete: bool = false,
     turns: u32 = 0,
     tool_calls: u32 = 0,
     stop_reason: []const u8 = "error",
@@ -138,10 +140,11 @@ fn watchdogMain(wd: *Watchdog) void {
     }
 }
 
-/// 把子 agent 结果写进 job:失败 stop_reason(api_error/aborted)记 error 不算 completed;
-/// dupe OOM 也记 error(别把丢数据装成成功)。
+/// 把子 agent 结果写进 job:失败 stop_reason(api_error/aborted)记 error、不带正文;续写耗尽
+/// 的回答带正文、标 incomplete;dupe OOM 也记 error(别把丢数据装成成功)。
 fn recordResult(job: *BatchJob, r: subagent.SubagentResult) void {
-    if (isFailureStop(r.stop_reason)) {
+    const class = classifyStop(r.stop_reason);
+    if (class == .failed) {
         // 超时被 watchdog 砍 vs 用户取消:agent_loop 只返 .aborted 不透传 reason,查 abort_sig.reason()
         // 还原成清楚的 err_name("timeout" vs "aborted"),debug 时分得清。
         if (r.stop_reason == .aborted and job.abort_sig.reason() == .timeout) {
@@ -153,6 +156,7 @@ fn recordResult(job: *BatchJob, r: subagent.SubagentResult) void {
     }
     if (std.heap.c_allocator.dupe(u8, r.final_text)) |t| {
         job.result_text = t;
+        job.incomplete = class == .incomplete;
         job.turns = r.turns;
         job.tool_calls = r.tool_calls;
         job.stop_reason = @tagName(r.stop_reason);
@@ -161,12 +165,24 @@ fn recordResult(job: *BatchJob, r: subagent.SubagentResult) void {
     }
 }
 
-/// 子 agent 的终止是否算失败。**exhaustive switch**:编译器逼后来人处理 StopReason 新增变体
-/// (别用 `==` 漏网——哪天给 batch subagent 接上 requester,suspended 不能被谎报成 completed)。
-fn isFailureStop(sr: @import("../core/agent_loop.zig").StopReason) bool {
+/// 子 agent 的终止归哪一类。
+const StopClass = enum {
+    /// 跑到终止,有产出 → completed。
+    completed,
+    /// 回答被 token 上限截断且续写额度用尽(#394):正文照样交给父,标 `incomplete`,
+    /// 计入 failed——它不是完成的结果,但丢掉正文会让父丢掉已做的工作。
+    incomplete,
+    /// 出错/中断/挂起 → 只记 error,不带正文。
+    failed,
+};
+
+/// **exhaustive switch**:编译器逼后来人处理 StopReason 新增变体(别用 `==` 漏网——哪天给
+/// batch subagent 接上 requester,suspended 不能被谎报成 completed)。
+fn classifyStop(sr: @import("../core/agent_loop.zig").StopReason) StopClass {
     return switch (sr) {
-        .api_error, .aborted, .tool_error, .suspended, .max_tokens_exhausted => true, // 出错/中断/挂起/续写耗尽未完成 → 失败
-        .end_turn, .max_turns, .tool_loop, .stalled, .backgrounded, .budget => false, // 跑到终止,有产出 → 完成
+        .api_error, .aborted, .tool_error, .suspended => .failed, // 出错/中断/挂起
+        .max_tokens_exhausted => .incomplete, // 续写耗尽:有正文但没写完
+        .end_turn, .max_turns, .tool_loop, .stalled, .backgrounded, .budget => .completed, // 跑到终止,有产出
     };
 }
 
@@ -411,7 +427,8 @@ fn buildResult(allocator: std.mem.Allocator, jobs: []const BatchJob) ![]u8 {
             try util_json.writeJsonString(&out.writer, e);
             try out.writer.writeByte('}');
         } else {
-            completed += 1;
+            // 没写完的回答带正文,但不算 completed(见 StopClass.incomplete)。
+            if (j.incomplete) failed += 1 else completed += 1;
             // per-item final_text 截断:防 N × 长输出撑爆父 context。单项 >PER_ITEM_TEXT_CAP 留头 + 标记。
             const full = j.result_text orelse "";
             const shown = utf8.pagePrefix(full, PER_ITEM_TEXT_CAP);
@@ -419,6 +436,7 @@ fn buildResult(allocator: std.mem.Allocator, jobs: []const BatchJob) ![]u8 {
             try out.writer.writeAll("\"final_text\":");
             try util_json.writeJsonString(&out.writer, shown);
             if (truncated) try out.writer.print(",\"truncated\":true,\"full_len\":{d}", .{full.len});
+            if (j.incomplete) try out.writer.writeAll(",\"incomplete\":true");
             try out.writer.print(",\"turns\":{d},\"tool_calls\":{d},\"stop_reason\":\"{s}\"}}", .{ j.turns, j.tool_calls, j.stop_reason });
         }
     }
@@ -553,19 +571,64 @@ test "shouldAbortJob: deadline / 父 abort / 未启动 判定(watchdog 核心逻
     try testing.expect(!shouldAbortJob(1_000_000, 1_300_000, false, deadline));
 }
 
-test "isFailureStop: exhaustive 覆盖 StopReason 10 变体" {
-    const SR = @import("../core/agent_loop.zig").StopReason;
-    try testing.expect(isFailureStop(.api_error));
-    try testing.expect(isFailureStop(.aborted));
-    try testing.expect(isFailureStop(.tool_error));
-    try testing.expect(isFailureStop(.suspended));
-    try testing.expect(isFailureStop(.max_tokens_exhausted));
-    try testing.expect(!isFailureStop(.end_turn));
-    try testing.expect(!isFailureStop(.max_turns));
-    try testing.expect(!isFailureStop(.tool_loop));
-    try testing.expect(!isFailureStop(.backgrounded));
-    try testing.expect(!isFailureStop(.budget));
-    _ = SR;
+test "classifyStop: exhaustive 覆盖 StopReason 全部变体" {
+    try testing.expectEqual(StopClass.failed, classifyStop(.api_error));
+    try testing.expectEqual(StopClass.failed, classifyStop(.aborted));
+    try testing.expectEqual(StopClass.failed, classifyStop(.tool_error));
+    try testing.expectEqual(StopClass.failed, classifyStop(.suspended));
+    try testing.expectEqual(StopClass.incomplete, classifyStop(.max_tokens_exhausted));
+    try testing.expectEqual(StopClass.completed, classifyStop(.end_turn));
+    try testing.expectEqual(StopClass.completed, classifyStop(.max_turns));
+    try testing.expectEqual(StopClass.completed, classifyStop(.tool_loop));
+    try testing.expectEqual(StopClass.completed, classifyStop(.stalled));
+    try testing.expectEqual(StopClass.completed, classifyStop(.backgrounded));
+    try testing.expectEqual(StopClass.completed, classifyStop(.budget));
+}
+
+fn subagentResult(text: []const u8, stop: @import("../core/agent_loop.zig").StopReason) !subagent.SubagentResult {
+    return .{ .allocator = testing.allocator, .final_text = try testing.allocator.dupe(u8, text), .stop_reason = stop, .turns = 4, .tool_calls = 0 };
+}
+
+test "#394 recordResult: 续写耗尽的回答带正文、标 incomplete、计入 failed" {
+    var jobs = [_]BatchJob{wdTestJob(0)};
+    const r = try subagentResult("half of the report", .max_tokens_exhausted);
+    defer r.deinit();
+    recordResult(&jobs[0], r);
+    defer if (jobs[0].result_text) |t| std.heap.c_allocator.free(t);
+    try testing.expect(jobs[0].err_name == null);
+    try testing.expect(jobs[0].incomplete);
+    try testing.expectEqualStrings("half of the report", jobs[0].result_text.?);
+
+    const res = try buildResult(testing.allocator, &jobs);
+    defer testing.allocator.free(res);
+    try testing.expectEqualStrings(
+        "{\"results\":[{\"index\":0,\"final_text\":\"half of the report\",\"incomplete\":true,\"turns\":4,\"tool_calls\":0,\"stop_reason\":\"max_tokens_exhausted\"}],\"total\":1,\"completed\":0,\"failed\":1}",
+        res,
+    );
+}
+
+test "#394 recordResult: api_error / aborted / 超时仍只记 error,不带正文" {
+    const cases = [_]struct { stop: @import("../core/agent_loop.zig").StopReason, timeout: bool, err: []const u8 }{
+        .{ .stop = .api_error, .timeout = false, .err = "api_error" },
+        .{ .stop = .aborted, .timeout = false, .err = "aborted" },
+        .{ .stop = .aborted, .timeout = true, .err = "timeout" },
+    };
+    for (cases) |case| {
+        var jobs = [_]BatchJob{wdTestJob(0)};
+        if (case.timeout) jobs[0].abort_sig.abort(.timeout);
+        const r = try subagentResult("text the parent must not see", case.stop);
+        defer r.deinit();
+        recordResult(&jobs[0], r);
+        try testing.expect(jobs[0].result_text == null);
+        try testing.expect(!jobs[0].incomplete);
+        try testing.expectEqualStrings(case.err, jobs[0].err_name.?);
+
+        const res = try buildResult(testing.allocator, &jobs);
+        defer testing.allocator.free(res);
+        try testing.expect(std.mem.indexOf(u8, res, "text the parent must not see") == null);
+        try testing.expect(std.mem.indexOf(u8, res, "\"incomplete\"") == null);
+        try testing.expect(std.mem.indexOf(u8, res, "\"completed\":0,\"failed\":1") != null);
+    }
 }
 
 test "stripTool: 从 subagent 工具集剥掉 TaskBatch(防嵌套指数 fan-out)" {

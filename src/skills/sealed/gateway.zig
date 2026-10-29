@@ -929,6 +929,14 @@ pub const Gateway = struct {
             },
             .api_error => return self.emitStep(arena, state, .{ .kind = .failed, .reason = "upstream_unavailable", .message = "the model provider failed", .usage = step_usage }),
             .max_turns => return self.emitStep(arena, state, .{ .kind = .failed, .reason = "skill_error", .message = "the Skill took too many model turns without a tool call for the client", .usage = step_usage }),
+            // The brain's answer is still cut at the output-token limit after
+            // its last continuation (#394). A `failed` Step has no `text`
+            // (§4.3), so the truncated answer stays on the gateway: the
+            // message names the cause and quotes none of it.
+            .max_tokens_exhausted => {
+                const message = std.fmt.allocPrint(arena, "the Skill's output was still cut off at the model's output-token limit after {d} continuations", .{outcome.continuations}) catch return error.OutOfMemory;
+                return self.emitStep(arena, state, .{ .kind = .failed, .reason = "skill_error", .message = message, .usage = step_usage });
+            },
             else => |reason| return self.emitStep(arena, state, .{ .kind = .failed, .reason = "skill_error", .message = @tagName(reason), .usage = step_usage }),
         }
     }
