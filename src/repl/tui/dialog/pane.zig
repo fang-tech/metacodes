@@ -335,7 +335,7 @@ pub fn run(comptime D: type, dialog: *D, allocator: std.mem.Allocator, th: Theme
             const n = platform_term.readInput(in_fd, &byte);
             if (n < 0 and input.retryInterruptedRead(in_fd)) continue;
             if (n <= 0) break :key .ctrl_c;
-            break :key parser.feed(byte[0]) orelse continue;
+            break :key parser.feedRead(in_fd, byte[0]) orelse continue;
         };
         switch (dialog.key(key)) {
             .none => {},
