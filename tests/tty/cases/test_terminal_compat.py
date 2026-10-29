@@ -4,11 +4,16 @@
 乱码/键失常。改成按终端 gate(对齐真 cc terminal.ts:167):认得出的直接发,deny-list
 (Apple Terminal 等)不发,认不出的启动时探测(test_keyboard_probe.py)。这些 case 验
 cc-zig **发什么字节**(pty 能测);真终端如何响应需用户真机抓。
+
+每个 case 先等空输入框画出(READY)再发键、再收尾断言,不靠固定的启动 sleep:首个输入框出现
+之前敲的键整段作为一次粘贴进第一个输入框(input.collectStartupInput,测在 test_startup_splash /
+test_keyboard_probe),换行是文本、Enter 不提交、Ctrl+R/Esc 被丢掉,测的就不是输入框里的按键了。
+macos-26 runner 上首个输入框实测晚到过 2.2 s(启动后 0.8 + 0.8 s 就开始打字)。
 """
 import os
 import sys
 
-from tty_driver import case_tmpdir, run
+from tty_driver import READY, case_tmpdir, run
 from asserts import TTYAssert
 from screen import Screen
 
@@ -30,7 +35,7 @@ def _skip_if_conpty():
 def test_apple_terminal_no_kitty(bin_path):
     _skip_if_conpty()
     # Apple Terminal:不发 Kitty 协议(\x1b[>1u / >4;2m),但 bracketed paste 仍发。
-    raw = run(bin_path, ["sleep:0.8"], env={"TERM_PROGRAM": "Apple_Terminal", "TERM": "xterm-256color"})
+    raw = run(bin_path, [READY], env={"TERM_PROGRAM": "Apple_Terminal", "TERM": "xterm-256color"})
     assert b"\x1b[>1u" not in raw, "Apple Terminal 不应发 Kitty enable \\x1b[>1u"
     assert b"\x1b[>4;2m" not in raw, "Apple Terminal 不应发 modifyOtherKeys level 2"
     assert b"\x1b[?2004h" in raw, "bracketed paste 应始终发(兼容性好)"
@@ -39,13 +44,13 @@ def test_apple_terminal_no_kitty(bin_path):
 def test_warp_sends_kitty(bin_path):
     _skip_if_conpty()
     # Warp(白名单):发 Kitty enable —— 实测其默认未开,需 cc-zig 主动发才能 Shift+Enter 换行。
-    raw = run(bin_path, ["sleep:0.8"], env={"TERM_PROGRAM": "WarpTerminal", "TERM": "xterm-256color"})
+    raw = run(bin_path, [READY], env={"TERM_PROGRAM": "WarpTerminal", "TERM": "xterm-256color"})
     assert b"\x1b[>1u" in raw, "Warp 应发 Kitty enable \\x1b[>1u"
 
 
 def test_iterm_sends_kitty(bin_path):
     _skip_if_conpty()
-    raw = run(bin_path, ["sleep:0.8"], env={"TERM_PROGRAM": "iTerm.app", "TERM": "xterm-256color"})
+    raw = run(bin_path, [READY], env={"TERM_PROGRAM": "iTerm.app", "TERM": "xterm-256color"})
     assert b"\x1b[>1u" in raw, "iTerm 应发 Kitty enable"
 
 
@@ -56,7 +61,7 @@ def test_sigstop_sigcont_reapplies_terminal_modes(bin_path):
     # state, including Kitty/modifyOtherKeys and bracketed paste.
     raw = run(
         bin_path,
-        ["sleep:0.8", "signal:stopcont", "sleep:0.8"],
+        [READY, "signal:stopcont", "sleep:0.8"],
         env={"TERM_PROGRAM": "WarpTerminal", "TERM": "xterm-256color"},
     )
     assert raw.count(b"\x1b[>1u") >= 2, "SIGCONT should re-enable Kitty keyboard"
@@ -71,7 +76,7 @@ def test_sigcont_restores_raw_input_after_shell_cooked_the_tty(bin_path):
     # newline and the input box stays empty.
     raw = run(
         bin_path,
-        ["sleep:0.8", "signal:stopcont:cooked", "sleep:0.5", "type:ab", "sleep:0.6"],
+        [READY, "signal:stopcont:cooked", "sleep:0.5", "type:ab", "sleep:0.6"],
     )
     a = TTYAssert(raw)
     a.assert_input_echo("ab")
@@ -83,16 +88,13 @@ def test_apple_terminal_backslash_newline_no_exit(bin_path):
     # 行尾 \ + 回车 → 删 \ 插 \n,留在输入框(不提交、不退出)。用 raw:\x0d 发裸回车。
     raw = run(
         bin_path,
-        ["sleep:0.8", "type:abc\\", "raw:\\x0d", "sleep:0.3"],
+        [READY, "type:abc\\", "raw:\\x0d", "sleep:0.3"],
         env={"TERM_PROGRAM": "Apple_Terminal", "TERM": "xterm-256color"},
     )
     assert b"Goodbye" not in raw, "backslash 续行不应退出程序"
     a = TTYAssert(raw)
     a.assert_box_height(2)  # 换行后输入框两行(abc + 空续行)
-    sc = Screen(24, 80)
-    sc.feed(raw)
-    top = a.box_top_row()
-    a.assert_line_contains(top + 1, "abc")  # 第一行是 abc(\ 已删)
+    a.assert_input_echo("abc")  # 第一行恰是 abc:\ 已删(只"含 abc"的话 abc\ 也算过)
 
 
 def test_esc_cr_inserts_a_newline(bin_path):
@@ -100,7 +102,7 @@ def test_esc_cr_inserts_a_newline(bin_path):
     # ESC CR (Meta+Return): a newline that stays in the input box, where a bare CR submits.
     raw = run(
         bin_path,
-        ["sleep:0.8", "type:abc", "raw:\\x1b\\x0d", "type:def", "sleep:0.4"],
+        [READY, "type:abc", "raw:\\x1b\\x0d", "type:def", "sleep:0.4"],
         env={"TERM_PROGRAM": "Apple_Terminal", "TERM": "xterm-256color"},
     )
     assert b"Goodbye" not in raw, "ESC CR must not submit or exit"
@@ -124,7 +126,7 @@ def _screen_text(raw):
 
 
 def test_esc_then_enter_pressed_apart_still_submits(bin_path):
-    raw = run(bin_path, ["sleep:0.8", "type:abc"] + SEPARATE_ESC_ENTER + ["sleep:0.8"],
+    raw = run(bin_path, [READY, "type:abc"] + SEPARATE_ESC_ENTER + ["sleep:0.8"],
               env=APPLE, per_key_drain=0.02)
     a = TTYAssert(raw)
     a.assert_box_present()
@@ -133,14 +135,14 @@ def test_esc_then_enter_pressed_apart_still_submits(bin_path):
 
 
 def test_vim_insert_esc_then_enter_apart_goes_normal_then_submits(bin_path):
-    events = ["sleep:0.8", "type:/vim", "key:enter", "wait:Editor mode: vim:5", "type:abc"]
+    events = [READY, "type:/vim", "key:enter", "wait:Editor mode: vim:5", "type:abc"]
     raw = run(bin_path, events + SEPARATE_ESC_ENTER + ["sleep:0.8"], env=APPLE, per_key_drain=0.02)
     a = TTYAssert(raw)
     a.assert_input_echo("")  # Esc → NORMAL, Enter → submit, as before ESC CR was a key
 
 
 def test_vim_insert_esc_cr_in_one_write_is_a_newline(bin_path):
-    events = ["sleep:0.8", "type:/vim", "key:enter", "wait:Editor mode: vim:5", "type:abc",
+    events = [READY, "type:/vim", "key:enter", "wait:Editor mode: vim:5", "type:abc",
               "raw:\\x1b\\x0d", "type:def", "sleep:0.4"]
     raw = run(bin_path, events, env=APPLE, per_key_drain=0.02)
     a = TTYAssert(raw)
@@ -155,7 +157,7 @@ def _reverse_search_hel(bin_path, keys):
     state = case_tmpdir("cc-tty-revsearch-")
     with open(os.path.join(state, "history"), "w", encoding="utf-8") as f:
         f.write('"hello"\n')
-    events = ["sleep:0.8", "key:ctrl_r", "wait:(reverse-search)`hel:3", "type:hel", "wait:hello:3", "sleep:0.3"]
+    events = [READY, "key:ctrl_r", "wait:(reverse-search)`hel:3", "type:hel", "wait:hello:3", "sleep:0.3"]
     raw = run(bin_path, events + keys + ["sleep:0.8"], env=APPLE, per_key_drain=0.02,
               extra_args=["--state-dir", state])
     assert b"(reverse-search)`hel': hello" in raw, "reverse search did not find the seeded history entry"
@@ -177,7 +179,7 @@ def test_reverse_search_esc_cr_in_one_write_accepts(bin_path):
 
 
 def test_paste_keeps_esc_cr_as_a_line_break(bin_path):
-    raw = run(bin_path, ["sleep:0.8", "raw:\\x1b[200~a\\x1b\\x0db\\x1b[201~", "sleep:0.5"], env=APPLE)
+    raw = run(bin_path, [READY, "raw:\\x1b[200~a\\x1b\\x0db\\x1b[201~", "sleep:0.5"], env=APPLE)
     a = TTYAssert(raw)
     a.assert_box_height(2)
     top = a.box_top_row()
@@ -188,9 +190,9 @@ def test_paste_keeps_esc_cr_as_a_line_break(bin_path):
 def _multiline_footer(bin_path, term_program):
     # 组多行(backslash 续行)后抓 footer 文案。Apple 用裸回车续行,Kitty 终端用 shift_enter。
     if term_program == "Apple_Terminal":
-        events = ["sleep:0.8", "type:a\\", "raw:\\x0d", "type:b", "sleep:0.3"]
+        events = [READY, "type:a\\", "raw:\\x0d", "type:b", "sleep:0.3"]
     else:
-        events = ["sleep:0.8", "type:a", "key:shift_enter", "type:b", "sleep:0.3"]
+        events = [READY, "type:a", "key:shift_enter", "type:b", "sleep:0.3"]
     raw = run(bin_path, events, env={"TERM_PROGRAM": term_program, "TERM": "xterm-256color"})
     sc = Screen(24, 80)
     sc.feed(raw)
@@ -227,7 +229,7 @@ def test_windows_console_shift_enter_record_is_a_newline(bin_path):
     a_key = _win32_records("65;30;97;1;32;1", "65;30;97;0;32;1")
     b_key = _win32_records("66;48;98;1;32;1", "66;48;98;0;32;1")
     shift_enter = _win32_records("16;42;0;1;16;1", "13;28;13;1;16;1", "13;28;13;0;16;1", "16;42;0;0;0;1")
-    raw = run(bin_path, ["sleep:0.8", a_key, a_key, shift_enter, b_key, b_key, "sleep:0.6"])
+    raw = run(bin_path, [READY, a_key, a_key, shift_enter, b_key, b_key, "sleep:0.6"])
     a = TTYAssert(raw)
     a.assert_box_height(2)
     top = a.box_top_row()
@@ -236,7 +238,7 @@ def test_windows_console_shift_enter_record_is_a_newline(bin_path):
     a.assert_line_contains(a.footer_row(), "shift + ")
 
     enter = _win32_records("13;28;13;1;0;1", "13;28;13;0;0;1")
-    raw = run(bin_path, ["sleep:0.8", "type:aa", enter, "sleep:0.8"])
+    raw = run(bin_path, [READY, "type:aa", enter, "sleep:0.8"])
     a = TTYAssert(raw)
     a.assert_input_echo("")
     sc = Screen(24, 80)
@@ -248,7 +250,7 @@ def test_colorless_conpty_keeps_unicode_frame(bin_path):
     """PowerShell often has no TERM; color fallback must keep the Unicode TUI glyphs."""
     raw = run(
         bin_path,
-        ["sleep:0.8"],
+        [READY],
         env={"FORCE_COLOR": None, "TERM": None, "COLORTERM": None, "NO_COLOR": None},
     )
     assert "╭".encode("utf-8") in raw, "no-color TTY must keep the banner's rounded top corner"
