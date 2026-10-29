@@ -11,10 +11,11 @@
 //!
 //! 分层:
 //! - render():纯渲染 → []u8(可 snapshot 测试)
-//! - prompt():render + raw mode 读键循环(真 TTY 才用;非 TTY 由调用方退回文字)
+//! - promptLoop():render + 读键循环(调用方负责 raw mode 与终端接管,见 TuiBackend)
 
 const std = @import("std");
 const pfs = @import("platform").fs;
+const platform_term = @import("platform").terminal;
 const ansi = @import("../ansi.zig");
 const theme_mod = @import("../theme.zig");
 const layout = @import("../layout.zig");
@@ -88,24 +89,10 @@ pub fn render(alloc: std.mem.Allocator, th: Theme, tool_name: []const u8, args: 
     });
 }
 
-/// 交互式询问(真 TTY)。渲染对话框 + raw mode 读键,返回选择。
-/// 非 TTY → 返回 null(调用方退回文字 prompt)。
-///
-/// input.zig 的 enterRawMode/restoreMode 复用。fd 默认 stdin(0),输出 fd 默认 stdout(1)。
-pub fn prompt(alloc: std.mem.Allocator, th: Theme, tool_name: []const u8, args: []const u8) ?PermissionChoice {
-    const in_fd: c_int = 0;
-
-    if (!term.isatty(in_fd)) return null;
-
-    const orig = input_mod.enterRawMode(in_fd) orelse return null;
-    defer input_mod.restoreMode(in_fd, orig);
-
-    return promptLoop(alloc, th, in_fd, 1, tool_name, args);
-}
-
 /// 渲染 + 读键循环(不管 raw mode / 终端接管——调用方负责)。
-/// 用于:① prompt() 自己进 raw mode 后调;② TuiBackend 终端接管(停 watcher+持锁)后调。
-/// out_fd 输出(prompt 用 stdout=1;TuiBackend 接管用 stderr=2 与 region 同流)。
+/// TuiBackend 终端接管(停 watcher+持锁)后调,生成期的 raw mode 由 loop 进好:对话框自己不再进
+/// 一层 raw mode(嵌套的 restoreMode 会把外层开着的括号粘贴、win32-input-mode 一起关掉)。
+/// out_fd 输出(TuiBackend 接管用 stderr=2 与 region 同流)。
 /// 重画用 render 实际行数(不再硬编码 8——参数长会折行变多行,硬编码会错位)。
 /// 回顶按终端现在的宽度数上一帧占的行:框比终端宽时画的那一刻就折了行,终端变窄后
 /// 又会把每行重排成多行(reflow.zig);回顶后 ED 0 清掉旧帧多出的行。
@@ -127,7 +114,7 @@ pub fn promptLoop(alloc: std.mem.Allocator, th: Theme, in_fd: c_int, out_fd: c_i
         drawn = reflow.Anchor.atEnd(frame, cols);
 
         var buf: [8]u8 = undefined;
-        const n = pfs.read(in_fd, &buf);
+        const n = platform_term.readInput(in_fd, &buf); // decodes a console's key records
         if (n <= 0) {
             if (n < 0 and input_mod.retryInterruptedRead(in_fd)) continue;
             return .deny_once;
@@ -219,4 +206,26 @@ test "VISUAL demo (打印到 stderr,看真实渲染)" {
     const s = try render(testing.allocator, theme_mod.dark, "Bash", "{\"command\":\"rm -rf /tmp/build\",\"timeout\":30000}", 0);
     defer testing.allocator.free(s);
     std.debug.print("\n{s}\n", .{s});
+}
+
+test "promptLoop 读 Windows 控制台送来的按键记录:y、n、Ctrl+C 各是一个回答" {
+    // win32-input-mode 开着时每个键都是一条记录(控制台逐字符排进队列,sendChars)。对话框读的是
+    // 还原后的键;读原始字节时一个也认不出,工具调用一直等着(#388 审查)。
+    if (@import("builtin").os.tag != .windows) return error.SkipZigTest;
+    var console = try @import("platform").test_support.PrivateConsole.begin();
+    defer console.end();
+    defer platform_term.resetConsoleInputForTesting();
+    platform_term.decodeKeyRecords();
+    const sink = pfs.open("NUL", .{ .ACCMODE = .WRONLY }, 0);
+    try testing.expect(sink >= 0);
+    defer _ = pfs.close(sink);
+    const cases = [_]struct { records: []const u8, choice: PermissionChoice }{
+        .{ .records = "\x1b[89;21;121;1;32;1_\x1b[89;21;121;0;32;1_", .choice = .allow_once },
+        .{ .records = "\x1b[78;49;110;1;32;1_\x1b[78;49;110;0;32;1_", .choice = .deny_once },
+        .{ .records = "\x1b[17;29;0;1;40;1_\x1b[67;46;3;1;40;1_\x1b[67;46;3;0;40;1_\x1b[17;29;0;0;32;1_", .choice = .deny_once },
+    };
+    for (cases) |c| {
+        try console.sendChars(c.records);
+        try testing.expectEqual(c.choice, promptLoop(testing.allocator, theme_mod.dark, 0, sink, "Write", "{}").?);
+    }
 }
