@@ -175,6 +175,22 @@ status, compatibility boundaries, and entry points are defined by
   written before the panic message, and the live region no longer draws
   over the stack trace.
 
+- **The Linux release binary no longer carries unwind tables (`.eh_frame`),
+  saving 300 KB.** The program never read them. A panic in the stripped
+  binary prints its message without a stack trace either way, and frame
+  pointers are kept. What changes is post-mortem debugging with outside
+  tools:
+  - **With the release's debug-symbol asset** (`metacodes.debug`, above):
+    gdb unwinds every thread's whole stack, with function names and source
+    lines, from the `.debug_frame` the asset carries.
+  - **Without it:** gdb can no longer unwind a core past the first metacodes
+    frame, and CFI-based unwinders (`perf --call-graph=dwarf`,
+    systemd-coredump) degrade the same way. `perf --call-graph=fp` still
+    works.
+
+  macOS and Windows binaries are unchanged
+  (`doc/PERF_MEMORY_PRINCIPLES.md` §3f).
+
 ### Fixed
 
 - **Release executables run beyond machines like the build runner.**
