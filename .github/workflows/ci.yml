@@ -1,4 +1,4 @@
-name: Windows picker comparison
+name: Windows picker watchdog checks
 on:
   workflow_dispatch:
     inputs:
@@ -20,12 +20,48 @@ jobs:
         with:
           version: 0.16.0
           use-cache: false
-      - shell: cmd
-        env:
-          METACODES_PICKER_TRACE: ${{ runner.temp }}\picker.log
-        run: zig build test:picker -j8 --seed 0x3e68a003 --test-timeout 5m -Dlean-kernels=on --summary all
-      - if: always()
-        shell: pwsh
+      - name: Verify case and protocol watchdogs
+        shell: bash
         run: |
-          $trace = Join-Path $env:RUNNER_TEMP picker.log
-          if (Test-Path $trace) { Get-Content $trace -Tail 12 }
+          set -eu
+          mkdir watchdog
+          cp scripts/recording_test_runner.zig scripts/test_id_record.zig watchdog/
+          cd watchdog
+          cat >fixture.zig <<'ZIG'
+          test "first completes" {}
+          test "hangs" {
+              while (true) @import("std").atomic.spinLoopHint();
+          }
+          test "last completes" {}
+          ZIG
+          cat >build.zig <<'ZIG'
+          const std = @import("std");
+          pub fn build(b: *std.Build) void {
+              const artifact = b.addTest(.{ .name = "picker-test", .root_module = b.createModule(.{ .root_source_file = b.path("fixture.zig"), .target = b.graph.host }), .test_runner = .{ .path = b.path("recording_test_runner.zig"), .mode = .server } });
+              b.step("test", "Run watchdog fixture").dependOn(&b.addRunArtifact(artifact).step);
+          }
+          ZIG
+          check_timeout() {
+            export METACODES_PICKER_TRACE="$1.log"
+            rc=0
+            zig build test --test-timeout 2s --summary all > "$1-build.log" 2>&1 || rc=$?
+            cat "$1-build.log" "$1.log"
+            test "$rc" -eq 1
+          }
+          check_timeout wedged-case
+          grep -F 'fixture.test.hangs' wedged-case-build.log | grep -F 'timed out after'
+          grep -F $'started\tfixture.test.hangs' wedged-case.log
+          grep -F $'pass\tfixture.test.last completes' wedged-case.log
+          test "$(grep -c '^server starting' wedged-case.log)" -eq 2
+          grep -F 'exiting' wedged-case.log
+          python - <<'PYTHON'
+          from pathlib import Path
+          p = Path("recording_test_runner.zig")
+          s = p.read_text()
+          pos = 'try trace("sending metadata", "");'
+          assert s.count(pos) == 1
+          p.write_text(s.replace(pos, pos + '\n                while (std.mem.eql(u8, builtin.zig_version_string, "0.16.0")) std.atomic.spinLoopHint();'))
+          PYTHON
+          check_timeout wedged-protocol
+          grep -F 'test runner failed to respond for' wedged-protocol-build.log
+          tail -1 wedged-protocol.log | grep -F 'sending metadata'
